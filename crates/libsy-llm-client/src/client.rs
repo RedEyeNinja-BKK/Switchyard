@@ -296,7 +296,7 @@ impl TranslatingLlmClient {
             &self.client
         };
         let builder = client.post(url).json(body);
-        let builder = forward_metadata_headers(builder, metadata);
+        let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
@@ -642,16 +642,27 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     }
 }
 
-// Forwards caller-supplied metadata headers except credentials and client-owned headers.
+// Forwards caller-supplied metadata headers except credentials, client-owned
+// headers, and headers explicitly overridden by the backend's extra_headers.
+// A backend-configured extra header wins for that backend; the inbound value
+// is suppressed so the upstream sees the configured value exactly once.
 fn forward_metadata_headers(
     mut builder: RequestBuilder,
     metadata: Option<&Metadata>,
+    backend: &Backend,
 ) -> RequestBuilder {
     let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
         return builder;
     };
     for (name, value) in headers {
         if is_reserved_header(name.as_str()) {
+            continue;
+        }
+        if backend
+            .extra_headers()
+            .keys()
+            .any(|extra| extra.eq_ignore_ascii_case(name.as_str()))
+        {
             continue;
         }
         builder = builder.header(name, value);

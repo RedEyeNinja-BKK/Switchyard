@@ -872,6 +872,15 @@ mod tests {
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
+    fn chat_map_with_extra_headers(
+        base_url: &str,
+        extra_headers: BTreeMap<String, String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.extra_headers = extra_headers;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
     fn anthropic_map(base_url: &str) -> Vec<ModelConfig> {
         vec![ModelConfig::new(
             "claude",
@@ -1833,6 +1842,82 @@ mod tests {
             .ok_or("request recording should be enabled")?;
         let received = received.first().ok_or("expected one upstream request")?;
         assert!(!received.headers.contains_key("accept-encoding"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extra_headers_override_inbound_metadata_headers_exactly_once()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // A: inbound User-Agent suppressed when backend configures one.
+        // B: non-overridden inbound header still forwarded.
+        // C: backend extra_header value wins, exactly once.
+        // D/E: reserved auth headers unchanged (authorization must be backend's).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("user-agent", "BrowserUA"))
+            .and(wiremock::matchers::header("x-custom", "backend-value"))
+            .and(wiremock::matchers::header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("user-agent", http::HeaderValue::from_static("OpenAI/Python"));
+        headers.insert("x-custom", http::HeaderValue::from_static("inbound-value"));
+        headers.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer client-key"),
+        );
+        let request = Request {
+            llm_request: LlmRequest {
+                model: Some("gpt".to_string()),
+                ..LlmRequest::default()
+            },
+            raw_request: None,
+            metadata: Some(Metadata {
+                session_id: None,
+                agent_id: None,
+                task_id: None,
+                correlation_id: None,
+                extra_metadata: None,
+                http_headers: Some(headers),
+                wire_format: None,
+                ..Default::default()
+            }),
+        };
+
+        let mut extra = BTreeMap::new();
+        extra.insert("User-Agent".to_string(), "BrowserUA".to_string());
+        extra.insert("x-custom".to_string(), "backend-value".to_string());
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
+            &format!("{}/v1", server.uri()),
+            extra,
+        ))?;
+
+        client.call_rewrite_model(request, None).await?;
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let received = received.first().ok_or("expected one upstream request")?;
+        assert_eq!(received.headers.get_all("user-agent").iter().count(), 1, "exactly one User-Agent");
+        assert_eq!(
+            received.headers.get("user-agent").unwrap().to_str().unwrap(),
+            "BrowserUA"
+        );
+        assert_eq!(received.headers.get_all("x-custom").iter().count(), 1, "exactly one x-custom");
+        assert_eq!(
+            received.headers.get("x-custom").unwrap().to_str().unwrap(),
+            "backend-value"
+        );
+        assert_eq!(
+            received.headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer secret"
+        );
         Ok(())
     }
 

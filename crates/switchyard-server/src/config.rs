@@ -360,6 +360,10 @@ struct LlmClientConfig {
     api_key_env: Option<String>,
     #[serde(default)]
     forward_auth: bool,
+    /// Server-owned bearer token env used as the upstream credential ONLY for
+    /// a forward-auth client when the caller supplies no Authorization header.
+    #[serde(default)]
+    server_auth_token_env: Option<String>,
     #[serde(default)]
     extra_headers: BTreeMap<String, String>,
     #[serde(default = "default_max_retries")]
@@ -1045,6 +1049,11 @@ fn build_backend(
             "llm client {client_name} cannot set both forward_auth and api_key_env"
         )));
     }
+    if !config.forward_auth && config.server_auth_token_env.is_some() {
+        return Err(ServerError::new(format!(
+            "llm client {client_name} server_auth_token_env requires forward_auth"
+        )));
+    }
     let api_key = config
         .api_key_env
         .as_deref()
@@ -1067,10 +1076,33 @@ fn build_backend(
             Ok(api_key)
         })
         .transpose()?;
+    let server_auth_token = config
+        .server_auth_token_env
+        .as_deref()
+        .map(|variable| {
+            if variable.trim().is_empty() {
+                return Err(ServerError::new(format!(
+                    "llm client {client_name} server_auth_token_env must not be empty"
+                )));
+            }
+            let token = std::env::var(variable).map_err(|error| {
+                ServerError::new(format!(
+                    "llm client {client_name} could not read server_auth_token_env {variable}: {error}"
+                ))
+            })?;
+            if token.trim().is_empty() {
+                return Err(ServerError::new(format!(
+                    "llm client {client_name} server_auth_token_env {variable} is empty"
+                )));
+            }
+            Ok(token)
+        })
+        .transpose()?;
     let http = HttpBackendConfig {
         base_url: base_url.to_string(),
         api_key,
         forward_auth: config.forward_auth,
+        server_auth_token,
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         max_retries: config.max_retries,
@@ -2017,6 +2049,7 @@ target = "azure"
         }
     }
 
+<<<<<<< HEAD
     const ADVISOR_CONFIG: &str = r#"
 schema_version = 1
 
@@ -2044,6 +2077,38 @@ advisor_target = "advisor"
         let state = server_state_from_toml(ADVISOR_CONFIG)?;
         assert_eq!(state.models().collect::<Vec<_>>(), ["switchyard/advisor"]);
         Ok(())
+    }
+
+    #[test]
+    fn server_auth_token_env_requires_forward_auth() {
+        let without_forward = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\nserver_auth_token_env = \"UNUSED_TEST_TOKEN\"",
+            1,
+        );
+        assert!(
+            error_message(&without_forward)
+                .contains("server_auth_token_env requires forward_auth")
+        );
+
+        const TOKEN_ENV: &str = "SWITCHYARD_CONFIG_TEST_SERVER_TOKEN";
+        unsafe {
+            std::env::set_var(TOKEN_ENV, "test-token-value");
+        }
+        let with_forward = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            &format!(
+                "base_url = \"https://example.test/v1\"\n\
+                 forward_auth = true\n\
+                 server_auth_token_env = \"{TOKEN_ENV}\""
+            ),
+            1,
+        );
+        let result = server_state_from_toml(&with_forward);
+        unsafe {
+            std::env::remove_var(TOKEN_ENV);
+        }
+        assert!(result.is_ok(), "forward_auth + server_auth_token_env must load");
     }
 
     const RESOURCE_ROUTER_CONFIG: &str = r#"

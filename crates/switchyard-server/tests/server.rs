@@ -369,6 +369,7 @@ fn random_state(base_url: &str, routes: &[(&str, &[&str])]) -> TestResult<Server
         base_url: base_url.to_string(),
         api_key: Some("test-key".to_string()),
         forward_auth: false,
+        server_auth_token: None,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         max_retries: 0,

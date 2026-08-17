@@ -593,6 +593,7 @@ mod tests {
                 base_url: format!("{}/v1", server.uri()),
                 api_key: None,
                 forward_auth: false,
+                server_auth_token: None,
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 max_retries: 2,

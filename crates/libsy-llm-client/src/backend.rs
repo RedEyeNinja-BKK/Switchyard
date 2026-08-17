@@ -47,6 +47,12 @@ pub struct HttpBackendConfig {
     pub api_key: Option<String>,
     /// Whether this backend forwards the caller's provider credential instead.
     pub forward_auth: bool,
+    /// Server-owned bearer token used as the upstream credential ONLY when
+    /// `forward_auth` is set AND the caller supplied no Authorization header.
+    /// This lets a forward-auth route broker a local gateway credential
+    /// (e.g. the :8645 catalog token) for callers that have none, while
+    /// never storing that credential in a caller's model catalog.
+    pub server_auth_token: Option<String>,
     /// Custom headers added to every outbound call to this backend.
     ///
     /// Provider-owned headers are rejected so a static value cannot replace
@@ -189,10 +195,21 @@ impl Backend {
         };
         match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+                let mut forwarded_caller_auth = false;
                 for name in ["authorization", "chatgpt-account-id", "x-openai-fedramp"] {
                     if let Some(value) = headers.get(name) {
+                        if name == "authorization" {
+                            forwarded_caller_auth = true;
+                        }
                         builder = builder.header(name, sensitive_header(value));
                     }
+                }
+                // Broker a server-owned credential only when the caller supplied
+                // no Authorization header (forward-auth route, keyless caller).
+                if !forwarded_caller_auth
+                    && let Some(token) = self.server_auth_token()
+                {
+                    builder = builder.bearer_auth(token);
                 }
             }
             Backend::Anthropic(_) => {
@@ -209,6 +226,17 @@ impl Backend {
             }
         }
         builder
+    }
+
+    /// Server-owned bearer token for forward-auth fallback (see
+    /// [`HttpBackendConfig::server_auth_token`]).
+    pub(crate) fn server_auth_token(&self) -> Option<&str> {
+        match self {
+            Backend::OpenAiChat(config) | Backend::OpenAiResponses(config) => {
+                config.server_auth_token.as_deref()
+            }
+            Backend::Anthropic(_) => None,
+        }
     }
 
     /// Removes an echoed caller credential before an upstream error is returned or logged.
@@ -343,6 +371,7 @@ mod tests {
             base_url: base_url.to_string(),
             api_key: Some("secret".to_string()),
             forward_auth: false,
+            server_auth_token: None,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
@@ -472,5 +501,76 @@ mod tests {
             )
         );
         assert!(!backend.is_context_overflow(r#"{"error":{"message":"overloaded"}}"#));
+    }
+
+    fn forward_auth_config(server_token: Option<&str>) -> HttpBackendConfig {
+        HttpBackendConfig {
+            base_url: "http://127.0.0.1:8645/v1".to_string(),
+            api_key: None,
+            forward_auth: true,
+            server_auth_token: server_token.map(ToOwned::to_owned),
+            extra_headers: BTreeMap::new(),
+            extra_body: BTreeMap::new(),
+            max_retries: 0,
+        }
+    }
+
+    fn metadata_with_auth(authorization: Option<&str>) -> Metadata {
+        let mut headers = http::HeaderMap::new();
+        if let Some(auth) = authorization {
+            headers.insert(
+                "authorization",
+                http::HeaderValue::from_str(auth).expect("valid header value"),
+            );
+        }
+        Metadata {
+            http_headers: Some(headers),
+            ..Default::default()
+        }
+    }
+
+    fn request_builder() -> RequestBuilder {
+        reqwest::Client::new()
+            .post("http://127.0.0.1:8645/v1/chat/completions")
+            .json(&serde_json::json!({"model": "gpt"}))
+    }
+
+    fn authorization_of(builder: RequestBuilder) -> Option<String> {
+        builder
+            .build()
+            .expect("request builds")
+            .headers()
+            .get("authorization")
+            .map(|value| value.to_str().expect("ascii header").to_string())
+    }
+
+    #[test]
+    fn forward_auth_falls_back_to_server_token_when_caller_has_no_auth() {
+        let backend = Backend::OpenAiChat(forward_auth_config(Some("server-token")));
+        let builder = backend.apply_forwarded_auth(request_builder(), Some(&metadata_with_auth(None)));
+        assert_eq!(
+            authorization_of(builder).as_deref(),
+            Some("Bearer server-token")
+        );
+    }
+
+    #[test]
+    fn forward_auth_prefers_caller_auth_over_server_token() {
+        let backend = Backend::OpenAiChat(forward_auth_config(Some("server-token")));
+        let builder = backend.apply_forwarded_auth(
+            request_builder(),
+            Some(&metadata_with_auth(Some("Bearer caller-key"))),
+        );
+        assert_eq!(
+            authorization_of(builder).as_deref(),
+            Some("Bearer caller-key")
+        );
+    }
+
+    #[test]
+    fn forward_auth_without_server_token_sends_no_auth() {
+        let backend = Backend::OpenAiChat(forward_auth_config(None));
+        let builder = backend.apply_forwarded_auth(request_builder(), Some(&metadata_with_auth(None)));
+        assert_eq!(authorization_of(builder), None);
     }
 }

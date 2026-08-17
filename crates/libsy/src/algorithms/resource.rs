@@ -844,6 +844,38 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn modality_incompatible_candidate_excluded() -> crate::Result<()> {
+        // §29.14: multimodal request must not select a text-only candidate
+        // merely because its pool is healthier.
+        let mut text_only = candidate("testing/text-only", Pool::DeepSeek);
+        text_only.modalities = vec![Modality::Text];
+        let mut image_ok = candidate("testing/image-ok", Pool::OpenAi);
+        image_ok.modalities = vec![Modality::Text, Modality::Image];
+        let router = make_router(
+            vec![text_only, image_ok],
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let mut llm = text_request(Some("auto".to_string()), "describe this image");
+        llm.messages.push(switchyard_protocol::Message {
+            role: switchyard_protocol::Role::User,
+            content: vec![switchyard_protocol::ContentBlock::Image {
+                source: switchyard_protocol::ImageSource::Base64 {
+                    media_type: Some("image/png".to_string()),
+                    data: "iVBORw0KGgo=".to_string(),
+                },
+            }],
+        });
+        let request = Request {
+            llm_request: llm,
+            raw_request: None,
+            metadata: None,
+        };
+        let (trace, _) = test_drive(router, request, echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/image-ok");
+        Ok(())
+    }
+
     // ── Provider-pool-local failure isolation (§3) ─────────────────────
     // One pool's telemetry unknown must not disable every smart route.
 

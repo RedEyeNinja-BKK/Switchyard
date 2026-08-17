@@ -7,14 +7,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use libsy::{
-    AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat,
-    ClassifyTrigger, CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig,
-    GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop,
-    Passthrough, PassthroughConfig, PassthroughSubagentConfig, PickerMode, Random, StageRouter,
-    StageRouterConfig, TargetPrompts, TaskClassifierConfig,
-};
+use libsy::{
+    AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger,
+    CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig, GateTrigger, HandoffNoteConfig, LlmClassifierConfig,
+    LlmFallback, LlmTaskClassifier, Noop, Passthrough, PassthroughConfig, PassthroughSubagentConfig,
+    PickerMode, Random, StageRouter, StageRouterConfig, TargetPrompts, TaskClassifierConfig,
+    Candidate, Modality, Pool, ReasoningPolicy, ResourceFetcher, ResourceRouter,
+    ResourceState,
+};};
 use serde::Deserialize;
 use serde_json::Value;
 use switchyard_llm_client::{
@@ -23,6 +26,7 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
+use crate::resource_fetcher::{CompositeResourceFetcher, DeepSeekHttpFetcher, OpenAiHttpFetcher};
 use crate::{
     CallerAuthKind, CountTokensTarget, ModelCapabilities, ServerError, ServerResult, ServerState,
 };
@@ -61,6 +65,52 @@ pub(crate) struct ServerConfig {
     pub(crate) llm_clients: BTreeMap<String, LlmClientConfig>,
     pub(crate) targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    /// Shared resource-pool definitions consumed by `resource_router` routes.
+    #[serde(default)]
+    resource_pools: BTreeMap<String, ResourcePoolsConfig>,
+}
+
+/// Credential-pool definitions for resource-aware routing. State is fetched
+/// on demand with a TTL cache shared across every route that names the pool.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourcePoolsConfig {
+    #[serde(default)]
+    openai: Option<OpenAiPoolConfig>,
+    #[serde(default)]
+    deepseek: Option<DeepSeekPoolConfig>,
+    /// Cache TTL seconds (default 30).
+    #[serde(default = "default_resource_ttl_seconds")]
+    ttl_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiPoolConfig {
+    /// Sanitized resource endpoint, normally http://127.0.0.1:8645/resource/openai-codex
+    url: String,
+    /// Env var holding the bearer token for the sanitized endpoint.
+    auth_token_env: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeepSeekPoolConfig {
+    /// DeepSeek balance endpoint (https://api.deepseek.com/user/balance).
+    url: String,
+    /// Env var holding the DeepSeek API key (server-owned credential).
+    api_key_env: String,
+    /// Currency used for availability (`CNY` default).
+    #[serde(default = "default_deepseek_currency")]
+    currency: String,
+}
+
+fn default_resource_ttl_seconds() -> u64 {
+    30
+}
+
+fn default_deepseek_currency() -> String {
+    "CNY".to_string()
 }
 
 impl ServerConfig {
@@ -100,6 +150,7 @@ impl ServerConfig {
 
         let clients = self.build_clients()?;
         let targets = self.build_targets()?;
+        let resource_states = self.build_resource_states()?;
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             validate_value("route name", route_name)?;
@@ -115,7 +166,7 @@ impl ServerConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
-            let algorithm = build_algorithm(route_name, config, &targets)?;
+            let algorithm = build_algorithm(route_name, config, &targets, &resource_states)?;
             let (client, caller_auth) = self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
             routes.push((
@@ -131,8 +182,66 @@ impl ServerConfig {
         ServerState::new_with_capabilities(routes)
     }
 
-    fn build_clients(&self) -> ServerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
-        let mut models_by_client = self
+    /// Build shared TTL-cached resource state for each `[resource_pools.*]`
+    /// definition. Routes reference these by pool name.
+    fn build_resource_states(
+        &self,
+    ) -> ServerResult<BTreeMap<String, Arc<ResourceState>>> {
+        let mut states = BTreeMap::new();
+        for (pool_name, pool) in &self.resource_pools {
+            validate_value("resource pool name", pool_name)?;
+            let mut fetchers: Vec<(&'static str, Box<dyn ResourceFetcher>)> = Vec::new();
+            if let Some(openai) = &pool.openai {
+                if openai.url.trim().is_empty() {
+                    return Err(ServerError::new(format!(
+                        "resource pool {pool_name} openai.url must not be empty"
+                    )));
+                }
+                let token = std::env::var(&openai.auth_token_env).map_err(|error| {
+                    ServerError::new(format!(
+                        "resource pool {pool_name} could not read openai.auth_token_env {}: {error}",
+                        openai.auth_token_env
+                    ))
+                })?;
+                fetchers.push(("openai", Box::new(OpenAiHttpFetcher::new(
+                    openai.url.clone(),
+                    token,
+                ))));
+            }
+            if let Some(deepseek) = &pool.deepseek {
+                if deepseek.url.trim().is_empty() {
+                    return Err(ServerError::new(format!(
+                        "resource pool {pool_name} deepseek.url must not be empty"
+                    )));
+                }
+                let key = std::env::var(&deepseek.api_key_env).map_err(|error| {
+                    ServerError::new(format!(
+                        "resource pool {pool_name} could not read deepseek.api_key_env {}: {error}",
+                        deepseek.api_key_env
+                    ))
+                })?;
+                fetchers.push(("deepseek", Box::new(DeepSeekHttpFetcher::new(
+                    deepseek.url.clone(),
+                    key,
+                    deepseek.currency.clone(),
+                ))));
+            }
+            if fetchers.is_empty() {
+                return Err(ServerError::new(format!(
+                    "resource pool {pool_name} must define at least one pool (openai or deepseek)"
+                )));
+            }
+            let ttl = Duration::from_secs(pool.ttl_seconds.max(1));
+            let state = Arc::new(ResourceState::new(
+                Arc::new(CompositeResourceFetcher::new(fetchers)),
+                ttl,
+            ));
+            states.insert(pool_name.clone(), state);
+        }
+        Ok(states)
+    }
+
+    fn build_clients(&self) -> ServerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {        let mut models_by_client = self
             .llm_clients
             .keys()
             .map(|name| (name.clone(), Vec::new()))
@@ -521,6 +630,19 @@ enum RouteConfig {
         #[serde(default)]
         classifier: Option<StageClassifierConfig>,
     },
+    ResourceRouter {
+        id: ModelId,
+        #[serde(default)]
+        context_window: Option<u32>,
+        #[serde(default)]
+        tool_calling: Option<bool>,
+        #[serde(default)]
+        reasoning: Option<bool>,
+        /// Name of the `[resource_pools.*]` definition this route consumes.
+        pool: String,
+        /// Ordered candidates; the first eligible target is selected.
+        candidates: Vec<ResourceCandidateConfig>,
+    },
     Advisor {
         id: ModelId,
         #[serde(default)]
@@ -570,6 +692,49 @@ enum AdvisorTriggerConfig {
     Pattern,
 }
 
+/// One ordered candidate for a `resource_router` route.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceCandidateConfig {
+    target: String,
+    /// Resource pool this candidate requires: "openai", "deepseek", or absent.
+    #[serde(default)]
+    pool: Option<ResourcePoolName>,
+    /// Economic context cap in tokens (request estimate above cap => ineligible).
+    #[serde(default)]
+    context_cap_tokens: Option<u64>,
+    /// Supported request modalities: "text", "image" (default ["text", "image"]).
+    #[serde(default)]
+    modalities: Option<Vec<ResourceModalityName>>,
+    /// Reasoning contract: "any", "non_thinking", "thinking" (default "any").
+    #[serde(default)]
+    reasoning: Option<ResourceReasoningName>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourcePoolName {
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceModalityName {
+    Text,
+    Image,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceReasoningName {
+    Any,
+    NonThinking,
+    Thinking,
+}
+
 /// The judge a `stage_router` route falls through to, and how it routes.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -617,7 +782,8 @@ impl RouteConfig {
             | LlmClassifier { id, .. }
             | Passthrough { id, .. }
             | StageRouter { id, .. }
-            | Advisor { id, .. } => id,
+            | Advisor { id, .. }
+            | ResourceRouter { id, .. } => id,
         }
     }
 
@@ -671,6 +837,10 @@ impl RouteConfig {
             Self::Advisor {
                 executor_target, ..
             } => vec![executor_target],
+            Self::ResourceRouter { candidates, .. } => candidates
+                .iter()
+                .map(|candidate| candidate.target.as_str())
+                .collect(),
         }
     }
 
@@ -732,6 +902,7 @@ impl RouteConfig {
                 ..
             }
             | Advisor {
+            | ResourceRouter {
                 context_window,
                 tool_calling,
                 reasoning,
@@ -1000,6 +1171,7 @@ fn build_algorithm(
     route_name: &str,
     config: &RouteConfig,
     targets: &BTreeMap<String, ModelId>,
+    resource_states: &BTreeMap<String, Arc<ResourceState>>,
 ) -> ServerResult<Arc<dyn Algorithm>> {
     match config {
         RouteConfig::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -1265,6 +1437,59 @@ fn build_algorithm(
             let algorithm = AdvisorGate::new(executor, advisor, config).map_err(|error| {
                 ServerError::new(format!("advisor route {route_name}: {error}"))
             })?;
+            Ok(Arc::new(algorithm))
+        }
+        RouteConfig::ResourceRouter {
+            pool,
+            candidates,
+            ..
+        } => {
+            let state = resource_states.get(pool).ok_or_else(|| {
+                ServerError::new(format!(
+                    "resource_router route {route_name} references undefined resource pool {pool:?}"
+                ))
+            })?;
+            if candidates.is_empty() {
+                return Err(ServerError::new(format!(
+                    "resource_router route {route_name} must define at least one candidate"
+                )));
+            }
+            let mut resolved = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
+                let pool = match candidate.pool {
+                    Some(ResourcePoolName::OpenAi) => Pool::OpenAi,
+                    Some(ResourcePoolName::DeepSeek) => Pool::DeepSeek,
+                    None => Pool::None,
+                };
+                let modalities = candidate.modalities.clone().unwrap_or_else(|| {
+                    vec![ResourceModalityName::Text, ResourceModalityName::Image]
+                });
+                let modalities = modalities
+                    .iter()
+                    .map(|m| match m {
+                        ResourceModalityName::Text => Modality::Text,
+                        ResourceModalityName::Image => Modality::Image,
+                    })
+                    .collect();
+                let reasoning = match candidate.reasoning {
+                    Some(ResourceReasoningName::Any) | None => ReasoningPolicy::Any,
+                    Some(ResourceReasoningName::NonThinking) => ReasoningPolicy::NonThinking,
+                    Some(ResourceReasoningName::Thinking) => ReasoningPolicy::Thinking,
+                };
+                resolved.push(Candidate {
+                    target,
+                    pool,
+                    context_cap_tokens: candidate.context_cap_tokens,
+                    modalities,
+                    reasoning,
+                });
+            }
+            let algorithm = ResourceRouter::new(
+                "resource_router",
+                resolved,
+                Arc::clone(state),
+            );
             Ok(Arc::new(algorithm))
         }
     }
@@ -2047,6 +2272,59 @@ advisor_target = "advisor"
         Ok(())
     }
 
+    const RESOURCE_ROUTER_CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.luna]
+id = "luna/model"
+llm_client = "primary"
+
+[targets.flash]
+id = "flash/model"
+llm_client = "primary"
+
+[resource_pools.smart]
+ttl_seconds = 30
+[resource_pools.smart.openai]
+url = "http://127.0.0.1:8645/resource/openai-codex"
+auth_token_env = "SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN"
+[resource_pools.smart.deepseek]
+url = "https://api.deepseek.com/user/balance"
+api_key_env = "SWITCHYARD_CONFIG_TEST_RESOURCE_KEY"
+currency = "CNY"
+
+[routes.smart]
+id = "switchyard/smart"
+type = "resource_router"
+pool = "smart"
+[[routes.smart.candidates]]
+target = "luna"
+pool = "openai"
+context_cap_tokens = 266000
+modalities = ["text", "image"]
+reasoning = "non_thinking"
+[[routes.smart.candidates]]
+target = "flash"
+pool = "deepseek"
+reasoning = "non_thinking"
+"#;
+
+    #[test]
+    fn builds_resource_router_with_pools() -> ServerResult<()> {
+        unsafe {
+            std::env::set_var("SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN", "test-token");
+            std::env::set_var("SWITCHYARD_CONFIG_TEST_RESOURCE_KEY", "test-key");
+        }
+        let result = server_state_from_toml(RESOURCE_ROUTER_CONFIG);
+        let state = result?;
+        assert!(state.models().collect::<Vec<_>>().contains(&"switchyard/smart"));
+        Ok(())
+    }
+
     #[test]
     fn advisor_route_accepts_every_gate_knob() -> ServerResult<()> {
         let tuned = ADVISOR_CONFIG.replace(
@@ -2134,5 +2412,41 @@ advisor_target = "advisor"
             "advisor_target = \"advisor\"\nmax_reviews = 0",
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
+    }
+
+    #[test]
+    fn resource_router_rejects_undefined_pool() {
+        unsafe {
+            std::env::set_var("SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN", "test-token");
+            std::env::set_var("SWITCHYARD_CONFIG_TEST_RESOURCE_KEY", "test-key");
+        }
+        let undefined = RESOURCE_ROUTER_CONFIG.replace("pool = \"smart\"", "pool = \"nope\"");
+        let message = error_message(&undefined);
+        assert!(message.contains("undefined resource pool"), "message: {message}");
+    }
+
+    #[test]
+    fn resource_router_rejects_empty_candidates() {
+        unsafe {
+            std::env::set_var("SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN", "test-token");
+            std::env::set_var("SWITCHYARD_CONFIG_TEST_RESOURCE_KEY", "test-key");
+        }
+        let empty = RESOURCE_ROUTER_CONFIG.replace(
+            "[[routes.smart.candidates]]\ntarget = \"luna\"\npool = \"openai\"\ncontext_cap_tokens = 266000\nmodalities = [\"text\", \"image\"]\nreasoning = \"non_thinking\"\n[[routes.smart.candidates]]\ntarget = \"flash\"\npool = \"deepseek\"\nreasoning = \"non_thinking\"",
+            "candidates = []",
+        );
+        let message = error_message(&empty);
+        assert!(message.contains("at least one candidate"), "message: {message}");
+    }
+
+    #[test]
+    fn resource_router_rejects_missing_openai_token_env() {
+        let missing = RESOURCE_ROUTER_CONFIG.replace(
+            "auth_token_env = \"SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN\"",
+            "auth_token_env = \"SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN_NOT_SET\"",
+        );
+        assert!(
+            error_message(&missing).contains("SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN_NOT_SET")
+        );
     }
 }

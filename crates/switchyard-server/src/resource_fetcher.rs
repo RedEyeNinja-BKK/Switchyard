@@ -104,38 +104,163 @@ impl ResourceFetcher for OpenAiHttpFetcher {
         }
         let value: serde_json::Value = serde_json::from_str(&body)
             .map_err(|error| libsy::LibsyError::external("openai-resource", error))?;
-        let rate_limit = value.get("rate_limit").cloned().unwrap_or_default();
-        let primary = rate_limit.get("primary_window").cloned().unwrap_or_default();
-        let credits = value.get("credits").cloned().unwrap_or_default();
-        let weekly_used = primary
-            .get("used_percent")
-            .and_then(serde_json::Value::as_f64);
-        let weekly_reset_at = primary.get("reset_at").and_then(serde_json::Value::as_i64);
-        let state = OpenAiResourceState {
-            available: rate_limit
-                .get("allowed")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            limit_reached: rate_limit
-                .get("limit_reached")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            spend_control_reached: value
-                .get("spend_control")
-                .and_then(|sc| sc.get("reached"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            weekly_used_percent: weekly_used,
-            weekly_reset_at,
-            credits_balance: credits
-                .get("balance")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-        };
+        let state = parse_openai_resource(&value)?;
         Ok(ResourceSnapshot {
             openai: Some(state),
             deepseek: None,
         })
+    }
+}
+
+/// Parse the SANITIZED :8645 resource payload.
+///
+/// The gateway's `/resource/openai-codex` surface is the contract: a
+/// normalized document keyed by `available` / `limit_reached` /
+/// `spend_control_reached` / `windows.primary.*` / `credits.balance`.
+///
+/// Raw upstream ChatGPT `/usage` documents (`rate_limit.allowed`,
+/// `rate_limit.primary_window.*`, `spend_control.reached`) are accepted as a
+/// compatibility fallback so the fetcher stays correct for either producer.
+/// Identity fields are never expected or parsed.
+fn parse_openai_resource(value: &serde_json::Value) -> Result<OpenAiResourceState> {
+    let rate_limit = value.get("rate_limit").cloned().unwrap_or_default();
+    let primary = value
+        .get("windows")
+        .and_then(|w| w.get("primary"))
+        .or_else(|| rate_limit.get("primary_window"))
+        .cloned()
+        .unwrap_or_default();
+    let credits = value.get("credits").cloned().unwrap_or_default();
+    let weekly_used = primary
+        .get("used_percent")
+        .and_then(serde_json::Value::as_f64);
+    let weekly_reset_at = primary.get("reset_at").and_then(serde_json::Value::as_i64);
+    let state = OpenAiResourceState {
+        available: value
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                rate_limit
+                    .get("allowed")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false),
+        limit_reached: value
+            .get("limit_reached")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                rate_limit
+                    .get("limit_reached")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false),
+        spend_control_reached: value
+            .get("spend_control_reached")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                value
+                    .get("spend_control")
+                    .and_then(|sc| sc.get("reached"))
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false),
+        weekly_used_percent: weekly_used,
+        weekly_reset_at,
+        credits_balance: credits
+            .get("balance")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    };
+    Ok(state)
+}
+
+/// Sanitized payloads as emitted by the :8645 gateway surface.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn normalized_healthy() -> serde_json::Value {
+        serde_json::json!({
+            "pool": "turnstone-openai-oauth",
+            "source": "openai-codex-oauth",
+            "plan_type": "plus",
+            "available": true,
+            "limit_reached": false,
+            "windows": {
+                "primary": {
+                    "used_percent": 76,
+                    "remaining_percent": 24.0,
+                    "window_seconds": 604800,
+                    "reset_after_seconds": 237150,
+                    "reset_at": 1787197109
+                },
+                "secondary": null
+            },
+            "spend_control_reached": false,
+            "credits": {"has_credits": false, "unlimited": false, "overage_limit_reached": false, "balance": "0"},
+            "observed_at": 1786959960.03
+        })
+    }
+
+    fn raw_healthy() -> serde_json::Value {
+        serde_json::json!({
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 76,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 237150,
+                    "reset_at": 1787197109
+                }
+            },
+            "spend_control": {"reached": false},
+            "credits": {"balance": "0"}
+        })
+    }
+
+    #[test]
+    fn parses_normalized_healthy_surface() {
+        let state = parse_openai_resource(&normalized_healthy()).expect("normalized payload parses");
+        assert!(state.available);
+        assert!(!state.limit_reached);
+        assert!(!state.spend_control_reached);
+        assert_eq!(state.weekly_used_percent, Some(76.0));
+        assert_eq!(state.weekly_reset_at, Some(1787197109));
+        assert_eq!(state.credits_balance.as_deref(), Some("0"));
+        assert!(state.weekly_eligible());
+    }
+
+    #[test]
+    fn parses_raw_upstream_compat_payload() {
+        let state = parse_openai_resource(&raw_healthy()).expect("raw payload parses");
+        assert!(state.available);
+        assert!(!state.limit_reached);
+        assert_eq!(state.weekly_used_percent, Some(76.0));
+        assert!(state.weekly_eligible());
+    }
+
+    #[test]
+    fn normalized_exhausted_surface_is_ineligible() {
+        let mut value = normalized_healthy();
+        value["available"] = serde_json::Value::Bool(true);
+        value["limit_reached"] = serde_json::Value::Bool(true);
+        let state = parse_openai_resource(&value).expect("payload parses");
+        assert!(!state.weekly_eligible());
+    }
+
+    #[test]
+    fn missing_optional_fields_fail_closed_on_availability() {
+        let value = serde_json::json!({
+            "pool": "turnstone-openai-oauth",
+            "source": "openai-codex-oauth",
+            "windows": {"primary": null, "secondary": null},
+            "credits": {"balance": "0"},
+            "observed_at": 0.0
+        });
+        let state = parse_openai_resource(&value).expect("payload parses");
+        assert!(!state.available);
+        assert!(!state.weekly_eligible());
     }
 }
 

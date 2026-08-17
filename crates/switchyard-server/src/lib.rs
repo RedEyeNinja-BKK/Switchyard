@@ -6,6 +6,7 @@
 pub mod config;
 mod metrics;
 mod observability;
+mod resource_fetcher;
 mod response;
 mod routing_log;
 mod shutdown;

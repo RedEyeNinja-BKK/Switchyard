@@ -45,6 +45,10 @@ pub struct OpenAiResourceState {
     pub weekly_used_percent: Option<f64>,
     pub weekly_reset_at: Option<i64>,
     pub credits_balance: Option<String>,
+    /// Unix seconds of the last successful read (None when never/unknown).
+    pub last_success_at: Option<i64>,
+    /// Coarse error text when the most recent read failed (no secrets).
+    pub error: Option<String>,
 }
 
 impl OpenAiResourceState {
@@ -57,7 +61,7 @@ impl OpenAiResourceState {
     ///
     /// Purchased credits are intentionally NOT spent automatically once the
     /// weekly allowance is exhausted (owner policy). `credits_balance` is
-    /// telemetry only.
+    /// telemetry only. Unknown/error state is INELIGIBLE (fail closed).
     pub fn weekly_eligible(&self) -> bool {
         self.available
             && !self.limit_reached
@@ -66,6 +70,22 @@ impl OpenAiResourceState {
                 .weekly_used_percent
                 .map(|used| used < 100.0)
                 .unwrap_or(true)
+    }
+
+    /// Error-marked state for pool-local failure isolation: this pool is
+    /// unknown, so candidates that require it become ineligible, while
+    /// independent healthy pools remain usable.
+    pub fn unavailable_error(error: String) -> Self {
+        Self {
+            available: false,
+            limit_reached: false,
+            spend_control_reached: false,
+            weekly_used_percent: None,
+            weekly_reset_at: None,
+            credits_balance: None,
+            last_success_at: None,
+            error: Some(error),
+        }
     }
 }
 
@@ -77,11 +97,16 @@ pub struct DeepSeekResourceState {
     pub total_balance: String,
     pub granted_balance: String,
     pub topped_up_balance: String,
+    /// Unix seconds of the last successful read (None when never/unknown).
+    pub last_success_at: Option<i64>,
+    /// Coarse error text when the most recent read failed (no secrets).
+    pub error: Option<String>,
 }
 
 impl DeepSeekResourceState {
     /// Hard eligibility: available positive balance in the configured
-    /// currency. No arbitrary CONSERVE cutoff yet (owner policy).
+    /// currency. No arbitrary CONSERVE cutoff yet (owner policy). Unknown/
+    /// error state is INELIGIBLE (fail closed).
     pub fn eligible(&self) -> bool {
         if !self.is_available {
             return false;
@@ -91,6 +116,19 @@ impl DeepSeekResourceState {
             .parse::<f64>()
             .map(|balance| balance > 0.0)
             .unwrap_or(false)
+    }
+
+    /// Error-marked state for pool-local failure isolation.
+    pub fn unavailable_error(error: String) -> Self {
+        Self {
+            is_available: false,
+            currency: String::new(),
+            total_balance: String::new(),
+            granted_balance: String::new(),
+            topped_up_balance: String::new(),
+            last_success_at: None,
+            error: Some(error),
+        }
     }
 }
 
@@ -161,6 +199,43 @@ pub enum ReasoningPolicy {
     Thinking,
 }
 
+/// Semantic work class carried structurally by the request (never guessed
+/// from prompt text). Mirrors the Turnstone role contract:
+/// `bounded` | `agentic` | `reasoning`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkClass {
+    Bounded,
+    Agentic,
+    Reasoning,
+}
+
+impl std::str::FromStr for WorkClass {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bounded" => Ok(WorkClass::Bounded),
+            "agentic" => Ok(WorkClass::Agentic),
+            "reasoning" => Ok(WorkClass::Reasoning),
+            other => Err(format!(
+                "invalid work_class {other:?} (expected bounded | agentic | reasoning)"
+            )),
+        }
+    }
+}
+
+/// How a resource router learns the request's work class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassFilter {
+    /// No class filtering (candidate `classes` lists are ignored / all match).
+    Any,
+    /// A fixed class configured on the route (e.g. the three semantic routes).
+    Fixed(WorkClass),
+    /// The class is read from structured request metadata
+    /// (`extensions.fields["work_class"]`); missing/invalid => error, never guessed.
+    Request,
+}
+
 /// Request modality derived from message + instruction content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modality {
@@ -176,6 +251,9 @@ pub struct Candidate {
     pub context_cap_tokens: Option<u64>,
     pub modalities: Vec<Modality>,
     pub reasoning: ReasoningPolicy,
+    /// Work classes this candidate serves. Empty = all classes (backward
+    /// compatibility for existing fixed routes).
+    pub classes: Vec<WorkClass>,
 }
 
 /// Conservative per-image token estimate for context-cap eligibility.
@@ -248,6 +326,7 @@ pub struct ResourceRouter {
     name: &'static str,
     candidates: Vec<Candidate>,
     state: Arc<ResourceState>,
+    class_filter: ClassFilter,
 }
 
 impl ResourceRouter {
@@ -256,6 +335,46 @@ impl ResourceRouter {
             name,
             candidates,
             state,
+            class_filter: ClassFilter::Any,
+        }
+    }
+
+    pub fn with_class_filter(mut self, class_filter: ClassFilter) -> Self {
+        self.class_filter = class_filter;
+        self
+    }
+
+    /// Resolve the effective work class for this request.
+    ///
+    /// `ClassFilter::Request` reads the STRUCTURAL `work_class` metadata from
+    /// the request extensions. Missing or invalid metadata is a hard error —
+    /// the router never guesses critical semantics from prompt text.
+    fn effective_work_class(&self, request: &Request) -> Result<Option<WorkClass>> {
+        match self.class_filter {
+            ClassFilter::Any => Ok(None),
+            ClassFilter::Fixed(class) => Ok(Some(class)),
+            ClassFilter::Request => {
+                let raw = request
+                    .llm_request
+                    .extensions
+                    .fields
+                    .get("work_class")
+                    .and_then(serde_json::Value::as_str);
+                let Some(raw) = raw else {
+                    return Err(LibsyError::AlgorithmError {
+                        message: format!(
+                            "{}: work_class metadata required (bounded | agentic | reasoning); refusing to guess from prompt text",
+                            self.name()
+                        ),
+                    });
+                };
+                let class = raw.parse::<WorkClass>().map_err(|message| {
+                    LibsyError::AlgorithmError {
+                        message: format!("{}: {message}", self.name()),
+                    }
+                })?;
+                Ok(Some(class))
+            }
         }
     }
 }
@@ -269,6 +388,7 @@ enum IneligibleKind {
     ContextCap,
     Modality,
     ReasoningContract,
+    WorkClass,
 }
 
 fn candidate_eligible(
@@ -366,6 +486,7 @@ fn reason_label(kind: IneligibleKind) -> &'static str {
         IneligibleKind::ContextCap => "request exceeds candidate context cap",
         IneligibleKind::Modality => "request modality not supported by candidate",
         IneligibleKind::ReasoningContract => "request reasoning contract conflicts with candidate",
+        IneligibleKind::WorkClass => "candidate does not serve the request work class",
     }
 }
 
@@ -386,12 +507,22 @@ impl Algorithm for ResourceRouter {
             }
         })?;
 
+        let work_class = self.effective_work_class(&request)?;
         let request_tokens = estimate_request_tokens(&request);
         let modality = request_modality(&request);
         let reasoning_effort = request_reasoning_effort(&request);
 
         let mut reasons = Vec::new();
         for candidate in &self.candidates {
+            // Work-class eligibility: a class-filtered route only considers
+            // candidates that serve the resolved class (empty = all classes).
+            if let Some(class) = work_class
+                && !candidate.classes.is_empty()
+                && !candidate.classes.contains(&class)
+            {
+                reasons.push((candidate.target.to_string(), IneligibleKind::WorkClass));
+                continue;
+            }
             if candidate_eligible(
                 candidate,
                 &snapshot,
@@ -403,6 +534,7 @@ impl Algorithm for ResourceRouter {
                 tracing::info!(
                     target = %candidate.target,
                     pool = ?candidate.pool,
+                    work_class = ?work_class,
                     "{} selected eligible target",
                     self.name()
                 );
@@ -464,6 +596,8 @@ mod tests {
             weekly_used_percent: Some(72.0),
             weekly_reset_at: Some(1787197109),
             credits_balance: Some("0".into()),
+            last_success_at: Some(1786959960),
+            error: None,
         }
     }
 
@@ -475,6 +609,8 @@ mod tests {
             weekly_used_percent: Some(100.0),
             weekly_reset_at: Some(1787197109),
             credits_balance: Some("500".into()),
+            last_success_at: Some(1786959960),
+            error: None,
         }
     }
 
@@ -486,7 +622,13 @@ mod tests {
             weekly_used_percent: Some(60.0),
             weekly_reset_at: Some(1787197109),
             credits_balance: Some("0".into()),
+            last_success_at: Some(1786959960),
+            error: None,
         }
+    }
+
+    fn openai_unknown() -> OpenAiResourceState {
+        OpenAiResourceState::unavailable_error("openai-resource fetch failed (HTTP 500)".into())
     }
 
     fn deepseek_available() -> DeepSeekResourceState {
@@ -496,6 +638,8 @@ mod tests {
             total_balance: "23.98".into(),
             granted_balance: "0.00".into(),
             topped_up_balance: "23.98".into(),
+            last_success_at: Some(1786959960),
+            error: None,
         }
     }
 
@@ -506,7 +650,13 @@ mod tests {
             total_balance: "0.00".into(),
             granted_balance: "0.00".into(),
             topped_up_balance: "0.00".into(),
+            last_success_at: Some(1786959960),
+            error: None,
         }
+    }
+
+    fn deepseek_unknown() -> DeepSeekResourceState {
+        DeepSeekResourceState::unavailable_error("deepseek-resource fetch failed (HTTP 500)".into())
     }
 
     fn text_request_hi() -> Request {
@@ -532,7 +682,55 @@ mod tests {
             context_cap_tokens: Some(266_000),
             modalities: vec![Modality::Text],
             reasoning: ReasoningPolicy::NonThinking,
+            classes: vec![],
         }
+    }
+
+    fn candidate_for(name: &str, pool: Pool, class: WorkClass) -> Candidate {
+        Candidate {
+            classes: vec![class],
+            ..candidate(name, pool)
+        }
+    }
+
+    fn request_with_work_class(class: &str, prompt: &str) -> Request {
+        let mut llm = text_request(Some("auto".to_string()), prompt);
+        llm.extensions
+            .fields
+            .insert("work_class".to_string(), serde_json::Value::String(class.to_string()));
+        Request {
+            llm_request: llm,
+            raw_request: None,
+            metadata: None,
+        }
+    }
+
+    fn make_request_router(
+        candidates: Vec<Candidate>,
+        snapshot: ResourceSnapshot,
+    ) -> Arc<dyn Algorithm> {
+        let state = Arc::new(ResourceState::new(
+            Arc::new(StubFetcher(snapshot)),
+            Duration::from_secs(30),
+        ));
+        Arc::new(
+            ResourceRouter::new("test_request_resource", candidates, state)
+                .with_class_filter(ClassFilter::Request),
+        )
+    }
+
+    /// The universal candidate set: bounded (Luna NT + Flash NT), agentic
+    /// (Flash NT only), reasoning (Flash thinking only).
+    fn universal_candidates() -> Vec<Candidate> {
+        let mut luna = candidate_for("testing/luna", Pool::OpenAi, WorkClass::Bounded);
+        luna.context_cap_tokens = Some(266_000);
+        let mut flash_nt = candidate_for("testing/flash-nt", Pool::DeepSeek, WorkClass::Agentic);
+        flash_nt.classes = vec![WorkClass::Bounded, WorkClass::Agentic];
+        flash_nt.context_cap_tokens = Some(750_000);
+        let mut flash_think = candidate_for("testing/flash-think", Pool::DeepSeek, WorkClass::Reasoning);
+        flash_think.reasoning = ReasoningPolicy::Thinking;
+        flash_think.context_cap_tokens = Some(1_048_576);
+        vec![luna, flash_nt, flash_think]
     }
 
     #[tokio::test]
@@ -643,6 +841,174 @@ mod tests {
         request.llm_request.reasoning.effort = Some("none".to_string());
         let (trace, _) = test_drive(router, request, echo()).await?;
         assert_eq!(trace[0].selected_model_id(), "testing/flash");
+        Ok(())
+    }
+
+    // ── Provider-pool-local failure isolation (§3) ─────────────────────
+    // One pool's telemetry unknown must not disable every smart route.
+
+    #[tokio::test]
+    async fn openai_unknown_deepseek_healthy_bounded_selects_flash() -> crate::Result<()> {
+        let router = make_router(
+            vec![
+                candidate("testing/luna", Pool::OpenAi),
+                candidate("testing/flash", Pool::DeepSeek),
+            ],
+            snapshot(openai_unknown(), deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deepseek_unknown_openai_healthy_bounded_selects_luna() -> crate::Result<()> {
+        let router = make_router(
+            vec![
+                candidate("testing/luna", Pool::OpenAi),
+                candidate("testing/flash", Pool::DeepSeek),
+            ],
+            snapshot(openai_healthy(), deepseek_unknown()),
+        );
+        let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_pools_unknown_controlled_no_eligible_target() -> crate::Result<()> {
+        let router = make_router(
+            vec![
+                candidate("testing/luna", Pool::OpenAi),
+                candidate("testing/flash", Pool::DeepSeek),
+            ],
+            snapshot(openai_unknown(), deepseek_unknown()),
+        );
+        let result = test_drive(router, text_request_hi(), echo()).await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("no eligible target"));
+        assert!(err.to_string().contains("openai pool ineligible"));
+        assert!(err.to_string().contains("deepseek pool unavailable"));
+        Ok(())
+    }
+
+    // ── Universal single-endpoint (work-class metadata) ────────────────
+    // One route id `localclaw/smart` selects per structured work_class.
+
+    #[tokio::test]
+    async fn universal_bounded_metadata_selects_luna_when_healthy() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, request_with_work_class("bounded", "hi"), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn universal_bounded_openai_unknown_falls_to_flash_nt() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_unknown(), deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, request_with_work_class("bounded", "hi"), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash-nt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn universal_agentic_metadata_selects_flash_nt_luna_excluded() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, request_with_work_class("agentic", "hi"), echo()).await?;
+        // Luna is bounded-class only; must never be chosen for agentic even
+        // though OpenAI is healthy.
+        assert_eq!(trace[0].selected_model_id(), "testing/flash-nt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn universal_agentic_large_context_luna_never_considered() -> crate::Result<()> {
+        // ~320K chars -> ~80K estimated tokens; Luna is class-excluded for
+        // agentic regardless of its 266K cap.
+        let prompt = "x".repeat(320_000);
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, request_with_work_class("agentic", &prompt), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash-nt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn universal_reasoning_metadata_selects_flash_thinking() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) =
+            test_drive(router, request_with_work_class("reasoning", "hi"), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash-think");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn universal_missing_metadata_errors_no_guessing() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let result = test_drive(router, text_request_hi(), echo()).await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("work_class metadata required"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn universal_invalid_metadata_errors() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let result = test_drive(router, request_with_work_class("chatty", "hi"), echo()).await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("invalid work_class"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn universal_reasoning_deepseek_unknown_no_luna_substitution() -> crate::Result<()> {
+        // DeepSeek unknown + reasoning class: the thinking candidate is
+        // ineligible and Luna NT is NOT a semantic substitute -> controlled
+        // no-eligible-target (never silently replace reasoning with Luna NT).
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_unknown()),
+        );
+        let result = test_drive(router, request_with_work_class("reasoning", "hi"), echo()).await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("no eligible target"));
+        assert!(!err.to_string().contains("testing/luna"));
         Ok(())
     }
 }

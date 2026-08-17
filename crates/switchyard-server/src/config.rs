@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use libsy::{
     AdvisorGate, AdvisorGateConfig, Algorithm, Candidate, ClassFilter, ClassifierContractConfig,
-    ClassifierResponseFormat, CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig,
-    GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Modality,
-    Noop, Passthrough, PickerMode, Pool, Random, ReasoningPolicy, ResourceFetcher, ResourceRouter,
-    ResourceState, StageRouter, StageRouterConfig, TargetPrompts, TaskClassifierConfig, WorkClass,
+    ClassifierResponseFormat, ContractFilter, CustomClassifierConfig, CustomClassifierPolicy,
+    EscalationJudgeConfig, GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback,
+    LlmTaskClassifier, Modality, Noop, Passthrough, PickerMode, Pool, Random, ReasoningIntent,
+    ReasoningPolicy, ResourceFetcher, ResourceRouter, ResourceState, SemanticContract, StageRouter,
+    StageRouterConfig, TargetPrompts, TaskClassifierConfig, WorkClass, WorkShape,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -578,14 +579,26 @@ enum RouteConfig {
         reasoning: Option<bool>,
         /// Name of the `[resource_pools.*]` definition this route consumes.
         pool: String,
-        /// Fixed work class for this route (semantic contract). Mutually
-        /// exclusive with `work_class_source`.
+        /// Fixed LEGACY work class for this route (translated to the
+        /// orthogonal contract). Mutually exclusive with `work_class_source`
+        /// and with `work_shape`/`reasoning_intent` fixed forms.
         #[serde(default)]
         work_class: Option<ResourceWorkClassName>,
-        /// Read the work class from structured request metadata. Mutually
-        /// exclusive with `work_class`.
+        /// Read the LEGACY work class from structured request metadata.
         #[serde(default)]
         work_class_source: Option<ResourceWorkClassSourceName>,
+        /// Fixed work shape for this route (orthogonal contract).
+        #[serde(default)]
+        work_shape: Option<ResourceWorkShapeName>,
+        /// Read the work shape from structured request metadata.
+        #[serde(default)]
+        work_shape_source: Option<ResourceWorkShapeSourceName>,
+        /// Fixed reasoning intent for this route (orthogonal contract).
+        #[serde(default)]
+        reasoning_intent: Option<ResourceReasoningIntentName>,
+        /// Read the reasoning intent from structured request metadata.
+        #[serde(default)]
+        reasoning_intent_source: Option<ResourceReasoningIntentSourceName>,
         /// Ordered candidates; the first eligible target is selected.
         candidates: Vec<ResourceCandidateConfig>,
     },
@@ -655,10 +668,16 @@ struct ResourceCandidateConfig {
     /// Reasoning contract: "any", "non_thinking", "thinking" (default "any").
     #[serde(default)]
     reasoning: Option<ResourceReasoningName>,
-    /// Work classes this candidate serves: "bounded", "agentic", "reasoning"
-    /// (default all).
+    /// LEGACY work classes this candidate serves: "bounded", "agentic",
+    /// "reasoning" (default all). Translated to shapes/intents.
     #[serde(default)]
     classes: Option<Vec<ResourceWorkClassName>>,
+    /// Work shapes this candidate serves: "bounded", "agentic" (default all).
+    #[serde(default)]
+    shapes: Option<Vec<ResourceWorkShapeName>>,
+    /// Reasoning intents this candidate serves: "none", "deliberate" (default all).
+    #[serde(default)]
+    reasoning_intents: Option<Vec<ResourceReasoningIntentName>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -709,6 +728,56 @@ impl ResourceWorkClassName {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ResourceWorkClassSourceName {
+    #[serde(rename = "request")]
+    Request,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceWorkShapeName {
+    #[serde(rename = "bounded")]
+    Bounded,
+    #[serde(rename = "agentic")]
+    Agentic,
+}
+
+impl ResourceWorkShapeName {
+    fn to_work_shape(self) -> WorkShape {
+        match self {
+            ResourceWorkShapeName::Bounded => WorkShape::Bounded,
+            ResourceWorkShapeName::Agentic => WorkShape::Agentic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceWorkShapeSourceName {
+    #[serde(rename = "request")]
+    Request,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceReasoningIntentName {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "deliberate")]
+    Deliberate,
+}
+
+impl ResourceReasoningIntentName {
+    fn to_reasoning_intent(self) -> ReasoningIntent {
+        match self {
+            ResourceReasoningIntentName::None => ReasoningIntent::None,
+            ResourceReasoningIntentName::Deliberate => ReasoningIntent::Deliberate,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceReasoningIntentSourceName {
     #[serde(rename = "request")]
     Request,
 }
@@ -1363,6 +1432,10 @@ fn build_algorithm(
             candidates,
             work_class,
             work_class_source,
+            work_shape,
+            work_shape_source,
+            reasoning_intent,
+            reasoning_intent_source,
             ..
         } => {
             let state = resource_states.get(pool).ok_or_else(|| {
@@ -1375,15 +1448,58 @@ fn build_algorithm(
                     "resource_router route {route_name} must define at least one candidate"
                 )));
             }
-            let class_filter = match (work_class, work_class_source) {
+            // Resolve the route's semantic-contract filter.
+            // Priority: orthogonal fixed > legacy fixed > request-source > any.
+            let fixed_shape = match (work_shape, work_shape_source) {
+                (Some(_), Some(_)) => {
+                    return Err(ServerError::new(format!(
+                        "resource_router route {route_name} cannot set both work_shape and work_shape_source"
+                    )));
+                }
+                (Some(shape), None) => Some(shape.to_work_shape()),
+                (None, Some(ResourceWorkShapeSourceName::Request)) => None,
+                (None, None) => None,
+            };
+            let fixed_intent = match (reasoning_intent, reasoning_intent_source) {
+                (Some(_), Some(_)) => {
+                    return Err(ServerError::new(format!(
+                        "resource_router route {route_name} cannot set both reasoning_intent and reasoning_intent_source"
+                    )));
+                }
+                (Some(intent), None) => Some(intent.to_reasoning_intent()),
+                (None, Some(ResourceReasoningIntentSourceName::Request)) => None,
+                (None, None) => None,
+            };
+            let legacy_class = match (work_class, work_class_source) {
                 (Some(_), Some(_)) => {
                     return Err(ServerError::new(format!(
                         "resource_router route {route_name} cannot set both work_class and work_class_source"
                     )));
                 }
-                (Some(class), None) => ClassFilter::Fixed(class.to_work_class()),
-                (None, Some(ResourceWorkClassSourceName::Request)) => ClassFilter::Request,
-                (None, None) => ClassFilter::Any,
+                (Some(class), None) => Some(class.to_work_class()),
+                (None, Some(ResourceWorkClassSourceName::Request)) => None,
+                (None, None) => None,
+            };
+            let contract_filter = match (fixed_shape, fixed_intent, legacy_class) {
+                (Some(shape), Some(intent), _) => {
+                    ContractFilter::Fixed(SemanticContract { shape, intent })
+                }
+                (Some(_), None, _) | (None, Some(_), _) => {
+                    return Err(ServerError::new(format!(
+                        "resource_router route {route_name} must set BOTH work_shape and reasoning_intent (orthogonal contract)"
+                    )));
+                }
+                (None, None, Some(class)) => {
+                    ContractFilter::Fixed(SemanticContract::from_work_class(class))
+                }
+                (None, None, None)
+                    if work_shape_source.is_some()
+                        || reasoning_intent_source.is_some()
+                        || work_class_source.is_some() =>
+                {
+                    ContractFilter::Request
+                }
+                (None, None, None) => ContractFilter::Any,
             };
             let mut resolved = Vec::with_capacity(candidates.len());
             for candidate in candidates {
@@ -1408,20 +1524,40 @@ fn build_algorithm(
                     Some(ResourceReasoningName::NonThinking) => ReasoningPolicy::NonThinking,
                     Some(ResourceReasoningName::Thinking) => ReasoningPolicy::Thinking,
                 };
-                let classes = candidate
-                    .classes
+                // Orthogonal shapes/intents, with legacy classes translated.
+                let mut shapes: Vec<WorkShape> = candidate
+                    .shapes
                     .clone()
                     .unwrap_or_default()
                     .iter()
-                    .map(|c| c.to_work_class())
+                    .map(|s| s.to_work_shape())
                     .collect();
+                let mut intents: Vec<ReasoningIntent> = candidate
+                    .reasoning_intents
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|i| i.to_reasoning_intent())
+                    .collect();
+                if let Some(classes) = &candidate.classes {
+                    for class in classes {
+                        let contract = SemanticContract::from_work_class(class.to_work_class());
+                        if !shapes.contains(&contract.shape) {
+                            shapes.push(contract.shape);
+                        }
+                        if !intents.contains(&contract.intent) {
+                            intents.push(contract.intent);
+                        }
+                    }
+                }
                 resolved.push(Candidate {
                     target,
                     pool,
                     context_cap_tokens: candidate.context_cap_tokens,
                     modalities,
                     reasoning,
-                    classes,
+                    shapes,
+                    intents,
                 });
             }
             let algorithm = ResourceRouter::new(
@@ -1429,7 +1565,7 @@ fn build_algorithm(
                 resolved,
                 Arc::clone(state),
             )
-            .with_class_filter(class_filter);
+            .with_contract_filter(contract_filter);
             Ok(Arc::new(algorithm))
         }
     }

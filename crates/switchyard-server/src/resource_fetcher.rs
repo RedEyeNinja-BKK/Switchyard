@@ -48,13 +48,39 @@ impl CompositeResourceFetcher {
 impl ResourceFetcher for CompositeResourceFetcher {
     async fn fetch(&self) -> Result<ResourceSnapshot> {
         let mut snapshot = ResourceSnapshot::default();
+        let mut any_failed = false;
         for (kind, fetcher) in &self.fetchers {
-            let part = fetcher.fetch().await?;
-            match *kind {
-                "openai" => snapshot.openai = part.openai,
-                "deepseek" => snapshot.deepseek = part.deepseek,
-                _ => {}
+            match fetcher.fetch().await {
+                Ok(part) => match *kind {
+                    "openai" => snapshot.openai = part.openai,
+                    "deepseek" => snapshot.deepseek = part.deepseek,
+                    _ => {}
+                },
+                Err(error) => {
+                    // PROVIDER-POOL-LOCAL FAILURE ISOLATION: one telemetry
+                    // failure must not disable every smart route. Mark the
+                    // failed pool unknown (ineligible) and keep independent
+                    // healthy pools usable.
+                    any_failed = true;
+                    let coarse = format!("resource fetch failed: {error}");
+                    match *kind {
+                        "openai" => {
+                            snapshot.openai = Some(OpenAiResourceState::unavailable_error(coarse))
+                        }
+                        "deepseek" => {
+                            snapshot.deepseek = Some(DeepSeekResourceState::unavailable_error(coarse))
+                        }
+                        _ => {}
+                    }
+                }
             }
+        }
+        if any_failed {
+            tracing::warn!(
+                openai_error = snapshot.openai.as_ref().and_then(|s| s.error.as_deref()),
+                deepseek_error = snapshot.deepseek.as_ref().and_then(|s| s.error.as_deref()),
+                "resource snapshot partially failed; failed pool(s) marked ineligible"
+            );
         }
         Ok(snapshot)
     }
@@ -104,12 +130,22 @@ impl ResourceFetcher for OpenAiHttpFetcher {
         }
         let value: serde_json::Value = serde_json::from_str(&body)
             .map_err(|error| libsy::LibsyError::external("openai-resource", error))?;
-        let state = parse_openai_resource(&value)?;
+        let mut state = parse_openai_resource(&value)?;
+        state.last_success_at = Some(now_unix());
+        state.error = None;
         Ok(ResourceSnapshot {
             openai: Some(state),
             deepseek: None,
         })
     }
+}
+
+/// Current Unix time (seconds) for `last_success_at` stamps.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Parse the SANITIZED :8645 resource payload.
@@ -170,6 +206,8 @@ fn parse_openai_resource(value: &serde_json::Value) -> Result<OpenAiResourceStat
             .get("balance")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
+        last_success_at: None,
+        error: None,
     };
     Ok(state)
 }
@@ -357,7 +395,123 @@ impl ResourceFetcher for DeepSeekHttpFetcher {
                 total_balance: total,
                 granted_balance: granted,
                 topped_up_balance: topped_up,
+                last_success_at: Some(now_unix()),
+                error: None,
             }),
         })
+    }
+}
+
+/// Stub fetcher for pool-local isolation tests.
+struct StubFetcher {
+    snapshot: ResourceSnapshot,
+    fail: bool,
+}
+
+#[async_trait]
+impl ResourceFetcher for StubFetcher {
+    async fn fetch(&self) -> Result<ResourceSnapshot> {
+        if self.fail {
+            Err(libsy::LibsyError::external(
+                "stub",
+                std::io::Error::new(std::io::ErrorKind::Other, "boom"),
+            ))
+        } else {
+            Ok(self.snapshot.clone())
+        }
+    }
+}
+
+fn healthy_openai_part() -> ResourceSnapshot {
+    ResourceSnapshot {
+        openai: Some(OpenAiResourceState {
+            available: true,
+            limit_reached: false,
+            spend_control_reached: false,
+            weekly_used_percent: Some(50.0),
+            weekly_reset_at: Some(1787197109),
+            credits_balance: Some("0".to_string()),
+            last_success_at: Some(now_unix()),
+            error: None,
+        }),
+        deepseek: None,
+    }
+}
+
+fn healthy_deepseek_part() -> ResourceSnapshot {
+    ResourceSnapshot {
+        openai: None,
+        deepseek: Some(DeepSeekResourceState {
+            is_available: true,
+            currency: "CNY".to_string(),
+            total_balance: "100.00".to_string(),
+            granted_balance: "0.00".to_string(),
+            topped_up_balance: "100.00".to_string(),
+            last_success_at: Some(now_unix()),
+            error: None,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    fn openai_fail() -> Box<StubFetcher> {
+        Box::new(StubFetcher { snapshot: ResourceSnapshot::default(), fail: true })
+    }
+    fn deepseek_fail() -> Box<StubFetcher> {
+        Box::new(StubFetcher { snapshot: ResourceSnapshot::default(), fail: true })
+    }
+    fn openai_ok() -> Box<StubFetcher> {
+        Box::new(StubFetcher { snapshot: healthy_openai_part(), fail: false })
+    }
+    fn deepseek_ok() -> Box<StubFetcher> {
+        Box::new(StubFetcher { snapshot: healthy_deepseek_part(), fail: false })
+    }
+
+    #[tokio::test]
+    async fn openai_failure_marks_openai_unknown_keeps_deepseek_usable() {
+        let composite = CompositeResourceFetcher::new(vec![
+            ("openai", openai_fail()),
+            ("deepseek", deepseek_ok()),
+        ]);
+        let snapshot = composite.fetch().await.expect("composite must not fail");
+        let openai = snapshot.openai.expect("openai error state present");
+        assert!(openai.error.is_some());
+        assert!(!openai.weekly_eligible());
+        let deepseek = snapshot.deepseek.expect("deepseek state present");
+        assert!(deepseek.error.is_none());
+        assert!(deepseek.eligible());
+    }
+
+    #[tokio::test]
+    async fn deepseek_failure_marks_deepseek_unknown_keeps_openai_usable() {
+        let composite = CompositeResourceFetcher::new(vec![
+            ("openai", openai_ok()),
+            ("deepseek", deepseek_fail()),
+        ]);
+        let snapshot = composite.fetch().await.expect("composite must not fail");
+        let deepseek = snapshot.deepseek.expect("deepseek error state present");
+        assert!(deepseek.error.is_some());
+        assert!(!deepseek.eligible());
+        let openai = snapshot.openai.expect("openai state present");
+        assert!(openai.error.is_none());
+        assert!(openai.weekly_eligible());
+    }
+
+    #[tokio::test]
+    async fn both_fail_marks_both_ineligible() {
+        let composite = CompositeResourceFetcher::new(vec![
+            ("openai", openai_fail()),
+            ("deepseek", deepseek_fail()),
+        ]);
+        let snapshot = composite.fetch().await.expect("composite must not fail");
+        let openai = snapshot.openai.as_ref().expect("openai state");
+        let deepseek = snapshot.deepseek.as_ref().expect("deepseek state");
+        assert!(!openai.weekly_eligible());
+        assert!(!deepseek.eligible());
+        assert!(openai.error.is_some());
+        assert!(deepseek.error.is_some());
     }
 }

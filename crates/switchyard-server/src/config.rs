@@ -10,15 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libsy::{
-use libsy::{
     AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger,
     CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig, GateTrigger, HandoffNoteConfig, LlmClassifierConfig,
     LlmFallback, LlmTaskClassifier, Noop, Passthrough, PassthroughConfig, PassthroughSubagentConfig,
     PickerMode, Random, StageRouter, StageRouterConfig, TargetPrompts, TaskClassifierConfig,
     Candidate, Modality, Pool, ReasoningPolicy, ResourceFetcher, ResourceRouter,
-    ResourceState,
-};};
-use serde::Deserialize;
+    ResourceState, ClassFilter, WorkClass,
+};use serde::Deserialize;
 use serde_json::Value;
 use switchyard_llm_client::{
     Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
@@ -644,6 +642,14 @@ enum RouteConfig {
         reasoning: Option<bool>,
         /// Name of the `[resource_pools.*]` definition this route consumes.
         pool: String,
+        /// Fixed work class for this route (semantic contract). Mutually
+        /// exclusive with `work_class_source`.
+        #[serde(default)]
+        work_class: Option<ResourceWorkClassName>,
+        /// Read the work class from structured request metadata. Mutually
+        /// exclusive with `work_class`.
+        #[serde(default)]
+        work_class_source: Option<ResourceWorkClassSourceName>,
         /// Ordered candidates; the first eligible target is selected.
         candidates: Vec<ResourceCandidateConfig>,
     },
@@ -713,6 +719,10 @@ struct ResourceCandidateConfig {
     /// Reasoning contract: "any", "non_thinking", "thinking" (default "any").
     #[serde(default)]
     reasoning: Option<ResourceReasoningName>,
+    /// Work classes this candidate serves: "bounded", "agentic", "reasoning"
+    /// (default all).
+    #[serde(default)]
+    classes: Option<Vec<ResourceWorkClassName>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -737,6 +747,34 @@ enum ResourceReasoningName {
     Any,
     NonThinking,
     Thinking,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceWorkClassName {
+    #[serde(rename = "bounded")]
+    Bounded,
+    #[serde(rename = "agentic")]
+    Agentic,
+    #[serde(rename = "reasoning")]
+    Reasoning,
+}
+
+impl ResourceWorkClassName {
+    fn to_work_class(self) -> WorkClass {
+        match self {
+            ResourceWorkClassName::Bounded => WorkClass::Bounded,
+            ResourceWorkClassName::Agentic => WorkClass::Agentic,
+            ResourceWorkClassName::Reasoning => WorkClass::Reasoning,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceWorkClassSourceName {
+    #[serde(rename = "request")]
+    Request,
 }
 
 /// The judge a `stage_router` route falls through to, and how it routes.
@@ -1474,6 +1512,8 @@ fn build_algorithm(
         RouteConfig::ResourceRouter {
             pool,
             candidates,
+            work_class,
+            work_class_source,
             ..
         } => {
             let state = resource_states.get(pool).ok_or_else(|| {
@@ -1486,6 +1526,16 @@ fn build_algorithm(
                     "resource_router route {route_name} must define at least one candidate"
                 )));
             }
+            let class_filter = match (work_class, work_class_source) {
+                (Some(_), Some(_)) => {
+                    return Err(ServerError::new(format!(
+                        "resource_router route {route_name} cannot set both work_class and work_class_source"
+                    )));
+                }
+                (Some(class), None) => ClassFilter::Fixed(class.to_work_class()),
+                (None, Some(ResourceWorkClassSourceName::Request)) => ClassFilter::Request,
+                (None, None) => ClassFilter::Any,
+            };
             let mut resolved = Vec::with_capacity(candidates.len());
             for candidate in candidates {
                 let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
@@ -1509,19 +1559,28 @@ fn build_algorithm(
                     Some(ResourceReasoningName::NonThinking) => ReasoningPolicy::NonThinking,
                     Some(ResourceReasoningName::Thinking) => ReasoningPolicy::Thinking,
                 };
+                let classes = candidate
+                    .classes
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| c.to_work_class())
+                    .collect();
                 resolved.push(Candidate {
                     target,
                     pool,
                     context_cap_tokens: candidate.context_cap_tokens,
                     modalities,
                     reasoning,
+                    classes,
                 });
             }
             let algorithm = ResourceRouter::new(
                 "resource_router",
                 resolved,
                 Arc::clone(state),
-            );
+            )
+            .with_class_filter(class_filter);
             Ok(Arc::new(algorithm))
         }
     }
@@ -2275,7 +2334,6 @@ target = "azure"
         }
     }
 
-<<<<<<< HEAD
     const ADVISOR_CONFIG: &str = r#"
 schema_version = 1
 

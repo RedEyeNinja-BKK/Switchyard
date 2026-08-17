@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use libsy::{Algorithm, Random};
+use libsy::{Algorithm, DeepSeekResourceState, Random, ResourceSnapshot, SharedResourceTelemetry};
 use serde_json::{Value, json};
 use switchyard_llm_client::{
     Backend, ClientRouter, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
@@ -453,6 +453,50 @@ async fn stats_exposes_the_exact_empty_schema_and_no_legacy_alias() -> TestResul
         send(&app, "GET", "/v1/routing/stats", None).await?.status,
         StatusCode::NOT_FOUND
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepseek_resource_endpoint_returns_sanitized_cached_balance() -> TestResult {
+    let mut state = random_state(
+        "http://127.0.0.1:9/v1",
+        &[(ROUTE_MODEL, &[ROUTE_MODEL])],
+    )?;
+    let telemetry = SharedResourceTelemetry::new();
+    telemetry.set(Arc::new(ResourceSnapshot {
+        openai: None,
+        deepseek: Some(DeepSeekResourceState {
+            is_available: true,
+            currency: "CNY".to_string(),
+            total_balance: "154.55".to_string(),
+            granted_balance: "10.00".to_string(),
+            topped_up_balance: "144.55".to_string(),
+            last_success_at: Some(1786976000),
+            error: None,
+        }),
+    }));
+    state.attach_resource_telemetry(telemetry);
+    let app = build_switchyard_router(state);
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = response.json()?;
+    assert_eq!(body["is_available"], json!(true));
+    assert_eq!(body["currency"], "CNY");
+    assert_eq!(body["total_balance"], "154.55");
+    assert_eq!(body["granted_balance"], "10.00");
+    assert_eq!(body["topped_up_balance"], "144.55");
+    assert_eq!(body["observed_at"], json!(1786976000));
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepseek_resource_endpoint_503_when_telemetry_not_attached() -> TestResult {
+    let state = random_state("http://127.0.0.1:9/v1", &[(ROUTE_MODEL, &[ROUTE_MODEL])])?;
+    let app = build_switchyard_router(state);
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json()?;
+    assert_eq!(body["error"], "resource_telemetry_not_attached");
     Ok(())
 }
 

@@ -25,7 +25,7 @@ pub use algorithms::rand::{Random, RandomClassifier};
 pub use algorithms::resource::{
     Candidate, ContractFilter, DeepSeekResourceState, Modality, OpenAiResourceState, Pool,
     ReasoningIntent, ReasoningPolicy, ResourceFetcher, ResourceRouter, ResourceSnapshot,
-    ResourceState, SemanticContract, WorkClass, WorkShape,
+    ResourceState, SemanticContract, SharedResourceTelemetry, WorkClass, WorkShape,
 };
 pub use algorithms::stage::{LlmFallback, StageRouter, StageRouterConfig};
 pub use algorithms::util::affinity::AffinityRouter;

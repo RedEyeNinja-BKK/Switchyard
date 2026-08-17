@@ -139,6 +139,36 @@ pub struct ResourceSnapshot {
     pub deepseek: Option<DeepSeekResourceState>,
 }
 
+/// Shared, last-known sanitized resource snapshot for observability surfaces
+/// (e.g. the read-only `/v1/resource/deepseek` endpoint).
+///
+/// The server attaches one telemetry slot to resource states that carry a
+/// DeepSeek fetcher; after each successful TTL refresh the fresh snapshot is
+/// published here. Never holds secrets — it is the same sanitized state the
+/// router already uses. A plain `std::sync::Mutex` suffices: `get`/`set` are
+/// never held across an await, so the routing hot path cannot deadlock.
+#[derive(Clone, Debug, Default)]
+pub struct SharedResourceTelemetry(
+    std::sync::Arc<std::sync::Mutex<Option<Arc<ResourceSnapshot>>>>,
+);
+
+impl SharedResourceTelemetry {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(None)))
+    }
+
+    /// Latest published snapshot, if any.
+    pub fn get(&self) -> Option<Arc<ResourceSnapshot>> {
+        self.0.lock().expect("resource telemetry mutex poisoned").clone()
+    }
+
+    /// Publish a snapshot (used by ResourceState after refresh; public so
+    /// tests can seed a deterministic state).
+    pub fn set(&self, snapshot: Arc<ResourceSnapshot>) {
+        *self.0.lock().expect("resource telemetry mutex poisoned") = Some(snapshot);
+    }
+}
+
 /// Injectable resource fetcher. Production uses HTTP; tests inject mocks.
 #[async_trait]
 pub trait ResourceFetcher: Send + Sync {
@@ -155,6 +185,7 @@ pub struct ResourceState {
     fetcher: Arc<dyn ResourceFetcher>,
     ttl: Duration,
     cache: Mutex<Option<(std::time::Instant, Arc<ResourceSnapshot>)>>,
+    telemetry: std::sync::OnceLock<SharedResourceTelemetry>,
 }
 
 impl ResourceState {
@@ -163,7 +194,14 @@ impl ResourceState {
             fetcher,
             ttl,
             cache: Mutex::new(None),
+            telemetry: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach a shared observability slot. The last successful snapshot is
+    /// published to it after every refresh. Idempotent: the first attach wins.
+    pub fn attach_telemetry(&self, telemetry: SharedResourceTelemetry) {
+        let _ = self.telemetry.set(telemetry);
     }
 
     pub async fn snapshot(&self) -> Result<Arc<ResourceSnapshot>> {
@@ -179,6 +217,12 @@ impl ResourceState {
         let snapshot = self.fetcher.fetch().await?;
         let snapshot = Arc::new(snapshot);
         *guard = Some((std::time::Instant::now(), Arc::clone(&snapshot)));
+        // Publish after the cache store. The telemetry mutex is a plain sync
+        // mutex (never held across await), so this cannot deadlock and does
+        // not extend an async critical section.
+        if let Some(telemetry) = self.telemetry.get() {
+            telemetry.set(Arc::clone(&snapshot));
+        }
         Ok(snapshot)
     }
 }

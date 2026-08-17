@@ -23,8 +23,23 @@ pub use algorithms::noop::Noop;
 pub use algorithms::passthrough::{Passthrough, PassthroughConfig, PassthroughSubagentConfig};
 pub use algorithms::rand::{Random, RandomClassifier};
 pub use algorithms::resource::{
-    Candidate, ClassFilter, DeepSeekResourceState, Modality, OpenAiResourceState, Pool,
-    ReasoningPolicy, ResourceFetcher, ResourceRouter, ResourceSnapshot, ResourceState, WorkClass,
+    Candidate,
+    ClassFilter,
+    DeepSeekResourceState,
+    Modality,
+    OpenAiResourceState,
+    Pool,
+    ReasoningPolicy,
+    ResourceFetcher,
+    ResourceRouter,
+    ResourceSnapshot,
+    ResourceState,
+    WorkClass,
+    ContractFilter,
+    ReasoningIntent,
+    SemanticContract,
+    SharedResourceTelemetry,
+    WorkShape,
 };
 pub use algorithms::stage::{LlmFallback, StageRouter, StageRouterConfig};
 pub use algorithms::util::affinity::{AffinityRouter, ClassifyTrigger};

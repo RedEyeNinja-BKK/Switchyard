@@ -15,11 +15,13 @@
 //! response bodies are never propagated to callers; errors carry only a
 //! bounded coarse status.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use libsy::{
-    DeepSeekResourceState, OpenAiResourceState, ResourceFetcher, ResourceSnapshot, Result,
+    DeepSeekResourceState, OpenAiResourceState, ResourceFetcher, ResourceSnapshot, ResourceState,
+    Result, SharedResourceTelemetry,
 };
 use reqwest::redirect;
 
@@ -513,5 +515,25 @@ mod isolation_tests {
         assert!(!deepseek.eligible());
         assert!(openai.error.is_some());
         assert!(deepseek.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn resource_state_publishes_last_successful_snapshot_to_telemetry() {
+        let state = ResourceState::new(
+            Arc::new(CompositeResourceFetcher::new(vec![
+                ("deepseek", deepseek_ok()),
+            ])),
+            Duration::from_secs(30),
+        );
+        let telemetry = SharedResourceTelemetry::new();
+        state.attach_telemetry(telemetry.clone());
+        assert!(telemetry.get().is_none());
+        let snapshot = state.snapshot().await.expect("snapshot must succeed");
+        let published = telemetry.get().expect("telemetry published");
+        let deepseek = published.deepseek.as_ref().expect("deepseek state");
+        assert!(deepseek.eligible());
+        assert_eq!(deepseek.total_balance, "100.00");
+        // the published snapshot is the same Arc as the cache snapshot
+        assert!(Arc::ptr_eq(&snapshot, &published));
     }
 }

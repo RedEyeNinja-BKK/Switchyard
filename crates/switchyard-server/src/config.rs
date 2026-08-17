@@ -15,9 +15,9 @@ use libsy::{
     LlmFallback, LlmTaskClassifier, Noop, Passthrough, PassthroughConfig, PassthroughSubagentConfig,
     PickerMode, Random, StageRouter, StageRouterConfig, TargetPrompts, TaskClassifierConfig,
     Candidate, Modality, Pool, ReasoningPolicy, ResourceFetcher, ResourceRouter,
-    ResourceState, ClassFilter, WorkClass,
-};use serde::Deserialize;
-use serde_json::Value;
+    ResourceState, ClassFilter, WorkClass, ;, ContractFilter, ReasoningIntent,
+    SemanticContract, SharedResourceTelemetry, WorkShape,
+};use serde_json::Value;
 use switchyard_llm_client::{
     Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
@@ -148,7 +148,8 @@ impl ServerConfig {
 
         let clients = self.build_clients()?;
         let targets = self.build_targets()?;
-        let resource_states = self.build_resource_states()?;
+        let telemetry = SharedResourceTelemetry::new();
+        let resource_states = self.build_resource_states(&telemetry)?;
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             validate_value("route name", route_name)?;
@@ -177,13 +178,21 @@ impl ServerConfig {
                 Some(route_name.clone()),
             ));
         }
-        ServerState::new_with_capabilities(routes)
+        let mut state = ServerState::new_with_capabilities(routes)?;
+        state.attach_resource_telemetry(telemetry);
+        Ok(state)
     }
 
     /// Build shared TTL-cached resource state for each `[resource_pools.*]`
     /// definition. Routes reference these by pool name.
+    ///
+    /// The shared observability slot is attached ONLY to pools that carry a
+    /// DeepSeek fetcher, so a refresh of an openai-only pool can never
+    /// clobber the last-known DeepSeek snapshot (the endpoint would
+    /// otherwise flap 200/503).
     fn build_resource_states(
         &self,
+        telemetry: &SharedResourceTelemetry,
     ) -> ServerResult<BTreeMap<String, Arc<ResourceState>>> {
         let mut states = BTreeMap::new();
         for (pool_name, pool) in &self.resource_pools {
@@ -206,6 +215,7 @@ impl ServerConfig {
                     token,
                 ))));
             }
+            let mut has_deepseek = false;
             if let Some(deepseek) = &pool.deepseek {
                 if deepseek.url.trim().is_empty() {
                     return Err(ServerError::new(format!(
@@ -223,6 +233,7 @@ impl ServerConfig {
                     key,
                     deepseek.currency.clone(),
                 ))));
+                has_deepseek = true;
             }
             if fetchers.is_empty() {
                 return Err(ServerError::new(format!(
@@ -234,6 +245,9 @@ impl ServerConfig {
                 Arc::new(CompositeResourceFetcher::new(fetchers)),
                 ttl,
             ));
+            if has_deepseek {
+                state.attach_telemetry(telemetry.clone());
+            }
             states.insert(pool_name.clone(), state);
         }
         Ok(states)

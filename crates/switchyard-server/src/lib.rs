@@ -33,7 +33,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
-use libsy::{Algorithm, CallModel, LibsyError, RoutingOutcome, drive};
+<<<<<<< HEAD
+use libsy::{Algorithm, CallModel, LibsyError, RoutingOutcome, SharedResourceTelemetry, drive};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -191,6 +192,7 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    resource_telemetry: Option<SharedResourceTelemetry>,
 }
 
 #[derive(Clone)]
@@ -301,6 +303,7 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            resource_telemetry: None,
         })
     }
 
@@ -308,6 +311,12 @@ impl ServerState {
     fn with_config(mut self, config: Arc<ServerConfig>) -> Self {
         self.config = Some(config);
         self
+    }
+
+    /// Attach the shared sanitized resource-telemetry slot published by the
+    /// configured resource pools (read-only observability endpoint backing).
+    pub fn attach_resource_telemetry(&mut self, telemetry: SharedResourceTelemetry) {
+        self.resource_telemetry = Some(telemetry);
     }
 
     /// Enables durable per-request routing records at `path`.
@@ -590,6 +599,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
+        .route("/v1/resource/deepseek", get(get_deepseek_resource))
         .route("/metrics", get(prometheus_metrics))
         .route("/health", get(health));
     if state.routing_log.is_some() {
@@ -1244,6 +1254,46 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
     Json(state.stats.snapshot())
+}
+
+/// Read-only sanitized DeepSeek resource state for observability.
+///
+/// Returns the last successful TTL-refreshed snapshot published by the
+/// configured resource pools. No raw credentials, no routing state, no
+/// mutation — bounded telemetry only.
+async fn get_deepseek_resource(
+    State(state): State<ServerState>,
+) -> (StatusCode, Json<Value>) {
+    let Some(telemetry) = &state.resource_telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "resource_telemetry_not_attached" })),
+        );
+    };
+    let Some(snapshot) = telemetry.get() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no_resource_snapshot_yet" })),
+        );
+    };
+    let Some(deepseek) = &snapshot.deepseek else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "deepseek_pool_not_configured" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "is_available": deepseek.is_available,
+            "currency": deepseek.currency,
+            "total_balance": deepseek.total_balance,
+            "granted_balance": deepseek.granted_balance,
+            "topped_up_balance": deepseek.topped_up_balance,
+            "observed_at": deepseek.last_success_at,
+            "error": deepseek.error,
+        })),
+    )
 }
 
 async fn reset_stats(State(state): State<ServerState>) -> Json<Value> {

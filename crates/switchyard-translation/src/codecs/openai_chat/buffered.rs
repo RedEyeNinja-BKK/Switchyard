@@ -1203,43 +1203,62 @@ pub(crate) fn encode_openai_tool_choice(choice: &ToolChoice) -> Value {
 }
 
 /// Normalizes OpenAI usage fields.
+///
+/// Accepts BOTH usage payload shapes emitted by OpenAI-compatible backends:
+/// the legacy `prompt_tokens` / `completion_tokens` / `prompt_tokens_details`
+/// naming, and the modern `input_tokens` / `output_tokens` /
+/// `input_tokens_details` / `output_tokens_details` naming (used by the
+/// Codex/ChatGPT backend since 2026-08-18). Modern fields win when present so
+/// a provider that mixes shapes is accounted exactly.
 pub(crate) fn decode_openai_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value.and_then(Value::as_object) else {
         return Usage::default();
     };
-    let cached_input_tokens = value
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64);
-    let cache_creation_input_tokens = value
-        .get("prompt_tokens_details")
-        .and_then(|details| {
-            details
-                .get("cache_write_tokens")
-                .or_else(|| details.get("cache_creation_tokens"))
-        })
-        .and_then(Value::as_u64);
+    let details = |name: &str| value.get(name).and_then(Value::as_object);
+    let cached_input_tokens = details("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            details("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        });
+    let cache_creation_input_tokens = details("input_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            details("prompt_tokens_details")
+                .and_then(|d| {
+                    d.get("cache_write_tokens")
+                        .or_else(|| d.get("cache_creation_tokens"))
+                })
+                .and_then(Value::as_u64)
+        });
+    let raw_input = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("prompt_tokens").and_then(Value::as_u64));
+    let raw_output = value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("completion_tokens").and_then(Value::as_u64));
     Usage {
-        input_tokens: value
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .map(|tokens| {
-                tokens
-                    .saturating_sub(cached_input_tokens.unwrap_or(0))
-                    .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
-            }),
+        input_tokens: raw_input.map(|tokens| {
+            tokens
+                .saturating_sub(cached_input_tokens.unwrap_or(0))
+                .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
+        }),
         cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
-        output_tokens: value.get("completion_tokens").and_then(Value::as_u64),
+        output_tokens: raw_output,
         total_tokens: value.get("total_tokens").and_then(Value::as_u64),
-        reasoning_tokens: value
-            .get("completion_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
+        reasoning_tokens: details("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
             .or_else(|| {
-                value
-                    .get("output_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-            })
-            .and_then(Value::as_u64),
+                details("completion_tokens_details")
+                    .and_then(|d| d.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            }),
     }
 }
 

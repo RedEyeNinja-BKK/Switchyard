@@ -301,7 +301,7 @@ impl ServerConfig {
         route: &RouteConfig,
         clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
     ) -> ServerResult<(ClientRouter, Option<CallerAuthKind>)> {
-        let mut by_model = HashMap::new();
+        let mut by_model: HashMap<ModelId, (String, Arc<dyn RoutedLlmClient>)> = HashMap::new();
         let mut caller_auth = None;
         for name in route.callable_target_names() {
             let target = self.targets.get(name).ok_or_else(|| {
@@ -326,8 +326,25 @@ impl ServerConfig {
                 caller_auth = Some(target_auth);
             }
             let client: Arc<dyn RoutedLlmClient> = client.clone();
-            by_model.insert(target.id.clone(), client);
+            // The client router resolves a decision by model id. Two DIFFERENT
+            // targets sharing one model id in the same route would silently
+            // shadow each other (the last insert wins), losing per-target
+            // extra_body / llm_client semantics. Fail closed instead of
+            // silently misrouting; the same target listed twice is fine.
+            if let Some(previous) = by_model.get(&target.id) {
+                if previous.0 != name {
+                    return Err(ServerError::new(format!(
+                        "route {route_name} targets {} and {name:?} share model id {:?}; duplicate model ids in one route cannot be disambiguated — give each target a distinct id or fold them into one target",
+                        previous.0, target.id
+                    )));
+                }
+            }
+            by_model.insert(target.id.clone(), (name.to_string(), client));
         }
+        let by_model = by_model
+            .into_iter()
+            .map(|(id, (_name, client))| (id, client))
+            .collect();
         Ok((ClientRouter::new(by_model), caller_auth))
     }
 

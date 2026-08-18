@@ -228,6 +228,34 @@ impl TranslatingLlmClient {
         if matches!(backend, Backend::OpenAiChat(_)) {
             ensure_openai_stream_usage(&mut body);
         }
+        // Enforce the algorithm's reasoning contract on the wire body.
+        // Same-format hops carry the PRESERVED original request, so the
+        // caller's fields (or a shadowed target's extra_body) would otherwise
+        // win; the router's candidate policy is authoritative. The provider-
+        // neutral knob is `reasoning_effort` (DeepSeek maps "none" to thinking
+        // disabled and any other value to thinking enabled; the OpenAI-shaped
+        // gateway ignores it for its NT targets). DeepSeek additionally
+        // prefers an explicit `thinking` object over `reasoning_effort`, so
+        // the override also forces that object for the DeepSeek backend —
+        // otherwise a caller's `thinking:{type:enabled}` on an agentic-NT
+        // contract (or `thinking:{type:disabled}` on a deliberate contract)
+        // would silently flip the lane. Only enforce when the router stamped
+        // an effort (None means "no contract to enforce").
+        if let Some(effort) = llm_request.reasoning.effort.as_deref() {
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "reasoning_effort".to_string(),
+                    Value::String(effort.to_string()),
+                );
+                if backend_is_deepseek(backend) {
+                    let thinking_enabled = effort != "none";
+                    object.insert(
+                        "thinking".to_string(),
+                        serde_json::json!({"type": if thinking_enabled { "enabled" } else { "disabled" }}),
+                    );
+                }
+            }
+        }
         let streaming = endpoint.allows_streaming()
             && body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let url = endpoint.url(backend);
@@ -760,6 +788,14 @@ fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     for (key, value) in extra_body {
         object.entry(key.clone()).or_insert_with(|| value.clone());
     }
+}
+
+// True when the upstream is the DeepSeek API. The `thinking` reasoning object
+// is DeepSeek's native thinking toggle; the OpenAI-shaped catalog gateway
+// ignores the field, so the reasoning-policy override only needs to force it
+// for the DeepSeek backend (identified by its resolved upstream URL).
+fn backend_is_deepseek(backend: &Backend) -> bool {
+    backend.url().contains("api.deepseek.com")
 }
 
 // Marks the final message content block as the Anthropic prompt-cache breakpoint.

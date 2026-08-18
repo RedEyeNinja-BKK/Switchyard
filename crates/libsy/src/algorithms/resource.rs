@@ -584,6 +584,36 @@ impl Algorithm for ResourceRouter {
         let reasoning_effort = request_reasoning_effort(&request);
 
         let mut reasons = Vec::new();
+        // Fallback gate (owner policy): DeepSeek may be selected only when no
+        // OpenAI candidate in this route semantically serves the request, or
+        // when the OpenAI pool is CONFIRMED exhausted. Unknown/stale/error
+        // telemetry and context-cap overflow are NOT spill grounds — bounded
+        // lanes fail toward Luna or fail closed.
+        let route_has_openai = self
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate.pool, Pool::OpenAi));
+        let openai_confirmed_exhausted = snapshot
+            .openai
+            .as_ref()
+            .map(OpenAiResourceState::confirmed_exhausted);
+        let openai_semantically_serves = route_has_openai
+            && self.candidates.iter().any(|candidate| {
+                matches!(candidate.pool, Pool::OpenAi)
+                    && candidate_semantic_eligible(
+                        candidate,
+                        modality,
+                        &reasoning_effort,
+                        contract,
+                    )
+            });
+        let deepseek_fallback_allowed =
+            !openai_semantically_serves || openai_confirmed_exhausted == Some(true);
+        // Observability: label a selection when DeepSeek is chosen as the
+        // sanctioned fallback (route carries an OpenAI candidate that is
+        // CONFIRMED exhausted). DeepSeek selections in routes without a
+        // serving OpenAI candidate are designated lanes, not fallbacks.
+        let confirmed_openai_exhausted = route_has_openai && openai_confirmed_exhausted == Some(true);
         for candidate in &self.candidates {
             // Work-class eligibility: a class-filtered route only considers
             // candidates that serve the resolved class (empty = all classes).
@@ -605,7 +635,14 @@ impl Algorithm for ResourceRouter {
                 tracing::info!(
                     target = %candidate.target,
                     pool = ?candidate.pool,
-                    work_class = ?work_class,
+                    contract = ?contract,
+                    fallback_reason = if confirmed_openai_exhausted
+                        && matches!(candidate.pool, Pool::DeepSeek)
+                    {
+                        "openai_confirmed_exhausted"
+                    } else {
+                        ""
+                    },
                     "{} selected eligible target",
                     self.name()
                 );

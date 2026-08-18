@@ -10,14 +10,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libsy::{
-    AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger,
-    CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig, GateTrigger, HandoffNoteConfig, LlmClassifierConfig,
-    LlmFallback, LlmTaskClassifier, Noop, Passthrough, PassthroughConfig, PassthroughSubagentConfig,
-    PickerMode, Random, StageRouter, StageRouterConfig, TargetPrompts, TaskClassifierConfig,
-    Candidate, Modality, Pool, ReasoningPolicy, ResourceFetcher, ResourceRouter,
-    ResourceState, ClassFilter, WorkClass, ;, ContractFilter, ReasoningIntent,
-    SemanticContract, SharedResourceTelemetry, WorkShape,
-};use serde_json::Value;
+    AdvisorGate, AdvisorGateConfig, Algorithm, Candidate, ClassifierContractConfig,
+    ClassifierResponseFormat, ContractFilter, CustomClassifierConfig, CustomClassifierPolicy,
+    EscalationJudgeConfig, GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback,
+    LlmTaskClassifier, Modality, Noop, Passthrough, PickerMode, Pool, Random, ReasoningIntent,
+    ReasoningPolicy, ResourceFetcher, ResourceRouter, ResourceState, SemanticContract,
+    SharedResourceTelemetry, StageRouter, StageRouterConfig, TargetPrompts, TaskClassifierConfig,
+    WorkClass, WorkShape,
+};
+use serde::Deserialize;
+use serde_json::Value;
 use switchyard_llm_client::{
     Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
@@ -975,6 +977,11 @@ impl RouteConfig {
                 ..
             }
             | Advisor {
+                context_window,
+                tool_calling,
+                reasoning,
+                ..
+            }
             | ResourceRouter {
                 context_window,
                 tool_calling,

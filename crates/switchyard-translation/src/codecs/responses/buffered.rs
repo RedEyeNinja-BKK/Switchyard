@@ -194,6 +194,12 @@ impl FormatCodec for OpenAiResponsesCodec {
         if request.stream {
             body.insert("stream".to_string(), Value::Bool(true));
         }
+        // Semantic routing fields are host-owned request extensions.
+        for field in ["work_shape", "reasoning_intent", "work_class"] {
+            if let Some(value) = request.extensions.fields.get(field) {
+                body.insert(field.to_string(), value.clone());
+            }
+        }
         let body = embed_preservation(Value::Object(body), &request.preservation, _policy);
         Ok(EncodedRequest { body, diagnostics })
     }

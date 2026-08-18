@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libsy::{
-    AdvisorGate, AdvisorGateConfig, Algorithm, Candidate, ClassFilter, ClassifierContractConfig,
+    AdvisorGate, AdvisorGateConfig, Algorithm, Candidate, ClassifierContractConfig,
     ClassifierResponseFormat, ContractFilter, CustomClassifierConfig, CustomClassifierPolicy,
     EscalationJudgeConfig, GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback,
     LlmTaskClassifier, Modality, Noop, Passthrough, PickerMode, Pool, Random, ReasoningIntent,
@@ -967,6 +967,11 @@ impl RouteConfig {
                 ..
             }
             | Advisor {
+                context_window,
+                tool_calling,
+                reasoning,
+                ..
+            }
             | ResourceRouter {
                 context_window,
                 tool_calling,

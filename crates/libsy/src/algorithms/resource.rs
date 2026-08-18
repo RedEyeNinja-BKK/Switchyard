@@ -61,7 +61,12 @@ impl OpenAiResourceState {
     ///
     /// Purchased credits are intentionally NOT spent automatically once the
     /// weekly allowance is exhausted (owner policy). `credits_balance` is
-    /// telemetry only. Unknown/error state is INELIGIBLE (fail closed).
+    /// telemetry only.
+    ///
+    /// NOTE: this predicate is NOT the router's gate. The resource router
+    /// uses [`Self::confirmed_exhausted`] so that unknown/error telemetry
+    /// fails TOWARD Luna instead of spilling (owner policy). Keep this
+    /// method for allowance math; do not re-introduce it as a routing gate.
     pub fn weekly_eligible(&self) -> bool {
         self.available
             && !self.limit_reached
@@ -578,7 +583,6 @@ fn candidate_semantic_eligible(
 /// Detailed resource values stay in the server-side log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IneligibleKind {
-    OpenAiPool,
     OpenAiPoolExhausted,
     DeepSeekPool,
     DeepSeekFallbackBlocked,
@@ -649,20 +653,23 @@ fn candidate_eligible(
             }
         }
         Pool::DeepSeek => {
-            let Some(deepseek) = snapshot.deepseek.as_ref() else {
-                reasons.push((candidate.target.to_string(), IneligibleKind::DeepSeekPool));
-                return false;
+            // Evaluate both failure conditions so the client-visible reasons
+            // are not masked when both apply (observability: a fail-closed
+            // bounded lane should report WHY it blocked, and whether the
+            // fallback pool itself was unavailable).
+            let deepseek_unavailable = match snapshot.deepseek.as_ref() {
+                Some(deepseek) => !deepseek.eligible(),
+                None => true,
             };
-            if !deepseek.eligible() {
+            if deepseek_unavailable {
                 tracing::info!(
                     target = %candidate.target,
-                    is_available = deepseek.is_available,
-                    total_balance = deepseek.total_balance,
-                    currency = deepseek.currency,
+                    is_available = snapshot.deepseek.as_ref().map_or(false, |d| d.is_available),
+                    total_balance = snapshot.deepseek.as_ref().map_or("", |d| d.total_balance.as_str()),
+                    currency = snapshot.deepseek.as_ref().map_or("", |d| d.currency.as_str()),
                     "deepseek pool ineligible for candidate"
                 );
                 reasons.push((candidate.target.to_string(), IneligibleKind::DeepSeekPool));
-                return false;
             }
             // Fallback gate: DeepSeek may only serve this request when no
             // OpenAI candidate semantically serves it, or the OpenAI pool is
@@ -677,6 +684,8 @@ fn candidate_eligible(
                     candidate.target.to_string(),
                     IneligibleKind::DeepSeekFallbackBlocked,
                 ));
+            }
+            if deepseek_unavailable || !deepseek_fallback_allowed {
                 return false;
             }
         }
@@ -726,7 +735,6 @@ fn candidate_eligible(
 
 fn reason_label(kind: IneligibleKind) -> &'static str {
     match kind {
-        IneligibleKind::OpenAiPool => "openai pool state unavailable",
         IneligibleKind::OpenAiPoolExhausted => "openai pool exhausted (confirmed)",
         IneligibleKind::DeepSeekPool => "deepseek pool unavailable",
         IneligibleKind::DeepSeekFallbackBlocked => "deepseek fallback blocked (openai not confirmed exhausted)",
@@ -1258,6 +1266,25 @@ mod tests {
                 candidate("testing/flash", Pool::DeepSeek),
             ],
             snapshot(openai, deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_state_missing_bounded_stays_on_luna() -> crate::Result<()> {
+        // Missing OpenAI slot is NOT confirmed exhaustion: keep Luna eligible
+        // and block the fallback (fail toward Luna, no spill).
+        let router = make_router(
+            vec![
+                candidate("testing/luna", Pool::OpenAi),
+                candidate("testing/flash", Pool::DeepSeek),
+            ],
+            ResourceSnapshot {
+                openai: None,
+                deepseek: Some(deepseek_available()),
+            },
         );
         let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
         assert_eq!(trace[0].selected_model_id(), "testing/luna");

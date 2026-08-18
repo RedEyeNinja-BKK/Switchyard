@@ -278,40 +278,57 @@ fn finish_openai_chat_stream(state: &mut StreamTranslationState) -> Vec<Value> {
 }
 
 // Normalizes OpenAI token usage fields.
+//
+// Accepts BOTH usage payload shapes (legacy `prompt_tokens`/
+// `completion_tokens`/`prompt_tokens_details` and modern `input_tokens`/
+// `output_tokens`/`input_tokens_details`/`output_tokens_details`); modern
+// fields win when present.
 fn openai_usage(usage: &Map<String, Value>) -> Usage {
-    let cached_input_tokens = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64);
-    let cache_creation_input_tokens = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| {
-            details
-                .get("cache_write_tokens")
-                .or_else(|| details.get("cache_creation_tokens"))
-        })
-        .and_then(Value::as_u64);
+    let details = |name: &str| usage.get(name).and_then(Value::as_object);
+    let cached_input_tokens = details("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            details("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        });
+    let cache_creation_input_tokens = details("input_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            details("prompt_tokens_details")
+                .and_then(|d| {
+                    d.get("cache_write_tokens")
+                        .or_else(|| d.get("cache_creation_tokens"))
+                })
+                .and_then(Value::as_u64)
+        });
+    let raw_input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("prompt_tokens").and_then(Value::as_u64));
+    let raw_output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("completion_tokens").and_then(Value::as_u64));
     Usage {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .map(|tokens| {
-                tokens
-                    .saturating_sub(cached_input_tokens.unwrap_or(0))
-                    .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
-            }),
+        input_tokens: raw_input.map(|tokens| {
+            tokens
+                .saturating_sub(cached_input_tokens.unwrap_or(0))
+                .saturating_sub(cache_creation_input_tokens.unwrap_or(0))
+        }),
         cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
-        output_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
+        output_tokens: raw_output,
         total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
-        reasoning_tokens: usage
-            .get("completion_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
+        reasoning_tokens: details("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
             .or_else(|| {
-                usage
-                    .get("output_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-            })
-            .and_then(Value::as_u64),
+                details("completion_tokens_details")
+                    .and_then(|d| d.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            }),
     }
 }
 

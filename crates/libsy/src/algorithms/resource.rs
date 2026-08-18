@@ -796,6 +796,26 @@ impl Algorithm for ResourceRouter {
                     "{} selected eligible target",
                     self.name()
                 );
+                // Enforce the candidate's reasoning policy on the request IR
+                // BEFORE the offloaded call. The client-side wire body for a
+                // same-format hop is the PRESERVED original request, so a
+                // target's extra_body (or the caller's own fields) may not
+                // reflect the selected candidate's policy; the candidate's
+                // policy must WIN (operator invariant: no request-level field
+                // may silently turn an agentic-NT contract into thinking, or
+                // deliberately turn a thinking contract off).
+                //
+                // `reasoning_effort` is the provider-neutral knob: DeepSeek
+                // honors "none" (thinking disabled) and "high" (thinking
+                // enabled); the OpenAI-shaped gateway ignores the field for
+                // its NT targets. The llm-client applies it to the preserved
+                // wire body in send_encoded.
+                let mut request = request;
+                request.llm_request.reasoning.effort = match candidate.reasoning {
+                    ReasoningPolicy::NonThinking => Some("none".to_string()),
+                    ReasoningPolicy::Thinking => Some("high".to_string()),
+                    ReasoningPolicy::Any => request.llm_request.reasoning.effort,
+                };
                 let decision = Decision::new(candidate.target.clone(), true);
                 driver.decide(decision.clone()).await?;
                 return driver

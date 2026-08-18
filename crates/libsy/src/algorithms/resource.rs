@@ -72,6 +72,19 @@ impl OpenAiResourceState {
                 .unwrap_or(true)
     }
 
+    /// CONFIRMED exhaustion only: explicit limit/spend-control flags or used
+    /// >= 100% of the included weekly allowance. Unknown, stale, or error
+    /// telemetry is NOT exhaustion — bounded lanes must not spill to fallback
+    /// pools on anything short of a confirmed quota stop (owner policy).
+    pub fn confirmed_exhausted(&self) -> bool {
+        self.limit_reached
+            || self.spend_control_reached
+            || self
+                .weekly_used_percent
+                .map(|used| used >= 100.0)
+                .unwrap_or(false)
+    }
+
     /// Error-marked state for pool-local failure isolation: this pool is
     /// unknown, so candidates that require it become ineligible, while
     /// independent healthy pools remain usable.
@@ -521,12 +534,54 @@ impl ResourceRouter {
     }
 }
 
+/// Semantic-only fit (no resource state, no context cap): does this candidate
+/// serve the request's shape/intent/modality/reasoning contract? Mirrors the
+/// semantic block of [`candidate_eligible`]; used by [`ResourceRouter::route`]
+/// to decide whether a DeepSeek fallback is permitted in a route that also
+/// carries an OpenAI candidate.
+fn candidate_semantic_eligible(
+    candidate: &Candidate,
+    modality: Modality,
+    reasoning_effort: &Option<String>,
+    contract: Option<SemanticContract>,
+) -> bool {
+    if let Some(contract) = contract {
+        if !candidate.shapes.is_empty() && !candidate.shapes.contains(&contract.shape) {
+            return false;
+        }
+        if !candidate.intents.is_empty() && !candidate.intents.contains(&contract.intent) {
+            return false;
+        }
+    }
+    if !candidate.modalities.contains(&modality) {
+        return false;
+    }
+    match candidate.reasoning {
+        ReasoningPolicy::NonThinking => {
+            if let Some(effort) = reasoning_effort {
+                if !effort.is_empty() && effort != "none" {
+                    return false;
+                }
+            }
+        }
+        ReasoningPolicy::Thinking => {
+            if reasoning_effort.as_deref() == Some("none") {
+                return false;
+            }
+        }
+        ReasoningPolicy::Any => {}
+    }
+    true
+}
+
 /// Coarse reason shown to the caller when a candidate is ineligible.
 /// Detailed resource values stay in the server-side log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IneligibleKind {
     OpenAiPool,
+    OpenAiPoolExhausted,
     DeepSeekPool,
+    DeepSeekFallbackBlocked,
     ContextCap,
     Modality,
     ReasoningContract,
@@ -541,6 +596,7 @@ fn candidate_eligible(
     modality: Modality,
     reasoning_effort: &Option<String>,
     contract: Option<SemanticContract>,
+    deepseek_fallback_allowed: bool,
     reasons: &mut Vec<(String, IneligibleKind)>,
 ) -> bool {
     // Semantic-contract eligibility: a contract-filtered route only considers
@@ -558,21 +614,38 @@ fn candidate_eligible(
 
     match candidate.pool {
         Pool::OpenAi => {
-            let Some(openai) = snapshot.openai.as_ref() else {
-                reasons.push((candidate.target.to_string(), IneligibleKind::OpenAiPool));
-                return false;
-            };
-            if !openai.weekly_eligible() {
-                tracing::info!(
+            // Exhaustion-aware gate: a candidate is resource-ineligible ONLY on
+            // CONFIRMED exhaustion (limit/spend-control flags or used >= 100%).
+            // Missing/unknown/stale/error telemetry keeps the candidate
+            // eligible — bounded lanes fail toward Luna rather than spill to a
+            // fallback pool on unconfirmed signals (owner policy).
+            if let Some(openai) = snapshot.openai.as_ref() {
+                if openai.confirmed_exhausted() {
+                    tracing::info!(
+                        target = %candidate.target,
+                        limit_reached = openai.limit_reached,
+                        spend_control_reached = openai.spend_control_reached,
+                        weekly_used_percent = openai.weekly_used_percent,
+                        "openai pool CONFIRMED exhausted for candidate (fallback permitted)"
+                    );
+                    reasons.push((
+                        candidate.target.to_string(),
+                        IneligibleKind::OpenAiPoolExhausted,
+                    ));
+                    return false;
+                }
+                if !openai.available {
+                    tracing::warn!(
+                        target = %candidate.target,
+                        error = openai.error.as_deref().unwrap_or(""),
+                        "openai pool unavailable but NOT confirmed exhausted; candidate remains eligible (fail toward Luna)"
+                    );
+                }
+            } else {
+                tracing::warn!(
                     target = %candidate.target,
-                    available = openai.available,
-                    limit_reached = openai.limit_reached,
-                    spend_control_reached = openai.spend_control_reached,
-                    weekly_used_percent = openai.weekly_used_percent,
-                    "openai pool ineligible for candidate"
+                    "openai pool state missing; candidate remains eligible (fail toward Luna)"
                 );
-                reasons.push((candidate.target.to_string(), IneligibleKind::OpenAiPool));
-                return false;
             }
         }
         Pool::DeepSeek => {
@@ -589,6 +662,21 @@ fn candidate_eligible(
                     "deepseek pool ineligible for candidate"
                 );
                 reasons.push((candidate.target.to_string(), IneligibleKind::DeepSeekPool));
+                return false;
+            }
+            // Fallback gate: DeepSeek may only serve this request when no
+            // OpenAI candidate semantically serves it, or the OpenAI pool is
+            // CONFIRMED exhausted. Unknown/over-cap/error are NOT spill
+            // grounds — the bounded lane fails closed instead.
+            if !deepseek_fallback_allowed {
+                tracing::info!(
+                    target = %candidate.target,
+                    "deepseek fallback blocked: openai candidate serves request but is not confirmed exhausted"
+                );
+                reasons.push((
+                    candidate.target.to_string(),
+                    IneligibleKind::DeepSeekFallbackBlocked,
+                ));
                 return false;
             }
         }
@@ -638,8 +726,10 @@ fn candidate_eligible(
 
 fn reason_label(kind: IneligibleKind) -> &'static str {
     match kind {
-        IneligibleKind::OpenAiPool => "openai pool ineligible",
+        IneligibleKind::OpenAiPool => "openai pool state unavailable",
+        IneligibleKind::OpenAiPoolExhausted => "openai pool exhausted (confirmed)",
         IneligibleKind::DeepSeekPool => "deepseek pool unavailable",
+        IneligibleKind::DeepSeekFallbackBlocked => "deepseek fallback blocked (openai not confirmed exhausted)",
         IneligibleKind::ContextCap => "request exceeds candidate context cap",
         IneligibleKind::Modality => "request modality not supported by candidate",
         IneligibleKind::ReasoningContract => "request reasoning contract conflicts with candidate",
@@ -671,6 +761,31 @@ impl Algorithm for ResourceRouter {
         let reasoning_effort = request_reasoning_effort(&request);
 
         let mut reasons = Vec::new();
+        // Fallback gate (owner policy): DeepSeek may be selected only when no
+        // OpenAI candidate in this route semantically serves the request, or
+        // when the OpenAI pool is CONFIRMED exhausted. Unknown/stale/error
+        // telemetry and context-cap overflow are NOT spill grounds — bounded
+        // lanes fail toward Luna or fail closed.
+        let route_has_openai = self
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate.pool, Pool::OpenAi));
+        let openai_confirmed_exhausted = snapshot
+            .openai
+            .as_ref()
+            .map(OpenAiResourceState::confirmed_exhausted);
+        let openai_semantically_serves = route_has_openai
+            && self.candidates.iter().any(|candidate| {
+                matches!(candidate.pool, Pool::OpenAi)
+                    && candidate_semantic_eligible(
+                        candidate,
+                        modality,
+                        &reasoning_effort,
+                        contract,
+                    )
+            });
+        let deepseek_fallback_allowed =
+            !openai_semantically_serves || openai_confirmed_exhausted == Some(true);
         for candidate in &self.candidates {
             if candidate_eligible(
                 candidate,
@@ -679,6 +794,7 @@ impl Algorithm for ResourceRouter {
                 modality,
                 &reasoning_effort,
                 contract,
+                deepseek_fallback_allowed,
                 &mut reasons,
             ) {
                 tracing::info!(
@@ -990,32 +1106,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_empty_excludes_flash() -> crate::Result<()> {
+    async fn deepseek_only_route_selects_flash_when_available() -> crate::Result<()> {
+        // A route with no OpenAI candidate is a designated DeepSeek lane; the
+        // fallback gate must not block it.
         let router = make_router(
             vec![candidate("testing/flash", Pool::DeepSeek)],
-            snapshot(openai_healthy(), deepseek_empty()),
+            snapshot(openai_healthy(), deepseek_available()),
         );
-        let result = test_drive(router, text_request_hi(), echo()).await;
-        assert!(result.is_err());
-        let err = match result {
-            Ok(_) => panic!("expected error"),
-            Err(error) => error,
-        };
-        assert!(err.to_string().contains("no eligible target"));
-        // Coarse reason only — no balance/percentage values in the error.
-        assert!(err.to_string().contains("deepseek pool unavailable"));
-        assert!(!err.to_string().contains("0.00"));
+        let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash");
         Ok(())
     }
 
     #[tokio::test]
-    async fn context_over_cap_excludes_luna() -> crate::Result<()> {
+    async fn used_percent_100_confirmed_exhaustion_selects_flash() -> crate::Result<()> {
+        // used >= 100% alone (no limit/spend-control flags) is still CONFIRMED
+        // exhaustion -> the single sanctioned spill path.
+        let mut openai = openai_healthy();
+        openai.weekly_used_percent = Some(100.0);
+        let router = make_router(
+            vec![
+                candidate("testing/luna", Pool::OpenAi),
+                candidate("testing/flash", Pool::DeepSeek),
+            ],
+            snapshot(openai, deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_over_cap_fails_closed_no_deepseek_escape_hatch() -> crate::Result<()> {
+        // No context-length escape hatch (owner policy): a bounded request that
+        // exceeds the Luna context cap must FAIL, not spill to DeepSeek.
         let mut cand = candidate("testing/luna", Pool::OpenAi);
         cand.context_cap_tokens = Some(8); // tiny cap
         let request = Request {
             llm_request: text_request(
                 Some("auto".to_string()),
-                "this is a substantially longer request body used to exceed the tiny configured context cap for the luna candidate so that eligibility falls through to flash",
+                "this is a substantially longer request body used to exceed the tiny configured context cap for the luna candidate",
             ),
             raw_request: None,
             metadata: None,
@@ -1024,8 +1154,16 @@ mod tests {
             vec![cand, candidate("testing/flash", Pool::DeepSeek)],
             snapshot(openai_healthy(), deepseek_available()),
         );
-        let (trace, _) = test_drive(router, request, echo()).await?;
-        assert_eq!(trace[0].selected_model_id(), "testing/flash");
+        let result = test_drive(router, request, echo()).await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("no eligible target"));
+        assert!(err
+            .to_string()
+            .contains("deepseek fallback blocked (openai not confirmed exhausted)"));
         Ok(())
     }
 
@@ -1080,7 +1218,9 @@ mod tests {
     // One pool's telemetry unknown must not disable every smart route.
 
     #[tokio::test]
-    async fn openai_unknown_deepseek_healthy_bounded_selects_flash() -> crate::Result<()> {
+    async fn openai_unknown_deepseek_healthy_bounded_stays_on_luna() -> crate::Result<()> {
+        // Unknown/error telemetry is NOT confirmed exhaustion: the bounded lane
+        // must fail toward Luna and must NOT spill to DeepSeek (owner policy).
         let router = make_router(
             vec![
                 candidate("testing/luna", Pool::OpenAi),
@@ -1089,7 +1229,26 @@ mod tests {
             snapshot(openai_unknown(), deepseek_available()),
         );
         let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
-        assert_eq!(trace[0].selected_model_id(), "testing/flash");
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_available_false_not_exhausted_bounded_stays_on_luna() -> crate::Result<()> {
+        // available=false WITHOUT limit/spend-control/used>=100 is a transient
+        // or stale signal, not exhaustion: the bounded lane stays on Luna.
+        let mut openai = openai_healthy();
+        openai.available = false;
+        openai.error = Some("transient read failure".into());
+        let router = make_router(
+            vec![
+                candidate("testing/luna", Pool::OpenAi),
+                candidate("testing/flash", Pool::DeepSeek),
+            ],
+            snapshot(openai, deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
         Ok(())
     }
 
@@ -1108,7 +1267,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_pools_unknown_controlled_no_eligible_target() -> crate::Result<()> {
+    async fn both_pools_unknown_bounded_stays_on_luna() -> crate::Result<()> {
+        // OpenAI unknown -> not confirmed exhausted -> Luna stays eligible and
+        // the fallback is blocked; DeepSeek unknown is irrelevant because Luna
+        // is selected first. No spill, no spurious error.
         let router = make_router(
             vec![
                 candidate("testing/luna", Pool::OpenAi),
@@ -1116,15 +1278,8 @@ mod tests {
             ],
             snapshot(openai_unknown(), deepseek_unknown()),
         );
-        let result = test_drive(router, text_request_hi(), echo()).await;
-        assert!(result.is_err());
-        let err = match result {
-            Ok(_) => panic!("expected error"),
-            Err(error) => error,
-        };
-        assert!(err.to_string().contains("no eligible target"));
-        assert!(err.to_string().contains("openai pool ineligible"));
-        assert!(err.to_string().contains("deepseek pool unavailable"));
+        let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
         Ok(())
     }
 
@@ -1144,13 +1299,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn universal_bounded_openai_unknown_falls_to_flash_nt() -> crate::Result<()> {
+    async fn universal_bounded_openai_unknown_stays_on_luna() -> crate::Result<()> {
         let router = make_request_router(
             universal_candidates(),
             snapshot(openai_unknown(), deepseek_available()),
         );
         let (trace, _) = test_drive(router, request_with_work_class("bounded", "hi"), echo()).await?;
-        assert_eq!(trace[0].selected_model_id(), "testing/flash-nt");
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
         Ok(())
     }
 

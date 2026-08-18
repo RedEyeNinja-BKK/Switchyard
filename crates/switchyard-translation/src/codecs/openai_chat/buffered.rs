@@ -926,6 +926,9 @@ fn copy_openai_chat_request_extensions(
     extensions: &Map<String, Value>,
 ) {
     for field in [
+        "work_shape",
+        "reasoning_intent",
+        "work_class",
         "metadata",
         "parallel_tool_calls",
         "prompt_cache_key",

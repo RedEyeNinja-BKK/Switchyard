@@ -786,6 +786,11 @@ impl Algorithm for ResourceRouter {
             });
         let deepseek_fallback_allowed =
             !openai_semantically_serves || openai_confirmed_exhausted == Some(true);
+        // Observability: label a selection when DeepSeek is chosen as the
+        // sanctioned fallback (route carries an OpenAI candidate that is
+        // CONFIRMED exhausted). DeepSeek selections in routes without a
+        // serving OpenAI candidate are designated lanes, not fallbacks.
+        let confirmed_openai_exhausted = route_has_openai && openai_confirmed_exhausted == Some(true);
         for candidate in &self.candidates {
             if candidate_eligible(
                 candidate,
@@ -801,6 +806,13 @@ impl Algorithm for ResourceRouter {
                     target = %candidate.target,
                     pool = ?candidate.pool,
                     contract = ?contract,
+                    fallback_reason = if confirmed_openai_exhausted
+                        && matches!(candidate.pool, Pool::DeepSeek)
+                    {
+                        "openai_confirmed_exhausted"
+                    } else {
+                        ""
+                    },
                     "{} selected eligible target",
                     self.name()
                 );

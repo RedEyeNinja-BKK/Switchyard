@@ -77,6 +77,23 @@ impl OpenAiResourceState {
                 .unwrap_or(true)
     }
 
+    /// CONFIRMED included-allowance exhaustion ONLY: the provider-reported
+    /// limit flag (`rate_limit.limit_reached` from the OpenAI/Codex /usage
+    /// surface) or used >= 100% of the included weekly allowance
+    /// (`rate_limit.primary_window.used_percent`).
+    ///
+    /// Deliberately EXCLUDED: `spend_control_reached` (spend-control / paid
+    /// overage policy state, NOT included-allowance exhaustion — must not
+    /// unlock a fallback), `available=false` and unknown/stale/error telemetry
+    /// (bounded lanes fail toward Luna instead of spilling).
+    pub fn confirmed_exhausted(&self) -> bool {
+        self.limit_reached
+            || self
+                .weekly_used_percent
+                .map(|used| used >= 100.0)
+                .unwrap_or(false)
+    }
+
     /// Error-marked state for pool-local failure isolation: this pool is
     /// unknown, so candidates that require it become ineligible, while
     /// independent healthy pools remain usable.
@@ -275,8 +292,83 @@ impl std::str::FromStr for WorkClass {
 
 /// How a resource router learns the request's work class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClassFilter {
-    /// No class filtering (candidate `classes` lists are ignored / all match).
+pub enum WorkShape {
+    Bounded,
+    Agentic,
+}
+
+impl std::str::FromStr for WorkShape {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bounded" => Ok(WorkShape::Bounded),
+            "agentic" => Ok(WorkShape::Agentic),
+            other => Err(format!(
+                "invalid work_shape {other:?} (expected bounded | agentic)"
+            )),
+        }
+    }
+}
+
+/// REASONING INTENT: whether the caller wants deliberate reasoning behavior.
+/// Independent of work shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningIntent {
+    None,
+    Deliberate,
+}
+
+impl std::str::FromStr for ReasoningIntent {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(ReasoningIntent::None),
+            "deliberate" => Ok(ReasoningIntent::Deliberate),
+            other => Err(format!(
+                "invalid reasoning_intent {other:?} (expected none | deliberate)"
+            )),
+        }
+    }
+}
+
+/// The orthogonal semantic contract: work shape × reasoning intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SemanticContract {
+    pub shape: WorkShape,
+    pub intent: ReasoningIntent,
+}
+
+impl SemanticContract {
+    /// Translate a LEGACY `work_class` value into the orthogonal contract.
+    ///
+    /// Operator correction (2026-08-18): `bounded` work may NOT carry
+    /// deliberate reasoning intent (that would be an inference-model escape
+    /// hatch). Legacy `reasoning` is therefore classified as NON-bounded
+    /// deliberate work: (agentic, deliberate) → Flash thinking.
+    pub fn from_work_class(class: WorkClass) -> Self {
+        match class {
+            WorkClass::Bounded => SemanticContract {
+                shape: WorkShape::Bounded,
+                intent: ReasoningIntent::None,
+            },
+            WorkClass::Agentic => SemanticContract {
+                shape: WorkShape::Agentic,
+                intent: ReasoningIntent::None,
+            },
+            WorkClass::Reasoning => SemanticContract {
+                shape: WorkShape::Agentic,
+                intent: ReasoningIntent::Deliberate,
+            },
+        }
+    }
+}
+
+/// How a resource router learns the request's semantic contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractFilter {
+    /// No contract filtering (candidate `shapes`/`intents` lists ignored).
     Any,
     /// A fixed class configured on the route (e.g. the three semantic routes).
     Fixed(WorkClass),
@@ -395,34 +487,79 @@ impl ResourceRouter {
 
     /// Resolve the effective work class for this request.
     ///
-    /// `ClassFilter::Request` reads the STRUCTURAL `work_class` metadata from
-    /// the request extensions. Missing or invalid metadata is a hard error —
-    /// the router never guesses critical semantics from prompt text.
-    fn effective_work_class(&self, request: &Request) -> Result<Option<WorkClass>> {
-        match self.class_filter {
-            ClassFilter::Any => Ok(None),
-            ClassFilter::Fixed(class) => Ok(Some(class)),
-            ClassFilter::Request => {
-                let raw = request
-                    .llm_request
-                    .extensions
-                    .fields
-                    .get("work_class")
+    /// `ContractFilter::Request` reads STRUCTURAL metadata from the request
+    /// extensions. Prefer `work_shape` + `reasoning_intent` (orthogonal);
+    /// fall back to the LEGACY `work_class` (translated). Missing or invalid
+    /// metadata is a hard error — the router never guesses critical semantics
+    /// from prompt text.
+    ///
+    /// Operator correction (2026-08-18): `bounded` work MUST carry
+    /// `reasoning_intent=none`. A contradictory bounded+deliberate contract
+    /// is REJECTED — reasoning requirements belong to work classification,
+    /// not an inference-model escape hatch.
+    fn effective_contract(&self, request: &Request) -> Result<Option<SemanticContract>> {
+        fn reject_contradiction(
+            name: &str,
+            contract: SemanticContract,
+        ) -> Result<SemanticContract> {
+            if contract.shape == WorkShape::Bounded && contract.intent == ReasoningIntent::Deliberate
+            {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "{}: bounded work_shape with reasoning_intent=deliberate is contradictory; reclassify the task as deliberate/non-bounded before routing",
+                        name
+                    ),
+                });
+            }
+            Ok(contract)
+        }
+
+        match self.contract_filter {
+            ContractFilter::Any => Ok(None),
+            ContractFilter::Fixed(contract) => Ok(Some(contract)),
+            ContractFilter::Request => {
+                let fields = &request.llm_request.extensions.fields;
+
+                // Preferred: orthogonal dimensions.
+                let shape_raw = fields.get("work_shape").and_then(serde_json::Value::as_str);
+                let intent_raw = fields
+                    .get("reasoning_intent")
                     .and_then(serde_json::Value::as_str);
-                let Some(raw) = raw else {
-                    return Err(LibsyError::AlgorithmError {
-                        message: format!(
-                            "{}: work_class metadata required (bounded | agentic | reasoning); refusing to guess from prompt text",
-                            self.name()
-                        ),
-                    });
-                };
-                let class = raw.parse::<WorkClass>().map_err(|message| {
-                    LibsyError::AlgorithmError {
-                        message: format!("{}: {message}", self.name()),
-                    }
-                })?;
-                Ok(Some(class))
+                if let (Some(shape_raw), Some(intent_raw)) = (shape_raw, intent_raw) {
+                    let shape = shape_raw.parse::<WorkShape>().map_err(|message| {
+                        LibsyError::AlgorithmError {
+                            message: format!("{}: {message}", self.name()),
+                        }
+                    })?;
+                    let intent = intent_raw.parse::<ReasoningIntent>().map_err(|message| {
+                        LibsyError::AlgorithmError {
+                            message: format!("{}: {message}", self.name()),
+                        }
+                    })?;
+                    return reject_contradiction(self.name(), SemanticContract { shape, intent })
+                        .map(Some);
+                }
+
+                // Legacy fallback: single work_class value.
+                if let Some(raw) = fields.get("work_class").and_then(serde_json::Value::as_str) {
+                    let class = raw.parse::<WorkClass>().map_err(|message| {
+                        LibsyError::AlgorithmError {
+                            message: format!("{}: {message}", self.name()),
+                        }
+                    })?;
+                    return reject_contradiction(
+                        self.name(),
+                        SemanticContract::from_work_class(class),
+                    )
+                    .map(Some);
+                }
+
+                Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "{}: work_shape + reasoning_intent metadata required (or legacy work_class); refusing to guess from prompt text",
+                        self.name()
+                    ),
+                })
             }
         }
     }
@@ -582,6 +719,19 @@ impl Algorithm for ResourceRouter {
         let request_tokens = estimate_request_tokens(&request);
         let modality = request_modality(&request);
         let reasoning_effort = request_reasoning_effort(&request);
+        // Bounded lanes are non-thinking by policy (operator correction
+        // 2026-08-18): a client-attached reasoning effort must NOT exclude the
+        // Luna NT candidate and silently open the DeepSeek fallback. Normalize
+        // effort to none for bounded work; deliberate work is classified via
+        // reasoning_intent/work_class, never via an effort flag on a bounded
+        // task.
+        let reasoning_effort = match contract {
+            Some(SemanticContract {
+                shape: WorkShape::Bounded,
+                ..
+            }) => None,
+            _ => reasoning_effort,
+        };
 
         let mut reasons = Vec::new();
         // Fallback gate (owner policy): DeepSeek may be selected only when no
@@ -827,8 +977,12 @@ mod tests {
         )
     }
 
-    /// The universal candidate set: bounded (Luna NT + Flash NT), agentic
-    /// (Flash NT only), reasoning (Flash thinking only).
+    /// The universal candidate set (orthogonal semantics):
+    ///   bounded+none       -> Luna NT (OpenAI) preferred, Flash NT fallback
+    ///   agentic+none       -> Flash NT (Luna excluded)
+    ///   bounded+deliberate -> REJECTED (contradictory; reclassify as
+    ///                          deliberate/non-bounded — operator correction)
+    ///   agentic+deliberate -> Flash thinking (newly surfaced Hermes case)
     fn universal_candidates() -> Vec<Candidate> {
         let mut luna = candidate_for("testing/luna", Pool::OpenAi, WorkClass::Bounded);
         luna.context_cap_tokens = Some(266_000);
@@ -884,7 +1038,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spend_control_reached_excludes_luna() -> crate::Result<()> {
+    async fn spend_control_reached_does_not_unlock_fallback() -> crate::Result<()> {
+        // spend_control.reached is spend-control/paid-overage policy state,
+        // NOT included-allowance exhaustion (operator audit 2026-08-18): it
+        // must NOT unlock the DeepSeek fallback. Bounded stays on Luna.
         let router = make_router(
             vec![
                 candidate("testing/luna", Pool::OpenAi),
@@ -893,7 +1050,24 @@ mod tests {
             snapshot(openai_spend_control(), deepseek_available()),
         );
         let (trace, _) = test_drive(router, text_request_hi(), echo()).await?;
-        assert_eq!(trace[0].selected_model_id(), "testing/flash");
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_with_effort_high_stays_on_luna() -> crate::Result<()> {
+        // A client-attached reasoning effort on a bounded contract must NOT
+        // exclude Luna NT and open the DeepSeek fallback (operator correction
+        // 2026-08-18): bounded work is non-thinking by policy; effort is
+        // normalized to none for eligibility.
+        let mut request = request_with_contract("bounded", "none", "hi");
+        request.llm_request.reasoning.effort = Some("high".to_string());
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) = test_drive(router, request, echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
         Ok(())
     }
 
@@ -1109,6 +1283,9 @@ mod tests {
 
     #[tokio::test]
     async fn universal_reasoning_metadata_selects_flash_thinking() -> crate::Result<()> {
+        // Legacy work_class=reasoning translates to (agentic, deliberate) —
+        // non-bounded deliberate work -> Flash thinking (operator correction
+        // 2026-08-18; bounded may never carry deliberate intent).
         let router = make_request_router(
             universal_candidates(),
             snapshot(openai_healthy(), deepseek_available()),
@@ -1116,6 +1293,154 @@ mod tests {
         let (trace, _) =
             test_drive(router, request_with_work_class("reasoning", "hi"), echo()).await?;
         assert_eq!(trace[0].selected_model_id(), "testing/flash-think");
+        Ok(())
+    }
+
+    // ── §7 matrix: work_shape × reasoning_intent (orthogonal) ─────────
+
+    #[tokio::test]
+    async fn contract_bounded_none_selects_luna_when_healthy() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) =
+            test_drive(router, request_with_contract("bounded", "none", "hi"), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/luna");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_bounded_none_openai_exhausted_selects_flash_nt() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_exhausted(), deepseek_available()),
+        );
+        let (trace, _) =
+            test_drive(router, request_with_contract("bounded", "none", "hi"), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash-nt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_agentic_none_selects_flash_nt() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) =
+            test_drive(router, request_with_contract("agentic", "none", "hi"), echo()).await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash-nt");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_bounded_deliberate_rejected() -> crate::Result<()> {
+        // Operator correction (2026-08-18): bounded work MUST be non-thinking.
+        // A contradictory bounded+deliberate contract is rejected, never
+        // auto-selected to DeepSeek thinking.
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let result = test_drive(
+            router,
+            request_with_contract("bounded", "deliberate", "hi"),
+            echo(),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err
+            .to_string()
+            .contains("bounded work_shape with reasoning_intent=deliberate is contradictory"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_agentic_deliberate_selects_flash_thinking() -> crate::Result<()> {
+        // THE newly surfaced Hermes case: agentic work CAN require deliberate
+        // reasoning. It must NOT be rejected as "non-thinking only".
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_available()),
+        );
+        let (trace, _) = test_drive(
+            router,
+            request_with_contract("agentic", "deliberate", "hi"),
+            echo(),
+        )
+        .await?;
+        assert_eq!(trace[0].selected_model_id(), "testing/flash-think");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_agentic_deliberate_deepseek_unknown_no_luna_downgrade()
+    -> crate::Result<()> {
+        // Agentic + deliberate + DeepSeek unknown: flash-think ineligible.
+        // DO NOT silently downgrade to Luna NT (shape+intent incompatible) ->
+        // controlled no-eligible-target.
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_unknown()),
+        );
+        let result = test_drive(
+            router,
+            request_with_contract("agentic", "deliberate", "hi"),
+            echo(),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("no eligible target"));
+        assert!(!err.to_string().contains("testing/luna"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_agentic_none_deepseek_unknown_no_luna_downgrade() -> crate::Result<()> {
+        // Agentic + none + DeepSeek unknown: Flash NT ineligible; Luna is
+        // shape-excluded even though OpenAI healthy -> controlled error.
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_unknown()),
+        );
+        let result = test_drive(
+            router,
+            request_with_contract("agentic", "none", "hi"),
+            echo(),
+        )
+        .await;
+        assert!(result.is_err());
+        let err = match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("no eligible target"));
+        assert!(!err.to_string().contains("testing/luna"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contract_agentic_none_deepseek_empty_excludes_flash() -> crate::Result<()> {
+        let router = make_request_router(
+            universal_candidates(),
+            snapshot(openai_healthy(), deepseek_empty()),
+        );
+        let result = test_drive(
+            router,
+            request_with_contract("agentic", "none", "hi"),
+            echo(),
+        )
+        .await;
+        assert!(result.is_err());
         Ok(())
     }
 

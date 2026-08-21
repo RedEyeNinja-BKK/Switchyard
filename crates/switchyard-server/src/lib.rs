@@ -165,9 +165,11 @@ pub struct ServerState {
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
     resource_telemetry: Option<SharedResourceTelemetry>,
-    /// Optional inert ComfyNinja runtime composition (Gate C2-A). `None` when
-    /// the integration is disabled (no consumer, no network, no credential).
-    comfy: Option<Arc<comfy::ComfyNinjaRuntime>>,
+    /// Optional activated ComfyNinja runtime driver (Gate C2-W). `None` when the
+    /// integration is disabled (no runtime, no driver, no consumer, no network,
+    /// no credential). `Some(handle)` is the single production driver for an
+    /// enabled integration, retained for the server lifetime.
+    comfy: Option<Arc<comfy::ComfyDriverHandle>>,
 }
 
 #[derive(Clone)]
@@ -278,18 +280,40 @@ impl ServerState {
         self.resource_telemetry = Some(telemetry);
     }
 
-    /// Attach the (optionally enabled) inert ComfyNinja runtime composition.
+    /// Attach the activated ComfyNinja runtime driver (Gate C2-W).
     ///
-    /// When `None` (integration disabled) the server holds no ComfyNinja
-    /// consumer/task/credential. When `Some(runtime)` the composition is inert:
-    /// no background task, no live fetch, no `:8447` request until driven.
-    pub fn set_comfy(&mut self, comfy: Option<comfy::ComfyNinjaRuntime>) {
+    /// When `None` (integration disabled/absent) the server holds no ComfyNinja
+    /// runtime, driver, consumer, task, credential, or network path. When
+    /// `Some(handle)` it is the single production driver retained for the
+    /// server lifetime.
+    pub fn set_comfy(&mut self, comfy: Option<comfy::ComfyDriverHandle>) {
         self.comfy = comfy.map(Arc::new);
     }
 
-    /// Accessor for the current inert ComfyNinja composition status (read-only).
-    pub fn comfy_status(&self) -> Option<comfy::ComfyCompositionStatus> {
-        self.comfy.as_ref().map(|c| c.status())
+    /// Accessor for the activated ComfyNinja composition status (read-only).
+    ///
+    /// Returns `None` when the integration is disabled/absent (no runtime, no
+    /// driver). Returns the current status through the activated driver's shared
+    /// runtime when enabled.
+    pub async fn comfy_status(&self) -> Option<comfy::ComfyCompositionStatus> {
+        let comfy = self.comfy.as_ref()?;
+        Some(comfy.status().await)
+    }
+
+    /// Request cancellation of the ComfyNinja driver and await its join.
+    ///
+    /// Called from the server shutdown path so the driver stops cleanly and is
+    /// joined before a normal shutdown returns. On a state with no driver this
+    /// is a no-op.
+    pub async fn stop_comfy(&self) {
+        if let Some(comfy) = self.comfy.as_ref() {
+            comfy.stop_and_join().await;
+        }
+    }
+
+    /// Whether an activated ComfyNinja driver is present.
+    pub fn has_comfy(&self) -> bool {
+        self.comfy.is_some()
     }
 
     /// Enables durable per-request routing records at `path`.
@@ -389,11 +413,18 @@ impl BoundServer {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> ServerResult<()> {
         let shutdown_timeout = self.options.shutdown_timeout;
-        if let Some(tls) = self.options.tls {
+        // Capture the state so the ComfyNinja driver (if any) can be stopped
+        // and joined once the shutdown drain completes.
+        let state = self.state;
+        let result = if let Some(tls) = self.options.tls {
             serve_tls(self.listener, self.router, tls, shutdown_timeout, shutdown).await
         } else {
             serve(self.listener, self.router, shutdown_timeout, shutdown).await
-        }
+        };
+        // Deterministic cancellation/join of the ComfyNinja driver (no-op when
+        // no driver is active). Ensures no further fetch occurs after shutdown.
+        state.stop_comfy().await;
+        result
     }
 
     fn startup_banner(&self, color: bool) -> String {

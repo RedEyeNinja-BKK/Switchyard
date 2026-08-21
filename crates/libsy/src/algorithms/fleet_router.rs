@@ -196,8 +196,7 @@ impl FleetRouter {
     /// and build `(selected, fallbacks)`.
     fn decide(&self, request: &switchyard_protocol::Request) -> Result<(ModelId, Vec<ModelId>)> {
         let require_tools = !request.llm_request.tools.is_empty();
-        let require_reasoning = request.llm_request.reasoning.effort.is_some()
-            || request.llm_request.reasoning.raw.is_some();
+        let require_reasoning = reasoning_requested(&request.llm_request.reasoning);
 
         let mut eligible = Vec::new();
         for profile in &self.profiles {
@@ -240,6 +239,33 @@ impl FleetRouter {
     }
 }
 
+/// Whether the request requires a reasoning-capable target, derived from the
+/// normalized reasoning controls.
+///
+/// Reasoning is required only when the normalized `effort` is an actual
+/// reasoning level. Semantics:
+///
+/// * no reasoning controls → `false`
+/// * `effort = "none"` → `false` (an explicit non-thinking request)
+/// * `effort` is any other string → `true` (a reasoning level such as
+///   `low`/`medium`/`high`/`xhigh`/`max` or any provider value preserved in the
+///   normalized field)
+///
+/// `reasoning.raw` is deliberately NOT consulted: it is a container that holds
+/// whatever reasoning controls a provider/decoder preserved (the Responses
+/// decoder clones the whole `reasoning` object, so `raw` can be present for a
+/// deliberate `{"effort":"none"}` request). Presence of `raw` does not mean
+/// reasoning is enabled, and there is no generic provider-agnostic shape that
+/// reliably means "enabled" in this narrow PoC. Raw-based reasoning admission is
+/// therefore **deferred** (not treated as a requirement here); scope reasoning
+/// admission to the normalized `effort` field.
+fn reasoning_requested(reasoning: &switchyard_protocol::ReasoningParams) -> bool {
+    match reasoning.effort.as_deref() {
+        None | Some("none") => false,
+        Some(_) => true,
+    }
+}
+
 #[async_trait::async_trait]
 impl Algorithm for FleetRouter {
     fn name(&self) -> &str {
@@ -266,6 +292,7 @@ impl Algorithm for FleetRouter {
 #[cfg(test)]
 mod tests {
     use super::{CandidateProfile, CandidateState, FleetRouter};
+    use crate::Algorithm;
     use switchyard_protocol::{ModelId, ReasoningParams, Request, text_request};
 
     fn text_req() -> Request {
@@ -294,6 +321,29 @@ mod tests {
         req.llm_request.reasoning = ReasoningParams {
             effort: Some("high".to_string()),
             raw: None,
+        };
+        req
+    }
+
+    /// An explicit non-thinking request via `effort = "none"` (normalized path).
+    fn none_reasoning_req() -> Request {
+        let mut req = text_req();
+        req.llm_request.reasoning = ReasoningParams {
+            effort: Some("none".to_string()),
+            raw: None,
+        };
+        req
+    }
+
+    /// The Responses-decoder shape that regressed: `effort = "none"` AND `raw`
+    /// carrying the whole reasoning object (including `{"effort":"none"}`).
+    /// The decoder clones `body.reasoning` into `raw`, so this is what a
+    /// deliberate non-thinking Responses request decodes to.
+    fn responses_none_reasoning_req() -> Request {
+        let mut req = text_req();
+        req.llm_request.reasoning = ReasoningParams {
+            effort: Some("none".to_string()),
+            raw: Some(serde_json::json!({ "effort": "none" })),
         };
         req
     }
@@ -490,6 +540,112 @@ mod tests {
         assert!(
             FleetRouter::new(profiles(), states_dup).is_err(),
             "duplicate state key must be rejected"
+        );
+    }
+
+    // ─── Reasoning-mode semantics (review correction) ───────────────────────
+
+    /// The key invariant from the review: an explicit non-thinking request
+    /// (`effort = "none"`, with or without `raw`) is NOT a reasoning requirement.
+    /// HTPC (reasoning=false) must stay eligible.
+    ///
+    /// This covers the discovered bug: the Responses decoder preserves the whole
+    /// `reasoning` object into `ReasoningParams.raw`, so `{"effort":"none"}`
+    /// decodes to `effort="none"` + `raw=Some(reasoning)`. A predicate of
+    /// `effort.is_some() || raw.is_some()` would wrongly require reasoning.
+    #[test]
+    fn effort_none_is_not_a_reasoning_requirement() {
+        let router = FleetRouter::new(profiles(), all_ready()).unwrap();
+
+        // effort = "none", raw = None: HTPC stays eligible.
+        let (_, fb) = router.decide(&none_reasoning_req()).unwrap();
+        let fb = fb.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(fb.contains(&"htpc-qwen3_5".to_string()));
+
+        // Responses-style: effort = "none" + raw = Some(reasoning object).
+        // HTPC still eligible (non-thinking != reasoning-required).
+        let (_, fb) = router.decide(&responses_none_reasoning_req()).unwrap();
+        let fb = fb.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(fb.contains(&"htpc-qwen3_5".to_string()));
+    }
+
+    /// Reasoning absent: non-reasoning candidate remains eligible.
+    #[test]
+    fn reasoning_absent_keeps_non_reasoning_candidate_eligible() {
+        let router = FleetRouter::new(profiles(), all_ready()).unwrap();
+        let (_, fb) = router.decide(&text_req()).unwrap(); // no reasoning controls
+        let fb = fb.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(fb.contains(&"htpc-qwen3_5".to_string()));
+    }
+
+    /// Positive reasoning level (effort = "high"): non-reasoning candidate excluded.
+    #[test]
+    fn positive_reasoning_excludes_non_reasoning_candidate() {
+        let router = FleetRouter::new(profiles(), all_ready()).unwrap();
+        let (_, fb) = router.decide(&reasoning_req()).unwrap();
+        let fb = fb.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(
+            !fb.contains(&"htpc-qwen3_5".to_string()),
+            "a high-effort reasoning request must exclude the non-reasoning candidate"
+        );
+    }
+
+    // ─── Public Algorithm-path proof (review correction) ────────────────────
+
+    /// Drives a real `FleetRouter` through the public libsy Algorithm path
+    /// (`run_stream` → `route` → `RoutingOutcome`) via the exported `drive`, and
+    /// asserts the native selected + fallback contract.
+    #[tokio::test]
+    async fn public_algorithm_path_produces_native_routing_outcome() {
+        use crate::{CallModel, drive};
+        use std::sync::Arc as StdArc;
+
+        let router: StdArc<dyn Algorithm> =
+            StdArc::new(FleetRouter::new(profiles(), all_ready()).unwrap());
+
+        let outcome = drive(
+            StdArc::clone(&router),
+            text_req(),
+            // FleetRouter makes no offloaded calls, so serve is never invoked;
+            // provide a stub satisfying the drive contract.
+            |_call: CallModel| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.selected_model_id.to_string(), "luna");
+        let fb = outcome
+            .fallback_models
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(fb, ["deepseek-flash", "htpc-qwen3_5"]);
+        // The selected model is stamped into the request, as upstream requires.
+        assert_eq!(outcome.request.llm_request.model.as_deref(), Some("luna"));
+    }
+
+    /// The no-eligible fail-closed error propagates through the public path.
+    #[tokio::test]
+    async fn public_algorithm_path_propagates_fail_closed() {
+        use crate::{CallModel, drive};
+
+        let states = vec![
+            (ModelId::from("luna"), CandidateState::not_ready()),
+            (ModelId::from("htpc-qwen3_5"), CandidateState::not_ready()),
+            (
+                ModelId::from("comfyninja-qwen3_8"),
+                CandidateState::transition_required(),
+            ),
+        ];
+        let router: std::sync::Arc<dyn Algorithm> =
+            std::sync::Arc::new(FleetRouter::new(profiles(), states).unwrap());
+        let err = match drive(router, text_req(), |_call: CallModel| async { Ok(()) }).await {
+            Ok(_) => panic!("expected fail-closed error, got a RoutingOutcome"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("no immediately-eligible candidate")
         );
     }
 }

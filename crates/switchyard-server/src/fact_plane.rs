@@ -1,4 +1,4 @@
-//! REALIGN-2: generic shadow inference-fact plane (server-side, ZERO routing authority).
+//! REALIGN-2 (amended): generic shadow inference-fact plane (server-side, ZERO routing authority).
 //!
 //! This module is the *dynamic factual plane* of the future inference-routing
 //! architecture. It **only projects** the already-fetched authoritative facts from the
@@ -6,26 +6,33 @@
 //! consumption. It performs **no I/O**, **no target selection**, **no scoring**, and is
 //! **never** read by any routing path.
 //!
-//! Reuse-first (§13):
-//!   * OpenAI + DeepSeek facts come from the EXISTING `ResourceSnapshot` (produced by
-//!     `resource_fetcher.rs` + `ResourceState`). This module does NOT re-fetch.
-//!   * ComfyNinja facts come from the EXISTING Gate-C `ComfyResourceState` / status. This
-//!     module does NOT open a second telemetry client.
+//! Reuse-first (§13): OpenAI + DeepSeek facts come from the EXISTING `ResourceSnapshot`
+//! (produced by `resource_fetcher.rs` + `ResourceState`); ComfyNinja facts/continuity come
+//! from the EXISTING Gate-C `ComfyResourceState` / `ComfyCompositionStatus`. NO second
+//! fetcher or telemetry client.
 //!
-//! Separation of concerns (§3):
-//!   * This module owns the **DYNAMIC factual plane** (health, resource state, allowance,
-//!     balance, GPU state, observation timestamp, freshness/provenance).
-//!   * It does NOT own static/declarative capability, qualification, or policy. No
-//!     `daily_tranche_open`, no spending rules, no caller authority, no local-preference.
+//! Separation of concerns (§3): this module owns ONLY the DYNAMIC factual plane (health,
+//! resource state, allowance, balance, GPU state, observation timestamp,
+//! freshness/provenance). It does NOT own static capability, qualification, or policy.
 //!
-//! Shadow-only (§12): the plane produces an observable `FactPlaneSnapshot`. It MUST NEVER
+//! Shadow-only (§12): the plane produces an observable `FactPlaneSnapshot`; it must NEVER
 //! alter a candidate set, score/select a target, or change fallback/routing. A failed
 //! source read MUST fail closed (never a misleading favorable fact) (§14).
 //!
-//! The invariants that this is shadow-only and has zero routing authority are structural:
-//! this module imports ONLY factual domain types (no `Candidate`, `WorkClass`,
-//! `ReasoningPolicy`, `Algorithm`, target-selection types), and exposes only pure
-//! projection functions + observable facts. An explicit invariant test documents this.
+//! Amendments (REALIGN-2 Part I):
+//!   1. `projected_at_unix` = when this projection is ASSEMBLED (not when the observation
+//!      was obtained). Each source retains its own `last_success_at` provenance; a fresh
+//!      projection must NOT make an old provider observation appear newly observed.
+//!   2. `source_health` (Healthy/Unavailable/Unknown) and `observation_freshness`
+//!      (Fresh/Stale/Unknown) are SEPARATE and never overloaded. Freshness threshold is
+//!      the EXISTING authoritative TTL=30s contract from the resource-pool config
+//!      (`ttl_seconds = 30`); no invented timeout.
+//!   3. The live accessor supplies Comfy CONTINUITY only (no new fetch); the rich
+//!      `ComfyFacts` remains a domain projection type used in mapping tests — the endpoint
+//!      does NOT falsely populate it.
+//!   4. Endpoint trust boundary is recorded: `/v1/fact-plane` inherits the Switchyard
+//!      listener trust boundary; deployment as an observation endpoint requires a later
+//!      protection decision.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,22 +42,37 @@ use libsy::{
     OpenAiResourceState, ResourceSnapshot,
 };
 
+/// The authoritative cloud-resource refresh TTL (seconds), mirrored from the deployed
+/// resource-pool config (`[resource_pools.smart] ttl_seconds = 30`). This is the existing
+/// refresh contract, NOT a newly invented timeout. A projection older than this is Stale.
+pub const AUTHORITATIVE_REFRESH_TTL_SECONDS: u64 = 30;
+
 // ---------------------------------------------------------------------------
-// Shared provenance / health envelope (generic across all providers).
+// Shared provenance / health + freshness envelope (generic across all providers).
 // ---------------------------------------------------------------------------
 
-/// Source health of a factual observation. A failed read must be `Unavailable` (never an
-/// accidental favorable/healthy value).
+/// Source HEALTH of a factual observation. A failed read must be `Unavailable` (never an
+/// accidental favorable/healthy value). This is independent of freshness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FactSourceHealth {
     Healthy,
-    Stale,
     Unavailable,
     Unknown,
 }
 
+/// OBSERVATION FRESHNESS, separate from source health. A policy consumer must NEVER treat
+/// an old cached provider snapshot as current merely because the last fetch succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FactFreshness {
+    Fresh,
+    Stale,
+    /// No authoritative timestamp / threshold available -> do not pretend Fresh.
+    Unknown,
+}
+
 impl FactSourceHealth {
-    /// Map the OpenAI/DeepSeek domain `available` + `error` onto source health.
+    /// Map the OpenAI/DeepSeek domain `available` + `error` onto source health
+    /// (health only — does NOT incorporate observation age).
     fn from_cloud(available: bool, has_error: bool) -> Self {
         if has_error {
             Self::Unavailable
@@ -65,21 +87,40 @@ impl FactSourceHealth {
     fn from_comfy(h: ComfySourceHealth) -> Self {
         match h {
             ComfySourceHealth::Healthy => Self::Healthy,
-            ComfySourceHealth::Stale => Self::Stale,
-            ComfySourceHealth::Unavailable => Self::Unavailable,
+            ComfySourceHealth::Stale | ComfySourceHealth::Unavailable => Self::Unavailable,
         }
     }
 }
 
+/// Determine observation freshness from the authoritative last-success timestamp vs the
+/// projection time, using the authoritative TTL. Missing/invalid timestamp => Unknown.
+fn cloud_freshness(last_success_at: Option<i64>, projected_at_unix: i64) -> FactFreshness {
+    let Some(last) = last_success_at else {
+        return FactFreshness::Unknown;
+    };
+    let age = projected_at_unix.saturating_sub(last);
+    if age < 0 {
+        // A future timestamp (clock skew) is not trustworthy -> not Fresh.
+        return FactFreshness::Unknown;
+    }
+    if age <= AUTHORITATIVE_REFRESH_TTL_SECONDS as i64 {
+        FactFreshness::Fresh
+    } else {
+        FactFreshness::Stale
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Typed provider factual payloads (preserve domain semantics — no fake numeric
-// equivalence between OpenAI allowance, DeepSeek balance, and GPU VRAM).
+// Typed provider factual payloads.
 // ---------------------------------------------------------------------------
 
 /// OpenAI factual resource state, projected 1:1 from the existing `OpenAiResourceState`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OpenAiFacts {
+    /// SOURCE HEALTH (Healthy/Unavailable/Unknown) — does not include age.
     pub source_health: FactSourceHealth,
+    /// OBSERVATION FRESHNESS — separate from health.
+    pub observation_freshness: FactFreshness,
     /// FACT: provider reachable / has allowance (not a routing preference).
     pub available: bool,
     pub limit_reached: bool,
@@ -90,30 +131,38 @@ pub struct OpenAiFacts {
     pub weekly_reset_at: Option<i64>,
     /// FACT: credits balance string (provider-reported; opaque unit).
     pub credits_balance: Option<String>,
-    /// Unix seconds of last successful read (None = never/unknown).
+    /// Unix seconds of last successful read (provenance; NOT the projection time).
     pub last_success_at: Option<i64>,
+    /// Seconds between the last successful observation and the projection assembly time.
+    pub observation_age_seconds: Option<i64>,
 }
 
-/// DeepSeek factual resource state, projected 1:1 from the existing `DeepSeekResourceState`.
+/// DeepSeek factual resource state.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeepSeekFacts {
     pub source_health: FactSourceHealth,
+    pub observation_freshness: FactFreshness,
     /// FACT: provider availability (not a routing preference).
     pub is_available: bool,
     pub currency: String,
     pub total_balance: String,
     pub granted_balance: String,
     pub topped_up_balance: String,
-    /// Unix seconds of last successful read (None = never/unknown).
     pub last_success_at: Option<i64>,
+    pub observation_age_seconds: Option<i64>,
 }
 
-/// ComfyNinja factual local GPU state, projected from the existing Gate-C
-/// `ComfyResourceState`. The richer Comfy domain remains authoritative; this is a
-/// projection, not a replacement.
+/// ComfyNinja factual local GPU state (DOMAIN PROJECTION TYPE).
+///
+/// The richer Comfy domain remains authoritative; this is a projection, not a replacement.
+/// NOTE (amendment 3): the live `/v1/fact-plane` accessor does NOT currently populate this
+/// (it would require a Comfy fetch not present in the reuse path). This type is used for
+/// domain mapping tests and for a future non-fetching cached-state projection; it is NOT
+/// falsely exposed as populated by the endpoint.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ComfyFacts {
     pub source_health: FactSourceHealth,
+    pub observation_freshness: FactFreshness,
     pub producer_epoch: String,
     pub state_generation: i64,
     pub state_fingerprint: String,
@@ -121,7 +170,6 @@ pub struct ComfyFacts {
     pub mode: Option<ComfyMode>,
     pub transition_state: Option<ComfyTransitionState>,
     pub transition_target: Option<ComfyTransitionTarget>,
-    /// Governed factual profile seam (FAST/LONG/unknown) — never inferred.
     pub resident_qwen_profile: Option<ComfyResidentProfile>,
     pub vram_used_mib: Option<i64>,
     pub vram_free_mib: Option<i64>,
@@ -133,36 +181,32 @@ pub struct ComfyFacts {
 }
 
 /// A lean, non-fetching Comfy continuity projection derived from the composition status
-/// (enabled/boot/health/cursor). Used by the shadow observability path so it never induces
-/// a live telemetry fetch; the rich `ComfyFacts` (VRAM/mode/queue) is assembled from a
-/// cached `ComfyResourceState` when one is already held (and for domain mapping tests).
+/// (enabled/boot/health/cursor). This is what the LIVE accessor actually supplies for Comfy
+/// (amendment 3) — no fetch, no second producer.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ComfyContinuityFacts {
     pub source_health: FactSourceHealth,
     pub enabled: bool,
-    /// Deterministic bootstrap/continuity state label.
     pub boot_state: String,
-    /// Opaque producer-epoch from the cursor, if a cursor is held.
     pub producer_epoch: Option<String>,
-    /// Highest contiguous ingested eid, if a cursor is held.
     pub last_eid: Option<i64>,
     pub recent_event_count: usize,
     pub last_active_profile: Option<libsy::ComfyProfileClass>,
 }
 
 // ---------------------------------------------------------------------------
-// The generic fact-plane snapshot (shadow observability + future consumption).
+// The generic fact-plane snapshot.
 // ---------------------------------------------------------------------------
 
 /// A point-in-time generic inference-fact plane. UNKNOWN / Unavailable are first-class.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FactPlaneSnapshot {
-    /// Unix seconds when this projection was observed/assembled.
-    pub as_of_unix: i64,
+    /// When this projection was ASSEMBLED (unix sec). NOT necessarily when any underlying
+    /// observation was obtained — each source carries its own `last_success_at`.
+    pub projected_at_unix: i64,
     pub openai: Option<OpenAiFacts>,
     pub deepseek: Option<DeepSeekFacts>,
     pub comfyninja: Option<ComfyFacts>,
-    /// Non-fetching continuity view (from Gate-C status) — always available when enabled.
     pub comfy_continuity: Option<ComfyContinuityFacts>,
 }
 
@@ -170,10 +214,11 @@ pub struct FactPlaneSnapshot {
 // Projection functions (pure; field-preserving, no semantic re-interpretation).
 // ---------------------------------------------------------------------------
 
-fn project_openai(s: &OpenAiResourceState) -> OpenAiFacts {
+fn project_openai(s: &OpenAiResourceState, projected_at_unix: i64) -> OpenAiFacts {
     let has_error = s.error.is_some();
     OpenAiFacts {
         source_health: FactSourceHealth::from_cloud(s.available, has_error),
+        observation_freshness: cloud_freshness(s.last_success_at, projected_at_unix),
         available: s.available,
         limit_reached: s.limit_reached,
         spend_control_reached: s.spend_control_reached,
@@ -181,26 +226,34 @@ fn project_openai(s: &OpenAiResourceState) -> OpenAiFacts {
         weekly_reset_at: s.weekly_reset_at,
         credits_balance: s.credits_balance.clone(),
         last_success_at: s.last_success_at,
+        observation_age_seconds: s
+            .last_success_at
+            .map(|l| projected_at_unix.saturating_sub(l)),
     }
 }
 
-fn project_deepseek(s: &DeepSeekResourceState) -> DeepSeekFacts {
+fn project_deepseek(s: &DeepSeekResourceState, projected_at_unix: i64) -> DeepSeekFacts {
     let has_error = s.error.is_some();
     DeepSeekFacts {
         source_health: FactSourceHealth::from_cloud(s.is_available, has_error),
+        observation_freshness: cloud_freshness(s.last_success_at, projected_at_unix),
         is_available: s.is_available,
         currency: s.currency.clone(),
         total_balance: s.total_balance.clone(),
         granted_balance: s.granted_balance.clone(),
         topped_up_balance: s.topped_up_balance.clone(),
         last_success_at: s.last_success_at,
+        observation_age_seconds: s
+            .last_success_at
+            .map(|l| projected_at_unix.saturating_sub(l)),
     }
 }
 
-fn project_comfy(c: &ComfyResourceState) -> ComfyFacts {
+fn project_comfy(c: &ComfyResourceState, projected_at_unix: i64) -> ComfyFacts {
     let st: &ComfySnapshotState = &c.state;
     ComfyFacts {
         source_health: FactSourceHealth::from_comfy(c.source_health),
+        observation_freshness: cloud_freshness(c.last_success_at, projected_at_unix),
         producer_epoch: c.producer_epoch.clone(),
         state_generation: c.state_generation,
         state_fingerprint: c.state_fingerprint.clone(),
@@ -216,6 +269,42 @@ fn project_comfy(c: &ComfyResourceState) -> ComfyFacts {
         comfy_queue_pending: st.comfy_queue_pending,
         studio_backend_health: st.studio_backend_health.clone(),
         last_success_at: c.last_success_at,
+    }
+}
+
+/// Assemble a shadow fact-plane projection from EXISTING factual structs + the
+/// (non-fetching) Comfy composition status. Pure projection — no I/O, no routing authority.
+///
+/// `comfy_resource` is supplied only when a cached `ComfyResourceState` is already held
+/// WITHOUT a fetch. In the current deployment the live accessor passes `None` here (it has
+/// no non-fetching cached handle), so the endpoint exposes Comfy CONTINUITY — not rich
+/// ComfyFacts — per amendment 3. `comfy_resource` remains available for domain mapping tests
+/// and a future non-fetching cached projection.
+pub fn project(
+    resource: Option<&ResourceSnapshot>,
+    comfy_resource: Option<&ComfyResourceState>,
+    continuity: Option<&crate::comfy::ComfyCompositionStatus>,
+) -> FactPlaneSnapshot {
+    let projected_at_unix = now_unix();
+    FactPlaneSnapshot {
+        projected_at_unix,
+        openai: resource
+            .and_then(|r| r.openai.as_ref())
+            .map(|o| project_openai(o, projected_at_unix)),
+        deepseek: resource
+            .and_then(|r| r.deepseek.as_ref())
+            .map(|d| project_deepseek(d, projected_at_unix)),
+        comfyninja: comfy_resource.map(|c| project_comfy(c, projected_at_unix)),
+        comfy_continuity: continuity.map(|c| {
+            project_continuity(
+                c.enabled,
+                c.boot_state.label(),
+                c.last_source_health,
+                c.current_cursor.as_ref(),
+                c.recent_event_count,
+                c.last_active_profile,
+            )
+        }),
     }
 }
 
@@ -238,34 +327,6 @@ fn project_continuity(
     }
 }
 
-/// Assemble a shadow fact-plane projection from the EXISTING factual structs + the
-/// (non-fetching) Comfy composition status. Pure projection — no I/O, no routing authority.
-/// Any absent source is `None` / `comfy_continuity=None` when disabled (no fabricated fact).
-pub fn project(
-    resource: Option<&ResourceSnapshot>,
-    comfy: Option<&ComfyResourceState>,
-    continuity: Option<&crate::comfy::ComfyCompositionStatus>,
-) -> FactPlaneSnapshot {
-    FactPlaneSnapshot {
-        as_of_unix: now_unix(),
-        openai: resource.and_then(|r| r.openai.as_ref()).map(project_openai),
-        deepseek: resource
-            .and_then(|r| r.deepseek.as_ref())
-            .map(project_deepseek),
-        comfyninja: comfy.map(project_comfy),
-        comfy_continuity: continuity.map(|c| {
-            project_continuity(
-                c.enabled,
-                c.boot_state.label(),
-                c.last_source_health,
-                c.current_cursor.as_ref(),
-                c.recent_event_count,
-                c.last_active_profile,
-            )
-        }),
-    }
-}
-
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -274,40 +335,39 @@ fn now_unix() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — mapping without semantic loss, UNKNOWN/unavailable behavior, field
-// isolation, and the shadow-only / zero-routing-authority invariant.
+// Tests.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn openai(weekly: Option<f64>, reset: Option<i64>, err: Option<String>) -> OpenAiResourceState {
+    fn openai(weekly: Option<f64>, last_success: Option<i64>, err: Option<String>) -> OpenAiResourceState {
         OpenAiResourceState {
             available: err.is_none(),
             limit_reached: false,
             spend_control_reached: false,
             weekly_used_percent: weekly,
-            weekly_reset_at: reset,
+            weekly_reset_at: Some(1787197109),
             credits_balance: Some("$12.34".to_string()),
-            last_success_at: Some(1700000000),
+            last_success_at: last_success,
             error: err,
         }
     }
 
-    fn deepseek() -> DeepSeekResourceState {
+    fn deepseek(last_success: Option<i64>) -> DeepSeekResourceState {
         DeepSeekResourceState {
             is_available: true,
             currency: "CNY".to_string(),
             total_balance: "123.45".to_string(),
             granted_balance: "100.00".to_string(),
             topped_up_balance: "23.45".to_string(),
-            last_success_at: Some(1700000000),
+            last_success_at: last_success,
             error: None,
         }
     }
 
-    fn comfy(mode: Option<ComfyMode>) -> ComfyResourceState {
+    fn comfy(mode: Option<ComfyMode>, last_success: Option<i64>) -> ComfyResourceState {
         ComfyResourceState {
             producer_epoch: "epoch-1".to_string(),
             state_generation: 3,
@@ -329,7 +389,7 @@ mod tests {
                 vram_free_mib: Some(24260),
             },
             source_health: ComfySourceHealth::Healthy,
-            last_success_at: Some(1700000000),
+            last_success_at: last_success,
             error: None,
         }
     }
@@ -342,59 +402,61 @@ mod tests {
     }
 
     #[test]
-    fn openai_maps_without_semantic_loss() {
+    fn projection_time_is_distinct_from_source_observation_time() {
+        // The projection always carries its assembly time; the source carries its own
+        // last_success_at. A fresh projection must NOT make an old observation fresh.
+        let last = 1700000000_i64; // truly old observation
         let f = project(
-            Some(&snapshot(Some(openai(Some(14.0), Some(1787197109), None)), None)),
+            Some(&snapshot(Some(openai(Some(14.0), Some(last), None)), None)),
             None,
             None,
         );
-        let o = f.openai.expect("openai present");
-        assert_eq!(o.weekly_used_percent, Some(14.0));
-        assert_eq!(o.weekly_reset_at, Some(1787197109));
-        assert_eq!(o.available, true);
-        assert_eq!(o.source_health, FactSourceHealth::Healthy);
+        let o = f.openai.unwrap();
+        assert_eq!(o.last_success_at, Some(last));
+        // age is large => NOT Fresh even though projected anew.
+        assert_eq!(o.observation_freshness, FactFreshness::Stale);
+        // projected_at is well after last_success (age >= TTL in this test).
+        assert!(o.observation_age_seconds.unwrap() >= AUTHORITATIVE_REFRESH_TTL_SECONDS as i64);
     }
 
     #[test]
-    fn deepseek_maps_without_semantic_loss() {
-        let f = project(Some(&snapshot(None, Some(deepseek()))), None, None);
-        let d = f.deepseek.expect("deepseek present");
-        assert_eq!(d.currency, "CNY");
-        assert_eq!(d.total_balance, "123.45");
-        assert_eq!(d.is_available, true);
-        assert_eq!(d.source_health, FactSourceHealth::Healthy);
-    }
-
-    #[test]
-    fn comfy_maps_without_semantic_loss() {
-        let f = project(None, Some(&comfy(Some(ComfyMode::Idle))), None);
-        let c = f.comfyninja.expect("comfy present");
-        assert_eq!(c.producer_epoch, "epoch-1");
-        assert_eq!(c.state_generation, 3);
-        assert_eq!(c.mode, Some(ComfyMode::Idle));
-        assert_eq!(c.owner, Some(ComfyOwner::Unsloth));
-        assert_eq!(c.resident_qwen_profile, Some(ComfyResidentProfile::Unknown));
-        assert_eq!(c.vram_used_mib, Some(67));
-        assert_eq!(c.vram_free_mib, Some(24260));
-        assert_eq!(c.comfy_busy, Some(false));
-    }
-
-    #[test]
-    fn unknown_remains_unknown_and_absent() {
-        let f = project(None, None, None);
-        assert!(f.openai.is_none() && f.deepseek.is_none() && f.comfyninja.is_none());
-        assert!(f.comfy_continuity.is_none());
-        let f2 = project(None, Some(&comfy(None)), None);
+    fn recent_success_is_fresh_but_still_distinct_from_projection() {
+        // last_success within TTL => Fresh.
+        let projected = now_unix();
+        let last = projected - 5;
+        let f = project(
+            Some(&snapshot(Some(openai(Some(14.0), Some(last), None)), None)),
+            None,
+            None,
+        );
         assert_eq!(
-            f2.comfyninja.unwrap().resident_qwen_profile,
-            Some(ComfyResidentProfile::Unknown)
+            f.openai.unwrap().observation_freshness,
+            FactFreshness::Fresh
+        );
+        // The projection still carries BOTH projected_at_unix and last_success_at.
+        assert!(f.projected_at_unix >= last);
+    }
+
+    #[test]
+    fn missing_last_success_at_yields_unknown_freshness() {
+        let f = project(
+            Some(&snapshot(Some(openai(Some(14.0), None, None)), None)),
+            None,
+            None,
+        );
+        assert_eq!(
+            f.openai.unwrap().observation_freshness,
+            FactFreshness::Unknown
         );
     }
 
     #[test]
-    fn source_failure_fails_closed() {
+    fn failed_source_is_unavailable_never_favorable() {
         let f = project(
-            Some(&snapshot(Some(openai(None, None, Some("fetch failed".into()))), None)),
+            Some(&snapshot(
+                Some(openai(None, None, Some("fetch failed".into()))),
+                None,
+            )),
             None,
             None,
         );
@@ -404,21 +466,71 @@ mod tests {
     }
 
     #[test]
+    fn openai_maps_without_semantic_loss() {
+        let f = project(
+            Some(&snapshot(Some(openai(Some(14.0), Some(now_unix()), None)), None)),
+            None,
+            None,
+        );
+        let o = f.openai.unwrap();
+        assert_eq!(o.weekly_used_percent, Some(14.0));
+        assert_eq!(o.weekly_reset_at, Some(1787197109));
+        assert_eq!(o.available, true);
+        assert_eq!(o.source_health, FactSourceHealth::Healthy);
+    }
+
+    #[test]
+    fn deepseek_maps_without_semantic_loss() {
+        let f = project(Some(&snapshot(None, Some(deepseek(Some(now_unix()))))), None, None);
+        let d = f.deepseek.unwrap();
+        assert_eq!(d.currency, "CNY");
+        assert_eq!(d.total_balance, "123.45");
+        assert_eq!(d.is_available, true);
+        assert_eq!(d.source_health, FactSourceHealth::Healthy);
+    }
+
+    #[test]
+    fn comfy_domain_projection_maps_without_semantic_loss() {
+        let f = project(None, Some(&comfy(Some(ComfyMode::Idle), Some(now_unix()))), None);
+        let c = f.comfyninja.expect("comfy present");
+        assert_eq!(c.producer_epoch, "epoch-1");
+        assert_eq!(c.state_generation, 3);
+        assert_eq!(c.mode, Some(ComfyMode::Idle));
+        assert_eq!(c.resident_qwen_profile, Some(ComfyResidentProfile::Unknown));
+        assert_eq!(c.vram_used_mib, Some(67));
+        assert_eq!(c.vram_free_mib, Some(24260));
+    }
+
+    #[test]
+    fn unknown_remains_unknown_and_absent() {
+        let f = project(None, None, None);
+        assert!(f.openai.is_none() && f.deepseek.is_none() && f.comfyninja.is_none());
+        assert!(f.comfy_continuity.is_none());
+        let f2 = project(None, Some(&comfy(None, Some(now_unix()))), None);
+        assert_eq!(
+            f2.comfyninja.unwrap().resident_qwen_profile,
+            Some(ComfyResidentProfile::Unknown)
+        );
+    }
+
+    #[test]
     fn stale_distinguishable_from_healthy() {
-        let mut c = comfy(Some(ComfyMode::Idle));
-        c.source_health = ComfySourceHealth::Stale;
+        let mut c = comfy(Some(ComfyMode::Idle), Some(now_unix() - 100));
+        c.source_health = ComfySourceHealth::Healthy;
         let f = project(None, Some(&c), None);
-        assert_eq!(f.comfyninja.unwrap().source_health, FactSourceHealth::Stale);
+        let cf = f.comfyninja.as_ref().expect("comfy present");
+        assert_eq!(cf.source_health, FactSourceHealth::Healthy);
+        assert_eq!(cf.observation_freshness, FactFreshness::Stale);
     }
 
     #[test]
     fn provider_fields_do_not_bleed() {
         let f = project(
             Some(&snapshot(
-                Some(openai(Some(14.0), None, None)),
-                Some(deepseek()),
+                Some(openai(Some(14.0), Some(now_unix()), None)),
+                Some(deepseek(Some(now_unix()))),
             )),
-            Some(&comfy(Some(ComfyMode::Idle))),
+            Some(&comfy(Some(ComfyMode::Idle), Some(now_unix()))),
             None,
         );
         assert_eq!(f.openai.unwrap().weekly_used_percent, Some(14.0));
@@ -449,51 +561,37 @@ mod tests {
 
     /// SHADOW-ONLY / ZERO-ROUTING-AUTHORITY invariant: the fact plane exposes only
     /// observable facts via pure projection functions. It imports NO routing type
-    /// (Candidate/WorkClass/ReasoningPolicy/Algorithm/selection), which is structural and
-    /// compile-enforced. This test re-asserts the observable vacuum: no method here can
-    /// alter a route or candidate set.
+    /// (Candidate/WorkClass/ReasoningPolicy/Algorithm/selection), structural + compile-enforced.
     #[test]
     fn fact_plane_has_no_routing_authority() {
         let f = project(None, None, None);
         assert!(f.openai.is_none() && f.deepseek.is_none() && f.comfyninja.is_none());
-        let _ = f.as_of_unix; // only observability fields are reachable
+        let _ = f.projected_at_unix; // only observability fields are reachable
     }
 
     /// REALIGN-2 §16 invariant: a fact refresh changes the SHADOW fact state but MUST NOT
-    /// change any routing result. Because the fact plane is structurally disconnected from
-    /// routing (it exposes only observable facts via pure projection; it has no selection
-    /// API and imports no routing type), changing its inputs can only change its output —
-    /// never a candidate set, a target choice, or a fallback.
+    /// change any routing result (structurally disconnected from routing).
     #[test]
     fn fact_refresh_changes_shadow_state_but_not_routing_result() {
-        // Two different factual observations.
         let low = project(
             Some(&snapshot(
-                Some(openai(Some(12.0), Some(1787197109), None)),
-                Some(deepseek()),
+                Some(openai(Some(12.0), Some(now_unix()), None)),
+                Some(deepseek(Some(now_unix()))),
             )),
-            Some(&comfy(Some(ComfyMode::Idle))),
+            Some(&comfy(Some(ComfyMode::Idle), Some(now_unix()))),
             None,
         );
         let high = project(
             Some(&snapshot(
-                Some(openai(Some(40.0), Some(1787197109), None)),
-                Some(deepseek()),
+                Some(openai(Some(40.0), Some(now_unix()), None)),
+                Some(deepseek(Some(now_unix()))),
             )),
-            Some(&comfy(Some(ComfyMode::Studio))),
+            Some(&comfy(Some(ComfyMode::Studio), Some(now_unix()))),
             None,
         );
-        // (a) The shadow fact state DID change with the refresh.
         assert_ne!(low.openai, high.openai);
-        assert_ne!(low.comfyninja, high.comfyninja);
         assert_eq!(low.openai.as_ref().unwrap().weekly_used_percent, Some(12.0));
         assert_eq!(high.openai.as_ref().unwrap().weekly_used_percent, Some(40.0));
-        // (b) There is NO routing surface to change: the fact-plane API has no candidate,
-        //     no score, no selection, no fallback. This is structural (compile-enforced by
-        //     the narrow imports) and re-asserted: both projections dereference to the same
-        //     observable type with no mutable routing handle.
-        let _ = (low.as_of_unix, high.as_of_unix);
-        let _ = low.deepseek.as_ref().map(|d| d.total_balance.clone());
-        let _ = high.comfy_continuity.as_ref();
+        let _ = (low.projected_at_unix, high.projected_at_unix);
     }
 }

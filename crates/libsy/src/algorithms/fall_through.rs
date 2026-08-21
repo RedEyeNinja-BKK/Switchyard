@@ -966,4 +966,549 @@ mod tests {
         assert!(states.contains_key("session-1"));
         assert!(!states.contains_key("session-2"));
     }
+
+    // ------------------------------------------------------------------
+    // REALIGN-1B disposable proof: authority-safe candidate set + fallback contract.
+    // ------------------------------------------------------------------
+    #[cfg(test)]
+    mod authority_safe_proof {
+    use super::*;
+    use crate::core::classifier::{Classification, Score};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use switchyard_protocol::{LlmClientError, text_request};
+
+    // ---------------- GENERIC FACT PLANE (provider-agnostic) --------------------
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Thinking {
+        Thinking,
+        NonThinking,
+        Both,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PressureTier {
+        Normal,
+        Conserve,
+        StrongConserve,
+    }
+
+    /// Generic target fact: facts + capability + policy pressure. No routing decisions.
+    #[derive(Clone, Debug)]
+    pub struct TargetFact {
+        pub target_id: &'static str,
+        pub available: bool,
+        pub qualified: bool,
+        pub ready: bool,
+        pub thinking: Thinking,
+        pub pressure: PressureTier,
+        pub service_class: &'static str,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct FactState {
+        pub targets: Vec<TargetFact>,
+    }
+
+    /// Per-request capability contract supplied by the caller/route.
+    #[derive(Clone, Copy, Debug)]
+    pub struct RequestContract {
+        pub service_class: &'static str,
+        pub thinking: Thinking,
+        pub pinned: Option<&'static str>,
+    }
+
+    // ---------------- GENERIC FACT INJECTOR (Processor<FactState>) --------------
+
+    #[derive(Clone, Debug)]
+    pub struct FactInjector {
+        pub fixture: fn(&'static str) -> TargetFact,
+        pub ids: Vec<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Processor<FactState> for FactInjector {
+        async fn process(&self, state: &mut FactState, _e: Event<'_>) -> crate::Result<()> {
+            state.targets.clear();
+            state
+                .targets
+                .extend(self.ids.iter().copied().map(self.fixture));
+            Ok(())
+        }
+    }
+
+    // ---------------- GENERIC ADMISSIBILITY CLASSIFIER --------------------------
+
+    pub struct AdmissibleClassifier {
+        pub contract: RequestContract,
+    }
+
+    impl AdmissibleClassifier {
+        /// Admissible = available + service-class + qualified + thinking-compatible +
+        /// ready-now. Readiness is a SELECTION gate here, NOT a permanent ineligibility
+        /// (RE-1 will allow a transition-cost override for qualified-not-ready targets).
+        pub fn admissible_target(&self, t: &TargetFact) -> bool {
+            if let Some(pinned) = self.contract.pinned {
+                return t.target_id == pinned && t.available && t.qualified;
+            }
+            if !t.available || !t.qualified || !t.ready {
+                return false;
+            }
+            if t.service_class != self.contract.service_class {
+                return false;
+            }
+            matches!(
+                (self.contract.thinking, t.thinking),
+                (Thinking::Thinking, Thinking::Thinking | Thinking::Both)
+                    | (Thinking::NonThinking, Thinking::NonThinking | Thinking::Both)
+                    | (Thinking::Both, _)
+            )
+        }
+
+        pub fn admissible(&self, state: &FactState) -> BTreeSet<String> {
+            state
+                .targets
+                .iter()
+                .filter(|t| self.admissible_target(t))
+                .map(|t| t.target_id.to_string())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Classifier<FactState> for AdmissibleClassifier {
+        async fn score(
+            &self,
+            state: &mut FactState,
+            _req: &mut Request,
+            _driver: Option<&Driver>,
+        ) -> crate::Result<(Classification, Option<Response>)> {
+            let mut scores = Vec::new();
+            for t in state.targets.iter() {
+                if !self.admissible_target(t) {
+                    continue;
+                }
+                let mut conf = 0.6f64;
+                match t.pressure {
+                    PressureTier::Normal => {}
+                    PressureTier::Conserve => conf += 0.1,
+                    PressureTier::StrongConserve => conf -= 0.25,
+                }
+                scores.push(Score {
+                    confidence: conf,
+                    target: ModelId::from(t.target_id),
+                });
+            }
+            Ok((Classification::Scores(scores), None))
+        }
+    }
+
+    // ---------------- STOCK-FALLBACK GAP PROOFS (deliverables 2, 3) -------------
+
+    fn req() -> Request {
+        Request {
+            llm_request: text_request(Some("none".into()), "x"),
+            raw_request: None,
+            metadata: None,
+        }
+    }
+
+    /// Drive a stock FallThrough and return (selected, fallback list).
+    async fn drive_stock(
+        targets: &'static [&'static str],
+        contract: RequestContract,
+        with_default: bool,
+        fixture: fn(&'static str) -> TargetFact,
+    ) -> crate::Result<(String, Vec<String>)> {
+        let ids: &[&'static str] = targets;
+        let target_ids: Vec<ModelId> = targets.iter().map(|s| ModelId::from(*s)).collect();
+        let mut router = FallThrough::<FactState>::new_with_state(target_ids)
+            .with_name("stock-gap")
+            .with_processor(Arc::new(FactInjector { fixture, ids: ids.to_vec() }))
+            .with_classifier(Arc::new(AdmissibleClassifier { contract }));
+        if with_default {
+            // stock terminal: never abstains
+            router = router.with_classifier(Arc::new(DefaultTarget::new(ModelId::from(
+                targets[targets.len() - 1],
+            ))));
+        }
+        let outcome = crate::drive(Arc::new(router), req(), |_c| {
+            Box::pin(async { Ok(()) })
+        })
+        .await?;
+        let fb: Vec<String> = outcome
+            .fallback_models
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        Ok((outcome.selected_model_id.to_string(), fb))
+    }
+
+    // ---------------- SCENARIOS (synthetic fixtures, no real provider) ----------
+
+    pub mod fx {
+        use super::*;
+        pub const LUNA: &str = "openai/gpt-5.6-luna";
+        pub const SOL: &str = "openai/gpt-5.6-sol";
+        pub const FLASH: &str = "deepseek/flash";
+        pub const LOCAL_QR: &str = "local/qwen-fast";
+        pub const LOCAL_NOTREADY: &str = "local/notready";
+        pub const LOCAL_UNQUAL: &str = "local/unqualified";
+
+        pub fn cloud_all_thinking(id: &'static str) -> TargetFact {
+            TargetFact {
+                target_id: id,
+                available: true,
+                qualified: true,
+                ready: true,
+                thinking: Thinking::Thinking,
+                pressure: PressureTier::Normal,
+                service_class: "generation",
+            }
+        }
+        pub fn sol_unavailable(id: &'static str) -> TargetFact {
+            TargetFact {
+                target_id: id,
+                available: id != SOL,
+                qualified: true,
+                ready: true,
+                thinking: Thinking::Thinking,
+                pressure: PressureTier::Normal,
+                service_class: "generation",
+            }
+        }
+        pub fn mixed_thinking(id: &'static str) -> TargetFact {
+            TargetFact {
+                target_id: id,
+                available: true,
+                qualified: true,
+                ready: true,
+                thinking: if id.contains("openai") {
+                    Thinking::Thinking
+                } else {
+                    Thinking::NonThinking
+                },
+                pressure: if id.contains("luna") {
+                    PressureTier::StrongConserve
+                } else {
+                    PressureTier::Normal
+                },
+                service_class: "generation",
+            }
+        }
+        pub fn local(id: &'static str) -> TargetFact {
+            TargetFact {
+                target_id: id,
+                available: true,
+                qualified: id != LOCAL_UNQUAL,
+                ready: id != LOCAL_NOTREADY,
+                thinking: Thinking::NonThinking,
+                pressure: PressureTier::Normal,
+                service_class: "generation",
+            }
+        }
+    }
+
+    // ---- CONFIRM the stock fallback-escape (gap 1) ------------------------------
+
+    #[tokio::test]
+    async fn confirms_stock_fallback_escapes_unavailable_target() -> crate::Result<()> {
+        // Targets = full static fleet. Sol is unavailable. Classifier excludes it at
+        // primary; stock fallbacks() = every static target except the selected one, so
+        // the unavailable Sol target WILL appear in the terminal fallback list. This is
+        // the authority gap: a gate-rejected target escapes into fallback.
+        let (sel, fb) = drive_stock(
+            &[fx::LUNA, fx::SOL, fx::FLASH],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::Both,
+                pinned: None,
+            },
+            true, // with DefaultTarget
+            fx::sol_unavailable,
+        )
+        .await?;
+        // CONFIRMED FINDING: the unavailable Sol appears in the stock terminal fallback
+        // list. This documents the gap positively (the assertion asserts the leak exists),
+        // so the proof records the stock behavior rather than merely failing.
+        assert_ne!(sel, fx::SOL, "sol unavailable so must not be primary");
+        assert!(
+            fb.contains(&fx::SOL.to_string()),
+            "expected stock fallback to leak unavailable target; got {fb:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn confirms_stock_defaulttarget_fails_open() -> crate::Result<()> {
+        // All targets unavailable -> classifier abstains -> DefaultTarget picks flash
+        // (fail open), NOT a no-eligible-target error.
+        let out = drive_stock(
+            &[fx::LUNA, fx::SOL, fx::FLASH],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::Both,
+                pinned: None,
+            },
+            true, // DefaultTarget present
+            |_| TargetFact {
+                target_id: "x",
+                available: false,
+                qualified: true,
+                ready: true,
+                thinking: Thinking::Thinking,
+                pressure: PressureTier::Normal,
+                service_class: "generation",
+            },
+        )
+        .await;
+        // default target rescued an empty admissible set => NOT a no-eligible result
+        let (sel, _) = out.unwrap();
+        assert_eq!(sel, fx::FLASH, "DefaultTarget failed OPEN instead of no-eligible");
+        Ok(())
+    }
+
+    // ---- AUTHORITY-SAFE PATTERN (deliverables 4, 8, 9, 10) ---------------------
+
+    /// Build an authority-safe composition:
+    ///   admissible := AdmissibleClassifier{contract}.admissible(state)
+    ///   targets    := admissible            (so stock fallbacks() = admissible-minus-selected)
+    ///   DefaultTarget OMITTED for the no-eligible case.
+    async fn drive_safe(
+        ids: &'static [&'static str],
+        contract: RequestContract,
+        fixture: fn(&'static str) -> TargetFact,
+    ) -> crate::Result<(String, Vec<String>)> {
+        // 1. compute admissible
+        let mut st = FactState::default();
+        FactInjector { fixture, ids: ids.to_vec() }
+            .process(&mut st, Event::Request(&mut req()))
+            .await?;
+        let admissible = AdmissibleClassifier { contract }.admissible(&st);
+        if admissible.is_empty() {
+            // explicit no-eligible-target (the authority-safe semantic)
+            return Err(LibsyError::AlgorithmError {
+                message: "no eligible target for this request".to_string(),
+            });
+        }
+        let targets: Vec<ModelId> =
+            admissible.iter().map(|s| ModelId::from(s.as_str())).collect();
+
+        // 2. build FallThrough with targets = admissible, classifier only (NO DefaultTarget)
+        let mut router = FallThrough::<FactState>::new_with_state(targets.clone())
+            .with_name("authority-safe")
+            .with_processor(Arc::new(FactInjector { fixture, ids: ids.to_vec() }))
+            .with_classifier(Arc::new(AdmissibleClassifier { contract }));
+        if let Some(pinned) = contract.pinned {
+            // pinned + no caller fallback authorization => fallback empty; add a terminal
+            // that routes to the pin only if it is admissible (it is, by construction).
+            router = router.with_classifier(Arc::new(DefaultTarget::new(ModelId::from(pinned))));
+        } else {
+            // closed cascade to the top admissible target (still within the admissible set)
+            let top = targets.first().cloned().unwrap();
+            router = router.with_classifier(Arc::new(DefaultTarget::new(top)));
+        }
+        let outcome = crate::drive(Arc::new(router), req(), |_c| {
+            Box::pin(async { Ok(()) })
+        })
+        .await?;
+        let fb: Vec<String> = outcome
+            .fallback_models
+            .iter()
+            .map(|m| m.to_string())
+            .collect();
+        Ok((outcome.selected_model_id.to_string(), fb))
+    }
+
+    use fx::*;
+
+    #[tokio::test]
+    async fn pin_sol_no_fallback() -> crate::Result<()> {
+        // A: pin sol; fallback must be empty (no luna/deepseek/local substitution).
+        let (sel, fb) = drive_safe(
+            &[LUNA, SOL, FLASH],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::Both,
+                pinned: Some(SOL),
+            },
+            cloud_all_thinking,
+        )
+        .await?;
+        assert_eq!(sel, SOL);
+        assert!(fb.is_empty(), "pin must have empty fallback, got {fb:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn constrained_thinking_no_nonthinking_escape() -> crate::Result<()> {
+        // B: thinking envelope -> non-thinking deepseek cannot appear primary or fallback.
+        let (sel, fb) = drive_safe(
+            &[LUNA, FLASH],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::Thinking,
+                pinned: None,
+            },
+            mixed_thinking,
+        )
+        .await?;
+        assert!(!sel.contains("deepseek"), "non-thinking selected: {sel}");
+        assert!(
+            fb.iter().all(|x| !x.contains("deepseek")),
+            "non-thinking escaped fallback: {fb:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn constrained_nonthinking_no_thinking_escape() -> crate::Result<()> {
+        // C: non-thinking envelope -> thinking OpenAI cannot appear primary or fallback.
+        let (sel, fb) = drive_safe(
+            &[LUNA, FLASH],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::NonThinking,
+                pinned: None,
+            },
+            mixed_thinking,
+        )
+        .await?;
+        assert!(sel.contains("deepseek"), "wrong primary: {sel}");
+        assert!(
+            fb.iter().all(|x| !x.contains("openai")),
+            "thinking escaped fallback: {fb:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_target_never_in_primary_or_fallback() -> crate::Result<()> {
+        // D: unavailable sol must not appear primary or fallback.
+        let (sel, fb) = drive_safe(
+            &[LUNA, SOL, FLASH],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::Both,
+                pinned: None,
+            },
+            sol_unavailable,
+        )
+        .await?;
+        assert_ne!(sel, SOL);
+        assert!(
+            !fb.contains(&SOL.to_string()),
+            "unavailable leaked into fallback: {fb:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_qualified_ready_participates_others_excluded() -> crate::Result<()> {
+        // F: qualified+ready local participates; ready-but-unqualified and
+        // unqualified-but-ready do not. (Readiness is a selection gate, not a permanent
+        // ineligibility label.)
+        let (sel, fb) = drive_safe(
+            &[LOCAL_QR, LOCAL_NOTREADY, LOCAL_UNQUAL],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::NonThinking,
+                pinned: None,
+            },
+            local,
+        )
+        .await?;
+        assert_eq!(sel, LOCAL_QR);
+        assert!(fb.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_eligible_target_is_explicit_error_not_failopen() -> crate::Result<()> {
+        // G: all unavailable -> explicit no-eligible-target error (no DefaultTarget escape).
+        let out = drive_safe(
+            &[LUNA, SOL, FLASH],
+            RequestContract {
+                service_class: "generation",
+                thinking: Thinking::Both,
+                pinned: None,
+            },
+            |_| TargetFact {
+                target_id: "x",
+                available: false,
+                qualified: true,
+                ready: true,
+                thinking: Thinking::Thinking,
+                pressure: PressureTier::Normal,
+                service_class: "generation",
+            },
+        )
+        .await;
+        assert!(out.is_err(), "expected no-eligible-target error, got Ok");
+        Ok(())
+    }
+    // ---- scenario H (mandatory): selected-target runtime failure -> every attempted
+    // terminal fallback stays inside the admissible candidate set. -----------------
+
+    #[tokio::test]
+    async fn h_primary_failure_fallback_stays_in_admissible_set() -> crate::Result<()> {
+        // Admissible set (thinking envelope): luna + flash (luna + flash available,
+        // thinking-compatible). Sol is factually unavailable -> must NEVER appear in
+        // primary OR any terminal fallback.
+        let ids: &[&'static str] = &[LUNA, SOL, FLASH];
+        let contract = RequestContract {
+            service_class: "generation",
+            thinking: Thinking::Thinking,
+            pinned: None,
+        };
+        let fixture = sol_unavailable;
+
+        // 1. compute admissible
+        let mut st = FactState::default();
+        FactInjector {
+            fixture,
+            ids: ids.to_vec(),
+        }
+        .process(&mut st, Event::Request(&mut req()))
+        .await?;
+        let admissible = AdmissibleClassifier { contract }.admissible(&st);
+        assert!(!admissible.contains(&SOL.to_string()), "sol must be excluded");
+
+        // 2. build authority-safe composition (targets = admissible set, DefaultTarget
+        //    within the admissible set only)
+        let targets: Vec<ModelId> =
+            admissible.iter().map(|s| ModelId::from(s.as_str())).collect();
+        let top = targets.first().cloned().unwrap();
+        let router = FallThrough::<FactState>::new_with_state(targets.clone())
+            .with_name("authority-safe-H")
+            .with_processor(Arc::new(FactInjector { fixture, ids: ids.to_vec() }))
+            .with_classifier(Arc::new(AdmissibleClassifier { contract }))
+            .with_classifier(Arc::new(DefaultTarget::new(top)));
+
+        // 3. drive with a serve that FAILS the primary with a fallback-eligible transport
+        //    error, so the caller would advance to fallback_models.
+        let outcome = crate::drive(Arc::new(router), req(), |_call| {
+            Box::pin(async {
+                Err(LibsyError::client_call(
+                    ModelId::from("openai/gpt-5.6-luna"),
+                    LlmClientError::Transport {
+                        source: std::io::Error::other("simulated transport failure").into(),
+                    },
+                ))
+            })
+        })
+        .await?;
+
+        // 4. THE CONTRACT: every terminal fallback is inside the admissible set; sol and
+        //    any non-thinking target can never be attempted.
+        for m in &outcome.fallback_models {
+            assert!(
+                admissible.contains(&m.to_string()),
+                "fallback {m} outside admissible set {admissible:?}"
+            );
+        }
+        Ok(())
+    }
+    }
 }

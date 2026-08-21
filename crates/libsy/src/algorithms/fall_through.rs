@@ -966,4 +966,272 @@ mod tests {
         assert!(states.contains_key("session-1"));
         assert!(!states.contains_key("session-2"));
     }
+
+    // ------------------------------------------------------------------
+    // REALIGN-1 disposable proof: generic inference-fact seam on native FallThrough.
+    // ------------------------------------------------------------------
+    #[cfg(test)]
+    mod fact_plane_proof {
+    use super::*;
+    use crate::core::classifier::Score as NativeScore;
+    use crate::core::testing::{Serve, echo, test_drive};
+    use std::sync::Arc;
+    use switchyard_protocol::text_request;
+
+    // ---- FACT PLANE (generic, provider-agnostic) --------------------------------
+
+    /// POLICY pacing signal. NEVER factual eligibility.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PressureTier {
+        Normal,
+        Conserve,
+        StrongConserve,
+    }
+
+    /// Qualification is DISTINCT from readiness (qualified-but-not-ready etc.).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Qualification {
+        Qualified,
+        Unqualified,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Readiness {
+        Ready,
+        NotReady,
+        Unknown,
+    }
+
+    /// Generic typed fact for one target, independent of provider.
+    #[derive(Clone, Debug)]
+    pub struct TargetFact {
+        pub target_id: &'static str,
+        /// FACT: reachable / allowance available. NOT a routing preference.
+        pub available: bool,
+        pub qualification: Qualification,
+        pub readiness: Readiness,
+        /// POLICY pressure (pacing).
+        pub pressure: PressureTier,
+        pub service_class: &'static str,
+    }
+
+    /// Composition state the processor fills and the classifier reads.
+    #[derive(Clone, Debug, Default)]
+    pub struct FactState {
+        pub targets: Vec<TargetFact>,
+    }
+
+    // ---- FACT INJECTOR: a GENERIC Processor<FactState> --------------------------
+    // Folds a synthetic external fact snapshot in per request. In production a fact
+    // producer (Comfy-style seam) supplies it. It REFRESHES facts; it never routes.
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct FactInjector {
+        pub preset: u8,
+    }
+
+    const TWO: &[&str] = &["openai/gpt-5.6-luna", "deepseek/flash"];
+
+    impl FactInjector {
+        fn snapshot(&self, id: &'static str) -> TargetFact {
+            match self.preset {
+                0 => TargetFact {
+                    // both cloud healthy, normal pace
+                    target_id: id,
+                    available: true,
+                    qualification: Qualification::Qualified,
+                    readiness: Readiness::Ready,
+                    pressure: PressureTier::Normal,
+                    service_class: "generation",
+                },
+                1 => TargetFact {
+                    // OpenAI factually exhausted (available=false)
+                    target_id: id,
+                    available: !id.contains("openai"),
+                    qualification: Qualification::Qualified,
+                    readiness: Readiness::Ready,
+                    pressure: PressureTier::Normal,
+                    service_class: "generation",
+                },
+                _ => TargetFact {
+                    // OpenAI ahead of budget -> StrongConserve (still available)
+                    target_id: id,
+                    available: true,
+                    qualification: Qualification::Qualified,
+                    readiness: Readiness::Ready,
+                    pressure: if id.contains("openai") {
+                        PressureTier::StrongConserve
+                    } else {
+                        PressureTier::Normal
+                    },
+                    service_class: "generation",
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Processor<FactState> for FactInjector {
+        async fn process(&self, state: &mut FactState, _ev: Event<'_>) -> crate::Result<()> {
+            state.targets.clear();
+            state.targets.extend(TWO.iter().copied().map(|id| self.snapshot(id)));
+            Ok(())
+        }
+    }
+
+    // ---- FACT-AWARE CLASSIFIER: a GENERIC Classifier<FactState> -----------------
+    // Reads the fact plane and scores via the same trait stage/llm_class use.
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct FactAwareClassifier {
+        pub wanted_service: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Classifier<FactState> for FactAwareClassifier {
+        async fn score(
+            &self,
+            state: &mut FactState,
+            _request: &mut Request,
+            _driver: Option<&Driver>,
+        ) -> crate::Result<(Classification, Option<Response>)> {
+            let mut scores = Vec::new();
+            for t in state.targets.iter() {
+                if !t.available {
+                    continue; // factually unavailable -> fail-closed
+                }
+                if t.service_class != self.wanted_service {
+                    continue; // generation vs embedding/rerank separation
+                }
+                if t.qualification == Qualification::Unqualified {
+                    continue; // READY but NOT QUALIFIED -> skip
+                }
+                if t.readiness != Readiness::Ready {
+                    continue; // QUALIFIED but NOT READY -> skip
+                }
+                let mut confidence = 0.5_f64;
+                match t.pressure {
+                    PressureTier::Normal => {}
+                    PressureTier::Conserve => confidence += 0.10,
+                    PressureTier::StrongConserve => confidence -= 0.30,
+                }
+                scores.push(NativeScore {
+                    confidence,
+                    target: ModelId::from(t.target_id),
+                });
+            }
+            Ok((Classification::Scores(scores), None))
+        }
+    }
+
+    // ---- Composition + scenario proofs -----------------------------------------
+
+    fn req() -> Request {
+        Request {
+            llm_request: text_request(Some("ignored".into()), "run a turn"),
+            raw_request: None,
+            metadata: None,
+        }
+    }
+
+    fn router_cloudenv(preset: u8) -> Arc<dyn Algorithm> {
+        Arc::new(
+            FallThrough::<FactState>::new_with_state(vec![
+                ModelId::from("openai/gpt-5.6-luna"),
+                ModelId::from("deepseek/flash"),
+            ])
+            .with_name("realign1-fact-plane")
+            .with_processor(Arc::new(FactInjector { preset }))
+            .with_classifier(Arc::new(FactAwareClassifier {
+                wanted_service: "generation",
+            }))
+            .with_classifier(Arc::new(DefaultTarget::new(ModelId::from(
+                "deepseek/flash",
+            )))),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_both_healthy_routes_to_preference() -> crate::Result<()> {
+        let (sel, _) = test_drive(router_cloudenv(0), req(), echo()).await?;
+        assert_eq!(sel.to_string(), "openai/gpt-5.6-luna");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn b_openai_exhausted_routes_to_deepseek() -> crate::Result<()> {
+        let (sel, _) = test_drive(router_cloudenv(1), req(), echo()).await?;
+        assert_eq!(sel.to_string(), "deepseek/flash");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn c_openai_ahead_of_pressure_prefers_deepseek_not_hard_excluded() -> crate::Result<()> {
+        let (sel, _) = test_drive(router_cloudenv(2), req(), echo()).await?;
+        // StrongConserve lowers OpenAI confidence -> DeepSeek (Normal) wins here,
+        // proving pacing is a PREFERENCE not a hard exclusion (OpenAI stays eligible).
+        assert_eq!(sel.to_string(), "deepseek/flash");
+        Ok(())
+    }
+
+    // ---- gate-specific: qualification + readiness (future local fleet) ---------
+
+    struct LocalGateInjector;
+
+    #[async_trait::async_trait]
+    impl Processor<FactState> for LocalGateInjector {
+        async fn process(&self, state: &mut FactState, _ev: Event<'_>) -> crate::Result<()> {
+            state.targets = vec![
+                TargetFact {
+                    target_id: "local/qualified-ready",
+                    available: true,
+                    qualification: Qualification::Qualified,
+                    readiness: Readiness::Ready,
+                    pressure: PressureTier::Normal,
+                    service_class: "generation",
+                },
+                TargetFact {
+                    target_id: "local/qualified-notready",
+                    available: true,
+                    qualification: Qualification::Qualified,
+                    readiness: Readiness::NotReady,
+                    pressure: PressureTier::Normal,
+                    service_class: "generation",
+                },
+                TargetFact {
+                    target_id: "local/unqualified-ready",
+                    available: true,
+                    qualification: Qualification::Unqualified,
+                    readiness: Readiness::Ready,
+                    pressure: PressureTier::Normal,
+                    service_class: "generation",
+                },
+            ];
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn d_only_qualified_and_ready_local_target_is_selected() -> crate::Result<()> {
+        let router: Arc<dyn Algorithm> = Arc::new(
+            FallThrough::<FactState>::new_with_state(vec![
+                ModelId::from("local/qualified-ready"),
+                ModelId::from("local/qualified-notready"),
+                ModelId::from("local/unqualified-ready"),
+            ])
+            .with_name("realign1-local-gates")
+            .with_processor(Arc::new(LocalGateInjector))
+            .with_classifier(Arc::new(FactAwareClassifier {
+                wanted_service: "generation",
+            }))
+            .with_classifier(Arc::new(DefaultTarget::new(ModelId::from(
+                "local/qualified-ready",
+            )))),
+        );
+        let (sel, _) = test_drive(router.clone(), req(), echo()).await?;
+        assert_eq!(sel.to_string(), "local/qualified-ready");
+        Ok(())
+    }
+    }
+
 }

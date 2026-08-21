@@ -927,6 +927,21 @@ async fn handle_llm_request(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    // Preserve the caller's pre-resolution route alias independently of the
+    // resolved physical model. At this point `request.llm_request.model` is
+    // still the requested alias (the algorithm stamps the selected model onto
+    // it only during `run` below). It stays absent when no model was supplied.
+    let routing_log_context = routing_log_context.map(|context| {
+        match request
+            .llm_request
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
+            Some(requested) => context.with_requested_route(requested.to_owned()),
+            None => context,
+        }
+    });
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let algorithm = Arc::clone(&route.algorithm);

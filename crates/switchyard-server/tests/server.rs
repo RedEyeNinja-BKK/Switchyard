@@ -831,6 +831,15 @@ async fn send(app: &Router, method: &str, path: &str, body: Option<Value>) -> Te
     send_with_headers(app, method, path, body, &[]).await
 }
 
+/// Parses every JSONL record in a routing log into serde values, for the
+/// routing-log tests that assert on the enriched request-envelope schema.
+fn read_routing_records(path: &std::path::Path) -> TestResult<Vec<Value>> {
+    let contents = std::fs::read_to_string(path)?;
+    contents
+        .lines()
+        .map(|line| Ok(serde_json::from_str::<Value>(line)?))
+        .collect()
+}
 async fn send_with_headers(
     app: &Router,
     method: &str,
@@ -2360,6 +2369,230 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
             .as_str()
             .is_some_and(|value| value.ends_with('Z'))
     );
+    Ok(())
+}
+
+/// The caller's requested route alias must survive resolution independently of
+/// the resolved physical model (ROUTE here aliases to `model/a`).
+#[tokio::test]
+async fn routing_log_records_requested_route_independent_of_resolved_model() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": ROUTE_MODEL, "messages": [{"role":"user","content":"hi"}] })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let records = std::fs::read_to_string(&log_path)?;
+    let record: Value = serde_json::from_str(records.lines().next().ok_or("empty log")?)?;
+    // The requested route alias is distinct from the selected physical model.
+    assert_eq!(record["requested_route"], ROUTE_MODEL);
+    assert_eq!(record["model"], "model/a");
+    assert_ne!(record["requested_route"], record["model"]);
+    Ok(())
+}
+
+/// Declared caller identity via standard Switchyard metadata headers is recorded
+/// exactly when supplied, and no full metadata map or arbitrary keys are dumped.
+#[tokio::test]
+async fn routing_log_records_declared_header_identity_subject_to_allowlist() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send_with_headers(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": ROUTE_MODEL,
+            "messages": [{"role":"user","content":"hi"}]
+        })),
+        &[
+            ("x-switchyard-agent-id", "openclaw-remote"),
+            ("x-switchyard-request-id", "req-1234"),
+            ("x-switchyard-task-id", "task-9"),
+            ("x-switchyard-task-kind", "bounded"),
+            ("x-switchyard-turn-id", "turn-1"),
+            ("x-switchyard-agent-role", "worker"),
+            ("x-switchyard-agent-kind", "collab_spawn"),
+            ("x-switchyard-session-id", "declared-session"),
+            ("x-some-arbitrary-header", "not-logged"),
+        ],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let records = std::fs::read_to_string(&log_path)?;
+    let record: Value = serde_json::from_str(records.lines().next().ok_or("empty log")?)?;
+    // Declared identity fields from standard metadata headers.
+    assert_eq!(record["agent_id"], "openclaw-remote");
+    assert_eq!(record["correlation_id"], "req-1234");
+    assert_eq!(record["task_id"], "task-9");
+    assert_eq!(record["task_kind"], "bounded");
+    assert_eq!(record["turn_id"], "turn-1");
+    assert_eq!(record["agent_role"], "worker");
+    assert_eq!(record["agent_kind"], "collab_spawn");
+    assert_eq!(record["session_id"], "declared-session");
+    // No arbitrary headers or full metadata maps are persisted.
+    assert!(record.get("http_headers").is_none());
+    assert!(record.get("extra_metadata").is_none());
+    assert!(record.get("x-some-arbitrary-header").is_none());
+    // Stephen's independent OpenClaw is NOT modeled as a subagent.
+    assert_eq!(record["is_subagent"], false);
+    assert_eq!(record["is_delegated_work"], false);
+    Ok(())
+}
+
+/// Absent identity is recorded as absent (null / false), never invented.
+#[tokio::test]
+async fn routing_log_leaves_absent_identity_unknown() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": ROUTE_MODEL, "messages": [{"role":"user","content":"hi"}] })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let records = std::fs::read_to_string(&log_path)?;
+    let record: Value = serde_json::from_str(records.lines().next().ok_or("empty log")?)?;
+    // Canonical serialization contract for absent optional identity fields: a
+    // present field whose value is JSON null (NOT fabricated into a value).
+    // Booleans default to false (e.g. absent sub-agent signal).
+    assert!(record["agent_id"].is_null());
+    assert!(record["routing_principal"].is_null());
+    assert_eq!(record["is_subagent"], false);
+    assert_eq!(record["is_delegated_work"], false);
+    Ok(())
+}
+
+/// `is_subagent`/`is_delegated_work` header booleans are honored (false stays
+/// false for an independent caller; true is parsed, not defaulted).
+#[tokio::test]
+async fn routing_log_independent_caller_stays_non_subagent() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    // Independent caller (e.g. Stephen's remote OpenClaw): explicit false, not a subagent.
+    let response = send_with_headers(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": ROUTE_MODEL, "messages": [{"role":"user","content":"hi"}] })),
+        &[
+            ("x-switchyard-agent-id", "openclaw-remote"),
+            ("x-switchyard-is-subagent", "false"),
+        ],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    // Contrast: a genuine sub-agent request with an explicit true value.
+    let response = send_with_headers(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": ROUTE_MODEL, "messages": [{"role":"user","content":"hi again"}] })),
+        &[
+            ("x-switchyard-agent-id", "child-agent"),
+            ("x-switchyard-is-subagent", "true"),
+        ],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let records = std::fs::read_to_string(&log_path)?;
+    let mut lines = records.lines();
+    let independent: Value = serde_json::from_str(lines.next().ok_or("empty log")?)?;
+    let subagent: Value = serde_json::from_str(lines.next().ok_or("missing second record")?)?;
+
+    // Independent caller is explicitly NOT a subagent.
+    assert_eq!(independent["agent_id"], "openclaw-remote");
+    assert_eq!(independent["is_subagent"], false);
+    assert_eq!(independent["is_delegated_work"], false);
+
+    // The true value is parsed and preserved (not swallowed to a default false).
+    assert_eq!(subagent["agent_id"], "child-agent");
+    assert_eq!(subagent["is_subagent"], true);
+    Ok(())
+}
+
+/// Existing routing selection is unchanged by the telemetry-only change, and the
+/// routing-stats consumer still parses the enriched schema (backward compatible).
+#[tokio::test]
+async fn routing_log_enriched_schema_remains_consumable_by_stats() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send_with_headers(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": ROUTE_MODEL,
+            "messages": [{"role":"user","content":"hi"}]
+        })),
+        &[("x-switchyard-session-id", "stats-session")],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    // The selected model is still the same physical target (selection unchanged).
+    assert_eq!(
+        response
+            .headers
+            .get("x-model-router-selected-model")
+            .and_then(|v| v.to_str().ok()),
+        Some("model/a")
+    );
+
+    // The existing routing-stats consumer parses the enriched schema, and the
+    // record carries the requested route independently of the resolved model.
+    let stats = send(
+        &app,
+        "GET",
+        "/v1/routing/session-stats?session_id=stats-session",
+        None,
+    )
+    .await?;
+    assert_eq!(stats.status, StatusCode::OK);
+    let stats_json = stats.json()?;
+    assert_eq!(stats_json["total_calls"], 1);
+
+    let records = read_routing_records(&log_path)?;
+    let record = records.into_iter().next().ok_or("empty log")?;
+    assert_eq!(record["session_id"], "stats-session");
+    assert_eq!(record["requested_route"], ROUTE_MODEL);
+    assert_eq!(record["model"], "model/a");
     Ok(())
 }
 

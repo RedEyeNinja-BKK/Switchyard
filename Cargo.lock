@@ -2351,6 +2351,7 @@ dependencies = [
  "axum",
  "axum-server",
  "clap",
+ "futures",
  "futures-util",
  "http",
  "http-body-util",

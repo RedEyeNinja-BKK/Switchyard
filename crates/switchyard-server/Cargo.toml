@@ -23,6 +23,7 @@ axum = "0.8"
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 clap = { version = "4", features = ["derive", "env"] }
+futures.workspace = true
 futures-util.workspace = true
 http.workspace = true
 libsy = { package = "switchyard-libsy", path = "../libsy", version = "0.2.0" }

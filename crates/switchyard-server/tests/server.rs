@@ -2450,7 +2450,8 @@ async fn routing_log_records_declared_header_identity() -> TestResult {
     assert!(record.get("http_headers").is_none());
     assert!(record.get("extra_metadata").is_none());
     assert!(record.get("x-some-arbitrary-header").is_none());
-    // No LocalClaw envelope fields exist; is_subagent absent (no declaration).
+    // No LocalClaw envelope fields exist; no explicit subagent declaration was
+    // made, so normalized `is_subagent` is false and `declared_is_subagent` null.
     for removed in [
         "routing_principal",
         "policy_domain",
@@ -2463,11 +2464,15 @@ async fn routing_log_records_declared_header_identity() -> TestResult {
             "removed LocalClaw envelope field {removed} must not be persisted"
         );
     }
-    assert!(record["is_subagent"].is_null());
+    assert_eq!(record["is_subagent"], false);
+    assert!(record["declared_is_subagent"].is_null());
     Ok(())
 }
 
-/// Absent identity is recorded as absent (null), never invented.
+/// Case A — no subagent signal AND no explicit declaration: normalized
+/// `is_subagent` is `false`, `declared_is_subagent` is `null` (absent), and
+/// `is_delegated_work` is `false`. The two facts are distinct: an absent
+/// explicit declaration is not the same as a proven non-sub-agent classification.
 #[tokio::test]
 async fn routing_log_leaves_absent_identity_unknown() -> TestResult {
     let upstream = MockUpstream::start().await?;
@@ -2488,11 +2493,12 @@ async fn routing_log_leaves_absent_identity_unknown() -> TestResult {
 
     let records = std::fs::read_to_string(&log_path)?;
     let record: Value = serde_json::from_str(records.lines().next().ok_or("empty log")?)?;
-    // Canonical serialization contract for absent optional identity fields: a
-    // present field whose value is JSON null (NOT fabricated into a value), and
-    // `is_subagent` absent => null (UNKNOWN), NOT false.
+    // Canonical serialization contract: optional identity fields are null when
+    // absent; the normalized `is_subagent` bool defaults false; the explicit
+    // `declared_is_subagent` is null when no Switchyard declaration was made.
     assert!(record["agent_id"].is_null());
-    assert!(record["is_subagent"].is_null());
+    assert_eq!(record["is_subagent"], false);
+    assert!(record["declared_is_subagent"].is_null());
     assert_eq!(record["is_delegated_work"], false);
     Ok(())
 }
@@ -2543,14 +2549,51 @@ async fn routing_log_independent_caller_stays_non_subagent() -> TestResult {
     let independent: Value = serde_json::from_str(lines.next().ok_or("empty log")?)?;
     let subagent: Value = serde_json::from_str(lines.next().ok_or("missing second record")?)?;
 
-    // Independent caller is explicitly NOT a subagent.
+    // Case B — independent caller declares explicit false: normalized false and
+    // the explicit declaration is preserved as false (not conflated with absent).
     assert_eq!(independent["agent_id"], "openclaw-remote");
     assert_eq!(independent["is_subagent"], false);
+    assert_eq!(independent["declared_is_subagent"], false);
     assert_eq!(independent["is_delegated_work"], false);
 
-    // The true value is parsed and preserved (not swallowed to a default false).
+    // Case C — explicit true: normalized true, declaration true.
     assert_eq!(subagent["agent_id"], "child-agent");
     assert_eq!(subagent["is_subagent"], true);
+    assert_eq!(subagent["declared_is_subagent"], true);
+    Ok(())
+}
+
+/// Case D — a native harness child (Claude lineage) with NO explicit Switchyard
+/// override: `is_subagent` is `true` via upstream-derived classification while
+/// `declared_is_subagent` stays null (no explicit Switchyard declaration).
+#[tokio::test]
+async fn routing_log_native_harness_child_no_explicit_override() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    // Claude Code sub-agent lineage: `x-claude-code-agent-id` sets is_subagent
+    // via native harness metadata, with NO x-switchyard-is-subagent declaration.
+    let response = send_with_headers(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": ROUTE_MODEL, "messages": [{"role":"user","content":"hi"}] })),
+        &[
+            ("x-claude-code-agent-id", "claude-agent"),
+            ("x-claude-code-session-id", "root-session"),
+        ],
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let records = std::fs::read_to_string(&log_path)?;
+    let record: Value = serde_json::from_str(records.lines().next().ok_or("empty log")?)?;
+    assert_eq!(record["is_subagent"], true);
+    assert!(record["declared_is_subagent"].is_null());
     Ok(())
 }
 

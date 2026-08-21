@@ -63,6 +63,7 @@ impl RoutingLog {
             agent_kind: context.agent_kind.map(Cow::Owned),
             agent_role: context.agent_role.map(Cow::Owned),
             is_subagent: context.is_subagent,
+            declared_is_subagent: context.declared_is_subagent,
             is_delegated_work: context.is_delegated_work,
             model: model.into(),
             tier: tier.unwrap_or("").into(),
@@ -107,20 +108,24 @@ pub(crate) fn snapshot(
 
 /// Request fields retained until terminal usage and routing are available.
 ///
-/// Serialization contract for the durable routing JSONL (caller-declared vs
-/// harness-derived):
-/// - **Caller-declared strings** (`agent_id`, `task_id`, `task_kind`, `turn_id`,
-///   `correlation_id`, `agent_kind`, `agent_role`) are `Option`: when the caller
-///   supplied no value, the record omits/null the field rather than fabricating one.
-/// - **Caller-declared `is_subagent`** is `Option<bool>`, read from the explicit
-///   `x-switchyard-is-subagent` header via `Metadata::declared_is_subagent()`:
-///   absent => `None` (UNKNOWN, not false); explicit true/false => `Some(true)`/`Some(false)`.
-///   A present-but-unparseable value is treated as not-declared (`None`).
-/// - **Harness-derived `is_delegated_work`** is a plain `bool`: there is no
-///   caller declaration for it, so no presence distinction is claimed.
-/// - **Trust boundary:** these are caller-declared / harness-derived metadata for
-///   observability ONLY. Their presence is NOT evidence of trusted/authenticated
-///   authority (declared != trusted).
+/// Serialization contract for the durable routing JSONL (categorized by
+/// normalized-metadata vs explicit-declaration vs harness-derived):
+/// - **Normalized request metadata** (`agent_id`, `task_id`, `task_kind`,
+///   `turn_id`, `correlation_id`, `agent_kind`, `agent_role`,
+///   `is_subagent`): the aggregated upstream `Metadata` values as Switchyard
+///   already normalizes them (for `is_subagent`, all supported signals). These
+///   are an upstream classification, not a caller credential.
+/// - **Explicit caller declaration** (`declared_is_subagent`): `Option<bool>`
+///   read from the explicit `x-switchyard-is-subagent` header via
+///   `Metadata::declared_is_subagent()` — absent => `null`, explicit true/false
+///   => `Some(true)`/`Some(false)`, unparseable => `null`.
+/// - **Harness-derived classification** (`is_delegated_work`): the
+///   upstream-normalized `Metadata.is_delegated_work`, computed from raw harness
+///   signals (no caller declaration exists for it, so no presence is claimed).
+/// - **Trust boundary:** `normalized metadata != authenticated principal !=
+///   governance authority != effective routing authorization`. `agent_id`,
+///   `is_subagent`, `declared_is_subagent`, and `is_delegated_work` are
+///   observability facts only.
 /// - `requested_route` is stamped after route resolution so the caller's route
 ///   alias is preserved independently of the resolved physical `model`, and stays
 ///   absent when no route alias was supplied.
@@ -141,9 +146,11 @@ pub(crate) struct RoutingLogContext {
     correlation_id: Option<String>,
     agent_kind: Option<String>,
     agent_role: Option<String>,
-    /// Caller declaration (absent => `None`); see `Metadata::declared_is_subagent()`.
-    is_subagent: Option<bool>,
-    /// Harness-derived, always present (no caller declaration for it).
+    /// Upstream normalized `Metadata.is_subagent` (all supported signals).
+    is_subagent: bool,
+    /// Explicit `x-switchyard-is-subagent` declaration only (absent => `None`).
+    declared_is_subagent: Option<bool>,
+    /// Upstream harness-derived `Metadata.is_delegated_work`.
     is_delegated_work: bool,
 }
 
@@ -171,7 +178,8 @@ impl RoutingLogContext {
             correlation_id: metadata.correlation_id.clone(),
             agent_kind: metadata.agent_kind.clone(),
             agent_role: metadata.agent_role.clone(),
-            is_subagent: metadata.declared_is_subagent(),
+            is_subagent: metadata.is_subagent,
+            declared_is_subagent: metadata.declared_is_subagent(),
             is_delegated_work: metadata.is_delegated_work,
         }
     }
@@ -213,7 +221,8 @@ struct RoutingRecord<'a> {
     agent_kind: Option<Cow<'a, str>>,
     #[serde(borrow)]
     agent_role: Option<Cow<'a, str>>,
-    is_subagent: Option<bool>,
+    is_subagent: bool,
+    declared_is_subagent: Option<bool>,
     is_delegated_work: bool,
     model: Cow<'a, str>,
     tier: Cow<'a, str>,
@@ -343,48 +352,90 @@ mod tests {
         assert!(snapshot(&path, "missing").expect("read log").is_none());
     }
 
-    /// `is_subagent` presence is preserved: absent => None; explicit
-    /// `x-switchyard-is-subagent: false`/`true` => Some(false)/Some(true).
+    /// The durable record preserves the distinct concepts `is_subagent` (upstream
+    /// normalized, bool), `declared_is_subagent` (explicit header, Option<bool>),
+    /// and `is_delegated_work` (harness-derived, bool). Covers absent / explicit
+    /// false / explicit true / native-harness-child-without-override / malformed.
     /// Arbitrary `extra_metadata` is never propagated into the routing record.
     #[test]
-    fn declared_is_subagent_preserves_absent_false_true_and_ignores_extra_metadata() {
-        fn context_from_header(value: Option<&str>) -> RoutingLogContext {
+    fn preserves_normalized_and_declared_subagent_distinctly() {
+        fn context_from(
+            value: Option<&str>,
+            normalized_subagent: bool,
+            delegated_work: bool,
+        ) -> RoutingLogContext {
             let mut map = BTreeMap::new();
             map.insert("sensitive_secret".to_string(), "must-not-leak".to_string());
             map.insert("user_content".to_string(), "must-not-leak".to_string());
             let mut metadata = Metadata {
                 agent_id: Some("openclaw-remote".to_string()),
+                // The normalizer and the harness-derived flag are independent
+                // facts; the fixture supplies each separately (test-data only,
+                // no semantic coupling implied between the two fields).
+                is_subagent: normalized_subagent,
+                is_delegated_work: delegated_work,
                 extra_metadata: Some(map.clone()),
                 ..Metadata::default()
             };
-            if let Some(headers) = value.map(|v| {
+            if let Some(header_value) = value {
                 let mut h = http::HeaderMap::new();
-                h.insert("x-switchyard-is-subagent", v.parse().expect("header value"));
-                h
-            }) {
-                metadata.http_headers = Some(headers);
+                h.insert(
+                    "x-switchyard-is-subagent",
+                    header_value.parse().expect("header value"),
+                );
+                metadata.http_headers = Some(h);
             }
             RoutingLogContext::from_metadata(&metadata)
         }
 
-        // Absent declaration => None (UNKNOWN), not false.
-        assert_eq!(context_from_header(None).is_subagent, None);
-        // Explicit false => Some(false).
-        assert_eq!(context_from_header(Some("false")).is_subagent, Some(false));
-        // Explicit true => Some(true).
-        assert_eq!(context_from_header(Some("true")).is_subagent, Some(true));
-        // A present-but-unparseable declaration is not trusted as a value:
-        // treated as not-declared (None), matching upstream's header parsing.
-        assert_eq!(context_from_header(Some("banana")).is_subagent, None);
+        // Case A — no subagent signal: normalized false, no declaration.
+        let ctx = context_from(None, false, false);
+        assert!(!ctx.is_subagent);
+        assert_eq!(ctx.declared_is_subagent, None);
+        assert!(!ctx.is_delegated_work);
+
+        // Case B — explicit false: both false.
+        let ctx = context_from(Some("false"), false, false);
+        assert!(!ctx.is_subagent);
+        assert_eq!(ctx.declared_is_subagent, Some(false));
+
+        // Case C — explicit true: both true.
+        let ctx = context_from(Some("true"), true, true);
+        assert!(ctx.is_subagent);
+        assert_eq!(ctx.declared_is_subagent, Some(true));
+
+        // Case D — native harness child, NO explicit Switchyard override:
+        // normalized is_subagent = true (derived), declared = None (no header),
+        // and it IS delegated work.
+        let ctx = context_from(None, true, true);
+        assert!(ctx.is_subagent);
+        assert_eq!(ctx.declared_is_subagent, None);
+        assert!(ctx.is_delegated_work);
+
+        // Case D-2 — native harness child lineage fact WITHOUT delegated-work
+        // (e.g. a harness kind that is a sub-agent lineage fact but not routed
+        // as work): is_subagent and is_delegated_work can differ.
+        let ctx = context_from(None, true, false);
+        assert!(ctx.is_subagent);
+        assert_eq!(ctx.declared_is_subagent, None);
+        assert!(!ctx.is_delegated_work);
+
+        // Case E — malformed explicit override: declared = None, but the
+        // normalized upstream classification is independent of the malformed
+        // header (still reflects the underlying derived value).
+        let ctx = context_from(Some("banana"), false, false);
+        assert_eq!(ctx.declared_is_subagent, None);
+        assert!(!ctx.is_subagent);
+
         // Declared identity still captured.
         assert_eq!(
-            context_from_header(None).agent_id.as_deref(),
+            context_from(None, false, false).agent_id.as_deref(),
             Some("openclaw-remote")
         );
 
         // Arbitrary extra_metadata and the removed LocalClaw envelope fields are
         // never serialized into the durable record.
-        let context = context_from_header(Some("false"));
+        let context = context_from(Some("false"), false, false);
         let record = RoutingRecord {
             requested_route: context.requested_route.map(Cow::Owned),
             agent_id: context.agent_id.map(Cow::Owned),
@@ -395,6 +446,7 @@ mod tests {
             agent_kind: context.agent_kind.map(Cow::Owned),
             agent_role: context.agent_role.map(Cow::Owned),
             is_subagent: context.is_subagent,
+            declared_is_subagent: context.declared_is_subagent,
             is_delegated_work: context.is_delegated_work,
             ..Default::default()
         };

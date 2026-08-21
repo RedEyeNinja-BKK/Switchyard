@@ -15,6 +15,14 @@ pub use error::{DriverError, LibsyError, Result};
 
 mod algorithms;
 pub use algorithms::advisor_gate::{AdvisorGate, AdvisorGateConfig, GateTrigger};
+pub use algorithms::comfy::{
+    ComfyMode, ComfyOwner, ComfyParseError, ComfyProfileClass, ComfyRemoteSnapshot,
+    ComfyResidentProfile, ComfyResourceState, ComfySnapshotCache, ComfySnapshotState,
+    ComfySourceHealth, ComfyTransitionLedger, ComfyTransitionState, ComfyTransitionTarget,
+    CorrelationStatus, CorrelationTable, FeedDisposition, TransitionCellStats, TransitionCursor,
+    TransitionEvent, TransitionFeed, TransitionPhase, TransitionResult, TransitionSample,
+    advance_cursor,
+};
 pub use algorithms::llm_class::{
     CustomClassifierConfig, CustomClassifierPolicy, LlmClassifierConfig, LlmTaskClassifier,
     TaskClassifierConfig,

@@ -254,6 +254,9 @@ pub fn assess(
     let day = policy_day_id(now_unix_secs);
 
     // --- Deduplication: an unchanged provider observation is NOT a new accounting event.
+    // Observation identity is assigned BEFORE the admissibility gate, so it is INDEPENDENT
+    // of whether the observation is usable for policy: polling the same unusable observation
+    // repeatedly must not manufacture multiple factual events (POLICY-CONSUME-SHADOW §6).
     let id = ObservationId::of(&observation);
     if retained.last_observation_id == Some(id) {
         return OpenAiDailyTranchePolicy {
@@ -271,6 +274,9 @@ pub fn assess(
             reasons: vec!["duplicate_observation_no_new_event"],
         };
     }
+    // Record this observation's identity now (before any admissibility/early return) so
+    // repeated identical observations — including unusable ones — are correctly deduplicated.
+    retained.last_observation_id = Some(id);
 
     // --- Admissibility gate (fresh + healthy + valid %). Refuse confident tranche otherwise.
     if !admissible {
@@ -309,10 +315,9 @@ pub fn assess(
     };
 
     let week = observation.weekly_reset_at;
-    // Decide identity BEFORE mutating last_observation_id (comparisons use retained prior).
-    // Capture continuity between old and new window.
+    // Capture continuity between the OLD and NEW provider window (compared against retained
+    // prior state before it is updated below).
     let cont = provider_week_continuity(retained.latest_provider_week, week);
-    retained.last_observation_id = Some(id);
 
     // --- A NEW Bangkok policy day (F): the day's baseline may anchor from a prior-day
     //     observation ONLY if it brackets the policy boundary under the documented rule.
@@ -804,4 +809,24 @@ mod tests {
         assert!(!s.contains("substitut") && !s.contains("deepseek-v4"), "policy must not enforce substitution");
         assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::ConserveOpenaiDeepSeekContinuation);
     }
+
+    /// POLICY-CONSUME-SHADOW §6 regression: repeated identical UNUSABLE observations must
+    /// not report advanced=true multiple times (observation identity is independent of
+    /// whether the observation is usable for policy).
+    #[test]
+    fn repeated_unusable_observation_is_deduped() {
+        let mut st = OpenAiTrancheState::default();
+        let t0 = BANGKOK_NOON_UTC;
+        let obs1 = obs(None, Some(WEEK), Some(t0)); // unusable (missing weekly)
+        let r1 = assess(t0, obs1, false, &mut st);
+        assert_eq!(r1.advanced, true); // first unusable observation is new
+        // Same identical unusable observation polled again -> NOT a new event.
+        let r2 = assess(t0, obs1, false, &mut st);
+        assert_eq!(r2.advanced, false);
+        assert!(r2.reasons.contains(&"duplicate_observation_no_new_event"));
+        // A DIFFERENT unusable observation IS a new event.
+        let r3 = assess(t0, obs(None, Some(WEEK), Some(t0 + 1)), false, &mut st);
+        assert_eq!(r3.advanced, true);
+    }
+
 }

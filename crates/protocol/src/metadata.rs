@@ -228,6 +228,25 @@ impl Metadata {
     pub fn is_subagent_work(&self) -> bool {
         self.is_delegated_work
     }
+
+    /// Whether the caller explicitly declared `is_subagent` via the
+    /// `x-switchyard-is-subagent` header.
+    ///
+    /// Returns `None` when the caller supplied no explicit declaration (the
+    /// value was then *derived* from harness signals, or defaulted `false`),
+    /// and `Some(true)` / `Some(false)` when the caller explicitly declared it.
+    /// A present-but-unparseable header value is treated as not-declared
+    /// (returns `None`), matching how upstream parses the same header for its
+    /// own routing; the caller's value is not trusted when malformed.
+    /// This preserves the distinction between "declared false" and "absent" for
+    /// observability, without changing the collapsed `is_subagent` bool used by
+    /// routing.
+    pub fn declared_is_subagent(&self) -> Option<bool> {
+        self.http_headers
+            .as_ref()
+            .and_then(|headers| header(headers, SWITCHYARD_IS_SUBAGENT_HEADER))
+            .and_then(parse_bool)
+    }
 }
 
 /// Returns `(parent_agent_id, is_subagent, is_delegated_work)` from the headers.
@@ -645,5 +664,37 @@ mod tests {
 
         // A non-subagent request is never work, whatever its kind says.
         assert!(!Metadata::default().is_subagent_work());
+    }
+
+    /// `declared_is_subagent()` preserves declaration presence distinctly from
+    /// the collapsed `is_subagent` bool: absent => None, explicit true/false =>
+    /// Some(true)/Some(false), and a present-but-unparseable value is treated as
+    /// not-declared (None), matching upstream's own header parsing.
+    #[test]
+    fn declared_is_subagent_preserves_presence() {
+        fn with_subagent_header(value: &str) -> Metadata {
+            let mut m = Metadata::default();
+            let mut h = http::HeaderMap::new();
+            h.insert(
+                http::HeaderName::from_static("x-switchyard-is-subagent"),
+                value.parse().expect("valid header value"),
+            );
+            m.http_headers = Some(h);
+            m
+        }
+        // Absent header => None (UNKNOWN), not false.
+        assert_eq!(Metadata::default().declared_is_subagent(), None);
+        // Explicit false => Some(false).
+        assert_eq!(
+            with_subagent_header("false").declared_is_subagent(),
+            Some(false)
+        );
+        // Explicit true => Some(true).
+        assert_eq!(
+            with_subagent_header("true").declared_is_subagent(),
+            Some(true)
+        );
+        // Present-but-unparseable => None (not-declared, not trusted as a value).
+        assert_eq!(with_subagent_header("banana").declared_is_subagent(), None);
     }
 }

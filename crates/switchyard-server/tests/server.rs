@@ -2402,9 +2402,9 @@ async fn routing_log_records_requested_route_independent_of_resolved_model() -> 
 }
 
 /// Declared caller identity via standard Switchyard metadata headers is recorded
-/// exactly when supplied, and no full metadata map or arbitrary keys are dumped.
+/// exactly when supplied; no full metadata map or arbitrary headers are dumped.
 #[tokio::test]
-async fn routing_log_records_declared_header_identity_subject_to_allowlist() -> TestResult {
+async fn routing_log_records_declared_header_identity() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let temp_dir = tempfile::tempdir()?;
     let log_path = temp_dir.path().join("routing.jsonl");
@@ -2450,13 +2450,24 @@ async fn routing_log_records_declared_header_identity_subject_to_allowlist() -> 
     assert!(record.get("http_headers").is_none());
     assert!(record.get("extra_metadata").is_none());
     assert!(record.get("x-some-arbitrary-header").is_none());
-    // Stephen's independent OpenClaw is NOT modeled as a subagent.
-    assert_eq!(record["is_subagent"], false);
-    assert_eq!(record["is_delegated_work"], false);
+    // No LocalClaw envelope fields exist; is_subagent absent (no declaration).
+    for removed in [
+        "routing_principal",
+        "policy_domain",
+        "work_shape",
+        "reasoning_intent",
+        "tool_required",
+    ] {
+        assert!(
+            record.get(removed).is_none(),
+            "removed LocalClaw envelope field {removed} must not be persisted"
+        );
+    }
+    assert!(record["is_subagent"].is_null());
     Ok(())
 }
 
-/// Absent identity is recorded as absent (null / false), never invented.
+/// Absent identity is recorded as absent (null), never invented.
 #[tokio::test]
 async fn routing_log_leaves_absent_identity_unknown() -> TestResult {
     let upstream = MockUpstream::start().await?;
@@ -2478,17 +2489,18 @@ async fn routing_log_leaves_absent_identity_unknown() -> TestResult {
     let records = std::fs::read_to_string(&log_path)?;
     let record: Value = serde_json::from_str(records.lines().next().ok_or("empty log")?)?;
     // Canonical serialization contract for absent optional identity fields: a
-    // present field whose value is JSON null (NOT fabricated into a value).
-    // Booleans default to false (e.g. absent sub-agent signal).
+    // present field whose value is JSON null (NOT fabricated into a value), and
+    // `is_subagent` absent => null (UNKNOWN), NOT false.
     assert!(record["agent_id"].is_null());
-    assert!(record["routing_principal"].is_null());
-    assert_eq!(record["is_subagent"], false);
+    assert!(record["is_subagent"].is_null());
     assert_eq!(record["is_delegated_work"], false);
     Ok(())
 }
 
-/// `is_subagent`/`is_delegated_work` header booleans are honored (false stays
-/// false for an independent caller; true is parsed, not defaulted).
+/// `is_subagent` declaration presence is preserved through the routing JSONL:
+/// absent => null, explicit false => false, explicit true => true. An
+/// independent caller (e.g. Stephen's remote OpenClaw) declaring false stays
+/// false and is never coerced to true.
 #[tokio::test]
 async fn routing_log_independent_caller_stays_non_subagent() -> TestResult {
     let upstream = MockUpstream::start().await?;

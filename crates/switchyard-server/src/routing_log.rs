@@ -64,11 +64,6 @@ impl RoutingLog {
             agent_role: context.agent_role.map(Cow::Owned),
             is_subagent: context.is_subagent,
             is_delegated_work: context.is_delegated_work,
-            routing_principal: context.routing_principal.map(Cow::Owned),
-            policy_domain: context.policy_domain.map(Cow::Owned),
-            work_shape: context.work_shape.map(Cow::Owned),
-            reasoning_intent: context.reasoning_intent.map(Cow::Owned),
-            tool_required: context.tool_required.map(Cow::Owned),
             model: model.into(),
             tier: tier.unwrap_or("").into(),
             prompt_tokens: usage.prompt_tokens,
@@ -112,18 +107,27 @@ pub(crate) fn snapshot(
 
 /// Request fields retained until terminal usage and routing are available.
 ///
-/// Serialization contract for the durable routing JSONL:
-/// - String identity/envelope fields are `Option`: when the caller supplied no
-///   value, the record omits (or nulls) the field rather than fabricating one.
-/// - `is_subagent` / `is_delegated_work` are plain booleans derived from inbound
-///   metadata (absent = `false`); they are always present in a record.
-/// - These are caller-DECLARED metadata for observability only. Their presence
-///   is NOT evidence of trusted/authenticated authority (declared != trusted).
+/// Serialization contract for the durable routing JSONL (caller-declared vs
+/// harness-derived):
+/// - **Caller-declared strings** (`agent_id`, `task_id`, `task_kind`, `turn_id`,
+///   `correlation_id`, `agent_kind`, `agent_role`) are `Option`: when the caller
+///   supplied no value, the record omits/null the field rather than fabricating one.
+/// - **Caller-declared `is_subagent`** is `Option<bool>`, read from the explicit
+///   `x-switchyard-is-subagent` header via `Metadata::declared_is_subagent()`:
+///   absent => `None` (UNKNOWN, not false); explicit true/false => `Some(true)`/`Some(false)`.
+///   A present-but-unparseable value is treated as not-declared (`None`).
+/// - **Harness-derived `is_delegated_work`** is a plain `bool`: there is no
+///   caller declaration for it, so no presence distinction is claimed.
+/// - **Trust boundary:** these are caller-declared / harness-derived metadata for
+///   observability ONLY. Their presence is NOT evidence of trusted/authenticated
+///   authority (declared != trusted).
 /// - `requested_route` is stamped after route resolution so the caller's route
 ///   alias is preserved independently of the resolved physical `model`, and stays
 ///   absent when no route alias was supplied.
 /// - Records are forward/backward compatible: `#[serde(default)]` lets older
 ///   records (missing new fields) and newer records parse through unchanged.
+/// - Durable telemetry applies to normal answer-serving request paths that
+///   generate terminal routing/usage records (not the `/v1/decision` path).
 #[derive(Clone, Default)]
 pub(crate) struct RoutingLogContext {
     task: Option<String>,
@@ -137,21 +141,16 @@ pub(crate) struct RoutingLogContext {
     correlation_id: Option<String>,
     agent_kind: Option<String>,
     agent_role: Option<String>,
-    is_subagent: bool,
+    /// Caller declaration (absent => `None`); see `Metadata::declared_is_subagent()`.
+    is_subagent: Option<bool>,
+    /// Harness-derived, always present (no caller declaration for it).
     is_delegated_work: bool,
-    // Narrow allowlisted subset of `extra_metadata`, present only when supplied.
-    routing_principal: Option<String>,
-    policy_domain: Option<String>,
-    work_shape: Option<String>,
-    reasoning_intent: Option<String>,
-    tool_required: Option<String>,
 }
 
 impl RoutingLogContext {
     /// Captures the normalized session ID, with the legacy log-only header as a fallback.
     pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
         let headers = metadata.http_headers.as_ref();
-        let envelope = extra_metadata_allowlist(metadata);
         Self {
             task: headers
                 .and_then(|headers| nonempty_header(headers, TASK_HEADER))
@@ -172,13 +171,8 @@ impl RoutingLogContext {
             correlation_id: metadata.correlation_id.clone(),
             agent_kind: metadata.agent_kind.clone(),
             agent_role: metadata.agent_role.clone(),
-            is_subagent: metadata.is_subagent,
+            is_subagent: metadata.declared_is_subagent(),
             is_delegated_work: metadata.is_delegated_work,
-            routing_principal: envelope.routing_principal,
-            policy_domain: envelope.policy_domain,
-            work_shape: envelope.work_shape,
-            reasoning_intent: envelope.reasoning_intent,
-            tool_required: envelope.tool_required,
         }
     }
 
@@ -189,59 +183,6 @@ impl RoutingLogContext {
         self
     }
 }
-
-/// The allowlisted `extra_metadata` routing-envelope subset.
-///
-/// Reads only the keys below out of `Metadata::extra_metadata`. Any other key,
-/// header, secret, or arbitrary metadata map is intentionally NOT captured.
-/// Each `(key, setter)` pair is the single authoritative definition of which
-/// `extra_metadata` key maps to which record field, so there is no separate
-/// string list to drift.
-struct EnvelopeAllowlist {
-    routing_principal: Option<String>,
-    policy_domain: Option<String>,
-    work_shape: Option<String>,
-    reasoning_intent: Option<String>,
-    tool_required: Option<String>,
-}
-
-impl EnvelopeAllowlist {
-    fn new() -> Self {
-        Self {
-            routing_principal: None,
-            policy_domain: None,
-            work_shape: None,
-            reasoning_intent: None,
-            tool_required: None,
-        }
-    }
-}
-
-fn extra_metadata_allowlist(metadata: &Metadata) -> EnvelopeAllowlist {
-    let mut envelope = EnvelopeAllowlist::new();
-    let Some(map) = metadata.extra_metadata.as_ref() else {
-        return envelope;
-    };
-    // One authoritative source of the allowlist key -> target field mapping.
-    for (key, setter) in ENVELOPE_FIELD_MAP {
-        if let Some(nonempty) = map.get(*key).filter(|value| !value.is_empty()) {
-            setter(&mut envelope, nonempty.clone());
-        }
-    }
-    envelope
-}
-
-/// Setter for one allowlisted field inside [`EnvelopeAllowlist`].
-type EnvelopeSetter = fn(&mut EnvelopeAllowlist, String);
-
-/// Maps each allowlisted `extra_metadata` key to the record field it feeds.
-static ENVELOPE_FIELD_MAP: &[(&str, EnvelopeSetter)] = &[
-    ("routing_principal", |e, v| e.routing_principal = Some(v)),
-    ("policy_domain", |e, v| e.policy_domain = Some(v)),
-    ("work_shape", |e, v| e.work_shape = Some(v)),
-    ("reasoning_intent", |e, v| e.reasoning_intent = Some(v)),
-    ("tool_required", |e, v| e.tool_required = Some(v)),
-];
 
 /// One appended routing record, and the read schema [`snapshot`] parses back,
 /// so the written and expected shapes cannot drift apart. Missing fields
@@ -272,17 +213,7 @@ struct RoutingRecord<'a> {
     agent_kind: Option<Cow<'a, str>>,
     #[serde(borrow)]
     agent_role: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    routing_principal: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    policy_domain: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    work_shape: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    reasoning_intent: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    tool_required: Option<Cow<'a, str>>,
-    is_subagent: bool,
+    is_subagent: Option<bool>,
     is_delegated_work: bool,
     model: Cow<'a, str>,
     tier: Cow<'a, str>,
@@ -412,40 +343,48 @@ mod tests {
         assert!(snapshot(&path, "missing").expect("read log").is_none());
     }
 
-    /// Only the allowlisted `extra_metadata` routing-envelope keys are captured.
-    /// Arbitrary or sensitive keys are never propagated into the routing log.
+    /// `is_subagent` presence is preserved: absent => None; explicit
+    /// `x-switchyard-is-subagent: false`/`true` => Some(false)/Some(true).
+    /// Arbitrary `extra_metadata` is never propagated into the routing record.
     #[test]
-    fn from_metadata_allowlists_only_envelope_keys() {
-        let mut map = BTreeMap::new();
-        map.insert(
-            "routing_principal".to_string(),
-            "stephen-remote-openclaw".to_string(),
-        );
-        map.insert("policy_domain".to_string(), "managed-external".to_string());
-        map.insert("work_shape".to_string(), "bounded".to_string());
-        map.insert("reasoning_intent".to_string(), "none".to_string());
-        map.insert("tool_required".to_string(), "false".to_string());
-        map.insert("sensitive_secret".to_string(), "must-not-leak".to_string());
-        map.insert("user_content".to_string(), "must-not-leak".to_string());
-        let metadata = Metadata {
-            agent_id: Some("openclaw-remote".to_string()),
-            extra_metadata: Some(map.clone()),
-            ..Metadata::default()
-        };
+    fn declared_is_subagent_preserves_absent_false_true_and_ignores_extra_metadata() {
+        fn context_from_header(value: Option<&str>) -> RoutingLogContext {
+            let mut map = BTreeMap::new();
+            map.insert("sensitive_secret".to_string(), "must-not-leak".to_string());
+            map.insert("user_content".to_string(), "must-not-leak".to_string());
+            let mut metadata = Metadata {
+                agent_id: Some("openclaw-remote".to_string()),
+                extra_metadata: Some(map.clone()),
+                ..Metadata::default()
+            };
+            if let Some(headers) = value.map(|v| {
+                let mut h = http::HeaderMap::new();
+                h.insert("x-switchyard-is-subagent", v.parse().expect("header value"));
+                h
+            }) {
+                metadata.http_headers = Some(headers);
+            }
+            RoutingLogContext::from_metadata(&metadata)
+        }
 
-        let context = RoutingLogContext::from_metadata(&metadata);
-        // Allowlisted envelope keys present.
+        // Absent declaration => None (UNKNOWN), not false.
+        assert_eq!(context_from_header(None).is_subagent, None);
+        // Explicit false => Some(false).
+        assert_eq!(context_from_header(Some("false")).is_subagent, Some(false));
+        // Explicit true => Some(true).
+        assert_eq!(context_from_header(Some("true")).is_subagent, Some(true));
+        // A present-but-unparseable declaration is not trusted as a value:
+        // treated as not-declared (None), matching upstream's header parsing.
+        assert_eq!(context_from_header(Some("banana")).is_subagent, None);
+        // Declared identity still captured.
         assert_eq!(
-            context.routing_principal.as_deref(),
-            Some("stephen-remote-openclaw")
+            context_from_header(None).agent_id.as_deref(),
+            Some("openclaw-remote")
         );
-        assert_eq!(context.policy_domain.as_deref(), Some("managed-external"));
-        assert_eq!(context.work_shape.as_deref(), Some("bounded"));
-        assert_eq!(context.reasoning_intent.as_deref(), Some("none"));
-        assert_eq!(context.tool_required.as_deref(), Some("false"));
-        // Declared identity captured.
-        assert_eq!(context.agent_id.as_deref(), Some("openclaw-remote"));
-        // Sensitive / unrecognized keys are NOT captured; the full map is not stored.
+
+        // Arbitrary extra_metadata and the removed LocalClaw envelope fields are
+        // never serialized into the durable record.
+        let context = context_from_header(Some("false"));
         let record = RoutingRecord {
             requested_route: context.requested_route.map(Cow::Owned),
             agent_id: context.agent_id.map(Cow::Owned),
@@ -455,11 +394,6 @@ mod tests {
             correlation_id: context.correlation_id.map(Cow::Owned),
             agent_kind: context.agent_kind.map(Cow::Owned),
             agent_role: context.agent_role.map(Cow::Owned),
-            routing_principal: context.routing_principal.map(Cow::Owned),
-            policy_domain: context.policy_domain.map(Cow::Owned),
-            work_shape: context.work_shape.map(Cow::Owned),
-            reasoning_intent: context.reasoning_intent.map(Cow::Owned),
-            tool_required: context.tool_required.map(Cow::Owned),
             is_subagent: context.is_subagent,
             is_delegated_work: context.is_delegated_work,
             ..Default::default()
@@ -468,5 +402,17 @@ mod tests {
         assert!(!serialized.contains("sensitive_secret"));
         assert!(!serialized.contains("user_content"));
         assert!(!serialized.contains("must-not-leak"));
+        for removed in [
+            "routing_principal",
+            "policy_domain",
+            "work_shape",
+            "reasoning_intent",
+            "tool_required",
+        ] {
+            assert!(
+                !serialized.contains(removed),
+                "removed LocalClaw envelope field {removed} must not be serialized"
+            );
+        }
     }
 }

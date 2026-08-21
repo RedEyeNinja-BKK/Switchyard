@@ -268,7 +268,14 @@ impl ServerConfig {
         let mut state = ServerState::new_with_capabilities(routes)?;
         state.attach_resource_telemetry(telemetry);
         let comfy = self.build_comfy()?;
-        state.set_comfy(comfy);
+        // Spawn the driver ONLY after the whole server state has constructed
+        // successfully, so a construction failure never orphans a driver task.
+        if let Some(activation) = comfy {
+            let handle = activation
+                .runtime
+                .into_driver(activation.transitions, activation.config);
+            state.set_comfy(Some(handle));
+        }
         Ok(state)
     }
 
@@ -286,7 +293,7 @@ impl ServerConfig {
     /// this method** (Gate C2-A is inert). The credential reference is only
     /// existence-checked here; the value is discarded and used lazily, never
     /// stored, and never emitted.
-    fn build_comfy(&self) -> ServerResult<Option<crate::comfy::ComfyNinjaRuntime>> {
+    fn build_comfy(&self) -> ServerResult<Option<crate::comfy::ComfyNinjaActivation>> {
         let Some(config) = &self.comfyninja else {
             return Ok(None); // absent => inert disabled
         };
@@ -315,12 +322,14 @@ impl ServerConfig {
 
         // Construct the enabled runtime with a REAL authenticated snapshot fetch
         // path (Gate C2-F). The snapshot fetch is captured inside the runtime's
-        // TTL cache; the transition credential is validated above and the
-        // transition fetcher is constructed at driver activation (C2-B).
+        // TTL cache; the transition fetch is built below into a `TransitionTick`
+        // that the driver consumes. NOT spawned here (see `build()`).
         // boot_state=Fresh (no prior history/checkpoint).
         let ttl = Duration::from_secs(config.ttl_seconds.max(1));
         let snapshot_url = snapshot.url.to_string();
         let snapshot_cred_env = snapshot.auth_token_env.to_string();
+        let transitions_url = transitions.url.to_string();
+        let transitions_cred_env = transitions.auth_token_env.to_string();
 
         // The snapshot cache closure resolves the credential lazily per fetch.
         // The request path constructs the bearer, sends it, and drops it; the
@@ -337,7 +346,16 @@ impl ServerConfig {
             crate::comfy::ComfyBootState::Fresh,
         );
 
-        Ok(Some(runtime))
+        // Build the transition tick + default driver config (bounded semantics
+        // as committed in C2-F: 15s / cap 30s / threshold 8).
+        let transitions =
+            crate::comfy::transition_tick_for_endpoint(transitions_url, transitions_cred_env);
+        let config = crate::comfy::ComfyDriverConfig::default();
+        Ok(Some(crate::comfy::ComfyNinjaActivation {
+            runtime,
+            transitions,
+            config,
+        }))
     }
 
     /// Build shared TTL-cached resource state for each `[resource_pools.*]`
@@ -2783,10 +2801,10 @@ auth_token_env = "COMFY_TEST_TOKEN_A"
 [comfyninja]
 enabled = true
 [comfyninja.snapshot]
-url = "https://comfy.test:8447/v1/resource"
+url = "http://127.0.0.1:9/v1/resource"
 auth_token_env = "COMFY_TEST_TOKEN_A"
 [comfyninja.transitions]
-url = "https://comfy.test:8447/v1/transitions"
+url = "http://127.0.0.1:9/v1/transitions"
 auth_token_env = "COMFY_TEST_TOKEN_A"
 "#;
 
@@ -2795,15 +2813,17 @@ auth_token_env = "COMFY_TEST_TOKEN_A"
     }
 
     /// Test 1: a configured-but-`enabled=false` integration composes as inert.
-    /// `comfy_status()` is `None` (no consumer, no network, no credential) and
-    /// existing routes/models are unchanged.
-    #[test]
-    fn disabled_comfy_integration_is_inert_and_routes_unchanged() -> ServerResult<()> {
+    /// `comfy_status()` is `None` (no consumer, no driver, no network, no
+    /// credential) and existing routes/models are unchanged.
+    #[tokio::test]
+    async fn disabled_comfy_integration_is_inert_and_routes_unchanged() -> ServerResult<()> {
         let state_disabled = server_state_from_toml(&comfy_config(COMFY_DISABLED))?;
-        assert!(state_disabled.comfy_status().is_none());
+        assert!(state_disabled.comfy_status().await.is_none());
+        assert!(!state_disabled.has_comfy());
 
         let state_absent = server_state_from_toml(VALID_CONFIG)?;
-        assert!(state_absent.comfy_status().is_none());
+        assert!(state_absent.comfy_status().await.is_none());
+        assert!(!state_absent.has_comfy());
 
         // Existing non-ComfyNinja operation is unchanged: identical model set.
         assert_eq!(
@@ -2814,10 +2834,13 @@ auth_token_env = "COMFY_TEST_TOKEN_A"
     }
 
     /// Test 2: an `enabled=true` integration with a complete config + resolvable
-    /// credential reference constructs the consumers (status Some, enabled,
-    /// boot_state Fresh) WITHOUT any network fetch.
-    #[test]
-    fn enabled_comfy_integration_constructs_inert_when_credential_resolves() -> ServerResult<()> {
+    /// credential references constructs AND ACTIVATES exactly one driver
+    /// (status Some, enabled, boot_state Fresh). The endpoint is loopback
+    /// discard (`127.0.0.1:9`) so the spawned driver's background fetch fails
+    /// closed without any external network — this also proves the driver is
+    /// actually started by normal composition (not merely "constructible").
+    #[tokio::test]
+    async fn enabled_comfy_integration_constructs_inert_when_credential_resolves() -> ServerResult<()> {
         unsafe {
             std::env::set_var("COMFY_TEST_TOKEN_A", "test-only-fake-token");
         }
@@ -2826,12 +2849,16 @@ auth_token_env = "COMFY_TEST_TOKEN_A"
             std::env::remove_var("COMFY_TEST_TOKEN_A");
         }
         let state = result?;
+        assert!(state.has_comfy(), "enabled comfyninja must activate one driver");
         let status = state
             .comfy_status()
+            .await
             .expect("enabled comfyninja must attach a runtime");
         assert!(status.enabled);
         assert_eq!(status.boot_state, crate::comfy::ComfyBootState::Fresh);
         assert!(status.current_cursor.is_none());
+        // Clean up the spawned driver (deterministic shutdown).
+        state.stop_comfy().await;
         Ok(())
     }
 

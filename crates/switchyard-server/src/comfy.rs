@@ -148,6 +148,16 @@ impl ComfyCompositionStatus {
 /// **no** task. The snapshot cache fetches lazily only when `snapshot()`
 /// is called; the transition ledger ingests only when `ingest_transitions()`
 /// is called. In Gate C2-A nothing calls these — the runtimes are inert.
+/// The un-spawned production activation bundle for an enabled ComfyNinja
+/// integration. Built by `config.rs::build_comfy`; spawned (via
+/// `ComfyNinjaRuntime::into_driver`) only after the whole `ServerState` has
+/// constructed successfully, so a construction failure never orphans a driver.
+pub struct ComfyNinjaActivation {
+    pub(crate) runtime: ComfyNinjaRuntime,
+    pub(crate) transitions: TransitionTick,
+    pub(crate) config: ComfyDriverConfig,
+}
+
 #[derive(Debug)]
 pub struct ComfyNinjaRuntime {
     /// Set only when the integration is enabled.
@@ -535,6 +545,19 @@ impl ComfyHttpTransitionFetcher {
     }
 }
 
+/// Build a `TransitionTick` from an endpoint's URL + credential env-var NAME.
+///
+/// This is the production wiring seam: `config.rs` constructs the transition
+/// tick from the parsed `[comfyninja.transitions]` block and hands it to the
+/// driver. The credential is resolved per request by `ComfyHttpTransitionFetcher`.
+pub fn transition_tick_for_endpoint(url: String, auth_token_env: String) -> TransitionTick {
+    let fetcher = std::sync::Arc::new(ComfyHttpTransitionFetcher::new(url, auth_token_env));
+    Box::new(move |cursor: Option<TransitionCursor>| {
+        let f = std::sync::Arc::clone(&fetcher);
+        Box::pin(async move { f.fetch(cursor.as_ref()).await })
+    })
+}
+
 /// Driver configuration (bounded; no uncontrolled polling loop).
 #[derive(Clone, Copy, Debug)]
 pub struct ComfyDriverConfig {
@@ -596,9 +619,17 @@ impl std::fmt::Debug for ComfyRuntimeDriver {
 }
 
 /// A handle permitting a clean stop of a spawned [`ComfyRuntimeDriver`].
+///
+/// - `stop()` / `stop_and_join()` set the stop flag and (optionally) await the
+///   driver task. The task is stored under a `parking_lot::Mutex<Option<..>>`
+///   so `stop_and_join(&self)` can consume + await it without taking ownership
+///   of this handle (which may be `Arc`-shared into `ServerState`).
+/// - `status()`/`runtime()` expose the shared runtime held by the driver so the
+///   server can observe `ComfyCompositionStatus` through the activated handle.
 pub struct ComfyDriverHandle {
     stop: Arc<std::sync::atomic::AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    runtime: Arc<tokio::sync::Mutex<ComfyNinjaRuntime>>,
 }
 
 impl std::fmt::Debug for ComfyDriverHandle {
@@ -613,9 +644,32 @@ impl ComfyDriverHandle {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Wait for the driver loop to exit (e.g. on shutdown / cancellation).
-    pub async fn join(self) {
-        let _ = self.task.await;
+    /// Request cancellation and wait for the driver task to exit/join.
+    ///
+    /// Safe to call from a shared `&Arc<ComfyDriverHandle>` (e.g. from the
+    /// server shutdown path). The task handle is taken once; later calls are
+    /// no-ops for the join.
+    pub async fn stop_and_join(&self) {
+        self.stop();
+        let task = self.task.lock().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    /// Whether an explicit stop was requested.
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Observable ComfyNinja composition status through the activated driver.
+    pub async fn status(&self) -> ComfyCompositionStatus {
+        self.runtime.lock().await.status()
+    }
+
+    /// The shared runtime the driver drives (for lifecycle observability).
+    pub fn runtime(&self) -> &Arc<tokio::sync::Mutex<ComfyNinjaRuntime>> {
+        &self.runtime
     }
 }
 
@@ -633,14 +687,20 @@ impl ComfyRuntimeDriver {
         }
     }
 
-    /// Spawn the tick loop on the current tokio runtime; returns a stop handle.
+    /// Spawn the tick loop on the current tokio runtime; returns a stop handle
+    /// that also exposes the shared runtime for status observability.
     pub fn spawn(self) -> ComfyDriverHandle {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_b = Arc::clone(&stop);
+        let runtime = Arc::clone(&self.runtime); // shared runtime into the handle
         let task = tokio::spawn(async move {
             self.run(stop_b).await;
         });
-        ComfyDriverHandle { stop, task }
+        ComfyDriverHandle {
+            stop,
+            task: parking_lot::Mutex::new(Some(task)),
+            runtime,
+        }
     }
 
     async fn run(self, stop: Arc<std::sync::atomic::AtomicBool>) {

@@ -9,10 +9,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use libsy::{
-    AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat,
-    ClassifyTrigger, CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig,
-    GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop,
-    Passthrough, PickerMode, Random, StageRouter, StageRouterConfig, SubagentRouter,
+    AdvisorGate, AdvisorGateConfig, Algorithm, CandidateProfile, ClassifierContractConfig,
+    ClassifierResponseFormat, ClassifyTrigger, CustomClassifierConfig, CustomClassifierPolicy,
+    EscalationJudgeConfig, FleetRouter, FleetSnapshot, FleetStateSource, GateTrigger,
+    HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop, Passthrough,
+    PickerMode, Random, StageRouter, StageRouterConfig, StaticFleetState, SubagentRouter,
     SubagentRouterConfig, TargetPrompts, TaskClassifierConfig,
 };
 use serde::Deserialize;
@@ -44,12 +45,49 @@ pub fn load_server_state(path: impl AsRef<Path>) -> ServerResult<ServerState> {
     })
 }
 
+/// Constructs a fail-closed fleet source used when no producer has attached one
+/// yet: an empty snapshot, so every candidate resolves to not-ready and a
+/// `fleet_router` route never selects anything until a real source is injected.
+fn fail_closed_fleet_source() -> Arc<dyn FleetStateSource> {
+    Arc::new(StaticFleetState::new(
+        FleetSnapshot::new(Vec::new()).expect("empty fleet snapshot is valid"),
+    ))
+}
+
 fn server_state_from_toml(toml: &str) -> ServerResult<ServerState> {
+    server_state_from_toml_with_fleet_source(toml, fail_closed_fleet_source())
+}
+
+/// Builds server state from TOML using an injected fleet readiness source.
+///
+/// This is the S2-C dependency-injection seam: current readiness is supplied
+/// here (e.g. a [`SharedFleetState`]), never baked into the durable route
+/// config.
+pub fn load_server_state_with_fleet_source(
+    path: impl AsRef<Path>,
+    fleet_source: Arc<dyn FleetStateSource>,
+) -> ServerResult<ServerState> {
+    let path = path.as_ref();
+    let toml = fs::read_to_string(path).map_err(|error| {
+        ServerError::new(format!(
+            "failed to read server config {}: {error}",
+            path.display()
+        ))
+    })?;
+    server_state_from_toml_with_fleet_source(&toml, fleet_source).map_err(|error| {
+        ServerError::new(format!("invalid server config {}: {error}", path.display()))
+    })
+}
+
+fn server_state_from_toml_with_fleet_source(
+    toml: &str,
+    fleet_source: Arc<dyn FleetStateSource>,
+) -> ServerResult<ServerState> {
     let config: Arc<ServerConfig> = Arc::new(
         toml::from_str(toml)
             .map_err(|error| ServerError::new(format!("failed to parse TOML: {error}")))?,
     );
-    let state = config.build()?;
+    let state = config.build(fleet_source)?;
     Ok(state.with_config(config))
 }
 
@@ -70,7 +108,7 @@ impl ServerConfig {
             .map(RouteConfig::routing_target_names)
     }
 
-    fn build(&self) -> ServerResult<ServerState> {
+    fn build(&self, fleet_source: Arc<dyn FleetStateSource>) -> ServerResult<ServerState> {
         if self.schema_version != SUPPORTED_SCHEMA_VERSION {
             return Err(ServerError::new(format!(
                 "unsupported schema_version {}; expected {SUPPORTED_SCHEMA_VERSION}",
@@ -115,7 +153,7 @@ impl ServerConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
-            let algorithm = build_algorithm(route_name, config, &targets)?;
+            let algorithm = build_algorithm(route_name, config, &targets, fleet_source.clone())?;
             let (client, caller_auth) = self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
             routes.push((
@@ -575,6 +613,41 @@ enum RouteConfig {
         #[serde(default = "default_fail_open")]
         fail_open: bool,
     },
+    /// Fleet router over static candidate profiles, with readiness injected at
+    /// server construction via a [`FleetStateSource`] (never baked into this
+    /// durable config).
+    FleetRouter {
+        id: ModelId,
+        #[serde(default)]
+        context_window: Option<u32>,
+        #[serde(default)]
+        tool_calling: Option<bool>,
+        #[serde(default)]
+        reasoning: Option<bool>,
+        /// Static per-candidate capability + preference profiles.
+        #[serde(default)]
+        candidates: Vec<FleetCandidateConfig>,
+    },
+}
+
+/// Static capability + preference profile for one `fleet_router` candidate.
+///
+/// This is the durable, Algorithm-owned profile only — it carries **no live
+/// readiness** (a candidate's `ready`/`transition_required` comes from the
+/// injected [`FleetStateSource`], never from this route config). This preserves
+/// the S2-B separation of static capability from current factual state.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetCandidateConfig {
+    /// A `[targets.*]` reference this candidate may select.
+    target: String,
+    #[serde(default)]
+    tool_calling: bool,
+    #[serde(default)]
+    reasoning: bool,
+    /// Deterministic preference; lower is preferred.
+    #[serde(default)]
+    preference_rank: u16,
 }
 
 /// What fires an advisor route's review.
@@ -635,7 +708,8 @@ impl RouteConfig {
             | LlmClassifier { id, .. }
             | Passthrough { id, .. }
             | StageRouter { id, .. }
-            | Advisor { id, .. } => id,
+            | Advisor { id, .. }
+            | FleetRouter { id, .. } => id,
         }
     }
 
@@ -696,6 +770,9 @@ impl RouteConfig {
             Self::Advisor {
                 executor_target, ..
             } => vec![executor_target],
+            Self::FleetRouter { candidates, .. } => {
+                candidates.iter().map(|c| c.target.as_str()).collect()
+            }
         }
     }
 
@@ -772,6 +849,24 @@ impl RouteConfig {
                 tool_calling: *tool_calling,
                 reasoning: *reasoning,
             },
+            // The fleet router can serve tool/reasoning requests whenever it has
+            // ANY capable candidate; advertise the truthful aggregate. Route-level
+            // explicit overrides (if set) win; otherwise OR the candidates.
+            Self::FleetRouter {
+                context_window,
+                tool_calling,
+                reasoning,
+                candidates,
+                ..
+            } => {
+                let any_tool = candidates.iter().any(|c| c.tool_calling);
+                let any_reasoning = candidates.iter().any(|c| c.reasoning);
+                ModelCapabilities {
+                    context_window: *context_window,
+                    tool_calling: tool_calling.or(Some(any_tool)),
+                    reasoning: reasoning.or(Some(any_reasoning)),
+                }
+            }
         }
     }
 }
@@ -1123,6 +1218,7 @@ fn build_algorithm(
     route_name: &str,
     config: &RouteConfig,
     targets: &BTreeMap<String, ModelId>,
+    fleet_source: Arc<dyn FleetStateSource>,
 ) -> ServerResult<Arc<dyn Algorithm>> {
     match config {
         RouteConfig::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -1325,6 +1421,24 @@ fn build_algorithm(
                 ServerError::new(format!("advisor route {route_name}: {error}"))
             })?;
             Ok(Arc::new(algorithm))
+        }
+        RouteConfig::FleetRouter { candidates, .. } => {
+            // Static profile only: capability + preference per candidate. Live
+            // readiness comes from the injected `fleet_source`, never this config.
+            let mut profiles = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
+                profiles.push(CandidateProfile::new(
+                    target,
+                    candidate.tool_calling,
+                    candidate.reasoning,
+                    candidate.preference_rank,
+                ));
+            }
+            let router = FleetRouter::with_source(profiles, fleet_source).map_err(|error| {
+                ServerError::new(format!("fleet_router route {route_name}: {error}"))
+            })?;
+            Ok(Arc::new(router))
         }
     }
 }

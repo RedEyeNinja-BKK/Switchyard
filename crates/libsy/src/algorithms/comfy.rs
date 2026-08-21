@@ -691,19 +691,11 @@ pub fn advance_cursor(
 ) -> (FeedDisposition, Option<TransitionCursor>) {
     use FeedDisposition::*;
 
-    // Epoch change / reset: producer restarted. Ingest current epoch from eid 0.
-    let epoch_matches = persisted
-        .map(|c| c.producer_epoch == feed.producer_epoch)
-        .unwrap_or(false);
-    if feed.epoch_reset || !epoch_matches {
-        return (
-            EpochReset,
-            Some(TransitionCursor::fresh(&feed.producer_epoch)),
-        );
-    }
-
+    // A `None` persisted cursor means a FRESH start with no prior history —
+    // NOT a producer restart. Begin at eid 0 of the feed's current epoch with
+    // a clean continuation (Continuation). Continuity from the past is not
+    // claimed because there was none.
     let Some(cursor) = persisted else {
-        // No persisted cursor: fresh start in the current epoch.
         let last = feed.events.last().map(|e| e.eid).unwrap_or(0);
         return (
             Continuation,
@@ -713,6 +705,16 @@ pub fn advance_cursor(
             }),
         );
     };
+
+    // Producer restart is only detectable when we have a prior cursor to
+    // compare the epoch against. If we are not aware of an epoch change (and
+    // the feed did NOT flag a reset), proceed to overflow/gap/continuation.
+    if feed.epoch_reset || cursor.producer_epoch != feed.producer_epoch {
+        return (
+            EpochReset,
+            Some(TransitionCursor::fresh(&feed.producer_epoch)),
+        );
+    }
 
     // Overflow: cursor strictly below retained leading edge.
     if let Some(oldest) = feed.oldest_available_eid
@@ -1007,6 +1009,27 @@ mod tests {
         let (disp, next) = advance_cursor(Some(&persisted), &feed);
         assert_eq!(disp, FeedDisposition::Continuation);
         let next = next.expect("cursor advances");
+        assert_eq!(next.last_eid, 4);
+        assert_eq!(next.producer_epoch, "e0");
+    }
+
+    #[tokio::test]
+    async fn cursor_fresh_start_none_is_continuation_not_epoch_reset() {
+        // A None persisted cursor = fresh start with no prior history. It must
+        // NOT be misread as a producer restart (epoch reset). Continuity from
+        // the past is not claimed because there was none.
+        let mut b = FeedBuilder::new("e0").overflow_oldest(1);
+        for ev in sealed_idle_transition(1) {
+            b = b.push(ev); // eids 3,4
+        }
+        let feed = b.build();
+        let (disp, next) = advance_cursor(None, &feed);
+        assert_eq!(
+            disp,
+            FeedDisposition::Continuation,
+            "fresh start is a continuation, not epoch reset"
+        );
+        let next = next.expect("fresh cursor advances");
         assert_eq!(next.last_eid, 4);
         assert_eq!(next.producer_epoch, "e0");
     }

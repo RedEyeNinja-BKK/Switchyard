@@ -68,6 +68,52 @@ pub(crate) struct ServerConfig {
     /// Shared resource-pool definitions consumed by `resource_router` routes.
     #[serde(default)]
     resource_pools: BTreeMap<String, ResourcePoolsConfig>,
+    /// Optional inert ComfyNinja hardware-resource composition (Gate C2-A).
+    /// `absent` or `enabled=false` => no consumer, no network, no credential.
+    #[serde(default)]
+    comfyninja: Option<ComfyNinjaConfig>,
+}
+
+/// Inert ComfyNinja runtime composition configuration (Gate C2-A).
+///
+/// This block is **never activated** by Gate C2-A. It exists so the exact
+/// deployable diff is reviewable before Gate C2-B. Semantics:
+///
+/// - `enabled=false` (or absent): no ComfyNinja consumer, no network request
+///   toward `:8447`, no credential required, status `Disabled`.
+/// - `enabled=true`: construction requires resolvable credential references
+///   (env vars present + non-empty). Missing/unresolvable credential fails
+///   closed (deterministically `ComfyNinjaMisconfigured`) and never infers
+///   GPU availability.
+///
+/// The auth values live ONLY as env-var references (`auth_token_env`); no
+/// credential value appears here or anywhere in code/config/docs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComfyNinjaConfig {
+    /// When false (or absent), the integration is fully inert.
+    #[serde(default)]
+    enabled: bool,
+    /// Snapshot (`GET /v1/resource`) endpoint + auth env-var reference.
+    #[serde(default)]
+    snapshot: Option<ComfyNinjaEndpointConfig>,
+    /// Transition-feed (`GET /v1/transitions`) endpoint + auth env-var reference.
+    #[serde(default)]
+    transitions: Option<ComfyNinjaEndpointConfig>,
+    /// Cache TTL seconds (default 30).
+    #[serde(default = "default_resource_ttl_seconds")]
+    ttl_seconds: u64,
+}
+
+/// One ComfyNinja endpoint's URL + auth env reference (Gate C2-A, inert).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComfyNinjaEndpointConfig {
+    /// Protected tailnet telemetry endpoint (e.g. https://…:8447/v1/…).
+    url: String,
+    /// Name of the env var holding the read-only telemetry bearer (reference
+    /// only; the value is never stored here).
+    auth_token_env: String,
 }
 
 /// Credential-pool definitions for resource-aware routing. State is fetched
@@ -111,6 +157,45 @@ fn default_resource_ttl_seconds() -> u64 {
 
 fn default_deepseek_currency() -> String {
     "CNY".to_string()
+}
+
+/// Require a ComfyNinja endpoint sub-config to be present + have a non-empty
+/// URL + non-empty env reference. Returns a reference to it (enabled path only).
+fn require_endpoint<'a>(
+    endpoint: Option<&'a ComfyNinjaEndpointConfig>,
+    name: &str,
+) -> ServerResult<&'a ComfyNinjaEndpointConfig> {
+    let Some(endpoint) = endpoint else {
+        return Err(ServerError::new(format!(
+            "{name} is required when comfyninja.enabled=true"
+        )));
+    };
+    if endpoint.url.trim().is_empty() {
+        return Err(ServerError::new(format!("{name}.url must not be empty")));
+    }
+    if endpoint.auth_token_env.trim().is_empty() {
+        return Err(ServerError::new(format!(
+            "{name}.auth_token_env must not be empty"
+        )));
+    }
+    Ok(endpoint)
+}
+
+/// Confirm a credential env var name resolves to a present, non-empty value.
+///
+/// **Existence-check only** — the value is never returned, stored, logged, or
+/// emitted. If the variable is absent or empty this is a fail-closed
+/// misconfiguration: ComfyNinja GPU resources must never be implied available.
+fn resolve_credential_env(env_name: &str) -> std::result::Result<(), String> {
+    let value = std::env::var(env_name).map_err(|_| {
+        format!("credential env var {env_name} is not set (fail closed; ComfyNinja source unavailable)")
+    })?;
+    if value.trim().is_empty() {
+        return Err(format!(
+            "credential env var {env_name} is empty (fail closed; ComfyNinja source unavailable)"
+        ));
+    }
+    Ok(())
 }
 
 impl ServerConfig {
@@ -182,7 +267,71 @@ impl ServerConfig {
         }
         let mut state = ServerState::new_with_capabilities(routes)?;
         state.attach_resource_telemetry(telemetry);
+        let comfy = self.build_comfy()?;
+        state.set_comfy(comfy);
         Ok(state)
+    }
+
+    /// Construct the inert ComfyNinja runtime composition.
+    ///
+    /// Returns `Ok(None)` when the integration is disabled or absent — in that
+    /// case the server holds **no** ComfyNinja consumer, performs **no**
+    /// network request toward `:8447`, and requires **no** credential.
+    ///
+    /// Returns a hard `Err` when enabled but the credential references do not
+    /// resolve (env var absent or empty). This is deterministic, explicit,
+    /// fail-closed, and never implies GPU availability.
+    ///
+    /// **No live fetch, no credential value, and no `:8447` request occurs in
+    /// this method** (Gate C2-A is inert). The credential reference is only
+    /// existence-checked here; the value is discarded and used lazily, never
+    /// stored, and never emitted.
+    fn build_comfy(&self) -> ServerResult<Option<crate::comfy::ComfyNinjaRuntime>> {
+        let Some(config) = &self.comfyninja else {
+            return Ok(None); // absent => inert disabled
+        };
+        if !config.enabled {
+            return Ok(None); // disabled => inert disabled
+        }
+
+        // Enabled: validate endpoint config + credential REFERENCES (existence
+        // only; the value is never read into this structure or stored).
+        let snapshot = require_endpoint(config.snapshot.as_ref(), "comfyninja.snapshot")?;
+        let transitions =
+            require_endpoint(config.transitions.as_ref(), "comfyninja.transitions")?;
+        let credential_refs = [
+            ("comfyninja.snapshot.auth_token_env", &snapshot.auth_token_env),
+            ("comfyninja.transitions.auth_token_env", &transitions.auth_token_env),
+        ];
+        for (name, env_name) in credential_refs {
+            resolve_credential_env(env_name)
+                .map_err(|message| ServerError::new(format!("{name}: {message}")))?;
+        }
+
+        // Construct the inert runtime. `boot_state` reflects a fresh start (no
+        // prior Switchyard history / checkpoint established in C2-A).
+        let ttl = Duration::from_secs(config.ttl_seconds.max(1));
+        let snapshot_url = snapshot.url.to_string();
+        let snapshot_cred_env = snapshot.auth_token_env.to_string();
+
+        let runtime: crate::comfy::ComfyNinjaRuntime = crate::comfy::ComfyNinjaRuntime::enabled(
+            ttl,
+            // Lazy closure: would authenticate on the first requested read.
+            // NOT invoked in Gate C2-A (inert). Holds only env-var NAMES, never
+            // a credential value.
+            Box::new(move || {
+                let _url = snapshot_url.clone();
+                let _cred_env = snapshot_cred_env.clone();
+                // No live network in Gate C2-A. This closure will be completed
+                // by Gate C2-B; today it fails closed so it can never imply
+                // GPU availability.
+                Box::pin(async move {
+                    Err("comfyninja snapshot fetch: not enabled in Gate C2-A".to_string())
+                })
+            }),
+            crate::comfy::ComfyBootState::Fresh,
+        );
+        Ok(Some(runtime))
     }
 
     /// Build shared TTL-cached resource state for each `[resource_pools.*]`
@@ -2609,5 +2758,143 @@ reasoning = "non_thinking"
         assert!(
             error_message(&missing).contains("SWITCHYARD_CONFIG_TEST_RESOURCE_TOKEN_NOT_SET")
         );
+    }
+
+    // --- Layer-8C Gate C2-A: inert ComfyNinja composition --------------------
+
+    const COMFY_DISABLED: &str = r#"
+[comfyninja]
+enabled = false
+[comfyninja.snapshot]
+url = "https://comfy.test:8447/v1/resource"
+auth_token_env = "COMFY_TEST_TOKEN_A"
+[comfyninja.transitions]
+url = "https://comfy.test:8447/v1/transitions"
+auth_token_env = "COMFY_TEST_TOKEN_A"
+"#;
+
+    const COMFY_ENABLED: &str = r#"
+[comfyninja]
+enabled = true
+[comfyninja.snapshot]
+url = "https://comfy.test:8447/v1/resource"
+auth_token_env = "COMFY_TEST_TOKEN_A"
+[comfyninja.transitions]
+url = "https://comfy.test:8447/v1/transitions"
+auth_token_env = "COMFY_TEST_TOKEN_A"
+"#;
+
+    fn comfy_config(block: &str) -> String {
+        format!("{VALID_CONFIG}\n{block}")
+    }
+
+    /// Test 1: a configured-but-`enabled=false` integration composes as inert.
+    /// `comfy_status()` is `None` (no consumer, no network, no credential) and
+    /// existing routes/models are unchanged.
+    #[test]
+    fn disabled_comfy_integration_is_inert_and_routes_unchanged() -> ServerResult<()> {
+        let state_disabled = server_state_from_toml(&comfy_config(COMFY_DISABLED))?;
+        assert!(state_disabled.comfy_status().is_none());
+
+        let state_absent = server_state_from_toml(VALID_CONFIG)?;
+        assert!(state_absent.comfy_status().is_none());
+
+        // Existing non-ComfyNinja operation is unchanged: identical model set.
+        assert_eq!(
+            state_disabled.models().collect::<Vec<_>>(),
+            state_absent.models().collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// Test 2: an `enabled=true` integration with a complete config + resolvable
+    /// credential reference constructs the consumers (status Some, enabled,
+    /// boot_state Fresh) WITHOUT any network fetch.
+    #[test]
+    fn enabled_comfy_integration_constructs_inert_when_credential_resolves() -> ServerResult<()> {
+        unsafe {
+            std::env::set_var("COMFY_TEST_TOKEN_A", "test-only-fake-token");
+        }
+        let result = server_state_from_toml(&comfy_config(COMFY_ENABLED));
+        unsafe {
+            std::env::remove_var("COMFY_TEST_TOKEN_A");
+        }
+        let state = result?;
+        let status = state
+            .comfy_status()
+            .expect("enabled comfyninja must attach a runtime");
+        assert!(status.enabled);
+        assert_eq!(status.boot_state, crate::comfy::ComfyBootState::Fresh);
+        assert!(status.current_cursor.is_none());
+        Ok(())
+    }
+
+    /// Test 3: `enabled=true` without a resolvable credential fails closed and
+    /// explicitly (never implies GPU availability). References an env var
+    /// (`_NEVER_SET`) that is never set.
+    #[test]
+    fn enabled_comfy_without_credential_fails_closed() {
+        let missing = COMFY_ENABLED.replace("COMFY_TEST_TOKEN_A", "COMFY_TEST_TOKEN_NEVER_SET");
+        let message = error_message(&comfy_config(&missing));
+        assert!(
+            message.contains("COMFY_TEST_TOKEN_NEVER_SET"),
+            "fail-closed message must name the missing credential: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("available") || message.contains("unavailable"),
+            "must never imply GPU availability"
+        );
+    }
+
+    /// Test 4a: `enabled=true` but missing the snapshot endpoint fails
+    /// deterministically (before any credential resolution).
+    #[test]
+    fn enabled_comfy_missing_snapshot_endpoint_fails() {
+        let bad = r#"
+[comfyninja]
+enabled = true
+[comfyninja.transitions]
+url = "https://comfy.test:8447/v1/transitions"
+auth_token_env = "COMFY_TEST_TOKEN_A"
+"#;
+        let full = error_message(&comfy_config(bad));
+        assert!(
+            full.contains("comfyninja.snapshot is required"),
+            "message: {full}"
+        );
+    }
+
+    /// Test 4b: `enabled=true` with an empty credential env name fails
+    /// deterministically (validation rejects empty ref before env resolution).
+    #[test]
+    fn enabled_comfy_empty_credential_env_name_fails() {
+        let bad = r#"
+[comfyninja]
+enabled = true
+[comfyninja.snapshot]
+url = "https://comfy.test:8447/v1/resource"
+auth_token_env = ""
+[comfyninja.transitions]
+url = "https://comfy.test:8447/v1/transitions"
+auth_token_env = "COMFY_TEST_TOKEN_A"
+"#;
+        let full = error_message(&comfy_config(bad));
+        assert!(
+            full.contains("auth_token_env must not be empty"),
+            "message: {full}"
+        );
+    }
+
+    /// Test 10 (config level): a `[comfyninja]` block (disabled) does not change
+    /// the resolved routes/models vs. a config with no comfy block at all.
+    #[test]
+    fn comfy_block_does_not_alter_routing_model_set() -> ServerResult<()> {
+        let with_comfy = server_state_from_toml(&comfy_config(COMFY_DISABLED))?;
+        let without_comfy = server_state_from_toml(VALID_CONFIG)?;
+        assert_eq!(
+            with_comfy.models().collect::<Vec<_>>(),
+            without_comfy.models().collect::<Vec<_>>()
+        );
+        Ok(())
     }
 }

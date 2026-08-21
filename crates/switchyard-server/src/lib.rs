@@ -3,6 +3,7 @@
 
 //! Rust HTTP server for libsy algorithms.
 
+pub mod comfy;
 pub mod config;
 mod metrics;
 mod observability;
@@ -193,6 +194,9 @@ pub struct ServerState {
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
     resource_telemetry: Option<SharedResourceTelemetry>,
+    /// Optional inert ComfyNinja runtime composition (Gate C2-A). `None` when
+    /// the integration is disabled (no consumer, no network, no credential).
+    comfy: Option<Arc<comfy::ComfyNinjaRuntime>>,
 }
 
 #[derive(Clone)]
@@ -304,6 +308,7 @@ impl ServerState {
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             resource_telemetry: None,
+            comfy: None,
         })
     }
 
@@ -317,6 +322,20 @@ impl ServerState {
     /// configured resource pools (read-only observability endpoint backing).
     pub fn attach_resource_telemetry(&mut self, telemetry: SharedResourceTelemetry) {
         self.resource_telemetry = Some(telemetry);
+    }
+
+    /// Attach the (optionally enabled) inert ComfyNinja runtime composition.
+    ///
+    /// When `None` (integration disabled) the server holds no ComfyNinja
+    /// consumer/task/credential. When `Some(runtime)` the composition is inert:
+    /// no background task, no live fetch, no `:8447` request until driven.
+    pub fn set_comfy(&mut self, comfy: Option<comfy::ComfyNinjaRuntime>) {
+        self.comfy = comfy.map(Arc::new);
+    }
+
+    /// Accessor for the current inert ComfyNinja composition status (read-only).
+    pub fn comfy_status(&self) -> Option<comfy::ComfyCompositionStatus> {
+        self.comfy.as_ref().map(|c| c.status())
     }
 
     /// Enables durable per-request routing records at `path`.

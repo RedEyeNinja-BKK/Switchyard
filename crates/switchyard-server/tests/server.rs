@@ -1231,6 +1231,15 @@ fn fleet_ready_snapshot() -> FleetSnapshot {
     .unwrap()
 }
 
+/// A ready snapshot for the two-target (`model/a`, `model/b`) fleet configs.
+fn ab_ready_snapshot() -> FleetSnapshot {
+    FleetSnapshot::new(vec![
+        (ModelId::from("model/a"), CandidateState::ready()),
+        (ModelId::from("model/b"), CandidateState::ready()),
+    ])
+    .unwrap()
+}
+
 #[tokio::test]
 async fn s2c_fleet_route_parses_and_unknown_target_fails_validation() -> TestResult {
     let upstream = MockUpstream::start().await?;
@@ -1500,6 +1509,257 @@ async fn s2c_decision_same_server_snapshot_update_changes_decision() -> TestResu
     .await?;
     let second = second.json()?;
     assert_eq!(second["selected"]["target"], "deepseek");
+    Ok(())
+}
+
+// ─── S2-C final: truthful route-capability envelope validation ─────────────
+
+/// Builds a fleet config with arbitrary candidate capability profiles.
+///
+/// `candidates_toml` is the raw `[[routes.fleet.candidates]]` block (may set
+/// `tool_calling`/`reasoning` per candidate). `route_dims` is the optional
+/// route-level `tool_calling`/`reasoning` override lines.
+fn fleet_toml_with_candidates(base_url: &str, candidates_toml: &str, route_dims: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.model_provider]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.a]
+id = "model/a"
+llm_client = "model_provider"
+
+[targets.b]
+id = "model/b"
+llm_client = "model_provider"
+
+[routes.fleet]
+id = "localclaw/fleet"
+type = "fleet_router"
+context_window = 1048576
+{route_dims}
+{candidates_toml}
+"#
+    )
+}
+
+#[tokio::test]
+async fn s2c_no_tool_capable_candidate_rejects_tool_override() -> TestResult {
+    // A: candidate set has no tool-capable target; route-level tool_calling=true
+    // must fail config construction.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = false
+reasoning = true
+preference_rank = 1
+"#;
+    let toml = fleet_toml_with_candidates(&upstream.base_url, candidates, "tool_calling = true");
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("tool_calling=true with no tool-capable candidate must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("tool_calling=true"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_no_reasoning_capable_candidate_rejects_reasoning_override() -> TestResult {
+    // B: no reasoning-capable candidate; route-level reasoning=true must fail.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+"#;
+    let toml = fleet_toml_with_candidates(&upstream.base_url, candidates, "reasoning = true");
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("reasoning=true with no reasoning-capable candidate must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("reasoning=true"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_disjoint_candidate_set_rejects_implicit_both() -> TestResult {
+    // C: A = tools-only, B = reasoning-only. Automatic OR would imply both true,
+    // but no candidate can satisfy tools + reasoning together => reject.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+
+[[routes.fleet.candidates]]
+target = "b"
+tool_calling = false
+reasoning = true
+preference_rank = 2
+"#;
+    let toml = fleet_toml_with_candidates(&upstream.base_url, candidates, "");
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("disjoint tool-only + reasoning-only candidate set must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("not representable"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_explicit_restriction_makes_disjoint_set_representable() -> TestResult {
+    // D: same disjoint candidate set, but explicit tool_calling=true /
+    // reasoning=false narrows the envelope so it is representable.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+
+[[routes.fleet.candidates]]
+target = "b"
+tool_calling = false
+reasoning = true
+preference_rank = 2
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = false",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    // Loads successfully: the advertised envelope is exactly
+    // tool_calling=true, reasoning=false (representable by tool-only A).
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    // A tool-bearing request routes to the tool-capable candidate.
+    let tool_resp = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role":"user","content":"use a tool"}],
+                "tools": [{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(tool_resp.status, StatusCode::OK);
+    assert_eq!(tool_resp.json()?["selected"]["target"], "a");
+
+    // Because the envelope excludes reasoning, a positive-reasoning request has
+    // no eligible candidate and fails closed (envelope is truthful).
+    let reason_resp = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role":"user","content":"reason"}],
+                "reasoning_effort": "high"
+            }
+        })),
+    )
+    .await?;
+    assert!(
+        reason_resp.status == StatusCode::OK
+            || reason_resp.status == StatusCode::INTERNAL_SERVER_ERROR
+            || reason_resp.status == StatusCode::SERVICE_UNAVAILABLE,
+        "a reasoning request must fail closed when the advertised envelope has reasoning=false; got {}",
+        reason_resp.status
+    );
+    if reason_resp
+        .headers
+        .get("x-model-router-selected-model")
+        .is_some()
+    {
+        unreachable!(
+            "a reasoning request must not select a target under a reasoning=false envelope"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_combined_capable_candidate_auto_advertises_both() -> TestResult {
+    // E: a candidate set with at least one tool+reasoning candidate still
+    // auto-advertises tool_calling=true, reasoning=true (existing S2-C shape).
+    // The advertised both-true envelope is truthful because luna/deepseek
+    // support tools AND reasoning, so a combined tools+reasoning request is
+    // satisfiable.
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    // Simple request still selects the top preference (luna).
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["selected"]["target"], "luna");
+
+    // A combined tools + reasoning request must succeed (proving the advertised
+    // tool_calling=true AND reasoning=true envelope is actually satisfiable by a
+    // single candidate), excluding htpc (no tool, no reasoning).
+    let combined = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role":"user","content":"use a tool and reason"}],
+                "tools": [{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                "reasoning_effort": "high"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(combined.status, StatusCode::OK);
+    let all: Vec<String> = {
+        let res = combined.json()?;
+        let mut v = vec![res["selected"]["target"].as_str().unwrap().to_string()];
+        v.extend(
+            res["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["target"].as_str().unwrap().to_string()),
+        );
+        v
+    };
+    assert!(
+        !all.contains(&"htpc".to_string()),
+        "a tools+reasoning request must not reach the non-tool/non-reasoning htpc"
+    );
     Ok(())
 }
 

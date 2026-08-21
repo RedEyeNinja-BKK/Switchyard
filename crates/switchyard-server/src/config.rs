@@ -153,6 +153,9 @@ impl ServerConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
+            // A fleet_router route's advertised capability envelope must be
+            // satisfiable by its candidate set (truthful model advertisement).
+            config.validate_fleet_capabilities(route_name)?;
             let algorithm = build_algorithm(route_name, config, &targets, fleet_source.clone())?;
             let (client, caller_auth) = self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
@@ -849,9 +852,9 @@ impl RouteConfig {
                 tool_calling: *tool_calling,
                 reasoning: *reasoning,
             },
-            // The fleet router can serve tool/reasoning requests whenever it has
-            // ANY capable candidate; advertise the truthful aggregate. Route-level
-            // explicit overrides (if set) win; otherwise OR the candidates.
+            // The fleet router advertises the truthful aggregate of its candidate
+            // capabilities, validated during build (see validate_fleet_capabilities)
+            // so it is always satisfiable by at least one candidate.
             Self::FleetRouter {
                 context_window,
                 tool_calling,
@@ -859,15 +862,99 @@ impl RouteConfig {
                 candidates,
                 ..
             } => {
-                let any_tool = candidates.iter().any(|c| c.tool_calling);
-                let any_reasoning = candidates.iter().any(|c| c.reasoning);
-                ModelCapabilities {
-                    context_window: *context_window,
-                    tool_calling: tool_calling.or(Some(any_tool)),
-                    reasoning: reasoning.or(Some(any_reasoning)),
-                }
+                fleet_effective_capabilities(*context_window, *tool_calling, *reasoning, candidates)
             }
         }
+    }
+
+    /// Validates that a `fleet_router` route's advertised capability envelope is
+    /// truthfully satisfiable by its static candidate set. Non-fleet-router
+    /// variants are a no-op.
+    ///
+    /// [`ServerConfig::build`] calls this before algorithm/client construction, so
+    /// a violation surfaces as a `ServerError` that fails configuration loading
+    /// with a descriptive message.
+    ///
+    /// Rules enforced (STATIC capability validation; readiness is never
+    /// consulted):
+    /// - An explicit `tool_calling=true` (or `reasoning=true`) override is
+    ///   rejected when no candidate advertises that capability — a route-level
+    ///   override must never expand beyond the candidate set.
+    /// - Explicit `false` may conservatively restrict the advertised envelope.
+    /// - If the effective advertised envelope (shared with
+    ///   [`Self::capabilities`] via [`fleet_effective_capabilities`]) is
+    ///   `tool_calling=true` AND `reasoning=true`, at least one candidate must
+    ///   support the **combined** requirement (a disjoint tool-only +
+    ///   reasoning-only candidate set cannot satisfy a tools+reasoning request,
+    ///   so that aggregate is rejected).
+    fn validate_fleet_capabilities(&self, route_name: &str) -> ServerResult<()> {
+        let RouteConfig::FleetRouter {
+            tool_calling,
+            reasoning,
+            candidates,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+
+        let any_tool = candidates.iter().any(|c| c.tool_calling);
+        let any_reasoning = candidates.iter().any(|c| c.reasoning);
+        let any_tool_and_reasoning = candidates.iter().any(|c| c.tool_calling && c.reasoning);
+
+        // Explicit TRUE overrides must not exceed the candidate capability set.
+        if tool_calling == &Some(true) && !any_tool {
+            return Err(ServerError::new(format!(
+                "fleet_router route {route_name} advertises tool_calling=true but no \
+                 candidate profile supports tool calling"
+            )));
+        }
+        if reasoning == &Some(true) && !any_reasoning {
+            return Err(ServerError::new(format!(
+                "fleet_router route {route_name} advertises reasoning=true but no \
+                 candidate profile supports reasoning"
+            )));
+        }
+
+        // Effective advertised envelope after applying restrictive (false)
+        // overrides — shares its derivation with `capabilities()` so validation
+        // and advertisement can never disagree.
+        let effective = fleet_effective_capabilities(None, *tool_calling, *reasoning, candidates);
+
+        // A tools+reasoning aggregate must be satisfiable by one candidate.
+        if effective.tool_calling == Some(true)
+            && effective.reasoning == Some(true)
+            && !any_tool_and_reasoning
+        {
+            return Err(ServerError::new(format!(
+                "fleet_router route {route_name} would advertise tool_calling=true and \
+                 reasoning=true, but no single candidate supports both; the aggregate \
+                 capability envelope is not representable by the candidate set"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Derives the effective `fleet_router` capability envelope shared by both
+/// [`RouteConfig::capabilities`] and [`RouteConfig::validate_fleet_capabilities`].
+///
+/// Defaults to the OR of candidate tool/reasoning; an explicit route-level
+/// override narrows or asserts a dimension. The `context_window` argument is
+/// passed through (context admission remains deferred; it does not depend on
+/// candidates).
+fn fleet_effective_capabilities(
+    context_window: Option<u32>,
+    tool_calling: Option<bool>,
+    reasoning: Option<bool>,
+    candidates: &[FleetCandidateConfig],
+) -> ModelCapabilities {
+    let any_tool = candidates.iter().any(|c| c.tool_calling);
+    let any_reasoning = candidates.iter().any(|c| c.reasoning);
+    ModelCapabilities {
+        context_window,
+        tool_calling: tool_calling.or(Some(any_tool)),
+        reasoning: reasoning.or(Some(any_reasoning)),
     }
 }
 

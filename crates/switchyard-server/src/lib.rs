@@ -5,6 +5,7 @@
 
 pub mod comfy;
 pub mod config;
+pub mod fact_plane;
 mod metrics;
 mod observability;
 mod resource_fetcher;
@@ -300,6 +301,20 @@ impl ServerState {
         Some(comfy.status().await)
     }
 
+    /// Project the shadow inference-fact plane (REALIGN-2). ZERO routing authority.
+    ///
+    /// Reuses the already-published resource telemetry for OpenAI/DeepSeek facts and the
+    /// (non-fetching) Comfy composition status for local-GPU continuity. It never fetches,
+    /// never selects a target, and is unread by any routing path.
+    pub async fn fact_plane(&self) -> fact_plane::FactPlaneSnapshot {
+        // Cloud facts from the existing published telemetry (no re-fetch).
+        let resource = self.resource_telemetry.as_ref().and_then(|t| t.get());
+        let resource_ref = resource.as_ref().map(|r| r.as_ref());
+        // Comfy continuity from the existing Gate-C status (non-fetching).
+        let continuity = self.comfy_status().await;
+        fact_plane::project(resource_ref, None, continuity.as_ref())
+    }
+
     /// Request cancellation of the ComfyNinja driver and await its join.
     ///
     /// Called from the server shutdown path so the driver stops cleanly and is
@@ -565,6 +580,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
         .route("/v1/resource/deepseek", get(get_deepseek_resource))
+        .route("/v1/fact-plane", get(get_fact_plane))
         .route("/metrics", get(prometheus_metrics))
         .route("/health", get(health));
     if state.routing_log.is_some() {
@@ -1168,6 +1184,20 @@ async fn get_deepseek_resource(
             "error": deepseek.error,
         })),
     )
+}
+
+/// Read-only shadow inference-fact plane (REALIGN-2).
+///
+/// Returns the projected generic fact-plane snapshot (OpenAI allowance/health, DeepSeek
+/// balance/health, Comfy continuity) for OBSERVATION ONLY. It has ZERO routing authority:
+/// it never selects a target, alters a candidate set, changes fallback, or touches routing.
+/// It reuses the already-published resource telemetry + non-fetching Comfy status — it does
+/// not fetch, does not expose credentials, and never fabricates favorable facts.
+async fn get_fact_plane(
+    State(state): State<ServerState>,
+) -> Json<fact_plane::FactPlaneSnapshot> {
+    let plane = state.fact_plane().await;
+    Json(plane)
 }
 
 async fn reset_stats(State(state): State<ServerState>) -> Json<Value> {

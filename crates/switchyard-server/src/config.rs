@@ -297,40 +297,46 @@ impl ServerConfig {
         // Enabled: validate endpoint config + credential REFERENCES (existence
         // only; the value is never read into this structure or stored).
         let snapshot = require_endpoint(config.snapshot.as_ref(), "comfyninja.snapshot")?;
-        let transitions =
-            require_endpoint(config.transitions.as_ref(), "comfyninja.transitions")?;
+        let transitions = require_endpoint(config.transitions.as_ref(), "comfyninja.transitions")?;
         let credential_refs = [
-            ("comfyninja.snapshot.auth_token_env", &snapshot.auth_token_env),
-            ("comfyninja.transitions.auth_token_env", &transitions.auth_token_env),
+            (
+                "comfyninja.snapshot.auth_token_env",
+                &snapshot.auth_token_env,
+            ),
+            (
+                "comfyninja.transitions.auth_token_env",
+                &transitions.auth_token_env,
+            ),
         ];
         for (name, env_name) in credential_refs {
             resolve_credential_env(env_name)
                 .map_err(|message| ServerError::new(format!("{name}: {message}")))?;
         }
 
-        // Construct the inert runtime. `boot_state` reflects a fresh start (no
-        // prior Switchyard history / checkpoint established in C2-A).
+        // Construct the enabled runtime with a REAL authenticated snapshot fetch
+        // path (Gate C2-F). The snapshot fetch is captured inside the runtime's
+        // TTL cache; the transition credential is validated above and the
+        // transition fetcher is constructed at driver activation (C2-B).
+        // boot_state=Fresh (no prior history/checkpoint).
         let ttl = Duration::from_secs(config.ttl_seconds.max(1));
         let snapshot_url = snapshot.url.to_string();
         let snapshot_cred_env = snapshot.auth_token_env.to_string();
 
+        // The snapshot cache closure resolves the credential lazily per fetch.
+        // The request path constructs the bearer, sends it, and drops it; the
+        // value never enters persistent state (see ComfyHttpSnapshotFetcher).
         let runtime: crate::comfy::ComfyNinjaRuntime = crate::comfy::ComfyNinjaRuntime::enabled(
             ttl,
-            // Lazy closure: would authenticate on the first requested read.
-            // NOT invoked in Gate C2-A (inert). Holds only env-var NAMES, never
-            // a credential value.
             Box::new(move || {
-                let _url = snapshot_url.clone();
-                let _cred_env = snapshot_cred_env.clone();
-                // No live network in Gate C2-A. This closure will be completed
-                // by Gate C2-B; today it fails closed so it can never imply
-                // GPU availability.
-                Box::pin(async move {
-                    Err("comfyninja snapshot fetch: not enabled in Gate C2-A".to_string())
-                })
+                let fetcher = Arc::new(crate::comfy::ComfyHttpSnapshotFetcher::new(
+                    snapshot_url.clone(),
+                    snapshot_cred_env.clone(),
+                ));
+                Box::pin(async move { fetcher.fetch().await })
             }),
             crate::comfy::ComfyBootState::Fresh,
         );
+
         Ok(Some(runtime))
     }
 

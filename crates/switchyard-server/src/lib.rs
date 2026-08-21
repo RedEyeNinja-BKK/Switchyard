@@ -6,6 +6,7 @@
 pub mod comfy;
 pub mod config;
 pub mod fact_plane;
+pub mod policy_shadow;
 mod metrics;
 mod observability;
 mod resource_fetcher;

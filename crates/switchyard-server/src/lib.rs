@@ -167,6 +167,10 @@ pub struct ServerState {
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
     resource_telemetry: Option<SharedResourceTelemetry>,
+    /// Retained SHADOW OpenAI daily-tranche accounting state (POLICY-CONSUME-SHADOW).
+    /// This is policy-observation state (not factual, not routing). A `std::sync::Mutex`
+    /// suffices — it is never held across an await on the hot path.
+    openai_tranche_state: std::sync::Arc<std::sync::Mutex<policy_shadow::OpenAiTrancheState>>,
     /// Optional activated ComfyNinja runtime driver (Gate C2-W). `None` when the
     /// integration is disabled (no runtime, no driver, no consumer, no network,
     /// no credential). `Some(handle)` is the single production driver for an
@@ -272,6 +276,7 @@ impl ServerState {
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             resource_telemetry: None,
+            openai_tranche_state: std::sync::Arc::new(std::sync::Mutex::new(policy_shadow::OpenAiTrancheState::default())),
             comfy: None,
         })
     }
@@ -311,9 +316,67 @@ impl ServerState {
         // Cloud facts from the existing published telemetry (no re-fetch).
         let resource = self.resource_telemetry.as_ref().and_then(|t| t.get());
         let resource_ref = resource.as_ref().map(|r| r.as_ref());
+        // Effective refresh TTL from the actual source (config authority; no mirrored constant).
+        let effective_refresh_ttl = self
+            .resource_telemetry
+            .as_ref()
+            .and_then(|t| t.refresh_ttl());
         // Comfy continuity from the existing Gate-C status (non-fetching).
         let continuity = self.comfy_status().await;
-        fact_plane::project(resource_ref, None, continuity.as_ref())
+        fact_plane::project(resource_ref, None, continuity.as_ref(), effective_refresh_ttl)
+    }
+
+    /// Compose the OpenAI daily-tranche shadow policy from the LIVE fact plane
+    /// (POLICY-CONSUME-SHADOW). One-way: FACT PLANE → POLICY PLANE. Zero routing authority.
+    ///
+    /// Chain: existing provider fetch → SharedResourceTelemetry → fact projection →
+    /// OpenAiFacts → admission adapter (from the factual contract) → shadow policy assessor
+    /// → OpenAiDailyTranchePolicy. The retained accounting state is advanced ONLY by a new
+    /// (deduplicated) factual observation, never by client polling frequency.
+    pub fn shadow_openai_tranche_policy(&self) -> policy_shadow::OpenAiDailyTranchePolicy {
+        use policy_shadow::OpenAiObservation;
+        let now = fact_plane::now_unix_secs();
+        let resource = self.resource_telemetry.as_ref().and_then(|t| t.get());
+        let effective_refresh_ttl = self
+            .resource_telemetry
+            .as_ref()
+            .and_then(|t| t.refresh_ttl());
+        // Project ONLY the OpenAI facts directly from the existing snapshot (no re-fetch).
+        // Bind the snapshot first so the projected owned OpenAiFacts does not borrow it.
+        let openai_facts = resource.as_ref().and_then(|r| {
+            r.openai
+                .as_ref()
+                .map(|o| fact_plane::project_openai_for_policy(o, effective_refresh_ttl))
+        });
+        let mut st = self
+            .openai_tranche_state
+            .lock()
+            .expect("openai tranche state mutex poisoned");
+        match &openai_facts {
+            Some(facts) => {
+                let adm = policy_shadow::admit_from_openai_facts(facts);
+                policy_shadow::assess(
+                    now,
+                    OpenAiObservation {
+                        weekly_used_percent: adm.weekly_used_percent,
+                        weekly_reset_at: adm.weekly_reset_at,
+                        last_success_at: adm.last_success_at,
+                    },
+                    adm.usable,
+                    &mut st,
+                )
+            }
+            None => policy_shadow::assess(
+                now,
+                OpenAiObservation {
+                    weekly_used_percent: None,
+                    weekly_reset_at: None,
+                    last_success_at: None,
+                },
+                false,
+                &mut st,
+            ),
+        }
     }
 
     /// Request cancellation of the ComfyNinja driver and await its join.
@@ -582,6 +645,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/stats/reset", post(reset_stats))
         .route("/v1/resource/deepseek", get(get_deepseek_resource))
         .route("/v1/fact-plane", get(get_fact_plane))
+        .route("/v1/shadow/openai-tranche", get(get_shadow_openai_tranche))
         .route("/metrics", get(prometheus_metrics))
         .route("/health", get(health));
     if state.routing_log.is_some() {
@@ -1199,6 +1263,21 @@ async fn get_fact_plane(
 ) -> Json<fact_plane::FactPlaneSnapshot> {
     let plane = state.fact_plane().await;
     Json(plane)
+}
+
+/// Read-only SHADOW OpenAI daily-tranche policy observation (POLICY-CONSUME-SHADOW).
+///
+/// Returns the composed FACT PLANE → POLICY PLANE shadow result for the OpenAI ordinary
+/// daily tranche (OPEN/CONSUMED/UNKNOWN + consumed/remaining pp + accounting + ordinary-cloud
+/// phase). It has NO routing authority (never selects a target / changes candidates /
+/// fallback), is one-way (no policy written back into facts), and inherits the previously
+/// recorded Switchyard-listener trust boundary — it is NOT deploy-authorized as-is. It is
+/// NOT deploy-authorized; the accounting state advances only on new factual observations
+/// (deduplicated), never on client polling frequency.
+async fn get_shadow_openai_tranche(
+    State(state): State<ServerState>,
+) -> Json<policy_shadow::OpenAiDailyTranchePolicy> {
+    Json(state.shadow_openai_tranche_policy())
 }
 
 async fn reset_stats(State(state): State<ServerState>) -> Json<Value> {

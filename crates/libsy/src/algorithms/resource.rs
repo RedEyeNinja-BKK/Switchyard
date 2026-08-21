@@ -169,25 +169,54 @@ pub struct ResourceSnapshot {
 /// published here. Never holds secrets — it is the same sanitized state the
 /// router already uses. A plain `std::sync::Mutex` suffices: `get`/`set` are
 /// never held across an await, so the routing hot path cannot deadlock.
+///
+/// The telemetry also carries the **effective refresh TTL of the source that
+/// published the snapshot** (from the resource-pool config, `ttl_seconds`).
+/// This is the SINGLE source of truth for fact-plane observation freshness —
+/// the fact/policy layers read it from the actual source rather than a
+/// mirrored compiled constant (native/config-first doctrine). Configuration
+/// remains the authority; no second copy is hard-coded elsewhere.
 #[derive(Clone, Debug, Default)]
-pub struct SharedResourceTelemetry(
-    std::sync::Arc<std::sync::Mutex<Option<Arc<ResourceSnapshot>>>>,
-);
+pub struct SharedResourceTelemetry {
+    inner: std::sync::Arc<std::sync::Mutex<Option<Arc<ResourceSnapshot>>>>,
+    refresh_ttl: std::sync::Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+}
 
 impl SharedResourceTelemetry {
     pub fn new() -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(None)))
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            refresh_ttl: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// Latest published snapshot, if any.
     pub fn get(&self) -> Option<Arc<ResourceSnapshot>> {
-        self.0.lock().expect("resource telemetry mutex poisoned").clone()
+        self.inner
+            .lock()
+            .expect("resource telemetry mutex poisoned")
+            .clone()
     }
 
-    /// Publish a snapshot (used by ResourceState after refresh; public so
-    /// tests can seed a deterministic state).
-    pub fn set(&self, snapshot: Arc<ResourceSnapshot>) {
-        *self.0.lock().expect("resource telemetry mutex poisoned") = Some(snapshot);
+    /// The effective refresh TTL of the source that last published the snapshot.
+    pub fn refresh_ttl(&self) -> Option<std::time::Duration> {
+        *self
+            .refresh_ttl
+            .lock()
+            .expect("resource telemetry mutex poisoned")
+    }
+
+    /// Publish a snapshot + its effective refresh TTL (used by ResourceState after
+    /// refresh; public so tests can seed a deterministic state).
+    pub fn set(&self, snapshot: Arc<ResourceSnapshot>, refresh_ttl: std::time::Duration) {
+        *self
+            .inner
+            .lock()
+            .expect("resource telemetry mutex poisoned") = Some(snapshot);
+        *self
+            .refresh_ttl
+            .lock()
+            .expect("resource telemetry mutex poisoned") = Some(refresh_ttl);
     }
 }
 
@@ -243,7 +272,7 @@ impl ResourceState {
         // mutex (never held across await), so this cannot deadlock and does
         // not extend an async critical section.
         if let Some(telemetry) = self.telemetry.get() {
-            telemetry.set(Arc::clone(&snapshot));
+            telemetry.set(Arc::clone(&snapshot), self.ttl);
         }
         Ok(snapshot)
     }

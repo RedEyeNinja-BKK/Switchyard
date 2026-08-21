@@ -1,102 +1,124 @@
-//! FACT-3A: OpenAI daily-tranche shadow policy (SHADOW ACCOUNTING / OBSERVATION ONLY).
+//! POLICY-CONSUME-SHADOW: OpenAI daily-tranche shadow policy (OBSERVATION ONLY).
 //!
-//! This is the FIRST POLICY consumer of the factual plane. It has ZERO routing authority
-//! (no candidate/candidate-set/fallback/model-selection). It is the ordinary-cloud
-//! accounting policy: how much of the ~14 percentage-points-per-Bangkok-policy-day OpenAI
-//! tranche remains, and whether ordinary cloud should be OpenAI or DeepSeek continuation.
+//! Evolved from FACT-3A with the POLICY-CONSUME-SHADOW corrections:
+//!   1. Provider-window continuity must be POSITIVELY known (Some→Some same); None
+//!      transitions are UNKNOWN, never silently continuous.
+//!   2. A prior-day observation anchors a new Bangkok policy day ONLY when it sufficiently
+//!      brackets the policy boundary under a documented near-boundary rule.
+//!   3. Non-monotonic same-window usage (current < prior) is DISCONTINUITY, not clamp-to-zero.
+//!   4. A later fresh continuous cumulative observation may recover accounting to Ok within
+//!      a positively-known provider week.
+//!   5. Policy output describes POLICY PERMISSION/PREFERENCE, not factual provider health.
+//!   6. A thin adapter derives observation admissibility from the factual contract
+//!      (OpenAiFacts), not an arbitrary caller bool.
+//!   7. Repeated projection of an unchanged provider observation does NOT manufacture a new
+//!      accounting event.
 //!
-//! SEPARATIONS (REALIGN-2 doctrine, preserved):
-//!   * FACT PLANE ≠ POLICY PLANE — this module does NOT fetch/project facts; it consumes
-//!     them, and lives in a separate neutral module (`policy_shadow.rs`), NOT under routing.
-//!   * POLICY ≠ FACT — it never writes facts back; it only observes/accounts.
-//!   * POLICY ≠ CAPABILITY — the daily tranche never redefines capability (thinking /
-//!     non-thinking) and can never downgrade capability because of budget.
-//!   * POLICY ≠ ROUTING — it emits a shadow disposition only; no route/candidate mutation.
-//!
-//! POLICY-DAY SEMANTICS (operator): 00:00→24:00 Asia/Bangkok (UTC+7, no DST). A policy day
-//! is OUR accounting boundary — NOT OpenAI's weekly-reset boundary. The 14% means ~14
-//! percentage points of the (current) weekly-allowance basis per policy day, NOT 14% of
-//! whatever happens to remain.
+//! It remains: FACT PLANE ≠ POLICY PLANE (this module consumes facts, never fetches/writes
+//! them); POLICY ≠ ROUTING (zero candidate/selection/fallback authority); CAPABILITY is
+//! never redefined by budget. This answers ONLY "which ordinary CLOUD lane should
+//! participate"; it implies nothing about local inference.
 
 /// Asia/Bangkok constant UTC offset (no DST): +7 hours = 25200 seconds.
 const BANGKOK_OFFSET_SECS: i64 = 7 * 3600;
 /// The operator daily tranche target: ~14 percentage points of the weekly allowance/day.
 pub const OPENAI_DAILY_TRANCHE_PP: f64 = 14.0;
+/// Near-boundary bracket (seconds before Bangkok midnight) within which a prior-day
+/// observation is a trustworthy day-start anchor. Request-driven cloud refresh may produce
+/// no observation near midnight; a sample from hours before midnight is NOT a factual 00:00
+/// baseline and must NOT anchor the day. This is a documented SHADOW-phase rule — the
+/// observation lifecycle must later guarantee/reconstruct a trustworthy boundary before the
+/// policy gains any routing authority.
+pub const POLICY_BOUNDARY_BRACKET_SECS: i64 = 3600; // 1 hour before Bangkok midnight
 
 // ---------------------------------------------------------------------------
 // Output types.
 // ---------------------------------------------------------------------------
 
-/// Whether the ordinary OpenAI daily tranche is open for ordinary-cloud participation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrancheStatus {
-    /// < 14 pp consumed today, and the accounting basis is trustworthy.
     Open,
-    /// >= 14 pp consumed today (or continuity cannot grant more this day).
     Consumed,
-    /// Cannot confidently determine (cold start, stale/missing, provider-reset discontinuity).
-    /// FAILS SAFE — never a fresh allocation from a bad baseline.
     Unknown,
 }
 
-/// Accounting continuity for the policy day.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AccountingStatus {
-    /// A trustworthy day-start baseline exists (from a continuous prior-day observation).
     Ok,
-    /// Observer started mid-day / cold-start with no trustworthy baseline to anchor today's
-    /// consumption. Must NOT silently grant a fresh 14-point tranche.
     Uninitialized,
-    /// The OpenAI weekly window reset within the policy day and exact consumption cannot be
-    /// reconstructed from the observed sequence.
     ContinuityDegraded,
-    /// The observation feeding the calculation was stale / unknown / absent.
     FreshnessGated,
 }
 
-/// The ordinary-cloud phase the operator policy would produce (shadow only — never enforced).
+/// The ordinary-CLOUD policy disposition (POLICY PERMISSION/PREFERENCE — NOT factual
+/// provider health). These never claim "OpenAI is reachable" / "DeepSeek is reachable";
+/// reachability is a fact-plane concern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OrdinaryCloudPhase {
-    /// OpenAI daily tranche open -> OpenAI remains available for ordinary cloud.
-    OpenAiAvailable,
+    /// OpenAI daily tranche is open -> ordinary OpenAI is POLICY-PERMITTED.
+    OpenaiOrdinaryPermitted,
     /// OpenAI tranche consumed -> ordinary OpenAI conserved; DeepSeek is the normal
     /// ordinary-cloud continuation until the next Bangkok policy day.
-    DeepSeekContinuation,
+    ConserveOpenaiDeepSeekContinuation,
     /// Indeterminate.
     Unknown,
 }
 
+/// Provider-week continuity MUST be positively established; absence is never proof of
+/// continuity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum ProviderWeekContinuity {
+    /// previous Some(X) and current Some(X) -> continuity may be established.
+    KnownContinuous,
+    /// Same day, Some(X) -> Some(Y) with X != Y -> reset/change.
+    Changed,
+    /// Any None-involving transition (None→None, None→Some, Some→None) or unknown week ->
+    /// cannot establish continuity.
+    Unknown,
+}
+
 /// One structured observation (FACT — supplied by the fact plane, not computed here).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OpenAiObservation {
-    /// FACT: current weekly used percentage.
     pub weekly_used_percent: Option<f64>,
-    /// FACT: provider weekly reset timestamp.
     pub weekly_reset_at: Option<i64>,
-    /// FACT: last successful read time (provenance).
     pub last_success_at: Option<i64>,
 }
 
-/// The FULL shadow policy result for one assessment tick (Serialize-only: it carries
-/// `Vec<&'static str>` reasons and is a pure observation; it is not deserialized).
+/// Observation IDENTITY (deduplication): a fresh projection/query with an unchanged identity
+/// is NOT a new provider observation and must not advance the accounting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObservationId {
+    pub last_success_at: Option<i64>,
+    pub weekly_used_percent: Option<f64>,
+    pub weekly_reset_at: Option<i64>,
+}
+
+impl ObservationId {
+    pub fn of(o: &OpenAiObservation) -> Self {
+        Self {
+            last_success_at: o.last_success_at,
+            weekly_used_percent: o.weekly_used_percent,
+            weekly_reset_at: o.weekly_reset_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct OpenAiDailyTranchePolicy {
-    /// Asia/Bangkok policy-day id.
     pub policy_day_id: i64,
     pub tranche_status: TrancheStatus,
     pub accounting_status: AccountingStatus,
-    /// Percentage points consumed so far this policy day.
     pub consumed_today_pp: Option<f64>,
-    /// The day-start weekly-usage baseline this accounting is anchored to.
     pub day_start_baseline_pp: Option<f64>,
-    /// Remaining percentage points of the daily tranche (14 - consumed), when known.
     pub remaining_today_pp: Option<f64>,
-    /// Provider weekly window identity at the accounting baseline.
     pub day_start_provider_week: Option<i64>,
-    /// The latest provider weekly window seen this policy day.
     pub latest_provider_week: Option<i64>,
+    pub provider_week_continuity: ProviderWeekContinuity,
     pub ordinary_cloud_phase: OrdinaryCloudPhase,
-    /// Structured reasons (no credentials).
+    /// true when the observation advanced the accounting (new observation), false when it was
+    /// a duplicate of an already-seen observation.
+    pub advanced: bool,
     pub reasons: Vec<&'static str>,
 }
 
@@ -104,24 +126,15 @@ pub struct OpenAiDailyTranchePolicy {
 // Retained accounting state (volatile — NOT durable in this shadow phase).
 // ---------------------------------------------------------------------------
 
-/// Minimal SHADOW accounting state. In-memory only: a process restart does NOT retain it,
-/// so restart semantics are handled explicitly by `assess` (cold start -> Uninitialized/UNKNOWN;
-/// reconstruction would require retaining the prior day's observations — documented, not
-/// implemented here to avoid introducing durable production state for a shadow proof).
 #[derive(Clone, Debug)]
 pub struct OpenAiTrancheState {
-    /// Bangkok policy-day id of the LAST assessed observation (0 = never assessed).
     pub current_policy_day: i64,
-    /// The weekly-% baseline anchoring the current policy day (None until established).
     pub day_start_baseline_pp: Option<f64>,
-    /// Provider weekly window at the day-start baseline.
     pub day_start_provider_week: Option<i64>,
-    /// Provider weekly window of the latest observation.
     pub latest_provider_week: Option<i64>,
-    /// The most recent weekly-% observation (any day; used to establish the next day's
-    /// opening baseline when the provider week is continuous).
     pub last_weekly_observed: Option<f64>,
     pub last_observed_at: Option<i64>,
+    pub last_observation_id: Option<ObservationId>,
     pub accounting_status: AccountingStatus,
 }
 
@@ -134,6 +147,7 @@ impl Default for OpenAiTrancheState {
             latest_provider_week: None,
             last_weekly_observed: None,
             last_observed_at: None,
+            last_observation_id: None,
             accounting_status: AccountingStatus::Uninitialized,
         }
     }
@@ -144,28 +158,122 @@ pub fn policy_day_id(unix_secs: i64) -> i64 {
     (unix_secs + BANGKOK_OFFSET_SECS).div_euclid(86400)
 }
 
+/// Seconds from a given unix time to the NEXT Bangkok midnight boundary (0 at boundary).
+fn seconds_to_next_bangkok_midnight(unix_secs: i64) -> i64 {
+    let day = policy_day_id(unix_secs);
+    let day_start_utc = (day * 86400) - BANGKOK_OFFSET_SECS;
+    let next_midnight_utc = day_start_utc + 86400;
+    next_midnight_utc.saturating_sub(unix_secs).max(0)
+}
+
+// ---------------------------------------------------------------------------
+// Observation admissibility adapter (from the factual contract — not a caller bool).
+// ---------------------------------------------------------------------------
+
+/// Admissibility summary derived by the policy layer from `OpenAiFacts` (the amended
+/// fact-plane contract) — the policy consumer never trusts an arbitrary caller bool.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdmissibleObservation {
+    pub usable: bool,
+    pub weekly_used_percent: Option<f64>,
+    pub weekly_reset_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub reason: Option<&'static str>,
+}
+
+/// Derive an admissible policy observation from the fact plane's `OpenAiFacts`.
+///
+/// Admissible only when: source is Healthy AND observation is Fresh AND weekly_used_percent
+/// is present AND the percentage is finite + in [0,100]. A failed/stale/unknown source yields
+/// `usable=false` (never a confident tranche). This is the REAL shadow composition path — the
+/// policy consumer cannot accidentally pass `freshness_ok=true` for stale facts.
+pub fn admit_from_openai_facts(o: &crate::fact_plane::OpenAiFacts) -> AdmissibleObservation {
+    use crate::fact_plane::{FactFreshness, FactSourceHealth};
+    if o.source_health != FactSourceHealth::Healthy {
+        return AdmissibleObservation {
+            usable: false,
+            weekly_used_percent: o.weekly_used_percent,
+            weekly_reset_at: o.weekly_reset_at,
+            last_success_at: o.last_success_at,
+            reason: Some("openai_source_not_healthy"),
+        };
+    }
+    if o.observation_freshness != FactFreshness::Fresh {
+        return AdmissibleObservation {
+            usable: false,
+            weekly_used_percent: o.weekly_used_percent,
+            weekly_reset_at: o.weekly_reset_at,
+            last_success_at: o.last_success_at,
+            reason: Some("openai_observation_not_fresh"),
+        };
+    }
+    match o.weekly_used_percent {
+        Some(p) if valid_percent(p) => AdmissibleObservation {
+            usable: true,
+            weekly_used_percent: Some(p),
+            weekly_reset_at: o.weekly_reset_at,
+            last_success_at: o.last_success_at,
+            reason: None,
+        },
+        _ => AdmissibleObservation {
+            usable: false,
+            weekly_used_percent: o.weekly_used_percent,
+            weekly_reset_at: o.weekly_reset_at,
+            last_success_at: o.last_success_at,
+            reason: Some("weekly_used_percent_missing_or_invalid"),
+        },
+    }
+}
+
+fn valid_percent(p: f64) -> bool {
+    p.is_finite() && (0.0..=100.0).contains(&p)
+}
+
 // ---------------------------------------------------------------------------
 // The accounting algorithm.
 // ---------------------------------------------------------------------------
 
-/// Assess one (already freshness-gated by the caller) OpenAI observation for the current
-/// Bangkok policy day, updating the retained state and returning the shadow policy.
-///
-/// `freshness_ok` MUST be `true` only when the caller has already judged the observation
-/// authoritative (source healthy + freshness Fresh per the amended fact-plane contract).
-/// When `false`, the result is UNKNOWN (never a confident Open/Consumed from stale/missing
-/// data) — the operator invariant that a policy consumer must not treat an old cached
-/// snapshot as current merely because the last fetch happened to succeed.
+/// Determine provider-week continuity. Positively known only when BOTH the previous and the
+/// current window id are `Some` and equal.
+fn provider_week_continuity(prev: Option<i64>, cur: Option<i64>) -> ProviderWeekContinuity {
+    match (prev, cur) {
+        (Some(a), Some(b)) if a == b => ProviderWeekContinuity::KnownContinuous,
+        (Some(_), Some(_)) => ProviderWeekContinuity::Changed,
+        _ => ProviderWeekContinuity::Unknown, // None-involving => cannot establish
+    }
+}
+
+/// Assess one observation for the current Bangkok policy day, updating retained state.
+/// `duplicate` is set when the observation identity matches the last seen (deduplication).
 pub fn assess(
     now_unix_secs: i64,
     observation: OpenAiObservation,
-    freshness_ok: bool,
+    admissible: bool,
     retained: &mut OpenAiTrancheState,
 ) -> OpenAiDailyTranchePolicy {
     let day = policy_day_id(now_unix_secs);
 
-    // --- Freshness gate: refuse a confident tranche from stale/missing data.
-    if !freshness_ok {
+    // --- Deduplication: an unchanged provider observation is NOT a new accounting event.
+    let id = ObservationId::of(&observation);
+    if retained.last_observation_id == Some(id) {
+        return OpenAiDailyTranchePolicy {
+            policy_day_id: day,
+            tranche_status: TrancheStatus::Unknown,
+            accounting_status: retained.accounting_status,
+            consumed_today_pp: consumed_from(retained),
+            day_start_baseline_pp: retained.day_start_baseline_pp,
+            remaining_today_pp: None,
+            day_start_provider_week: retained.day_start_provider_week,
+            latest_provider_week: retained.latest_provider_week,
+            provider_week_continuity: ProviderWeekContinuity::Unknown,
+            ordinary_cloud_phase: OrdinaryCloudPhase::Unknown,
+            advanced: false,
+            reasons: vec!["duplicate_observation_no_new_event"],
+        };
+    }
+
+    // --- Admissibility gate (fresh + healthy + valid %). Refuse confident tranche otherwise.
+    if !admissible {
         retained.accounting_status = AccountingStatus::FreshnessGated;
         return OpenAiDailyTranchePolicy {
             policy_day_id: day,
@@ -176,8 +284,10 @@ pub fn assess(
             remaining_today_pp: None,
             day_start_provider_week: retained.day_start_provider_week,
             latest_provider_week: retained.latest_provider_week,
+            provider_week_continuity: ProviderWeekContinuity::Unknown,
             ordinary_cloud_phase: OrdinaryCloudPhase::Unknown,
-            reasons: vec!["observation_not_fresh_unknown"],
+            advanced: true,
+            reasons: vec!["observation_not_admissible"],
         };
     }
     let Some(weekly) = observation.weekly_used_percent else {
@@ -191,48 +301,58 @@ pub fn assess(
             remaining_today_pp: None,
             day_start_provider_week: retained.day_start_provider_week,
             latest_provider_week: retained.latest_provider_week,
+            provider_week_continuity: ProviderWeekContinuity::Unknown,
             ordinary_cloud_phase: OrdinaryCloudPhase::Unknown,
+            advanced: true,
             reasons: vec!["weekly_used_percent_missing"],
         };
     };
 
     let week = observation.weekly_reset_at;
-    // Capture the PRIOR day's last observed weekly BEFORE overwriting it (used to anchor the
-    // next policy day's baseline when the provider week is continuous).
-    let prior_last_weekly = retained.last_weekly_observed;
-    let provider_week_changed = retained
-        .latest_provider_week
-        .is_some_and(|w| week.is_some_and(|nw| w != nw));
+    // Decide identity BEFORE mutating last_observation_id (comparisons use retained prior).
+    // Capture continuity between old and new window.
+    let cont = provider_week_continuity(retained.latest_provider_week, week);
+    retained.last_observation_id = Some(id);
 
-    // --- A NEW Bangkok policy day (F): a fresh day begins; the day's accounting baseline is
-    //     anchored to where the PRIOR day ended (the last observed weekly) when the provider
-    //     week did NOT reset across the boundary. A cold start (no prior observation) or a
-    //     discontinuous week => Uninitialized / UNKNOWN (E, no false baseline).
+    // --- A NEW Bangkok policy day (F): the day's baseline may anchor from a prior-day
+    //     observation ONLY if it brackets the policy boundary under the documented rule.
     if retained.current_policy_day != day {
         retained.current_policy_day = day;
+        let prior_weekly = retained.last_weekly_observed;
+        let prior_obs_at = retained.last_observed_at;
         retained.last_weekly_observed = Some(weekly);
         retained.last_observed_at = observation.last_success_at;
         retained.latest_provider_week = week;
-        if !provider_week_changed && prior_last_weekly.is_some() {
-            retained.day_start_baseline_pp = prior_last_weekly;
+
+        // Trustworthy boundary anchor requires: provider week positively continuous AND the
+        // prior observation was within the near-boundary bracket before Bangkok midnight.
+        let brackets_boundary = prior_obs_at.map_or(false, |at| {
+            // The prior observation must be on the PRIOR policy day and within the bracket of
+            // that day's own midnight boundary -> i.e. close to the start of the new day.
+            let prior_day = policy_day_id(at);
+            let within_bracket = seconds_to_next_bangkok_midnight(at) <= POLICY_BOUNDARY_BRACKET_SECS;
+            prior_day != day && within_bracket
+        });
+        let anchor_ok = cont == ProviderWeekContinuity::KnownContinuous && brackets_boundary && prior_weekly.is_some();
+        if anchor_ok {
+            retained.day_start_baseline_pp = prior_weekly;
             retained.day_start_provider_week = week;
             retained.accounting_status = AccountingStatus::Ok;
         } else {
             retained.day_start_baseline_pp = None;
             retained.accounting_status = AccountingStatus::Uninitialized;
         }
-        return policy_output(retained, day);
+        return policy_output(retained, day, cont, true);
     }
 
-    // Same policy day: update the observation.
+    // Same policy day.
+    let prior_weekly_same_day = retained.last_weekly_observed;
     retained.last_weekly_observed = Some(weekly);
     retained.last_observed_at = observation.last_success_at;
     retained.latest_provider_week = week;
 
-    // --- Same policy day: a provider weekly reset INSIDE the day (G/H)?
-    if provider_week_changed {
-        // Cannot reconstruct exact consumption across the reset; do NOT auto-grant another
-        // full 14-point tranche. Mark continuity degraded and return UNKNOWN.
+    // --- Provider week changed INSIDE the day (G/H) -> cannot reconstruct, do NOT auto-grant.
+    if cont == ProviderWeekContinuity::Changed {
         retained.accounting_status = AccountingStatus::ContinuityDegraded;
         return OpenAiDailyTranchePolicy {
             policy_day_id: day,
@@ -243,14 +363,57 @@ pub fn assess(
             remaining_today_pp: None,
             day_start_provider_week: retained.day_start_provider_week,
             latest_provider_week: retained.latest_provider_week,
+            provider_week_continuity: cont,
             ordinary_cloud_phase: OrdinaryCloudPhase::Unknown,
+            advanced: true,
             reasons: vec!["provider_weekly_reset_within_policy_day"],
         };
     }
+    // Provider week UNKNOWN (None-involving) -> cannot establish continuity; do not infer.
+    if cont == ProviderWeekContinuity::Unknown {
+        // We cannot positively know the window is continuous; without another continuity
+        // mechanism we must NOT treat it as continuous. Report UNKNOWN (no false baseline).
+        retained.accounting_status = AccountingStatus::Uninitialized;
+        return OpenAiDailyTranchePolicy {
+            policy_day_id: day,
+            tranche_status: TrancheStatus::Unknown,
+            accounting_status: AccountingStatus::Uninitialized,
+            consumed_today_pp: None,
+            day_start_baseline_pp: retained.day_start_baseline_pp,
+            remaining_today_pp: None,
+            day_start_provider_week: retained.day_start_provider_week,
+            latest_provider_week: retained.latest_provider_week,
+            provider_week_continuity: cont,
+            ordinary_cloud_phase: OrdinaryCloudPhase::Unknown,
+            advanced: true,
+            reasons: vec!["provider_week_continuity_unknown"],
+        };
+    }
 
-    // --- Normal same-day accounting against the established baseline.
+    // Positively same provider week: usage must be non-decreasing. A drop is discontinuity
+    // (reset/correction/malformed), NOT clamp-to-zero.
+    if let (Some(prev), Some(cur)) = (prior_weekly_same_day, Some(weekly)) {
+        if cur < prev {
+            retained.accounting_status = AccountingStatus::ContinuityDegraded;
+            return OpenAiDailyTranchePolicy {
+                policy_day_id: day,
+                tranche_status: TrancheStatus::Unknown,
+                accounting_status: AccountingStatus::ContinuityDegraded,
+                consumed_today_pp: None,
+                day_start_baseline_pp: retained.day_start_baseline_pp,
+                remaining_today_pp: None,
+                day_start_provider_week: retained.day_start_provider_week,
+                latest_provider_week: retained.latest_provider_week,
+                provider_week_continuity: cont,
+                ordinary_cloud_phase: OrdinaryCloudPhase::Unknown,
+                advanced: true,
+                reasons: vec!["non_monotonic_same_window_discontinuity"],
+            };
+        }
+    }
+
+    // --- No baseline this day?
     if retained.day_start_baseline_pp.is_none() {
-        // No baseline this day (e.g. cold start); cannot confidently measure consumption.
         retained.accounting_status = AccountingStatus::Uninitialized;
         return OpenAiDailyTranchePolicy {
             policy_day_id: day,
@@ -261,33 +424,50 @@ pub fn assess(
             remaining_today_pp: None,
             day_start_provider_week: retained.day_start_provider_week,
             latest_provider_week: retained.latest_provider_week,
+            provider_week_continuity: cont,
             ordinary_cloud_phase: OrdinaryCloudPhase::Unknown,
+            advanced: true,
             reasons: vec!["no_day_start_baseline"],
         };
     }
-    policy_output(retained, day)
+
+    // --- Freshness RECOVERY (correction 5): a later fresh observation in a positively-known
+    //     same week + same day + valid baseline + monotonic cumulative usage may restore Ok.
+    retained.accounting_status = AccountingStatus::Ok;
+    policy_output(retained, day, cont, true)
 }
 
 fn consumed_from(r: &OpenAiTrancheState) -> Option<f64> {
     match (r.day_start_baseline_pp, r.last_weekly_observed) {
-        (Some(b), Some(n)) => Some((n - b).max(0.0)),
+        (Some(b), Some(n)) => {
+            if valid_percent(n) && (n - b) >= 0.0 {
+                Some(n - b)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
-fn policy_output(retained: &OpenAiTrancheState, day: i64) -> OpenAiDailyTranchePolicy {
+fn policy_output(
+    retained: &OpenAiTrancheState,
+    day: i64,
+    cont: ProviderWeekContinuity,
+    advanced: bool,
+) -> OpenAiDailyTranchePolicy {
     let baseline = retained.day_start_baseline_pp;
     let consumed = consumed_from(retained);
     let (mut tranche, mut phase, mut reasons) = match consumed {
         Some(c) if c < OPENAI_DAILY_TRANCHE_PP => (
             TrancheStatus::Open,
-            OrdinaryCloudPhase::OpenAiAvailable,
-            vec!["tranche_open"],
+            OrdinaryCloudPhase::OpenaiOrdinaryPermitted,
+            vec!["tranche_open_openai_ordinary_permitted"],
         ),
         Some(_) => (
             TrancheStatus::Consumed,
-            OrdinaryCloudPhase::DeepSeekContinuation,
-            vec!["tranche_consumed_openai_conserved"],
+            OrdinaryCloudPhase::ConserveOpenaiDeepSeekContinuation,
+            vec!["tranche_consumed_conserve_openai_deepseek_continuation"],
         ),
         None => (
             TrancheStatus::Unknown,
@@ -309,18 +489,22 @@ fn policy_output(retained: &OpenAiTrancheState, day: i64) -> OpenAiDailyTrancheP
         remaining_today_pp: consumed.map(|c| (OPENAI_DAILY_TRANCHE_PP - c).max(0.0)),
         day_start_provider_week: retained.day_start_provider_week,
         latest_provider_week: retained.latest_provider_week,
+        provider_week_continuity: cont,
         ordinary_cloud_phase: phase,
+        advanced,
         reasons,
     }
 }
 
 // ---------------------------------------------------------------------------
-// FACT-3A scenario tests (synthetic time-series; no real provider).
+// POLICY-CONSUME-SHADOW tests (corrected contract + §15 mandatory scenarios).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fact_plane::{FactFreshness, FactSourceHealth, OpenAiFacts};
+    use std::time::Duration;
 
     fn obs(weekly: Option<f64>, reset: Option<i64>, last: Option<i64>) -> OpenAiObservation {
         OpenAiObservation {
@@ -330,200 +514,294 @@ mod tests {
         }
     }
 
-    /// A fixed "now" in Bangkok. Use a base unix time in the Asia/Bangkok day (any instant).
-    const BANGKOK_NOON_UTC: i64 = 1_700_000_000; // +7 => well into a Bangkok day
-
-    // A. Fresh same-window observations, 0..<14 pp consumed => OPEN.
-    #[test]
-    fn a_fresh_under_14_pp_is_open() {
-        // Continuous observer: seed the PRIOR Bangkok day's end (31%) so the target day has a
-        // legitimately anchored baseline (not a mid-day cold start).
-        let mut st = OpenAiTrancheState::default();
-        let prior_day = BANGKOK_NOON_UTC - 86400;
-        assess(prior_day, obs(Some(31.0), Some(1000), Some(prior_day)), true, &mut st);
-        // The target Bangkok day opens; prior-day-end 31% is the day-start baseline.
-        let t0 = BANGKOK_NOON_UTC;
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st);
-        // Same day: consumed 9pp (40 - 31) => still < 14 => OPEN, remaining ~5.
-        let t1 = t0 + 1000;
-        let r2 = assess(t1, obs(Some(40.0), Some(1000), Some(t1)), true, &mut st);
-        assert_eq!(r2.tranche_status, TrancheStatus::Open);
-        assert_eq!(r2.ordinary_cloud_phase, OrdinaryCloudPhase::OpenAiAvailable);
-        assert_eq!(r2.consumed_today_pp, Some(9.0));
-        assert_eq!(r2.remaining_today_pp, Some(5.0));
+    /// Build OpenAiFacts directly (admission is derived by the adapter, so we exercise it).
+    fn facts(weekly: Option<f64>, reset: Option<i64>, last: Option<i64>) -> OpenAiFacts {
+        OpenAiFacts {
+            source_health: FactSourceHealth::Healthy,
+            observation_freshness: FactFreshness::Fresh,
+            available: true,
+            limit_reached: false,
+            spend_control_reached: false,
+            weekly_used_percent: weekly,
+            weekly_reset_at: reset,
+            credits_balance: None,
+            last_success_at: last,
+            observation_age_seconds: Some(0),
+        }
     }
 
-    // B. Fresh same-window observations, >= 14 pp consumed => CONSUMED.
-    #[test]
-    fn b_fresh_over_14_pp_is_consumed() {
-        let mut st = OpenAiTrancheState::default();
-        let prior_day = BANGKOK_NOON_UTC - 86400;
-        assess(prior_day, obs(Some(31.0), Some(1000), Some(prior_day)), true, &mut st);
-        let t0 = BANGKOK_NOON_UTC;
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st); // baseline 31
-        let t1 = t0 + 1200;
-        let r = assess(t1, obs(Some(50.0), Some(1000), Some(t1)), true, &mut st); // 19pp
-        assert_eq!(r.tranche_status, TrancheStatus::Consumed);
-        assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::DeepSeekContinuation);
-        assert_eq!(r.consumed_today_pp, Some(19.0));
+    /// A fixed Bangkok "now" (well inside a policy day).
+    const BANGKOK_NOON_UTC: i64 = 1_700_000_000;
+    /// A fixed provider week id.
+    const WEEK: i64 = 1000;
+
+    /// A timestamp close to the Bangkok-midnight boundary (within the bracket) on the PRIOR
+    /// policy day - so it is a valid day-start anchor for the target day.
+    fn prior_boundary_anchor() -> i64 {
+        // BANGKOK_NOON_UTC is inside target day D. The prior day's midnight is at the end of
+        // day D-1. We want an instant within POLICY_BOUNDARY_BRACKET_SECS before that midnight.
+        let day = policy_day_id(BANGKOK_NOON_UTC);
+        let this_day_start_utc = (day * 86400) - BANGKOK_OFFSET_SECS;
+        // Bangkok midnight that begins the target day == this_day_start_utc in local terms.
+        // The anchor is 10 min before that midnight, i.e. 600s before this_day_start_utc.
+        this_day_start_utc - 600
     }
 
-    // C. Stale OpenAI fact => UNKNOWN (never Open/Consumed from stale data).
+    // --- Provider-week continuity (correction 2) --------------------------------
+
     #[test]
-    fn c_stale_observation_is_unknown() {
-        let mut st = OpenAiTrancheState::default();
-        let t0 = BANGKOK_NOON_UTC;
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st);
-        // Next observation not fresh (freshness_ok=false) => UNKNOWN.
-        let t1 = t0 + 1000;
-        let r = assess(t1, obs(Some(40.0), Some(1000), Some(t1)), false, &mut st);
-        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
-        assert_eq!(r.accounting_status, AccountingStatus::FreshnessGated);
+    fn provider_week_some_some_same_is_known_continuous() {
+        assert_eq!(provider_week_continuity(Some(1), Some(1)), ProviderWeekContinuity::KnownContinuous);
+    }
+    #[test]
+    fn provider_week_missing_is_unknown() {
+        assert_eq!(provider_week_continuity(None, None), ProviderWeekContinuity::Unknown);
+        assert_eq!(provider_week_continuity(None, Some(1)), ProviderWeekContinuity::Unknown);
+        assert_eq!(provider_week_continuity(Some(1), None), ProviderWeekContinuity::Unknown);
+    }
+    #[test]
+    fn provider_week_change_is_changed() {
+        assert_eq!(provider_week_continuity(Some(1), Some(2)), ProviderWeekContinuity::Changed);
     }
 
-    // D. Missing weekly_used_percent => UNKNOWN.
+    // --- Day-boundary baseline (correction 3) -----------------------------------
+
     #[test]
-    fn d_missing_weekly_percent_is_unknown() {
+    fn near_boundary_prior_observation_anchors_baseline() {
         let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor(); // within bracket before target-day midnight
+        let p = assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
+        assert_eq!(p.tranche_status, TrancheStatus::Unknown); // cold start on the prior day
+        // Now the target day with a fresh observation.
         let t0 = BANGKOK_NOON_UTC;
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st);
-        let r = assess(t0 + 500, obs(None, Some(1000), Some(t0 + 500)), true, &mut st);
-        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
-        assert!(r.reasons.contains(&"weekly_used_percent_missing"));
+        let r = assess(t0, obs(Some(33.0), Some(WEEK), Some(t0)), true, &mut st);
+        // Prior observation bracketed the boundary + same week => baseline accepted (31).
+        assert_eq!(r.day_start_baseline_pp, Some(31.0));
+        assert_eq!(r.tranche_status, TrancheStatus::Open);
     }
 
-    // E. Observer starts mid-day / cold-start with no trustworthy baseline => UNKNOWN,
-    //    NOT a fresh 14-point allocation.
     #[test]
-    fn e_cold_start_mid_day_is_unknown_not_fresh_tranche() {
-        let mut st = OpenAiTrancheState::default(); // no prior state
+    fn old_prior_day_observation_does_not_anchor_baseline() {
+        let mut st = OpenAiTrancheState::default();
+        // Prior observation is hours before midnight (NOT within the bracket).
+        let old = BANGKOK_NOON_UTC - 86400 + 5 * 3600; // prior day ~5h before its midnight
+        assess(old, obs(Some(31.0), Some(WEEK), Some(old)), true, &mut st);
         let t0 = BANGKOK_NOON_UTC;
-        // The very first observation cannot establish "consumed today = 0"; it is the cold
-        // start. The assessor treats it as Uninitialized (no prior day's baseline to anchor).
-        let r = assess(t0, obs(Some(62.0), Some(1000), Some(t0)), true, &mut st);
-        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
+        let r = assess(t0, obs(Some(33.0), Some(WEEK), Some(t0)), true, &mut st);
+        // Old observation not near boundary -> NOT accepted as midnight baseline; UNINITIALIZED.
         assert_eq!(r.accounting_status, AccountingStatus::Uninitialized);
-        // It does NOT grant a fresh 14-point tranche: consumed/remaining are not confident.
+        assert_eq!(r.day_start_baseline_pp, None);
+        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
+    }
+
+    #[test]
+    fn cold_start_mid_day_is_unknown_not_fresh_tranche() {
+        let mut st = OpenAiTrancheState::default();
+        let t0 = BANGKOK_NOON_UTC;
+        let r = assess(t0, obs(Some(62.0), Some(WEEK), Some(t0)), true, &mut st);
+        assert_eq!(r.accounting_status, AccountingStatus::Uninitialized);
+        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
         assert_eq!(r.consumed_today_pp, None);
     }
 
-    // F. Bangkok midnight => new policy day.
     #[test]
-    fn f_bangkok_midnight_starts_new_policy_day() {
+    fn bangkok_rollover_without_valid_boundary_is_unknown() {
         let mut st = OpenAiTrancheState::default();
-        // Pick two instants on different Bangkok days (24h apart, +1 to avoid == boundary).
-        let day1 = BANGKOK_NOON_UTC;
-        assess(day1, obs(Some(31.0), Some(1000), Some(day1)), true, &mut st);
-        assert_eq!(st.current_policy_day, policy_day_id(day1));
-        let day2 = day1 + 86400;
-        let r = assess(day2, obs(Some(33.0), Some(1000), Some(day2)), true, &mut st);
-        // New day: new baseline from prior day end (31), still OPEN.
-        assert_eq!(st.current_policy_day, policy_day_id(day2));
-        assert_ne!(r.policy_day_id, policy_day_id(day1));
-        // consumed = 33 - 31 = 2; still OPEN on the new day.
-        assert_eq!(r.tranche_status, TrancheStatus::Open);
-        assert_eq!(r.day_start_baseline_pp, Some(31.0));
+        // Seed a prior day observation NOT near the boundary.
+        let far = BANGKOK_NOON_UTC - 86400 + 3 * 3600;
+        assess(far, obs(Some(31.0), Some(WEEK), Some(far)), true, &mut st);
+        let t0 = BANGKOK_NOON_UTC;
+        let r = assess(t0, obs(Some(33.0), Some(WEEK), Some(t0)), true, &mut st);
+        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
+        assert_eq!(r.accounting_status, AccountingStatus::Uninitialized);
     }
 
-    // G. OpenAI weekly reset INSIDE the same Bangkok day => NOT another automatic 14-pp
-    //    allocation; continuity degraded => UNKNOWN.
+    // --- Monotonicity (correction 4) -------------------------------------------
+
     #[test]
-    fn g_provider_week_reset_within_policy_day_no_auto_tranche() {
+    fn same_week_increasing_usage_is_valid() {
         let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
         let t0 = BANGKOK_NOON_UTC;
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st);
-        // Same Bangkok day, but provider week reset (1000 -> 2000). Cannot reconstruct exact
-        // consumption across the reset => CONTINUITY_DEGRADED, no fresh tranche.
-        let t1 = t0 + 3000;
-        let r = assess(t1, obs(Some(5.0), Some(2000), Some(t1)), true, &mut st);
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        let r = assess(t0 + 500, obs(Some(36.0), Some(WEEK), Some(t0 + 500)), true, &mut st);
+        assert_eq!(r.tranche_status, TrancheStatus::Open); // 31->36 = 5pp
+        assert_eq!(r.consumed_today_pp, Some(5.0));
+    }
+
+    #[test]
+    fn same_week_decreasing_usage_is_continuity_degraded() {
+        let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
+        let t0 = BANGKOK_NOON_UTC;
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        // Decrease same week -> NOT clamp-to-zero; degraded/UNKNOWN.
+        let r = assess(t0 + 500, obs(Some(25.0), Some(WEEK), Some(t0 + 500)), true, &mut st);
+        assert_eq!(r.accounting_status, AccountingStatus::ContinuityDegraded);
+        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
+        assert!(r.reasons.contains(&"non_monotonic_same_window_discontinuity"));
+    }
+
+    #[test]
+    fn invalid_percent_is_not_admissible() {
+        // Adapter rejects out-of-range / non-finite weekly.
+        let bad = facts(Some(150.0), Some(WEEK), Some(BANGKOK_NOON_UTC));
+        let a = admit_from_openai_facts(&bad);
+        assert_eq!(a.usable, false);
+        assert_eq!(a.reason, Some("weekly_used_percent_missing_or_invalid"));
+        let nan = facts(Some(f64::NAN), Some(WEEK), Some(BANGKOK_NOON_UTC));
+        assert_eq!(admit_from_openai_facts(&nan).usable, false);
+    }
+
+    // --- Freshness recovery (correction 5) -------------------------------------
+
+    #[test]
+    fn stale_then_fresh_recovers_accounting_within_known_week() {
+        let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
+        let t0 = BANGKOK_NOON_UTC;
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        // Stale observation -> FreshnessGated / UNKNOWN.
+        let stale = assess(t0 + 500, obs(Some(40.0), Some(WEEK), Some(t0 + 500)), false, &mut st);
+        assert_eq!(stale.accounting_status, AccountingStatus::FreshnessGated);
+        // Later FRESH observation, same positively-known week, same day, baseline valid,
+        // cumulative monotonic (31 baseline, 41 now) -> recover Ok.
+        let fresh = assess(t0 + 1000, obs(Some(41.0), Some(WEEK), Some(t0 + 1000)), true, &mut st);
+        assert_eq!(fresh.accounting_status, AccountingStatus::Ok);
+        assert_eq!(fresh.tranche_status, TrancheStatus::Open); // 41-31=10 <14
+        assert_eq!(fresh.consumed_today_pp, Some(10.0));
+    }
+
+    // --- Provider reset within a policy day (G/H) ------------------------------
+
+    #[test]
+    fn provider_reset_within_day_does_not_auto_grant_tranche() {
+        let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
+        let t0 = BANGKOK_NOON_UTC;
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        // Same Bangkok day (t0+2000 is still within the same day), but week resets X->Y.
+        let r = assess(t0 + 2000, obs(Some(5.0), Some(WEEK + 1), Some(t0 + 2000)), true, &mut st);
         assert_eq!(r.accounting_status, AccountingStatus::ContinuityDegraded);
         assert_eq!(r.tranche_status, TrancheStatus::Unknown);
         assert!(r.reasons.contains(&"provider_weekly_reset_within_policy_day"));
     }
 
-    // H. Observation discontinuity around provider reset => continuity degraded / UNKNOWN.
+    // --- Tranche Open/Consumed (A/B) -------------------------------------------
+
     #[test]
-    fn h_discontinuity_around_provider_reset_is_unknown() {
+    fn fresh_under_14_pp_is_open() {
         let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
         let t0 = BANGKOK_NOON_UTC;
-        assess(t0, obs(Some(50.0), Some(1000), Some(t0)), true, &mut st);
-        // A gap then a reset -> we lose the continuous window; treat as degraded.
-        let t1 = t0 + 3600;
-        let r = assess(t1, obs(Some(5.0), Some(2100), Some(t1)), true, &mut st);
-        assert_eq!(r.accounting_status, AccountingStatus::ContinuityDegraded);
-        assert_eq!(r.tranche_status, TrancheStatus::Unknown);
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        let r = assess(t0 + 1000, obs(Some(40.0), Some(WEEK), Some(t0 + 1000)), true, &mut st);
+        assert_eq!(r.tranche_status, TrancheStatus::Open);
+        assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::OpenaiOrdinaryPermitted);
+        assert_eq!(r.consumed_today_pp, Some(9.0));
     }
 
-    // I. Policy output changes => routing result remains bit-for-bit unaffected (structural:
-    //    policy_shadow has no routing API and is unread by routing).
+    #[test]
+    fn fresh_over_14_pp_is_consumed() {
+        let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
+        let t0 = BANGKOK_NOON_UTC;
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        let r = assess(t0 + 1200, obs(Some(50.0), Some(WEEK), Some(t0 + 1200)), true, &mut st);
+        assert_eq!(r.tranche_status, TrancheStatus::Consumed);
+        assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::ConserveOpenaiDeepSeekContinuation);
+        assert_eq!(r.consumed_today_pp, Some(19.0));
+    }
+
+    // --- Deduplication (correction 9) ------------------------------------------
+
+    #[test]
+    fn repeated_unchanged_observation_is_not_a_new_event() {
+        let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
+        let t0 = BANGKOK_NOON_UTC;
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        // Same provider observation repeated (same id) -> no new accounting event (advanced=false).
+        let r = assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        assert_eq!(r.advanced, false);
+        assert!(r.reasons.contains(&"duplicate_observation_no_new_event"));
+    }
+
+    // --- Admissible adapter (correction 7) -------------------------------------
+
+    #[test]
+    fn adapter_rejects_stale_and_unhealthy_facts() {
+        let stale = OpenAiFacts {
+            source_health: FactSourceHealth::Healthy,
+            observation_freshness: FactFreshness::Stale,
+            ..facts(Some(14.0), Some(WEEK), Some(BANGKOK_NOON_UTC))
+        };
+        assert_eq!(admit_from_openai_facts(&stale).usable, false);
+        let unhealthy = OpenAiFacts {
+            source_health: FactSourceHealth::Unavailable,
+            observation_freshness: FactFreshness::Fresh,
+            ..facts(Some(14.0), Some(WEEK), Some(BANGKOK_NOON_UTC))
+        };
+        assert_eq!(admit_from_openai_facts(&unhealthy).reason, Some("openai_source_not_healthy"));
+    }
+
+    // --- No routing authority / separation (I/J/K/L) ---------------------------
+
     #[test]
     fn i_policy_changes_do_not_affect_routing() {
-        // Two different policy outcomes from different fact sequences.
         let mut a = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut a);
         let t0 = BANGKOK_NOON_UTC;
-        assess(t0 - 86400, obs(Some(31.0), Some(1000), Some(t0 - 86400)), true, &mut a);
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut a);
-        let ra1 = assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut a);
-        let ra2 = assess(t0 + 1000, obs(Some(40.0), Some(1000), Some(t0 + 1000)), true, &mut a);
-        assert_eq!(ra1.tranche_status, TrancheStatus::Open);
-        assert_eq!(ra2.tranche_status, TrancheStatus::Open);
-        // The module exposes only policy observation types (TrancheStatus, policy struct) and
-        // no routing surface. This test documents that no routing result can be read or
-        // changed here. (Structural: it imports no routing type.)
-        let _ = (ra1, ra2);
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut a);
+        let ra = assess(t0 + 1000, obs(Some(40.0), Some(WEEK), Some(t0 + 1000)), true, &mut a);
+        // Policy output is pure observation; the module imports no routing type (structural).
+        assert_eq!(ra.tranche_status, TrancheStatus::Open);
+        let _ = ra;
     }
 
-    // J. Daily tranche state does NOT imply local targets are excluded.
     #[test]
     fn j_tranche_does_not_imply_local_exclusion() {
         let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
         let t0 = BANGKOK_NOON_UTC;
-        assess(t0 - 86400, obs(Some(31.0), Some(1000), Some(t0 - 86400)), true, &mut st);
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st);
-        let r = assess(t0 + 1200, obs(Some(60.0), Some(1000), Some(t0 + 1200)), true, &mut st);
-        // Consumed -> DEEPSEEK_CONTINUATION for ORDINARY CLOUD. There is NO field anywhere in
-        // the policy output that excludes local targets (comfyninja/htpc participate
-        // throughout per the invariant). We assert the output has no local-exclusion signal.
-        assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::DeepSeekContinuation);
-        // Serialize -> must not contain a local-exclusion concept.
-        let json = serde_json::to_value(&r).expect("serialize");
-        let s = json.to_string().to_lowercase();
-        assert!(!s.contains("comfyninja") && !s.contains("htpc"), "policy must not mention local hosts");
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        let r = assess(t0 + 1200, obs(Some(60.0), Some(WEEK), Some(t0 + 1200)), true, &mut st);
+        assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::ConserveOpenaiDeepSeekContinuation);
+        let json = serde_json::to_value(&r).expect("serialize").to_string().to_lowercase();
+        assert!(!json.contains("comfyninja") && !json.contains("htpc"), "no local-host mention");
     }
 
-    // K. Thinking/non-thinking capability is untouched by the tranche.
     #[test]
     fn k_thinking_capability_untouched() {
-        // The policy module has NO reasoning/capability field or logic. It only accounts the
-        // OpenAI percentage; it cannot downgrade capability because of budget. We verify the
-        // entire policy output type carries no capability/reasoning enum.
         let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
         let t0 = BANGKOK_NOON_UTC;
-        assess(t0 - 86400, obs(Some(31.0), Some(1000), Some(t0 - 86400)), true, &mut st);
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st);
-        let r = assess(t0 + 1000, obs(Some(60.0), Some(1000), Some(t0 + 1000)), true, &mut st);
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        let r = assess(t0 + 1000, obs(Some(50.0), Some(WEEK), Some(t0 + 1000)), true, &mut st);
         assert_eq!(r.tranche_status, TrancheStatus::Consumed);
-        // The output has no capability field (structural: the struct fields are all
-        // tranche/accounting), so it cannot redefine thinking/non-thinking.
-        let _ = r;
+        let _ = r; // no capability field exists in the output
     }
 
-    // L. PINNED caller intent is not silently rewritten.
     #[test]
     fn l_pinned_intent_not_silently_rewritten() {
-        // FACT-3A exposes the policy condition only; it does NOT enforce a provider
-        // substitution. A pinned caller's exact target intent is not in-scope for this
-        // module (no selection/substitution API exists). This documents that the policy
-        // output never contains a "substitute target" directive.
         let mut st = OpenAiTrancheState::default();
+        let anchor = prior_boundary_anchor();
+        assess(anchor, obs(Some(31.0), Some(WEEK), Some(anchor)), true, &mut st);
         let t0 = BANGKOK_NOON_UTC;
-        assess(t0 - 86400, obs(Some(31.0), Some(1000), Some(t0 - 86400)), true, &mut st);
-        assess(t0, obs(Some(31.0), Some(1000), Some(t0)), true, &mut st);
-        let r = assess(t0 + 1000, obs(Some(50.0), Some(1000), Some(t0 + 1000)), true, &mut st);
-        let json = serde_json::to_value(&r).expect("serialize");
-        let s = json.to_string().to_lowercase();
-        // No field emits a target substitution (no "substitute", no model id).
+        assess(t0, obs(Some(31.0), Some(WEEK), Some(t0)), true, &mut st);
+        let r = assess(t0 + 1000, obs(Some(50.0), Some(WEEK), Some(t0 + 1000)), true, &mut st);
+        let s = serde_json::to_value(&r).expect("serialize").to_string().to_lowercase();
         assert!(!s.contains("substitut") && !s.contains("deepseek-v4"), "policy must not enforce substitution");
-        assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::DeepSeekContinuation); // shadow disposition only
+        assert_eq!(r.ordinary_cloud_phase, OrdinaryCloudPhase::ConserveOpenaiDeepSeekContinuation);
     }
 }

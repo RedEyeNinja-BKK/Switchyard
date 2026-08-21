@@ -34,7 +34,7 @@
 //!      listener trust boundary; deployment as an observation endpoint requires a later
 //!      protection decision.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libsy::{
     ComfyMode, ComfyOwner, ComfyResidentProfile, ComfyResourceState, ComfySnapshotState,
@@ -42,10 +42,11 @@ use libsy::{
     OpenAiResourceState, ResourceSnapshot,
 };
 
-/// The authoritative cloud-resource refresh TTL (seconds), mirrored from the deployed
-/// resource-pool config (`[resource_pools.smart] ttl_seconds = 30`). This is the existing
-/// refresh contract, NOT a newly invented timeout. A projection older than this is Stale.
-pub const AUTHORITATIVE_REFRESH_TTL_SECONDS: u64 = 30;
+// NOTE: The refresh TTL is NOT a mirrored constant here. Observation freshness is derived
+// from the EFFECTIVE refresh TTL of the factual source that published the snapshot, read
+// from the resource-pool config (`ttl_seconds`) via `SharedResourceTelemetry::refresh_ttl()`.
+// Configuration remains the authority; this module consumes it as a parameter (no hard-coded
+// copy, no drift if the config TTL changes).
 
 // ---------------------------------------------------------------------------
 // Shared provenance / health + freshness envelope (generic across all providers).
@@ -92,10 +93,19 @@ impl FactSourceHealth {
     }
 }
 
-/// Determine observation freshness from the authoritative last-success timestamp vs the
-/// projection time, using the authoritative TTL. Missing/invalid timestamp => Unknown.
-fn cloud_freshness(last_success_at: Option<i64>, projected_at_unix: i64) -> FactFreshness {
+/// Determine observation freshness using the EFFECTIVE source refresh TTL (from config via
+/// the telemetry `refresh_ttl()`), not a mirrored constant. Missing/invalid timestamp or TTL
+/// => Unknown (never pretend Fresh without an authoritative threshold).
+fn cloud_freshness(
+    last_success_at: Option<i64>,
+    projected_at_unix: i64,
+    effective_refresh_ttl: Option<Duration>,
+) -> FactFreshness {
     let Some(last) = last_success_at else {
+        return FactFreshness::Unknown;
+    };
+    let Some(ttl) = effective_refresh_ttl else {
+        // No authoritative refresh threshold known for this source -> do not pretend Fresh.
         return FactFreshness::Unknown;
     };
     let age = projected_at_unix.saturating_sub(last);
@@ -103,7 +113,7 @@ fn cloud_freshness(last_success_at: Option<i64>, projected_at_unix: i64) -> Fact
         // A future timestamp (clock skew) is not trustworthy -> not Fresh.
         return FactFreshness::Unknown;
     }
-    if age <= AUTHORITATIVE_REFRESH_TTL_SECONDS as i64 {
+    if age <= ttl.as_secs() as i64 {
         FactFreshness::Fresh
     } else {
         FactFreshness::Stale
@@ -214,11 +224,19 @@ pub struct FactPlaneSnapshot {
 // Projection functions (pure; field-preserving, no semantic re-interpretation).
 // ---------------------------------------------------------------------------
 
-fn project_openai(s: &OpenAiResourceState, projected_at_unix: i64) -> OpenAiFacts {
+fn project_openai(
+    s: &OpenAiResourceState,
+    projected_at_unix: i64,
+    effective_refresh_ttl: Option<Duration>,
+) -> OpenAiFacts {
     let has_error = s.error.is_some();
     OpenAiFacts {
         source_health: FactSourceHealth::from_cloud(s.available, has_error),
-        observation_freshness: cloud_freshness(s.last_success_at, projected_at_unix),
+        observation_freshness: cloud_freshness(
+            s.last_success_at,
+            projected_at_unix,
+            effective_refresh_ttl,
+        ),
         available: s.available,
         limit_reached: s.limit_reached,
         spend_control_reached: s.spend_control_reached,
@@ -232,11 +250,28 @@ fn project_openai(s: &OpenAiResourceState, projected_at_unix: i64) -> OpenAiFact
     }
 }
 
-fn project_deepseek(s: &DeepSeekResourceState, projected_at_unix: i64) -> DeepSeekFacts {
+/// Public single-source projection for POLICY CONSUMPTION: map one `OpenAiResourceState`
+/// to the generic `OpenAiFacts` (used by the policy-consumer composition). Zero routing.
+pub fn project_openai_for_policy(
+    s: &OpenAiResourceState,
+    effective_refresh_ttl: Option<Duration>,
+) -> OpenAiFacts {
+    project_openai(s, now_unix(), effective_refresh_ttl)
+}
+
+fn project_deepseek(
+    s: &DeepSeekResourceState,
+    projected_at_unix: i64,
+    effective_refresh_ttl: Option<Duration>,
+) -> DeepSeekFacts {
     let has_error = s.error.is_some();
     DeepSeekFacts {
         source_health: FactSourceHealth::from_cloud(s.is_available, has_error),
-        observation_freshness: cloud_freshness(s.last_success_at, projected_at_unix),
+        observation_freshness: cloud_freshness(
+            s.last_success_at,
+            projected_at_unix,
+            effective_refresh_ttl,
+        ),
         is_available: s.is_available,
         currency: s.currency.clone(),
         total_balance: s.total_balance.clone(),
@@ -249,11 +284,19 @@ fn project_deepseek(s: &DeepSeekResourceState, projected_at_unix: i64) -> DeepSe
     }
 }
 
-fn project_comfy(c: &ComfyResourceState, projected_at_unix: i64) -> ComfyFacts {
+fn project_comfy(
+    c: &ComfyResourceState,
+    projected_at_unix: i64,
+    effective_refresh_ttl: Option<Duration>,
+) -> ComfyFacts {
     let st: &ComfySnapshotState = &c.state;
     ComfyFacts {
         source_health: FactSourceHealth::from_comfy(c.source_health),
-        observation_freshness: cloud_freshness(c.last_success_at, projected_at_unix),
+        observation_freshness: cloud_freshness(
+            c.last_success_at,
+            projected_at_unix,
+            effective_refresh_ttl,
+        ),
         producer_epoch: c.producer_epoch.clone(),
         state_generation: c.state_generation,
         state_fingerprint: c.state_fingerprint.clone(),
@@ -284,17 +327,18 @@ pub fn project(
     resource: Option<&ResourceSnapshot>,
     comfy_resource: Option<&ComfyResourceState>,
     continuity: Option<&crate::comfy::ComfyCompositionStatus>,
+    effective_refresh_ttl: Option<Duration>,
 ) -> FactPlaneSnapshot {
     let projected_at_unix = now_unix();
     FactPlaneSnapshot {
         projected_at_unix,
         openai: resource
             .and_then(|r| r.openai.as_ref())
-            .map(|o| project_openai(o, projected_at_unix)),
+            .map(|o| project_openai(o, projected_at_unix, effective_refresh_ttl)),
         deepseek: resource
             .and_then(|r| r.deepseek.as_ref())
-            .map(|d| project_deepseek(d, projected_at_unix)),
-        comfyninja: comfy_resource.map(|c| project_comfy(c, projected_at_unix)),
+            .map(|d| project_deepseek(d, projected_at_unix, effective_refresh_ttl)),
+        comfyninja: comfy_resource.map(|c| project_comfy(c, projected_at_unix, effective_refresh_ttl)),
         comfy_continuity: continuity.map(|c| {
             project_continuity(
                 c.enabled,
@@ -327,6 +371,10 @@ fn project_continuity(
     }
 }
 
+pub fn now_unix_secs() -> i64 {
+    now_unix()
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -341,6 +389,8 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    fn test_ttl() -> Duration { Duration::from_secs(30) }
 
     fn openai(weekly: Option<f64>, last_success: Option<i64>, err: Option<String>) -> OpenAiResourceState {
         OpenAiResourceState {
@@ -410,13 +460,13 @@ mod tests {
             Some(&snapshot(Some(openai(Some(14.0), Some(last), None)), None)),
             None,
             None,
-        );
+        Some(test_ttl()));
         let o = f.openai.unwrap();
         assert_eq!(o.last_success_at, Some(last));
         // age is large => NOT Fresh even though projected anew.
         assert_eq!(o.observation_freshness, FactFreshness::Stale);
         // projected_at is well after last_success (age >= TTL in this test).
-        assert!(o.observation_age_seconds.unwrap() >= AUTHORITATIVE_REFRESH_TTL_SECONDS as i64);
+        assert!(o.observation_age_seconds.unwrap() >= test_ttl().as_secs() as i64);
     }
 
     #[test]
@@ -428,7 +478,7 @@ mod tests {
             Some(&snapshot(Some(openai(Some(14.0), Some(last), None)), None)),
             None,
             None,
-        );
+        Some(test_ttl()));
         assert_eq!(
             f.openai.unwrap().observation_freshness,
             FactFreshness::Fresh
@@ -443,7 +493,7 @@ mod tests {
             Some(&snapshot(Some(openai(Some(14.0), None, None)), None)),
             None,
             None,
-        );
+        Some(test_ttl()));
         assert_eq!(
             f.openai.unwrap().observation_freshness,
             FactFreshness::Unknown
@@ -459,7 +509,7 @@ mod tests {
             )),
             None,
             None,
-        );
+        Some(test_ttl()));
         let o = f.openai.unwrap();
         assert_eq!(o.available, false);
         assert_eq!(o.source_health, FactSourceHealth::Unavailable);
@@ -471,7 +521,7 @@ mod tests {
             Some(&snapshot(Some(openai(Some(14.0), Some(now_unix()), None)), None)),
             None,
             None,
-        );
+        Some(test_ttl()));
         let o = f.openai.unwrap();
         assert_eq!(o.weekly_used_percent, Some(14.0));
         assert_eq!(o.weekly_reset_at, Some(1787197109));
@@ -481,7 +531,7 @@ mod tests {
 
     #[test]
     fn deepseek_maps_without_semantic_loss() {
-        let f = project(Some(&snapshot(None, Some(deepseek(Some(now_unix()))))), None, None);
+        let f = project(Some(&snapshot(None, Some(deepseek(Some(now_unix()))))), None, None, Some(test_ttl()));
         let d = f.deepseek.unwrap();
         assert_eq!(d.currency, "CNY");
         assert_eq!(d.total_balance, "123.45");
@@ -491,7 +541,7 @@ mod tests {
 
     #[test]
     fn comfy_domain_projection_maps_without_semantic_loss() {
-        let f = project(None, Some(&comfy(Some(ComfyMode::Idle), Some(now_unix()))), None);
+        let f = project(None, Some(&comfy(Some(ComfyMode::Idle), Some(now_unix()))), None, Some(test_ttl()));
         let c = f.comfyninja.expect("comfy present");
         assert_eq!(c.producer_epoch, "epoch-1");
         assert_eq!(c.state_generation, 3);
@@ -503,10 +553,10 @@ mod tests {
 
     #[test]
     fn unknown_remains_unknown_and_absent() {
-        let f = project(None, None, None);
+        let f = project(None, None, None, Some(test_ttl()));
         assert!(f.openai.is_none() && f.deepseek.is_none() && f.comfyninja.is_none());
         assert!(f.comfy_continuity.is_none());
-        let f2 = project(None, Some(&comfy(None, Some(now_unix()))), None);
+        let f2 = project(None, Some(&comfy(None, Some(now_unix()))), None, Some(test_ttl()));
         assert_eq!(
             f2.comfyninja.unwrap().resident_qwen_profile,
             Some(ComfyResidentProfile::Unknown)
@@ -517,7 +567,7 @@ mod tests {
     fn stale_distinguishable_from_healthy() {
         let mut c = comfy(Some(ComfyMode::Idle), Some(now_unix() - 100));
         c.source_health = ComfySourceHealth::Healthy;
-        let f = project(None, Some(&c), None);
+        let f = project(None, Some(&c), None, Some(test_ttl()));
         let cf = f.comfyninja.as_ref().expect("comfy present");
         assert_eq!(cf.source_health, FactSourceHealth::Healthy);
         assert_eq!(cf.observation_freshness, FactFreshness::Stale);
@@ -532,7 +582,7 @@ mod tests {
             )),
             Some(&comfy(Some(ComfyMode::Idle), Some(now_unix()))),
             None,
-        );
+        Some(test_ttl()));
         assert_eq!(f.openai.unwrap().weekly_used_percent, Some(14.0));
         assert_eq!(f.deepseek.unwrap().currency, "CNY");
         assert_eq!(f.comfyninja.unwrap().vram_used_mib, Some(67));
@@ -564,7 +614,7 @@ mod tests {
     /// (Candidate/WorkClass/ReasoningPolicy/Algorithm/selection), structural + compile-enforced.
     #[test]
     fn fact_plane_has_no_routing_authority() {
-        let f = project(None, None, None);
+        let f = project(None, None, None, Some(test_ttl()));
         assert!(f.openai.is_none() && f.deepseek.is_none() && f.comfyninja.is_none());
         let _ = f.projected_at_unix; // only observability fields are reachable
     }
@@ -580,7 +630,7 @@ mod tests {
             )),
             Some(&comfy(Some(ComfyMode::Idle), Some(now_unix()))),
             None,
-        );
+        Some(test_ttl()));
         let high = project(
             Some(&snapshot(
                 Some(openai(Some(40.0), Some(now_unix()), None)),
@@ -588,10 +638,44 @@ mod tests {
             )),
             Some(&comfy(Some(ComfyMode::Studio), Some(now_unix()))),
             None,
-        );
+        Some(test_ttl()));
         assert_ne!(low.openai, high.openai);
         assert_eq!(low.openai.as_ref().unwrap().weekly_used_percent, Some(12.0));
         assert_eq!(high.openai.as_ref().unwrap().weekly_used_percent, Some(40.0));
         let _ = (low.projected_at_unix, high.projected_at_unix);
     }
+
+    /// POLICY-CONSUME-SHADOW §15 source-of-truth: freshness is driven by the EFFECTIVE
+    /// source TTL (from config via telemetry), not a mirrored constant. Changing the
+    /// effective TTL changes freshness WITHOUT code change.
+    #[test]
+    fn configured_ttl_drives_freshness_and_changes_it() {
+        let last = now_unix() - 20; // 20s old
+        // TTL=30s -> age 20 <= 30 => Fresh.
+        let f30 = project(
+            Some(&snapshot(Some(openai(Some(14.0), Some(last), None)), None)),
+            None,
+            None,
+            Some(Duration::from_secs(30)),
+        );
+        assert_eq!(f30.openai.unwrap().observation_freshness, FactFreshness::Fresh);
+        // TTL=10s -> same 20s-old obs is now Stale (no code change; behavior changed by the
+        // effective source TTL alone).
+        let f10 = project(
+            Some(&snapshot(Some(openai(Some(14.0), Some(last), None)), None)),
+            None,
+            None,
+            Some(Duration::from_secs(10)),
+        );
+        assert_eq!(f10.openai.unwrap().observation_freshness, FactFreshness::Stale);
+        // No TTL known -> cannot pretend Fresh (Unknown).
+        let fnone = project(
+            Some(&snapshot(Some(openai(Some(14.0), Some(last), None)), None)),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(fnone.openai.unwrap().observation_freshness, FactFreshness::Unknown);
+    }
+
 }

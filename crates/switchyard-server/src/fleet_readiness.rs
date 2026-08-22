@@ -876,6 +876,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::Router;
+    use axum::http::StatusCode;
     use axum::routing::{get, post};
     use libsy::{CandidateState, FleetSnapshot, FleetStateSource, SharedFleetState};
     use switchyard_protocol::ModelId;
@@ -1811,5 +1812,64 @@ mod tests {
             None,
         );
         assert_eq!(client2.observe_openai().await, CandidateState::ready());
+    }
+
+    // F4 (Hermes review): an OpenAI resource FETCH FAILURE (HTTP 500) or a
+    // MALFORMED payload is NOT confirmed included-allowance exhaustion and must
+    // fail toward Luna (ready) — it must NOT open a DeepSeek spill.
+    #[tokio::test]
+    async fn openai_fetch_failure_or_malformed_fails_toward_luna_no_spill() {
+        // A 500-returning OpenAI resource endpoint.
+        let fail_router = axum::Router::new().route(
+            "/resource/openai-codex",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json("boom".to_string()),
+                )
+            }),
+        );
+        let fail_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fail_addr = fail_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(fail_listener, fail_router).await.unwrap() });
+
+        let fail_client = ResourceStateFactsClient::new(
+            Some(format!("http://{fail_addr}/resource/openai-codex")),
+            Some("S2D_TEST_FETCH_FAIL_TOKEN".into()),
+            None,
+            None,
+            None,
+        );
+        unsafe { std::env::set_var("S2D_TEST_FETCH_FAIL_TOKEN", "dummy") };
+        assert_eq!(
+            fail_client.observe_openai().await,
+            CandidateState::ready(),
+            "an OpenAI resource fetch failure must fail toward Luna (no DeepSeek spill)"
+        );
+        unsafe { std::env::remove_var("S2D_TEST_FETCH_FAIL_TOKEN") };
+
+        // A garbage/malformed-JSON OpenAI resource endpoint.
+        let garbage_router = axum::Router::new().route(
+            "/resource/openai-codex",
+            axum::routing::get(|| async { (StatusCode::OK, axum::body::Body::from("not-json{")) }),
+        );
+        let garbage_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let garbage_addr = garbage_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(garbage_listener, garbage_router).await.unwrap() });
+
+        let garbage_client = ResourceStateFactsClient::new(
+            Some(format!("http://{garbage_addr}/resource/openai-codex")),
+            Some("S2D_TEST_GARBAGE_TOKEN".into()),
+            None,
+            None,
+            None,
+        );
+        unsafe { std::env::set_var("S2D_TEST_GARBAGE_TOKEN", "dummy") };
+        assert_eq!(
+            garbage_client.observe_openai().await,
+            CandidateState::ready(),
+            "a malformed OpenAI resource payload must fail toward Luna (no DeepSeek spill)"
+        );
+        unsafe { std::env::remove_var("S2D_TEST_GARBAGE_TOKEN") };
     }
 }

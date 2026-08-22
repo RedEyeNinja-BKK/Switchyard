@@ -173,6 +173,42 @@ fn build_fleet_readiness_monitor(
         )
     });
 
+    // F2 (Hermes review): model ids must be disjoint across readiness sources. A
+    // duplicate key would make FleetSnapshot::new fail every cycle and the fleet
+    // stay at the empty fail-closed snapshot — reject it loudly at load time.
+    let mut declared: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    let mut disjoint = |model: &str, source: &'static str| -> Result<(), String> {
+        if let Some(origin) = declared.insert(model.to_string(), source) {
+            return Err(format!(
+                "[fleet_readiness] model {model:?} appears in both {origin} and {source}"
+            ));
+        }
+        Ok(())
+    };
+    for model in &config.ready {
+        disjoint(model, "ready")?;
+    }
+    for model in &config.transition_required {
+        disjoint(model, "transition_required")?;
+    }
+    if let Some(c) = &config.comfy {
+        disjoint(&c.model, "comfy")?;
+    }
+    if let Some(h) = &config.htpc {
+        disjoint(&h.model, "htpc")?;
+    }
+    if let Some(r) = &config.resource {
+        for m in r
+            .openai_gated
+            .iter()
+            .chain(r.openclaw_openai_gated.iter())
+            .chain(r.deepseek_gated.iter())
+        {
+            disjoint(m, "resource-gated")?;
+        }
+    }
+
     let mut cloud_base = Vec::with_capacity(config.ready.len() + config.transition_required.len());
     for model in &config.ready {
         cloud_base.push(Observed {
@@ -224,6 +260,37 @@ fn build_fleet_readiness_monitor(
                         .to_string(),
                 ),
             };
+        // F1 (Hermes review): a non-empty gated list MUST have its observation
+        // source configured, otherwise that candidate is silently excluded every
+        // cycle (e.g. a Luna never-gated due to a missing URL env would let the
+        // DEEPSEEK spill open WITHOUT confirmed exhaustion — the exact policy Fix
+        // C forbids). Fail loud at load time instead of silently spilling.
+        if !resource.openai_gated.is_empty()
+            && (resource.openai_url.is_none() || resource.openai_auth_token_env.is_none())
+        {
+            return Err(
+                "openai_gated candidates require openai_url and openai_auth_token_env".to_string(),
+            );
+        }
+        if !resource.openclaw_openai_gated.is_empty()
+            && (resource.openclaw_openai_url.is_none()
+                || resource.openclaw_openai_auth_token_env.is_none())
+        {
+            return Err(
+                "openclaw_openai_gated candidates require openclaw_openai_url and openclaw_openai_auth_token_env"
+                    .to_string(),
+            );
+        }
+        if !resource.deepseek_gated.is_empty()
+            && (resource.deepseek_url.is_none()
+                || resource.deepseek_api_key_env.is_none()
+                || resource.deepseek_currency.is_none())
+        {
+            return Err(
+                "deepseek_gated candidates require deepseek_url, deepseek_api_key_env and deepseek_currency"
+                    .to_string(),
+            );
+        }
         let openai_gated = resource
             .openai_gated
             .iter()

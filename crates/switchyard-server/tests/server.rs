@@ -2644,7 +2644,7 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
     });
 
     let http = reqwest::Client::new();
-    let smart_req = |effort: Option<&str>| {
+    let smart_req = |effort: Option<&str>, work_shape: Option<&str>| {
         let mut req = json!({
             "input_format": "openai_chat",
             "request": {"model":"localclaw/dev/smart","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
@@ -2655,20 +2655,50 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
         if let Some(e) = effort {
             req["request"]["reasoning_effort"] = json!(e);
         }
+        // Fix D wire-body work_shape: an unknown top-level field is preserved
+        // into LlmRequest.extensions.fields by the codec and drives the
+        // request-sourced work-shape dispatch.
+        if let Some(ws) = work_shape {
+            req["request"]["work_shape"] = json!(ws);
+        }
         req
     };
 
-    // (1) OpenAI healthy + DeepSeek healthy -> non-thinking selects luna (rank1).
+    // (1) OpenAI healthy + DeepSeek healthy -> bounded/non-thinking selects luna
+    // (rank1). The explicit bounded wire shape keeps luna eligible.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let resp = http
         .post(format!("http://{bound_addr}/v1/decision"))
-        .json(&smart_req(None))
+        .json(&smart_req(None, Some("bounded")))
         .send()
         .await?;
     let body: Value = resp.json().await?;
     assert_eq!(
         body["selected"]["target"], "luna",
         "healthy OpenAI must gate the luna candidate ready and select it first: {body}"
+    );
+
+    // (1b) Fix D wire-body proof: an AGENTIC / non-thinking request with healthy
+    // OpenAI must NEVER select Luna (bounded-only, work-shape-excluded); DeepSeek
+    // is selected instead, even though Luna's resource-gated readiness is healthy.
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None, Some("agentic")))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "an agentic/non-thinking request must select deepseek, never luna: {body}"
+    );
+    let all: Vec<Value> = {
+        let mut v = vec![body["selected"].clone()];
+        v.extend(body["fallbacks"].as_array().cloned().unwrap_or_default());
+        v
+    };
+    assert!(
+        all.iter().all(|c| c["target"] != "luna"),
+        "agentic/non-thinking must never select or fall back to the bounded-only luna: {body}"
     );
 
     // (2) Flip OpenAI to confirmed exhaustion; DeepSeek stays healthy. After a
@@ -2681,7 +2711,7 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let resp = http
         .post(format!("http://{bound_addr}/v1/decision"))
-        .json(&smart_req(None))
+        .json(&smart_req(None, None))
         .send()
         .await?;
     let body: Value = resp.json().await?;
@@ -2699,7 +2729,7 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let resp = http
         .post(format!("http://{bound_addr}/v1/decision"))
-        .json(&smart_req(None))
+        .json(&smart_req(None, None))
         .send()
         .await?;
     let body: Value = resp.json().await?;
@@ -2717,7 +2747,7 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let resp = http
         .post(format!("http://{bound_addr}/v1/decision"))
-        .json(&smart_req(None))
+        .json(&smart_req(None, None))
         .send()
         .await?;
     let body: Value = resp.json().await?;
@@ -2731,7 +2761,7 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
     // the reasoning capability filter regardless of OpenAI health.
     let resp = http
         .post(format!("http://{bound_addr}/v1/decision"))
-        .json(&smart_req(Some("high")))
+        .json(&smart_req(Some("high"), None))
         .send()
         .await?;
     let body: Value = resp.json().await?;
@@ -2960,12 +2990,14 @@ type = "fleet_router"
 context_window = 1048576
 tool_calling = true
 reasoning = true
+work_shape_source = "request"
 
 [[routes.smart.candidates]]
 target = "luna"
 tool_calling = true
 reasoning = false
 preference_rank = 1
+work_shape = "bounded"
 
 [[routes.smart.candidates]]
 target = "deepseek"

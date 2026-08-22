@@ -704,6 +704,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llama_cpp_context_overflow_falls_through_to_next_candidate() -> Result<()> {
+        // S2-E.0B: prove the REAL llama.cpp context-overflow response (exact deployed HTPC
+        // 400 fixture, `exceed_context_size_error`) is classified by current native
+        // switchyard-llm-client as ContextWindowExceeded, and call_first_available then
+        // falls through to the next ordered fallback candidate — no custom fallback logic.
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                observed_calls.lock().push(model.clone());
+                if model == "weak" {
+                    // Exact real deployed HTPC (Qwen3.5-9B-MTP) oversized-input rejection.
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "error": {
+                            "code": 400,
+                            "message": "request (66901 tokens) exceeds the available context size (65536 tokens), try increasing it",
+                            "type": "exceed_context_size_error",
+                            "n_prompt_tokens": 66901,
+                            "n_ctx": 65536
+                        }
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "answer",
+                        "model": "strong",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let backend = || {
+            Backend::OpenAiChat(HttpBackendConfig {
+                base_url: format!("{}/v1", server.uri()),
+                api_key: None,
+                forward_auth: false,
+                extra_headers: BTreeMap::new(),
+                extra_body: BTreeMap::new(),
+                max_retries: 1,
+            })
+        };
+        let client = Arc::new(
+            TranslatingLlmClient::new(&[
+                ModelConfig::new("weak", backend(), None),
+                ModelConfig::new("strong", backend(), None),
+            ])
+            .map_err(|error| LibsyError::external("building test client", error))?,
+        );
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["weak".into(), "strong".into()],
+        });
+        // run() routes (weak selected, strong fallback) then drives call_first_available:
+        // weak's real 400 overflow is classified as ContextWindowExceeded and the native
+        // machinery falls through to strong, which succeeds.
+        run(algorithm, ClientRouter::single(client), request(), None).await?;
+
+        assert_eq!(&*calls.lock(), &[ModelId::from("weak"), "strong".into()]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn streams_are_outside_the_candidate_fallback_boundary() -> Result<()> {
         // Receiving a stream handle is a successful call and ends candidate selection.
         let (client, result) = run_candidates(FirstOutcome::StreamSuccess).await;

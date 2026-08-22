@@ -1884,6 +1884,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_overflow_400_llama_cpp_exceed_context_size_is_mapped()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // Exact real failure fixture from the deployed HTPC llama.cpp (b10472): an
+        // oversized 66901-token prompt rejected pre-generation with HTTP 400 and
+        // `error.type == "exceed_context_size_error"`. The client must classify it as
+        // ContextWindowExceeded through the new generic OpenAI-compatible recognition
+        // (structured error.type), so the native fallback machinery can route around it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "code": 400,
+                    "message": "request (66901 tokens) exceeds the available context size (65536 tokens), try increasing it",
+                    "type": "exceed_context_size_error",
+                    "n_prompt_tokens": 66901,
+                    "n_ctx": 65536
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+
+        let Err(error) = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await
+        else {
+            panic!("expected an error");
+        };
+        assert!(matches!(
+            error,
+            LlmClientError::ContextWindowExceeded { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn forwards_metadata_headers_except_reserved()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;

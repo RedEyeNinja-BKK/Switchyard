@@ -114,6 +114,11 @@ struct RouteEntry {
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
     count_tokens_target: Option<CountTokensTarget>,
+    /// Explicitly-qualified exact input-token producers for this route's BOUNDED
+    /// candidates (host-owned; initially HTPC). The producer populates the
+    /// request's host-owned `candidate_input_tokens` before the routing Algorithm
+    /// runs, so FleetRouter stays pure (no network/tokenization I/O).
+    input_tokens_targets: Vec<InputTokensTarget>,
     config_name: Option<String>,
 }
 
@@ -182,6 +187,22 @@ impl CountTokensTarget {
     }
 }
 
+/// Exact upstream model used by the server's OpenAI-chat input-token producer for
+/// a BOUNDED fleet candidate. Mirrors [`CountTokensTarget`]. One instance per
+/// explicitly-qualified exact counter (initially HTPC).
+#[derive(Clone)]
+struct InputTokensTarget {
+    model: ModelId,
+    client: Arc<TranslatingLlmClient>,
+}
+
+impl InputTokensTarget {
+    /// The exact input-token count for `request` under this candidate's target.
+    async fn count_input_tokens(&self, request: &Request) -> Result<u64, LlmClientError> {
+        self.client.count_input_tokens(&self.model, request).await
+    }
+}
+
 /// Shared server state used by all endpoint handlers.
 #[derive(Clone)]
 pub struct ServerState {
@@ -241,6 +262,7 @@ impl ServerState {
                 None,
                 ModelCapabilities::default(),
                 None,
+                Vec::new(),
                 None,
             )
         }))
@@ -255,6 +277,7 @@ impl ServerState {
                 Option<CallerAuthKind>,
                 ModelCapabilities,
                 Option<CountTokensTarget>,
+                Vec<InputTokensTarget>,
                 Option<String>,
             ),
         >,
@@ -267,6 +290,7 @@ impl ServerState {
             caller_auth,
             capabilities,
             count_tokens_target,
+            input_tokens_targets,
             config_name,
         ) in routes
         {
@@ -280,6 +304,7 @@ impl ServerState {
                 caller_auth,
                 capabilities,
                 count_tokens_target,
+                input_tokens_targets,
                 config_name,
             };
             if entries.insert(model.clone(), entry).is_some() {
@@ -683,6 +708,7 @@ async fn decision(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    let request = prepare_candidate_context_facts(route, request).await;
     let mut outcome = match run_decision_only(route, request).await {
         Ok(outcome) => outcome,
         Err(error) => return algorithm_error(error),
@@ -713,6 +739,36 @@ async fn decision(
             server_error("routing outcome contains a model with no callable target configuration")
         }
     }
+}
+
+/// Host-owned exact input-token producer for routing paths.
+///
+/// Enriches `request` with `candidate_input_tokens` from this route's
+/// explicitly-qualified [`InputTokensTarget`]s, using a clone of the request for
+/// each target-specific count (so a multi-candidate route counts each target's
+/// own final representation). A count failure simply leaves that candidate's
+/// fact absent — FleetRouter then fails that BOUNDED candidate closed — and never
+/// fails the whole routing request. Called only from routing-eligible paths
+/// (normal inference and `/v1/decision`), never from the Anthropic count_tokens
+/// endpoint.
+async fn prepare_candidate_context_facts(route: &RouteEntry, mut request: Request) -> Request {
+    for target in &route.input_tokens_targets {
+        match target.count_input_tokens(&request).await {
+            Ok(count) => {
+                request
+                    .candidate_input_tokens
+                    .insert(target.model.clone(), count);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    model = %target.model,
+                    error = %error,
+                    "exact input-token count unavailable for candidate; leaving its fact absent"
+                );
+            }
+        }
+    }
+    request
 }
 
 /// Completes routing-time calls and returns the outcome without serving its answer target.
@@ -929,6 +985,9 @@ async fn handle_llm_request(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    // Host-owned exact context facts (BOUNDED candidates' target-specific counts)
+    // are attached before the routing Algorithm runs, keeping FleetRouter pure.
+    let request = prepare_candidate_context_facts(route, request).await;
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let algorithm = Arc::clone(&route.algorithm);

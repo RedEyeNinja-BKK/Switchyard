@@ -25,7 +25,8 @@ use switchyard_llm_client::{
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
 use crate::{
-    CallerAuthKind, CountTokensTarget, ModelCapabilities, ServerError, ServerResult, ServerState,
+    CallerAuthKind, CountTokensTarget, InputTokensTarget, ModelCapabilities, ServerError,
+    ServerResult, ServerState,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -159,6 +160,7 @@ impl ServerConfig {
             let algorithm = build_algorithm(route_name, config, &targets, fleet_source.clone())?;
             let (client, caller_auth) = self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
+            let input_tokens_targets = self.build_input_tokens_targets(config, &clients)?;
             routes.push((
                 config.id().clone(),
                 algorithm,
@@ -166,6 +168,7 @@ impl ServerConfig {
                 caller_auth,
                 capabilities,
                 count_tokens_target,
+                input_tokens_targets,
                 Some(route_name.clone()),
             ));
         }
@@ -290,6 +293,71 @@ impl ServerConfig {
                 model: target.id.clone(),
                 client: client.clone(),
             })
+    }
+
+    /// Builds the explicitly-qualified exact input-token producers for a fleet_router
+    /// route.
+    ///
+    /// Only `fleet_router` candidates that declare `context_policy.kind =
+    /// "bounded"` **and** `input_token_source = openai_chat_input_tokens` yield an
+    /// [`InputTokensTarget`]. A declared source whose target is **not** served by
+    /// an OpenAI-chat backend is a configuration error (rejected, not silently
+    /// ignored). Non-fleet routes and bounded candidates without an explicit
+    /// producer yield no target (their fact stays absent and FleetRouter fails
+    /// closed).
+    fn build_input_tokens_targets(
+        &self,
+        route_config: &RouteConfig,
+        clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+    ) -> ServerResult<Vec<InputTokensTarget>> {
+        let RouteConfig::FleetRouter { candidates, .. } = route_config else {
+            return Ok(Vec::new());
+        };
+        let mut targets = Vec::new();
+        for candidate in candidates {
+            let FleetCandidateContextPolicyConfig::Bounded {
+                usable_context_tokens,
+                input_token_source,
+            } = candidate.context_policy
+            else {
+                continue;
+            };
+            let Some(source) = input_token_source else {
+                // Bounded without an explicit producer: no fact, must fail closed.
+                continue;
+            };
+            match source {
+                InputTokenSourceConfig::OpenAiChatInputTokens => {
+                    let target = self.targets.get(&candidate.target).ok_or_else(|| {
+                        ServerError::new(format!(
+                            "fleet candidate {:?} declares input_token_source but has no [targets.*]",
+                            candidate.target
+                        ))
+                    })?;
+                    let Some(client) = clients.get(&target.llm_client) else {
+                        return Err(ServerError::new(format!(
+                            "fleet candidate {:?} references unknown llm_client {}",
+                            candidate.target, target.llm_client
+                        )));
+                    };
+                    if !client.supports_input_tokens(&target.id) {
+                        return Err(ServerError::new(format!(
+                            "fleet candidate {:?} declares input_token_source = openai_chat_input_tokens \
+                             but its target is not served by an OpenAI-chat backend",
+                            candidate.target
+                        )));
+                    }
+                    // `usable_context_tokens` is enforced as > 0 by the FleetRouter
+                    // core validator (shared by new/with_source).
+                    let _ = usable_context_tokens;
+                    targets.push(InputTokensTarget {
+                        model: target.id.clone(),
+                        client: client.clone(),
+                    });
+                }
+            }
+        }
+        Ok(targets)
     }
 }
 
@@ -669,7 +737,27 @@ enum FleetCandidateContextPolicyConfig {
     Unmanaged,
     /// Admit only when a candidate-specific input-token fact plus an explicit
     /// output budget fits `usable_context_tokens`.
-    Bounded { usable_context_tokens: u64 },
+    Bounded {
+        usable_context_tokens: u64,
+        /// Optional server-side exact-count producer qualification. Absent means
+        /// no exact producer is authorized for this bounded candidate (no
+        /// `InputTokensTarget`, no fact; FleetRouter fails closed). This is a
+        /// server-config concept; libsy only sees Unmanaged/Bounded + capacity +
+        /// the host-owned fact.
+        #[serde(default)]
+        input_token_source: Option<InputTokenSourceConfig>,
+    },
+}
+
+/// Server-only declaration of the exact input-token source a BOUNDED candidate is
+/// explicitly qualified to use. Currently the only supported source is a llama.cpp
+/// OpenAI-chat `/chat/completions/input_tokens` endpoint. Not inferred from a
+/// target merely being OpenAI-compatible; declared explicitly per candidate.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+enum InputTokenSourceConfig {
+    #[default]
+    #[serde(rename = "openai_chat_input_tokens")]
+    OpenAiChatInputTokens,
 }
 
 /// What fires an advisor route's review.
@@ -1557,6 +1645,7 @@ fn build_algorithm(
                         }
                         FleetCandidateContextPolicyConfig::Bounded {
                             usable_context_tokens,
+                            ..
                         } => ContextAdmissionPolicy::Bounded {
                             usable_context_tokens,
                         },

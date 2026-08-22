@@ -268,6 +268,17 @@ impl Backend {
         format!("{}/count_tokens", anthropic_url(base_url))
     }
 
+    /// The upstream OpenAI-chat input-token-count URL, derived from the same base
+    /// URL join as [`url`](Self::url).
+    ///
+    /// Only [`Backend::OpenAiChat`] supports the exact input-token endpoint; a
+    /// caller must not call this on other backends. The derived path is
+    /// `/chat/completions/input_tokens` under the backend's resolved base.
+    pub fn input_tokens_url(&self) -> String {
+        let base_url = self.config().base_url.trim_end_matches('/');
+        openai_url(base_url, "/chat/completions/input_tokens")
+    }
+
     /// Whether an upstream 400 `body` looks like a context-window overflow for
     /// this backend's provider.
     pub(crate) fn is_context_overflow(&self, body: &str) -> bool {
@@ -409,6 +420,32 @@ mod tests {
         assert_eq!(
             Backend::Anthropic(config("https://host/v1/")).count_tokens_url(),
             "https://host/v1/messages/count_tokens"
+        );
+    }
+
+    #[test]
+    fn input_tokens_url_joins_openai_chat_shapes() {
+        // The exact llama.cpp input-token endpoint derives from the OpenAI-chat
+        // backend's existing base URL via the native openai_url join (no hardcoded
+        // hostname/port/path). Bare root, /v1 base, trailing slash, and an existing
+        // completion-style suffix all resolve to .../chat/completions/input_tokens.
+        let backend = Backend::OpenAiChat(config("https://htpc.example"));
+        assert_eq!(
+            backend.input_tokens_url(),
+            "https://htpc.example/chat/completions/input_tokens"
+        );
+        assert_eq!(
+            Backend::OpenAiChat(config("https://htpc.example/v1")).input_tokens_url(),
+            "https://htpc.example/v1/chat/completions/input_tokens"
+        );
+        assert_eq!(
+            Backend::OpenAiChat(config("https://htpc.example/v1/")).input_tokens_url(),
+            "https://htpc.example/v1/chat/completions/input_tokens"
+        );
+        // An existing completion suffix is normalized to the input-tokens endpoint.
+        assert_eq!(
+            Backend::OpenAiChat(config("https://htpc.example/chat/completions")).input_tokens_url(),
+            "https://htpc.example/chat/completions/input_tokens"
         );
     }
 

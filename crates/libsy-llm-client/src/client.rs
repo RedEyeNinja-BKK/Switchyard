@@ -189,6 +189,81 @@ impl TranslatingLlmClient {
         })
     }
 
+    /// Whether `model` has an OpenAI-chat backend that supports exact input-token
+    /// counting via `/chat/completions/input_tokens`.
+    pub fn supports_input_tokens(&self, model: &ModelId) -> bool {
+        self.backend_for(model, WireFormat::OpenAiChat).is_some()
+    }
+
+    /// Walks the model's OpenAI-chat backend and counts the exact input tokens of
+    /// the target-specific final request body via `/chat/completions/input_tokens`.
+    ///
+    /// The count reuses the shared [`send_encoded`](Self::send_encoded) path, so
+    /// the counted body is the same token-relevant final target representation
+    /// that generation (`Completion`) would POST: resolved target model stamping,
+    /// same-format preservation, target `extra_body`, metadata/backend headers,
+    /// auth, and retry behavior all stay identical. Only a valid
+    /// `{"input_tokens": N}` result is accepted; `N` must be a non-negative
+    /// integer representable in [`u64`].
+    ///
+    /// Returns an error when the model has no OpenAI-chat backend, the upstream
+    /// request fails, or the response is not a valid `{"input_tokens": N}`.
+    pub async fn count_input_tokens(&self, model: &ModelId, request: &Request) -> Result<u64> {
+        let backend = self
+            .backend_for(model, WireFormat::OpenAiChat)
+            .ok_or_else(|| LlmClientError::Configuration {
+                message: format!(
+                    "model {model} has no OpenAI-chat backend for input-token counting"
+                ),
+            })?;
+        let Request {
+            llm_request,
+            metadata,
+            ..
+        } = request;
+        let http_response = self
+            .send_encoded(
+                backend,
+                WireFormat::OpenAiChat,
+                llm_request.clone(),
+                metadata.as_ref(),
+                model,
+                UpstreamEndpoint::InputTokens,
+            )
+            .await?;
+        let body = match http_response {
+            EncodedResponse::Buffered { body, .. } => body,
+            EncodedResponse::Streaming(_) => {
+                return Err(LlmClientError::InvalidRequest {
+                    message: "input-token counting does not support streaming requests".to_string(),
+                });
+            }
+        };
+        let parsed: Value =
+            serde_json::from_slice(&body).map_err(|error| LlmClientError::InvalidResponse {
+                source: Box::new(error),
+            })?;
+        let input_tokens =
+            parsed
+                .get("input_tokens")
+                .ok_or_else(|| LlmClientError::InvalidResponse {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "input_tokens response missing `input_tokens` field",
+                    )),
+                })?;
+        let input_tokens =
+            input_tokens
+                .as_u64()
+                .ok_or_else(|| LlmClientError::InvalidResponse {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "input_tokens response `input_tokens` is not a valid non-negative integer",
+                    )),
+                })?;
+        Ok(input_tokens)
+    }
+
     /// Encode `llm_request` for `wire_format`, POST it to `url` with the request's
     /// forwarded headers plus the backend's static headers and auth, and return the
     /// successful upstream response. A
@@ -547,6 +622,7 @@ impl RoutedLlmClient for TranslatingLlmClient {
 enum UpstreamEndpoint {
     Completion,
     CountTokens,
+    InputTokens,
 }
 
 impl UpstreamEndpoint {
@@ -554,6 +630,7 @@ impl UpstreamEndpoint {
         match self {
             UpstreamEndpoint::Completion => backend.url(),
             UpstreamEndpoint::CountTokens => backend.count_tokens_url(),
+            UpstreamEndpoint::InputTokens => backend.input_tokens_url(),
         }
     }
 
@@ -2212,6 +2289,144 @@ mod tests {
                 WireFormat::OpenAiChat,
             )
             .await?;
+        Ok(())
+    }
+
+    // --- S2-E.2: exact OpenAI-chat input-token counting -------------------------
+
+    #[tokio::test]
+    async fn count_input_tokens_returns_exact_count() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"input_tokens": 42, "object": "response.input_tokens"}
+            )))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let model = ModelId::from("gpt");
+        let n = client
+            .count_input_tokens(&model, &request_for(Some("gpt"), false))
+            .await?;
+        assert_eq!(n, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_input_tokens_rejects_invalid_payloads() {
+        // Rejects every non-`{ "input_tokens": N }`-with-non-negative-integer result.
+        // (A numeric literal larger than u64 cannot be held by serde_json's default
+        // Number, so the u64-overflow path is covered by the strict `as_u64`
+        // validation in `count_input_tokens`, not a constructible JSON fixture.)
+        let cases: &[serde_json::Value] = &[
+            json!({}),                     // missing field
+            json!({"input_tokens": null}), // null
+            json!({"input_tokens": -1}),   // negative
+            json!({"input_tokens": 3.5}),  // float
+            json!({"input_tokens": "12"}), // string
+        ];
+        for payload in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(payload.clone()))
+                .mount(&server)
+                .await;
+            let client =
+                TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri()))).unwrap();
+            let model = ModelId::from("gpt");
+            let result = client
+                .count_input_tokens(&model, &request_for(Some("gpt"), false))
+                .await;
+            assert!(result.is_err(), "payload {payload} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn input_tokens_body_matches_generation_token_semantics() -> Result<()> {
+        // Body-fidelity invariant: the same Request + target + backend through the
+        // Completion and InputTokens paths produce the same token-relevant final
+        // outbound request body (target model stamp, messages, tools, target
+        // extra_body). We capture both POSTed request bodies keyed by URL suffix and
+        // compare their token-relevant fields. `stream` may differ and is treated
+        // as token-neutral (not part of the prompt semantics).
+        use std::sync::Mutex as StdMutex;
+        let captured: Arc<StdMutex<Vec<(String, Value)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_assert = Arc::clone(&captured);
+        let server = MockServer::start().await;
+        let mut extra = BTreeMap::new();
+        extra.insert("reasoning".to_string(), json!({"effort": "none"}));
+        let uri = server.uri();
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let key = if req.url.path().ends_with("/input_tokens") {
+                    "input_tokens"
+                } else {
+                    "completion"
+                };
+                captured_for_assert.lock().unwrap().push((key.to_string(), body));
+                if key == "input_tokens" {
+                    ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 10}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "r", "model": "gpt",
+                        "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                        "usage": {}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client =
+            TranslatingLlmClient::new(&chat_map_with_extra_body(&format!("{uri}/v1"), extra))?;
+        let mut request = request_for(Some("gpt"), false);
+        request
+            .llm_request
+            .tools
+            .push(switchyard_protocol::ToolDefinition {
+                name: "lookup".to_string(),
+                description: Some("test tool".to_string()),
+                parameters: json!({"type": "object"}),
+                strict: None,
+            });
+
+        // Drive the InputTokens path (target model gpt).
+        let model = ModelId::from("gpt");
+        let _count = client.count_input_tokens(&model, &request).await?;
+
+        // Drive the Completion path (generation) with the same request.
+        client.call_rewrite_model(request, None).await?;
+
+        let captured = captured.lock().unwrap().clone();
+        let input_body = captured
+            .iter()
+            .find(|(k, _)| k == "input_tokens")
+            .map(|(_, b)| b)
+            .expect("an input_tokens request body");
+        let completion_body = captured
+            .iter()
+            .find(|(k, _)| k == "completion")
+            .map(|(_, b)| b)
+            .expect("a completion request body");
+        // Token-relevant fields must match across the two outbound paths.
+        assert_eq!(
+            input_body["model"], "gpt",
+            "target model must be stamped identically"
+        );
+        assert_eq!(
+            input_body["messages"], completion_body["messages"],
+            "messages must match token-relevant representation"
+        );
+        assert_eq!(
+            input_body["tools"], completion_body["tools"],
+            "tools must match token-relevant representation"
+        );
+        assert_eq!(
+            input_body["reasoning"], completion_body["reasoning"],
+            "target extra_body (reasoning) must be merged identically"
+        );
         Ok(())
     }
 }

@@ -1055,6 +1055,15 @@ struct FleetCandidateConfig {
     /// qualified usable context capacity.
     #[serde(default)]
     context_policy: FleetCandidateContextPolicyConfig,
+    /// Static qualified usable context capacity of this candidate (a capability
+    /// fact, SEPARATE from `context_policy`'s exact-request admission behavior).
+    /// Positive integer = this deployment truthfully guarantees/configured the
+    /// candidate to serve that many usable context tokens; absent = capacity
+    /// UNKNOWN; zero is invalid configuration (rejected at load). Never inferred
+    /// from provider/model names. A candidate may be `Unmanaged` for exact
+    /// preflight counting while still carrying a known capacity here.
+    #[serde(default)]
+    usable_context_tokens: Option<u64>,
     /// Optional structural work-shape limitation. `bounded` limits this candidate
     /// to bounded requests; `agentic` to agentic requests; absent means it serves
     /// any shape (used by the fixed routes and the any-shape DeepSeek lane).
@@ -2019,8 +2028,15 @@ fn build_algorithm(
             // never this config.
             let mut profiles = Vec::with_capacity(candidates.len());
             for candidate in candidates {
+                if candidate.usable_context_tokens == Some(0) {
+                    return Err(ServerError::new(format!(
+                        "fleet candidate {:?} declares an invalid zero usable_context_tokens; \
+                         a configured static capacity must be positive",
+                        candidate.target
+                    )));
+                }
                 let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
-                let profile = CandidateProfile::new(
+                let mut profile = CandidateProfile::new(
                     target,
                     candidate.tool_calling,
                     candidate.reasoning,
@@ -2037,6 +2053,9 @@ fn build_algorithm(
                         usable_context_tokens,
                     },
                 });
+                if let Some(capacity) = candidate.usable_context_tokens {
+                    profile = profile.with_usable_context_tokens(capacity);
+                }
                 let profile = match candidate.work_shape {
                     Some(FleetWorkShapeName::Bounded) => {
                         profile.with_work_shape(libsy::WorkShape::Bounded)

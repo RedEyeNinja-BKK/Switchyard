@@ -28,6 +28,10 @@ const OPENAI_OVERFLOW_PHRASES: &[&str] = &[
     "exceeds the maximum allowed input length",
     "exceeds the maximum allowed length",
     "is longer than the model's context length",
+    // llama.cpp native: structured `error.type == "exceed_context_size_error"` is
+    // recognized separately; this exact phrase covers the same overflow when a
+    // provider/transport wrap drops the type but preserves the message.
+    "exceeds the available context size",
 ];
 
 // Anthropic has no structured `error.code`, so detection is phrase-based only.
@@ -268,21 +272,43 @@ impl Backend {
         format!("{}/count_tokens", anthropic_url(base_url))
     }
 
+    /// The upstream OpenAI-chat input-token-count URL, derived from the same base
+    /// URL join as [`url`](Self::url).
+    ///
+    /// Only [`Backend::OpenAiChat`] supports the exact input-token endpoint; a
+    /// caller must not call this on other backends. The derived path is
+    /// `/chat/completions/input_tokens` under the backend's resolved base.
+    pub fn input_tokens_url(&self) -> String {
+        let base_url = self.config().base_url.trim_end_matches('/');
+        openai_url(base_url, "/chat/completions/input_tokens")
+    }
+
     /// Whether an upstream 400 `body` looks like a context-window overflow for
     /// this backend's provider.
     pub(crate) fn is_context_overflow(&self, body: &str) -> bool {
+        // A 400 response can signal a context-window overflow through:
+        //   * a structured error.code of "context_length_exceeded" (OpenAI canonical), or
+        //   * a structured llama.cpp error.type of "exceed_context_size_error" (also
+        //     covered by the message carrying the exact phrase when the type is absent
+        //     under a provider wrap).
+        // The exact phrase is deliberately narrow ("exceeds the available context
+        // size <n> tokens") so it cannot misclassify unrelated 400 bodies.
+        let structured_overflow = |value: &Value| {
+            value
+                .get("error")
+                .and_then(|err| err.get("code"))
+                .and_then(Value::as_str)
+                == Some("context_length_exceeded")
+                || value
+                    .get("error")
+                    .and_then(|err| err.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("exceed_context_size_error")
+        };
         match self {
-            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => is_overflow_body(
-                body,
-                |value| {
-                    value
-                        .get("error")
-                        .and_then(|err| err.get("code"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("context_length_exceeded")
-                },
-                OPENAI_OVERFLOW_PHRASES,
-            ),
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+                is_overflow_body(body, structured_overflow, OPENAI_OVERFLOW_PHRASES)
+            }
             Backend::Anthropic(_) => is_overflow_body(body, |_| false, ANTHROPIC_OVERFLOW_PHRASES),
         }
     }
@@ -413,6 +439,32 @@ mod tests {
     }
 
     #[test]
+    fn input_tokens_url_joins_openai_chat_shapes() {
+        // The exact llama.cpp input-token endpoint derives from the OpenAI-chat
+        // backend's existing base URL via the native openai_url join (no hardcoded
+        // hostname/port/path). Bare root, /v1 base, trailing slash, and an existing
+        // completion-style suffix all resolve to .../chat/completions/input_tokens.
+        let backend = Backend::OpenAiChat(config("https://htpc.example"));
+        assert_eq!(
+            backend.input_tokens_url(),
+            "https://htpc.example/chat/completions/input_tokens"
+        );
+        assert_eq!(
+            Backend::OpenAiChat(config("https://htpc.example/v1")).input_tokens_url(),
+            "https://htpc.example/v1/chat/completions/input_tokens"
+        );
+        assert_eq!(
+            Backend::OpenAiChat(config("https://htpc.example/v1/")).input_tokens_url(),
+            "https://htpc.example/v1/chat/completions/input_tokens"
+        );
+        // An existing completion suffix is normalized to the input-tokens endpoint.
+        assert_eq!(
+            Backend::OpenAiChat(config("https://htpc.example/chat/completions")).input_tokens_url(),
+            "https://htpc.example/chat/completions/input_tokens"
+        );
+    }
+
+    #[test]
     fn only_anthropic_backend_is_anthropic() {
         assert!(Backend::Anthropic(config("x")).is_anthropic());
         assert!(!Backend::OpenAiChat(config("x")).is_anthropic());
@@ -460,6 +512,36 @@ mod tests {
         ));
         assert!(backend.is_context_overflow(
             r#"{"object":"error","message":"The input (12345 tokens) is longer than the model's context length (8192 tokens).","type":"BadRequestError","param":null,"code":400}"#
+        ));
+    }
+
+    #[test]
+    fn openai_detects_llama_cpp_exceed_context_size_error() {
+        // Exact real failure fixture from the deployed HTPC llama.cpp (Qwen3.5-9B-MTP,
+        // b10472): an oversized 66901-token prompt rejected pre-generation with HTTP 400
+        // and `error.type = "exceed_context_size_error"`. This is recognized through the
+        // structured llama.cpp type (and, equivalently, the exact message phrase).
+        let backend = Backend::OpenAiChat(config("x"));
+        let fixture = r#"{
+            "error": {
+                "code": 400,
+                "message": "request (66901 tokens) exceeds the available context size (65536 tokens), try increasing it",
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 66901,
+                "n_ctx": 65536
+            }
+        }"#;
+        assert!(
+            backend.is_context_overflow(fixture),
+            "the real llama.cpp overflow body must be classified as a context overflow"
+        );
+        // The exact phrase alone (provider/type stripped) must also be recognized.
+        assert!(backend.is_context_overflow(
+            r#"{"error":{"message":"request (66901 tokens) exceeds the available context size (65536 tokens), try increasing it"}}"#
+        ));
+        // A generic 400 must not be misclassified.
+        assert!(!backend.is_context_overflow(
+            r#"{"error":{"code":400,"message":"bad request","type":"invalid_request_error"}}"#
         ));
     }
 

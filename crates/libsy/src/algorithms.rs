@@ -8,6 +8,7 @@
 
 pub mod advisor_gate;
 pub mod fall_through;
+pub mod fleet_router;
 pub mod llm_class;
 pub mod noop;
 pub mod passthrough;

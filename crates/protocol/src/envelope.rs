@@ -4,6 +4,8 @@
 //! The request/response envelope: the normalized [`LlmRequest`]/[`LlmResponse`] paired
 //! with the original provider payload and correlation [`Metadata`].
 
+use std::collections::BTreeMap;
+
 use crate::{LlmRequest, LlmResponse, Metadata, ModelId};
 
 /// A request an algorithm routes: the normalized [`LlmRequest`] plus optional
@@ -16,6 +18,15 @@ pub struct Request {
     /// codecs do not read it. Exact same-format codec replay instead uses
     /// [`LlmRequest::preservation`].
     pub raw_request: Option<serde_json::Value>,
+    /// Host-owned, candidate-specific exact input-token requirement facts, keyed
+    /// by the candidate target they apply to.
+    ///
+    /// These are **trusted routing facts supplied by the host** (e.g. from a
+    /// candidate's exact tokenizer count for the final rendered request), not
+    /// caller-supplied adapter values. They are tokenizer/template dependent, so
+    /// one candidate's count is never borrowed by another candidate. Absent/
+    /// unknown for a context-constrained candidate fails closed to non-admission.
+    pub candidate_input_tokens: BTreeMap<ModelId, u64>,
     /// Correlation metadata carried through the request.
     pub metadata: Option<Metadata>,
 }

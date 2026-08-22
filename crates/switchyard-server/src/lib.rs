@@ -4,6 +4,7 @@
 //! Rust HTTP server for libsy algorithms.
 
 pub mod config;
+pub mod fleet_readiness;
 mod metrics;
 mod observability;
 mod response;
@@ -45,6 +46,7 @@ use tracing::{Instrument, Level};
 use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
 
 use crate::config::ServerConfig;
+use crate::fleet_readiness::FleetReadinessMonitor;
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
@@ -113,6 +115,11 @@ struct RouteEntry {
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
     count_tokens_target: Option<CountTokensTarget>,
+    /// Explicitly-qualified exact input-token producers for this route's BOUNDED
+    /// candidates (host-owned; initially HTPC). The producer populates the
+    /// request's host-owned `candidate_input_tokens` before the routing Algorithm
+    /// runs, so FleetRouter stays pure (no network/tokenization I/O).
+    input_tokens_targets: Vec<InputTokensTarget>,
     config_name: Option<String>,
 }
 
@@ -181,6 +188,22 @@ impl CountTokensTarget {
     }
 }
 
+/// Exact upstream model used by the server's OpenAI-chat input-token producer for
+/// a BOUNDED fleet candidate. Mirrors [`CountTokensTarget`]. One instance per
+/// explicitly-qualified exact counter (initially HTPC).
+#[derive(Clone)]
+struct InputTokensTarget {
+    model: ModelId,
+    client: Arc<TranslatingLlmClient>,
+}
+
+impl InputTokensTarget {
+    /// The exact input-token count for `request` under this candidate's target.
+    async fn count_input_tokens(&self, request: &Request) -> Result<u64, LlmClientError> {
+        self.client.count_input_tokens(&self.model, request).await
+    }
+}
+
 /// Shared server state used by all endpoint handlers.
 #[derive(Clone)]
 pub struct ServerState {
@@ -240,6 +263,7 @@ impl ServerState {
                 None,
                 ModelCapabilities::default(),
                 None,
+                Vec::new(),
                 None,
             )
         }))
@@ -254,6 +278,7 @@ impl ServerState {
                 Option<CallerAuthKind>,
                 ModelCapabilities,
                 Option<CountTokensTarget>,
+                Vec<InputTokensTarget>,
                 Option<String>,
             ),
         >,
@@ -266,6 +291,7 @@ impl ServerState {
             caller_auth,
             capabilities,
             count_tokens_target,
+            input_tokens_targets,
             config_name,
         ) in routes
         {
@@ -279,6 +305,7 @@ impl ServerState {
                 caller_auth,
                 capabilities,
                 count_tokens_target,
+                input_tokens_targets,
                 config_name,
             };
             if entries.insert(model.clone(), entry).is_some() {
@@ -410,6 +437,69 @@ pub async fn run_server(state: ServerState, options: ServerRunOptions) -> Server
     server.serve(shutdown::signal()).await
 }
 
+/// A coherent production runtime bundle: the server state plus an optional
+/// fleet-readiness monitor built over the SAME `Arc<SharedFleetState>` that was
+/// injected into the server's FleetRouter(s).
+///
+/// This is the structural shared-state guarantee for the normal stock CLI: the
+/// config/runtime builder creates ONE `Arc<SharedFleetState>` and hands clones of
+/// THAT object to both the `ServerState` and the `FleetReadinessMonitor`, so the
+/// operator never needs to wire them together manually.
+pub struct ServerRuntime {
+    /// Server state (FleetRouter(s) injected with a shared fleet source).
+    pub state: ServerState,
+    /// Optional fleet-readiness monitor; `Some` only when the config declares a
+    /// `[fleet_readiness]` section. When `Some`, it MUST be run via
+    /// [`run_server_with_fleet_monitor`] (or the CLI chooses that path) so the
+    /// background monitor keeps the shared fleet state populated.
+    pub monitor: Option<FleetReadinessMonitor>,
+}
+
+impl ServerRuntime {
+    /// Produces a coherent bundle from a config path, sharing ONE fleet state.
+    pub fn load(path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+        crate::config::load_server_runtime(path)
+    }
+
+    /// Runs the runtime. Chooses the monitored lifecycle when a monitor is
+    /// configured, otherwise the ordinary server lifecycle. Consumes the runtime.
+    ///
+    /// Honors `options.dry_run`: validates the full runtime (including monitor
+    /// construction) and prints the summary WITHOUT binding a socket or starting
+    /// the background monitor, so `--dry-run` never creates an accidental service.
+    pub async fn run(self, options: ServerRunOptions) -> ServerResult<()> {
+        if options.dry_run {
+            println!("{}", crate::dry_run_summary(&self.state));
+            return Ok(());
+        }
+        match self.monitor {
+            Some(monitor) => run_server_with_fleet_monitor(self.state, options, monitor).await,
+            None => run_server(self.state, options).await,
+        }
+    }
+}
+
+/// Production runtime owner: runs the server while a fleet-readiness monitor is
+/// the owner of live readiness facts, sharing one `SharedFleetState` with the
+/// server's FleetRouter and stopping together on the same process signal.
+///
+/// The caller must ensure `monitor` was built over the same `Arc<SharedFleetState>`
+/// that was injected into `state` (see [`BoundServer::serve_with_fleet_monitor`]);
+/// otherwise the server would see the fail-closed empty source while a monitor
+/// wrote to a separate state. This entry exists so a production runtime can start
+/// the S2-D FleetReadinessMonitor alongside the server under one lifecycle.
+pub async fn run_server_with_fleet_monitor(
+    state: ServerState,
+    options: ServerRunOptions,
+    monitor: FleetReadinessMonitor,
+) -> ServerResult<()> {
+    let server = BoundServer::bind(state, options)?;
+    println!("{}", server.startup_banner(std::io::stdout().is_terminal()));
+    server
+        .serve_with_fleet_monitor(shutdown::signal(), monitor)
+        .await
+}
+
 /// A configured server with its listening socket already bound.
 pub struct BoundServer {
     listener: TcpListener,
@@ -447,6 +537,40 @@ impl BoundServer {
         } else {
             serve(self.listener, self.router, shutdown_timeout, shutdown).await
         }
+    }
+
+    /// Serves requests while a background fleet-readiness monitor runs, stopping
+    /// both on the same shutdown.
+    ///
+    /// The monitor is the runtime owner of the fleet readiness facts. Identity is
+    /// structural by construction: the caller passes a [`FleetReadinessMonitor`]
+    /// holding the same `Arc<SharedFleetState>` that was injected into this
+    /// server's FleetRouter (e.g. via [`ServerConfig::build`](crate::ServerConfig)),
+    /// so the monitor and the router observe and publish through one shared state —
+    /// never the fail-closed empty default while a separate monitor writes
+    /// elsewhere.
+    pub async fn serve_with_fleet_monitor(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        monitor: FleetReadinessMonitor,
+    ) -> ServerResult<()> {
+        // A shared stop trigger so the monitor loop and the HTTP server stop on the
+        // same signal. `serve` swallows the caller shutdown; we also propagate it to
+        // the monitor via the trigger.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let monitor_task = tokio::spawn(monitor.run(async move {
+            let _ = stop_rx.await;
+        }));
+        let shutdown_timeout = self.options.shutdown_timeout;
+        let serve_result = if let Some(tls) = self.options.tls {
+            serve_tls(self.listener, self.router, tls, shutdown_timeout, shutdown).await
+        } else {
+            serve(self.listener, self.router, shutdown_timeout, shutdown).await
+        };
+        // Signal the monitor to stop; it observes once more? No — it stops cleanly.
+        let _ = stop_tx.send(());
+        let _ = monitor_task.await;
+        serve_result
     }
 
     fn startup_banner(&self, color: bool) -> String {
@@ -682,6 +806,7 @@ async fn decision(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    let request = prepare_candidate_context_facts(route, request).await;
     let mut outcome = match run_decision_only(route, request).await {
         Ok(outcome) => outcome,
         Err(error) => return algorithm_error(error),
@@ -712,6 +837,36 @@ async fn decision(
             server_error("routing outcome contains a model with no callable target configuration")
         }
     }
+}
+
+/// Host-owned exact input-token producer for routing paths.
+///
+/// Enriches `request` with `candidate_input_tokens` from this route's
+/// explicitly-qualified [`InputTokensTarget`]s, using a clone of the request for
+/// each target-specific count (so a multi-candidate route counts each target's
+/// own final representation). A count failure simply leaves that candidate's
+/// fact absent — FleetRouter then fails that BOUNDED candidate closed — and never
+/// fails the whole routing request. Called only from routing-eligible paths
+/// (normal inference and `/v1/decision`), never from the Anthropic count_tokens
+/// endpoint.
+async fn prepare_candidate_context_facts(route: &RouteEntry, mut request: Request) -> Request {
+    for target in &route.input_tokens_targets {
+        match target.count_input_tokens(&request).await {
+            Ok(count) => {
+                request
+                    .candidate_input_tokens
+                    .insert(target.model.clone(), count);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    model = %target.model,
+                    error = %error,
+                    "exact input-token count unavailable for candidate; leaving its fact absent"
+                );
+            }
+        }
+    }
+    request
 }
 
 /// Completes routing-time calls and returns the outcome without serving its answer target.
@@ -910,6 +1065,7 @@ fn resolve_route(
         llm_request,
         raw_request: Some(body),
         metadata: Some(metadata),
+        ..Request::default()
     };
     Ok((route, request))
 }
@@ -927,6 +1083,9 @@ async fn handle_llm_request(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    // Host-owned exact context facts (BOUNDED candidates' target-specific counts)
+    // are attached before the routing Algorithm runs, keeping FleetRouter pure.
+    let request = prepare_candidate_context_facts(route, request).await;
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let algorithm = Arc::clone(&route.algorithm);

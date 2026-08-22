@@ -613,6 +613,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Request::default()
         }
     }
 

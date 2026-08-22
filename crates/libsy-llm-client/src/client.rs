@@ -189,6 +189,81 @@ impl TranslatingLlmClient {
         })
     }
 
+    /// Whether `model` has an OpenAI-chat backend that supports exact input-token
+    /// counting via `/chat/completions/input_tokens`.
+    pub fn supports_input_tokens(&self, model: &ModelId) -> bool {
+        self.backend_for(model, WireFormat::OpenAiChat).is_some()
+    }
+
+    /// Walks the model's OpenAI-chat backend and counts the exact input tokens of
+    /// the target-specific final request body via `/chat/completions/input_tokens`.
+    ///
+    /// The count reuses the shared [`send_encoded`](Self::send_encoded) path, so
+    /// the counted body is the same token-relevant final target representation
+    /// that generation (`Completion`) would POST: resolved target model stamping,
+    /// same-format preservation, target `extra_body`, metadata/backend headers,
+    /// auth, and retry behavior all stay identical. Only a valid
+    /// `{"input_tokens": N}` result is accepted; `N` must be a non-negative
+    /// integer representable in [`u64`].
+    ///
+    /// Returns an error when the model has no OpenAI-chat backend, the upstream
+    /// request fails, or the response is not a valid `{"input_tokens": N}`.
+    pub async fn count_input_tokens(&self, model: &ModelId, request: &Request) -> Result<u64> {
+        let backend = self
+            .backend_for(model, WireFormat::OpenAiChat)
+            .ok_or_else(|| LlmClientError::Configuration {
+                message: format!(
+                    "model {model} has no OpenAI-chat backend for input-token counting"
+                ),
+            })?;
+        let Request {
+            llm_request,
+            metadata,
+            ..
+        } = request;
+        let http_response = self
+            .send_encoded(
+                backend,
+                WireFormat::OpenAiChat,
+                llm_request.clone(),
+                metadata.as_ref(),
+                model,
+                UpstreamEndpoint::InputTokens,
+            )
+            .await?;
+        let body = match http_response {
+            EncodedResponse::Buffered { body, .. } => body,
+            EncodedResponse::Streaming(_) => {
+                return Err(LlmClientError::InvalidRequest {
+                    message: "input-token counting does not support streaming requests".to_string(),
+                });
+            }
+        };
+        let parsed: Value =
+            serde_json::from_slice(&body).map_err(|error| LlmClientError::InvalidResponse {
+                source: Box::new(error),
+            })?;
+        let input_tokens =
+            parsed
+                .get("input_tokens")
+                .ok_or_else(|| LlmClientError::InvalidResponse {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "input_tokens response missing `input_tokens` field",
+                    )),
+                })?;
+        let input_tokens =
+            input_tokens
+                .as_u64()
+                .ok_or_else(|| LlmClientError::InvalidResponse {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "input_tokens response `input_tokens` is not a valid non-negative integer",
+                    )),
+                })?;
+        Ok(input_tokens)
+    }
+
     /// Encode `llm_request` for `wire_format`, POST it to `url` with the request's
     /// forwarded headers plus the backend's static headers and auth, and return the
     /// successful upstream response. A
@@ -304,7 +379,7 @@ impl TranslatingLlmClient {
             &self.client
         };
         let builder = client.post(url).json(body);
-        let builder = forward_metadata_headers(builder, metadata);
+        let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
@@ -508,6 +583,7 @@ impl TranslatingLlmClient {
                 wire_format: None,
                 ..Default::default()
             }),
+            ..Request::default()
         };
         let response = self.call_rewrite_model(request, model).await?;
 
@@ -546,6 +622,7 @@ impl RoutedLlmClient for TranslatingLlmClient {
 enum UpstreamEndpoint {
     Completion,
     CountTokens,
+    InputTokens,
 }
 
 impl UpstreamEndpoint {
@@ -553,6 +630,7 @@ impl UpstreamEndpoint {
         match self {
             UpstreamEndpoint::Completion => backend.url(),
             UpstreamEndpoint::CountTokens => backend.count_tokens_url(),
+            UpstreamEndpoint::InputTokens => backend.input_tokens_url(),
         }
     }
 
@@ -657,16 +735,34 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     }
 }
 
-// Forwards caller-supplied metadata headers except credentials and client-owned headers.
+// Forwards caller-supplied metadata headers except credentials, client-owned
+// headers, and headers the backend overrides via `extra_headers`.
+//
+// A backend that configures a canonical header (e.g. ThaiLLM's `User-Agent` to a
+// fixed value the upstream WAF requires) must win exactly once: suppressing any
+// inbound header whose name matches an `extra_headers` key here means the backend
+// value applied later by `apply_extra_headers` is not duplicated or shadowed by a
+// caller-supplied one. Comparison is case-insensitive; auth/credential headers are
+// already reserved and never forwarded.
 fn forward_metadata_headers(
     mut builder: RequestBuilder,
     metadata: Option<&Metadata>,
+    backend: &Backend,
 ) -> RequestBuilder {
     let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
         return builder;
     };
     for (name, value) in headers {
         if is_reserved_header(name.as_str()) {
+            continue;
+        }
+        // The backend overrides this header via extra_headers; do not forward the
+        // inbound value so the backend's configured value is applied exactly once.
+        if backend
+            .extra_headers()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(name.as_str()))
+        {
             continue;
         }
         builder = builder.header(name, value);
@@ -901,6 +997,16 @@ mod tests {
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
+    // A one-model config list whose backend carries fixed `extra_headers`.
+    fn chat_map_with_extra_headers(
+        base_url: &str,
+        extra_headers: BTreeMap<String, String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.extra_headers = extra_headers;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
     fn anthropic_map(base_url: &str) -> Vec<ModelConfig> {
         vec![ModelConfig::new(
             "claude",
@@ -979,6 +1085,7 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            ..Request::default()
         }
     }
 
@@ -1884,6 +1991,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_overflow_400_llama_cpp_exceed_context_size_is_mapped()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // Exact real failure fixture from the deployed HTPC llama.cpp (b10472): an
+        // oversized 66901-token prompt rejected pre-generation with HTTP 400 and
+        // `error.type == "exceed_context_size_error"`. The client must classify it as
+        // ContextWindowExceeded through the new generic OpenAI-compatible recognition
+        // (structured error.type), so the native fallback machinery can route around it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "code": 400,
+                    "message": "request (66901 tokens) exceeds the available context size (65536 tokens), try increasing it",
+                    "type": "exceed_context_size_error",
+                    "n_prompt_tokens": 66901,
+                    "n_ctx": 65536
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+
+        let Err(error) = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await
+        else {
+            panic!("expected an error");
+        };
+        assert!(matches!(
+            error,
+            LlmClientError::ContextWindowExceeded { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn forwards_metadata_headers_except_reserved()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
@@ -1937,6 +2081,7 @@ mod tests {
                 wire_format: None,
                 ..Default::default()
             }),
+            ..Request::default()
         };
 
         let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
@@ -1953,6 +2098,71 @@ mod tests {
         assert!(!received.headers.contains_key("api-key"));
         assert!(!received.headers.contains_key("openai-organization"));
         assert!(!received.headers.contains_key("openai-project"));
+        Ok(())
+    }
+
+    // A backend that configures a canonical header via `extra_headers` must win
+    // exactly once: an inbound caller header whose name matches an `extra_headers`
+    // key is suppressed so the backend value applies once (not duplicated or
+    // shadowed by a caller-supplied value). ThaiLLM's fixed User-Agent is the
+    // production case (the upstream WAF requires the canonical UA).
+    #[tokio::test]
+    async fn extra_headers_override_inbound_headers_exactly_once()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let mut extra_headers = BTreeMap::new();
+        extra_headers.insert(
+            "User-Agent".to_string(),
+            "Switchyard/backend-canonical-ua".to_string(),
+        );
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
+            "http://127.0.0.1:9/v1",
+            extra_headers,
+        ))?;
+        let backend = client
+            .backend_for(&ModelId::from("gpt"), WireFormat::OpenAiChat)
+            .unwrap();
+
+        // Caller metadata carries its own User-Agent plus a passthrough header we
+        // expect to be forwarded (the backend does not override it).
+        let mut caller_headers = http::HeaderMap::new();
+        caller_headers.insert("user-agent", http::HeaderValue::from_static("caller-ua"));
+        caller_headers.insert("x-resource-ref", http::HeaderValue::from_static("ref-1"));
+
+        let builder = reqwest::Client::new().post("http://127.0.0.1:9/v1/chat/completions");
+        let builder = forward_metadata_headers(
+            builder,
+            Some(&Metadata {
+                session_id: None,
+                agent_id: None,
+                task_id: None,
+                correlation_id: None,
+                extra_metadata: None,
+                http_headers: Some(caller_headers),
+                wire_format: None,
+                ..Default::default()
+            }),
+            backend,
+        );
+        let builder = apply_extra_headers(builder, backend);
+        let request = builder.build().expect("request builds");
+
+        // Reserved/suppressed inbound override: the caller's User-Agent is NOT
+        // forwarded; the backend's canonical value is set exactly once.
+        let ua_values: Vec<&str> = request
+            .headers()
+            .get_all("user-agent")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(ua_values, vec!["Switchyard/backend-canonical-ua"]);
+        // Non-overridden inbound header still forwards.
+        assert_eq!(
+            request
+                .headers()
+                .get("x-resource-ref")
+                .map(|v| v.to_str().unwrap()),
+            Some("ref-1"),
+        );
         Ok(())
     }
 
@@ -2209,6 +2419,144 @@ mod tests {
                 WireFormat::OpenAiChat,
             )
             .await?;
+        Ok(())
+    }
+
+    // --- S2-E.2: exact OpenAI-chat input-token counting -------------------------
+
+    #[tokio::test]
+    async fn count_input_tokens_returns_exact_count() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"input_tokens": 42, "object": "response.input_tokens"}
+            )))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let model = ModelId::from("gpt");
+        let n = client
+            .count_input_tokens(&model, &request_for(Some("gpt"), false))
+            .await?;
+        assert_eq!(n, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_input_tokens_rejects_invalid_payloads() {
+        // Rejects every non-`{ "input_tokens": N }`-with-non-negative-integer result.
+        // (A numeric literal larger than u64 cannot be held by serde_json's default
+        // Number, so the u64-overflow path is covered by the strict `as_u64`
+        // validation in `count_input_tokens`, not a constructible JSON fixture.)
+        let cases: &[serde_json::Value] = &[
+            json!({}),                     // missing field
+            json!({"input_tokens": null}), // null
+            json!({"input_tokens": -1}),   // negative
+            json!({"input_tokens": 3.5}),  // float
+            json!({"input_tokens": "12"}), // string
+        ];
+        for payload in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(payload.clone()))
+                .mount(&server)
+                .await;
+            let client =
+                TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri()))).unwrap();
+            let model = ModelId::from("gpt");
+            let result = client
+                .count_input_tokens(&model, &request_for(Some("gpt"), false))
+                .await;
+            assert!(result.is_err(), "payload {payload} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn input_tokens_body_matches_generation_token_semantics() -> Result<()> {
+        // Body-fidelity invariant: the same Request + target + backend through the
+        // Completion and InputTokens paths produce the same token-relevant final
+        // outbound request body (target model stamp, messages, tools, target
+        // extra_body). We capture both POSTed request bodies keyed by URL suffix and
+        // compare their token-relevant fields. `stream` may differ and is treated
+        // as token-neutral (not part of the prompt semantics).
+        use std::sync::Mutex as StdMutex;
+        let captured: Arc<StdMutex<Vec<(String, Value)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_assert = Arc::clone(&captured);
+        let server = MockServer::start().await;
+        let mut extra = BTreeMap::new();
+        extra.insert("reasoning".to_string(), json!({"effort": "none"}));
+        let uri = server.uri();
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let key = if req.url.path().ends_with("/input_tokens") {
+                    "input_tokens"
+                } else {
+                    "completion"
+                };
+                captured_for_assert.lock().unwrap().push((key.to_string(), body));
+                if key == "input_tokens" {
+                    ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 10}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "r", "model": "gpt",
+                        "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                        "usage": {}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let client =
+            TranslatingLlmClient::new(&chat_map_with_extra_body(&format!("{uri}/v1"), extra))?;
+        let mut request = request_for(Some("gpt"), false);
+        request
+            .llm_request
+            .tools
+            .push(switchyard_protocol::ToolDefinition {
+                name: "lookup".to_string(),
+                description: Some("test tool".to_string()),
+                parameters: json!({"type": "object"}),
+                strict: None,
+            });
+
+        // Drive the InputTokens path (target model gpt).
+        let model = ModelId::from("gpt");
+        let _count = client.count_input_tokens(&model, &request).await?;
+
+        // Drive the Completion path (generation) with the same request.
+        client.call_rewrite_model(request, None).await?;
+
+        let captured = captured.lock().unwrap().clone();
+        let input_body = captured
+            .iter()
+            .find(|(k, _)| k == "input_tokens")
+            .map(|(_, b)| b)
+            .expect("an input_tokens request body");
+        let completion_body = captured
+            .iter()
+            .find(|(k, _)| k == "completion")
+            .map(|(_, b)| b)
+            .expect("a completion request body");
+        // Token-relevant fields must match across the two outbound paths.
+        assert_eq!(
+            input_body["model"], "gpt",
+            "target model must be stamped identically"
+        );
+        assert_eq!(
+            input_body["messages"], completion_body["messages"],
+            "messages must match token-relevant representation"
+        );
+        assert_eq!(
+            input_body["tools"], completion_body["tools"],
+            "tools must match token-relevant representation"
+        );
+        assert_eq!(
+            input_body["reasoning"], completion_body["reasoning"],
+            "target extra_body (reasoning) must be merged identically"
+        );
         Ok(())
     }
 }

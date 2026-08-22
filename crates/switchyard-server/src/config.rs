@@ -7,13 +7,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use libsy::{
-    AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat,
-    ClassifyTrigger, CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig,
-    GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop,
-    Passthrough, PickerMode, Random, StageRouter, StageRouterConfig, SubagentRouter,
-    SubagentRouterConfig, TargetPrompts, TaskClassifierConfig,
+    AdvisorGate, AdvisorGateConfig, Algorithm, CandidateProfile, CandidateState,
+    ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger, ContextAdmissionPolicy,
+    CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig, FleetRouter,
+    FleetSnapshot, FleetStateSource, GateTrigger, HandoffNoteConfig, LlmClassifierConfig,
+    LlmFallback, LlmTaskClassifier, Noop, Passthrough, PickerMode, Random, SharedFleetState,
+    StageRouter, StageRouterConfig, StaticFleetState, SubagentRouter, SubagentRouterConfig,
+    TargetPrompts, TaskClassifierConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,8 +26,12 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
+use crate::fleet_readiness::{
+    ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed, ResourceStateFactsClient,
+};
 use crate::{
-    CallerAuthKind, CountTokensTarget, ModelCapabilities, ServerError, ServerResult, ServerState,
+    CallerAuthKind, CountTokensTarget, InputTokensTarget, ModelCapabilities, ServerError,
+    ServerResult, ServerRuntime, ServerState,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -44,13 +51,270 @@ pub fn load_server_state(path: impl AsRef<Path>) -> ServerResult<ServerState> {
     })
 }
 
+/// Constructs a fail-closed fleet source used when no producer has attached one
+/// yet: an empty snapshot, so every candidate resolves to not-ready and a
+/// `fleet_router` route never selects anything until a real source is injected.
+fn fail_closed_fleet_source() -> Arc<dyn FleetStateSource> {
+    Arc::new(StaticFleetState::new(
+        FleetSnapshot::new(Vec::new()).expect("empty fleet snapshot is valid"),
+    ))
+}
+
 fn server_state_from_toml(toml: &str) -> ServerResult<ServerState> {
+    server_state_from_toml_with_fleet_source(toml, fail_closed_fleet_source())
+}
+
+/// Builds server state from TOML using an injected fleet readiness source.
+///
+/// This is the S2-C dependency-injection seam: current readiness is supplied
+/// here (e.g. a [`SharedFleetState`]), never baked into the durable route
+/// config.
+pub fn load_server_state_with_fleet_source(
+    path: impl AsRef<Path>,
+    fleet_source: Arc<dyn FleetStateSource>,
+) -> ServerResult<ServerState> {
+    let path = path.as_ref();
+    let toml = fs::read_to_string(path).map_err(|error| {
+        ServerError::new(format!(
+            "failed to read server config {}: {error}",
+            path.display()
+        ))
+    })?;
+    server_state_from_toml_with_fleet_source(&toml, fleet_source).map_err(|error| {
+        ServerError::new(format!("invalid server config {}: {error}", path.display()))
+    })
+}
+
+fn server_state_from_toml_with_fleet_source(
+    toml: &str,
+    fleet_source: Arc<dyn FleetStateSource>,
+) -> ServerResult<ServerState> {
     let config: Arc<ServerConfig> = Arc::new(
         toml::from_str(toml)
             .map_err(|error| ServerError::new(format!("failed to parse TOML: {error}")))?,
     );
-    let state = config.build()?;
+    let state = config.build(fleet_source)?;
     Ok(state.with_config(config))
+}
+
+/// Loads a TOML deployment file and returns a coherent [`ServerRuntime`]: the
+/// server state plus (when `[fleet_readiness]` is declared) a fleet-readiness
+/// monitor, both sharing ONE `Arc<SharedFleetState>`.
+///
+/// This is the stock-CLI runtime owner path (Fix A/B): the normal
+/// `switchyard-server --config ...` command builds the monitored lifecycle purely
+/// from the config file, with the shared-state identity guaranteed structurally by
+/// construction (one Arc is created here and cloned into both the server's fleet
+/// source and the monitor), not by operator wiring.
+pub fn load_server_runtime(path: impl AsRef<Path>) -> ServerResult<ServerRuntime> {
+    let path = path.as_ref();
+    let toml = fs::read_to_string(path).map_err(|error| {
+        ServerError::new(format!(
+            "failed to read server config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let config: Arc<ServerConfig> = Arc::new(
+        toml::from_str(&toml)
+            .map_err(|error| ServerError::new(format!("failed to parse TOML: {error}")))?,
+    );
+    match &config.fleet_readiness {
+        // Monitored runtime: ONE SharedFleetState shared structurally by the
+        // server's FleetRouter(s) and the FleetReadinessMonitor.
+        Some(readiness) => {
+            let shared = Arc::new(SharedFleetState::new(
+                FleetSnapshot::new(Vec::new()).expect("empty fleet snapshot is valid"),
+            ));
+            let monitor = build_fleet_readiness_monitor(readiness, Arc::clone(&shared))
+                .map_err(|error| ServerError::new(format!("invalid [fleet_readiness]: {error}")))?;
+            let state = config
+                .build(Arc::clone(&shared) as Arc<dyn FleetStateSource>)
+                .map_err(|error| {
+                    ServerError::new(format!("invalid server config {}: {error}", path.display()))
+                })?;
+            Ok(ServerRuntime {
+                state: state.with_config(config),
+                monitor: Some(monitor),
+            })
+        }
+        // Plain runtime: fail-closed fleet source (no monitor).
+        None => {
+            let source = Arc::new(StaticFleetState::new(
+                FleetSnapshot::new(Vec::new()).expect("empty fleet snapshot is valid"),
+            )) as Arc<dyn FleetStateSource>;
+            let state = config.build(source).map_err(|error| {
+                ServerError::new(format!("invalid server config {}: {error}", path.display()))
+            })?;
+            Ok(ServerRuntime {
+                state: state.with_config(config),
+                monitor: None,
+            })
+        }
+    }
+}
+
+/// Builds a [`FleetReadinessMonitor`] from a `[fleet_readiness]` config section
+/// over the given shared fleet state. All sub-components are optional; the
+/// monitor observes whichever of Comfy / HTPC / resource facts are configured.
+fn build_fleet_readiness_monitor(
+    config: &FleetReadinessConfig,
+    state: Arc<SharedFleetState>,
+) -> Result<FleetReadinessMonitor, String> {
+    let comfy = config.comfy.as_ref().map(|c| {
+        (
+            ComfyFactsClient::new(c.url.clone(), c.auth_token_env.clone()),
+            ModelId::from(c.model.clone()),
+        )
+    });
+    let htpc = config.htpc.as_ref().map(|h| {
+        (
+            HtpcFactsClient::new(h.base_url.clone(), h.expected_model.clone()),
+            ModelId::from(h.model.clone()),
+        )
+    });
+
+    // F2 (Hermes review): model ids must be disjoint across readiness sources. A
+    // duplicate key would make FleetSnapshot::new fail every cycle and the fleet
+    // stay at the empty fail-closed snapshot — reject it loudly at load time.
+    let mut declared: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    let mut disjoint = |model: &str, source: &'static str| -> Result<(), String> {
+        if let Some(origin) = declared.insert(model.to_string(), source) {
+            return Err(format!(
+                "[fleet_readiness] model {model:?} appears in both {origin} and {source}"
+            ));
+        }
+        Ok(())
+    };
+    for model in &config.ready {
+        disjoint(model, "ready")?;
+    }
+    for model in &config.transition_required {
+        disjoint(model, "transition_required")?;
+    }
+    if let Some(c) = &config.comfy {
+        disjoint(&c.model, "comfy")?;
+    }
+    if let Some(h) = &config.htpc {
+        disjoint(&h.model, "htpc")?;
+    }
+    if let Some(r) = &config.resource {
+        for m in r
+            .openai_gated
+            .iter()
+            .chain(r.openclaw_openai_gated.iter())
+            .chain(r.deepseek_gated.iter())
+        {
+            disjoint(m, "resource-gated")?;
+        }
+    }
+
+    let mut cloud_base = Vec::with_capacity(config.ready.len() + config.transition_required.len());
+    for model in &config.ready {
+        cloud_base.push(Observed {
+            model: ModelId::from(model.clone()),
+            state: CandidateState::ready(),
+        });
+    }
+    for model in &config.transition_required {
+        cloud_base.push(Observed {
+            model: ModelId::from(model.clone()),
+            state: CandidateState::transition_required(),
+        });
+    }
+
+    let (comfy_client, comfy_model) = comfy.map_or((None, None), |(c, m)| (Some(c), Some(m)));
+    let (htpc_client, htpc_model) = htpc.map_or((None, None), |(h, m)| (Some(h), Some(m)));
+
+    let mut monitor = FleetReadinessMonitor::new(
+        comfy_client,
+        comfy_model,
+        htpc_client,
+        htpc_model,
+        cloud_base,
+        state,
+        Duration::from_secs(config.observe_interval_seconds.max(1)),
+    );
+
+    if let Some(resource) = &config.resource {
+        let resource_client = ResourceStateFactsClient::new(
+            resource.openai_url.clone(),
+            resource.openai_auth_token_env.clone(),
+            resource.deepseek_url.clone(),
+            resource.deepseek_api_key_env.clone(),
+            resource.deepseek_currency.clone(),
+        );
+        // Optional separate OpenClaw-owned OpenAI pool: only wired when both its
+        // URL and credential-env are declared.
+        let resource_client =
+            match (
+                &resource.openclaw_openai_url,
+                &resource.openclaw_openai_auth_token_env,
+            ) {
+                (Some(url), Some(env)) => {
+                    resource_client.with_openclaw_openai(url.clone(), env.clone())
+                }
+                (None, None) => resource_client,
+                _ => return Err(
+                    "openclaw_openai_url and openclaw_openai_auth_token_env must be set together"
+                        .to_string(),
+                ),
+            };
+        // F1 (Hermes review): a non-empty gated list MUST have its observation
+        // source configured, otherwise that candidate is silently excluded every
+        // cycle (e.g. a Luna never-gated due to a missing URL env would let the
+        // DEEPSEEK spill open WITHOUT confirmed exhaustion — the exact policy Fix
+        // C forbids). Fail loud at load time instead of silently spilling.
+        if !resource.openai_gated.is_empty()
+            && (resource.openai_url.is_none() || resource.openai_auth_token_env.is_none())
+        {
+            return Err(
+                "openai_gated candidates require openai_url and openai_auth_token_env".to_string(),
+            );
+        }
+        if !resource.openclaw_openai_gated.is_empty()
+            && (resource.openclaw_openai_url.is_none()
+                || resource.openclaw_openai_auth_token_env.is_none())
+        {
+            return Err(
+                "openclaw_openai_gated candidates require openclaw_openai_url and openclaw_openai_auth_token_env"
+                    .to_string(),
+            );
+        }
+        if !resource.deepseek_gated.is_empty()
+            && (resource.deepseek_url.is_none()
+                || resource.deepseek_api_key_env.is_none()
+                || resource.deepseek_currency.is_none())
+        {
+            return Err(
+                "deepseek_gated candidates require deepseek_url, deepseek_api_key_env and deepseek_currency"
+                    .to_string(),
+            );
+        }
+        let openai_gated = resource
+            .openai_gated
+            .iter()
+            .map(|m| ModelId::from(m.clone()))
+            .collect();
+        let openclaw_gated = resource
+            .openclaw_openai_gated
+            .iter()
+            .map(|m| ModelId::from(m.clone()))
+            .collect();
+        let deepseek_gated = resource
+            .deepseek_gated
+            .iter()
+            .map(|m| ModelId::from(m.clone()))
+            .collect();
+        monitor = monitor.with_resource(
+            resource_client,
+            openai_gated,
+            openclaw_gated,
+            deepseek_gated,
+        );
+    }
+
+    Ok(monitor)
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +325,91 @@ pub(crate) struct ServerConfig {
     pub(crate) llm_clients: BTreeMap<String, LlmClientConfig>,
     pub(crate) targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    /// Optional fleet-readiness monitor configuration. When present, the config
+    /// loader hands ONE `Arc<SharedFleetState>` to BOTH the server's FleetRouter(s)
+    /// and a `FleetReadinessMonitor` built over that same Arc, so the stock CLI can
+    /// run the monitored lifecycle without an external runtime wrapper.
+    #[serde(default)]
+    pub(crate) fleet_readiness: Option<FleetReadinessConfig>,
+}
+
+/// Declares the fleet-readiness monitor components for the stock CLI runtime
+/// owner. All sub-sections are optional; a fully-absent `fleet_readiness` means no
+/// monitor is constructed and the server runs fail-closed for fleet routes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FleetReadinessConfig {
+    #[serde(default = "default_fleet_observe_interval")]
+    pub(crate) observe_interval_seconds: u64,
+    #[serde(default)]
+    pub(crate) comfy: Option<ComfyFactConfig>,
+    #[serde(default)]
+    pub(crate) htpc: Option<HtpcFactConfig>,
+    #[serde(default)]
+    pub(crate) resource: Option<ResourceFactConfig>,
+    /// Static `(model-id, ready)` base entries for cloud candidates that need no
+    /// live resource/health probe (immediately attemptable).
+    #[serde(default)]
+    pub(crate) ready: Vec<String>,
+    /// Static `(model-id, transition-required)` entries (e.g. a sealed-idle
+    /// locally-resident model that is valid but not yet loaded).
+    #[serde(default)]
+    pub(crate) transition_required: Vec<String>,
+}
+
+const fn default_fleet_observe_interval() -> u64 {
+    30
+}
+
+/// ComfyNinja factual-readiness probe (read-only `/v1/resource`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComfyFactConfig {
+    pub(crate) url: String,
+    pub(crate) auth_token_env: String,
+    /// The candidate target model id this fact gates.
+    pub(crate) model: String,
+}
+
+/// HTPC factual-readiness probe (read-only `/health` + `/v1/models`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HtpcFactConfig {
+    pub(crate) base_url: String,
+    pub(crate) expected_model: String,
+    /// The candidate target model id this fact gates.
+    pub(crate) model: String,
+}
+
+/// Live resource-state facts (OpenAI weekly allowance + DeepSeek balance) that
+/// gate cloud candidate readiness according to the operator confirmed-exhaustion
+/// policy.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceFactConfig {
+    #[serde(default)]
+    pub(crate) openai_url: Option<String>,
+    #[serde(default)]
+    pub(crate) openai_auth_token_env: Option<String>,
+    #[serde(default)]
+    pub(crate) openclaw_openai_url: Option<String>,
+    #[serde(default)]
+    pub(crate) openclaw_openai_auth_token_env: Option<String>,
+    #[serde(default)]
+    pub(crate) deepseek_url: Option<String>,
+    #[serde(default)]
+    pub(crate) deepseek_api_key_env: Option<String>,
+    #[serde(default)]
+    pub(crate) deepseek_currency: Option<String>,
+    /// Target model ids gated by the primary OpenAI weekly allowance.
+    #[serde(default)]
+    pub(crate) openai_gated: Vec<String>,
+    /// Target model ids gated by the separate OpenClaw-owned OpenAI allowance.
+    #[serde(default)]
+    pub(crate) openclaw_openai_gated: Vec<String>,
+    /// Target model ids gated by the DeepSeek configured-currency balance.
+    #[serde(default)]
+    pub(crate) deepseek_gated: Vec<String>,
 }
 
 impl ServerConfig {
@@ -70,7 +419,7 @@ impl ServerConfig {
             .map(RouteConfig::routing_target_names)
     }
 
-    fn build(&self) -> ServerResult<ServerState> {
+    fn build(&self, fleet_source: Arc<dyn FleetStateSource>) -> ServerResult<ServerState> {
         if self.schema_version != SUPPORTED_SCHEMA_VERSION {
             return Err(ServerError::new(format!(
                 "unsupported schema_version {}; expected {SUPPORTED_SCHEMA_VERSION}",
@@ -115,9 +464,13 @@ impl ServerConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
-            let algorithm = build_algorithm(route_name, config, &targets)?;
+            // A fleet_router route's advertised capability envelope must be
+            // satisfiable by its candidate set (truthful model advertisement).
+            config.validate_fleet_capabilities(route_name)?;
+            let algorithm = build_algorithm(route_name, config, &targets, fleet_source.clone())?;
             let (client, caller_auth) = self.build_route_clients(route_name, config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
+            let input_tokens_targets = self.build_input_tokens_targets(config, &clients)?;
             routes.push((
                 config.id().clone(),
                 algorithm,
@@ -125,6 +478,7 @@ impl ServerConfig {
                 caller_auth,
                 capabilities,
                 count_tokens_target,
+                input_tokens_targets,
                 Some(route_name.clone()),
             ));
         }
@@ -249,6 +603,71 @@ impl ServerConfig {
                 model: target.id.clone(),
                 client: client.clone(),
             })
+    }
+
+    /// Builds the explicitly-qualified exact input-token producers for a fleet_router
+    /// route.
+    ///
+    /// Only `fleet_router` candidates that declare `context_policy.kind =
+    /// "bounded"` **and** `input_token_source = openai_chat_input_tokens` yield an
+    /// [`InputTokensTarget`]. A declared source whose target is **not** served by
+    /// an OpenAI-chat backend is a configuration error (rejected, not silently
+    /// ignored). Non-fleet routes and bounded candidates without an explicit
+    /// producer yield no target (their fact stays absent and FleetRouter fails
+    /// closed).
+    fn build_input_tokens_targets(
+        &self,
+        route_config: &RouteConfig,
+        clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+    ) -> ServerResult<Vec<InputTokensTarget>> {
+        let RouteConfig::FleetRouter { candidates, .. } = route_config else {
+            return Ok(Vec::new());
+        };
+        let mut targets = Vec::new();
+        for candidate in candidates {
+            let FleetCandidateContextPolicyConfig::Bounded {
+                usable_context_tokens,
+                input_token_source,
+            } = candidate.context_policy
+            else {
+                continue;
+            };
+            let Some(source) = input_token_source else {
+                // Bounded without an explicit producer: no fact, must fail closed.
+                continue;
+            };
+            match source {
+                InputTokenSourceConfig::OpenAiChatInputTokens => {
+                    let target = self.targets.get(&candidate.target).ok_or_else(|| {
+                        ServerError::new(format!(
+                            "fleet candidate {:?} declares input_token_source but has no [targets.*]",
+                            candidate.target
+                        ))
+                    })?;
+                    let Some(client) = clients.get(&target.llm_client) else {
+                        return Err(ServerError::new(format!(
+                            "fleet candidate {:?} references unknown llm_client {}",
+                            candidate.target, target.llm_client
+                        )));
+                    };
+                    if !client.supports_input_tokens(&target.id) {
+                        return Err(ServerError::new(format!(
+                            "fleet candidate {:?} declares input_token_source = openai_chat_input_tokens \
+                             but its target is not served by an OpenAI-chat backend",
+                            candidate.target
+                        )));
+                    }
+                    // `usable_context_tokens` is enforced as > 0 by the FleetRouter
+                    // core validator (shared by new/with_source).
+                    let _ = usable_context_tokens;
+                    targets.push(InputTokensTarget {
+                        model: target.id.clone(),
+                        client: client.clone(),
+                    });
+                }
+            }
+        }
+        Ok(targets)
     }
 }
 
@@ -575,6 +994,154 @@ enum RouteConfig {
         #[serde(default = "default_fail_open")]
         fail_open: bool,
     },
+    /// Fleet router over static candidate profiles, with readiness injected at
+    /// server construction via a [`FleetStateSource`] (never baked into this
+    /// durable config).
+    FleetRouter {
+        id: ModelId,
+        #[serde(default)]
+        context_window: Option<u32>,
+        #[serde(default)]
+        tool_calling: Option<bool>,
+        #[serde(default)]
+        reasoning: Option<bool>,
+        /// When `"request"`, read the declared `work_shape` from structured
+        /// request metadata and apply per-candidate `work_shape` eligibility.
+        #[serde(default)]
+        work_shape_source: Option<FleetWorkShapeSourceName>,
+        /// Static per-candidate capability + preference profiles.
+        #[serde(default)]
+        candidates: Vec<FleetCandidateConfig>,
+    },
+}
+
+/// Named values for a `fleet_router` route's work-shape source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum FleetWorkShapeSourceName {
+    #[serde(rename = "request")]
+    Request,
+}
+
+/// Named work shapes for a `fleet_router` candidate's structural eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum FleetWorkShapeName {
+    #[serde(rename = "bounded")]
+    Bounded,
+    #[serde(rename = "agentic")]
+    Agentic,
+}
+
+/// Static capability + preference profile for one `fleet_router` candidate.
+///
+/// This is the durable, Algorithm-owned profile only — it carries **no live
+/// readiness** (a candidate's `ready`/`transition_required` comes from the
+/// injected [`FleetStateSource`], never from this route config). This preserves
+/// the S2-B separation of static capability from current factual state.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetCandidateConfig {
+    /// A `[targets.*]` reference this candidate may select.
+    target: String,
+    #[serde(default)]
+    tool_calling: bool,
+    #[serde(default)]
+    reasoning: bool,
+    /// Deterministic preference; lower is preferred.
+    #[serde(default)]
+    preference_rank: u16,
+    /// Preflight context admission policy. Absent (or `unmanaged`) means FleetRouter
+    /// does not assert preflight context fit for this candidate (the pre-S2-E
+    /// behavior). `bounded` opts this candidate into pure context admission with a
+    /// qualified usable context capacity.
+    #[serde(default)]
+    context_policy: FleetCandidateContextPolicyConfig,
+    /// Optional structural work-shape limitation. `bounded` limits this candidate
+    /// to bounded requests; `agentic` to agentic requests; absent means it serves
+    /// any shape (used by the fixed routes and the any-shape DeepSeek lane).
+    #[serde(default)]
+    work_shape: Option<FleetWorkShapeName>,
+}
+
+/// Durable per-candidate context admission policy (configuration only; no live
+/// counts live here).
+///
+/// Deserialized via a raw [`serde_json::Value`] so an invalid combination — an
+/// `input_token_source` under a non-`bounded` policy — is rejected rather than
+/// silently dropped (serde's internally-tagged enum cannot `deny_unknown_fields`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FleetCandidateContextPolicyConfig {
+    /// No preflight context assertion for this candidate.
+    #[default]
+    Unmanaged,
+    /// Admit only when a candidate-specific input-token fact plus an explicit
+    /// output budget fits `usable_context_tokens`.
+    Bounded {
+        usable_context_tokens: u64,
+        input_token_source: Option<InputTokenSourceConfig>,
+    },
+}
+
+impl<'de> serde::Deserialize<'de> for FleetCandidateContextPolicyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let obj = raw.as_object().ok_or_else(|| {
+            serde::de::Error::custom("context_policy must be a table with a `kind` field")
+        })?;
+        let kind = obj
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("context_policy must have a string `kind`"))?;
+        match kind {
+            "unmanaged" => {
+                // `input_token_source` is meaningful only for a `bounded` policy; any
+                // extra field (not just `kind`) under `unmanaged` is invalid.
+                if obj.len() != 1 {
+                    return Err(serde::de::Error::custom(
+                        "context_policy kind = \"unmanaged\" accepts no other fields \
+                         (input_token_source is only valid under a bounded policy)",
+                    ));
+                }
+                Ok(FleetCandidateContextPolicyConfig::Unmanaged)
+            }
+            "bounded" => {
+                let usable_context_tokens = obj
+                    .get("usable_context_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "context_policy kind = \"bounded\" requires a numeric \
+                             `usable_context_tokens`",
+                        )
+                    })?;
+                let input_token_source = obj
+                    .get("input_token_source")
+                    .map(InputTokenSourceConfig::deserialize)
+                    .transpose()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(FleetCandidateContextPolicyConfig::Bounded {
+                    usable_context_tokens,
+                    input_token_source,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown context_policy kind {other:?} (expected \"unmanaged\" or \"bounded\")"
+            ))),
+        }
+    }
+}
+
+/// Server-only declaration of the exact input-token source a BOUNDED candidate is
+/// explicitly qualified to use. Currently the only supported source is a llama.cpp
+/// OpenAI-chat `/chat/completions/input_tokens` endpoint. Not inferred from a
+/// target merely being OpenAI-compatible; declared explicitly per candidate.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+enum InputTokenSourceConfig {
+    #[default]
+    #[serde(rename = "openai_chat_input_tokens")]
+    OpenAiChatInputTokens,
 }
 
 /// What fires an advisor route's review.
@@ -635,7 +1202,8 @@ impl RouteConfig {
             | LlmClassifier { id, .. }
             | Passthrough { id, .. }
             | StageRouter { id, .. }
-            | Advisor { id, .. } => id,
+            | Advisor { id, .. }
+            | FleetRouter { id, .. } => id,
         }
     }
 
@@ -696,6 +1264,9 @@ impl RouteConfig {
             Self::Advisor {
                 executor_target, ..
             } => vec![executor_target],
+            Self::FleetRouter { candidates, .. } => {
+                candidates.iter().map(|c| c.target.as_str()).collect()
+            }
         }
     }
 
@@ -772,7 +1343,118 @@ impl RouteConfig {
                 tool_calling: *tool_calling,
                 reasoning: *reasoning,
             },
+            // The fleet router advertises the truthful aggregate of its candidate
+            // capabilities, validated during build (see validate_fleet_capabilities)
+            // so it is always satisfiable by at least one candidate.
+            Self::FleetRouter {
+                context_window,
+                tool_calling,
+                reasoning,
+                candidates,
+                ..
+            } => {
+                fleet_effective_capabilities(*context_window, *tool_calling, *reasoning, candidates)
+            }
         }
+    }
+
+    /// Validates that a `fleet_router` route's advertised capability envelope is
+    /// truthfully satisfiable by its static candidate set. Non-fleet-router
+    /// variants are a no-op.
+    ///
+    /// [`ServerConfig::build`] calls this before algorithm/client construction, so
+    /// a violation surfaces as a `ServerError` that fails configuration loading
+    /// with a descriptive message.
+    ///
+    /// Rules enforced (STATIC capability validation; readiness is never
+    /// consulted):
+    /// - An explicit `tool_calling=true` (or `reasoning=true`) override is
+    ///   rejected when no candidate advertises that capability — a route-level
+    ///   override must never expand beyond the candidate set.
+    /// - Explicit `false` may conservatively restrict the advertised envelope.
+    /// - If the effective advertised envelope (shared with
+    ///   [`Self::capabilities`] via [`fleet_effective_capabilities`]) is
+    ///   `tool_calling=true` AND `reasoning=true`, at least one candidate must
+    ///   support the **combined** requirement (a disjoint tool-only +
+    ///   reasoning-only candidate set cannot satisfy a tools+reasoning request,
+    ///   so that aggregate is rejected).
+    fn validate_fleet_capabilities(&self, route_name: &str) -> ServerResult<()> {
+        let RouteConfig::FleetRouter {
+            tool_calling,
+            reasoning,
+            candidates,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+
+        let any_tool = candidates.iter().any(|c| c.tool_calling);
+        let any_reasoning = candidates.iter().any(|c| c.reasoning);
+        let any_tool_and_reasoning = candidates.iter().any(|c| c.tool_calling && c.reasoning);
+
+        // Explicit TRUE overrides must not exceed the candidate capability set.
+        if tool_calling == &Some(true) && !any_tool {
+            return Err(ServerError::new(format!(
+                "fleet_router route {route_name} advertises tool_calling=true but no \
+                 candidate profile supports tool calling"
+            )));
+        }
+        if reasoning == &Some(true) && !any_reasoning {
+            return Err(ServerError::new(format!(
+                "fleet_router route {route_name} advertises reasoning=true but no \
+                 candidate profile supports reasoning"
+            )));
+        }
+
+        // Effective advertised envelope after applying restrictive (false)
+        // overrides — shares its derivation with `capabilities()` so validation
+        // and advertisement can never disagree.
+        let effective = fleet_effective_capabilities(None, *tool_calling, *reasoning, candidates);
+
+        // A tools+reasoning aggregate must be satisfiable by one candidate.
+        if effective.tool_calling == Some(true)
+            && effective.reasoning == Some(true)
+            && !any_tool_and_reasoning
+        {
+            return Err(ServerError::new(format!(
+                "fleet_router route {route_name} would advertise tool_calling=true and \
+                 reasoning=true, but no single candidate supports both; the aggregate \
+                 capability envelope is not representable by the candidate set"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Derives the effective `fleet_router` capability envelope shared by both
+/// [`RouteConfig::capabilities`] and [`RouteConfig::validate_fleet_capabilities`].
+///
+/// These are **static advertisement metadata** for `/v1/models` — NOT
+/// request-admission policy. A route advertising `tool_calling=false` or
+/// `reasoning=false` does NOT block such requests at runtime; FleetRouter
+/// admission continues to use each candidate's `CandidateProfile` plus the
+/// injected readiness snapshot. An explicit `false` may conservatively
+/// UNDER-advertise a capability without rewriting candidate profiles.
+///
+/// Derivation: defaults to the OR of candidate tool/reasoning; an explicit
+/// route-level override narrows (false) or asserts (true) a dimension. Positive
+/// claims are validated against candidate satisfiability by
+/// [`RouteConfig::validate_fleet_capabilities`] during build. The
+/// `context_window` argument is passed through (context admission remains
+/// deferred; it does not depend on candidates).
+fn fleet_effective_capabilities(
+    context_window: Option<u32>,
+    tool_calling: Option<bool>,
+    reasoning: Option<bool>,
+    candidates: &[FleetCandidateConfig],
+) -> ModelCapabilities {
+    let any_tool = candidates.iter().any(|c| c.tool_calling);
+    let any_reasoning = candidates.iter().any(|c| c.reasoning);
+    ModelCapabilities {
+        context_window,
+        tool_calling: tool_calling.or(Some(any_tool)),
+        reasoning: reasoning.or(Some(any_reasoning)),
     }
 }
 
@@ -1123,6 +1805,7 @@ fn build_algorithm(
     route_name: &str,
     config: &RouteConfig,
     targets: &BTreeMap<String, ModelId>,
+    fleet_source: Arc<dyn FleetStateSource>,
 ) -> ServerResult<Arc<dyn Algorithm>> {
     match config {
         RouteConfig::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -1325,6 +2008,53 @@ fn build_algorithm(
                 ServerError::new(format!("advisor route {route_name}: {error}"))
             })?;
             Ok(Arc::new(algorithm))
+        }
+        RouteConfig::FleetRouter {
+            candidates,
+            work_shape_source,
+            ..
+        } => {
+            // Static profile only: capability + preference + context policy per
+            // candidate. Live readiness comes from the injected `fleet_source`,
+            // never this config.
+            let mut profiles = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
+                let profile = CandidateProfile::new(
+                    target,
+                    candidate.tool_calling,
+                    candidate.reasoning,
+                    candidate.preference_rank,
+                )
+                .with_context_policy(match candidate.context_policy {
+                    FleetCandidateContextPolicyConfig::Unmanaged => {
+                        ContextAdmissionPolicy::Unmanaged
+                    }
+                    FleetCandidateContextPolicyConfig::Bounded {
+                        usable_context_tokens,
+                        ..
+                    } => ContextAdmissionPolicy::Bounded {
+                        usable_context_tokens,
+                    },
+                });
+                let profile = match candidate.work_shape {
+                    Some(FleetWorkShapeName::Bounded) => {
+                        profile.with_work_shape(libsy::WorkShape::Bounded)
+                    }
+                    Some(FleetWorkShapeName::Agentic) => {
+                        profile.with_work_shape(libsy::WorkShape::Agentic)
+                    }
+                    None => profile,
+                };
+                profiles.push(profile);
+            }
+            let mut router = FleetRouter::with_source(profiles, fleet_source).map_err(|error| {
+                ServerError::new(format!("fleet_router route {route_name}: {error}"))
+            })?;
+            if work_shape_source == &Some(FleetWorkShapeSourceName::Request) {
+                router = router.with_request_work_shape();
+            }
+            Ok(Arc::new(router))
         }
     }
 }

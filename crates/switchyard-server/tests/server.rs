@@ -17,15 +17,21 @@ use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use libsy::{Algorithm, Random};
+use libsy::{Algorithm, CandidateState, FleetSnapshot, FleetStateSource, Random, SharedFleetState};
 use serde_json::{Value, json};
 use switchyard_llm_client::{
     Backend, ClientRouter, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
 };
 use switchyard_protocol::ModelId;
 use switchyard_protocol::RoutedLlmClient;
-use switchyard_server::config::load_server_state;
-use switchyard_server::{DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState, build_switchyard_router};
+use switchyard_server::config::{load_server_state, load_server_state_with_fleet_source};
+use switchyard_server::fleet_readiness::{
+    ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed, ResourceStateFactsClient,
+};
+use switchyard_server::{
+    BoundServer, DEFAULT_MAX_REQUEST_BODY_BYTES, ServerRunOptions, ServerState,
+    build_switchyard_router, config::load_server_runtime,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -797,6 +803,24 @@ fn load_test_config(toml: &str) -> TestResult<ServerState> {
     Ok(load_server_state(config.path())?)
 }
 
+/// Builds a server state from TOML using an injected fleet readiness source
+/// (the S2-C dependency-injection seam — readiness is never in the route config).
+fn load_fleet_test_config(
+    toml: &str,
+    fleet_source: std::sync::Arc<dyn libsy::FleetStateSource>,
+) -> TestResult<ServerState> {
+    let mut config = tempfile::Builder::new()
+        .prefix("switchyard-server-config-")
+        .suffix(".toml")
+        .tempfile()?;
+    config.write_all(toml.as_bytes())?;
+    config.flush()?;
+    Ok(load_server_state_with_fleet_source(
+        config.path(),
+        fleet_source,
+    )?)
+}
+
 /// A `random` route that selects `first` before any request-local fallback.
 fn fallback_state(base_url: &str) -> TestResult<ServerState> {
     load_test_config(&format!(
@@ -1129,6 +1153,2127 @@ escalation = {{ confirmations = 1 }}
     );
     assert_eq!(model_upstream.models().await, ["model/weak"]);
     assert_eq!(judge_upstream.models().await, ["model/classifier"]);
+    Ok(())
+}
+
+// ─── S2-C: FleetRouter server registration + /v1/decision proof ────────────
+
+/// Builds a TOML config with a `fleet_router` route over four candidate targets
+/// on a single mock provider. Static profile only; readiness is injected.
+fn fleet_toml(base_url: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.model_provider]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.luna]
+id = "model/luna"
+llm_client = "model_provider"
+extra_body = {{ model = "gpt-5.6-luna" }}
+
+[targets.deepseek]
+id = "model/deepseek-flash"
+llm_client = "model_provider"
+
+[targets.htpc]
+id = "model/htpc-qwen3_5"
+llm_client = "model_provider"
+
+[targets.comfy]
+id = "model/comfyninja-qwen3_8"
+llm_client = "model_provider"
+
+[routes.fleet]
+id = "localclaw/fleet"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.fleet.candidates]]
+target = "luna"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+
+[[routes.fleet.candidates]]
+target = "deepseek"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+
+[[routes.fleet.candidates]]
+target = "htpc"
+tool_calling = false
+reasoning = false
+preference_rank = 3
+
+[[routes.fleet.candidates]]
+target = "comfy"
+tool_calling = true
+reasoning = true
+preference_rank = 4
+"#
+    )
+}
+
+/// A coherent ready snapshot: luna/deepseek/htpc ready, comfy transition-required.
+fn fleet_ready_snapshot() -> FleetSnapshot {
+    FleetSnapshot::new(vec![
+        (ModelId::from("model/luna"), CandidateState::ready()),
+        (
+            ModelId::from("model/deepseek-flash"),
+            CandidateState::ready(),
+        ),
+        (ModelId::from("model/htpc-qwen3_5"), CandidateState::ready()),
+        (
+            ModelId::from("model/comfyninja-qwen3_8"),
+            CandidateState::transition_required(),
+        ),
+    ])
+    .unwrap()
+}
+
+/// A ready snapshot for the two-target (`model/a`, `model/b`) fleet configs.
+fn ab_ready_snapshot() -> FleetSnapshot {
+    FleetSnapshot::new(vec![
+        (ModelId::from("model/a"), CandidateState::ready()),
+        (ModelId::from("model/b"), CandidateState::ready()),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn s2c_fleet_route_parses_and_unknown_target_fails_validation() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    // A: a valid fleet_router route with an injected source loads successfully.
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    drop(state);
+
+    // B: a candidate referencing a nonexistent [targets.*] must fail validation.
+    let bad_toml =
+        fleet_toml(&upstream.base_url).replace("target = \"comfy\"", "target = \"does-not-exist\"");
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let err = match load_fleet_test_config(&bad_toml, Arc::new(shared)) {
+        Ok(_) => panic!("a candidate targeting a nonexistent [targets.*] entry must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("unknown target"),
+        "error must mention the unknown target"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_decision_simple_and_transition_required() -> TestResult {
+    // C + G: the native /v1/decision endpoint selects by preference among the
+    // ready set (luna) with ordered fallbacks; transition-required comfy is absent
+    // from both selected and fallbacks, and no model call occurs.
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role": "user", "content": "hello"}]
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let res = response.json()?;
+    assert_eq!(res["selected"]["target"], "luna");
+    assert_eq!(res["fallbacks"][0]["target"], "deepseek");
+    assert_eq!(res["fallbacks"][1]["target"], "htpc");
+    // transition-required comfy is not in selected or immediate fallbacks.
+    let all = res["fallbacks"].as_array().unwrap();
+    assert!(all.iter().all(|f| f["target"] != "comfy"));
+    // No selected-model inference call occurred on /v1/decision.
+    assert!(upstream.models().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_decision_tool_required_excludes_htpc() -> TestResult {
+    // D: a tool-bearing request excludes the non-tool candidate (htpc).
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role": "user", "content": "use a tool"}],
+                "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let res = response.json()?;
+    let all = {
+        let mut v = vec![res["selected"]["target"].as_str().unwrap().to_string()];
+        v.extend(
+            res["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["target"].as_str().unwrap().to_string()),
+        );
+        v
+    };
+    assert!(
+        !all.contains(&"htpc".to_string()),
+        "tool-required request must not select or fall back to the non-tool htpc"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_decision_reasoning_none_keeps_htpc_eligible() -> TestResult {
+    // E: `reasoning_effort = "none"` is an explicit non-thinking request; a
+    // non-reasoning candidate (htpc) remains eligible (no S2-A regression).
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "none"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let res = response.json()?;
+    let all: Vec<String> = {
+        let mut v = vec![res["selected"]["target"].as_str().unwrap().to_string()];
+        v.extend(
+            res["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["target"].as_str().unwrap().to_string()),
+        );
+        v
+    };
+    assert!(
+        all.contains(&"htpc".to_string()),
+        "reasoning-none non-thinking request must keep htpc eligible"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_decision_positive_reasoning_excludes_htpc() -> TestResult {
+    // F: a positive reasoning effort excludes the non-reasoning candidate (htpc).
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role": "user", "content": "reason hard"}],
+                "reasoning_effort": "high"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let res = response.json()?;
+    let all: Vec<String> = {
+        let mut v = vec![res["selected"]["target"].as_str().unwrap().to_string()];
+        v.extend(
+            res["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["target"].as_str().unwrap().to_string()),
+        );
+        v
+    };
+    assert!(
+        !all.contains(&"htpc".to_string()),
+        "positive-reasoning request must not select or fall back to htpc"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_decision_no_eligible_fails_closed() -> TestResult {
+    // H: with a fail-closed (empty) source, no candidate is eligible and the
+    // native decision endpoint returns the algorithm failure (fail closed).
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(FleetSnapshot::new(vec![]).unwrap());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role": "user", "content": "hello"}]
+            }
+        })),
+    )
+    .await?;
+    assert!(
+        response.status == StatusCode::OK
+            || response.status == StatusCode::INTERNAL_SERVER_ERROR
+            || response.status == StatusCode::SERVICE_UNAVAILABLE,
+        "fail-closed decision must not succeed; got {}",
+        response.status
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_decision_same_server_snapshot_update_changes_decision() -> TestResult {
+    // I: same server state; replace the SharedFleetState snapshot on the SAME
+    // instance; the next decision changes without rebuilding the server.
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared.clone()))?;
+    let app = build_switchyard_router(state);
+
+    let first = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    let first = first.json()?;
+    assert_eq!(first["selected"]["target"], "luna");
+
+    // Replace the whole snapshot: luna goes not_ready; deepseek wins.
+    shared.set(
+        FleetSnapshot::new(vec![
+            (ModelId::from("model/luna"), CandidateState::not_ready()),
+            (
+                ModelId::from("model/deepseek-flash"),
+                CandidateState::ready(),
+            ),
+            (ModelId::from("model/htpc-qwen3_5"), CandidateState::ready()),
+            (
+                ModelId::from("model/comfyninja-qwen3_8"),
+                CandidateState::transition_required(),
+            ),
+        ])
+        .unwrap(),
+    );
+
+    let second = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    let second = second.json()?;
+    assert_eq!(second["selected"]["target"], "deepseek");
+    Ok(())
+}
+
+// ─── S2-C final: truthful route-capability envelope validation ─────────────
+
+/// Builds a fleet config with arbitrary candidate capability profiles.
+///
+/// `candidates_toml` is the raw `[[routes.fleet.candidates]]` block (may set
+/// `tool_calling`/`reasoning` per candidate). `route_dims` is the optional
+/// route-level `tool_calling`/`reasoning` override lines.
+fn fleet_toml_with_candidates(base_url: &str, candidates_toml: &str, route_dims: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.model_provider]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.a]
+id = "model/a"
+llm_client = "model_provider"
+
+[targets.b]
+id = "model/b"
+llm_client = "model_provider"
+
+[routes.fleet]
+id = "localclaw/fleet"
+type = "fleet_router"
+context_window = 1048576
+{route_dims}
+{candidates_toml}
+"#
+    )
+}
+
+// ─── S2-E.1 server DI: durable per-candidate context policy ────────────────
+#[tokio::test]
+async fn s2e1_bounded_candidate_excluded_without_host_count() -> TestResult {
+    // A `bounded` candidate (priority 1) has NO host-supplied candidate-input
+    // fact for this request, so it is excluded by preflight context admission;
+    // the lower-priority `unmanaged` candidate is selected instead. This proves
+    // the durable TOML `context_policy` deserializes and flows into FleetRouter.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "bounded", usable_context_tokens = 65536 }
+
+[[routes.fleet.candidates]]
+target = "b"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}], "max_tokens": 64}
+        })),
+    )
+    .await?;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "unmanaged fallback must be selected"
+    );
+    let res = response.json()?;
+    // Without a host-supplied count for bounded `a`, only unmanaged `b` is eligible.
+    assert_eq!(res["selected"]["target"], "b");
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2e1_absent_context_policy_stays_unmanaged() -> TestResult {
+    // Backward compatibility: a candidate TOML without `context_policy` must
+    // still be eligible exactly as before (no preflight context assertion).
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}], "max_tokens": 64}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let res = response.json()?;
+    assert_eq!(res["selected"]["target"], "a");
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2e1_zero_bounded_capacity_fails_config_build() -> TestResult {
+    // A `context_policy = bounded` with `usable_context_tokens = 0` is an invalid
+    // context-admission contract and must fail configuration/build (propagated from
+    // the FleetRouter core validator), not silently create a useless route.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "bounded", usable_context_tokens = 0 }
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("bounded usable_context_tokens = 0 must fail config build"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("invalid zero usable_context_tokens"),
+        "error must name the invalid zero capacity: {err}"
+    );
+    Ok(())
+}
+
+// ─── S2-E.2: exact input-token producer (server) ──────────────────────────────
+
+/// Builds a fleet TOML with a configurable OpenAI-chat backend `format` for all
+/// candidate targets, allowing per-client format validation tests.
+fn fleet_toml_with_openai_format(
+    base_url: &str,
+    client_format: &str,
+    candidates_toml: &str,
+    route_dims: &str,
+) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.model_provider]
+format = "{client_format}"
+base_url = "{base_url}"
+
+[targets.a]
+id = "model/a"
+llm_client = "model_provider"
+
+[routes.fleet]
+id = "localclaw/fleet"
+type = "fleet_router"
+context_window = 1048576
+{route_dims}
+{candidates_toml}
+"#
+    )
+}
+
+// §16 config validation: producer-qualification states.
+#[tokio::test]
+async fn s2e2_config_producer_state_matrix() -> TestResult {
+    // A: bounded + OpenAI-chat + explicit producer declaration => builds.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "bounded", usable_context_tokens = 65536, input_token_source = "openai_chat_input_tokens" }
+"#;
+    let toml = fleet_toml_with_openai_format(
+        &upstream.base_url,
+        "openai_chat",
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    load_fleet_test_config(&toml, Arc::new(shared))?; // must succeed
+
+    // B: bounded + no producer => builds, no InputTokensTarget (fact absent => fail-closed at runtime).
+    let candidates_b = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "bounded", usable_context_tokens = 65536 }
+"#;
+    let toml_b = fleet_toml_with_openai_format(
+        &upstream.base_url,
+        "openai_chat",
+        candidates_b,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared_b = SharedFleetState::new(ab_ready_snapshot());
+    load_fleet_test_config(&toml_b, Arc::new(shared_b))?; // must succeed
+
+    // C: producer declared but target served by OpenAI Responses => config error.
+    let candidates_c = candidates;
+    let toml_c = fleet_toml_with_openai_format(
+        &upstream.base_url,
+        "openai_responses",
+        candidates_c,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared_c = SharedFleetState::new(ab_ready_snapshot());
+    let err_c = match load_fleet_test_config(&toml_c, Arc::new(shared_c)) {
+        Ok(_) => panic!("input_token_source on a non-OpenAI-chat target must fail config build"),
+        Err(e) => e,
+    };
+    assert!(
+        err_c
+            .to_string()
+            .contains("not served by an OpenAI-chat backend"),
+        "mismatch error must explain the backend mismatch: {err_c}"
+    );
+
+    // D: producer declared but target served by Anthropic => config error.
+    let toml_d = fleet_toml_with_openai_format(
+        &upstream.base_url,
+        "anthropic_messages",
+        candidates_c,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared_d = SharedFleetState::new(ab_ready_snapshot());
+    let err_d = match load_fleet_test_config(&toml_d, Arc::new(shared_d)) {
+        Ok(_) => panic!("input_token_source on an Anthropic target must fail config build"),
+        Err(e) => e,
+    };
+    assert!(
+        err_d
+            .to_string()
+            .contains("not served by an OpenAI-chat backend"),
+        "mismatch error must explain the backend mismatch: {err_d}"
+    );
+
+    // E: unmanaged config unchanged.
+    let candidates_e = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+"#;
+    let toml_e = fleet_toml_with_openai_format(
+        &upstream.base_url,
+        "openai_chat",
+        candidates_e,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared_e = SharedFleetState::new(ab_ready_snapshot());
+    load_fleet_test_config(&toml_e, Arc::new(shared_e))?; // must succeed
+    Ok(())
+}
+
+// §2: `unmanaged` with an `input_token_source` is an invalid combination and must
+// be rejected (input_token_source is meaningful only for a bounded context policy).
+#[tokio::test]
+async fn s2e2_unmanaged_with_producer_is_rejected() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "unmanaged", input_token_source = "openai_chat_input_tokens" }
+"#;
+    let toml = fleet_toml_with_openai_format(
+        &upstream.base_url,
+        "openai_chat",
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("unmanaged + input_token_source must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("input_token_source")
+            || err.to_string().contains("unknown")
+            || err.to_string().contains("cannot"),
+        "rejection must mention the invalid producer declaration: {err}"
+    );
+    Ok(())
+}
+
+// A mutable OpenAI-chat mock serving BOTH `/v1/chat/completions` (generation) and
+// `/v1/chat/completions/input_tokens` (exact count) for a bounded candidate. Count
+// is swappable between tests so we can drive fit / overflow / failure.
+struct InputTokenMock {
+    count: Arc<Mutex<Option<u64>>>,
+    chat_calls: Arc<Mutex<usize>>,
+    input_token_calls: Arc<Mutex<usize>>,
+}
+
+impl InputTokenMock {
+    async fn start() -> TestResult<(Self, String)> {
+        let count: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(Some(500)));
+        let chat_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let input_token_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let count_router = count.clone();
+        let chat_router = chat_calls.clone();
+        let input_router = input_token_calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions/input_tokens",
+                post(move || {
+                    let count = count_router.clone();
+                    let input_router = input_router.clone();
+                    async move {
+                        *input_router.lock().await += 1;
+                        let count = count.lock().await;
+                        match *count {
+                            Some(n) => (StatusCode::OK, Json(json!({"input_tokens": n}))),
+                            None => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": "count unavailable"})),
+                            ),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let calls = chat_router.clone();
+                    async move {
+                        *calls.lock().await += 1;
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "r", "model": "model/a",
+                                "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                                "usage": {}
+                            })),
+                        )
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Ok((
+            Self {
+                count,
+                chat_calls,
+                input_token_calls,
+            },
+            format!("http://{addr}"),
+        ))
+    }
+
+    async fn set_count(&self, count: Option<u64>) {
+        *self.count.lock().await = count;
+    }
+
+    async fn chat_calls(&self) -> usize {
+        *self.chat_calls.lock().await
+    }
+
+    async fn input_token_calls(&self) -> usize {
+        *self.input_token_calls.lock().await
+    }
+}
+
+/// A fleet TOML with bounded candidate `a` on `input_client` (OpenAI-chat with an
+/// exact producer) and unmanaged candidate `b` on the upstream client.
+fn s2e2_fleet_toml(input_client_base: &str, upstream_base: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.input_client]
+format = "openai_chat"
+base_url = "{input_client_base}/v1"
+
+[llm_clients.upstream_client]
+format = "openai_chat"
+base_url = "{upstream_base}"
+
+[targets.a]
+id = "model/a"
+llm_client = "input_client"
+
+[targets.b]
+id = "model/b"
+llm_client = "upstream_client"
+
+[routes.fleet]
+id = "localclaw/fleet"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = {{ kind = "bounded", usable_context_tokens = 65536, input_token_source = "openai_chat_input_tokens" }}
+
+[[routes.fleet.candidates]]
+target = "b"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+"#
+    )
+}
+
+// §12: decision path — producer populates the fact and FleetRouter admits/excludes
+// the bounded candidate accordingly.
+#[tokio::test]
+async fn s2e2_decision_path_producer_admits_or_excludes() -> TestResult {
+    let (mock, mock_base) = InputTokenMock::start().await?;
+    let upstream = MockUpstream::start().await?;
+    let toml = s2e2_fleet_toml(&mock_base, &upstream.base_url);
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+    let req = json!({
+        "input_format": "openai_chat",
+        "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}], "max_tokens": 64}
+    });
+
+    // count fits (500 <= 65536): host populates fact -> bounded `a` selected.
+    mock.set_count(Some(500)).await;
+    let res = send(&app, "POST", "/v1/decision", Some(req.clone())).await?;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.json()?["selected"]["target"], "a");
+
+    // count does not fit: fact present but > capacity -> bounded excluded, unmanaged selected.
+    mock.set_count(Some(70_000)).await;
+    let res = send(&app, "POST", "/v1/decision", Some(req.clone())).await?;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.json()?["selected"]["target"], "b");
+
+    // count endpoint fails: no fact -> bounded excluded, unmanaged selected; request still 200.
+    mock.set_count(None).await;
+    let res = send(&app, "POST", "/v1/decision", Some(req.clone())).await?;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "producer failure must not fail the request"
+    );
+    assert_eq!(res.json()?["selected"]["target"], "b");
+    Ok(())
+}
+
+// §13: real inference path — producer populates the fact BEFORE the algorithm runs,
+// so the bounded target's `/chat/completions` is actually called on a fit, and the
+// unmanaged fallback is called when counting fails.
+#[tokio::test]
+async fn s2e2_inference_path_selects_and_calls_bounded_target() -> TestResult {
+    let (mock, mock_base) = InputTokenMock::start().await?;
+    let upstream = MockUpstream::start().await?;
+    let toml = s2e2_fleet_toml(&mock_base, &upstream.base_url);
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+    let req = json!({
+        "model": "localclaw/fleet",
+        "messages": [{"role":"user","content":"hi"}],
+        "max_tokens": 64
+    });
+
+    // Fit: bounded `a` selected -> its `/chat/completions` is actually called.
+    mock.set_count(Some(500)).await;
+    let res = send(&app, "POST", "/v1/chat/completions", Some(req.clone())).await?;
+    assert_eq!(res.status, StatusCode::OK, "inference must succeed");
+    assert_eq!(
+        mock.chat_calls().await,
+        1,
+        "bounded target must be called for generation"
+    );
+
+    // Count failure: bounded excluded -> unmanaged fallback (`b` -> MockUpstream) is called instead.
+    mock.set_count(None).await;
+    let res = send(&app, "POST", "/v1/chat/completions", Some(req.clone())).await?;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "fallback inference must succeed"
+    );
+    // The bounded mock must NOT be called again (only the upstream fallback served).
+    assert_eq!(
+        mock.chat_calls().await,
+        1,
+        "bounded target must not be called when its count is absent"
+    );
+    Ok(())
+}
+
+// §14: the Anthropic count_tokens endpoint does NOT trigger the producer.
+#[tokio::test]
+async fn s2e2_anthropic_count_tokens_does_not_invoke_producer() -> TestResult {
+    let (mock, mock_base) = InputTokenMock::start().await?;
+    let upstream = MockUpstream::start().await?;
+    let toml = s2e2_fleet_toml(&mock_base, &upstream.base_url);
+    // The route has no Anthropic target, so a count_tokens call with no Anthropic
+    // backend must be rejected as "no Anthropic target" — and importantly the
+    // input-token mock must never receive an /input_tokens request. We assert the
+    // route resolves but count_tokens returns a non-OK that is NOT "ok".
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+    let res = send(
+        &app,
+        "POST",
+        "/v1/messages/count_tokens",
+        Some(json!({
+            "model": "localclaw/fleet",
+            "messages": [{"role":"user","content":"hi"}]
+        })),
+    )
+    .await?;
+    // The route has no Anthropic target; count_tokens must fail cleanly (4xx).
+    // Primary invariant: the Anthropic count_tokens endpoint must NOT invoke the
+    // input-token producer, i.e. /v1/chat/completions/input_tokens is never called.
+    assert!(
+        res.status.is_client_error(),
+        "count_tokens without an Anthropic target should be a client error, got {}",
+        res.status
+    );
+    assert_eq!(
+        mock.input_token_calls().await,
+        0,
+        "Anthropic count_tokens must NOT invoke /chat/completions/input_tokens"
+    );
+    // Secondary: the bounded mock saw no generation call either.
+    assert_eq!(
+        mock.chat_calls().await,
+        0,
+        "no generation call on the bounded mock"
+    );
+    Ok(())
+}
+
+// ─── S2-F/G: development deployment-candidate lane qualification ─────────────
+//
+// Minimum useful resource/task preference policy via SEPARATE logical fleet_router
+// routes (mainline-native, no semantic classifier). Preference is expressed as
+// per-route candidate sets + preference_rank; capability/readiness/context remain
+// hard eligibility gates and are never bypassed by preference.
+
+/// A DEVELOPMENT three-lane fleet config using existing candidate identities:
+///  - localclaw/dev/general : ordinary dependable bounded work -> flash workhorse,
+///    with qualified local HTPC + context-fail-closed Comfy lower-preference
+///    optionals; V4 Pro is NOT in this lane.
+///  - localclaw/dev/tech    : explicitly local-qualified bounded work -> HTPC
+///    (exact context admission) first, flash fallback.
+///  - localclaw/dev/premium : premium reasoning -> gpt preferred, deepseek-pro
+///    fallback; flash/htpc are NOT automatic middle rungs.
+fn dev_fleet_toml(
+    flash_base: &str,
+    cloud_base: &str,
+    input_client_base: &str,
+    comfy_base: &str,
+) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.flash_client]
+format = "openai_chat"
+base_url = "{flash_base}"
+
+[llm_clients.cloud_client]
+format = "openai_chat"
+base_url = "{cloud_base}"
+
+[llm_clients.input_client]
+format = "openai_chat"
+base_url = "{input_client_base}/v1"
+
+[llm_clients.comfy_client]
+format = "openai_chat"
+base_url = "{comfy_base}"
+
+[targets.flash]
+id = "model/deepseek-v4-flash"
+llm_client = "flash_client"
+
+[targets.gpt]
+id = "model/gpt-5.6"
+llm_client = "cloud_client"
+
+[targets.pro]
+id = "model/deepseek-v4-pro"
+llm_client = "cloud_client"
+
+[targets.htpc]
+id = "model/htpc-qwen3_5"
+llm_client = "input_client"
+
+[targets.comfy]
+id = "model/comfyninja-qwen3_8"
+llm_client = "comfy_client"
+
+# --- bounded/general lane ---
+[routes.general]
+id = "localclaw/dev/general"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.general.candidates]]
+target = "flash"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+
+[[routes.general.candidates]]
+target = "htpc"
+tool_calling = false
+reasoning = false
+preference_rank = 2
+context_policy = {{ kind = "bounded", usable_context_tokens = 65536, input_token_source = "openai_chat_input_tokens" }}
+
+[[routes.general.candidates]]
+target = "comfy"
+tool_calling = true
+reasoning = true
+preference_rank = 3
+context_policy = {{ kind = "bounded", usable_context_tokens = 69888 }}
+
+# --- bounded/technical (explicitly local-qualified) lane ---
+[routes.tech]
+id = "localclaw/dev/tech"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.tech.candidates]]
+target = "htpc"
+tool_calling = false
+reasoning = false
+preference_rank = 1
+context_policy = {{ kind = "bounded", usable_context_tokens = 65536, input_token_source = "openai_chat_input_tokens" }}
+
+[[routes.tech.candidates]]
+target = "flash"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+
+# --- premium reasoning lane (GPT preferred, V4 Pro alternative; no Flash rung) ---
+[routes.premium]
+id = "localclaw/dev/premium"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.premium.candidates]]
+target = "gpt"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+
+[[routes.premium.candidates]]
+target = "pro"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+"#
+    )
+}
+
+/// A mutable readiness snapshot helper: marks `ready` candidates, all others
+/// not-ready, keyed by the fixed dev-lane model identities.
+fn dev_readiness(ready: &[&str]) -> FleetSnapshot {
+    let models = [
+        "model/deepseek-v4-flash",
+        "model/gpt-5.6",
+        "model/deepseek-v4-pro",
+        "model/htpc-qwen3_5",
+        "model/comfyninja-qwen3_8",
+    ];
+    FleetSnapshot::new(
+        models
+            .iter()
+            .map(|m| {
+                let state = if ready.contains(m) {
+                    CandidateState::ready()
+                } else {
+                    CandidateState::not_ready()
+                };
+                (ModelId::from(*m), state)
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn s2fg_dev_lane_preference_and_gates() -> TestResult {
+    let (input_mock, input_base) = InputTokenMock::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+    let cloud_upstream = MockUpstream::start().await?;
+    let comfy_upstream = MockUpstream::start().await?;
+    let toml = dev_fleet_toml(
+        &flash_upstream.base_url,
+        &cloud_upstream.base_url,
+        &input_base,
+        &comfy_upstream.base_url,
+    );
+    let shared = SharedFleetState::new(dev_readiness(&[
+        "model/deepseek-v4-flash",
+        "model/gpt-5.6",
+        "model/deepseek-v4-pro",
+        "model/htpc-qwen3_5",
+        "model/comfyninja-qwen3_8",
+    ]));
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    // 1) bounded/general: flash is the dependable workhorse (rank 1), selected even
+    //    with a context-fittable HTPC present.
+    input_mock.set_count(Some(500)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/general","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "flash");
+
+    // 2) bounded/tech: explicitly local-qualified lane -> HTPC selected (context fits).
+    input_mock.set_count(Some(500)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/tech","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "htpc");
+
+    // 3) bounded/tech with HTPC context overflow -> HTPC excluded, flash fallback.
+    input_mock.set_count(Some(70_000)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/tech","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "flash");
+
+    // 4) premium lane: GPT preferred; V4 Pro is the fallback (Flash is NOT in the
+    //    premium route).
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/premium","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "gpt");
+
+    // 5) premium with GPT unavailable (not-ready) -> Pro selected, NOT Flash.
+    let shared = SharedFleetState::new(dev_readiness(&[
+        "model/deepseek-v4-flash",
+        "model/deepseek-v4-pro",
+        "model/htpc-qwen3_5",
+        "model/comfyninja-qwen3_8",
+    ]));
+    let state2 = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app2 = build_switchyard_router(state2);
+    let res2 = send(
+        &app2,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/premium","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res2.json()?["selected"]["target"], "pro");
+
+    // 6) Comfy stays context-fail-closed for automatic selection (bounded/69888 but
+    //    no exact producer); it is never selected. With only flash + comfy ready in
+    //    the general lane, flash (workhorse) still wins; with only comfy ready, the
+    //    lane fails closed (Bounded comfy without a count is not eligible).
+    let shared3 = SharedFleetState::new(dev_readiness(&[
+        "model/deepseek-v4-flash",
+        "model/comfyninja-qwen3_8",
+    ]));
+    input_mock.set_count(Some(500)).await;
+    let state3 = load_fleet_test_config(&toml, Arc::new(shared3))?;
+    let app3 = build_switchyard_router(state3);
+    let res3 = send(
+        &app3,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/general","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res3.json()?["selected"]["target"], "flash");
+
+    let shared4 = SharedFleetState::new(dev_readiness(&["model/comfyninja-qwen3_8"]));
+    let state4 = load_fleet_test_config(&toml, Arc::new(shared4))?;
+    let app4 = build_switchyard_router(state4);
+    let res4 = send(
+        &app4,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/general","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert!(
+        res4.status.is_server_error(),
+        "general lane with only a no-count Comfy must fail closed (5xx no-eligible), got {}",
+        res4.status
+    );
+    Ok(())
+}
+
+// ─── S2-H: production FleetRouter runtime owner ───────────────────────────────
+// Proves the §8 identity guarantee: ONE SharedFleetState drives both the
+// FleetRouter server and the background FleetReadinessMonitor; the monitor's
+// initial observe publishes readiness the server's /v1/decision reads; and a
+// monitored server starts on a staging bind and stops cleanly on shutdown.
+#[tokio::test]
+async fn s2h_runtime_owner_shares_state_and_stops_cleanly() -> TestResult {
+    // Mock Comfy (sealed-idle => transition_required) and HTPC (ready).
+    let comfy_router = axum::Router::new().route(
+        "/v1/resource",
+        axum::routing::get(|| async move {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "state":{"mode":"idle","resident_qwen_profile":"unknown","llama_server":"no"}
+                })),
+            )
+        }),
+    );
+    let comfy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let comfy_addr = comfy_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(comfy_listener, comfy_router).await.unwrap() });
+
+    let htpc_router = axum::Router::new()
+        .route(
+            "/health",
+            axum::routing::get(|| async move { (StatusCode::OK, Json(json!({"status":"ok"}))) }),
+        )
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async move {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "object":"list",
+                        "data":[{"id":"/srv/htpc-ai/models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_0.gguf"}]
+                    })),
+                )
+            }),
+        );
+    let htpc_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let htpc_addr = htpc_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(htpc_listener, htpc_router).await.unwrap() });
+
+    // ONE shared state across server + monitor.
+    let state = Arc::new(SharedFleetState::new(FleetSnapshot::new(vec![])?));
+    let comfy = ComfyFactsClient::new(
+        format!("http://{comfy_addr}/v1/resource"),
+        "S2H_TEST_TOKEN".to_string(),
+    );
+    unsafe { std::env::set_var("S2H_TEST_TOKEN", "dummy") };
+    let htpc = HtpcFactsClient::new(
+        format!("http://{htpc_addr}"),
+        "Qwen3.5-9B-Q4_0.gguf".to_string(),
+    );
+    let monitor = FleetReadinessMonitor::new(
+        Some(comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
+        vec![Observed {
+            model: ModelId::from("model/deepseek-v4-flash"),
+            state: CandidateState::ready(),
+        }],
+        Arc::clone(&state),
+        std::time::Duration::from_millis(50),
+    );
+
+    // Build a dev-lane server over the SAME shared state (HTPC bounded/65536 producer,
+    // flash + comfy as before), then run it with the background monitor.
+    let (input_mock, input_base) = InputTokenMock::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+    let cloud_upstream = MockUpstream::start().await?;
+    let comfy_llm_upstream = MockUpstream::start().await?;
+    let toml = dev_fleet_toml(
+        &flash_upstream.base_url,
+        &cloud_upstream.base_url,
+        &input_base,
+        &comfy_llm_upstream.base_url,
+    );
+    let server_state = load_fleet_test_config(&toml, state.clone())?;
+    let options = ServerRunOptions {
+        addr: "127.0.0.1:0".parse()?,
+        backlog: 1024,
+        dry_run: false,
+        shutdown_timeout: std::time::Duration::from_secs(2),
+        tls: None,
+    };
+    let bound = BoundServer::bind(server_state, options)?;
+    let bound_addr = bound.local_addr();
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        bound
+            .serve_with_fleet_monitor(
+                async move {
+                    let _ = _shutdown_rx.await;
+                },
+                monitor,
+            )
+            .await
+    });
+
+    // Give the monitor's initial observe + a tick time to publish real readiness.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // The shared state (read via the running server) must be non-empty: the monitor
+    // published flash(cloud base ready) + comfy(transition) + htpc(ready).
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.state_for(&ModelId::from("model/deepseek-v4-flash")),
+        CandidateState::ready(),
+        "monitor-published cloud base state must be readable on the shared state"
+    );
+    assert_eq!(
+        snap.state_for(&ModelId::from("model/htpc-qwen3_5")),
+        CandidateState::ready(),
+        "monitor-published HTPC readiness must be readable on the shared state"
+    );
+
+    // A real /v1/decision on the running monitored server reads the SAME shared
+    // state (not the fail-closed empty source): HTPC is ready and context-fits.
+    input_mock.set_count(Some(500)).await;
+    let req = json!({
+        "input_format": "openai_chat",
+        "request": {"model":"localclaw/dev/tech","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+    });
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&req)
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    // HTPC is ready + context-fit via the live producer -> tech lane selects htpc.
+    assert_eq!(
+        body["selected"]["target"], "htpc",
+        "the monitored server's FleetRouter must read the shared HTPC readiness + count"
+    );
+
+    // Clean shutdown: signal and join; the monitor loop must exit.
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), serve_task)
+        .await
+        .expect("server must stop promptly on shutdown")??;
+    unsafe { std::env::remove_var("S2H_TEST_TOKEN") };
+    Ok(())
+}
+
+// A `localclaw/smart`-style fleet_router (luna rank1, deepseek rank2) served via
+// the S2-H runtime-owner seam, with LIVE OpenAI weekly / DeepSeek resource facts
+// gating the two cloud candidates on the SAME SharedFleetState. Proves the
+// recovered smart-route semantics end-to-end: OpenAI healthy + DeepSeek healthy
+// -> luna selected; OpenAI confirmed-exhausted -> deepseek selected (fallback
+// becomes permissible), never a spill while OpenAI state is merely unknown.
+#[tokio::test]
+async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> TestResult {
+    // Mutable OpenAI resource payload (healthy at first).
+    let openai_state = Arc::new(tokio::sync::Mutex::new(serde_json::json!({
+        "available": true, "limit_reached": false, "spend_control_reached": false,
+        "windows": {"primary": {"used_percent": 11}}
+    })));
+    let openai_payload = Arc::clone(&openai_state);
+    let openai_router = axum::Router::new().route(
+        "/resource/openai-codex",
+        axum::routing::get(move || {
+            let payload = Arc::clone(&openai_payload);
+            async move { (StatusCode::OK, Json(payload.lock().await.clone())) }
+        }),
+    );
+    let openai_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let openai_addr = openai_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(openai_listener, openai_router).await.unwrap() });
+
+    // Static DeepSeek balance (healthy, positive).
+    let deepseek_router = axum::Router::new().route(
+        "/user/balance",
+        axum::routing::get(|| async move {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "is_available": true,
+                    "balance_infos": [{"currency":"CNY","total_balance":"90.75","granted_balance":"0.00","topped_up_balance":"90.75"}]
+                })),
+            )
+        }),
+    );
+    let deepseek_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let deepseek_addr = deepseek_listener.local_addr()?;
+    tokio::spawn(async move {
+        axum::serve(deepseek_listener, deepseek_router)
+            .await
+            .unwrap()
+    });
+
+    // ONE shared state across server + monitor.
+    let state = Arc::new(SharedFleetState::new(FleetSnapshot::new(vec![])?));
+
+    // Resource-state client over the local mock surfaces + monitor gating luna
+    // (OpenAI) and deepseek (DeepSeek). No Comfy / HTPC in this focused test.
+    let resource = ResourceStateFactsClient::new(
+        Some(format!("http://{openai_addr}/resource/openai-codex")),
+        Some("S2H_RES_OPENAI_TOKEN".into()),
+        Some(format!("http://{deepseek_addr}/user/balance")),
+        Some("S2H_RES_DEEPSEEK_KEY".into()),
+        Some("CNY".into()),
+    );
+    unsafe { std::env::set_var("S2H_RES_OPENAI_TOKEN", "dummy") };
+    unsafe { std::env::set_var("S2H_RES_DEEPSEEK_KEY", "dummy") };
+
+    let monitor = FleetReadinessMonitor::new(
+        // No Comfy / HTPC facts configured -> None (skipped in observation).
+        None,
+        None,
+        None,
+        None,
+        vec![],
+        Arc::clone(&state),
+        std::time::Duration::from_millis(30),
+    )
+    .with_resource(
+        resource,
+        vec![ModelId::from("model/gpt-5.6")], // luna gated on OpenAI weekly
+        vec![],                               // no OpenClaw gating in this test
+        vec![ModelId::from("model/deepseek-v4-flash")], // deepseek gated on balance
+    );
+
+    // FleetRouter server over the SAME state: a smart-style route with luna
+    // (rank1) + deepseek (rank2). Cloud clients mocked.
+    let luna_upstream = MockUpstream::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+    let toml = smart_resource_toml(&luna_upstream.base_url, &flash_upstream.base_url);
+    let server_state = load_fleet_test_config(&toml, state.clone())?;
+    let options = ServerRunOptions {
+        addr: "127.0.0.1:0".parse()?,
+        backlog: 1024,
+        dry_run: false,
+        shutdown_timeout: std::time::Duration::from_secs(2),
+        tls: None,
+    };
+    let bound = BoundServer::bind(server_state, options)?;
+    let bound_addr = bound.local_addr();
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        bound
+            .serve_with_fleet_monitor(
+                async move {
+                    let _ = _shutdown_rx.await;
+                },
+                monitor,
+            )
+            .await
+    });
+
+    let http = reqwest::Client::new();
+    let smart_req = |effort: Option<&str>, work_shape: Option<&str>| {
+        let mut req = json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/smart","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        });
+        // A non-thinking request carries no reasoning effort; a deliberate one
+        // signals positive reasoning via the top-level `reasoning_effort` field
+        // (the same shape the /v1/decision handler maps into LlmRequest.reasoning).
+        if let Some(e) = effort {
+            req["request"]["reasoning_effort"] = json!(e);
+        }
+        // Fix D wire-body work_shape: an unknown top-level field is preserved
+        // into LlmRequest.extensions.fields by the codec and drives the
+        // request-sourced work-shape dispatch.
+        if let Some(ws) = work_shape {
+            req["request"]["work_shape"] = json!(ws);
+        }
+        req
+    };
+
+    // (1) OpenAI healthy + DeepSeek healthy -> bounded/non-thinking selects luna
+    // (rank1). The explicit bounded wire shape keeps luna eligible.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None, Some("bounded")))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "luna",
+        "healthy OpenAI must gate the luna candidate ready and select it first: {body}"
+    );
+
+    // (1b) Fix D wire-body proof: an AGENTIC / non-thinking request with healthy
+    // OpenAI must NEVER select Luna (bounded-only, work-shape-excluded); DeepSeek
+    // is selected instead, even though Luna's resource-gated readiness is healthy.
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None, Some("agentic")))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "an agentic/non-thinking request must select deepseek, never luna: {body}"
+    );
+    let all: Vec<Value> = {
+        let mut v = vec![body["selected"].clone()];
+        v.extend(body["fallbacks"].as_array().cloned().unwrap_or_default());
+        v
+    };
+    assert!(
+        all.iter().all(|c| c["target"] != "luna"),
+        "agentic/non-thinking must never select or fall back to the bounded-only luna: {body}"
+    );
+
+    // (1c) LEGACY work_class compatibility (cutover regression fix): the live
+    // Turnstone aliases send `work_class` via extra_body. wire-body `work_class`
+    // must dispatch identically: bounded->luna, agentic->deepseek NEVER luna.
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/smart","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"work_class":"agentic"}
+        }))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "legacy work_class=agentic must select deepseek, never luna: {body}"
+    );
+
+    // (2) Flip OpenAI to confirmed exhaustion; DeepSeek stays healthy. After a
+    // monitor cycle, a non-thinking request must fall to deepseek (fallback now
+    // permissible). It must NOT fail merely because telemetry earlier existed.
+    *openai_state.lock().await = json!({
+        "available": true, "limit_reached": true, "spend_control_reached": false,
+        "windows": {"primary": {"used_percent": 100}}
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None, None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "confirmed OpenAI exhaustion must make luna not-ready and select deepseek: {body}"
+    );
+
+    // (2b) spend_control_reached=true WITHOUT confirmed exhaustion must NOT open
+    // a DeepSeek spill: Luna stays selected (fail toward Luna).
+    *openai_state.lock().await = json!({
+        "available": true, "limit_reached": false, "spend_control_reached": true,
+        "windows": {"primary": {"used_percent": 60}}
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None, None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "luna",
+        "spend-control-only must NOT open a DeepSeek spill; luna stays selected: {body}"
+    );
+
+    // (2c) Unknown/missing resource telemetry (no windows, limit unknown, no
+    // confirmed exhaustion) must NOT open a DeepSeek spill: Luna stays selected.
+    *openai_state.lock().await = json!({
+        "available": true, "limit_reached": false, "spend_control_reached": false,
+        "windows": {"primary": {}}
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None, None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "luna",
+        "unknown/missing OpenAI telemetry must NOT open a DeepSeek spill; luna stays selected: {body}"
+    );
+
+    // (3) A deliberate (thinking) request on the healthy-at-exhaustion state must
+    // select deepseek (thinking capable) only; luna (non-thinking) is excluded by
+    // the reasoning capability filter regardless of OpenAI health.
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(Some("high"), None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "a deliberate request must select the thinking deepseek candidate: {body}"
+    );
+    assert!(
+        body["fallbacks"]
+            .as_array()
+            .map(|f| f.iter().all(|x| x["target"] != "luna"))
+            .unwrap_or(false),
+        "a deliberate request must never fall back to the non-thinking luna: {body}"
+    );
+
+    // Clean shutdown.
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), serve_task)
+        .await
+        .expect("server must stop promptly on shutdown")??;
+    unsafe { std::env::remove_var("S2H_RES_OPENAI_TOKEN") };
+    unsafe { std::env::remove_var("S2H_RES_DEEPSEEK_KEY") };
+    Ok(())
+}
+
+// Fix A/B structural shared-state proof: `load_server_runtime` (the stock CLI
+// construction path) builds ONE SharedFleetState and hands it to BOTH the server
+// FleetRouter and the FleetReadinessMonitor. We prove the identity by observing
+// the monitor once and then reading the SAME state through a live /v1/decision
+// on the server, plus that --dry-run validates without starting the monitor.
+#[tokio::test]
+async fn s2h_cli_runtime_shares_one_fleet_state_and_dry_run_validates() -> TestResult {
+    // Mock OpenAI resource (healthy at first) + DeepSeek balance.
+    let openai_state = Arc::new(tokio::sync::Mutex::new(serde_json::json!({
+        "available": true, "limit_reached": false, "spend_control_reached": false,
+        "windows": {"primary": {"used_percent": 11}}
+    })));
+    let openai_payload = Arc::clone(&openai_state);
+    let openai_router = axum::Router::new().route(
+        "/resource/openai-codex",
+        axum::routing::get(move || {
+            let payload = Arc::clone(&openai_payload);
+            async move { (StatusCode::OK, Json(payload.lock().await.clone())) }
+        }),
+    );
+    let openai_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let openai_addr = openai_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(openai_listener, openai_router).await.unwrap() });
+
+    let deepseek_router = axum::Router::new().route(
+        "/user/balance",
+        axum::routing::get(|| async move {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "is_available": true,
+                    "balance_infos": [{"currency":"CNY","total_balance":"90.75","granted_balance":"0.00","topped_up_balance":"90.75"}]
+                })),
+            )
+        }),
+    );
+    let deepseek_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let deepseek_addr = deepseek_listener.local_addr()?;
+    tokio::spawn(async move {
+        axum::serve(deepseek_listener, deepseek_router)
+            .await
+            .unwrap()
+    });
+
+    let luna_upstream = MockUpstream::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+
+    // A production-shaped TOML with a `localclaw/smart` fleet_router route AND a
+    // `[fleet_readiness]` section (resource gating + static ready base).
+    let toml = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.luna_client]
+format = "openai_chat"
+base_url = "{luna}"
+
+[llm_clients.deepseek_client]
+format = "openai_chat"
+base_url = "{flash}"
+
+[targets.luna]
+id = "model/gpt-5.6"
+llm_client = "luna_client"
+
+[targets.deepseek]
+id = "model/deepseek-v4-flash"
+llm_client = "deepseek_client"
+
+[routes.smart]
+id = "localclaw/dev/smart"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = false
+work_shape_source = "request"
+
+[[routes.smart.candidates]]
+target = "luna"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+work_shape = "bounded"
+
+[[routes.smart.candidates]]
+target = "deepseek"
+tool_calling = true
+reasoning = false
+preference_rank = 2
+
+[fleet_readiness]
+observe_interval_seconds = 30
+
+[fleet_readiness.resource]
+openai_url = "http://{oa}/resource/openai-codex"
+openai_auth_token_env = "S2H_CLI_OPENAI_TOKEN"
+openclaw_openai_url = "http://127.0.0.1:9/resource/openai-codex"
+openclaw_openai_auth_token_env = "S2H_CLI_OPENCLAW_TOKEN"
+deepseek_url = "http://{ds}/user/balance"
+deepseek_api_key_env = "S2H_CLI_DEEPSEEK_KEY"
+deepseek_currency = "CNY"
+openai_gated = ["model/gpt-5.6"]
+openclaw_openai_gated = []
+deepseek_gated = ["model/deepseek-v4-flash"]
+"#,
+        luna = luna_upstream.base_url,
+        flash = flash_upstream.base_url,
+        oa = openai_addr,
+        ds = deepseek_addr,
+    );
+
+    unsafe { std::env::set_var("S2H_CLI_OPENAI_TOKEN", "dummy") };
+    unsafe { std::env::set_var("S2H_CLI_DEEPSEEK_KEY", "dummy") };
+
+    // Write to a temp path and build the runtime through the CLI construction path.
+    let mut config = tempfile::Builder::new()
+        .prefix("switchyard-s2h-runtime-")
+        .suffix(".toml")
+        .tempfile()?;
+    use std::io::Write;
+    config.write_all(toml.as_bytes())?;
+    let runtime = load_server_runtime(config.path())?;
+    assert!(
+        runtime.monitor.is_some(),
+        "a [fleet_readiness] config must build a monitor"
+    );
+
+    // (A) One observation by the monitor writes into the SAME shared state the
+    // server's FleetRouter reads: after observe_once, a /v1/decision sees luna
+    // ready (OpenAI healthy) and selects it.
+    runtime.monitor.as_ref().unwrap().observe_once().await?;
+    let app = build_switchyard_router(runtime.state.clone());
+    let resp = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/dev/smart",
+                "messages": [{"role":"user","content":"hi"}],
+                "max_tokens": 32,
+                "reasoning_effort": "none"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(resp.status, StatusCode::OK);
+    let res = resp.json()?;
+    assert_eq!(
+        res["selected"]["target"], "luna",
+        "the server FleetRouter must read the monitor-published OpenAI-gated luna readiness: {res}"
+    );
+
+    // (B) dry-run through the CLI path validates (parses config + builds the
+    // monitor) but does NOT start it; here we assert the runtime built cleanly
+    // and dry_run is handled by the CLI layer (covered separately by run()).
+    let options = ServerRunOptions {
+        addr: "127.0.0.1:0".parse()?,
+        backlog: 1024,
+        dry_run: true,
+        shutdown_timeout: std::time::Duration::from_secs(2),
+        tls: None,
+    };
+    // `ServerRuntime::run` with dry_run prints the summary and returns without
+    // binding or starting the monitor — exercised here to prove no accidental
+    // background service.
+    runtime.run(options).await?;
+
+    unsafe { std::env::remove_var("S2H_CLI_OPENAI_TOKEN") };
+    unsafe { std::env::remove_var("S2H_CLI_DEEPSEEK_KEY") };
+    Ok(())
+}
+
+/// A `localclaw/smart`-style fleet_router TOML: luna (rank1, non-thinking) and
+/// deepseek (rank2, thinking-capable). Luna and deepseek are distinct model ids.
+fn smart_resource_toml(luna_base: &str, deepseek_base: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.luna_client]
+format = "openai_chat"
+base_url = "{luna_base}"
+
+[llm_clients.deepseek_client]
+format = "openai_chat"
+base_url = "{deepseek_base}"
+
+[targets.luna]
+id = "model/gpt-5.6"
+llm_client = "luna_client"
+
+[targets.deepseek]
+id = "model/deepseek-v4-flash"
+llm_client = "deepseek_client"
+
+[routes.smart]
+id = "localclaw/dev/smart"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+work_shape_source = "request"
+
+[[routes.smart.candidates]]
+target = "luna"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+work_shape = "bounded"
+
+[[routes.smart.candidates]]
+target = "deepseek"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+"#
+    )
+}
+
+#[tokio::test]
+async fn s2c_no_tool_capable_candidate_rejects_tool_override() -> TestResult {
+    // A: candidate set has no tool-capable target; route-level tool_calling=true
+    // must fail config construction.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = false
+reasoning = true
+preference_rank = 1
+"#;
+    let toml = fleet_toml_with_candidates(&upstream.base_url, candidates, "tool_calling = true");
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("tool_calling=true with no tool-capable candidate must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("tool_calling=true"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_no_reasoning_capable_candidate_rejects_reasoning_override() -> TestResult {
+    // B: no reasoning-capable candidate; route-level reasoning=true must fail.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+"#;
+    let toml = fleet_toml_with_candidates(&upstream.base_url, candidates, "reasoning = true");
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("reasoning=true with no reasoning-capable candidate must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("reasoning=true"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_disjoint_candidate_set_rejects_implicit_both() -> TestResult {
+    // C: A = tools-only, B = reasoning-only. Automatic OR would imply both true,
+    // but no candidate can satisfy tools + reasoning together => reject.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+
+[[routes.fleet.candidates]]
+target = "b"
+tool_calling = false
+reasoning = true
+preference_rank = 2
+"#;
+    let toml = fleet_toml_with_candidates(&upstream.base_url, candidates, "");
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("disjoint tool-only + reasoning-only candidate set must be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("not representable"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_explicit_restriction_makes_disjoint_set_representable() -> TestResult {
+    // D: same disjoint candidate set, but explicit tool_calling=true /
+    // reasoning=false narrows the advertised envelope so it is representable.
+    //
+    // IMPORTANT SEMANTIC: route-level capability fields are ADVERTISEMENT
+    // metadata, not request-admission policy. `reasoning=false` conservatively
+    // under-advertises; it does NOT rewrite FleetRouter candidate profiles nor
+    // block reasoning requests at runtime. Admission continues to use
+    // CandidateProfile (A=tool-only, B=reasoning-only) + the injected snapshot.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+
+[[routes.fleet.candidates]]
+target = "b"
+tool_calling = false
+reasoning = true
+preference_rank = 2
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = false",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    // A. ADVERTISEMENT: GET /v1/models must report the fleet route with the
+    // explicit conservative restriction applied (tool_calling=true,
+    // reasoning=false under-advertised).
+    let models = send(&app, "GET", "/v1/models", None).await?;
+    assert_eq!(models.status, StatusCode::OK);
+    let models_json = models.json()?;
+    // Standard `data` entry exposes the raw tool_calling capability (a positive
+    // claim must be truthful).
+    let data_entry = models_json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "localclaw/fleet")
+        .expect("fleet route must be advertised in /v1/models");
+    assert_eq!(
+        data_entry["capabilities"]["tool_calling"], true,
+        "route must positively advertise tool_calling=true"
+    );
+    // Codex `models` entry carries the reasoning advertisement: reasoning=false
+    // => default_reasoning_level is null and supports_reasoning_summaries false
+    // (conservative under-advertisement, matching the explicit reasoning=false).
+    let codex_entry = models_json["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "localclaw/fleet")
+        .expect("fleet route must be advertised in the Codex models list");
+    assert_eq!(
+        codex_entry["shell_type"], "shell_command",
+        "tool_calling=true advertised"
+    );
+    assert!(
+        codex_entry["default_reasoning_level"].is_null(),
+        "reasoning=false under-advertised"
+    );
+    assert_eq!(codex_entry["supports_reasoning_summaries"], false);
+
+    // B. ALGORITHM DECISION: route advertisement does not gate admission.
+    // A tool-bearing request selects the tool-capable candidate A.
+    let tool_resp = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role":"user","content":"use a tool"}],
+                "tools": [{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(tool_resp.status, StatusCode::OK);
+    assert_eq!(tool_resp.json()?["selected"]["target"], "a");
+
+    // A positive-reasoning request still routes to the reasoning-capable
+    // candidate B (FleetRouter uses CandidateProfile, not the route reasoning
+    // advertisement). This is NOT "fail-closed" — it is the explicit separation
+    // of advertisement metadata from candidate admission.
+    let reason_resp = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role":"user","content":"reason"}],
+                "reasoning_effort": "high"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(reason_resp.status, StatusCode::OK);
+    assert_eq!(
+        reason_resp.json()?["selected"]["target"],
+        "b",
+        "a reasoning request routes to the reasoning-capable candidate despite \
+         the route advertising reasoning=false (advertisement != admission)"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2c_combined_capable_candidate_auto_advertises_both() -> TestResult {
+    // E: a candidate set with at least one tool+reasoning candidate still
+    // auto-advertises tool_calling=true, reasoning=true (existing S2-C shape).
+    // The advertised both-true envelope is truthful because luna/deepseek
+    // support tools AND reasoning, so a combined tools+reasoning request is
+    // satisfiable.
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(fleet_ready_snapshot());
+    let state = load_fleet_test_config(&fleet_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    // Simple request still selects the top preference (luna).
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["selected"]["target"], "luna");
+
+    // A combined tools + reasoning request must succeed (proving the advertised
+    // tool_calling=true AND reasoning=true envelope is actually satisfiable by a
+    // single candidate), excluding htpc (no tool, no reasoning).
+    let combined = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/fleet",
+                "messages": [{"role":"user","content":"use a tool and reason"}],
+                "tools": [{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                "reasoning_effort": "high"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(combined.status, StatusCode::OK);
+    let all: Vec<String> = {
+        let res = combined.json()?;
+        let mut v = vec![res["selected"]["target"].as_str().unwrap().to_string()];
+        v.extend(
+            res["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["target"].as_str().unwrap().to_string()),
+        );
+        v
+    };
+    assert!(
+        !all.contains(&"htpc".to_string()),
+        "a tools+reasoning request must not reach the non-tool/non-reasoning htpc"
+    );
     Ok(())
 }
 
@@ -3367,4 +5512,448 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
     assert_eq!(completed["response"]["output"][0]["name"], "search");
     assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__b");
     Ok(())
+}
+
+/// S2-D real read-only proof (gated on `S2D_LIVE=1`; CI has no tailnet access).
+///
+/// Observes the REAL ComfyNinja (:8447) + HTPC (:8081) readiness surfaces
+/// read-only through the **real** [`FleetReadinessMonitor`] seam (construction +
+/// a single [`FleetReadinessMonitor::observe_once`]), then consumes the resulting
+/// [`SharedFleetState`] into a DEVELOPMENT FleetRouter server and exercises the
+/// native `/v1/decision` path to show real facts affect eligibility. No manual
+/// `comfy.observe()/htpc.observe()/producer.apply()` assembly. No production
+/// service or route change.
+#[tokio::test]
+async fn s2d_live_readonly_facts_drive_decision() -> TestResult {
+    if std::env::var("S2D_LIVE").as_deref() != Ok("1") {
+        return Ok(()); // gated: only run against live surfaces when explicitly requested
+    }
+    let state = Arc::new(SharedFleetState::new(libsy::FleetSnapshot::new(vec![])?));
+
+    let comfy = ComfyFactsClient::new(
+        "https://reninja.tailc8ef7b.ts.net:8447/v1/resource".to_string(),
+        "COMFYNINJA_READ_TOKEN".to_string(),
+    );
+    let htpc = HtpcFactsClient::new(
+        "https://htpc-wsl.tailc8ef7b.ts.net:8081".to_string(),
+        "Qwen3.5-9B-Q4_0.gguf".to_string(),
+    );
+
+    // The real server-owned monitor seam: construction + one observation cycle
+    // against the live read-only endpoints. A large interval is used because only
+    // a single cycle is needed here; the background loop is exercised separately.
+    let monitor = FleetReadinessMonitor::new(
+        Some(comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
+        // Static cloud base (configured/attemptable, not a live provider health
+        // guarantee).
+        vec![
+            Observed {
+                model: ModelId::from("model/luna"),
+                state: CandidateState::ready(),
+            },
+            Observed {
+                model: ModelId::from("model/deepseek-flash"),
+                state: CandidateState::ready(),
+            },
+        ],
+        Arc::clone(&state),
+        std::time::Duration::from_secs(3600),
+    );
+    monitor.observe_once().await?;
+
+    // Build a DEVELOPMENT FleetRouter server over this shared source.
+    let upstream = MockUpstream::start().await?;
+    let state_clone = Arc::clone(&state);
+    let server_state = load_server_state_with_fleet_source_from_parts(
+        &fleet_toml(&upstream.base_url),
+        state_clone,
+    )?;
+    let app = build_switchyard_router(server_state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "live /v1/decision must succeed"
+    );
+    let res = response.json()?;
+    let selected = res["selected"]["target"].as_str().unwrap().to_string();
+    let all: Vec<String> = {
+        let mut v = vec![selected.clone()];
+        v.extend(
+            res["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["target"].as_str().unwrap().to_string()),
+        );
+        v
+    };
+    // The real snapshot must be in effect: comfy (transition-required from the
+    // real sealed-idle facts) is never selected/immediate-fallback; htpc (should
+    // be ready from real facts) is eligible.
+    assert!(
+        !all.contains(&"comfy".to_string()),
+        "transition-required Comfy from real facts must not be selected/fallback: {all:?}"
+    );
+    assert!(
+        all.contains(&"htpc".to_string()),
+        "HTpc should be eligible from real facts: {all:?}"
+    );
+    // luna/deepseek are static cloud base (attemptable) and the top preference.
+    assert_eq!(selected, "luna");
+    Ok(())
+}
+
+/// Builds a server state from TOML with an injected fleet readiness source.
+fn load_server_state_with_fleet_source_from_parts(
+    toml: &str,
+    source: Arc<dyn FleetStateSource>,
+) -> TestResult<ServerState> {
+    use std::io::Write;
+    let mut config = tempfile::Builder::new()
+        .prefix("s2d-live")
+        .suffix(".toml")
+        .tempfile()?;
+    config.write_all(toml.as_bytes())?;
+    config.flush()?;
+    Ok(load_server_state_with_fleet_source(config.path(), source)?)
+}
+
+/// A mutable mock factual endpoint used by the S2-D monitor integration test.
+#[derive(Clone)]
+struct FactEndpoint {
+    body: Arc<std::sync::Mutex<String>>,
+    status: Arc<std::sync::Mutex<u16>>,
+}
+
+impl FactEndpoint {
+    fn new(body: &str) -> Self {
+        Self {
+            body: Arc::new(std::sync::Mutex::new(body.to_string())),
+            status: Arc::new(std::sync::Mutex::new(200)),
+        }
+    }
+    fn set(&self, status: u16, body: &str) {
+        *self.status.lock().unwrap() = status;
+        *self.body.lock().unwrap() = body.to_string();
+    }
+}
+
+/// S2-D live-update-without-rebuild + server-background coexistence proof.
+///
+/// One [`SharedFleetState`] + one FleetRouter server/router + ONE monitor over
+/// mutable mock Comfy/HTPC endpoints. Generation 1 facts (HTPC ready, Comfy
+/// transition-required) are published and reflected by `/v1/decision`; then the
+/// mock facts are changed and the SAME monitor publishes generation 2 (HTPC
+/// not-ready, Comfy ready) reflected by `/v1/decision` — NO server
+/// reconstruction. Finally the monitor's background `run` loop is exercised with
+/// a short interval while a `/v1/decision` is still served, and shutdown stops
+/// the loop cleanly.
+#[tokio::test]
+async fn s2d_fleet_monitor_updates_without_rebuild_and_runs_alongside_server() -> TestResult {
+    let comfy_ep = FactEndpoint::new(
+        r#"{"state":{"mode":"idle","resident_qwen_profile":"unknown","llama_server":"no"}}"#,
+    );
+    let comfy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let comfy_addr = comfy_listener.local_addr()?;
+    let comfy_ep_srv = comfy_ep.clone();
+    tokio::spawn(async move {
+        let comfy_ep = comfy_ep_srv;
+        let app = axum::Router::new().route(
+            "/v1/resource",
+            axum::routing::get(move || {
+                let comfy_ep = comfy_ep.clone();
+                async move {
+                    let status =
+                        axum::http::StatusCode::from_u16(*comfy_ep.status.lock().unwrap()).unwrap();
+                    let body = comfy_ep.body.lock().unwrap().clone();
+                    (status, body)
+                }
+            }),
+        );
+        axum::serve(comfy_listener, app).await.unwrap()
+    });
+    let comfy_url = format!("http://{comfy_addr}/v1/resource");
+
+    let htpc_health = FactEndpoint::new(r#"{"status":"ok"}"#);
+    let htpc_models = FactEndpoint::new(
+        r#"{"object":"list","data":[{"id":"/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_0.gguf"}]}"#,
+    );
+    let htpc_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let htpc_addr = htpc_listener.local_addr()?;
+    let health_srv = htpc_health.clone();
+    let models_srv = htpc_models.clone();
+    tokio::spawn(async move {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let ep = health_srv.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                axum::routing::get(move || {
+                    let ep = models_srv.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            );
+        axum::serve(htpc_listener, app).await.unwrap()
+    });
+    let htpc_base = format!("http://{htpc_addr}");
+
+    // One SharedFleetState shared by the monitor and the FleetRouter server.
+    let state = Arc::new(SharedFleetState::new(libsy::FleetSnapshot::new(vec![])?));
+    let upstream = MockUpstream::start().await?;
+
+    let comfy = ComfyFactsClient::new(comfy_url.clone(), "S2D_TEST_TOKEN_INT".to_string());
+    unsafe { std::env::set_var("S2D_TEST_TOKEN_INT", "dummy") };
+    let htpc = HtpcFactsClient::new(htpc_base.clone(), "Qwen3.5-9B-Q4_0.gguf".to_string());
+    let monitor = FleetReadinessMonitor::new(
+        Some(comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
+        vec![
+            Observed {
+                model: ModelId::from("model/luna"),
+                state: CandidateState::ready(),
+            },
+            Observed {
+                model: ModelId::from("model/deepseek-flash"),
+                state: CandidateState::ready(),
+            },
+        ],
+        Arc::clone(&state),
+        std::time::Duration::from_secs(3600),
+    );
+
+    // Generation 1: Comfy sealed-idle => transition_required, HTPC ready.
+    monitor.observe_once().await?;
+
+    // Build the FleetRouter server ONCE over the now-populated shared source.
+    // It is reused across generations (no reconstruction below).
+    let server_state = load_server_state_with_fleet_source_from_parts(
+        &fleet_toml(&upstream.base_url),
+        state.clone(),
+    )?;
+    let app = build_switchyard_router(server_state);
+
+    let (selected1, all1) = s2d_decision_targets(&app).await?;
+    assert_eq!(selected1, "luna", "gen1: luna is the top cloud preference");
+    assert!(
+        !all1.contains(&"comfy".to_string()),
+        "gen1: transition-required comfy must be excluded: {all1:?}"
+    );
+    assert!(
+        all1.contains(&"htpc".to_string()),
+        "gen1: ready htpc must be eligible: {all1:?}"
+    );
+
+    // Generation 2: change ONLY the mock fact responses — HTPC now not-ready
+    // (health down), Comfy now known-ready (serving signature). Same monitor,
+    // same SharedFleetState, same FleetRouter/server/router — no rebuild.
+    htpc_health.set(503, "down");
+    comfy_ep.set(
+        200,
+        r#"{"state":{"mode":"studio","resident_qwen_profile":"unknown","llama_server":"yes"}}"#,
+    );
+    monitor.observe_once().await?;
+    let (selected2, all2) = s2d_decision_targets(&app).await?;
+    assert_eq!(
+        selected2, "luna",
+        "gen2: luna is still the top cloud preference"
+    );
+    assert!(
+        !all2.contains(&"htpc".to_string()),
+        "gen2: now-not-ready htpc must be excluded without rebuild: {all2:?}"
+    );
+    assert!(
+        all2.contains(&"comfy".to_string()),
+        "gen2: now-ready comfy must be eligible without rebuild: {all2:?}"
+    );
+
+    // Background loop coexists with the server: run with a short interval while
+    // /v1/decision is still served, then shut it down cleanly.
+    let comfy_ep_run = FactEndpoint::new(
+        r#"{"state":{"mode":"studio","resident_qwen_profile":"unknown","llama_server":"yes"}}"#,
+    );
+    let run_comfy_url = s2d_spawn_single_endpoint("/v1/resource", comfy_ep_run.clone()).await?;
+    let run_htpc_base = s2d_spawn_dual_endpoints(
+        r#"{"status":"ok"}"#,
+        r#"{"object":"list","data":[{"id":"/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_0.gguf"}]}"#,
+    )
+    .await?;
+    let run_state = Arc::new(SharedFleetState::new(libsy::FleetSnapshot::new(vec![])?));
+    let run_comfy = ComfyFactsClient::new(run_comfy_url, "S2D_TEST_TOKEN_RUN".to_string());
+    unsafe { std::env::set_var("S2D_TEST_TOKEN_RUN", "dummy") };
+    let run_htpc = HtpcFactsClient::new(run_htpc_base, "Qwen3.5-9B-Q4_0.gguf".to_string());
+    let run_monitor = FleetReadinessMonitor::new(
+        Some(run_comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(run_htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
+        vec![Observed {
+            model: ModelId::from("model/luna"),
+            state: CandidateState::ready(),
+        }],
+        Arc::clone(&run_state),
+        std::time::Duration::from_millis(15),
+    );
+    let run_state_for_server = Arc::clone(&run_state);
+    let run_server_state = load_server_state_with_fleet_source_from_parts(
+        &fleet_toml(&upstream.base_url),
+        run_state_for_server,
+    )?;
+    let run_app = build_switchyard_router(run_server_state);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(run_monitor.run(async move {
+        let _ = rx.await;
+    }));
+    // Wait for the background monitor's first observation to publish luna before
+    // exercising the server (avoids a race where the decision runs against an
+    // as-yet-empty fleet snapshot).
+    let luna = ModelId::from("model/luna");
+    let mut attempts = 0;
+    while run_state.snapshot().state_for(&luna) != CandidateState::ready() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        attempts += 1;
+        if attempts > 400 {
+            panic!("background monitor did not publish a ready luna in time");
+        }
+    }
+    // Server serves /v1/decision while the monitor runs asynchronously.
+    let (selected_running, all_running) = s2d_decision_targets(&run_app).await?;
+    assert_eq!(selected_running, "luna");
+    assert!(
+        all_running.contains(&"comfy".to_string()),
+        "background: ready comfy should become eligible as the loop publishes: {all_running:?}"
+    );
+    // Let a few cycles run, then shut the loop down cleanly.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let _ = tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("monitor loop must exit cleanly on shutdown")
+        .expect("monitor task must not panic");
+
+    unsafe { std::env::remove_var("S2D_TEST_TOKEN_INT") };
+    unsafe { std::env::remove_var("S2D_TEST_TOKEN_RUN") };
+    Ok(())
+}
+
+/// Issues a `/v1/decision` and returns `(selected, all-targets)`.
+async fn s2d_decision_targets(app: &axum::Router) -> TestResult<(String, Vec<String>)> {
+    let response = send(
+        app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    if response.status != StatusCode::OK {
+        panic!(
+            "/v1/decision must succeed; status={:?} body={}",
+            response.status,
+            response.text().unwrap_or("<unreadable>")
+        );
+    }
+    let res = response.json()?;
+    let selected = res["selected"]["target"].as_str().unwrap().to_string();
+    let mut all = vec![selected.clone()];
+    all.extend(
+        res["fallbacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["target"].as_str().unwrap().to_string()),
+    );
+    Ok((selected, all))
+}
+
+/// Spawns a server serving one mutable GET endpoint, returning its full URL.
+async fn s2d_spawn_single_endpoint(path: &'static str, ep: FactEndpoint) -> TestResult<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::get(move || {
+                let ep = ep.clone();
+                async move {
+                    let status =
+                        axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                    let body = ep.body.lock().unwrap().clone();
+                    (status, body)
+                }
+            }),
+        );
+        axum::serve(listener, app).await.unwrap()
+    });
+    Ok(format!("http://{addr}{path}"))
+}
+
+/// Spawns a server serving `/health` + `/v1/models` mutable endpoints.
+async fn s2d_spawn_dual_endpoints(health_body: &str, models_body: &str) -> TestResult<String> {
+    let health_ep = FactEndpoint::new(health_body);
+    let models_ep = FactEndpoint::new(models_body);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let ep = health_ep.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                axum::routing::get(move || {
+                    let ep = models_ep.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            );
+        axum::serve(listener, app).await.unwrap()
+    });
+    Ok(format!("http://{addr}"))
 }

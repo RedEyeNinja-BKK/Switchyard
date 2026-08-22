@@ -160,6 +160,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Request::default()
         }
     }
 
@@ -228,6 +229,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Request::default()
         };
 
         append_note(&mut request, NOTE);

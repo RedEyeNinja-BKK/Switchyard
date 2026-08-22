@@ -2085,6 +2085,309 @@ async fn s2e2_anthropic_count_tokens_does_not_invoke_producer() -> TestResult {
     Ok(())
 }
 
+// ─── S2-F/G: development deployment-candidate lane qualification ─────────────
+//
+// Minimum useful resource/task preference policy via SEPARATE logical fleet_router
+// routes (mainline-native, no semantic classifier). Preference is expressed as
+// per-route candidate sets + preference_rank; capability/readiness/context remain
+// hard eligibility gates and are never bypassed by preference.
+
+/// A DEVELOPMENT three-lane fleet config using existing candidate identities:
+///  - localclaw/dev/general : ordinary dependable bounded work -> flash workhorse,
+///    with qualified local HTPC + context-fail-closed Comfy lower-preference
+///    optionals; V4 Pro is NOT in this lane.
+///  - localclaw/dev/tech    : explicitly local-qualified bounded work -> HTPC
+///    (exact context admission) first, flash fallback.
+///  - localclaw/dev/premium : premium reasoning -> gpt preferred, deepseek-pro
+///    fallback; flash/htpc are NOT automatic middle rungs.
+fn dev_fleet_toml(
+    flash_base: &str,
+    cloud_base: &str,
+    input_client_base: &str,
+    comfy_base: &str,
+) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.flash_client]
+format = "openai_chat"
+base_url = "{flash_base}"
+
+[llm_clients.cloud_client]
+format = "openai_chat"
+base_url = "{cloud_base}"
+
+[llm_clients.input_client]
+format = "openai_chat"
+base_url = "{input_client_base}/v1"
+
+[llm_clients.comfy_client]
+format = "openai_chat"
+base_url = "{comfy_base}"
+
+[targets.flash]
+id = "model/deepseek-v4-flash"
+llm_client = "flash_client"
+
+[targets.gpt]
+id = "model/gpt-5.6"
+llm_client = "cloud_client"
+
+[targets.pro]
+id = "model/deepseek-v4-pro"
+llm_client = "cloud_client"
+
+[targets.htpc]
+id = "model/htpc-qwen3_5"
+llm_client = "input_client"
+
+[targets.comfy]
+id = "model/comfyninja-qwen3_8"
+llm_client = "comfy_client"
+
+# --- bounded/general lane ---
+[routes.general]
+id = "localclaw/dev/general"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.general.candidates]]
+target = "flash"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+
+[[routes.general.candidates]]
+target = "htpc"
+tool_calling = false
+reasoning = false
+preference_rank = 2
+context_policy = {{ kind = "bounded", usable_context_tokens = 65536, input_token_source = "openai_chat_input_tokens" }}
+
+[[routes.general.candidates]]
+target = "comfy"
+tool_calling = true
+reasoning = true
+preference_rank = 3
+context_policy = {{ kind = "bounded", usable_context_tokens = 69888 }}
+
+# --- bounded/technical (explicitly local-qualified) lane ---
+[routes.tech]
+id = "localclaw/dev/tech"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.tech.candidates]]
+target = "htpc"
+tool_calling = false
+reasoning = false
+preference_rank = 1
+context_policy = {{ kind = "bounded", usable_context_tokens = 65536, input_token_source = "openai_chat_input_tokens" }}
+
+[[routes.tech.candidates]]
+target = "flash"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+
+# --- premium reasoning lane (GPT preferred, V4 Pro alternative; no Flash rung) ---
+[routes.premium]
+id = "localclaw/dev/premium"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.premium.candidates]]
+target = "gpt"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+
+[[routes.premium.candidates]]
+target = "pro"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+"#
+    )
+}
+
+/// A mutable readiness snapshot helper: marks `ready` candidates, all others
+/// not-ready, keyed by the fixed dev-lane model identities.
+fn dev_readiness(ready: &[&str]) -> FleetSnapshot {
+    let models = [
+        "model/deepseek-v4-flash",
+        "model/gpt-5.6",
+        "model/deepseek-v4-pro",
+        "model/htpc-qwen3_5",
+        "model/comfyninja-qwen3_8",
+    ];
+    FleetSnapshot::new(
+        models
+            .iter()
+            .map(|m| {
+                let state = if ready.contains(m) {
+                    CandidateState::ready()
+                } else {
+                    CandidateState::not_ready()
+                };
+                (ModelId::from(*m), state)
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn s2fg_dev_lane_preference_and_gates() -> TestResult {
+    let (input_mock, input_base) = InputTokenMock::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+    let cloud_upstream = MockUpstream::start().await?;
+    let comfy_upstream = MockUpstream::start().await?;
+    let toml = dev_fleet_toml(
+        &flash_upstream.base_url,
+        &cloud_upstream.base_url,
+        &input_base,
+        &comfy_upstream.base_url,
+    );
+    let shared = SharedFleetState::new(dev_readiness(&[
+        "model/deepseek-v4-flash",
+        "model/gpt-5.6",
+        "model/deepseek-v4-pro",
+        "model/htpc-qwen3_5",
+        "model/comfyninja-qwen3_8",
+    ]));
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    // 1) bounded/general: flash is the dependable workhorse (rank 1), selected even
+    //    with a context-fittable HTPC present.
+    input_mock.set_count(Some(500)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/general","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "flash");
+
+    // 2) bounded/tech: explicitly local-qualified lane -> HTPC selected (context fits).
+    input_mock.set_count(Some(500)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/tech","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "htpc");
+
+    // 3) bounded/tech with HTPC context overflow -> HTPC excluded, flash fallback.
+    input_mock.set_count(Some(70_000)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/tech","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "flash");
+
+    // 4) premium lane: GPT preferred; V4 Pro is the fallback (Flash is NOT in the
+    //    premium route).
+    let res = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/premium","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res.json()?["selected"]["target"], "gpt");
+
+    // 5) premium with GPT unavailable (not-ready) -> Pro selected, NOT Flash.
+    let shared = SharedFleetState::new(dev_readiness(&[
+        "model/deepseek-v4-flash",
+        "model/deepseek-v4-pro",
+        "model/htpc-qwen3_5",
+        "model/comfyninja-qwen3_8",
+    ]));
+    let state2 = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app2 = build_switchyard_router(state2);
+    let res2 = send(
+        &app2,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/premium","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res2.json()?["selected"]["target"], "pro");
+
+    // 6) Comfy stays context-fail-closed for automatic selection (bounded/69888 but
+    //    no exact producer); it is never selected. With only flash + comfy ready in
+    //    the general lane, flash (workhorse) still wins; with only comfy ready, the
+    //    lane fails closed (Bounded comfy without a count is not eligible).
+    let shared3 = SharedFleetState::new(dev_readiness(&[
+        "model/deepseek-v4-flash",
+        "model/comfyninja-qwen3_8",
+    ]));
+    input_mock.set_count(Some(500)).await;
+    let state3 = load_fleet_test_config(&toml, Arc::new(shared3))?;
+    let app3 = build_switchyard_router(state3);
+    let res3 = send(
+        &app3,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/general","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert_eq!(res3.json()?["selected"]["target"], "flash");
+
+    let shared4 = SharedFleetState::new(dev_readiness(&["model/comfyninja-qwen3_8"]));
+    let state4 = load_fleet_test_config(&toml, Arc::new(shared4))?;
+    let app4 = build_switchyard_router(state4);
+    let res4 = send(
+        &app4,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/general","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        })),
+    )
+    .await?;
+    assert!(
+        res4.status.is_server_error(),
+        "general lane with only a no-count Comfy must fail closed (5xx no-eligible), got {}",
+        res4.status
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn s2c_no_tool_capable_candidate_rejects_tool_override() -> TestResult {
     // A: candidate set has no tool-capable target; route-level tool_calling=true

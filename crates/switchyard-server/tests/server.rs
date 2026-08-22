@@ -1390,6 +1390,186 @@ async fn s2c_decision_reasoning_none_keeps_htpc_eligible() -> TestResult {
     Ok(())
 }
 
+// ─── FLEET-1: minimum-context requirement (wire-body structured ingress) ────
+
+/// A fleet config with STATIC qualified usable-context capacities on the
+/// candidates (separate from any exact-request admission policy). Luna is
+/// Unmanaged-for-counting but has known capacity 266_000; DeepSeek is likewise
+/// Unmanaged with known capacity 1_048_576. This mirrors the mandated
+/// separation: a cloud candidate may carry a known capacity while remaining
+/// `Unmanaged` for exact preflight counting.
+fn fleet1_toml(base_url: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.model_provider]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.luna]
+id = "model/luna"
+llm_client = "model_provider"
+
+[targets.deepseek]
+id = "model/deepseek-flash"
+llm_client = "model_provider"
+
+[routes.fleet]
+id = "localclaw/fleet1"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.fleet.candidates]]
+target = "luna"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+usable_context_tokens = 266000
+
+[[routes.fleet.candidates]]
+target = "deepseek"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+usable_context_tokens = 1048576
+"#
+    )
+}
+
+#[tokio::test]
+async fn fleet1_min_context_wire_body() -> TestResult {
+    // Wire-body proof: the codec preserves a top-level `min_context_tokens`
+    // unknown field into LlmRequest.extensions.fields (the same mechanism as
+    // work_shape), and the eligibility filter behaves per the Phase-A contract.
+    let upstream = MockUpstream::start().await?;
+    let shared = SharedFleetState::new(FleetSnapshot::new(vec![
+        (ModelId::from("model/luna"), CandidateState::ready()),
+        (
+            ModelId::from("model/deepseek-flash"),
+            CandidateState::ready(),
+        ),
+    ])?);
+    let state = load_fleet_test_config(&fleet1_toml(&upstream.base_url), Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    // (1) No declared requirement => luna (rank 1) selected; zero regression.
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet1", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["selected"]["target"], "luna");
+
+    // (2) Minimum below BOTH capacities => luna (rank 1) still selected.
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet1", "messages":[{"role":"user","content":"hi"}], "min_context_tokens": 100000}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["selected"]["target"], "luna");
+
+    // (3) Minimum above luna capacity (266_000) but below deepseek (1_048_576)
+    // => luna excluded by min-context, deepseek selected. Capacity is admission
+    // only; no ranking happens among the remaining eligible candidate.
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet1", "messages":[{"role":"user","content":"hi"}], "min_context_tokens": 300000}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["selected"]["target"], "deepseek");
+
+    // (4) Minimum above BOTH capacities => no eligible candidate => hard error.
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet1", "messages":[{"role":"user","content":"hi"}], "min_context_tokens": 2000000000}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // (5) Malformed (non-integer) => hard request failure, never silently ignored.
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet1", "messages":[{"role":"user","content":"hi"}], "min_context_tokens": "lots"}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // (6) Zero => hard request failure (zero is invalid, not "unknown").
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet1", "messages":[{"role":"user","content":"hi"}], "min_context_tokens": 0}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // No selected-model inference call occurred on any /v1/decision.
+    assert!(upstream.models().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fleet1_zero_static_capacity_config_rejected() -> TestResult {
+    // A configured static usable_context_tokens = 0 is invalid configuration
+    // and must fail load (never silently treated as UNKNOWN).
+    let upstream = MockUpstream::start().await?;
+    let bad_toml = fleet1_toml(&upstream.base_url).replace(
+        "usable_context_tokens = 266000",
+        "usable_context_tokens = 0",
+    );
+    let shared = SharedFleetState::new(FleetSnapshot::new(vec![
+        (ModelId::from("model/luna"), CandidateState::ready()),
+        (
+            ModelId::from("model/deepseek-flash"),
+            CandidateState::ready(),
+        ),
+    ])?);
+    let err = match load_fleet_test_config(&bad_toml, Arc::new(shared)) {
+        Ok(_) => panic!("usable_context_tokens = 0 must fail config load"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("zero"),
+        "error must mention the invalid zero capacity: {err}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn s2c_decision_positive_reasoning_excludes_htpc() -> TestResult {
     // F: a positive reasoning effort excludes the non-reasoning candidate (htpc).

@@ -99,8 +99,10 @@ pub enum WorkShapeSource {
 /// `reasoning` describe what the target advertises it can do; `preference_rank`
 /// is a deterministic deployment ordering (lower = more preferred);
 /// `context_policy` says whether and how preflight context admission applies;
-/// `work_shape` (when set) limits this candidate to a declared work shape under
-/// a request-sourced work-shape dispatcher.
+/// `usable_context_tokens` is the candidate's STATIC qualified usable context
+/// capacity (a configured capability fact, distinct from the exact-request
+/// admission policy); `work_shape` (when set) limits this candidate to a
+/// declared work shape under a request-sourced work-shape dispatcher.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateProfile {
     /// Target model id that will be selected when this candidate wins.
@@ -113,13 +115,24 @@ pub struct CandidateProfile {
     pub preference_rank: u16,
     /// Preflight context admission policy for this candidate.
     pub context_policy: ContextAdmissionPolicy,
+    /// Static qualified usable context capacity of this candidate.
+    ///
+    /// `Some(n)` = this deployment truthfully guarantees/configured the
+    /// candidate to serve `n` usable context tokens. `None` = capacity
+    /// UNKNOWN. `Some(0)` is invalid configuration (rejected at construction).
+    /// This is a capability fact for minimum-context eligibility — it is NOT
+    /// the exact-request admission policy, and a candidate may be `Unmanaged`
+    /// for exact preflight counting while still carrying a known capacity.
+    /// Never inferred from provider/model names.
+    pub usable_context_tokens: Option<u64>,
     /// Optional declared work-shape limitation. `None` serves any shape.
     pub work_shape: Option<WorkShape>,
 }
 
 impl CandidateProfile {
     /// Creates a candidate profile for `target` with no preflight context concern
-    /// ([`ContextAdmissionPolicy::Unmanaged`]) and no work-shape limitation.
+    /// ([`ContextAdmissionPolicy::Unmanaged`]), UNKNOWN static context capacity,
+    /// and no work-shape limitation.
     pub fn new(
         target: impl Into<ModelId>,
         tool_calling: bool,
@@ -132,6 +145,7 @@ impl CandidateProfile {
             reasoning,
             preference_rank,
             context_policy: ContextAdmissionPolicy::Unmanaged,
+            usable_context_tokens: None,
             work_shape: None,
         }
     }
@@ -139,6 +153,15 @@ impl CandidateProfile {
     /// Sets the candidate's preflight context admission policy (builder style).
     pub fn with_context_policy(mut self, policy: ContextAdmissionPolicy) -> Self {
         self.context_policy = policy;
+        self
+    }
+
+    /// Sets the candidate's static qualified usable context capacity (builder
+    /// style). A zero capacity is rejected when the router is constructed. For
+    /// a Bounded candidate, an explicitly present capacity must equal the
+    /// Bounded policy capacity (mismatch is a construction error).
+    pub fn with_usable_context_tokens(mut self, capacity: u64) -> Self {
+        self.usable_context_tokens = Some(capacity);
         self
     }
 
@@ -268,13 +291,44 @@ fn validate_profiles(profiles: &[CandidateProfile]) -> Result<()> {
     }
     for (i, a) in profiles.iter().enumerate() {
         if let ContextAdmissionPolicy::Bounded {
-            usable_context_tokens: 0,
+            usable_context_tokens,
         } = a.context_policy
         {
+            if usable_context_tokens == 0 {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "fleet router candidate {:?} has an invalid zero usable_context_tokens; \
+                         a bounded context policy must declare a positive usable capacity",
+                        a.target
+                    ),
+                });
+            }
+            // Capacity-coherence invariant (FLEET-1 review): a Bounded candidate's
+            // static usable_context_tokens, when explicitly present, MUST equal the
+            // Bounded policy capacity. Both represent the same qualified usable
+            // capacity; a mismatch is a configuration/construction error, never
+            // silently resolved. When the static field is absent, the Bounded
+            // policy capacity is the effective known static capacity for
+            // min_context_tokens eligibility (min_context_eligible reads it via
+            // the fallback below).
+            if let Some(static_cap) = a.usable_context_tokens
+                && static_cap != usable_context_tokens
+            {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "fleet router candidate {:?} has a static usable_context_tokens \
+                         ({static_cap}) that disagrees with its Bounded context-policy \
+                         capacity ({usable_context_tokens}); they must be equal",
+                        a.target
+                    ),
+                });
+            }
+        }
+        if a.usable_context_tokens == Some(0) {
             return Err(LibsyError::AlgorithmError {
                 message: format!(
-                    "fleet router candidate {:?} has an invalid zero usable_context_tokens; \
-                     a bounded context policy must declare a positive usable capacity",
+                    "fleet router candidate {:?} has an invalid zero static \
+                     usable_context_tokens; a configured capacity must be positive",
                     a.target
                 ),
             });
@@ -526,6 +580,71 @@ impl FleetRouter {
                 .unwrap_or(false)
     }
 
+    /// Declared task minimum usable-context requirement from structured request
+    /// metadata (the same normalized request-extension mechanism used for
+    /// `work_shape`). NEVER inferred from prompt text.
+    ///
+    /// Absent => `Ok(None)` (no minimum-context requirement; zero regression).
+    /// Present => must be a **positive** integer (u64, no overflow). Zero,
+    /// negative, non-integer, or malformed => `Err` (hard request/algorithm
+    /// failure, never silently ignored).
+    fn declared_min_context_tokens(
+        &self,
+        request: &switchyard_protocol::Request,
+    ) -> Result<Option<u64>> {
+        let Some(value) = request
+            .llm_request
+            .extensions
+            .fields
+            .get("min_context_tokens")
+        else {
+            return Ok(None);
+        };
+        let Some(n) = value.as_u64() else {
+            return Err(LibsyError::AlgorithmError {
+                message: format!(
+                    "declared min_context_tokens must be a positive integer, got {value}"
+                ),
+            });
+        };
+        if n == 0 {
+            return Err(LibsyError::AlgorithmError {
+                message: "declared min_context_tokens must be positive (zero is invalid)"
+                    .to_string(),
+            });
+        }
+        Ok(Some(n))
+    }
+
+    /// Minimum-context eligibility for one candidate under the declared task
+    /// requirement.
+    ///
+    /// No declared requirement => every candidate eligible. A declared minimum
+    /// requires the candidate's STATIC qualified usable context capacity (a
+    /// configured capability fact, separate from the exact-request admission
+    /// policy) to be known and >= the requirement. Unknown capacity + declared
+    /// requirement => excluded (fail closed). Unknown capacity + no requirement
+    /// => existing behavior preserved. Once the minimum is satisfied, context
+    /// size NEVER affects ranking — this is admission only.
+    fn min_context_eligible(profile: &CandidateProfile, declared: Option<u64>) -> bool {
+        let Some(min) = declared else {
+            return true;
+        };
+        // Effective known static capacity: the explicit static field when
+        // present; for a Bounded candidate WITHOUT an explicit static field, the
+        // Bounded policy capacity is the effective known static capacity (the
+        // coherence invariant guarantees they would be equal if both present).
+        match profile.usable_context_tokens {
+            Some(cap) => cap >= min,
+            None => match profile.context_policy {
+                ContextAdmissionPolicy::Bounded {
+                    usable_context_tokens,
+                } => usable_context_tokens >= min,
+                ContextAdmissionPolicy::Unmanaged => false,
+            },
+        }
+    }
+
     /// Work-shape eligibility for one candidate under the declared request shape.
     fn work_shape_eligible(profile: &CandidateProfile, declared: Option<WorkShape>) -> bool {
         match declared {
@@ -551,6 +670,9 @@ impl FleetRouter {
             || self.declared_legacy_reasoning(request);
         let declared_shape = self.declared_work_shape(request);
         let max_output = request.llm_request.output.max_output_tokens;
+        // Declared task minimum usable-context requirement. Malformed/zero is a
+        // HARD request failure (never silently ignored); absent is no requirement.
+        let min_context = self.declared_min_context_tokens(request)?;
         // One request consumes exactly one coherent factual snapshot.
         let snapshot = self.snapshot();
 
@@ -570,6 +692,13 @@ impl FleetRouter {
             // to a different declared work shape is excluded. A candidate that
             // serves any shape (None) remains eligible.
             if !Self::work_shape_eligible(profile, declared_shape) {
+                continue;
+            }
+            // Minimum-context filter (declared task requirement): a candidate with
+            // known static usable context capacity >= the minimum may remain
+            // eligible; UNKNOWN capacity + declared requirement => excluded
+            // (fail closed). Admission only — never a ranking signal.
+            if !Self::min_context_eligible(profile, min_context) {
                 continue;
             }
             // Readiness filter: only immediately-eligible (ready, no transition
@@ -1690,5 +1819,291 @@ mod tests {
             !all.contains(&"luna".to_string()),
             "legacy work_class=reasoning must select the thinking candidate, never luna: {all:?}"
         );
+    }
+
+    // --- FLEET-1: minimum-context requirement (structured ingress) ------------
+
+    /// A request with a declared `min_context_tokens` in structured extensions.
+    fn min_ctx_req(min: Option<u64>) -> Request {
+        let mut req = text_req();
+        if let Some(n) = min {
+            req.llm_request
+                .extensions
+                .fields
+                .insert("min_context_tokens".into(), serde_json::json!(n));
+        }
+        req
+    }
+
+    /// A request with a malformed (non-integer) `min_context_tokens`.
+    fn bad_min_ctx_req() -> Request {
+        let mut req = text_req();
+        req.llm_request
+            .extensions
+            .fields
+            .insert("min_context_tokens".into(), serde_json::json!("lots"));
+        req
+    }
+
+    /// A request with a zero `min_context_tokens`.
+    fn zero_min_ctx_req() -> Request {
+        let mut req = text_req();
+        req.llm_request
+            .extensions
+            .fields
+            .insert("min_context_tokens".into(), serde_json::json!(0));
+        req
+    }
+
+    /// A candidate with a static qualified usable context capacity (builder).
+    fn capacity_profile(target: &str, rank: u16, cap: u64) -> CandidateProfile {
+        CandidateProfile::new(target, true, true, rank).with_usable_context_tokens(cap)
+    }
+
+    #[test]
+    fn min_context_absent_preserves_behavior() {
+        // A: no declared requirement => candidate with UNKNOWN capacity stays eligible.
+        let router = FleetRouter::new(
+            vec![CandidateProfile::new("cloud", true, true, 1)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        let (selected, _) = router.decide(&text_req()).unwrap();
+        assert_eq!(selected.to_string(), "cloud");
+    }
+
+    #[test]
+    fn min_context_below_capacity_eligible() {
+        // B: valid minimum below candidate capacity => eligible.
+        let router = FleetRouter::new(
+            vec![capacity_profile("cloud", 1, 200_000)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        let (selected, _) = router.decide(&min_ctx_req(Some(50_000))).unwrap();
+        assert_eq!(selected.to_string(), "cloud");
+    }
+
+    #[test]
+    fn min_context_exact_boundary_eligible() {
+        // C: exact boundary (min == capacity) => eligible.
+        let router = FleetRouter::new(
+            vec![capacity_profile("cloud", 1, 200_000)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        let (selected, _) = router.decide(&min_ctx_req(Some(200_000))).unwrap();
+        assert_eq!(selected.to_string(), "cloud");
+    }
+
+    #[test]
+    fn min_context_above_capacity_excluded() {
+        // D: requirement above capacity => candidate excluded => no eligible candidate.
+        let router = FleetRouter::new(
+            vec![capacity_profile("cloud", 1, 200_000)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        assert!(router.decide(&min_ctx_req(Some(200_001))).is_err());
+    }
+
+    #[test]
+    fn min_context_unknown_capacity_declared_excluded() {
+        // E: unknown capacity + declared requirement => candidate excluded (fail closed).
+        let router = FleetRouter::new(
+            vec![CandidateProfile::new("cloud", true, true, 1)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        assert!(router.decide(&min_ctx_req(Some(1_000))).is_err());
+    }
+
+    #[test]
+    fn min_context_unknown_capacity_no_requirement_preserved() {
+        // F: unknown capacity + no requirement => existing behavior preserved.
+        let router = FleetRouter::new(
+            vec![CandidateProfile::new("cloud", true, true, 1)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        let (selected, _) = router.decide(&text_req()).unwrap();
+        assert_eq!(selected.to_string(), "cloud");
+    }
+
+    #[test]
+    fn min_context_malformed_hard_failure() {
+        // G: malformed (non-integer) => hard algorithm error, not silently ignored.
+        let router = FleetRouter::new(
+            vec![capacity_profile("cloud", 1, 200_000)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        let err = router.decide(&bad_min_ctx_req()).unwrap_err();
+        assert!(
+            err.to_string().contains("min_context_tokens"),
+            "expected min_context_tokens error, got {err}"
+        );
+    }
+
+    #[test]
+    fn min_context_zero_hard_failure() {
+        // H: zero => hard algorithm error (zero is invalid, not "unknown").
+        let router = FleetRouter::new(
+            vec![capacity_profile("cloud", 1, 200_000)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        let err = router.decide(&zero_min_ctx_req()).unwrap_err();
+        assert!(
+            err.to_string().contains("positive"),
+            "expected positive-integer error, got {err}"
+        );
+    }
+
+    #[test]
+    fn min_context_larger_capacity_does_not_rank() {
+        // I: once the minimum is satisfied, capacity NEVER affects ranking.
+        // Preference rank wins regardless of which candidate has the larger capacity.
+        let profiles = vec![
+            capacity_profile("small", 1, 100_000),
+            capacity_profile("large", 2, 500_000),
+        ];
+        let state = SharedFleetState::new(
+            FleetSnapshot::new(vec![
+                (ModelId::from("small"), CandidateState::ready()),
+                (ModelId::from("large"), CandidateState::ready()),
+            ])
+            .unwrap(),
+        );
+        let router = FleetRouter::with_source(profiles, Arc::new(state)).unwrap();
+        // Both satisfy min 50k; rank 1 (small) wins despite smaller capacity.
+        let (selected, _) = router.decide(&min_ctx_req(Some(50_000))).unwrap();
+        assert_eq!(selected.to_string(), "small");
+        // A large min that only `large` satisfies => large wins (admission only).
+        let (selected, _) = router.decide(&min_ctx_req(Some(400_000))).unwrap();
+        assert_eq!(selected.to_string(), "large");
+    }
+
+    #[test]
+    fn min_context_combined_bounded_exact_fit() {
+        // Combined admission: a BOUNDED candidate must satisfy BOTH the declared
+        // minimum AND the exact request fit (input + output <= capacity).
+        let profiles = vec![bounded_profile("local", 1, 65_536).with_usable_context_tokens(65_536)];
+        let router = FleetRouter::new(
+            profiles.clone(),
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        // (1) minimum satisfied but exact fit fails (60k + 8k > 65,536) => excluded.
+        let mut req = min_ctx_req(Some(60_000));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 60_000)]);
+        assert!(router.decide(&req).is_err());
+        // (2) exact fit OK but minimum not met (min 100k > 65,536) => excluded.
+        let mut req = min_ctx_req(Some(100_000));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 10_000)]);
+        assert!(router.decide(&req).is_err());
+        // (3) both satisfied (60k + 5k <= 65,536; min 60k <= 65,536) => eligible.
+        let mut req = min_ctx_req(Some(60_000));
+        req.llm_request.output.max_output_tokens = Some(5_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 60_000)]);
+        let (selected, _) = router.decide(&req).unwrap();
+        assert_eq!(selected.to_string(), "local");
+    }
+
+    #[test]
+    fn min_context_zero_capacity_config_rejected() {
+        // J: static capacity Some(0) is invalid configuration at construction.
+        let err = FleetRouter::new(
+            vec![CandidateProfile::new("cloud", true, true, 1).with_usable_context_tokens(0)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("zero"),
+            "expected zero-capacity config error, got {err}"
+        );
+    }
+
+    // --- FLEET-1 review: capacity-coherence invariant (Bounded vs static) ----
+
+    #[test]
+    fn bounded_without_static_uses_policy_capacity_for_min() {
+        // 1: Bounded(B) + no static field + min <= B => min eligibility uses B.
+        // (Existing `bounded_profile` helper builds exactly this shape.) The
+        // Bounded exact-fit admission still requires candidate input facts +
+        // an output budget; supply them so only min-context is under test.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        let mut req = min_ctx_req(Some(65_536));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 50_000)]);
+        let (selected, _) = router.decide(&req).unwrap();
+        assert_eq!(selected.to_string(), "local");
+        // Above B (min 65,537) => excluded (fail closed).
+        let mut req = min_ctx_req(Some(65_537));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 50_000)]);
+        assert!(router.decide(&req).is_err());
+    }
+
+    #[test]
+    fn bounded_with_matching_static_accepted() {
+        // 2: Bounded(B) + static B => accepted (coherent).
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536).with_usable_context_tokens(65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        let mut req = min_ctx_req(Some(65_536));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 50_000)]);
+        let (selected, _) = router.decide(&req).unwrap();
+        assert_eq!(selected.to_string(), "local");
+    }
+
+    #[test]
+    fn bounded_with_mismatched_static_rejected() {
+        // 3: Bounded(B) + static C where C != B => rejected at construction.
+        let err = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536).with_usable_context_tokens(69_888)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees"),
+            "expected capacity-coherence error, got {err}"
+        );
+    }
+
+    #[test]
+    fn bounded_combined_min_and_exact_fit_unchanged() {
+        // 4: combined minimum + exact-fit behavior unchanged when coherent.
+        let profiles = vec![bounded_profile("local", 1, 65_536).with_usable_context_tokens(65_536)];
+        let router = FleetRouter::new(
+            profiles,
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        // min ok, exact-fit fails (60k + 8k > 65,536) => excluded.
+        let mut req = min_ctx_req(Some(60_000));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 60_000)]);
+        assert!(router.decide(&req).is_err());
+        // exact-fit ok, min fails (min 100k > 65,536) => excluded.
+        let mut req = min_ctx_req(Some(100_000));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 10_000)]);
+        assert!(router.decide(&req).is_err());
+        // both ok => eligible.
+        let mut req = min_ctx_req(Some(60_000));
+        req.llm_request.output.max_output_tokens = Some(5_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 60_000)]);
+        let (selected, _) = router.decide(&req).unwrap();
+        assert_eq!(selected.to_string(), "local");
     }
 }

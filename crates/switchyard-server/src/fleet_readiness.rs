@@ -23,8 +23,13 @@
 //! transition" base state. That is distinct from a live provider health
 //! guarantee (documented, not health-monitored here).
 //!
-//! The server-owned seam is exercised by the normal runtime path via
-//! [`FleetReadinessMonitor`], so its types are not dead code.
+//! [`FleetReadinessMonitor`] is a reusable switchyard-server-owned / server-side
+//! readiness component that an explicit runtime owner can construct and run in a
+//! background Tokio task alongside the server using the same `SharedFleetState`.
+//! Automatic stock server-startup wiring (so `run_server`/`BoundServer` would
+//! start the monitor by itself) is intentionally deferred to the later migration
+//! gate; in S2-D the monitor is constructed and run explicitly by the
+//! development runtime proof, not auto-wired into the stock server startup.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,15 +144,10 @@ impl ComfyFactsClient {
         if token.trim().is_empty() {
             return Err("credential env var is empty (fail closed)".into());
         }
-        // Guard drops the credential on every path (success or error) before the
-        // future completes; it is never retained in any struct.
-        struct DropBearer(String);
-        impl Drop for DropBearer {
-            fn drop(&mut self) {
-                self.0.clear();
-            }
-        }
-        let _bearer = DropBearer(token.clone());
+        // The credential is read at observation time and used request-locally for
+        // this one HTTP call, then dropped at the end of this function (normal
+        // request-local lifetime). It is never stored/retained in the
+        // `ComfyFactsClient` struct, and its value is never logged or debugged.
         let response = self
             .client
             .get(&self.url)

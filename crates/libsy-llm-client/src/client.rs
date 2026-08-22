@@ -379,7 +379,7 @@ impl TranslatingLlmClient {
             &self.client
         };
         let builder = client.post(url).json(body);
-        let builder = forward_metadata_headers(builder, metadata);
+        let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
@@ -735,16 +735,34 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     }
 }
 
-// Forwards caller-supplied metadata headers except credentials and client-owned headers.
+// Forwards caller-supplied metadata headers except credentials, client-owned
+// headers, and headers the backend overrides via `extra_headers`.
+//
+// A backend that configures a canonical header (e.g. ThaiLLM's `User-Agent` to a
+// fixed value the upstream WAF requires) must win exactly once: suppressing any
+// inbound header whose name matches an `extra_headers` key here means the backend
+// value applied later by `apply_extra_headers` is not duplicated or shadowed by a
+// caller-supplied one. Comparison is case-insensitive; auth/credential headers are
+// already reserved and never forwarded.
 fn forward_metadata_headers(
     mut builder: RequestBuilder,
     metadata: Option<&Metadata>,
+    backend: &Backend,
 ) -> RequestBuilder {
     let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
         return builder;
     };
     for (name, value) in headers {
         if is_reserved_header(name.as_str()) {
+            continue;
+        }
+        // The backend overrides this header via extra_headers; do not forward the
+        // inbound value so the backend's configured value is applied exactly once.
+        if backend
+            .extra_headers()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(name.as_str()))
+        {
             continue;
         }
         builder = builder.header(name, value);
@@ -976,6 +994,16 @@ mod tests {
     ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.extra_body = extra_body;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    // A one-model config list whose backend carries fixed `extra_headers`.
+    fn chat_map_with_extra_headers(
+        base_url: &str,
+        extra_headers: BTreeMap<String, String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.extra_headers = extra_headers;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
@@ -2070,6 +2098,71 @@ mod tests {
         assert!(!received.headers.contains_key("api-key"));
         assert!(!received.headers.contains_key("openai-organization"));
         assert!(!received.headers.contains_key("openai-project"));
+        Ok(())
+    }
+
+    // A backend that configures a canonical header via `extra_headers` must win
+    // exactly once: an inbound caller header whose name matches an `extra_headers`
+    // key is suppressed so the backend value applies once (not duplicated or
+    // shadowed by a caller-supplied value). ThaiLLM's fixed User-Agent is the
+    // production case (the upstream WAF requires the canonical UA).
+    #[tokio::test]
+    async fn extra_headers_override_inbound_headers_exactly_once()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let mut extra_headers = BTreeMap::new();
+        extra_headers.insert(
+            "User-Agent".to_string(),
+            "Switchyard/backend-canonical-ua".to_string(),
+        );
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
+            "http://127.0.0.1:9/v1",
+            extra_headers,
+        ))?;
+        let backend = client
+            .backend_for(&ModelId::from("gpt"), WireFormat::OpenAiChat)
+            .unwrap();
+
+        // Caller metadata carries its own User-Agent plus a passthrough header we
+        // expect to be forwarded (the backend does not override it).
+        let mut caller_headers = http::HeaderMap::new();
+        caller_headers.insert("user-agent", http::HeaderValue::from_static("caller-ua"));
+        caller_headers.insert("x-resource-ref", http::HeaderValue::from_static("ref-1"));
+
+        let builder = reqwest::Client::new().post("http://127.0.0.1:9/v1/chat/completions");
+        let builder = forward_metadata_headers(
+            builder,
+            Some(&Metadata {
+                session_id: None,
+                agent_id: None,
+                task_id: None,
+                correlation_id: None,
+                extra_metadata: None,
+                http_headers: Some(caller_headers),
+                wire_format: None,
+                ..Default::default()
+            }),
+            backend,
+        );
+        let builder = apply_extra_headers(builder, backend);
+        let request = builder.build().expect("request builds");
+
+        // Reserved/suppressed inbound override: the caller's User-Agent is NOT
+        // forwarded; the backend's canonical value is set exactly once.
+        let ua_values: Vec<&str> = request
+            .headers()
+            .get_all("user-agent")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(ua_values, vec!["Switchyard/backend-canonical-ua"]);
+        // Non-overridden inbound header still forwards.
+        assert_eq!(
+            request
+                .headers()
+                .get("x-resource-ref")
+                .map(|v| v.to_str().unwrap()),
+            Some("ref-1"),
+        );
         Ok(())
     }
 

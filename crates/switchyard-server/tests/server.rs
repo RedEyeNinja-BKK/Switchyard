@@ -26,7 +26,7 @@ use switchyard_protocol::ModelId;
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_server::config::{load_server_state, load_server_state_with_fleet_source};
 use switchyard_server::fleet_readiness::{
-    ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed,
+    ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed, ResourceStateFactsClient,
 };
 use switchyard_server::{
     BoundServer, DEFAULT_MAX_REQUEST_BODY_BYTES, ServerRunOptions, ServerState,
@@ -2536,6 +2536,232 @@ async fn s2h_runtime_owner_shares_state_and_stops_cleanly() -> TestResult {
         .expect("server must stop promptly on shutdown")??;
     unsafe { std::env::remove_var("S2H_TEST_TOKEN") };
     Ok(())
+}
+
+// A `localclaw/smart`-style fleet_router (luna rank1, deepseek rank2) served via
+// the S2-H runtime-owner seam, with LIVE OpenAI weekly / DeepSeek resource facts
+// gating the two cloud candidates on the SAME SharedFleetState. Proves the
+// recovered smart-route semantics end-to-end: OpenAI healthy + DeepSeek healthy
+// -> luna selected; OpenAI confirmed-exhausted -> deepseek selected (fallback
+// becomes permissible), never a spill while OpenAI state is merely unknown.
+#[tokio::test]
+async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> TestResult {
+    // Mutable OpenAI resource payload (healthy at first).
+    let openai_state = Arc::new(tokio::sync::Mutex::new(serde_json::json!({
+        "available": true, "limit_reached": false, "spend_control_reached": false,
+        "windows": {"primary": {"used_percent": 11}}
+    })));
+    let openai_payload = Arc::clone(&openai_state);
+    let openai_router = axum::Router::new().route(
+        "/resource/openai-codex",
+        axum::routing::get(move || {
+            let payload = Arc::clone(&openai_payload);
+            async move { (StatusCode::OK, Json(payload.lock().await.clone())) }
+        }),
+    );
+    let openai_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let openai_addr = openai_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(openai_listener, openai_router).await.unwrap() });
+
+    // Static DeepSeek balance (healthy, positive).
+    let deepseek_router = axum::Router::new().route(
+        "/user/balance",
+        axum::routing::get(|| async move {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "is_available": true,
+                    "balance_infos": [{"currency":"CNY","total_balance":"90.75","granted_balance":"0.00","topped_up_balance":"90.75"}]
+                })),
+            )
+        }),
+    );
+    let deepseek_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let deepseek_addr = deepseek_listener.local_addr()?;
+    tokio::spawn(async move {
+        axum::serve(deepseek_listener, deepseek_router)
+            .await
+            .unwrap()
+    });
+
+    // ONE shared state across server + monitor.
+    let state = Arc::new(SharedFleetState::new(FleetSnapshot::new(vec![])?));
+
+    // Resource-state client over the local mock surfaces + monitor gating luna
+    // (OpenAI) and deepseek (DeepSeek). No Comfy / HTPC in this focused test.
+    let resource = ResourceStateFactsClient::new(
+        Some(format!("http://{openai_addr}/resource/openai-codex")),
+        Some("S2H_RES_OPENAI_TOKEN".into()),
+        Some(format!("http://{deepseek_addr}/user/balance")),
+        Some("S2H_RES_DEEPSEEK_KEY".into()),
+        Some("CNY".into()),
+    );
+    unsafe { std::env::set_var("S2H_RES_OPENAI_TOKEN", "dummy") };
+    unsafe { std::env::set_var("S2H_RES_DEEPSEEK_KEY", "dummy") };
+
+    let monitor = FleetReadinessMonitor::new(
+        // No Comfy / HTPC -> fail-closed not-ready (unused candidates).
+        ComfyFactsClient::new("http://127.0.0.1:9/resource".into(), "S2H_RES_NONE".into()),
+        ModelId::from("model/comfyninja-qwen3_8"),
+        HtpcFactsClient::new("http://127.0.0.1:9".into(), "none".into()),
+        ModelId::from("model/htpc-qwen3_5"),
+        vec![],
+        Arc::clone(&state),
+        std::time::Duration::from_millis(30),
+    )
+    .with_resource(
+        resource,
+        vec![ModelId::from("model/gpt-5.6")], // luna gated on OpenAI weekly
+        vec![],                               // no OpenClaw gating in this test
+        vec![ModelId::from("model/deepseek-v4-flash")], // deepseek gated on balance
+    );
+
+    // FleetRouter server over the SAME state: a smart-style route with luna
+    // (rank1) + deepseek (rank2). Cloud clients mocked.
+    let luna_upstream = MockUpstream::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+    let toml = smart_resource_toml(&luna_upstream.base_url, &flash_upstream.base_url);
+    let server_state = load_fleet_test_config(&toml, state.clone())?;
+    let options = ServerRunOptions {
+        addr: "127.0.0.1:0".parse()?,
+        backlog: 1024,
+        dry_run: false,
+        shutdown_timeout: std::time::Duration::from_secs(2),
+        tls: None,
+    };
+    let bound = BoundServer::bind(server_state, options)?;
+    let bound_addr = bound.local_addr();
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        bound
+            .serve_with_fleet_monitor(
+                async move {
+                    let _ = _shutdown_rx.await;
+                },
+                monitor,
+            )
+            .await
+    });
+
+    let http = reqwest::Client::new();
+    let smart_req = |effort: Option<&str>| {
+        let mut req = json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/smart","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+        });
+        // A non-thinking request carries no reasoning effort; a deliberate one does.
+        if let Some(e) = effort {
+            req["request"]["reasoning"] = json!({"effort": e});
+        }
+        req
+    };
+
+    // (1) OpenAI healthy + DeepSeek healthy -> non-thinking selects luna (rank1).
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "luna",
+        "healthy OpenAI must gate the luna candidate ready and select it first: {body}"
+    );
+
+    // (2) Flip OpenAI to confirmed exhaustion; DeepSeek stays healthy. After a
+    // monitor cycle, a non-thinking request must fall to deepseek (fallback now
+    // permissible). It must NOT fail merely because telemetry earlier existed.
+    *openai_state.lock().await = json!({
+        "available": true, "limit_reached": true, "spend_control_reached": false,
+        "windows": {"primary": {"used_percent": 100}}
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "confirmed OpenAI exhaustion must make luna not-ready and select deepseek: {body}"
+    );
+
+    // (3) A deliberate (thinking) request on the healthy-at-exhaustion state must
+    // select deepseek (thinking capable) only; luna (non-thinking) is excluded by
+    // the reasoning capability filter regardless of OpenAI health.
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(Some("high")))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "a deliberate request must select the thinking deepseek candidate: {body}"
+    );
+    assert!(
+        body["fallbacks"]
+            .as_array()
+            .map(|f| f.iter().all(|x| x["target"] != "luna"))
+            .unwrap_or(false),
+        "a deliberate request must never fall back to the non-thinking luna: {body}"
+    );
+
+    // Clean shutdown.
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), serve_task)
+        .await
+        .expect("server must stop promptly on shutdown")??;
+    unsafe { std::env::remove_var("S2H_RES_OPENAI_TOKEN") };
+    unsafe { std::env::remove_var("S2H_RES_DEEPSEEK_KEY") };
+    Ok(())
+}
+
+/// A `localclaw/smart`-style fleet_router TOML: luna (rank1, non-thinking) and
+/// deepseek (rank2, thinking-capable). Luna and deepseek are distinct model ids.
+fn smart_resource_toml(luna_base: &str, deepseek_base: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.luna_client]
+format = "openai_chat"
+base_url = "{luna_base}"
+
+[llm_clients.deepseek_client]
+format = "openai_chat"
+base_url = "{deepseek_base}"
+
+[targets.luna]
+id = "model/gpt-5.6"
+llm_client = "luna_client"
+
+[targets.deepseek]
+id = "model/deepseek-v4-flash"
+llm_client = "deepseek_client"
+
+[routes.smart]
+id = "localclaw/dev/smart"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+
+[[routes.smart.candidates]]
+target = "luna"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+
+[[routes.smart.candidates]]
+target = "deepseek"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+"#
+    )
 }
 
 #[tokio::test]

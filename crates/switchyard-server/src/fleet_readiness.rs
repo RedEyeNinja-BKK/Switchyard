@@ -327,7 +327,252 @@ fn fleet_basename(id: &str) -> &str {
     }
 }
 
+// --- Resource-state facts (OpenAI weekly allowance / DeepSeek balance) -------
+
+/// Sanitized OpenAI resource payload from a provider bridge's read-only
+/// `/resource/openai-codex` surface (the same contract the old smart-routing
+/// pool consumed). Only the fields needed to classify weekly-allowance
+/// eligibility are retained; no credential or account identity is parsed.
+#[derive(serde::Deserialize, Debug, Default)]
+struct OpenAiResourceState {
+    #[serde(default)]
+    available: Option<bool>,
+    #[serde(default)]
+    limit_reached: Option<bool>,
+    #[serde(default)]
+    spend_control_reached: Option<bool>,
+    #[serde(default)]
+    windows: Option<OpenAiWindows>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct OpenAiWindows {
+    #[serde(default)]
+    primary: Option<OpenAiPrimaryWindow>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct OpenAiPrimaryWindow {
+    #[serde(rename = "used_percent", default)]
+    used_percent: Option<f64>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct DeepSeekResourceState {
+    #[serde(rename = "is_available", default)]
+    is_available: Option<bool>,
+    #[serde(default)]
+    balance_infos: Option<Vec<DeepSeekBalanceInfo>>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct DeepSeekBalanceInfo {
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(rename = "total_balance", default)]
+    total_balance: Option<String>,
+}
+
+/// The preserved old smart-routing eligibility rule for the OpenAI weekly
+/// included allowance (verified live against the deployed source `resource.rs`):
+/// a candidate is READY (eligible) only while the allowance is confirmed
+/// available and not exhausted. **Unknown telemetry does NOT sanction spill**:
+/// an OpenAI candidate with `available=true` but missing/unknown `used_percent`
+/// remains ready (weekly_eligible's `unwrap_or(true)`).
+///
+/// This deliberately keeps **technical readiness** (provider can be attempted)
+/// separate from **resource policy** (included GPT allocation
+/// exhausted/unknown) — the old operator principle preserved.
+fn classify_openai_weekly(state: &OpenAiResourceState) -> CandidateState {
+    let available = state.available.unwrap_or(false);
+    let limit_reached = state.limit_reached.unwrap_or(false);
+    let spend_control = state.spend_control_reached.unwrap_or(false);
+    let used = state
+        .windows
+        .as_ref()
+        .and_then(|w| w.primary.as_ref())
+        .and_then(|p| p.used_percent);
+    // Confirmed exhaustion -> not ready (fallback may be permissible downstream).
+    // Unknown used% with available=true -> ready (do NOT spill merely because a
+    // monitoring field is missing).
+    let weekly_eligible =
+        available && !limit_reached && !spend_control && used.is_none_or(|u| u < 100.0);
+    if weekly_eligible {
+        CandidateState::ready()
+    } else {
+        CandidateState::not_ready()
+    }
+}
+
+/// The preserved old smart-routing DeepSeek eligibility rule: READY only when the
+/// provider reports the configured-currency balance available AND positive
+/// (parsed `total_balance > 0.0`). Unknown/error state is not_ready (fail closed;
+/// no cost engine is built here).
+fn classify_deepseek(state: &DeepSeekResourceState, currency: &str) -> CandidateState {
+    let is_available = state.is_available.unwrap_or(false);
+    let balance = state
+        .balance_infos
+        .as_ref()
+        .and_then(|infos| {
+            infos.iter().find(|b| {
+                b.currency
+                    .as_deref()
+                    .map(|c| c.eq_ignore_ascii_case(currency))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|b| b.total_balance.as_deref())
+        .and_then(|s| s.trim().parse::<f64>().ok());
+    let eligible = is_available && balance.is_some_and(|b| b > 0.0);
+    if eligible {
+        CandidateState::ready()
+    } else {
+        CandidateState::not_ready()
+    }
+}
+
+/// Read-only client for the sanitized resource-state surfaces (OpenAI weekly
+/// allowance via a provider bridge `/resource/openai-codex`, and the official
+/// DeepSeek `/user/balance` endpoint).
+///
+/// The bearer/api credential is read from an env-var **name** at request time and
+/// dropped on every path; values are never stored, logged, debugged, or printed.
+pub struct ResourceStateFactsClient {
+    openai_url: Option<String>,
+    openai_auth_token_env: Option<String>,
+    /// A second, caller-separated OpenAI OAuth pool (e.g. an OpenClaw-owned
+    /// provider bridge). Kept separate so a turnstone/Hermes Luna lane and an
+    /// OpenClaw Luna lane gate on their own allowance, never each other's.
+    openclaw_openai_url: Option<String>,
+    openclaw_openai_auth_token_env: Option<String>,
+    deepseek_url: Option<String>,
+    deepseek_api_key_env: Option<String>,
+    deepseek_currency: Option<String>,
+    client: Client,
+}
+
+impl std::fmt::Debug for ResourceStateFactsClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceStateFactsClient")
+            .field("openai_url", &self.openai_url)
+            .field("openai_auth_token_env", &self.openai_auth_token_env)
+            .field("openclaw_openai_url", &self.openclaw_openai_url)
+            .field(
+                "openclaw_openai_auth_token_env",
+                &self.openclaw_openai_auth_token_env,
+            )
+            .field("deepseek_url", &self.deepseek_url)
+            .field("deepseek_api_key_env", &self.deepseek_api_key_env)
+            .field("deepseek_currency", &self.deepseek_currency)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResourceStateFactsClient {
+    /// A client observing the given sanitized OpenAI and/or DeepSeek resource
+    /// surfaces. Pass `None` for a source not configured. `openai_*` is the
+    /// primary OpenAI OAuth pool; `openclaw_openai_*` is an optional separately
+    /// owned OpenAI OAuth pool.
+    pub fn new(
+        openai_url: Option<String>,
+        openai_auth_token_env: Option<String>,
+        deepseek_url: Option<String>,
+        deepseek_api_key_env: Option<String>,
+        deepseek_currency: Option<String>,
+    ) -> Self {
+        Self {
+            openai_url,
+            openai_auth_token_env,
+            openclaw_openai_url: None,
+            openclaw_openai_auth_token_env: None,
+            deepseek_url,
+            deepseek_api_key_env,
+            deepseek_currency,
+            client: factual_client(),
+        }
+    }
+
+    /// Configures the optional second (OpenClaw-owned) OpenAI OAuth pool.
+    pub fn with_openclaw_openai(mut self, url: String, auth_token_env: String) -> Self {
+        self.openclaw_openai_url = Some(url);
+        self.openclaw_openai_auth_token_env = Some(auth_token_env);
+        self
+    }
+
+    /// One read-only observation of the OpenClaw-owned OpenAI weekly allowance.
+    pub async fn observe_openai_openclaw(&self) -> CandidateState {
+        let (Some(url), Some(token_env)) = (
+            &self.openclaw_openai_url,
+            &self.openclaw_openai_auth_token_env,
+        ) else {
+            return CandidateState::not_ready();
+        };
+        observe_openai_generic(&self.client, url, token_env).await
+    }
+
+    /// One read-only observation of the OpenAI weekly allowance via the bridge
+    /// surface. Classifies eligibility per [`classify_openai_weekly`]; any fetch
+    /// failure or malformed payload resolves to `not_ready` (fail closed).
+    pub async fn observe_openai(&self) -> CandidateState {
+        let (Some(url), Some(token_env)) = (&self.openai_url, &self.openai_auth_token_env) else {
+            return CandidateState::not_ready();
+        };
+        observe_openai_generic(&self.client, url, token_env).await
+    }
+
+    /// One read-only observation of the DeepSeek configured-currency balance.
+    /// Classifies per [`classify_deepseek`]; fetch failure or missing currency
+    /// entry resolves to `not_ready` (fail closed).
+    pub async fn observe_deepseek(&self) -> CandidateState {
+        let (Some(url), Some(key_env), Some(currency)) = (
+            &self.deepseek_url,
+            &self.deepseek_api_key_env,
+            &self.deepseek_currency,
+        ) else {
+            return CandidateState::not_ready();
+        };
+        let key = std::env::var(key_env)
+            .map_err(|_| "credential env not set")
+            .ok();
+        let Some(key) = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) else {
+            return CandidateState::not_ready();
+        };
+        let response = self.client.get(url).bearer_auth(&key).send().await;
+        match response {
+            Ok(r) if r.status().is_success() => match r.json::<DeepSeekResourceState>().await {
+                Ok(state) => classify_deepseek(&state, currency),
+                Err(_) => CandidateState::not_ready(),
+            },
+            _ => CandidateState::not_ready(),
+        }
+    }
+}
+
 // --- Producer -----------------------------------------------------------------
+
+/// Shared read-only OpenAI weekly-allowance observation for one OpenAI OAuth
+/// bridge surface. Reads the credential from the env var NAME at request time
+/// and drops it on every path; failure or malformed payload resolves to
+/// `not_ready` (fail closed).
+async fn observe_openai_generic(client: &Client, url: &str, token_env: &str) -> CandidateState {
+    let token = std::env::var(token_env)
+        .map_err(|_| "credential env not set")
+        .ok();
+    let Some(token) = token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    else {
+        return CandidateState::not_ready();
+    };
+    let response = client.get(url).bearer_auth(&token).send().await;
+    match response {
+        Ok(r) if r.status().is_success() => match r.json::<OpenAiResourceState>().await {
+            Ok(state) => classify_openai_weekly(&state),
+            Err(_) => CandidateState::not_ready(),
+        },
+        _ => CandidateState::not_ready(),
+    }
+}
 
 /// Assembles one coherent [`FleetSnapshot`] from observed facts and writes it
 /// atomically to a shared [`SharedFleetState`].
@@ -405,6 +650,17 @@ pub struct FleetReadinessMonitor {
     /// Static cloud base states: "configured / immediately attemptable", never a
     /// live provider health guarantee.
     cloud_base: Vec<Observed>,
+    /// Optional live resource-state facts (OpenAI weekly / DeepSeek balance) that
+    /// gate the readiness of cloud resource-gated candidates on the same cycle.
+    resource: Option<ResourceStateFactsClient>,
+    /// Cloud candidates whose readiness is gated by the OpenAI weekly allowance
+    /// (e.g. a premium Luna lane): ready only while the allowance is eligible.
+    openai_gated: Vec<ModelId>,
+    /// Cloud candidates whose readiness is gated by the separate OpenClaw-owned
+    /// OpenAI OAuth allowance.
+    openclaw_openai_gated: Vec<ModelId>,
+    /// Cloud candidates whose readiness is gated by the DeepSeek balance.
+    deepseek_gated: Vec<ModelId>,
     state: Arc<SharedFleetState>,
     interval: Duration,
 }
@@ -417,6 +673,10 @@ impl std::fmt::Debug for FleetReadinessMonitor {
             .field("htpc", &self.htpc)
             .field("htpc_model", &self.htpc_model)
             .field("cloud_base_count", &self.cloud_base.len())
+            .field("resource", &self.resource)
+            .field("openai_gated", &self.openai_gated)
+            .field("openclaw_openai_gated", &self.openclaw_openai_gated)
+            .field("deepseek_gated", &self.deepseek_gated)
             .field("interval", &self.interval)
             .finish_non_exhaustive()
     }
@@ -443,9 +703,34 @@ impl FleetReadinessMonitor {
             htpc,
             htpc_model,
             cloud_base,
+            resource: None,
+            openai_gated: Vec::new(),
+            openclaw_openai_gated: Vec::new(),
+            deepseek_gated: Vec::new(),
             state,
             interval,
         }
+    }
+
+    /// Opts this monitor into live OpenAI/DeepSeek resource-state readiness for
+    /// the listed cloud candidates. `openai_gated` names candidates whose
+    /// readiness depends on the primary OpenAI weekly allowance (e.g. a premium
+    /// Luna lane); `openclaw_openai_gated` names candidates gated by the separate
+    /// OpenClaw-owned OpenAI OAuth allowance; `deepseek_gated` names candidates
+    /// gated by the DeepSeek balance. Each cycle observes the resource surfaces
+    /// once and applies the resulting eligibility to the corresponding candidates.
+    pub fn with_resource(
+        mut self,
+        resource: ResourceStateFactsClient,
+        openai_gated: Vec<ModelId>,
+        openclaw_openai_gated: Vec<ModelId>,
+        deepseek_gated: Vec<ModelId>,
+    ) -> Self {
+        self.resource = Some(resource);
+        self.openai_gated = openai_gated;
+        self.openclaw_openai_gated = openclaw_openai_gated;
+        self.deepseek_gated = deepseek_gated;
+        self
     }
 
     /// One complete observation cycle.
@@ -459,13 +744,50 @@ impl FleetReadinessMonitor {
     /// assembly itself fails (e.g. a duplicate model key, which cannot occur for
     /// distinct local models).
     pub async fn observe_once(&self) -> Result<(), LibsyError> {
-        let (comfy_state, htpc_state) = tokio::join!(self.comfy.observe(), self.htpc.observe());
-        let mut states = Vec::with_capacity(self.cloud_base.len() + 2);
+        // Observe the local surfaces concurrently. Resource-state observations
+        // (OpenAI weekly / DeepSeek balance) run only when a resource client is
+        // configured, also concurrently with the local probes.
+        let resource_fut = async {
+            if let Some(resource) = &self.resource {
+                // Contributes the primary OpenAI, the optional OpenClaw-owned
+                // OpenAI, and the DeepSeek facts; the gated candidate lists
+                // assemble the snapshot from them below.
+                tokio::join!(
+                    resource.observe_openai(),
+                    resource.observe_openai_openclaw(),
+                    resource.observe_deepseek(),
+                )
+            } else {
+                (
+                    CandidateState::not_ready(),
+                    CandidateState::not_ready(),
+                    CandidateState::not_ready(),
+                )
+            }
+        };
+        let (comfy_state, htpc_state, (openai_state, openclaw_state, deepseek_state)) =
+            tokio::join!(self.comfy.observe(), self.htpc.observe(), resource_fut);
+        let mut states = Vec::with_capacity(
+            self.cloud_base.len()
+                + 2
+                + self.openai_gated.len()
+                + self.openclaw_openai_gated.len()
+                + self.deepseek_gated.len(),
+        );
         for observed in &self.cloud_base {
             states.push((observed.model.clone(), observed.state));
         }
         states.push((self.comfy_model.clone(), comfy_state));
         states.push((self.htpc_model.clone(), htpc_state));
+        for model in &self.openai_gated {
+            states.push((model.clone(), openai_state));
+        }
+        for model in &self.openclaw_openai_gated {
+            states.push((model.clone(), openclaw_state));
+        }
+        for model in &self.deepseek_gated {
+            states.push((model.clone(), deepseek_state));
+        }
         let snapshot = FleetSnapshot::new(states)?;
         self.state.set(snapshot);
         Ok(())
@@ -508,7 +830,9 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        ComfyFactsClient, FleetReadinessMonitor, FleetSnapshotProducer, HtpcFactsClient, Observed,
+        ComfyFactsClient, DeepSeekBalanceInfo, DeepSeekResourceState, FleetReadinessMonitor,
+        FleetSnapshotProducer, HtpcFactsClient, Observed, OpenAiPrimaryWindow, OpenAiResourceState,
+        OpenAiWindows, ResourceStateFactsClient, classify_deepseek, classify_openai_weekly,
     };
 
     async fn mock_server(routes: Vec<(&'static str, &'static str)>) -> String {
@@ -1235,5 +1559,195 @@ mod tests {
 
         unsafe { std::env::remove_var("S2D_TEST_TOKEN_MONE") };
         let _ = &htpc_url;
+    }
+
+    // --- Resource-state classification (OpenAI weekly / DeepSeek balance) -----
+
+    #[test]
+    fn openai_weekly_eligible_when_available_and_under_100() {
+        let state = OpenAiResourceState {
+            available: Some(true),
+            limit_reached: Some(false),
+            spend_control_reached: Some(false),
+            windows: Some(OpenAiWindows {
+                primary: Some(OpenAiPrimaryWindow {
+                    used_percent: Some(11.0),
+                }),
+            }),
+        };
+        assert_eq!(classify_openai_weekly(&state), CandidateState::ready());
+    }
+
+    #[test]
+    fn openai_weekly_confirmed_exhausted_is_not_ready() {
+        // limit_reached OR weekly>=100 => confirmed exhaustion => not ready.
+        let limit = OpenAiResourceState {
+            available: Some(true),
+            limit_reached: Some(true),
+            spend_control_reached: Some(false),
+            windows: Some(OpenAiWindows {
+                primary: Some(OpenAiPrimaryWindow {
+                    used_percent: Some(90.0),
+                }),
+            }),
+        };
+        assert_eq!(classify_openai_weekly(&limit), CandidateState::not_ready());
+
+        let weekly_full = OpenAiResourceState {
+            available: Some(true),
+            limit_reached: Some(false),
+            spend_control_reached: Some(false),
+            windows: Some(OpenAiWindows {
+                primary: Some(OpenAiPrimaryWindow {
+                    used_percent: Some(100.0),
+                }),
+            }),
+        };
+        assert_eq!(
+            classify_openai_weekly(&weekly_full),
+            CandidateState::not_ready()
+        );
+    }
+
+    #[test]
+    fn openai_weekly_spend_control_or_unavailable_is_not_ready() {
+        let spend = OpenAiResourceState {
+            available: Some(true),
+            limit_reached: Some(false),
+            spend_control_reached: Some(true),
+            windows: Some(OpenAiWindows {
+                primary: Some(OpenAiPrimaryWindow {
+                    used_percent: Some(60.0),
+                }),
+            }),
+        };
+        assert_eq!(classify_openai_weekly(&spend), CandidateState::not_ready());
+
+        let unavailable = OpenAiResourceState {
+            available: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_openai_weekly(&unavailable),
+            CandidateState::not_ready()
+        );
+    }
+
+    #[test]
+    fn openai_weekly_unknown_used_percent_fails_toward_ready_not_spill() {
+        // The preserved old policy: unknown telemetry alone must NOT sanction a
+        // spill. available=true with a missing used_percent stays ready.
+        let unknown_used = OpenAiResourceState {
+            available: Some(true),
+            limit_reached: Some(false),
+            spend_control_reached: Some(false),
+            windows: None,
+        };
+        assert_eq!(
+            classify_openai_weekly(&unknown_used),
+            CandidateState::ready()
+        );
+    }
+
+    #[test]
+    fn deepseek_eligible_only_when_available_and_positive_balance() {
+        let healthy = DeepSeekResourceState {
+            is_available: Some(true),
+            balance_infos: Some(vec![DeepSeekBalanceInfo {
+                currency: Some("CNY".to_string()),
+                total_balance: Some("90.75".to_string()),
+            }]),
+        };
+        assert_eq!(classify_deepseek(&healthy, "CNY"), CandidateState::ready());
+
+        let empty = DeepSeekResourceState {
+            is_available: Some(true),
+            balance_infos: Some(vec![DeepSeekBalanceInfo {
+                currency: Some("CNY".to_string()),
+                total_balance: Some("0.00".to_string()),
+            }]),
+        };
+        assert_eq!(
+            classify_deepseek(&empty, "CNY"),
+            CandidateState::not_ready()
+        );
+
+        let unknown = DeepSeekResourceState::default();
+        assert_eq!(
+            classify_deepseek(&unknown, "CNY"),
+            CandidateState::not_ready()
+        );
+    }
+
+    #[test]
+    fn deepseek_wrong_currency_or_negative_is_not_ready() {
+        let wrong_currency = DeepSeekResourceState {
+            is_available: Some(true),
+            balance_infos: Some(vec![DeepSeekBalanceInfo {
+                currency: Some("USD".to_string()),
+                total_balance: Some("90.75".to_string()),
+            }]),
+        };
+        assert_eq!(
+            classify_deepseek(&wrong_currency, "CNY"),
+            CandidateState::not_ready()
+        );
+
+        let negative = DeepSeekResourceState {
+            is_available: Some(true),
+            balance_infos: Some(vec![DeepSeekBalanceInfo {
+                currency: Some("CNY".to_string()),
+                total_balance: Some("-1.0".to_string()),
+            }]),
+        };
+        assert_eq!(
+            classify_deepseek(&negative, "CNY"),
+            CandidateState::not_ready()
+        );
+    }
+
+    // Exercises the live observe path of the resource-state client against a
+    // real (loopback) sanitized OpenAI + DeepSeek surface, with the credential
+    // read from an env var name at request time and dropped on every path.
+    #[tokio::test]
+    async fn resource_state_client_observes_openai_and_deepseek_live() {
+        let openai_url = mock_server(vec![(
+            "/resource/openai-codex",
+            r#"{"available":true,"limit_reached":false,"spend_control_reached":false,
+                "windows":{"primary":{"used_percent":11}}} "#,
+        )])
+        .await;
+        let deepseek_url = mock_server(vec![(
+            "/user/balance",
+            r#"{"is_available":true,"balance_infos":[
+                {"currency":"CNY","total_balance":"90.75"}
+            ]}"#,
+        )])
+        .await;
+
+        let client = ResourceStateFactsClient::new(
+            Some(format!("{openai_url}/resource/openai-codex")),
+            Some("S2D_TEST_OPENAI_TOKEN".into()),
+            Some(format!("{deepseek_url}/user/balance")),
+            Some("S2D_TEST_DEEPSEEK_KEY".into()),
+            Some("CNY".into()),
+        );
+
+        unsafe { std::env::set_var("S2D_TEST_OPENAI_TOKEN", "dummy") };
+        unsafe { std::env::set_var("S2D_TEST_DEEPSEEK_KEY", "dummy") };
+        assert_eq!(client.observe_openai().await, CandidateState::ready());
+        assert_eq!(client.observe_deepseek().await, CandidateState::ready());
+        unsafe { std::env::remove_var("S2D_TEST_OPENAI_TOKEN") };
+        unsafe { std::env::remove_var("S2D_TEST_DEEPSEEK_KEY") };
+
+        // Missing credential env => fail closed (not_ready), not panic.
+        let client2 = ResourceStateFactsClient::new(
+            Some(format!("{openai_url}/resource/openai-codex")),
+            Some("S2D_TEST_MISSING_TOKEN".into()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(client2.observe_openai().await, CandidateState::not_ready());
     }
 }

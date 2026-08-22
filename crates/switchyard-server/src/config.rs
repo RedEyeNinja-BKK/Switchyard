@@ -7,14 +7,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use libsy::{
-    AdvisorGate, AdvisorGateConfig, Algorithm, CandidateProfile, ClassifierContractConfig,
-    ClassifierResponseFormat, ClassifyTrigger, ContextAdmissionPolicy, CustomClassifierConfig,
-    CustomClassifierPolicy, EscalationJudgeConfig, FleetRouter, FleetSnapshot, FleetStateSource,
-    GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop,
-    Passthrough, PickerMode, Random, StageRouter, StageRouterConfig, StaticFleetState,
-    SubagentRouter, SubagentRouterConfig, TargetPrompts, TaskClassifierConfig,
+    AdvisorGate, AdvisorGateConfig, Algorithm, CandidateProfile, CandidateState,
+    ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger, ContextAdmissionPolicy,
+    CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig, FleetRouter,
+    FleetSnapshot, FleetStateSource, GateTrigger, HandoffNoteConfig, LlmClassifierConfig,
+    LlmFallback, LlmTaskClassifier, Noop, Passthrough, PickerMode, Random, SharedFleetState,
+    StageRouter, StageRouterConfig, StaticFleetState, SubagentRouter, SubagentRouterConfig,
+    TargetPrompts, TaskClassifierConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,9 +26,12 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
+use crate::fleet_readiness::{
+    ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed, ResourceStateFactsClient,
+};
 use crate::{
     CallerAuthKind, CountTokensTarget, InputTokensTarget, ModelCapabilities, ServerError,
-    ServerResult, ServerState,
+    ServerResult, ServerRuntime, ServerState,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -92,6 +97,159 @@ fn server_state_from_toml_with_fleet_source(
     Ok(state.with_config(config))
 }
 
+/// Loads a TOML deployment file and returns a coherent [`ServerRuntime`]: the
+/// server state plus (when `[fleet_readiness]` is declared) a fleet-readiness
+/// monitor, both sharing ONE `Arc<SharedFleetState>`.
+///
+/// This is the stock-CLI runtime owner path (Fix A/B): the normal
+/// `switchyard-server --config ...` command builds the monitored lifecycle purely
+/// from the config file, with the shared-state identity guaranteed structurally by
+/// construction (one Arc is created here and cloned into both the server's fleet
+/// source and the monitor), not by operator wiring.
+pub fn load_server_runtime(path: impl AsRef<Path>) -> ServerResult<ServerRuntime> {
+    let path = path.as_ref();
+    let toml = fs::read_to_string(path).map_err(|error| {
+        ServerError::new(format!(
+            "failed to read server config {}: {error}",
+            path.display()
+        ))
+    })?;
+    let config: Arc<ServerConfig> = Arc::new(
+        toml::from_str(&toml)
+            .map_err(|error| ServerError::new(format!("failed to parse TOML: {error}")))?,
+    );
+    match &config.fleet_readiness {
+        // Monitored runtime: ONE SharedFleetState shared structurally by the
+        // server's FleetRouter(s) and the FleetReadinessMonitor.
+        Some(readiness) => {
+            let shared = Arc::new(SharedFleetState::new(
+                FleetSnapshot::new(Vec::new()).expect("empty fleet snapshot is valid"),
+            ));
+            let monitor = build_fleet_readiness_monitor(readiness, Arc::clone(&shared))
+                .map_err(|error| ServerError::new(format!("invalid [fleet_readiness]: {error}")))?;
+            let state = config
+                .build(Arc::clone(&shared) as Arc<dyn FleetStateSource>)
+                .map_err(|error| {
+                    ServerError::new(format!("invalid server config {}: {error}", path.display()))
+                })?;
+            Ok(ServerRuntime {
+                state: state.with_config(config),
+                monitor: Some(monitor),
+            })
+        }
+        // Plain runtime: fail-closed fleet source (no monitor).
+        None => {
+            let source = Arc::new(StaticFleetState::new(
+                FleetSnapshot::new(Vec::new()).expect("empty fleet snapshot is valid"),
+            )) as Arc<dyn FleetStateSource>;
+            let state = config.build(source).map_err(|error| {
+                ServerError::new(format!("invalid server config {}: {error}", path.display()))
+            })?;
+            Ok(ServerRuntime {
+                state: state.with_config(config),
+                monitor: None,
+            })
+        }
+    }
+}
+
+/// Builds a [`FleetReadinessMonitor`] from a `[fleet_readiness]` config section
+/// over the given shared fleet state. All sub-components are optional; the
+/// monitor observes whichever of Comfy / HTPC / resource facts are configured.
+fn build_fleet_readiness_monitor(
+    config: &FleetReadinessConfig,
+    state: Arc<SharedFleetState>,
+) -> Result<FleetReadinessMonitor, String> {
+    let comfy = config.comfy.as_ref().map(|c| {
+        (
+            ComfyFactsClient::new(c.url.clone(), c.auth_token_env.clone()),
+            ModelId::from(c.model.clone()),
+        )
+    });
+    let htpc = config.htpc.as_ref().map(|h| {
+        (
+            HtpcFactsClient::new(h.base_url.clone(), h.expected_model.clone()),
+            ModelId::from(h.model.clone()),
+        )
+    });
+
+    let mut cloud_base = Vec::with_capacity(config.ready.len() + config.transition_required.len());
+    for model in &config.ready {
+        cloud_base.push(Observed {
+            model: ModelId::from(model.clone()),
+            state: CandidateState::ready(),
+        });
+    }
+    for model in &config.transition_required {
+        cloud_base.push(Observed {
+            model: ModelId::from(model.clone()),
+            state: CandidateState::transition_required(),
+        });
+    }
+
+    let (comfy_client, comfy_model) = comfy.map_or((None, None), |(c, m)| (Some(c), Some(m)));
+    let (htpc_client, htpc_model) = htpc.map_or((None, None), |(h, m)| (Some(h), Some(m)));
+
+    let mut monitor = FleetReadinessMonitor::new(
+        comfy_client,
+        comfy_model,
+        htpc_client,
+        htpc_model,
+        cloud_base,
+        state,
+        Duration::from_secs(config.observe_interval_seconds.max(1)),
+    );
+
+    if let Some(resource) = &config.resource {
+        let resource_client = ResourceStateFactsClient::new(
+            resource.openai_url.clone(),
+            resource.openai_auth_token_env.clone(),
+            resource.deepseek_url.clone(),
+            resource.deepseek_api_key_env.clone(),
+            resource.deepseek_currency.clone(),
+        );
+        // Optional separate OpenClaw-owned OpenAI pool: only wired when both its
+        // URL and credential-env are declared.
+        let resource_client =
+            match (
+                &resource.openclaw_openai_url,
+                &resource.openclaw_openai_auth_token_env,
+            ) {
+                (Some(url), Some(env)) => {
+                    resource_client.with_openclaw_openai(url.clone(), env.clone())
+                }
+                (None, None) => resource_client,
+                _ => return Err(
+                    "openclaw_openai_url and openclaw_openai_auth_token_env must be set together"
+                        .to_string(),
+                ),
+            };
+        let openai_gated = resource
+            .openai_gated
+            .iter()
+            .map(|m| ModelId::from(m.clone()))
+            .collect();
+        let openclaw_gated = resource
+            .openclaw_openai_gated
+            .iter()
+            .map(|m| ModelId::from(m.clone()))
+            .collect();
+        let deepseek_gated = resource
+            .deepseek_gated
+            .iter()
+            .map(|m| ModelId::from(m.clone()))
+            .collect();
+        monitor = monitor.with_resource(
+            resource_client,
+            openai_gated,
+            openclaw_gated,
+            deepseek_gated,
+        );
+    }
+
+    Ok(monitor)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServerConfig {
@@ -100,6 +258,91 @@ pub(crate) struct ServerConfig {
     pub(crate) llm_clients: BTreeMap<String, LlmClientConfig>,
     pub(crate) targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    /// Optional fleet-readiness monitor configuration. When present, the config
+    /// loader hands ONE `Arc<SharedFleetState>` to BOTH the server's FleetRouter(s)
+    /// and a `FleetReadinessMonitor` built over that same Arc, so the stock CLI can
+    /// run the monitored lifecycle without an external runtime wrapper.
+    #[serde(default)]
+    pub(crate) fleet_readiness: Option<FleetReadinessConfig>,
+}
+
+/// Declares the fleet-readiness monitor components for the stock CLI runtime
+/// owner. All sub-sections are optional; a fully-absent `fleet_readiness` means no
+/// monitor is constructed and the server runs fail-closed for fleet routes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FleetReadinessConfig {
+    #[serde(default = "default_fleet_observe_interval")]
+    pub(crate) observe_interval_seconds: u64,
+    #[serde(default)]
+    pub(crate) comfy: Option<ComfyFactConfig>,
+    #[serde(default)]
+    pub(crate) htpc: Option<HtpcFactConfig>,
+    #[serde(default)]
+    pub(crate) resource: Option<ResourceFactConfig>,
+    /// Static `(model-id, ready)` base entries for cloud candidates that need no
+    /// live resource/health probe (immediately attemptable).
+    #[serde(default)]
+    pub(crate) ready: Vec<String>,
+    /// Static `(model-id, transition-required)` entries (e.g. a sealed-idle
+    /// locally-resident model that is valid but not yet loaded).
+    #[serde(default)]
+    pub(crate) transition_required: Vec<String>,
+}
+
+const fn default_fleet_observe_interval() -> u64 {
+    30
+}
+
+/// ComfyNinja factual-readiness probe (read-only `/v1/resource`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComfyFactConfig {
+    pub(crate) url: String,
+    pub(crate) auth_token_env: String,
+    /// The candidate target model id this fact gates.
+    pub(crate) model: String,
+}
+
+/// HTPC factual-readiness probe (read-only `/health` + `/v1/models`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HtpcFactConfig {
+    pub(crate) base_url: String,
+    pub(crate) expected_model: String,
+    /// The candidate target model id this fact gates.
+    pub(crate) model: String,
+}
+
+/// Live resource-state facts (OpenAI weekly allowance + DeepSeek balance) that
+/// gate cloud candidate readiness according to the operator confirmed-exhaustion
+/// policy.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResourceFactConfig {
+    #[serde(default)]
+    pub(crate) openai_url: Option<String>,
+    #[serde(default)]
+    pub(crate) openai_auth_token_env: Option<String>,
+    #[serde(default)]
+    pub(crate) openclaw_openai_url: Option<String>,
+    #[serde(default)]
+    pub(crate) openclaw_openai_auth_token_env: Option<String>,
+    #[serde(default)]
+    pub(crate) deepseek_url: Option<String>,
+    #[serde(default)]
+    pub(crate) deepseek_api_key_env: Option<String>,
+    #[serde(default)]
+    pub(crate) deepseek_currency: Option<String>,
+    /// Target model ids gated by the primary OpenAI weekly allowance.
+    #[serde(default)]
+    pub(crate) openai_gated: Vec<String>,
+    /// Target model ids gated by the separate OpenClaw-owned OpenAI allowance.
+    #[serde(default)]
+    pub(crate) openclaw_openai_gated: Vec<String>,
+    /// Target model ids gated by the DeepSeek configured-currency balance.
+    #[serde(default)]
+    pub(crate) deepseek_gated: Vec<String>,
 }
 
 impl ServerConfig {
@@ -695,10 +938,30 @@ enum RouteConfig {
         tool_calling: Option<bool>,
         #[serde(default)]
         reasoning: Option<bool>,
+        /// When `"request"`, read the declared `work_shape` from structured
+        /// request metadata and apply per-candidate `work_shape` eligibility.
+        #[serde(default)]
+        work_shape_source: Option<FleetWorkShapeSourceName>,
         /// Static per-candidate capability + preference profiles.
         #[serde(default)]
         candidates: Vec<FleetCandidateConfig>,
     },
+}
+
+/// Named values for a `fleet_router` route's work-shape source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum FleetWorkShapeSourceName {
+    #[serde(rename = "request")]
+    Request,
+}
+
+/// Named work shapes for a `fleet_router` candidate's structural eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum FleetWorkShapeName {
+    #[serde(rename = "bounded")]
+    Bounded,
+    #[serde(rename = "agentic")]
+    Agentic,
 }
 
 /// Static capability + preference profile for one `fleet_router` candidate.
@@ -725,6 +988,11 @@ struct FleetCandidateConfig {
     /// qualified usable context capacity.
     #[serde(default)]
     context_policy: FleetCandidateContextPolicyConfig,
+    /// Optional structural work-shape limitation. `bounded` limits this candidate
+    /// to bounded requests; `agentic` to agentic requests; absent means it serves
+    /// any shape (used by the fixed routes and the any-shape DeepSeek lane).
+    #[serde(default)]
+    work_shape: Option<FleetWorkShapeName>,
 }
 
 /// Durable per-candidate context admission policy (configuration only; no live
@@ -1674,36 +1942,51 @@ fn build_algorithm(
             })?;
             Ok(Arc::new(algorithm))
         }
-        RouteConfig::FleetRouter { candidates, .. } => {
+        RouteConfig::FleetRouter {
+            candidates,
+            work_shape_source,
+            ..
+        } => {
             // Static profile only: capability + preference + context policy per
             // candidate. Live readiness comes from the injected `fleet_source`,
             // never this config.
             let mut profiles = Vec::with_capacity(candidates.len());
             for candidate in candidates {
                 let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
-                profiles.push(
-                    CandidateProfile::new(
-                        target,
-                        candidate.tool_calling,
-                        candidate.reasoning,
-                        candidate.preference_rank,
-                    )
-                    .with_context_policy(match candidate.context_policy {
-                        FleetCandidateContextPolicyConfig::Unmanaged => {
-                            ContextAdmissionPolicy::Unmanaged
-                        }
-                        FleetCandidateContextPolicyConfig::Bounded {
-                            usable_context_tokens,
-                            ..
-                        } => ContextAdmissionPolicy::Bounded {
-                            usable_context_tokens,
-                        },
-                    }),
-                );
+                let profile = CandidateProfile::new(
+                    target,
+                    candidate.tool_calling,
+                    candidate.reasoning,
+                    candidate.preference_rank,
+                )
+                .with_context_policy(match candidate.context_policy {
+                    FleetCandidateContextPolicyConfig::Unmanaged => {
+                        ContextAdmissionPolicy::Unmanaged
+                    }
+                    FleetCandidateContextPolicyConfig::Bounded {
+                        usable_context_tokens,
+                        ..
+                    } => ContextAdmissionPolicy::Bounded {
+                        usable_context_tokens,
+                    },
+                });
+                let profile = match candidate.work_shape {
+                    Some(FleetWorkShapeName::Bounded) => {
+                        profile.with_work_shape(libsy::WorkShape::Bounded)
+                    }
+                    Some(FleetWorkShapeName::Agentic) => {
+                        profile.with_work_shape(libsy::WorkShape::Agentic)
+                    }
+                    None => profile,
+                };
+                profiles.push(profile);
             }
-            let router = FleetRouter::with_source(profiles, fleet_source).map_err(|error| {
+            let mut router = FleetRouter::with_source(profiles, fleet_source).map_err(|error| {
                 ServerError::new(format!("fleet_router route {route_name}: {error}"))
             })?;
+            if work_shape_source == &Some(FleetWorkShapeSourceName::Request) {
+                router = router.with_request_work_shape();
+            }
             Ok(Arc::new(router))
         }
     }

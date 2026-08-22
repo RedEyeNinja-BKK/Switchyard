@@ -68,12 +68,39 @@ pub enum ContextAdmissionPolicy {
     },
 }
 
+/// Declared work shape of a request, used as a structural eligibility signal.
+///
+/// This is **declared** in structured request metadata (never inferred from
+/// prompt text). It is the smallest generic mechanism FleetRouter uses to keep a
+/// bounded-only candidate (e.g. a premium Luna NT lane) off an **agentic**
+/// request even when both are non-thinking and the Luna resource is healthy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkShape {
+    /// A finite, self-contained task (e.g. a bounded tool call / single response).
+    Bounded,
+    /// A long-lived, evolving / multi-step agentic session.
+    Agentic,
+}
+
+/// How FleetRouter learns a request's declared work shape (if at all).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkShapeSource {
+    /// No work-shape filtering: every candidate is eligible regardless of shape.
+    #[default]
+    None,
+    /// Read `work_shape` from structured request metadata (extensions) and admit
+    /// only candidates whose declared `work_shape` matches (or serves any).
+    Request,
+}
+
 /// Static capability + preference profile for one candidate target.
 ///
 /// This is Algorithm configuration, not a live fact. `tool_calling` and
 /// `reasoning` describe what the target advertises it can do; `preference_rank`
 /// is a deterministic deployment ordering (lower = more preferred);
-/// `context_policy` says whether and how preflight context admission applies.
+/// `context_policy` says whether and how preflight context admission applies;
+/// `work_shape` (when set) limits this candidate to a declared work shape under
+/// a request-sourced work-shape dispatcher.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateProfile {
     /// Target model id that will be selected when this candidate wins.
@@ -86,11 +113,13 @@ pub struct CandidateProfile {
     pub preference_rank: u16,
     /// Preflight context admission policy for this candidate.
     pub context_policy: ContextAdmissionPolicy,
+    /// Optional declared work-shape limitation. `None` serves any shape.
+    pub work_shape: Option<WorkShape>,
 }
 
 impl CandidateProfile {
     /// Creates a candidate profile for `target` with no preflight context concern
-    /// ([`ContextAdmissionPolicy::Unmanaged`]).
+    /// ([`ContextAdmissionPolicy::Unmanaged`]) and no work-shape limitation.
     pub fn new(
         target: impl Into<ModelId>,
         tool_calling: bool,
@@ -103,12 +132,19 @@ impl CandidateProfile {
             reasoning,
             preference_rank,
             context_policy: ContextAdmissionPolicy::Unmanaged,
+            work_shape: None,
         }
     }
 
     /// Sets the candidate's preflight context admission policy (builder style).
     pub fn with_context_policy(mut self, policy: ContextAdmissionPolicy) -> Self {
         self.context_policy = policy;
+        self
+    }
+
+    /// Limits this candidate to a declared work shape (builder style).
+    pub fn with_work_shape(mut self, shape: WorkShape) -> Self {
+        self.work_shape = Some(shape);
         self
     }
 }
@@ -345,6 +381,8 @@ pub struct FleetRouter {
     profiles: Vec<CandidateProfile>,
     /// Injected coherent readiness source (static or externally replaceable).
     state: Arc<dyn FleetStateSource>,
+    /// How the router learns a request's declared work shape (default: none).
+    work_shape_source: WorkShapeSource,
 }
 
 impl FleetRouter {
@@ -390,6 +428,7 @@ impl FleetRouter {
         Ok(Self {
             profiles,
             state: Arc::new(StaticFleetState::new(snapshot)),
+            work_shape_source: WorkShapeSource::None,
         })
     }
 
@@ -417,7 +456,50 @@ impl FleetRouter {
         state: Arc<dyn FleetStateSource>,
     ) -> Result<Self> {
         validate_profiles(&profiles)?;
-        Ok(Self { profiles, state })
+        Ok(Self {
+            profiles,
+            state,
+            work_shape_source: WorkShapeSource::None,
+        })
+    }
+
+    /// Requests that this router read the declared `work_shape` from structured
+    /// request metadata and apply candidate `work_shape` eligibility. Building
+    /// block for the dynamic (request-sourced) smart routes.
+    pub fn with_request_work_shape(mut self) -> Self {
+        self.work_shape_source = WorkShapeSource::Request;
+        self
+    }
+
+    /// Resolves the request's declared work shape from structured metadata
+    /// (`work_shape` field in request extensions), or `None` when no shape is
+    /// declared. NEVER inferred from prompt text.
+    fn declared_work_shape(&self, request: &switchyard_protocol::Request) -> Option<WorkShape> {
+        if self.work_shape_source != WorkShapeSource::Request {
+            return None;
+        }
+        request
+            .llm_request
+            .extensions
+            .fields
+            .get("work_shape")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                "bounded" => Some(WorkShape::Bounded),
+                "agentic" => Some(WorkShape::Agentic),
+                _ => None,
+            })
+    }
+
+    /// Work-shape eligibility for one candidate under the declared request shape.
+    fn work_shape_eligible(profile: &CandidateProfile, declared: Option<WorkShape>) -> bool {
+        match declared {
+            // No work-shape filtering / no declared shape: every candidate is eligible.
+            None => true,
+            // A declared shape excludes a candidate limited to the opposite shape;
+            // a candidate that serves any shape (None) stays eligible.
+            Some(shape) => profile.work_shape.is_none_or(|s| s == shape),
+        }
     }
 
     fn snapshot(&self) -> Arc<FleetSnapshot> {
@@ -429,6 +511,7 @@ impl FleetRouter {
     fn decide(&self, request: &switchyard_protocol::Request) -> Result<(ModelId, Vec<ModelId>)> {
         let require_tools = !request.llm_request.tools.is_empty();
         let require_reasoning = reasoning_requested(&request.llm_request.reasoning);
+        let declared_shape = self.declared_work_shape(request);
         let max_output = request.llm_request.output.max_output_tokens;
         // One request consumes exactly one coherent factual snapshot.
         let snapshot = self.snapshot();
@@ -443,6 +526,12 @@ impl FleetRouter {
             // Capability filter: an explicit reasoning request must only reach
             // candidates that advertise reasoning.
             if require_reasoning && !profile.reasoning {
+                continue;
+            }
+            // Work-shape filter (request-sourced dispatcher): a candidate limited
+            // to a different declared work shape is excluded. A candidate that
+            // serves any shape (None) remains eligible.
+            if !Self::work_shape_eligible(profile, declared_shape) {
                 continue;
             }
             // Readiness filter: only immediately-eligible (ready, no transition
@@ -579,7 +668,7 @@ impl Algorithm for FleetRouter {
 mod tests {
     use super::{
         CandidateProfile, CandidateState, FleetRouter, FleetSnapshot, FleetStateSource,
-        SharedFleetState,
+        SharedFleetState, WorkShape,
     };
     use crate::Algorithm;
     use std::sync::Arc;
@@ -1429,5 +1518,71 @@ mod tests {
             Arc::new(SharedFleetState::new(FleetSnapshot::new(vec![]).unwrap())),
         )
         .unwrap();
+    }
+
+    // --- Request-sourced work-shape dispatch (Fix D) --------------------------
+
+    /// A request carrying a declared `work_shape` in structured extensions.
+    fn work_shape_req(shape: &str) -> Request {
+        let mut req = text_req();
+        req.llm_request.extensions.fields.insert(
+            "work_shape".to_string(),
+            serde_json::Value::String(shape.to_string()),
+        );
+        req
+    }
+
+    /// A dynamic smart-style router: luna (bounded-only, rank 1) and deepseek
+    /// (any shape, non-thinking, rank 2), all ready, request-sourced work shape.
+    fn work_shape_router() -> FleetRouter {
+        let profiles = vec![
+            CandidateProfile::new("luna", true, false, 1).with_work_shape(WorkShape::Bounded),
+            CandidateProfile::new("deepseek", true, false, 2),
+        ];
+        let state = SharedFleetState::new(
+            FleetSnapshot::new(vec![
+                (ModelId::from("luna"), CandidateState::ready()),
+                (ModelId::from("deepseek"), CandidateState::ready()),
+            ])
+            .unwrap(),
+        );
+        FleetRouter::with_source(profiles, Arc::new(state))
+            .unwrap()
+            .with_request_work_shape()
+    }
+
+    #[test]
+    fn request_work_shape_bounded_prefers_luna() {
+        // bounded / non-thinking -> Luna (rank1) both eligible -> luna selected.
+        let router = work_shape_router();
+        let (selected, _fb) = router.decide(&work_shape_req("bounded")).unwrap();
+        assert_eq!(selected.to_string(), "luna");
+    }
+
+    #[test]
+    fn request_work_shape_agentic_excludes_luna_never_selects_it() {
+        // agentic / non-thinking -> Luna (bounded-only) is WORK-SHAPE excluded;
+        // deepseek (any-shape) is the only eligible candidate.
+        let router = work_shape_router();
+        let (selected, fb) = router.decide(&work_shape_req("agentic")).unwrap();
+        assert_eq!(selected.to_string(), "deepseek");
+        let all: Vec<String> = std::iter::once(selected.to_string())
+            .chain(fb.iter().map(ToString::to_string))
+            .collect();
+        assert!(
+            !all.contains(&"luna".to_string()),
+            "agentic/non-thinking must NEVER select or fall back to the bounded-only luna: {all:?}"
+        );
+    }
+
+    #[test]
+    fn request_work_shape_missing_metadata_is_not_prompt_guessed() {
+        // A request with NO declared work_shape under a request-source dispatcher
+        // must NOT be guessed from prompt text; luna (bounded) stays eligible
+        // because no shape is declared (deterministic preference wins).
+        let router = work_shape_router();
+        let (selected, _fb) = router.decide(&text_req()).unwrap();
+        // No declared shape -> no work-shape exclusion; preference picks luna.
+        assert_eq!(selected.to_string(), "luna");
     }
 }

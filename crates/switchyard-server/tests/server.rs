@@ -30,7 +30,7 @@ use switchyard_server::fleet_readiness::{
 };
 use switchyard_server::{
     BoundServer, DEFAULT_MAX_REQUEST_BODY_BYTES, ServerRunOptions, ServerState,
-    build_switchyard_router,
+    build_switchyard_router, config::load_server_runtime,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -2447,10 +2447,10 @@ async fn s2h_runtime_owner_shares_state_and_stops_cleanly() -> TestResult {
         "Qwen3.5-9B-Q4_0.gguf".to_string(),
     );
     let monitor = FleetReadinessMonitor::new(
-        comfy,
-        ModelId::from("model/comfyninja-qwen3_8"),
-        htpc,
-        ModelId::from("model/htpc-qwen3_5"),
+        Some(comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
         vec![Observed {
             model: ModelId::from("model/deepseek-v4-flash"),
             state: CandidateState::ready(),
@@ -2600,11 +2600,11 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
     unsafe { std::env::set_var("S2H_RES_DEEPSEEK_KEY", "dummy") };
 
     let monitor = FleetReadinessMonitor::new(
-        // No Comfy / HTPC -> fail-closed not-ready (unused candidates).
-        ComfyFactsClient::new("http://127.0.0.1:9/resource".into(), "S2H_RES_NONE".into()),
-        ModelId::from("model/comfyninja-qwen3_8"),
-        HtpcFactsClient::new("http://127.0.0.1:9".into(), "none".into()),
-        ModelId::from("model/htpc-qwen3_5"),
+        // No Comfy / HTPC facts configured -> None (skipped in observation).
+        None,
+        None,
+        None,
+        None,
         vec![],
         Arc::clone(&state),
         std::time::Duration::from_millis(30),
@@ -2649,9 +2649,11 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
             "input_format": "openai_chat",
             "request": {"model":"localclaw/dev/smart","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
         });
-        // A non-thinking request carries no reasoning effort; a deliberate one does.
+        // A non-thinking request carries no reasoning effort; a deliberate one
+        // signals positive reasoning via the top-level `reasoning_effort` field
+        // (the same shape the /v1/decision handler maps into LlmRequest.reasoning).
         if let Some(e) = effort {
-            req["request"]["reasoning"] = json!({"effort": e});
+            req["request"]["reasoning_effort"] = json!(e);
         }
         req
     };
@@ -2688,6 +2690,42 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
         "confirmed OpenAI exhaustion must make luna not-ready and select deepseek: {body}"
     );
 
+    // (2b) spend_control_reached=true WITHOUT confirmed exhaustion must NOT open
+    // a DeepSeek spill: Luna stays selected (fail toward Luna).
+    *openai_state.lock().await = json!({
+        "available": true, "limit_reached": false, "spend_control_reached": true,
+        "windows": {"primary": {"used_percent": 60}}
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "luna",
+        "spend-control-only must NOT open a DeepSeek spill; luna stays selected: {body}"
+    );
+
+    // (2c) Unknown/missing resource telemetry (no windows, limit unknown, no
+    // confirmed exhaustion) must NOT open a DeepSeek spill: Luna stays selected.
+    *openai_state.lock().await = json!({
+        "available": true, "limit_reached": false, "spend_control_reached": false,
+        "windows": {"primary": {}}
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&smart_req(None))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "luna",
+        "unknown/missing OpenAI telemetry must NOT open a DeepSeek spill; luna stays selected: {body}"
+    );
+
     // (3) A deliberate (thinking) request on the healthy-at-exhaustion state must
     // select deepseek (thinking capable) only; luna (non-thinking) is excluded by
     // the reasoning capability filter regardless of OpenAI health.
@@ -2716,6 +2754,180 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
         .expect("server must stop promptly on shutdown")??;
     unsafe { std::env::remove_var("S2H_RES_OPENAI_TOKEN") };
     unsafe { std::env::remove_var("S2H_RES_DEEPSEEK_KEY") };
+    Ok(())
+}
+
+// Fix A/B structural shared-state proof: `load_server_runtime` (the stock CLI
+// construction path) builds ONE SharedFleetState and hands it to BOTH the server
+// FleetRouter and the FleetReadinessMonitor. We prove the identity by observing
+// the monitor once and then reading the SAME state through a live /v1/decision
+// on the server, plus that --dry-run validates without starting the monitor.
+#[tokio::test]
+async fn s2h_cli_runtime_shares_one_fleet_state_and_dry_run_validates() -> TestResult {
+    // Mock OpenAI resource (healthy at first) + DeepSeek balance.
+    let openai_state = Arc::new(tokio::sync::Mutex::new(serde_json::json!({
+        "available": true, "limit_reached": false, "spend_control_reached": false,
+        "windows": {"primary": {"used_percent": 11}}
+    })));
+    let openai_payload = Arc::clone(&openai_state);
+    let openai_router = axum::Router::new().route(
+        "/resource/openai-codex",
+        axum::routing::get(move || {
+            let payload = Arc::clone(&openai_payload);
+            async move { (StatusCode::OK, Json(payload.lock().await.clone())) }
+        }),
+    );
+    let openai_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let openai_addr = openai_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(openai_listener, openai_router).await.unwrap() });
+
+    let deepseek_router = axum::Router::new().route(
+        "/user/balance",
+        axum::routing::get(|| async move {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "is_available": true,
+                    "balance_infos": [{"currency":"CNY","total_balance":"90.75","granted_balance":"0.00","topped_up_balance":"90.75"}]
+                })),
+            )
+        }),
+    );
+    let deepseek_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let deepseek_addr = deepseek_listener.local_addr()?;
+    tokio::spawn(async move {
+        axum::serve(deepseek_listener, deepseek_router)
+            .await
+            .unwrap()
+    });
+
+    let luna_upstream = MockUpstream::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+
+    // A production-shaped TOML with a `localclaw/smart` fleet_router route AND a
+    // `[fleet_readiness]` section (resource gating + static ready base).
+    let toml = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.luna_client]
+format = "openai_chat"
+base_url = "{luna}"
+
+[llm_clients.deepseek_client]
+format = "openai_chat"
+base_url = "{flash}"
+
+[targets.luna]
+id = "model/gpt-5.6"
+llm_client = "luna_client"
+
+[targets.deepseek]
+id = "model/deepseek-v4-flash"
+llm_client = "deepseek_client"
+
+[routes.smart]
+id = "localclaw/dev/smart"
+type = "fleet_router"
+context_window = 1048576
+tool_calling = true
+reasoning = false
+work_shape_source = "request"
+
+[[routes.smart.candidates]]
+target = "luna"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+work_shape = "bounded"
+
+[[routes.smart.candidates]]
+target = "deepseek"
+tool_calling = true
+reasoning = false
+preference_rank = 2
+
+[fleet_readiness]
+observe_interval_seconds = 30
+
+[fleet_readiness.resource]
+openai_url = "http://{oa}/resource/openai-codex"
+openai_auth_token_env = "S2H_CLI_OPENAI_TOKEN"
+openclaw_openai_url = "http://127.0.0.1:9/resource/openai-codex"
+openclaw_openai_auth_token_env = "S2H_CLI_OPENCLAW_TOKEN"
+deepseek_url = "http://{ds}/user/balance"
+deepseek_api_key_env = "S2H_CLI_DEEPSEEK_KEY"
+deepseek_currency = "CNY"
+openai_gated = ["model/gpt-5.6"]
+openclaw_openai_gated = []
+deepseek_gated = ["model/deepseek-v4-flash"]
+"#,
+        luna = luna_upstream.base_url,
+        flash = flash_upstream.base_url,
+        oa = openai_addr,
+        ds = deepseek_addr,
+    );
+
+    unsafe { std::env::set_var("S2H_CLI_OPENAI_TOKEN", "dummy") };
+    unsafe { std::env::set_var("S2H_CLI_DEEPSEEK_KEY", "dummy") };
+
+    // Write to a temp path and build the runtime through the CLI construction path.
+    let mut config = tempfile::Builder::new()
+        .prefix("switchyard-s2h-runtime-")
+        .suffix(".toml")
+        .tempfile()?;
+    use std::io::Write;
+    config.write_all(toml.as_bytes())?;
+    let runtime = load_server_runtime(config.path())?;
+    assert!(
+        runtime.monitor.is_some(),
+        "a [fleet_readiness] config must build a monitor"
+    );
+
+    // (A) One observation by the monitor writes into the SAME shared state the
+    // server's FleetRouter reads: after observe_once, a /v1/decision sees luna
+    // ready (OpenAI healthy) and selects it.
+    runtime.monitor.as_ref().unwrap().observe_once().await?;
+    let app = build_switchyard_router(runtime.state.clone());
+    let resp = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "localclaw/dev/smart",
+                "messages": [{"role":"user","content":"hi"}],
+                "max_tokens": 32,
+                "reasoning_effort": "none"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(resp.status, StatusCode::OK);
+    let res = resp.json()?;
+    assert_eq!(
+        res["selected"]["target"], "luna",
+        "the server FleetRouter must read the monitor-published OpenAI-gated luna readiness: {res}"
+    );
+
+    // (B) dry-run through the CLI path validates (parses config + builds the
+    // monitor) but does NOT start it; here we assert the runtime built cleanly
+    // and dry_run is handled by the CLI layer (covered separately by run()).
+    let options = ServerRunOptions {
+        addr: "127.0.0.1:0".parse()?,
+        backlog: 1024,
+        dry_run: true,
+        shutdown_timeout: std::time::Duration::from_secs(2),
+        tls: None,
+    };
+    // `ServerRuntime::run` with dry_run prints the summary and returns without
+    // binding or starting the monitor — exercised here to prove no accidental
+    // background service.
+    runtime.run(options).await?;
+
+    unsafe { std::env::remove_var("S2H_CLI_OPENAI_TOKEN") };
+    unsafe { std::env::remove_var("S2H_CLI_DEEPSEEK_KEY") };
     Ok(())
 }
 
@@ -5282,10 +5494,10 @@ async fn s2d_live_readonly_facts_drive_decision() -> TestResult {
     // against the live read-only endpoints. A large interval is used because only
     // a single cycle is needed here; the background loop is exercised separately.
     let monitor = FleetReadinessMonitor::new(
-        comfy,
-        ModelId::from("model/comfyninja-qwen3_8"),
-        htpc,
-        ModelId::from("model/htpc-qwen3_5"),
+        Some(comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
         // Static cloud base (configured/attemptable, not a live provider health
         // guarantee).
         vec![
@@ -5473,10 +5685,10 @@ async fn s2d_fleet_monitor_updates_without_rebuild_and_runs_alongside_server() -
     unsafe { std::env::set_var("S2D_TEST_TOKEN_INT", "dummy") };
     let htpc = HtpcFactsClient::new(htpc_base.clone(), "Qwen3.5-9B-Q4_0.gguf".to_string());
     let monitor = FleetReadinessMonitor::new(
-        comfy,
-        ModelId::from("model/comfyninja-qwen3_8"),
-        htpc,
-        ModelId::from("model/htpc-qwen3_5"),
+        Some(comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
         vec![
             Observed {
                 model: ModelId::from("model/luna"),
@@ -5552,10 +5764,10 @@ async fn s2d_fleet_monitor_updates_without_rebuild_and_runs_alongside_server() -
     unsafe { std::env::set_var("S2D_TEST_TOKEN_RUN", "dummy") };
     let run_htpc = HtpcFactsClient::new(run_htpc_base, "Qwen3.5-9B-Q4_0.gguf".to_string());
     let run_monitor = FleetReadinessMonitor::new(
-        run_comfy,
-        ModelId::from("model/comfyninja-qwen3_8"),
-        run_htpc,
-        ModelId::from("model/htpc-qwen3_5"),
+        Some(run_comfy),
+        Some(ModelId::from("model/comfyninja-qwen3_8")),
+        Some(run_htpc),
+        Some(ModelId::from("model/htpc-qwen3_5")),
         vec![Observed {
             model: ModelId::from("model/luna"),
             state: CandidateState::ready(),

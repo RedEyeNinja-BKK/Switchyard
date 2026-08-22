@@ -437,6 +437,48 @@ pub async fn run_server(state: ServerState, options: ServerRunOptions) -> Server
     server.serve(shutdown::signal()).await
 }
 
+/// A coherent production runtime bundle: the server state plus an optional
+/// fleet-readiness monitor built over the SAME `Arc<SharedFleetState>` that was
+/// injected into the server's FleetRouter(s).
+///
+/// This is the structural shared-state guarantee for the normal stock CLI: the
+/// config/runtime builder creates ONE `Arc<SharedFleetState>` and hands clones of
+/// THAT object to both the `ServerState` and the `FleetReadinessMonitor`, so the
+/// operator never needs to wire them together manually.
+pub struct ServerRuntime {
+    /// Server state (FleetRouter(s) injected with a shared fleet source).
+    pub state: ServerState,
+    /// Optional fleet-readiness monitor; `Some` only when the config declares a
+    /// `[fleet_readiness]` section. When `Some`, it MUST be run via
+    /// [`run_server_with_fleet_monitor`] (or the CLI chooses that path) so the
+    /// background monitor keeps the shared fleet state populated.
+    pub monitor: Option<FleetReadinessMonitor>,
+}
+
+impl ServerRuntime {
+    /// Produces a coherent bundle from a config path, sharing ONE fleet state.
+    pub fn load(path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+        crate::config::load_server_runtime(path)
+    }
+
+    /// Runs the runtime. Chooses the monitored lifecycle when a monitor is
+    /// configured, otherwise the ordinary server lifecycle. Consumes the runtime.
+    ///
+    /// Honors `options.dry_run`: validates the full runtime (including monitor
+    /// construction) and prints the summary WITHOUT binding a socket or starting
+    /// the background monitor, so `--dry-run` never creates an accidental service.
+    pub async fn run(self, options: ServerRunOptions) -> ServerResult<()> {
+        if options.dry_run {
+            println!("{}", crate::dry_run_summary(&self.state));
+            return Ok(());
+        }
+        match self.monitor {
+            Some(monitor) => run_server_with_fleet_monitor(self.state, options, monitor).await,
+            None => run_server(self.state, options).await,
+        }
+    }
+}
+
 /// Production runtime owner: runs the server while a fleet-readiness monitor is
 /// the owner of live readiness facts, sharing one `SharedFleetState` with the
 /// server's FleetRouter and stopping together on the same process signal.

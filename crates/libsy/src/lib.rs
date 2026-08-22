@@ -17,7 +17,7 @@ mod algorithms;
 pub use algorithms::advisor_gate::{AdvisorGate, AdvisorGateConfig, GateTrigger};
 pub use algorithms::fleet_router::{
     CandidateProfile, CandidateState, ContextAdmissionPolicy, FleetRouter, FleetSnapshot,
-    FleetStateSource, SharedFleetState, StaticFleetState,
+    FleetStateSource, SharedFleetState, StaticFleetState, WorkShape, WorkShapeSource,
 };
 pub use algorithms::llm_class::{
     CustomClassifierConfig, CustomClassifierPolicy, LlmClassifierConfig, LlmTaskClassifier,

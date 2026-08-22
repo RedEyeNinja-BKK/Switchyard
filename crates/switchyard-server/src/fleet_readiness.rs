@@ -331,9 +331,12 @@ fn fleet_basename(id: &str) -> &str {
 
 /// Sanitized OpenAI resource payload from a provider bridge's read-only
 /// `/resource/openai-codex` surface (the same contract the old smart-routing
-/// pool consumed). Only the fields needed to classify weekly-allowance
-/// eligibility are retained; no credential or account identity is parsed.
+/// pool consumed). Fields are parsed for schema completeness; `available` and
+/// `spend_control_reached` are intentionally NOT spill triggers (only confirmed
+/// included-allowance exhaustion — `limit_reached` or `weekly used% >= 100` —
+/// opens a fallback). No credential or account identity is parsed.
 #[derive(serde::Deserialize, Debug, Default)]
+#[allow(dead_code)]
 struct OpenAiResourceState {
     #[serde(default)]
     available: Option<bool>,
@@ -373,34 +376,45 @@ struct DeepSeekBalanceInfo {
     total_balance: Option<String>,
 }
 
-/// The preserved old smart-routing eligibility rule for the OpenAI weekly
-/// included allowance (verified live against the deployed source `resource.rs`):
-/// a candidate is READY (eligible) only while the allowance is confirmed
-/// available and not exhausted. **Unknown telemetry does NOT sanction spill**:
-/// an OpenAI candidate with `available=true` but missing/unknown `used_percent`
-/// remains ready (weekly_eligible's `unwrap_or(true)`).
+/// The DEPLOYED OpenAI included-allowance spill policy (operator-verbatim):
+/// an OpenAI candidate becomes **resource-ineligible** (sanctioned DeepSeek
+/// fallback may open) ONLY on **confirmed included-allowance exhaustion**:
 ///
-/// This deliberately keeps **technical readiness** (provider can be attempted)
-/// separate from **resource policy** (included GPT allocation
-/// exhausted/unknown) — the old operator principle preserved.
-fn classify_openai_weekly(state: &OpenAiResourceState) -> CandidateState {
-    let available = state.available.unwrap_or(false);
+/// ```text
+///   limit_reached == true
+///   OR
+///   weekly_used_percent >= 100
+/// ```
+///
+/// Everything else does NOT open a spill merely because resource telemetry is
+/// uncertain:
+///
+/// - `spend_control_reached == true` — does NOT by itself sanction fallback
+/// - `available == false` without confirmed included exhaustion — does NOT
+///   sanction fallback
+/// - resource endpoint fetch failure — does NOT sanction fallback
+/// - malformed / stale / unknown telemetry — does NOT sanction fallback
+/// - missing `used_percent` — does NOT sanction fallback
+///
+/// Those states intentionally FAIL TOWARD LUNA/OpenAI. A resource-monitor
+/// failure is NOT confused with provider technical health: if the OpenAI
+/// provider subsequently fails as an actual call, normal runtime/provider
+/// failure behavior remains available. Do NOT open a DeepSeek spill merely
+/// because OpenAI resource monitoring is uncertain or the pool reports
+/// `spend_control_reached`/`available=false` without confirmed exhaustion.
+fn classify_openai(state: &OpenAiResourceState) -> CandidateState {
     let limit_reached = state.limit_reached.unwrap_or(false);
-    let spend_control = state.spend_control_reached.unwrap_or(false);
     let used = state
         .windows
         .as_ref()
         .and_then(|w| w.primary.as_ref())
         .and_then(|p| p.used_percent);
-    // Confirmed exhaustion -> not ready (fallback may be permissible downstream).
-    // Unknown used% with available=true -> ready (do NOT spill merely because a
-    // monitoring field is missing).
-    let weekly_eligible =
-        available && !limit_reached && !spend_control && used.is_none_or(|u| u < 100.0);
-    if weekly_eligible {
-        CandidateState::ready()
-    } else {
+    let confirmed_exhausted = limit_reached || used.is_some_and(|u| u >= 100.0);
+    // NOT confirmed exhausted -> OpenAI candidate stays eligible (fail toward Luna).
+    if confirmed_exhausted {
         CandidateState::not_ready()
+    } else {
+        CandidateState::ready()
     }
 }
 
@@ -511,8 +525,9 @@ impl ResourceStateFactsClient {
     }
 
     /// One read-only observation of the OpenAI weekly allowance via the bridge
-    /// surface. Classifies eligibility per [`classify_openai_weekly`]; any fetch
-    /// failure or malformed payload resolves to `not_ready` (fail closed).
+    /// surface. Classifies eligibility per [`classify_openai`] (confirmed
+    /// exhaustion only); any fetch failure or malformed payload fails toward
+    /// `ready` (does NOT sanction a DeepSeek spill).
     pub async fn observe_openai(&self) -> CandidateState {
         let (Some(url), Some(token_env)) = (&self.openai_url, &self.openai_auth_token_env) else {
             return CandidateState::not_ready();
@@ -552,8 +567,15 @@ impl ResourceStateFactsClient {
 
 /// Shared read-only OpenAI weekly-allowance observation for one OpenAI OAuth
 /// bridge surface. Reads the credential from the env var NAME at request time
-/// and drops it on every path; failure or malformed payload resolves to
-/// `not_ready` (fail closed).
+/// and drops it on every path.
+///
+/// Deployed spill policy (fail-toward-Luna): an OpenAI candidate is made
+/// resource-ineligible ONLY on confirmed included-allowance exhaustion
+/// (`limit_reached == true` OR `used_percent >= 100`). Any fetch failure,
+/// malformed payload, missing/empty credential, non-2xx status, unknown
+/// telemetry, `spend_control_reached`, `available == false`, or missing
+/// `used_percent` resolves to `ready` — i.e. it does NOT sanction a DeepSeek
+/// spill merely because OpenAI resource monitoring is uncertain.
 async fn observe_openai_generic(client: &Client, url: &str, token_env: &str) -> CandidateState {
     let token = std::env::var(token_env)
         .map_err(|_| "credential env not set")
@@ -562,15 +584,19 @@ async fn observe_openai_generic(client: &Client, url: &str, token_env: &str) -> 
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
     else {
-        return CandidateState::not_ready();
+        // Missing/empty credential is not confirmed included-allowance exhaustion:
+        // fail toward Luna (no spill).
+        return CandidateState::ready();
     };
     let response = client.get(url).bearer_auth(&token).send().await;
     match response {
         Ok(r) if r.status().is_success() => match r.json::<OpenAiResourceState>().await {
-            Ok(state) => classify_openai_weekly(&state),
-            Err(_) => CandidateState::not_ready(),
+            Ok(state) => classify_openai(&state),
+            // Malformed payload is not confirmed exhaustion: fail toward Luna.
+            Err(_) => CandidateState::ready(),
         },
-        _ => CandidateState::not_ready(),
+        // Fetch/HTTP failure is not confirmed exhaustion: fail toward Luna.
+        _ => CandidateState::ready(),
     }
 }
 
@@ -643,10 +669,14 @@ impl FleetSnapshotProducer {
 /// overwrite a newer one (structural no-stale-overwrite guarantee). The monitor
 /// performs no lifecycle transition, no economics, and no context admission.
 pub struct FleetReadinessMonitor {
-    comfy: ComfyFactsClient,
-    comfy_model: ModelId,
-    htpc: HtpcFactsClient,
-    htpc_model: ModelId,
+    /// ComfyNinja fact probe; `None` when no Comfy fact is configured.
+    comfy: Option<ComfyFactsClient>,
+    /// Candidate target model id gated by the (optional) Comfy fact.
+    comfy_model: Option<ModelId>,
+    /// HTPC fact probe; `None` when no HTPC fact is configured.
+    htpc: Option<HtpcFactsClient>,
+    /// Candidate target model id gated by the (optional) HTPC fact.
+    htpc_model: Option<ModelId>,
     /// Static cloud base states: "configured / immediately attemptable", never a
     /// live provider health guarantee.
     cloud_base: Vec<Observed>,
@@ -685,14 +715,14 @@ impl std::fmt::Debug for FleetReadinessMonitor {
 impl FleetReadinessMonitor {
     /// Constructs a monitor over `state` (which must be the same
     /// [`SharedFleetState`] injected into the FleetRouter server). Local
-    /// candidates are observed from `comfy`/`htpc`; `cloud_base` supplies the
-    /// static cloud base states. `interval` is the spacing between observation
-    /// cycles.
+    /// candidates are observed from `comfy`/`htpc` (each optional; `None` skips
+    /// that fact); `cloud_base` supplies the static cloud base states. `interval`
+    /// is the spacing between observation cycles.
     pub fn new(
-        comfy: ComfyFactsClient,
-        comfy_model: ModelId,
-        htpc: HtpcFactsClient,
-        htpc_model: ModelId,
+        comfy: Option<ComfyFactsClient>,
+        comfy_model: Option<ModelId>,
+        htpc: Option<HtpcFactsClient>,
+        htpc_model: Option<ModelId>,
         cloud_base: Vec<Observed>,
         state: Arc<SharedFleetState>,
         interval: Duration,
@@ -766,10 +796,12 @@ impl FleetReadinessMonitor {
             }
         };
         let (comfy_state, htpc_state, (openai_state, openclaw_state, deepseek_state)) =
-            tokio::join!(self.comfy.observe(), self.htpc.observe(), resource_fut);
+            tokio::join!(self.comfy_observe(), self.htpc_observe(), resource_fut);
+        let configured_local =
+            usize::from(self.comfy_model.is_some()) + usize::from(self.htpc_model.is_some());
         let mut states = Vec::with_capacity(
             self.cloud_base.len()
-                + 2
+                + configured_local
                 + self.openai_gated.len()
                 + self.openclaw_openai_gated.len()
                 + self.deepseek_gated.len(),
@@ -777,8 +809,12 @@ impl FleetReadinessMonitor {
         for observed in &self.cloud_base {
             states.push((observed.model.clone(), observed.state));
         }
-        states.push((self.comfy_model.clone(), comfy_state));
-        states.push((self.htpc_model.clone(), htpc_state));
+        if let Some(model) = &self.comfy_model {
+            states.push((model.clone(), comfy_state));
+        }
+        if let Some(model) = &self.htpc_model {
+            states.push((model.clone(), htpc_state));
+        }
         for model in &self.openai_gated {
             states.push((model.clone(), openai_state));
         }
@@ -791,6 +827,22 @@ impl FleetReadinessMonitor {
         let snapshot = FleetSnapshot::new(states)?;
         self.state.set(snapshot);
         Ok(())
+    }
+
+    /// Observes the Comfy fact when configured (else a fail-closed not_ready).
+    async fn comfy_observe(&self) -> CandidateState {
+        match &self.comfy {
+            Some(client) => client.observe().await,
+            None => CandidateState::not_ready(),
+        }
+    }
+
+    /// Observes the HTPC fact when configured (else a fail-closed not_ready).
+    async fn htpc_observe(&self) -> CandidateState {
+        match &self.htpc {
+            Some(client) => client.observe().await,
+            None => CandidateState::not_ready(),
+        }
     }
 
     /// The fleet readiness snapshot most recently published by this monitor
@@ -832,7 +884,7 @@ mod tests {
     use super::{
         ComfyFactsClient, DeepSeekBalanceInfo, DeepSeekResourceState, FleetReadinessMonitor,
         FleetSnapshotProducer, HtpcFactsClient, Observed, OpenAiPrimaryWindow, OpenAiResourceState,
-        OpenAiWindows, ResourceStateFactsClient, classify_deepseek, classify_openai_weekly,
+        OpenAiWindows, ResourceStateFactsClient, classify_deepseek, classify_openai,
     };
 
     async fn mock_server(routes: Vec<(&'static str, &'static str)>) -> String {
@@ -1277,10 +1329,10 @@ mod tests {
         interval: Duration,
     ) -> FleetReadinessMonitor {
         FleetReadinessMonitor::new(
-            comfy,
-            comfy_model,
-            htpc,
-            htpc_model,
+            Some(comfy),
+            Some(comfy_model),
+            Some(htpc),
+            Some(htpc_model),
             vec![
                 Observed {
                     model: ModelId::from("model/luna"),
@@ -1563,8 +1615,10 @@ mod tests {
 
     // --- Resource-state classification (OpenAI weekly / DeepSeek balance) -----
 
+    // --- OpenAI confirmed-exhaustion-only spill policy (Fix C) ----------------
+
     #[test]
-    fn openai_weekly_eligible_when_available_and_under_100() {
+    fn openai_healthy_under_100_is_ready() {
         let state = OpenAiResourceState {
             available: Some(true),
             limit_reached: Some(false),
@@ -1575,12 +1629,12 @@ mod tests {
                 }),
             }),
         };
-        assert_eq!(classify_openai_weekly(&state), CandidateState::ready());
+        assert_eq!(classify_openai(&state), CandidateState::ready());
     }
 
     #[test]
-    fn openai_weekly_confirmed_exhausted_is_not_ready() {
-        // limit_reached OR weekly>=100 => confirmed exhaustion => not ready.
+    fn openai_confirmed_exhaustion_opens_fallback() {
+        // limit_reached == true => confirmed exhaustion => not ready (fallback may open).
         let limit = OpenAiResourceState {
             available: Some(true),
             limit_reached: Some(true),
@@ -1591,8 +1645,9 @@ mod tests {
                 }),
             }),
         };
-        assert_eq!(classify_openai_weekly(&limit), CandidateState::not_ready());
+        assert_eq!(classify_openai(&limit), CandidateState::not_ready());
 
+        // weekly_used_percent >= 100 => confirmed exhaustion => not ready.
         let weekly_full = OpenAiResourceState {
             available: Some(true),
             limit_reached: Some(false),
@@ -1603,14 +1658,13 @@ mod tests {
                 }),
             }),
         };
-        assert_eq!(
-            classify_openai_weekly(&weekly_full),
-            CandidateState::not_ready()
-        );
+        assert_eq!(classify_openai(&weekly_full), CandidateState::not_ready());
     }
 
     #[test]
-    fn openai_weekly_spend_control_or_unavailable_is_not_ready() {
+    fn openai_spend_control_alone_does_not_open_fallback() {
+        // spend_control_reached == true WITHOUT confirmed exhaustion => NOT a
+        // spill trigger: OpenAI candidate stays ready (fail toward Luna).
         let spend = OpenAiResourceState {
             available: Some(true),
             limit_reached: Some(false),
@@ -1621,32 +1675,39 @@ mod tests {
                 }),
             }),
         };
-        assert_eq!(classify_openai_weekly(&spend), CandidateState::not_ready());
+        assert_eq!(classify_openai(&spend), CandidateState::ready());
+    }
 
+    #[test]
+    fn openai_unavailable_without_confirmed_exhaustion_does_not_open_fallback() {
+        // available == false alone does NOT sanction fallback.
         let unavailable = OpenAiResourceState {
             available: Some(false),
             ..Default::default()
         };
-        assert_eq!(
-            classify_openai_weekly(&unavailable),
-            CandidateState::not_ready()
-        );
+        assert_eq!(classify_openai(&unavailable), CandidateState::ready());
     }
 
     #[test]
-    fn openai_weekly_unknown_used_percent_fails_toward_ready_not_spill() {
-        // The preserved old policy: unknown telemetry alone must NOT sanction a
-        // spill. available=true with a missing used_percent stays ready.
+    fn openai_unknown_or_missing_telemetry_does_not_open_fallback() {
+        // missing used_percent / no windows => not confirmed exhaustion => ready.
         let unknown_used = OpenAiResourceState {
             available: Some(true),
             limit_reached: Some(false),
             spend_control_reached: Some(false),
             windows: None,
         };
-        assert_eq!(
-            classify_openai_weekly(&unknown_used),
-            CandidateState::ready()
-        );
+        assert_eq!(classify_openai(&unknown_used), CandidateState::ready());
+
+        // limit_reached NOT present but no used% => still recognized as not
+        // confirmed exhausted (missing used_percent does NOT sanction fallback).
+        let missing_used = OpenAiResourceState {
+            available: Some(true),
+            limit_reached: Some(false),
+            spend_control_reached: Some(false),
+            windows: Some(OpenAiWindows { primary: None }),
+        };
+        assert_eq!(classify_openai(&missing_used), CandidateState::ready());
     }
 
     #[test]
@@ -1740,7 +1801,8 @@ mod tests {
         unsafe { std::env::remove_var("S2D_TEST_OPENAI_TOKEN") };
         unsafe { std::env::remove_var("S2D_TEST_DEEPSEEK_KEY") };
 
-        // Missing credential env => fail closed (not_ready), not panic.
+        // Missing credential env => NOT confirmed included-allowance exhaustion:
+        // fail toward Luna (no DeepSeek spill), never panic.
         let client2 = ResourceStateFactsClient::new(
             Some(format!("{openai_url}/resource/openai-codex")),
             Some("S2D_TEST_MISSING_TOKEN".into()),
@@ -1748,6 +1810,6 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(client2.observe_openai().await, CandidateState::not_ready());
+        assert_eq!(client2.observe_openai().await, CandidateState::ready());
     }
 }

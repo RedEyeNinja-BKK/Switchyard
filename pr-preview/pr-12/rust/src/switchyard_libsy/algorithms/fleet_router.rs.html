@@ -311,17 +311,17 @@
 <a href=#311 id=311 data-nosnippet>311</a>            // policy capacity is the effective known static capacity for
 <a href=#312 id=312 data-nosnippet>312</a>            // min_context_tokens eligibility (min_context_eligible reads it via
 <a href=#313 id=313 data-nosnippet>313</a>            // the fallback below).
-<a href=#314 id=314 data-nosnippet>314</a>            </span><span class="kw">if let </span><span class="prelude-val">Some</span>(static_cap) = a.usable_context_tokens {
-<a href=#315 id=315 data-nosnippet>315</a>                <span class="kw">if </span>static_cap != usable_context_tokens {
-<a href=#316 id=316 data-nosnippet>316</a>                    <span class="kw">return </span><span class="prelude-val">Err</span>(LibsyError::AlgorithmError {
-<a href=#317 id=317 data-nosnippet>317</a>                        message: <span class="macro">format!</span>(
-<a href=#318 id=318 data-nosnippet>318</a>                            <span class="string">"fleet router candidate {:?} has a static usable_context_tokens \
-<a href=#319 id=319 data-nosnippet>319</a>                             ({static_cap}) that disagrees with its Bounded context-policy \
-<a href=#320 id=320 data-nosnippet>320</a>                             capacity ({usable_context_tokens}); they must be equal"</span>,
-<a href=#321 id=321 data-nosnippet>321</a>                            a.target
-<a href=#322 id=322 data-nosnippet>322</a>                        ),
-<a href=#323 id=323 data-nosnippet>323</a>                    });
-<a href=#324 id=324 data-nosnippet>324</a>                }
+<a href=#314 id=314 data-nosnippet>314</a>            </span><span class="kw">if let </span><span class="prelude-val">Some</span>(static_cap) = a.usable_context_tokens
+<a href=#315 id=315 data-nosnippet>315</a>                &amp;&amp; static_cap != usable_context_tokens
+<a href=#316 id=316 data-nosnippet>316</a>            {
+<a href=#317 id=317 data-nosnippet>317</a>                <span class="kw">return </span><span class="prelude-val">Err</span>(LibsyError::AlgorithmError {
+<a href=#318 id=318 data-nosnippet>318</a>                    message: <span class="macro">format!</span>(
+<a href=#319 id=319 data-nosnippet>319</a>                        <span class="string">"fleet router candidate {:?} has a static usable_context_tokens \
+<a href=#320 id=320 data-nosnippet>320</a>                         ({static_cap}) that disagrees with its Bounded context-policy \
+<a href=#321 id=321 data-nosnippet>321</a>                         capacity ({usable_context_tokens}); they must be equal"</span>,
+<a href=#322 id=322 data-nosnippet>322</a>                        a.target
+<a href=#323 id=323 data-nosnippet>323</a>                    ),
+<a href=#324 id=324 data-nosnippet>324</a>                });
 <a href=#325 id=325 data-nosnippet>325</a>            }
 <a href=#326 id=326 data-nosnippet>326</a>        }
 <a href=#327 id=327 data-nosnippet>327</a>        <span class="kw">if </span>a.usable_context_tokens == <span class="prelude-val">Some</span>(<span class="number">0</span>) {

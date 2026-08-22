@@ -1799,26 +1799,64 @@ preference_rank = 1
     Ok(())
 }
 
+// §2: `unmanaged` with an `input_token_source` is an invalid combination and must
+// be rejected (input_token_source is meaningful only for a bounded context policy).
+#[tokio::test]
+async fn s2e2_unmanaged_with_producer_is_rejected() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "unmanaged", input_token_source = "openai_chat_input_tokens" }
+"#;
+    let toml = fleet_toml_with_openai_format(
+        &upstream.base_url,
+        "openai_chat",
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("unmanaged + input_token_source must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("input_token_source")
+            || err.to_string().contains("unknown")
+            || err.to_string().contains("cannot"),
+        "rejection must mention the invalid producer declaration: {err}"
+    );
+    Ok(())
+}
+
 // A mutable OpenAI-chat mock serving BOTH `/v1/chat/completions` (generation) and
 // `/v1/chat/completions/input_tokens` (exact count) for a bounded candidate. Count
 // is swappable between tests so we can drive fit / overflow / failure.
 struct InputTokenMock {
     count: Arc<Mutex<Option<u64>>>,
     chat_calls: Arc<Mutex<usize>>,
+    input_token_calls: Arc<Mutex<usize>>,
 }
 
 impl InputTokenMock {
     async fn start() -> TestResult<(Self, String)> {
         let count: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(Some(500)));
         let chat_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let input_token_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
         let count_router = count.clone();
         let chat_router = chat_calls.clone();
+        let input_router = input_token_calls.clone();
         let app = Router::new()
             .route(
                 "/v1/chat/completions/input_tokens",
                 post(move || {
                     let count = count_router.clone();
+                    let input_router = input_router.clone();
                     async move {
+                        *input_router.lock().await += 1;
                         let count = count.lock().await;
                         match *count {
                             Some(n) => (StatusCode::OK, Json(json!({"input_tokens": n}))),
@@ -1850,7 +1888,14 @@ impl InputTokenMock {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Ok((Self { count, chat_calls }, format!("http://{addr}")))
+        Ok((
+            Self {
+                count,
+                chat_calls,
+                input_token_calls,
+            },
+            format!("http://{addr}"),
+        ))
     }
 
     async fn set_count(&self, count: Option<u64>) {
@@ -1859,6 +1904,10 @@ impl InputTokenMock {
 
     async fn chat_calls(&self) -> usize {
         *self.chat_calls.lock().await
+    }
+
+    async fn input_token_calls(&self) -> usize {
+        *self.input_token_calls.lock().await
     }
 }
 
@@ -2014,15 +2063,20 @@ async fn s2e2_anthropic_count_tokens_does_not_invoke_producer() -> TestResult {
         })),
     )
     .await?;
-    // The route has no Anthropic target; count_tokens must fail cleanly (4xx),
-    // and /input_tokens must never have been called (chat_calls stays 0 throughout;
-    // the /input_tokens path is distinct, but we assert no count fact was attached
-    // by checking the bounded mock saw no generation call either).
+    // The route has no Anthropic target; count_tokens must fail cleanly (4xx).
+    // Primary invariant: the Anthropic count_tokens endpoint must NOT invoke the
+    // input-token producer, i.e. /v1/chat/completions/input_tokens is never called.
     assert!(
         res.status.is_client_error(),
         "count_tokens without an Anthropic target should be a client error, got {}",
         res.status
     );
+    assert_eq!(
+        mock.input_token_calls().await,
+        0,
+        "Anthropic count_tokens must NOT invoke /chat/completions/input_tokens"
+    );
+    // Secondary: the bounded mock saw no generation call either.
     assert_eq!(
         mock.chat_calls().await,
         0,

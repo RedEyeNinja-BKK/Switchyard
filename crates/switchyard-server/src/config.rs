@@ -729,8 +729,11 @@ struct FleetCandidateConfig {
 
 /// Durable per-candidate context admission policy (configuration only; no live
 /// counts live here).
-#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+///
+/// Deserialized via a raw [`serde_json::Value`] so an invalid combination — an
+/// `input_token_source` under a non-`bounded` policy — is rejected rather than
+/// silently dropped (serde's internally-tagged enum cannot `deny_unknown_fields`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FleetCandidateContextPolicyConfig {
     /// No preflight context assertion for this candidate.
     #[default]
@@ -739,14 +742,60 @@ enum FleetCandidateContextPolicyConfig {
     /// output budget fits `usable_context_tokens`.
     Bounded {
         usable_context_tokens: u64,
-        /// Optional server-side exact-count producer qualification. Absent means
-        /// no exact producer is authorized for this bounded candidate (no
-        /// `InputTokensTarget`, no fact; FleetRouter fails closed). This is a
-        /// server-config concept; libsy only sees Unmanaged/Bounded + capacity +
-        /// the host-owned fact.
-        #[serde(default)]
         input_token_source: Option<InputTokenSourceConfig>,
     },
+}
+
+impl<'de> serde::Deserialize<'de> for FleetCandidateContextPolicyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let obj = raw.as_object().ok_or_else(|| {
+            serde::de::Error::custom("context_policy must be a table with a `kind` field")
+        })?;
+        let kind = obj
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("context_policy must have a string `kind`"))?;
+        match kind {
+            "unmanaged" => {
+                // `input_token_source` is meaningful only for a `bounded` policy; any
+                // extra field (not just `kind`) under `unmanaged` is invalid.
+                if obj.len() != 1 {
+                    return Err(serde::de::Error::custom(
+                        "context_policy kind = \"unmanaged\" accepts no other fields \
+                         (input_token_source is only valid under a bounded policy)",
+                    ));
+                }
+                Ok(FleetCandidateContextPolicyConfig::Unmanaged)
+            }
+            "bounded" => {
+                let usable_context_tokens = obj
+                    .get("usable_context_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "context_policy kind = \"bounded\" requires a numeric \
+                             `usable_context_tokens`",
+                        )
+                    })?;
+                let input_token_source = obj
+                    .get("input_token_source")
+                    .map(InputTokenSourceConfig::deserialize)
+                    .transpose()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(FleetCandidateContextPolicyConfig::Bounded {
+                    usable_context_tokens,
+                    input_token_source,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown context_policy kind {other:?} (expected \"unmanaged\" or \"bounded\")"
+            ))),
+        }
+    }
 }
 
 /// Server-only declaration of the exact input-token source a BOUNDED candidate is

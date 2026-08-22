@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use libsy::{Algorithm, CandidateState, FleetSnapshot, Random, SharedFleetState};
+use libsy::{Algorithm, CandidateState, FleetSnapshot, FleetStateSource, Random, SharedFleetState};
 use serde_json::{Value, json};
 use switchyard_llm_client::{
     Backend, ClientRouter, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
@@ -25,6 +25,9 @@ use switchyard_llm_client::{
 use switchyard_protocol::ModelId;
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_server::config::{load_server_state, load_server_state_with_fleet_source};
+use switchyard_server::fleet_readiness::{
+    ComfyFactsClient, FleetSnapshotProducer, HtpcFactsClient, Observed,
+};
 use switchyard_server::{DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState, build_switchyard_router};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -4033,4 +4036,121 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
     assert_eq!(completed["response"]["output"][0]["name"], "search");
     assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__b");
     Ok(())
+}
+
+/// S2-D real read-only proof (gated on `S2D_LIVE=1`; CI has no tailnet access).
+///
+/// Observes the REAL ComfyNinja (:8447) + HTPC (:8081) readiness surfaces
+/// read-only, assembles a coherent FleetSnapshot (with static cloud base
+/// entries), feeds it into a DEVELOPMENT FleetRouter server, and exercises the
+/// native `/v1/decision` path to show real facts affect eligibility. No
+/// production service or route change.
+#[tokio::test]
+async fn s2d_live_readonly_facts_drive_decision() -> TestResult {
+    if std::env::var("S2D_LIVE").as_deref() != Ok("1") {
+        return Ok(()); // gated: only run against live surfaces when explicitly requested
+    }
+    let state = Arc::new(SharedFleetState::new(libsy::FleetSnapshot::new(vec![])?));
+    let producer = FleetSnapshotProducer::new(Arc::clone(&state));
+
+    let comfy = ComfyFactsClient::new(
+        "https://reninja.tailc8ef7b.ts.net:8447/v1/resource".to_string(),
+        "COMFYNINJA_READ_TOKEN".to_string(),
+    );
+    let htpc = HtpcFactsClient::new(
+        "https://htpc-wsl.tailc8ef7b.ts.net:8081".to_string(),
+        "qwen3.5-9b-mtp".to_string(),
+    );
+
+    // Real observations (read-only).
+    let comfy_state = comfy.observe().await;
+    let htpc_state = htpc.observe().await;
+
+    // Assemble the complete generation: real local facts + static cloud base
+    // (configured/attemptable, not a live provider health guarantee).
+    let observations = vec![
+        Observed {
+            model: ModelId::from("model/luna"),
+            state: CandidateState::ready(),
+        },
+        Observed {
+            model: ModelId::from("model/deepseek-flash"),
+            state: CandidateState::ready(),
+        },
+        Observed {
+            model: ModelId::from("model/htpc-qwen3_5"),
+            state: htpc_state,
+        },
+        Observed {
+            model: ModelId::from("model/comfyninja-qwen3_8"),
+            state: comfy_state,
+        },
+    ];
+    producer.apply(observations)?;
+
+    // Build a DEVELOPMENT FleetRouter server over this shared source.
+    let upstream = MockUpstream::start().await?;
+    let state_clone = Arc::clone(&state);
+    let server_state = load_server_state_with_fleet_source_from_parts(
+        &fleet_toml(&upstream.base_url),
+        state_clone,
+    )?;
+    let app = build_switchyard_router(server_state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "live /v1/decision must succeed"
+    );
+    let res = response.json()?;
+    let selected = res["selected"]["target"].as_str().unwrap().to_string();
+    let all: Vec<String> = {
+        let mut v = vec![selected.clone()];
+        v.extend(
+            res["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["target"].as_str().unwrap().to_string()),
+        );
+        v
+    };
+    // The real snapshot must be in effect: comfy (transition-required, real) is
+    // never selected/immediate-fallback; htpc (ready, real) is eligible.
+    assert!(
+        !all.contains(&"comfy".to_string()),
+        "transition-required Comfy from real facts must not be selected/fallback: {all:?}"
+    );
+    assert!(
+        all.contains(&"htpc".to_string()),
+        "ready HTPC from real facts must be eligible: {all:?}"
+    );
+    // luna/deepseek are static cloud base (attemptable) and the top preference.
+    assert_eq!(selected, "luna");
+    Ok(())
+}
+
+/// Builds a server state from TOML with an injected fleet readiness source.
+fn load_server_state_with_fleet_source_from_parts(
+    toml: &str,
+    source: Arc<dyn FleetStateSource>,
+) -> TestResult<ServerState> {
+    use std::io::Write;
+    let mut config = tempfile::Builder::new()
+        .prefix("s2d-live")
+        .suffix(".toml")
+        .tempfile()?;
+    config.write_all(toml.as_bytes())?;
+    config.flush()?;
+    Ok(load_server_state_with_fleet_source(config.path(), source)?)
 }

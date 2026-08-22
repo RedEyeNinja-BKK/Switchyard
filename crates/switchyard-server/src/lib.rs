@@ -4,6 +4,7 @@
 //! Rust HTTP server for libsy algorithms.
 
 pub mod config;
+pub mod fleet_readiness;
 mod metrics;
 mod observability;
 mod response;

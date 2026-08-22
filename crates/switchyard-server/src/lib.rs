@@ -911,6 +911,7 @@ fn resolve_route(
         llm_request,
         raw_request: Some(body),
         metadata: Some(metadata),
+        ..Request::default()
     };
     Ok((route, request))
 }

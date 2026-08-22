@@ -71,6 +71,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Request::default()
         };
 
         // `Noop` synthesizes its own response and never offloads a call, so `echo` is
@@ -93,6 +94,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Request::default()
         };
 
         let algorithm: Arc<dyn Algorithm> = Arc::new(Noop {});

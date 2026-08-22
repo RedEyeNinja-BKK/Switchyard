@@ -66,6 +66,7 @@ fn delegated_prompt_request(request: &Request) -> Option<Request> {
         },
         raw_request: None,
         metadata: request.metadata.clone(),
+        ..Request::default()
     })
 }
 
@@ -186,6 +187,7 @@ mod tests {
             llm_request: text_request(Some(ModelId::from("auto").to_string()), "hi"),
             raw_request: None,
             metadata,
+            ..Request::default()
         }
     }
 

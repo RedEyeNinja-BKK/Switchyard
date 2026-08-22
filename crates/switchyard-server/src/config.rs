@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use libsy::{
     AdvisorGate, AdvisorGateConfig, Algorithm, CandidateProfile, ClassifierContractConfig,
-    ClassifierResponseFormat, ClassifyTrigger, CustomClassifierConfig, CustomClassifierPolicy,
-    EscalationJudgeConfig, FleetRouter, FleetSnapshot, FleetStateSource, GateTrigger,
-    HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop, Passthrough,
-    PickerMode, Random, StageRouter, StageRouterConfig, StaticFleetState, SubagentRouter,
-    SubagentRouterConfig, TargetPrompts, TaskClassifierConfig,
+    ClassifierResponseFormat, ClassifyTrigger, ContextAdmissionPolicy, CustomClassifierConfig,
+    CustomClassifierPolicy, EscalationJudgeConfig, FleetRouter, FleetSnapshot, FleetStateSource,
+    GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop,
+    Passthrough, PickerMode, Random, StageRouter, StageRouterConfig, StaticFleetState,
+    SubagentRouter, SubagentRouterConfig, TargetPrompts, TaskClassifierConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -651,6 +651,25 @@ struct FleetCandidateConfig {
     /// Deterministic preference; lower is preferred.
     #[serde(default)]
     preference_rank: u16,
+    /// Preflight context admission policy. Absent (or `unmanaged`) means FleetRouter
+    /// does not assert preflight context fit for this candidate (the pre-S2-E
+    /// behavior). `bounded` opts this candidate into pure context admission with a
+    /// qualified usable context capacity.
+    #[serde(default)]
+    context_policy: FleetCandidateContextPolicyConfig,
+}
+
+/// Durable per-candidate context admission policy (configuration only; no live
+/// counts live here).
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum FleetCandidateContextPolicyConfig {
+    /// No preflight context assertion for this candidate.
+    #[default]
+    Unmanaged,
+    /// Admit only when a candidate-specific input-token fact plus an explicit
+    /// output budget fits `usable_context_tokens`.
+    Bounded { usable_context_tokens: u64 },
 }
 
 /// What fires an advisor route's review.
@@ -1519,17 +1538,30 @@ fn build_algorithm(
             Ok(Arc::new(algorithm))
         }
         RouteConfig::FleetRouter { candidates, .. } => {
-            // Static profile only: capability + preference per candidate. Live
-            // readiness comes from the injected `fleet_source`, never this config.
+            // Static profile only: capability + preference + context policy per
+            // candidate. Live readiness comes from the injected `fleet_source`,
+            // never this config.
             let mut profiles = Vec::with_capacity(candidates.len());
             for candidate in candidates {
                 let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
-                profiles.push(CandidateProfile::new(
-                    target,
-                    candidate.tool_calling,
-                    candidate.reasoning,
-                    candidate.preference_rank,
-                ));
+                profiles.push(
+                    CandidateProfile::new(
+                        target,
+                        candidate.tool_calling,
+                        candidate.reasoning,
+                        candidate.preference_rank,
+                    )
+                    .with_context_policy(match candidate.context_policy {
+                        FleetCandidateContextPolicyConfig::Unmanaged => {
+                            ContextAdmissionPolicy::Unmanaged
+                        }
+                        FleetCandidateContextPolicyConfig::Bounded {
+                            usable_context_tokens,
+                        } => ContextAdmissionPolicy::Bounded {
+                            usable_context_tokens,
+                        },
+                    }),
+                );
             }
             let router = FleetRouter::with_source(profiles, fleet_source).map_err(|error| {
                 ServerError::new(format!("fleet_router route {route_name}: {error}"))

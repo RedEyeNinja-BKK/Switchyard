@@ -56,6 +56,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
             metadata: None,
+            ..Request::default()
         };
         let algorithm: Arc<dyn Algorithm> = Arc::new(Passthrough::new(MODEL_ID));
         let (selected_model, response) = test_drive(algorithm, request, echo()).await?;

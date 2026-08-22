@@ -26,8 +26,10 @@
 //! The Algorithm is **stateless in the routing sense**: the result depends only
 //! on the current request, the static profiles, and the injected snapshot — not
 //! on session/cursor/history state — so repeating them yields the same decision.
-//! Per-target context-window admission, LLM classifiers, and any real fact
-//! producer are explicitly out of scope for this core proof.
+//! Context-fit admission is applied as a pure eligibility filter (see
+//! [`ContextAdmissionPolicy`]); the Algorithm performs no token counting and no
+//! network/provider I/O. LLM classifiers and any real fact producer are
+//! explicitly out of scope for this core proof.
 
 use std::sync::Arc;
 
@@ -36,11 +38,41 @@ use switchyard_protocol::ModelId;
 use crate::core::algorithm::{Algorithm, Driver};
 use crate::{LibsyError, Result, RoutingOutcome};
 
+/// How FleetRouter treats a candidate's context capacity for preflight admission.
+///
+/// This is static candidate configuration (part of the profile), not a live fact
+/// and not a request-derived count. It deliberately distinguishes *unmanaged*
+/// (no preflight context assertion) from *bounded* (requires a trusted
+/// candidate-specific input-token fact and an explicit output budget before
+/// admission) so that `None` never ambiguously means "unknown / unlimited /
+/// legacy".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextAdmissionPolicy {
+    /// FleetRouter does not assert preflight context fit for this candidate.
+    ///
+    /// The candidate remains governed by capability, readiness, and normal
+    /// runtime/provider behavior (including the native `ContextWindowExceeded`
+    /// fallback). This is the initial state for cloud candidates and for any
+    /// candidate config that does not opt in to context admission.
+    Unmanaged,
+    /// FleetRouter requires a trusted candidate-specific input-token fact and an
+    /// explicit output budget before admitting this candidate.
+    ///
+    /// `usable_context_tokens` is the *qualified usable* context this deployment
+    /// guarantees for the candidate (not the theoretical/provider maximum, not a
+    /// route advertisement). Initial local floors: HTPC 65_536, Comfy 69_888.
+    Bounded {
+        /// The guaranteed qualified usable context this candidate can serve.
+        usable_context_tokens: u64,
+    },
+}
+
 /// Static capability + preference profile for one candidate target.
 ///
 /// This is Algorithm configuration, not a live fact. `tool_calling` and
 /// `reasoning` describe what the target advertises it can do; `preference_rank`
-/// is a deterministic deployment ordering (lower = more preferred).
+/// is a deterministic deployment ordering (lower = more preferred);
+/// `context_policy` says whether and how preflight context admission applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateProfile {
     /// Target model id that will be selected when this candidate wins.
@@ -51,10 +83,13 @@ pub struct CandidateProfile {
     pub reasoning: bool,
     /// Deterministic preference ordering; lower is preferred.
     pub preference_rank: u16,
+    /// Preflight context admission policy for this candidate.
+    pub context_policy: ContextAdmissionPolicy,
 }
 
 impl CandidateProfile {
-    /// Creates a candidate profile for `target`.
+    /// Creates a candidate profile for `target` with no preflight context concern
+    /// ([`ContextAdmissionPolicy::Unmanaged`]).
     pub fn new(
         target: impl Into<ModelId>,
         tool_calling: bool,
@@ -66,7 +101,14 @@ impl CandidateProfile {
             tool_calling,
             reasoning,
             preference_rank,
+            context_policy: ContextAdmissionPolicy::Unmanaged,
         }
+    }
+
+    /// Sets the candidate's preflight context admission policy (builder style).
+    pub fn with_context_policy(mut self, policy: ContextAdmissionPolicy) -> Self {
+        self.context_policy = policy;
+        self
     }
 }
 
@@ -372,6 +414,7 @@ impl FleetRouter {
     fn decide(&self, request: &switchyard_protocol::Request) -> Result<(ModelId, Vec<ModelId>)> {
         let require_tools = !request.llm_request.tools.is_empty();
         let require_reasoning = reasoning_requested(&request.llm_request.reasoning);
+        let max_output = request.llm_request.output.max_output_tokens;
         // One request consumes exactly one coherent factual snapshot.
         let snapshot = self.snapshot();
 
@@ -392,10 +435,24 @@ impl FleetRouter {
             if !snapshot.state_for(&profile.target).immediately_eligible() {
                 continue;
             }
+            // Context-fit filter (pure admission, no counting, no I/O): a
+            // BOUNDED candidate is eligible only when the request carries a
+            // trusted candidate-specific input-token fact AND an explicit output
+            // budget, and input + output fits its qualified usable context with
+            // checked arithmetic. Unknown/overflow => excluded (fail closed).
+            if !self.context_fits(
+                &profile.context_policy,
+                &profile.target,
+                request,
+                max_output,
+            ) {
+                continue;
+            }
             eligible.push(profile);
         }
         // Deterministic preference: lower rank first; ties broken by target id
-        // for a total order (still deterministic and stateless).
+        // for a total order (still deterministic and stateless). Context size is
+        // never used as a ranking signal — it is admission only.
         eligible.sort_by(|a, b| {
             a.preference_rank
                 .cmp(&b.preference_rank)
@@ -413,6 +470,43 @@ impl FleetRouter {
         let selected = ids.next().expect("non-empty eligible set");
         let fallbacks = ids.collect::<Vec<_>>();
         Ok((selected, fallbacks))
+    }
+
+    /// Pure preflight context-fit admission for one candidate.
+    ///
+    /// `Unmanaged` candidates always pass. A `Bounded { usable_context_tokens }`
+    /// candidate requires a **candidate-specific** exact input-token fact from the
+    /// request (keyed by its own target; never borrowed from another candidate)
+    /// and an explicit output budget; it admits only when
+    /// `input + output <= usable_context_tokens` under checked arithmetic.
+    /// Missing input fact, missing output budget, or arithmetic overflow all fail
+    /// closed to non-admission.
+    fn context_fits(
+        &self,
+        policy: &ContextAdmissionPolicy,
+        target: &ModelId,
+        request: &switchyard_protocol::Request,
+        max_output: Option<u64>,
+    ) -> bool {
+        let ContextAdmissionPolicy::Bounded {
+            usable_context_tokens,
+        } = policy
+        else {
+            return true;
+        };
+        let Some(input) = request.candidate_input_tokens.get(target) else {
+            // No trusted candidate-specific input count => unknown => excluded.
+            return false;
+        };
+        let Some(output) = max_output else {
+            // Missing explicit output budget => cannot be fully proven => excluded.
+            return false;
+        };
+        match input.checked_add(output) {
+            Some(fit) if fit <= *usable_context_tokens => true,
+            // Overflow or does-not-fit => fail closed.
+            _ => false,
+        }
     }
 }
 
@@ -481,6 +575,7 @@ mod tests {
             llm_request: text_request(None, "hello"),
             raw_request: None,
             metadata: None,
+            ..Request::default()
         }
     }
 
@@ -995,5 +1090,277 @@ mod tests {
             .collect::<Vec<_>>();
         // Every reader successfully observed only coherent snapshots.
         assert!(saw.iter().all(|v| *v));
+    }
+
+    // --- S2-E.1: pure context-fit admission -----------------------------------
+
+    use super::ContextAdmissionPolicy;
+    use std::collections::BTreeMap;
+
+    /// A request with explicit output budget and candidate input-token facts.
+    fn ctx_req(max_output_tokens: Option<u64>, input_tokens: &[(&str, u64)]) -> Request {
+        let mut req = text_req();
+        req.llm_request.output.max_output_tokens = max_output_tokens;
+        req.candidate_input_tokens = input_tokens
+            .iter()
+            .map(|(m, n)| (ModelId::from(*m), *n))
+            .collect::<BTreeMap<_, _>>();
+        req
+    }
+
+    fn bounded_profile(target: &str, rank: u16, cap: u64) -> CandidateProfile {
+        CandidateProfile::new(target, true, true, rank).with_context_policy(
+            ContextAdmissionPolicy::Bounded {
+                usable_context_tokens: cap,
+            },
+        )
+    }
+
+    #[test]
+    fn context_unmanaged_candidate_unchanged() {
+        // A: UNMANAGED candidate requires no input-count fact and no output budget;
+        // ready/capable => eligible exactly as pre-S2-E.
+        let router = FleetRouter::new(
+            vec![CandidateProfile::new("cloud", true, true, 1)],
+            vec![(ModelId::from("cloud"), CandidateState::ready())],
+        )
+        .unwrap();
+        let (selected, _) = router.decide(&text_req()).unwrap();
+        assert_eq!(selected.to_string(), "cloud");
+    }
+
+    #[test]
+    fn bounded_known_fit_eligible() {
+        // B: BOUNDED fits (input + output < capacity) => eligible.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        let (selected, _) = router
+            .decide(&ctx_req(Some(8_000), &[("local", 50_000)]))
+            .unwrap();
+        assert_eq!(selected.to_string(), "local");
+    }
+
+    #[test]
+    fn bounded_exact_boundary_eligible() {
+        // C: input + output == capacity => eligible.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        let (selected, _) = router
+            .decide(&ctx_req(Some(15_536), &[("local", 50_000)]))
+            .unwrap();
+        assert_eq!(selected.to_string(), "local");
+    }
+
+    #[test]
+    fn bounded_overflow_excluded() {
+        // D: input + output > capacity => excluded.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        assert!(
+            router
+                .decide(&ctx_req(Some(15_537), &[("local", 50_000)]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_input_fits_but_output_overflows_excluded() {
+        // E: input alone fits (65000) but requested output (2000) pushes past
+        // capacity (65536) => excluded. FleetRouter protects the requested output
+        // budget even though llama.cpp might silently constrain generation.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        assert!(
+            router
+                .decide(&ctx_req(Some(2_000), &[("local", 65_000)]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_missing_candidate_count_excluded() {
+        // F: BOUNDED with no candidate-specific input fact => excluded.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        assert!(router.decide(&ctx_req(Some(8_000), &[])).is_err());
+    }
+
+    #[test]
+    fn bounded_missing_output_budget_excluded() {
+        // G: BOUNDED with known input but no max_output_tokens => excluded (not
+        // treated as zero).
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        assert!(router.decide(&ctx_req(None, &[("local", 8_000)])).is_err());
+    }
+
+    #[test]
+    fn bounded_arithmetic_overflow_excluded() {
+        // H: checked_add overflow => excluded (fail closed).
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, u64::MAX)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        assert!(
+            router
+                .decide(&ctx_req(Some(u64::MAX), &[("local", u64::MAX)]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_specific_counts_never_borrowed() {
+        // I: HTPC has a count, Comfy does not. HTPC may qualify; Comfy must NOT
+        // borrow HTPC's count.
+        let router = FleetRouter::new(
+            vec![
+                bounded_profile("htpc", 1, 65_536),
+                bounded_profile("comfy", 2, 69_888),
+            ],
+            vec![
+                (ModelId::from("htpc"), CandidateState::ready()),
+                (ModelId::from("comfy"), CandidateState::ready()),
+            ],
+        )
+        .unwrap();
+        // Only HTPC has a candidate-specific count; both have an output budget.
+        let (selected, fallbacks) = router
+            .decide(&ctx_req(Some(4_096), &[("htpc", 30_000)]))
+            .unwrap();
+        assert_eq!(selected.to_string(), "htpc");
+        // Comfy must NOT be eligible (no its-own count), so no fallback.
+        assert!(fallbacks.is_empty());
+    }
+
+    #[test]
+    fn context_fit_filters_before_preference() {
+        // J: a higher-preference candidate does not fit; a lower-preference one
+        // does => the lower-preference candidate is selected.
+        let router = FleetRouter::new(
+            vec![
+                bounded_profile("pref", 1, 65_536),
+                bounded_profile("fit", 2, 200_000),
+            ],
+            vec![
+                (ModelId::from("pref"), CandidateState::ready()),
+                (ModelId::from("fit"), CandidateState::ready()),
+            ],
+        )
+        .unwrap();
+        // 'pref' has no candidate-specific count => excluded despite rank 1.
+        let (selected, _) = router
+            .decide(&ctx_req(Some(1_000), &[("fit", 50_000)]))
+            .unwrap();
+        assert_eq!(selected.to_string(), "fit");
+    }
+
+    #[test]
+    fn fallback_purity_selected_and_fallbacks_admitted() {
+        // K: selected AND every fallback must independently pass context admission.
+        let router = FleetRouter::new(
+            vec![
+                bounded_profile("a", 1, 65_536),
+                bounded_profile("b", 2, 65_536),
+                bounded_profile("c", 3, 65_536),
+            ],
+            vec![
+                (ModelId::from("a"), CandidateState::ready()),
+                (ModelId::from("b"), CandidateState::ready()),
+                (ModelId::from("c"), CandidateState::ready()),
+            ],
+        )
+        .unwrap();
+        // 'a' and 'c' have counts; 'b' (rank 2) does not => 'b' must NOT appear in
+        // fallbacks even though it is ranked above 'c'.
+        let (selected, fallbacks) = router
+            .decide(&ctx_req(Some(1_000), &[("a", 1_000), ("c", 1_000)]))
+            .unwrap();
+        let fbs = fallbacks
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(selected.to_string(), "a");
+        assert!(
+            !fbs.contains(&"b".to_string()),
+            "b must not leak into fallbacks"
+        );
+        assert_eq!(fbs, ["c"]);
+    }
+
+    #[test]
+    fn context_fit_does_not_override_readiness() {
+        // L: context-fit but not-ready candidate => excluded.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::not_ready())],
+        )
+        .unwrap();
+        assert!(
+            router
+                .decide(&ctx_req(Some(1_000), &[("local", 1_000)]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn context_fit_does_not_override_capability() {
+        // M: context-fit but tool-ineligible candidate => excluded for a tool request.
+        let router = FleetRouter::new(
+            vec![
+                CandidateProfile::new("local", false, false, 1).with_context_policy(
+                    ContextAdmissionPolicy::Bounded {
+                        usable_context_tokens: 65_536,
+                    },
+                ),
+            ],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        // A tool-required request: even with a fitting count and output budget, the
+        // tool-ineligible candidate must be excluded by the capability filter.
+        let mut req = tool_req();
+        req.llm_request.output.max_output_tokens = Some(1_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 1_000)]);
+        assert!(router.decide(&req).is_err());
+    }
+
+    #[test]
+    fn context_decision_is_deterministic() {
+        // N: same request/facts/snapshot => same decision.
+        let router = FleetRouter::new(
+            vec![
+                bounded_profile("a", 1, 65_536),
+                bounded_profile("b", 2, 65_536),
+            ],
+            vec![
+                (ModelId::from("a"), CandidateState::ready()),
+                (ModelId::from("b"), CandidateState::ready()),
+            ],
+        )
+        .unwrap();
+        let req = ctx_req(Some(1_000), &[("a", 1_000), ("b", 1_000)]);
+        let d1 = router.decide(&req).unwrap();
+        let d2 = router.decide(&req).unwrap();
+        assert_eq!(d1.0, d2.0);
+        assert_eq!(d1.1, d2.1);
     }
 }

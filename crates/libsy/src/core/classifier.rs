@@ -206,6 +206,7 @@ mod tests {
             llm_request: text_request(Some("strong".to_string()), "hi"),
             raw_request: None,
             metadata: None,
+            ..Request::default()
         };
         // A `None` driver is valid: the classifier scored without offloading a model call.
         let (classification, _) = RecordingClassifier
@@ -248,6 +249,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
             metadata: None,
+            ..Request::default()
         };
 
         RewritingClassifier

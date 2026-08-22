@@ -462,6 +462,7 @@ mod tests {
                 session_id: Some("session-1".to_string()),
                 ..Default::default()
             }),
+            ..Request::default()
         }
     }
 

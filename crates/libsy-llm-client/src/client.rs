@@ -508,6 +508,7 @@ impl TranslatingLlmClient {
                 wire_format: None,
                 ..Default::default()
             }),
+            ..Request::default()
         };
         let response = self.call_rewrite_model(request, model).await?;
 
@@ -979,6 +980,7 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            ..Request::default()
         }
     }
 
@@ -1937,6 +1939,7 @@ mod tests {
                 wire_format: None,
                 ..Default::default()
             }),
+            ..Request::default()
         };
 
         let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;

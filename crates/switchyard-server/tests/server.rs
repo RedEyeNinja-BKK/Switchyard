@@ -1549,6 +1549,94 @@ context_window = 1048576
     )
 }
 
+// ─── S2-E.1 server DI: durable per-candidate context policy ────────────────
+#[tokio::test]
+async fn s2e1_bounded_candidate_excluded_without_host_count() -> TestResult {
+    // A `bounded` candidate (priority 1) has NO host-supplied candidate-input
+    // fact for this request, so it is excluded by preflight context admission;
+    // the lower-priority `unmanaged` candidate is selected instead. This proves
+    // the durable TOML `context_policy` deserializes and flows into FleetRouter.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "bounded", usable_context_tokens = 65536 }
+
+[[routes.fleet.candidates]]
+target = "b"
+tool_calling = true
+reasoning = true
+preference_rank = 2
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}], "max_tokens": 64}
+        })),
+    )
+    .await?;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "unmanaged fallback must be selected"
+    );
+    let res = response.json()?;
+    // Without a host-supplied count for bounded `a`, only unmanaged `b` is eligible.
+    assert_eq!(res["selected"]["target"], "b");
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2e1_absent_context_policy_stays_unmanaged() -> TestResult {
+    // Backward compatibility: a candidate TOML without `context_policy` must
+    // still be eligible exactly as before (no preflight context assertion).
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let state = load_fleet_test_config(&toml, Arc::new(shared))?;
+    let app = build_switchyard_router(state);
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}], "max_tokens": 64}
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let res = response.json()?;
+    assert_eq!(res["selected"]["target"], "a");
+    Ok(())
+}
+
 #[tokio::test]
 async fn s2c_no_tool_capable_candidate_rejects_tool_override() -> TestResult {
     // A: candidate set has no tool-capable target; route-level tool_calling=true

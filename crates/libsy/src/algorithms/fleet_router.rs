@@ -58,11 +58,12 @@ pub enum ContextAdmissionPolicy {
     /// FleetRouter requires a trusted candidate-specific input-token fact and an
     /// explicit output budget before admitting this candidate.
     ///
-    /// `usable_context_tokens` is the *qualified usable* context this deployment
-    /// guarantees for the candidate (not the theoretical/provider maximum, not a
-    /// route advertisement). Initial local floors: HTPC 65_536, Comfy 69_888.
+    /// `usable_context_tokens` is the qualified usable context this deployment
+    /// guarantees for the candidate; it is not the theoretical/provider maximum
+    /// or route advertisement.
     Bounded {
-        /// The guaranteed qualified usable context this candidate can serve.
+        /// The qualified usable context this deployment guarantees this candidate
+        /// can serve.
         usable_context_tokens: u64,
     },
 }
@@ -210,6 +211,52 @@ impl FleetSnapshot {
     }
 }
 
+/// Shared candidate-profile validation for [`FleetRouter::new`] and
+/// [`FleetRouter::with_source`].
+///
+/// Enforces the invariants that apply to every candidate profile regardless of
+/// whether it came from server TOML, tests, another Rust host, or a future
+/// integration:
+/// - at least one candidate profile is required;
+/// - no two profiles name the same target;
+/// - a `Bounded` context policy must have a **positive** usable context capacity
+///   (a zero-capacity `Bounded` candidate is an invalid context-admission
+///   contract and is rejected at construction).
+///
+/// `Unmanaged` is always valid.
+fn validate_profiles(profiles: &[CandidateProfile]) -> Result<()> {
+    if profiles.is_empty() {
+        return Err(LibsyError::AlgorithmError {
+            message: "fleet router requires at least one candidate profile".to_string(),
+        });
+    }
+    for (i, a) in profiles.iter().enumerate() {
+        if let ContextAdmissionPolicy::Bounded {
+            usable_context_tokens: 0,
+        } = a.context_policy
+        {
+            return Err(LibsyError::AlgorithmError {
+                message: format!(
+                    "fleet router candidate {:?} has an invalid zero usable_context_tokens; \
+                     a bounded context policy must declare a positive usable capacity",
+                    a.target
+                ),
+            });
+        }
+        for b in profiles.iter().skip(i + 1) {
+            if a.target == b.target {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "fleet router profiles must not repeat target {:?}",
+                        a.target
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Produces one coherent [`FleetSnapshot`] synchronously.
 ///
 /// Implementors do no network I/O in `snapshot`; any external fact producer
@@ -323,23 +370,7 @@ impl FleetRouter {
         profiles: Vec<CandidateProfile>,
         state: Vec<(ModelId, CandidateState)>,
     ) -> Result<Self> {
-        if profiles.is_empty() {
-            return Err(LibsyError::AlgorithmError {
-                message: "fleet router requires at least one candidate profile".to_string(),
-            });
-        }
-        for (i, a) in profiles.iter().enumerate() {
-            for b in profiles.iter().skip(i + 1) {
-                if a.target == b.target {
-                    return Err(LibsyError::AlgorithmError {
-                        message: format!(
-                            "fleet router profiles must not repeat target {:?}",
-                            a.target
-                        ),
-                    });
-                }
-            }
-        }
+        validate_profiles(&profiles)?;
         // Validate the injected state: no duplicate keys, and each key must
         // correspond to a profile target.
         let snapshot =
@@ -385,23 +416,7 @@ impl FleetRouter {
         profiles: Vec<CandidateProfile>,
         state: Arc<dyn FleetStateSource>,
     ) -> Result<Self> {
-        if profiles.is_empty() {
-            return Err(LibsyError::AlgorithmError {
-                message: "fleet router requires at least one candidate profile".to_string(),
-            });
-        }
-        for (i, a) in profiles.iter().enumerate() {
-            for b in profiles.iter().skip(i + 1) {
-                if a.target == b.target {
-                    return Err(LibsyError::AlgorithmError {
-                        message: format!(
-                            "fleet router profiles must not repeat target {:?}",
-                            a.target
-                        ),
-                    });
-                }
-            }
-        }
+        validate_profiles(&profiles)?;
         Ok(Self { profiles, state })
     }
 
@@ -1362,5 +1377,57 @@ mod tests {
         let d2 = router.decide(&req).unwrap();
         assert_eq!(d1.0, d2.0);
         assert_eq!(d1.1, d2.1);
+    }
+
+    #[test]
+    fn zero_bounded_capacity_rejected_at_new() {
+        // Core invariant: a Bounded context policy with a zero usable capacity is an
+        // invalid context-admission contract and must fail construction (new path).
+        let profile = CandidateProfile::new("local", true, true, 1).with_context_policy(
+            ContextAdmissionPolicy::Bounded {
+                usable_context_tokens: 0,
+            },
+        );
+        let err = FleetRouter::new(
+            vec![profile],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid zero usable_context_tokens"),
+            "error must name the invalid zero capacity: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_bounded_capacity_rejected_at_with_source() {
+        // Core invariant via the injected-source constructor path.
+        let profile = CandidateProfile::new("local", true, true, 1).with_context_policy(
+            ContextAdmissionPolicy::Bounded {
+                usable_context_tokens: 0,
+            },
+        );
+        let source = SharedFleetState::new(
+            FleetSnapshot::new(vec![(ModelId::from("local"), CandidateState::ready())]).unwrap(),
+        );
+        let err = FleetRouter::with_source(vec![profile], Arc::new(source)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid zero usable_context_tokens"),
+            "error must name the invalid zero capacity: {err}"
+        );
+    }
+
+    #[test]
+    fn unmanaged_policy_is_valid_and_zero_bounded_is_not() {
+        // The explicit-semantic check: Unmanaged is always valid; only Bounded{0} is
+        // invalid. Both constructors share one validator.
+        let unmanaged = CandidateProfile::new("local", true, true, 1); // Unmanaged
+        FleetRouter::with_source(
+            vec![unmanaged],
+            Arc::new(SharedFleetState::new(FleetSnapshot::new(vec![]).unwrap())),
+        )
+        .unwrap();
     }
 }

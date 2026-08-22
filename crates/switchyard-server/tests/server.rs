@@ -1638,6 +1638,38 @@ preference_rank = 1
 }
 
 #[tokio::test]
+async fn s2e1_zero_bounded_capacity_fails_config_build() -> TestResult {
+    // A `context_policy = bounded` with `usable_context_tokens = 0` is an invalid
+    // context-admission contract and must fail configuration/build (propagated from
+    // the FleetRouter core validator), not silently create a useless route.
+    let upstream = MockUpstream::start().await?;
+    let candidates = r#"
+[[routes.fleet.candidates]]
+target = "a"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+context_policy = { kind = "bounded", usable_context_tokens = 0 }
+"#;
+    let toml = fleet_toml_with_candidates(
+        &upstream.base_url,
+        candidates,
+        "tool_calling = true\nreasoning = true",
+    );
+    let shared = SharedFleetState::new(ab_ready_snapshot());
+    let err = match load_fleet_test_config(&toml, Arc::new(shared)) {
+        Ok(_) => panic!("bounded usable_context_tokens = 0 must fail config build"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("invalid zero usable_context_tokens"),
+        "error must name the invalid zero capacity: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn s2c_no_tool_capable_candidate_rejects_tool_override() -> TestResult {
     // A: candidate set has no tool-capable target; route-level tool_calling=true
     // must fail config construction.

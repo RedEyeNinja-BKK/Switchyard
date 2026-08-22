@@ -157,7 +157,9 @@ impl CandidateProfile {
     }
 
     /// Sets the candidate's static qualified usable context capacity (builder
-    /// style). `Some(0)` is rejected at construction by [`validate_profiles`].
+    /// style). A zero capacity is rejected when the router is constructed. For
+    /// a Bounded candidate, an explicitly present capacity must equal the
+    /// Bounded policy capacity (mismatch is a construction error).
     pub fn with_usable_context_tokens(mut self, capacity: u64) -> Self {
         self.usable_context_tokens = Some(capacity);
         self
@@ -289,16 +291,38 @@ fn validate_profiles(profiles: &[CandidateProfile]) -> Result<()> {
     }
     for (i, a) in profiles.iter().enumerate() {
         if let ContextAdmissionPolicy::Bounded {
-            usable_context_tokens: 0,
+            usable_context_tokens,
         } = a.context_policy
         {
-            return Err(LibsyError::AlgorithmError {
-                message: format!(
-                    "fleet router candidate {:?} has an invalid zero usable_context_tokens; \
-                     a bounded context policy must declare a positive usable capacity",
-                    a.target
-                ),
-            });
+            if usable_context_tokens == 0 {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "fleet router candidate {:?} has an invalid zero usable_context_tokens; \
+                         a bounded context policy must declare a positive usable capacity",
+                        a.target
+                    ),
+                });
+            }
+            // Capacity-coherence invariant (FLEET-1 review): a Bounded candidate's
+            // static usable_context_tokens, when explicitly present, MUST equal the
+            // Bounded policy capacity. Both represent the same qualified usable
+            // capacity; a mismatch is a configuration/construction error, never
+            // silently resolved. When the static field is absent, the Bounded
+            // policy capacity is the effective known static capacity for
+            // min_context_tokens eligibility (min_context_eligible reads it via
+            // the fallback below).
+            if let Some(static_cap) = a.usable_context_tokens {
+                if static_cap != usable_context_tokens {
+                    return Err(LibsyError::AlgorithmError {
+                        message: format!(
+                            "fleet router candidate {:?} has a static usable_context_tokens \
+                             ({static_cap}) that disagrees with its Bounded context-policy \
+                             capacity ({usable_context_tokens}); they must be equal",
+                            a.target
+                        ),
+                    });
+                }
+            }
         }
         if a.usable_context_tokens == Some(0) {
             return Err(LibsyError::AlgorithmError {
@@ -606,9 +630,18 @@ impl FleetRouter {
         let Some(min) = declared else {
             return true;
         };
+        // Effective known static capacity: the explicit static field when
+        // present; for a Bounded candidate WITHOUT an explicit static field, the
+        // Bounded policy capacity is the effective known static capacity (the
+        // coherence invariant guarantees they would be equal if both present).
         match profile.usable_context_tokens {
             Some(cap) => cap >= min,
-            None => false,
+            None => match profile.context_policy {
+                ContextAdmissionPolicy::Bounded {
+                    usable_context_tokens,
+                } => usable_context_tokens >= min,
+                ContextAdmissionPolicy::Unmanaged => false,
+            },
         }
     }
 
@@ -1991,5 +2024,86 @@ mod tests {
             err.to_string().contains("zero"),
             "expected zero-capacity config error, got {err}"
         );
+    }
+
+    // --- FLEET-1 review: capacity-coherence invariant (Bounded vs static) ----
+
+    #[test]
+    fn bounded_without_static_uses_policy_capacity_for_min() {
+        // 1: Bounded(B) + no static field + min <= B => min eligibility uses B.
+        // (Existing `bounded_profile` helper builds exactly this shape.) The
+        // Bounded exact-fit admission still requires candidate input facts +
+        // an output budget; supply them so only min-context is under test.
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        let mut req = min_ctx_req(Some(65_536));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 50_000)]);
+        let (selected, _) = router.decide(&req).unwrap();
+        assert_eq!(selected.to_string(), "local");
+        // Above B (min 65,537) => excluded (fail closed).
+        let mut req = min_ctx_req(Some(65_537));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 50_000)]);
+        assert!(router.decide(&req).is_err());
+    }
+
+    #[test]
+    fn bounded_with_matching_static_accepted() {
+        // 2: Bounded(B) + static B => accepted (coherent).
+        let router = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536).with_usable_context_tokens(65_536)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        let mut req = min_ctx_req(Some(65_536));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 50_000)]);
+        let (selected, _) = router.decide(&req).unwrap();
+        assert_eq!(selected.to_string(), "local");
+    }
+
+    #[test]
+    fn bounded_with_mismatched_static_rejected() {
+        // 3: Bounded(B) + static C where C != B => rejected at construction.
+        let err = FleetRouter::new(
+            vec![bounded_profile("local", 1, 65_536).with_usable_context_tokens(69_888)],
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees"),
+            "expected capacity-coherence error, got {err}"
+        );
+    }
+
+    #[test]
+    fn bounded_combined_min_and_exact_fit_unchanged() {
+        // 4: combined minimum + exact-fit behavior unchanged when coherent.
+        let profiles = vec![bounded_profile("local", 1, 65_536).with_usable_context_tokens(65_536)];
+        let router = FleetRouter::new(
+            profiles,
+            vec![(ModelId::from("local"), CandidateState::ready())],
+        )
+        .unwrap();
+        // min ok, exact-fit fails (60k + 8k > 65,536) => excluded.
+        let mut req = min_ctx_req(Some(60_000));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 60_000)]);
+        assert!(router.decide(&req).is_err());
+        // exact-fit ok, min fails (min 100k > 65,536) => excluded.
+        let mut req = min_ctx_req(Some(100_000));
+        req.llm_request.output.max_output_tokens = Some(8_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 10_000)]);
+        assert!(router.decide(&req).is_err());
+        // both ok => eligible.
+        let mut req = min_ctx_req(Some(60_000));
+        req.llm_request.output.max_output_tokens = Some(5_000);
+        req.candidate_input_tokens = BTreeMap::from([(ModelId::from("local"), 60_000)]);
+        let (selected, _) = router.decide(&req).unwrap();
+        assert_eq!(selected.to_string(), "local");
     }
 }

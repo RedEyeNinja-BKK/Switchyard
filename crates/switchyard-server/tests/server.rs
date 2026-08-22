@@ -1620,7 +1620,13 @@ preference_rank = 2
 #[tokio::test]
 async fn s2c_explicit_restriction_makes_disjoint_set_representable() -> TestResult {
     // D: same disjoint candidate set, but explicit tool_calling=true /
-    // reasoning=false narrows the envelope so it is representable.
+    // reasoning=false narrows the advertised envelope so it is representable.
+    //
+    // IMPORTANT SEMANTIC: route-level capability fields are ADVERTISEMENT
+    // metadata, not request-admission policy. `reasoning=false` conservatively
+    // under-advertises; it does NOT rewrite FleetRouter candidate profiles nor
+    // block reasoning requests at runtime. Admission continues to use
+    // CandidateProfile (A=tool-only, B=reasoning-only) + the injected snapshot.
     let upstream = MockUpstream::start().await?;
     let candidates = r#"
 [[routes.fleet.candidates]]
@@ -1641,12 +1647,48 @@ preference_rank = 2
         "tool_calling = true\nreasoning = false",
     );
     let shared = SharedFleetState::new(ab_ready_snapshot());
-    // Loads successfully: the advertised envelope is exactly
-    // tool_calling=true, reasoning=false (representable by tool-only A).
     let state = load_fleet_test_config(&toml, Arc::new(shared))?;
     let app = build_switchyard_router(state);
 
-    // A tool-bearing request routes to the tool-capable candidate.
+    // A. ADVERTISEMENT: GET /v1/models must report the fleet route with the
+    // explicit conservative restriction applied (tool_calling=true,
+    // reasoning=false under-advertised).
+    let models = send(&app, "GET", "/v1/models", None).await?;
+    assert_eq!(models.status, StatusCode::OK);
+    let models_json = models.json()?;
+    // Standard `data` entry exposes the raw tool_calling capability (a positive
+    // claim must be truthful).
+    let data_entry = models_json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "localclaw/fleet")
+        .expect("fleet route must be advertised in /v1/models");
+    assert_eq!(
+        data_entry["capabilities"]["tool_calling"], true,
+        "route must positively advertise tool_calling=true"
+    );
+    // Codex `models` entry carries the reasoning advertisement: reasoning=false
+    // => default_reasoning_level is null and supports_reasoning_summaries false
+    // (conservative under-advertisement, matching the explicit reasoning=false).
+    let codex_entry = models_json["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "localclaw/fleet")
+        .expect("fleet route must be advertised in the Codex models list");
+    assert_eq!(
+        codex_entry["shell_type"], "shell_command",
+        "tool_calling=true advertised"
+    );
+    assert!(
+        codex_entry["default_reasoning_level"].is_null(),
+        "reasoning=false under-advertised"
+    );
+    assert_eq!(codex_entry["supports_reasoning_summaries"], false);
+
+    // B. ALGORITHM DECISION: route advertisement does not gate admission.
+    // A tool-bearing request selects the tool-capable candidate A.
     let tool_resp = send(
         &app,
         "POST",
@@ -1664,8 +1706,10 @@ preference_rank = 2
     assert_eq!(tool_resp.status, StatusCode::OK);
     assert_eq!(tool_resp.json()?["selected"]["target"], "a");
 
-    // Because the envelope excludes reasoning, a positive-reasoning request has
-    // no eligible candidate and fails closed (envelope is truthful).
+    // A positive-reasoning request still routes to the reasoning-capable
+    // candidate B (FleetRouter uses CandidateProfile, not the route reasoning
+    // advertisement). This is NOT "fail-closed" — it is the explicit separation
+    // of advertisement metadata from candidate admission.
     let reason_resp = send(
         &app,
         "POST",
@@ -1680,22 +1724,13 @@ preference_rank = 2
         })),
     )
     .await?;
-    assert!(
-        reason_resp.status == StatusCode::OK
-            || reason_resp.status == StatusCode::INTERNAL_SERVER_ERROR
-            || reason_resp.status == StatusCode::SERVICE_UNAVAILABLE,
-        "a reasoning request must fail closed when the advertised envelope has reasoning=false; got {}",
-        reason_resp.status
+    assert_eq!(reason_resp.status, StatusCode::OK);
+    assert_eq!(
+        reason_resp.json()?["selected"]["target"],
+        "b",
+        "a reasoning request routes to the reasoning-capable candidate despite \
+         the route advertising reasoning=false (advertisement != admission)"
     );
-    if reason_resp
-        .headers
-        .get("x-model-router-selected-model")
-        .is_some()
-    {
-        unreachable!(
-            "a reasoning request must not select a target under a reasoning=false envelope"
-        );
-    }
     Ok(())
 }
 

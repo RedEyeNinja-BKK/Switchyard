@@ -939,10 +939,19 @@ impl RouteConfig {
 /// Derives the effective `fleet_router` capability envelope shared by both
 /// [`RouteConfig::capabilities`] and [`RouteConfig::validate_fleet_capabilities`].
 ///
-/// Defaults to the OR of candidate tool/reasoning; an explicit route-level
-/// override narrows or asserts a dimension. The `context_window` argument is
-/// passed through (context admission remains deferred; it does not depend on
-/// candidates).
+/// These are **static advertisement metadata** for `/v1/models` — NOT
+/// request-admission policy. A route advertising `tool_calling=false` or
+/// `reasoning=false` does NOT block such requests at runtime; FleetRouter
+/// admission continues to use each candidate's `CandidateProfile` plus the
+/// injected readiness snapshot. An explicit `false` may conservatively
+/// UNDER-advertise a capability without rewriting candidate profiles.
+///
+/// Derivation: defaults to the OR of candidate tool/reasoning; an explicit
+/// route-level override narrows (false) or asserts (true) a dimension. Positive
+/// claims are validated against candidate satisfiability by
+/// [`RouteConfig::validate_fleet_capabilities`] during build. The
+/// `context_window` argument is passed through (context admission remains
+/// deferred; it does not depend on candidates).
 fn fleet_effective_capabilities(
     context_window: Option<u32>,
     tool_calling: Option<bool>,

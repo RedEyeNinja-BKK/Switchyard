@@ -26,7 +26,7 @@ use switchyard_protocol::ModelId;
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_server::config::{load_server_state, load_server_state_with_fleet_source};
 use switchyard_server::fleet_readiness::{
-    ComfyFactsClient, FleetSnapshotProducer, HtpcFactsClient, Observed,
+    ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed,
 };
 use switchyard_server::{DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState, build_switchyard_router};
 use tokio::net::TcpListener;
@@ -4041,17 +4041,18 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
 /// S2-D real read-only proof (gated on `S2D_LIVE=1`; CI has no tailnet access).
 ///
 /// Observes the REAL ComfyNinja (:8447) + HTPC (:8081) readiness surfaces
-/// read-only, assembles a coherent FleetSnapshot (with static cloud base
-/// entries), feeds it into a DEVELOPMENT FleetRouter server, and exercises the
-/// native `/v1/decision` path to show real facts affect eligibility. No
-/// production service or route change.
+/// read-only through the **real** [`FleetReadinessMonitor`] seam (construction +
+/// a single [`FleetReadinessMonitor::observe_once`]), then consumes the resulting
+/// [`SharedFleetState`] into a DEVELOPMENT FleetRouter server and exercises the
+/// native `/v1/decision` path to show real facts affect eligibility. No manual
+/// `comfy.observe()/htpc.observe()/producer.apply()` assembly. No production
+/// service or route change.
 #[tokio::test]
 async fn s2d_live_readonly_facts_drive_decision() -> TestResult {
     if std::env::var("S2D_LIVE").as_deref() != Ok("1") {
         return Ok(()); // gated: only run against live surfaces when explicitly requested
     }
     let state = Arc::new(SharedFleetState::new(libsy::FleetSnapshot::new(vec![])?));
-    let producer = FleetSnapshotProducer::new(Arc::clone(&state));
 
     let comfy = ComfyFactsClient::new(
         "https://reninja.tailc8ef7b.ts.net:8447/v1/resource".to_string(),
@@ -4059,34 +4060,33 @@ async fn s2d_live_readonly_facts_drive_decision() -> TestResult {
     );
     let htpc = HtpcFactsClient::new(
         "https://htpc-wsl.tailc8ef7b.ts.net:8081".to_string(),
-        "qwen3.5-9b-mtp".to_string(),
+        "Qwen3.5-9B-Q4_0.gguf".to_string(),
     );
 
-    // Real observations (read-only).
-    let comfy_state = comfy.observe().await;
-    let htpc_state = htpc.observe().await;
-
-    // Assemble the complete generation: real local facts + static cloud base
-    // (configured/attemptable, not a live provider health guarantee).
-    let observations = vec![
-        Observed {
-            model: ModelId::from("model/luna"),
-            state: CandidateState::ready(),
-        },
-        Observed {
-            model: ModelId::from("model/deepseek-flash"),
-            state: CandidateState::ready(),
-        },
-        Observed {
-            model: ModelId::from("model/htpc-qwen3_5"),
-            state: htpc_state,
-        },
-        Observed {
-            model: ModelId::from("model/comfyninja-qwen3_8"),
-            state: comfy_state,
-        },
-    ];
-    producer.apply(observations)?;
+    // The real server-owned monitor seam: construction + one observation cycle
+    // against the live read-only endpoints. A large interval is used because only
+    // a single cycle is needed here; the background loop is exercised separately.
+    let monitor = FleetReadinessMonitor::new(
+        comfy,
+        ModelId::from("model/comfyninja-qwen3_8"),
+        htpc,
+        ModelId::from("model/htpc-qwen3_5"),
+        // Static cloud base (configured/attemptable, not a live provider health
+        // guarantee).
+        vec![
+            Observed {
+                model: ModelId::from("model/luna"),
+                state: CandidateState::ready(),
+            },
+            Observed {
+                model: ModelId::from("model/deepseek-flash"),
+                state: CandidateState::ready(),
+            },
+        ],
+        Arc::clone(&state),
+        std::time::Duration::from_secs(3600),
+    );
+    monitor.observe_once().await?;
 
     // Build a DEVELOPMENT FleetRouter server over this shared source.
     let upstream = MockUpstream::start().await?;
@@ -4125,15 +4125,16 @@ async fn s2d_live_readonly_facts_drive_decision() -> TestResult {
         );
         v
     };
-    // The real snapshot must be in effect: comfy (transition-required, real) is
-    // never selected/immediate-fallback; htpc (ready, real) is eligible.
+    // The real snapshot must be in effect: comfy (transition-required from the
+    // real sealed-idle facts) is never selected/immediate-fallback; htpc (should
+    // be ready from real facts) is eligible.
     assert!(
         !all.contains(&"comfy".to_string()),
         "transition-required Comfy from real facts must not be selected/fallback: {all:?}"
     );
     assert!(
         all.contains(&"htpc".to_string()),
-        "ready HTPC from real facts must be eligible: {all:?}"
+        "HTpc should be eligible from real facts: {all:?}"
     );
     // luna/deepseek are static cloud base (attemptable) and the top preference.
     assert_eq!(selected, "luna");
@@ -4153,4 +4154,330 @@ fn load_server_state_with_fleet_source_from_parts(
     config.write_all(toml.as_bytes())?;
     config.flush()?;
     Ok(load_server_state_with_fleet_source(config.path(), source)?)
+}
+
+/// A mutable mock factual endpoint used by the S2-D monitor integration test.
+#[derive(Clone)]
+struct FactEndpoint {
+    body: Arc<std::sync::Mutex<String>>,
+    status: Arc<std::sync::Mutex<u16>>,
+}
+
+impl FactEndpoint {
+    fn new(body: &str) -> Self {
+        Self {
+            body: Arc::new(std::sync::Mutex::new(body.to_string())),
+            status: Arc::new(std::sync::Mutex::new(200)),
+        }
+    }
+    fn set(&self, status: u16, body: &str) {
+        *self.status.lock().unwrap() = status;
+        *self.body.lock().unwrap() = body.to_string();
+    }
+}
+
+/// S2-D live-update-without-rebuild + server-background coexistence proof.
+///
+/// One [`SharedFleetState`] + one FleetRouter server/router + ONE monitor over
+/// mutable mock Comfy/HTPC endpoints. Generation 1 facts (HTPC ready, Comfy
+/// transition-required) are published and reflected by `/v1/decision`; then the
+/// mock facts are changed and the SAME monitor publishes generation 2 (HTPC
+/// not-ready, Comfy ready) reflected by `/v1/decision` — NO server
+/// reconstruction. Finally the monitor's background `run` loop is exercised with
+/// a short interval while a `/v1/decision` is still served, and shutdown stops
+/// the loop cleanly.
+#[tokio::test]
+async fn s2d_fleet_monitor_updates_without_rebuild_and_runs_alongside_server() -> TestResult {
+    let comfy_ep = FactEndpoint::new(
+        r#"{"state":{"mode":"idle","resident_qwen_profile":"unknown","llama_server":"no"}}"#,
+    );
+    let comfy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let comfy_addr = comfy_listener.local_addr()?;
+    let comfy_ep_srv = comfy_ep.clone();
+    tokio::spawn(async move {
+        let comfy_ep = comfy_ep_srv;
+        let app = axum::Router::new().route(
+            "/v1/resource",
+            axum::routing::get(move || {
+                let comfy_ep = comfy_ep.clone();
+                async move {
+                    let status =
+                        axum::http::StatusCode::from_u16(*comfy_ep.status.lock().unwrap()).unwrap();
+                    let body = comfy_ep.body.lock().unwrap().clone();
+                    (status, body)
+                }
+            }),
+        );
+        axum::serve(comfy_listener, app).await.unwrap()
+    });
+    let comfy_url = format!("http://{comfy_addr}/v1/resource");
+
+    let htpc_health = FactEndpoint::new(r#"{"status":"ok"}"#);
+    let htpc_models = FactEndpoint::new(
+        r#"{"object":"list","data":[{"id":"/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_0.gguf"}]}"#,
+    );
+    let htpc_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let htpc_addr = htpc_listener.local_addr()?;
+    let health_srv = htpc_health.clone();
+    let models_srv = htpc_models.clone();
+    tokio::spawn(async move {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let ep = health_srv.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                axum::routing::get(move || {
+                    let ep = models_srv.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            );
+        axum::serve(htpc_listener, app).await.unwrap()
+    });
+    let htpc_base = format!("http://{htpc_addr}");
+
+    // One SharedFleetState shared by the monitor and the FleetRouter server.
+    let state = Arc::new(SharedFleetState::new(libsy::FleetSnapshot::new(vec![])?));
+    let upstream = MockUpstream::start().await?;
+
+    let comfy = ComfyFactsClient::new(comfy_url.clone(), "S2D_TEST_TOKEN_INT".to_string());
+    unsafe { std::env::set_var("S2D_TEST_TOKEN_INT", "dummy") };
+    let htpc = HtpcFactsClient::new(htpc_base.clone(), "Qwen3.5-9B-Q4_0.gguf".to_string());
+    let monitor = FleetReadinessMonitor::new(
+        comfy,
+        ModelId::from("model/comfyninja-qwen3_8"),
+        htpc,
+        ModelId::from("model/htpc-qwen3_5"),
+        vec![
+            Observed {
+                model: ModelId::from("model/luna"),
+                state: CandidateState::ready(),
+            },
+            Observed {
+                model: ModelId::from("model/deepseek-flash"),
+                state: CandidateState::ready(),
+            },
+        ],
+        Arc::clone(&state),
+        std::time::Duration::from_secs(3600),
+    );
+
+    // Generation 1: Comfy sealed-idle => transition_required, HTPC ready.
+    monitor.observe_once().await?;
+
+    // Build the FleetRouter server ONCE over the now-populated shared source.
+    // It is reused across generations (no reconstruction below).
+    let server_state = load_server_state_with_fleet_source_from_parts(
+        &fleet_toml(&upstream.base_url),
+        state.clone(),
+    )?;
+    let app = build_switchyard_router(server_state);
+
+    let (selected1, all1) = s2d_decision_targets(&app).await?;
+    assert_eq!(selected1, "luna", "gen1: luna is the top cloud preference");
+    assert!(
+        !all1.contains(&"comfy".to_string()),
+        "gen1: transition-required comfy must be excluded: {all1:?}"
+    );
+    assert!(
+        all1.contains(&"htpc".to_string()),
+        "gen1: ready htpc must be eligible: {all1:?}"
+    );
+
+    // Generation 2: change ONLY the mock fact responses — HTPC now not-ready
+    // (health down), Comfy now known-ready (serving signature). Same monitor,
+    // same SharedFleetState, same FleetRouter/server/router — no rebuild.
+    htpc_health.set(503, "down");
+    comfy_ep.set(
+        200,
+        r#"{"state":{"mode":"studio","resident_qwen_profile":"unknown","llama_server":"yes"}}"#,
+    );
+    monitor.observe_once().await?;
+    let (selected2, all2) = s2d_decision_targets(&app).await?;
+    assert_eq!(
+        selected2, "luna",
+        "gen2: luna is still the top cloud preference"
+    );
+    assert!(
+        !all2.contains(&"htpc".to_string()),
+        "gen2: now-not-ready htpc must be excluded without rebuild: {all2:?}"
+    );
+    assert!(
+        all2.contains(&"comfy".to_string()),
+        "gen2: now-ready comfy must be eligible without rebuild: {all2:?}"
+    );
+
+    // Background loop coexists with the server: run with a short interval while
+    // /v1/decision is still served, then shut it down cleanly.
+    let comfy_ep_run = FactEndpoint::new(
+        r#"{"state":{"mode":"studio","resident_qwen_profile":"unknown","llama_server":"yes"}}"#,
+    );
+    let run_comfy_url = s2d_spawn_single_endpoint("/v1/resource", comfy_ep_run.clone()).await?;
+    let run_htpc_base = s2d_spawn_dual_endpoints(
+        r#"{"status":"ok"}"#,
+        r#"{"object":"list","data":[{"id":"/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_0.gguf"}]}"#,
+    )
+    .await?;
+    let run_state = Arc::new(SharedFleetState::new(libsy::FleetSnapshot::new(vec![])?));
+    let run_comfy = ComfyFactsClient::new(run_comfy_url, "S2D_TEST_TOKEN_RUN".to_string());
+    unsafe { std::env::set_var("S2D_TEST_TOKEN_RUN", "dummy") };
+    let run_htpc = HtpcFactsClient::new(run_htpc_base, "Qwen3.5-9B-Q4_0.gguf".to_string());
+    let run_monitor = FleetReadinessMonitor::new(
+        run_comfy,
+        ModelId::from("model/comfyninja-qwen3_8"),
+        run_htpc,
+        ModelId::from("model/htpc-qwen3_5"),
+        vec![Observed {
+            model: ModelId::from("model/luna"),
+            state: CandidateState::ready(),
+        }],
+        Arc::clone(&run_state),
+        std::time::Duration::from_millis(15),
+    );
+    let run_state_for_server = Arc::clone(&run_state);
+    let run_server_state = load_server_state_with_fleet_source_from_parts(
+        &fleet_toml(&upstream.base_url),
+        run_state_for_server,
+    )?;
+    let run_app = build_switchyard_router(run_server_state);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(run_monitor.run(async move {
+        let _ = rx.await;
+    }));
+    // Wait for the background monitor's first observation to publish luna before
+    // exercising the server (avoids a race where the decision runs against an
+    // as-yet-empty fleet snapshot).
+    let luna = ModelId::from("model/luna");
+    let mut attempts = 0;
+    while run_state.snapshot().state_for(&luna) != CandidateState::ready() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        attempts += 1;
+        if attempts > 400 {
+            panic!("background monitor did not publish a ready luna in time");
+        }
+    }
+    // Server serves /v1/decision while the monitor runs asynchronously.
+    let (selected_running, all_running) = s2d_decision_targets(&run_app).await?;
+    assert_eq!(selected_running, "luna");
+    assert!(
+        all_running.contains(&"comfy".to_string()),
+        "background: ready comfy should become eligible as the loop publishes: {all_running:?}"
+    );
+    // Let a few cycles run, then shut the loop down cleanly.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let _ = tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("monitor loop must exit cleanly on shutdown")
+        .expect("monitor task must not panic");
+
+    unsafe { std::env::remove_var("S2D_TEST_TOKEN_INT") };
+    unsafe { std::env::remove_var("S2D_TEST_TOKEN_RUN") };
+    Ok(())
+}
+
+/// Issues a `/v1/decision` and returns `(selected, all-targets)`.
+async fn s2d_decision_targets(app: &axum::Router) -> TestResult<(String, Vec<String>)> {
+    let response = send(
+        app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {"model": "localclaw/fleet", "messages": [{"role":"user","content":"hi"}]}
+        })),
+    )
+    .await?;
+    if response.status != StatusCode::OK {
+        panic!(
+            "/v1/decision must succeed; status={:?} body={}",
+            response.status,
+            response.text().unwrap_or("<unreadable>")
+        );
+    }
+    let res = response.json()?;
+    let selected = res["selected"]["target"].as_str().unwrap().to_string();
+    let mut all = vec![selected.clone()];
+    all.extend(
+        res["fallbacks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["target"].as_str().unwrap().to_string()),
+    );
+    Ok((selected, all))
+}
+
+/// Spawns a server serving one mutable GET endpoint, returning its full URL.
+async fn s2d_spawn_single_endpoint(path: &'static str, ep: FactEndpoint) -> TestResult<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::get(move || {
+                let ep = ep.clone();
+                async move {
+                    let status =
+                        axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                    let body = ep.body.lock().unwrap().clone();
+                    (status, body)
+                }
+            }),
+        );
+        axum::serve(listener, app).await.unwrap()
+    });
+    Ok(format!("http://{addr}{path}"))
+}
+
+/// Spawns a server serving `/health` + `/v1/models` mutable endpoints.
+async fn s2d_spawn_dual_endpoints(health_body: &str, models_body: &str) -> TestResult<String> {
+    let health_ep = FactEndpoint::new(health_body);
+    let models_ep = FactEndpoint::new(models_body);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let ep = health_ep.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                axum::routing::get(move || {
+                    let ep = models_ep.clone();
+                    async move {
+                        let status =
+                            axum::http::StatusCode::from_u16(*ep.status.lock().unwrap()).unwrap();
+                        let body = ep.body.lock().unwrap().clone();
+                        (status, body)
+                    }
+                }),
+            );
+        axum::serve(listener, app).await.unwrap()
+    });
+    Ok(format!("http://{addr}"))
 }

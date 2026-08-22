@@ -2701,6 +2701,23 @@ async fn s2h_resource_gated_smart_routing_tracks_live_openai_and_deepseek() -> T
         "agentic/non-thinking must never select or fall back to the bounded-only luna: {body}"
     );
 
+    // (1c) LEGACY work_class compatibility (cutover regression fix): the live
+    // Turnstone aliases send `work_class` via extra_body. wire-body `work_class`
+    // must dispatch identically: bounded->luna, agentic->deepseek NEVER luna.
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&json!({
+            "input_format": "openai_chat",
+            "request": {"model":"localclaw/dev/smart","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"work_class":"agentic"}
+        }))
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["selected"]["target"], "deepseek",
+        "legacy work_class=agentic must select deepseek, never luna: {body}"
+    );
+
     // (2) Flip OpenAI to confirmed exhaustion; DeepSeek stays healthy. After a
     // monitor cycle, a non-thinking request must fall to deepseek (fallback now
     // permissible). It must NOT fail merely because telemetry earlier existed.

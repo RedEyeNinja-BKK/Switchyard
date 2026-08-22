@@ -472,16 +472,20 @@ impl FleetRouter {
     }
 
     /// Resolves the request's declared work shape from structured metadata
-    /// (`work_shape` field in request extensions), or `None` when no shape is
-    /// declared. NEVER inferred from prompt text.
+    /// (`work_shape` field in request extensions, or the LEGACY `work_class`
+    /// translated), or `None` when no shape is declared. NEVER inferred from
+    /// prompt text.
+    ///
+    /// Legacy `work_class` compatibility (the old ResourceRouter universal smart
+    /// contract): `bounded` -> Bounded, `agentic` -> Agentic, `reasoning` ->
+    /// (Bounded, deliberate) — the deliberate intent is surfaced separately via
+    /// [`Self::declared_legacy_reasoning`] so a thinking candidate is required.
     fn declared_work_shape(&self, request: &switchyard_protocol::Request) -> Option<WorkShape> {
         if self.work_shape_source != WorkShapeSource::Request {
             return None;
         }
-        request
-            .llm_request
-            .extensions
-            .fields
+        let fields = &request.llm_request.extensions.fields;
+        if let Some(shape) = fields
             .get("work_shape")
             .and_then(serde_json::Value::as_str)
             .and_then(|s| match s.to_ascii_lowercase().as_str() {
@@ -489,6 +493,37 @@ impl FleetRouter {
                 "agentic" => Some(WorkShape::Agentic),
                 _ => None,
             })
+        {
+            return Some(shape);
+        }
+        // Legacy fallback: work_class=bounded|agentic translate to a shape.
+        match fields
+            .get("work_class")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("bounded") => Some(WorkShape::Bounded),
+            Some("agentic") => Some(WorkShape::Agentic),
+            // work_class=reasoning -> (bounded, deliberate): the deliberate intent
+            // is handled by declared_legacy_reasoning, not a shape exclusion.
+            Some("reasoning") => None,
+            _ => None,
+        }
+    }
+
+    /// Whether the LEGACY `work_class=reasoning` contract is declared, which
+    /// requires a thinking candidate (deliberate intent) regardless of shape.
+    fn declared_legacy_reasoning(&self, request: &switchyard_protocol::Request) -> bool {
+        self.work_shape_source == WorkShapeSource::Request
+            && request
+                .llm_request
+                .extensions
+                .fields
+                .get("work_class")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.eq_ignore_ascii_case("reasoning"))
+                .unwrap_or(false)
     }
 
     /// Work-shape eligibility for one candidate under the declared request shape.
@@ -510,7 +545,10 @@ impl FleetRouter {
     /// and build `(selected, fallbacks)`.
     fn decide(&self, request: &switchyard_protocol::Request) -> Result<(ModelId, Vec<ModelId>)> {
         let require_tools = !request.llm_request.tools.is_empty();
-        let require_reasoning = reasoning_requested(&request.llm_request.reasoning);
+        // Reasoning is required either by an explicit reasoning effort or by the
+        // LEGACY `work_class=reasoning` contract (deliberate intent).
+        let require_reasoning = reasoning_requested(&request.llm_request.reasoning)
+            || self.declared_legacy_reasoning(request);
         let declared_shape = self.declared_work_shape(request);
         let max_output = request.llm_request.output.max_output_tokens;
         // One request consumes exactly one coherent factual snapshot.
@@ -1532,6 +1570,17 @@ mod tests {
         req
     }
 
+    /// A request carrying the LEGACY `work_class` contract (the shape the old
+    /// ResourceRouter universal smart route + the live Turnstone aliases send).
+    fn work_class_req(class: &str) -> Request {
+        let mut req = text_req();
+        req.llm_request.extensions.fields.insert(
+            "work_class".to_string(),
+            serde_json::Value::String(class.to_string()),
+        );
+        req
+    }
+
     /// A dynamic smart-style router: luna (bounded-only, rank 1) and deepseek
     /// (any shape, non-thinking, rank 2), all ready, request-sourced work shape.
     fn work_shape_router() -> FleetRouter {
@@ -1584,5 +1633,62 @@ mod tests {
         let (selected, _fb) = router.decide(&text_req()).unwrap();
         // No declared shape -> no work-shape exclusion; preference picks luna.
         assert_eq!(selected.to_string(), "luna");
+    }
+
+    // --- Legacy `work_class` compatibility (Fix: cutover regression) ---------
+    // The live Turnstone aliases (switchyard-smart-bounded/-agentic/-reasoning)
+    // send `work_class` via extra_body, not `work_shape`. The S2-H FleetRouter
+    // must translate it exactly like the old ResourceRouter: bounded->Bounded,
+    // agentic->Agentic (Luna NEVER), reasoning->(Bounded, deliberate) i.e.
+    // thinking-required (Luna NEVER).
+
+    #[test]
+    fn legacy_work_class_bounded_prefers_luna() {
+        let router = work_shape_router();
+        let (selected, _fb) = router.decide(&work_class_req("bounded")).unwrap();
+        assert_eq!(selected.to_string(), "luna");
+    }
+
+    #[test]
+    fn legacy_work_class_agentic_never_selects_luna() {
+        let router = work_shape_router();
+        let (selected, fb) = router.decide(&work_class_req("agentic")).unwrap();
+        assert_eq!(selected.to_string(), "deepseek");
+        let all: Vec<String> = std::iter::once(selected.to_string())
+            .chain(fb.iter().map(ToString::to_string))
+            .collect();
+        assert!(
+            !all.contains(&"luna".to_string()),
+            "legacy work_class=agentic must NEVER select or fall back to the bounded-only luna: {all:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_work_class_reasoning_requires_thinking_never_luna() {
+        // A thinking-required router (deepseek thinking candidate exists).
+        let profiles = vec![
+            CandidateProfile::new("luna", true, false, 1).with_work_shape(WorkShape::Bounded),
+            CandidateProfile::new("deepseek", true, true, 2),
+        ];
+        let state = SharedFleetState::new(
+            FleetSnapshot::new(vec![
+                (ModelId::from("luna"), CandidateState::ready()),
+                (ModelId::from("deepseek"), CandidateState::ready()),
+            ])
+            .unwrap(),
+        );
+        let router = FleetRouter::with_source(profiles, Arc::new(state))
+            .unwrap()
+            .with_request_work_shape();
+        // Legacy reasoning contract -> deliberate -> thinking required.
+        let (selected, fb) = router.decide(&work_class_req("reasoning")).unwrap();
+        assert_eq!(selected.to_string(), "deepseek");
+        let all: Vec<String> = std::iter::once(selected.to_string())
+            .chain(fb.iter().map(ToString::to_string))
+            .collect();
+        assert!(
+            !all.contains(&"luna".to_string()),
+            "legacy work_class=reasoning must select the thinking candidate, never luna: {all:?}"
+        );
     }
 }

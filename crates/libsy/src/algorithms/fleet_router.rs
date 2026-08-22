@@ -311,17 +311,17 @@ fn validate_profiles(profiles: &[CandidateProfile]) -> Result<()> {
             // policy capacity is the effective known static capacity for
             // min_context_tokens eligibility (min_context_eligible reads it via
             // the fallback below).
-            if let Some(static_cap) = a.usable_context_tokens {
-                if static_cap != usable_context_tokens {
-                    return Err(LibsyError::AlgorithmError {
-                        message: format!(
-                            "fleet router candidate {:?} has a static usable_context_tokens \
-                             ({static_cap}) that disagrees with its Bounded context-policy \
-                             capacity ({usable_context_tokens}); they must be equal",
-                            a.target
-                        ),
-                    });
-                }
+            if let Some(static_cap) = a.usable_context_tokens
+                && static_cap != usable_context_tokens
+            {
+                return Err(LibsyError::AlgorithmError {
+                    message: format!(
+                        "fleet router candidate {:?} has a static usable_context_tokens \
+                         ({static_cap}) that disagrees with its Bounded context-policy \
+                         capacity ({usable_context_tokens}); they must be equal",
+                        a.target
+                    ),
+                });
             }
         }
         if a.usable_context_tokens == Some(0) {

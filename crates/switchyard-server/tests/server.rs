@@ -28,7 +28,10 @@ use switchyard_server::config::{load_server_state, load_server_state_with_fleet_
 use switchyard_server::fleet_readiness::{
     ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed,
 };
-use switchyard_server::{DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState, build_switchyard_router};
+use switchyard_server::{
+    BoundServer, DEFAULT_MAX_REQUEST_BODY_BYTES, ServerRunOptions, ServerState,
+    build_switchyard_router,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -2385,6 +2388,153 @@ async fn s2fg_dev_lane_preference_and_gates() -> TestResult {
         "general lane with only a no-count Comfy must fail closed (5xx no-eligible), got {}",
         res4.status
     );
+    Ok(())
+}
+
+// ─── S2-H: production FleetRouter runtime owner ───────────────────────────────
+// Proves the §8 identity guarantee: ONE SharedFleetState drives both the
+// FleetRouter server and the background FleetReadinessMonitor; the monitor's
+// initial observe publishes readiness the server's /v1/decision reads; and a
+// monitored server starts on a staging bind and stops cleanly on shutdown.
+#[tokio::test]
+async fn s2h_runtime_owner_shares_state_and_stops_cleanly() -> TestResult {
+    // Mock Comfy (sealed-idle => transition_required) and HTPC (ready).
+    let comfy_router = axum::Router::new().route(
+        "/v1/resource",
+        axum::routing::get(|| async move {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "state":{"mode":"idle","resident_qwen_profile":"unknown","llama_server":"no"}
+                })),
+            )
+        }),
+    );
+    let comfy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let comfy_addr = comfy_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(comfy_listener, comfy_router).await.unwrap() });
+
+    let htpc_router = axum::Router::new()
+        .route(
+            "/health",
+            axum::routing::get(|| async move { (StatusCode::OK, Json(json!({"status":"ok"}))) }),
+        )
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async move {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "object":"list",
+                        "data":[{"id":"/srv/htpc-ai/models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_0.gguf"}]
+                    })),
+                )
+            }),
+        );
+    let htpc_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let htpc_addr = htpc_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(htpc_listener, htpc_router).await.unwrap() });
+
+    // ONE shared state across server + monitor.
+    let state = Arc::new(SharedFleetState::new(FleetSnapshot::new(vec![])?));
+    let comfy = ComfyFactsClient::new(
+        format!("http://{comfy_addr}/v1/resource"),
+        "S2H_TEST_TOKEN".to_string(),
+    );
+    unsafe { std::env::set_var("S2H_TEST_TOKEN", "dummy") };
+    let htpc = HtpcFactsClient::new(
+        format!("http://{htpc_addr}"),
+        "Qwen3.5-9B-Q4_0.gguf".to_string(),
+    );
+    let monitor = FleetReadinessMonitor::new(
+        comfy,
+        ModelId::from("model/comfyninja-qwen3_8"),
+        htpc,
+        ModelId::from("model/htpc-qwen3_5"),
+        vec![Observed {
+            model: ModelId::from("model/deepseek-v4-flash"),
+            state: CandidateState::ready(),
+        }],
+        Arc::clone(&state),
+        std::time::Duration::from_millis(50),
+    );
+
+    // Build a dev-lane server over the SAME shared state (HTPC bounded/65536 producer,
+    // flash + comfy as before), then run it with the background monitor.
+    let (input_mock, input_base) = InputTokenMock::start().await?;
+    let flash_upstream = MockUpstream::start().await?;
+    let cloud_upstream = MockUpstream::start().await?;
+    let comfy_llm_upstream = MockUpstream::start().await?;
+    let toml = dev_fleet_toml(
+        &flash_upstream.base_url,
+        &cloud_upstream.base_url,
+        &input_base,
+        &comfy_llm_upstream.base_url,
+    );
+    let server_state = load_fleet_test_config(&toml, state.clone())?;
+    let options = ServerRunOptions {
+        addr: "127.0.0.1:0".parse()?,
+        backlog: 1024,
+        dry_run: false,
+        shutdown_timeout: std::time::Duration::from_secs(2),
+        tls: None,
+    };
+    let bound = BoundServer::bind(server_state, options)?;
+    let bound_addr = bound.local_addr();
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_task = tokio::spawn(async move {
+        bound
+            .serve_with_fleet_monitor(
+                async move {
+                    let _ = _shutdown_rx.await;
+                },
+                monitor,
+            )
+            .await
+    });
+
+    // Give the monitor's initial observe + a tick time to publish real readiness.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // The shared state (read via the running server) must be non-empty: the monitor
+    // published flash(cloud base ready) + comfy(transition) + htpc(ready).
+    let snap = state.snapshot();
+    assert_eq!(
+        snap.state_for(&ModelId::from("model/deepseek-v4-flash")),
+        CandidateState::ready(),
+        "monitor-published cloud base state must be readable on the shared state"
+    );
+    assert_eq!(
+        snap.state_for(&ModelId::from("model/htpc-qwen3_5")),
+        CandidateState::ready(),
+        "monitor-published HTPC readiness must be readable on the shared state"
+    );
+
+    // A real /v1/decision on the running monitored server reads the SAME shared
+    // state (not the fail-closed empty source): HTPC is ready and context-fits.
+    input_mock.set_count(Some(500)).await;
+    let req = json!({
+        "input_format": "openai_chat",
+        "request": {"model":"localclaw/dev/tech","messages":[{"role":"user","content":"hi"}],"max_tokens":32}
+    });
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("http://{bound_addr}/v1/decision"))
+        .json(&req)
+        .send()
+        .await?;
+    let body: Value = resp.json().await?;
+    // HTPC is ready + context-fit via the live producer -> tech lane selects htpc.
+    assert_eq!(
+        body["selected"]["target"], "htpc",
+        "the monitored server's FleetRouter must read the shared HTPC readiness + count"
+    );
+
+    // Clean shutdown: signal and join; the monitor loop must exit.
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), serve_task)
+        .await
+        .expect("server must stop promptly on shutdown")??;
+    unsafe { std::env::remove_var("S2H_TEST_TOKEN") };
     Ok(())
 }
 

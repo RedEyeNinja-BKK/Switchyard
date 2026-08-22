@@ -46,6 +46,7 @@ use tracing::{Instrument, Level};
 use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
 
 use crate::config::ServerConfig;
+use crate::fleet_readiness::FleetReadinessMonitor;
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
@@ -436,6 +437,27 @@ pub async fn run_server(state: ServerState, options: ServerRunOptions) -> Server
     server.serve(shutdown::signal()).await
 }
 
+/// Production runtime owner: runs the server while a fleet-readiness monitor is
+/// the owner of live readiness facts, sharing one `SharedFleetState` with the
+/// server's FleetRouter and stopping together on the same process signal.
+///
+/// The caller must ensure `monitor` was built over the same `Arc<SharedFleetState>`
+/// that was injected into `state` (see [`BoundServer::serve_with_fleet_monitor`]);
+/// otherwise the server would see the fail-closed empty source while a monitor
+/// wrote to a separate state. This entry exists so a production runtime can start
+/// the S2-D FleetReadinessMonitor alongside the server under one lifecycle.
+pub async fn run_server_with_fleet_monitor(
+    state: ServerState,
+    options: ServerRunOptions,
+    monitor: FleetReadinessMonitor,
+) -> ServerResult<()> {
+    let server = BoundServer::bind(state, options)?;
+    println!("{}", server.startup_banner(std::io::stdout().is_terminal()));
+    server
+        .serve_with_fleet_monitor(shutdown::signal(), monitor)
+        .await
+}
+
 /// A configured server with its listening socket already bound.
 pub struct BoundServer {
     listener: TcpListener,
@@ -473,6 +495,40 @@ impl BoundServer {
         } else {
             serve(self.listener, self.router, shutdown_timeout, shutdown).await
         }
+    }
+
+    /// Serves requests while a background fleet-readiness monitor runs, stopping
+    /// both on the same shutdown.
+    ///
+    /// The monitor is the runtime owner of the fleet readiness facts. Identity is
+    /// structural by construction: the caller passes a [`FleetReadinessMonitor`]
+    /// holding the same `Arc<SharedFleetState>` that was injected into this
+    /// server's FleetRouter (e.g. via [`ServerConfig::build`](crate::ServerConfig)),
+    /// so the monitor and the router observe and publish through one shared state —
+    /// never the fail-closed empty default while a separate monitor writes
+    /// elsewhere.
+    pub async fn serve_with_fleet_monitor(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        monitor: FleetReadinessMonitor,
+    ) -> ServerResult<()> {
+        // A shared stop trigger so the monitor loop and the HTTP server stop on the
+        // same signal. `serve` swallows the caller shutdown; we also propagate it to
+        // the monitor via the trigger.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let monitor_task = tokio::spawn(monitor.run(async move {
+            let _ = stop_rx.await;
+        }));
+        let shutdown_timeout = self.options.shutdown_timeout;
+        let serve_result = if let Some(tls) = self.options.tls {
+            serve_tls(self.listener, self.router, tls, shutdown_timeout, shutdown).await
+        } else {
+            serve(self.listener, self.router, shutdown_timeout, shutdown).await
+        };
+        // Signal the monitor to stop; it observes once more? No — it stops cleanly.
+        let _ = stop_tx.send(());
+        let _ = monitor_task.await;
+        serve_result
     }
 
     fn startup_banner(&self, color: bool) -> String {

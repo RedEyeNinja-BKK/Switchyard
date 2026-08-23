@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod fleet_readiness;
+pub(crate) mod capability;
 mod metrics;
 mod observability;
 mod response;
@@ -45,6 +46,10 @@ use tracing::{Instrument, Level};
 
 use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
 
+use crate::capability::{
+    rerank_executor_body, validate_embedding_response, validate_rerank_response, CapabilityKind,
+    CapabilityRoute,
+};
 use crate::config::ServerConfig;
 use crate::fleet_readiness::{FleetReadinessMonitor, SharedDeepSeekTelemetry};
 use crate::response::into_http_response;
@@ -103,6 +108,11 @@ struct ModelCapabilities {
     // this, so a route opts in via config; undeclared routes advertise as
     // non-reasoning to Codex (fail closed).
     reasoning: Option<bool>,
+    // Whether the routed model truthfully advertises vision (image input)
+    // support. Undeclared serializes as `null` (unknown / not advertised);
+    // the FleetRouter vision filter never selects an undeclared candidate for
+    // an image-bearing request (fail closed).
+    supports_vision: Option<bool>,
 }
 
 /// A registered algorithm route and its server-owned endpoint metadata.
@@ -208,6 +218,7 @@ impl InputTokensTarget {
 #[derive(Clone)]
 pub struct ServerState {
     routes: Arc<BTreeMap<ModelId, RouteEntry>>,
+    capabilities: Arc<BTreeMap<String, CapabilityRoute>>,
     config: Option<Arc<ServerConfig>>,
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
@@ -323,6 +334,7 @@ impl ServerState {
         );
         Ok(Self {
             routes: Arc::new(entries),
+            capabilities: Arc::new(BTreeMap::new()),
             config: None,
             metrics,
             stats,
@@ -330,6 +342,12 @@ impl ServerState {
             track_cache_eligibility: tracking_enabled_from_env(),
             deepseek_telemetry: None,
         })
+    }
+
+    /// Attaches the capability routes (embeddings/rerank) built from config.
+    pub fn with_capabilities(mut self, capabilities: BTreeMap<String, CapabilityRoute>) -> Self {
+        self.capabilities = Arc::new(capabilities);
+        self
     }
 
     /// Attaches the shared sanitized DeepSeek telemetry slot published by the
@@ -354,7 +372,10 @@ impl ServerState {
 
     /// Returns the route model IDs served by the configured algorithms.
     pub fn models(&self) -> impl Iterator<Item = &str> {
-        self.routes.keys().map(ModelId::as_str)
+        self.routes
+            .keys()
+            .map(ModelId::as_str)
+            .chain(self.capabilities.keys().map(String::as_str))
     }
 
     /// Returns the caller credential family used by `model`, if any.
@@ -720,6 +741,8 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/responses", post(openai_responses))
         .route("/v1/decision", post(decision))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
+        .route("/v1/embeddings", post(embeddings_handler))
+        .route("/v1/rerank", post(rerank_handler))
         .route("/v1/models", get(models))
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
@@ -761,6 +784,225 @@ async fn openai_chat_completions(
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
     handle_endpoint(state, started, headers, body, WireFormat::OpenAiChat).await
+}
+
+/// OpenAI-compatible embedding endpoint. Proxies the typed embedding contract
+/// to the capability executor selected by the `model` route id (e.g.
+/// `localclaw/embed`); admission (dims, batch) is enforced at this boundary.
+async fn embeddings_handler(
+    State(state): State<ServerState>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => return invalid_body_error(status, message),
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(route) = state.capabilities.get(&model).cloned() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown embedding model {model}"),
+            "invalid_request_error",
+            "unknown_model",
+        );
+    };
+    let CapabilityKind::Embedding {
+        dimensions,
+        max_batch,
+        ..
+    } = &route.kind
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{model} is not an embedding capability"),
+            "invalid_request_error",
+            "wrong_capability",
+        );
+    };
+    let count = match body.get("input") {
+        Some(Value::String(_)) => 1,
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    };
+    if count == 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "input must be a non-empty string or array",
+            "invalid_request_error",
+            "invalid_input",
+        );
+    }
+    if count > *max_batch {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("input exceeds max_batch {max_batch}"),
+            "invalid_request_error",
+            "batch_too_large",
+        );
+    }
+    let mut executor_body = body.clone();
+    if let Some(object) = executor_body.as_object_mut() {
+        object.insert("model".to_string(), Value::String(route.client.model().to_string()));
+    }
+    match route.client.embeddings(executor_body).await {
+        Ok(value) => {
+            if let Err(message) = validate_embedding_response(&value, *dimensions) {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    message,
+                    "server_error",
+                    "embedding_invalid",
+                );
+            }
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_GATEWAY,
+            error.to_string(),
+            "server_error",
+            "executor_error",
+        ),
+    }
+}
+
+/// Cohere/Jina-compatible rerank endpoint. Proxies the typed rerank contract
+/// to the capability executor selected by the `model` route id (e.g.
+/// `localclaw/rerank`); bounds (candidates, top_n) are enforced here.
+async fn rerank_handler(
+    State(state): State<ServerState>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => return invalid_body_error(status, message),
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(route) = state.capabilities.get(&model).cloned() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown rerank model {model}"),
+            "invalid_request_error",
+            "unknown_model",
+        );
+    };
+    let CapabilityKind::Rerank {
+        max_candidates,
+        top_n,
+        max_doc_chars,
+        max_query_chars,
+    } = &route.kind
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{model} is not a rerank capability"),
+            "invalid_request_error",
+            "wrong_capability",
+        );
+    };
+    let query = body.get("query").and_then(Value::as_str).unwrap_or_default();
+    if query.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "query must be a non-empty string",
+            "invalid_request_error",
+            "invalid_query",
+        );
+    }
+    if query.chars().count() > *max_query_chars {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("query exceeds max_query_chars {max_query_chars}"),
+            "invalid_request_error",
+            "query_too_long",
+        );
+    }
+    let documents = body
+        .get("documents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if documents.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "documents must be a non-empty array",
+            "invalid_request_error",
+            "invalid_documents",
+        );
+    }
+    if documents.len() > *max_candidates {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("documents exceeds max_candidates {max_candidates}"),
+            "invalid_request_error",
+            "too_many_candidates",
+        );
+    }
+    for document in &documents {
+        let text = match document {
+            Value::String(text) => text.clone(),
+            Value::Object(object) => object
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            _ => String::new(),
+        };
+        if text.chars().count() > *max_doc_chars {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("document exceeds max_doc_chars {max_doc_chars}"),
+                "invalid_request_error",
+                "document_too_long",
+            );
+        }
+    }
+    let requested_top_n = body.get("top_n").and_then(Value::as_u64).map(|n| n as usize);
+    let effective_top_n = requested_top_n.unwrap_or(*top_n).min(*max_candidates);
+    let route_model = ModelId::from(model.as_str());
+    let executor_body = match rerank_executor_body(
+        &route_model,
+        route.client.model(),
+        query,
+        &documents,
+        effective_top_n,
+    ) {
+        Ok(body) => body,
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                "invalid_documents",
+            )
+        }
+    };
+    match route.client.rerank(executor_body).await {
+        Ok(value) => {
+            if let Err(message) = validate_rerank_response(&value) {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    message,
+                    "server_error",
+                    "rerank_invalid",
+                );
+            }
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_GATEWAY,
+            error.to_string(),
+            "server_error",
+            "executor_error",
+        ),
+    }
 }
 
 async fn anthropic_messages(
@@ -1407,7 +1649,13 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
         state
             .routes
             .iter()
-            .map(|(model, entry)| (model.as_str(), entry.capabilities)),
+            .map(|(model, entry)| (model.as_str(), entry.capabilities))
+            .chain(
+                state
+                    .capabilities
+                    .keys()
+                    .map(|id| (id.as_str(), ModelCapabilities::default())),
+            ),
     ))
 }
 
@@ -1555,6 +1803,7 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
+            "supports_vision": capabilities.supports_vision,
             "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",

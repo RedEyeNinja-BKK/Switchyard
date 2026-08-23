@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use switchyard_protocol::ModelId;
+use switchyard_protocol::{ContentBlock, ModelId};
 
 use crate::core::algorithm::{Algorithm, Driver};
 use crate::{LibsyError, Result, RoutingOutcome};
@@ -127,6 +127,13 @@ pub struct CandidateProfile {
     pub usable_context_tokens: Option<u64>,
     /// Optional declared work-shape limitation. `None` serves any shape.
     pub work_shape: Option<WorkShape>,
+    /// Whether the target truthfully advertises vision (image input) support.
+    ///
+    /// A candidate with `supports_vision=false` is NEVER selected for a request
+    /// that carries image content (fail closed on unknown/undeclared). This is
+    /// a static capability fact, separate from readiness and never inferred
+    /// from provider/model names.
+    pub supports_vision: bool,
 }
 
 impl CandidateProfile {
@@ -147,7 +154,16 @@ impl CandidateProfile {
             context_policy: ContextAdmissionPolicy::Unmanaged,
             usable_context_tokens: None,
             work_shape: None,
+            supports_vision: false,
         }
+    }
+
+    /// Sets whether the candidate advertises vision (image input) support
+    /// (builder style). Default `false` - undeclared candidates never receive
+    /// image-bearing requests (fail closed).
+    pub fn with_supports_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
     }
 
     /// Sets the candidate's preflight context admission policy (builder style).
@@ -664,6 +680,10 @@ impl FleetRouter {
     /// and build `(selected, fallbacks)`.
     fn decide(&self, request: &switchyard_protocol::Request) -> Result<(ModelId, Vec<ModelId>)> {
         let require_tools = !request.llm_request.tools.is_empty();
+        // Multimodal capability filter: a request that carries image content
+        // MUST only reach candidates that truthfully advertise vision. This is
+        // derived from the normalized content blocks (never from prompt text).
+        let require_vision = request_requires_vision(request);
         // Reasoning is required either by an explicit reasoning effort or by the
         // LEGACY `work_class=reasoning` contract (deliberate intent).
         let require_reasoning = reasoning_requested(&request.llm_request.reasoning)
@@ -686,6 +706,12 @@ impl FleetRouter {
             // Capability filter: an explicit reasoning request must only reach
             // candidates that advertise reasoning.
             if require_reasoning && !profile.reasoning {
+                continue;
+            }
+            // Vision filter: an image-bearing request must only reach candidates
+            // that advertise vision; an undeclared/non-vision candidate is
+            // excluded (fail closed, never assumed capable).
+            if require_vision && !profile.supports_vision {
                 continue;
             }
             // Work-shape filter (request-sourced dispatcher): a candidate limited
@@ -801,6 +827,20 @@ impl FleetRouter {
 /// reliably means "enabled" in this narrow PoC. Raw-based reasoning admission is
 /// therefore **deferred** (not treated as a requirement here); scope reasoning
 /// admission to the normalized `effort` field.
+/// True when the normalized request carries any image content block.
+///
+/// Derived from the typed conversation representation (ContentBlock::Image),
+/// never from prompt text or model names. A request with an image anywhere in
+/// its messages requires a vision-capable candidate.
+fn request_requires_vision(request: &switchyard_protocol::Request) -> bool {
+    request
+        .llm_request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .any(|block| matches!(block, ContentBlock::Image { .. }))
+}
+
 fn reasoning_requested(reasoning: &switchyard_protocol::ReasoningParams) -> bool {
     match reasoning.effort.as_deref() {
         None | Some("none") => false,
@@ -840,6 +880,78 @@ mod tests {
     use crate::Algorithm;
     use std::sync::Arc;
     use switchyard_protocol::{ModelId, ReasoningParams, Request, text_request};
+
+    // ------------------------------------------------------------------
+    // Vision capability filter (multimodal reconciliation 2026-08-23)
+    // ------------------------------------------------------------------
+
+    fn vision_req() -> Request {
+        use switchyard_protocol::{ContentBlock, Message, Role};
+        let mut req = text_req();
+        req.llm_request.messages.push(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is in this image".into(),
+                },
+                ContentBlock::Image {
+                    source: switchyard_protocol::ImageSource::Url {
+                        url: "https://example.com/x.png".into(),
+                        detail: None,
+                    },
+                },
+            ],
+        });
+        req
+    }
+
+    #[test]
+    fn vision_required_excludes_non_vision_candidates() {
+        // Image-bearing request must NOT select a text-only candidate.
+        let router = FleetRouter::new(
+            vec![
+                CandidateProfile::new("text-only", true, true, 1), // supports_vision=false
+                CandidateProfile::new("vision", true, true, 2).with_supports_vision(true),
+            ],
+            vec![
+                (ModelId::from("text-only"), CandidateState::ready()),
+                (ModelId::from("vision"), CandidateState::ready()),
+            ],
+        )
+        .unwrap();
+        let (selected, _) = router.decide(&vision_req()).unwrap();
+        assert_eq!(selected.to_string(), "vision");
+    }
+
+    #[test]
+    fn vision_required_fails_closed_when_only_text_candidates() {
+        // No vision-capable candidate => no eligible candidate (fail closed).
+        let router = FleetRouter::new(
+            vec![CandidateProfile::new("text-only", true, true, 1)],
+            vec![(ModelId::from("text-only"), CandidateState::ready())],
+        )
+        .unwrap();
+        let err = router.decide(&vision_req()).unwrap_err();
+        assert!(err.to_string().contains("no immediately-eligible candidate"));
+    }
+
+    #[test]
+    fn text_only_request_unaffected_by_vision_filter() {
+        // Text request still selects the text-only candidate (rank 1).
+        let router = FleetRouter::new(
+            vec![
+                CandidateProfile::new("text-only", true, true, 1),
+                CandidateProfile::new("vision", true, true, 2).with_supports_vision(true),
+            ],
+            vec![
+                (ModelId::from("text-only"), CandidateState::ready()),
+                (ModelId::from("vision"), CandidateState::ready()),
+            ],
+        )
+        .unwrap();
+        let (selected, _) = router.decide(&text_req()).unwrap();
+        assert_eq!(selected.to_string(), "text-only");
+    }
 
     fn text_req() -> Request {
         Request {

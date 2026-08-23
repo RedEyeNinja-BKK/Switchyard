@@ -26,6 +26,9 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
+use crate::capability::{
+    CapabilityClient, CapabilityClientConfig, CapabilityRoute, CapabilityRouteConfig,
+};
 use crate::fleet_readiness::{
     ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed, ResourceStateFactsClient,
     SharedDeepSeekTelemetry,
@@ -339,6 +342,12 @@ pub(crate) struct ServerConfig {
     pub(crate) llm_clients: BTreeMap<String, LlmClientConfig>,
     pub(crate) targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    /// Capability executor clients (non-LLM utility endpoints: embeddings, rerank).
+    #[serde(default)]
+    pub(crate) capability_clients: BTreeMap<String, CapabilityClientConfig>,
+    /// Capability routes served to callers (e.g. `localclaw/embed`, `localclaw/rerank`).
+    #[serde(default)]
+    pub(crate) capabilities: BTreeMap<String, CapabilityRouteConfig>,
     /// Optional fleet-readiness monitor configuration. When present, the config
     /// loader hands ONE `Arc<SharedFleetState>` to BOTH the server's FleetRouter(s)
     /// and a `FleetReadinessMonitor` built over that same Arc, so the stock CLI can
@@ -496,7 +505,40 @@ impl ServerConfig {
                 Some(route_name.clone()),
             ));
         }
-        ServerState::new_with_capabilities(routes)
+        Ok(ServerState::new_with_capabilities(routes)?.with_capabilities(self.build_capabilities()?))
+    }
+
+    /// Builds capability executor clients and routes (`localclaw/embed`, `localclaw/rerank`).
+    /// These are non-LLM typed utility endpoints; Switchyard proxies the typed
+    /// contract to the configured executor (primary today: ComfyNinja ingress
+    /// reninja:8448/8449; fallback: HTPC :8080/:8082) and enforces admission.
+    fn build_capabilities(&self) -> ServerResult<BTreeMap<String, CapabilityRoute>> {
+        let mut clients: BTreeMap<String, Arc<CapabilityClient>> = BTreeMap::new();
+        for (name, config) in &self.capability_clients {
+            validate_value("capability client name", name)?;
+            let client = CapabilityClient::new(config)
+                .map_err(|error| ServerError::new(error.to_string()))?;
+            clients.insert(name.clone(), Arc::new(client));
+        }
+        let mut routes = BTreeMap::new();
+        for (name, config) in &self.capabilities {
+            validate_value("capability route name", name)?;
+            validate_value("capability route id", &config.id)?;
+            let client = clients.get(&config.target).ok_or_else(|| {
+                ServerError::new(format!(
+                    "capability route {name} references unknown capability client {}",
+                    config.target
+                ))
+            })?;
+            routes.insert(
+                config.id.clone(),
+                CapabilityRoute {
+                    kind: config.kind.clone(),
+                    client: Arc::clone(client),
+                },
+            );
+        }
+        Ok(routes)
     }
 
     fn build_clients(&self) -> ServerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
@@ -1060,6 +1102,11 @@ struct FleetCandidateConfig {
     tool_calling: bool,
     #[serde(default)]
     reasoning: bool,
+    /// Whether this candidate truthfully advertises vision (image input)
+    /// support. Absent/false => never selected for image-bearing requests
+    /// (fail closed).
+    #[serde(default)]
+    supports_vision: bool,
     /// Deterministic preference; lower is preferred.
     #[serde(default)]
     preference_rank: u16,
@@ -1365,6 +1412,7 @@ impl RouteConfig {
                 context_window: *context_window,
                 tool_calling: *tool_calling,
                 reasoning: *reasoning,
+                supports_vision: None,
             },
             // The fleet router advertises the truthful aggregate of its candidate
             // capabilities, validated during build (see validate_fleet_capabilities)
@@ -1376,7 +1424,7 @@ impl RouteConfig {
                 candidates,
                 ..
             } => {
-                fleet_effective_capabilities(*context_window, *tool_calling, *reasoning, candidates)
+                fleet_effective_capabilities(*context_window, *tool_calling, *reasoning, None, candidates)
             }
         }
     }
@@ -1433,7 +1481,7 @@ impl RouteConfig {
         // Effective advertised envelope after applying restrictive (false)
         // overrides — shares its derivation with `capabilities()` so validation
         // and advertisement can never disagree.
-        let effective = fleet_effective_capabilities(None, *tool_calling, *reasoning, candidates);
+        let effective = fleet_effective_capabilities(None, *tool_calling, *reasoning, None, candidates);
 
         // A tools+reasoning aggregate must be satisfiable by one candidate.
         if effective.tool_calling == Some(true)
@@ -1470,14 +1518,17 @@ fn fleet_effective_capabilities(
     context_window: Option<u32>,
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
+    supports_vision: Option<bool>,
     candidates: &[FleetCandidateConfig],
 ) -> ModelCapabilities {
     let any_tool = candidates.iter().any(|c| c.tool_calling);
     let any_reasoning = candidates.iter().any(|c| c.reasoning);
+    let any_vision = candidates.iter().any(|c| c.supports_vision);
     ModelCapabilities {
         context_window,
         tool_calling: tool_calling.or(Some(any_tool)),
         reasoning: reasoning.or(Some(any_reasoning)),
+        supports_vision: supports_vision.or(Some(any_vision)),
     }
 }
 
@@ -2056,6 +2107,7 @@ fn build_algorithm(
                     candidate.reasoning,
                     candidate.preference_rank,
                 )
+                .with_supports_vision(candidate.supports_vision)
                 .with_context_policy(match candidate.context_policy {
                     FleetCandidateContextPolicyConfig::Unmanaged => {
                         ContextAdmissionPolicy::Unmanaged

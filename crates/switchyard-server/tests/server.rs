@@ -26,7 +26,8 @@ use switchyard_protocol::ModelId;
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_server::config::{load_server_state, load_server_state_with_fleet_source};
 use switchyard_server::fleet_readiness::{
-    ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed, ResourceStateFactsClient,
+    ComfyFactsClient, DeepSeekTelemetrySnapshot, FleetReadinessMonitor, HtpcFactsClient, Observed,
+    ResourceStateFactsClient, SharedDeepSeekTelemetry,
 };
 use switchyard_server::{
     BoundServer, DEFAULT_MAX_REQUEST_BODY_BYTES, ServerRunOptions, ServerState,
@@ -480,6 +481,17 @@ fn random_state_with_retries(
 async fn test_app(routes: &[(&str, &[&str])]) -> TestResult<(MockUpstream, Router)> {
     let upstream = MockUpstream::start().await?;
     let app = build_switchyard_router(random_state(&upstream.base_url, routes)?);
+    Ok((upstream, app))
+}
+
+/// Builds a router with a `[fleet_readiness]`-style sanitized DeepSeek telemetry
+/// slot attached (mirrors `load_server_runtime` wiring for the observability
+/// endpoint).
+async fn telemetry_app(telemetry: SharedDeepSeekTelemetry) -> TestResult<(MockUpstream, Router)> {
+    let upstream = MockUpstream::start().await?;
+    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
+        .with_deepseek_telemetry(telemetry);
+    let app = build_switchyard_router(state);
     Ok((upstream, app))
 }
 
@@ -6136,4 +6148,95 @@ async fn s2d_spawn_dual_endpoints(health_body: &str, models_body: &str) -> TestR
         axum::serve(listener, app).await.unwrap()
     });
     Ok(format!("http://{addr}"))
+}
+
+// --- DeepSeek observability endpoint (regression-fix contract) ---
+
+#[tokio::test]
+async fn deepseek_resource_503_when_telemetry_not_attached() -> TestResult {
+    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json()?;
+    assert_eq!(body, json!({ "error": "resource_telemetry_not_attached" }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepseek_resource_503_before_any_observation() -> TestResult {
+    let telemetry = SharedDeepSeekTelemetry::new();
+    let (upstream, app) = telemetry_app(telemetry).await?;
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json()?;
+    assert_eq!(body, json!({ "error": "no_resource_snapshot_yet" }));
+    // The GET itself performed no provider fetch: nothing hit the mock upstream.
+    assert!(
+        upstream.calls.lock().await.is_empty(),
+        "GET /v1/resource/deepseek must not trigger any provider fetch"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepseek_resource_returns_historical_schema_after_success() -> TestResult {
+    let telemetry = SharedDeepSeekTelemetry::new();
+    telemetry.publish(DeepSeekTelemetrySnapshot {
+        is_available: Some(true),
+        currency: Some("CNY".into()),
+        total_balance: Some(55.14),
+        granted_balance: Some(10.0),
+        topped_up_balance: Some(45.14),
+        observed_at: 1_700_000_000.0,
+        error: String::new(),
+    });
+    let (_upstream, app) = telemetry_app(telemetry).await?;
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = response.json()?;
+    assert_eq!(
+        body,
+        json!({
+            "is_available": true,
+            "currency": "CNY",
+            "total_balance": 55.14,
+            "granted_balance": 10.0,
+            "topped_up_balance": 45.14,
+            "observed_at": 1_700_000_000.0,
+            "error": "",
+        })
+    );
+    // No credential/key material in endpoint output (regression guard).
+    let raw = serde_json::to_string(&body)?.to_lowercase();
+    for banned in ["key", "token", "authorization", "bearer", "secret"] {
+        assert!(
+            !raw.contains(banned),
+            "endpoint output must not contain {banned:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepseek_resource_failed_observation_keeps_last_successful() -> TestResult {
+    let telemetry = SharedDeepSeekTelemetry::new();
+    telemetry.publish(DeepSeekTelemetrySnapshot {
+        is_available: Some(true),
+        currency: Some("CNY".into()),
+        total_balance: Some(55.14),
+        granted_balance: Some(10.0),
+        topped_up_balance: Some(45.14),
+        observed_at: 1_700_000_000.0,
+        error: String::new(),
+    });
+    let (_upstream, app) = telemetry_app(telemetry.clone()).await?;
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = response.json()?;
+    assert_eq!(body["total_balance"], json!(55.14));
+    assert_eq!(body["observed_at"], json!(1_700_000_000.0));
+    // A simulated failed cycle must NOT erase the last-successful snapshot:
+    // the endpoint continues to serve the truthful stale sample.
+    assert_eq!(telemetry.get().unwrap().total_balance, Some(55.14));
+    Ok(())
 }

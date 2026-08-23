@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libsy::{CandidateState, FleetSnapshot, FleetStateSource, LibsyError, SharedFleetState};
+use parking_lot::Mutex;
 use reqwest::Client;
 use switchyard_protocol::ModelId;
 
@@ -119,7 +120,7 @@ impl ComfyFactsClient {
     /// the model id it is classifying).
     ///
     /// Strict vocabulary (only the live-installed domain values map to a
-    /// non-fail-closed state; see [`classify_comfy`] for the exact rules):
+    /// non-fail-closed state; see `classify_comfy` for the exact rules):
     /// - the complete **sealed-idle** signature (`mode=="idle"` and
     ///   `resident_qwen_profile=="unknown"` and `llama_server=="no"`)
     ///   → `transition_required` (valid but unloaded; requires an external
@@ -374,6 +375,10 @@ struct DeepSeekBalanceInfo {
     currency: Option<String>,
     #[serde(rename = "total_balance", default)]
     total_balance: Option<String>,
+    #[serde(rename = "granted_balance", default)]
+    granted_balance: Option<String>,
+    #[serde(rename = "topped_up_balance", default)]
+    topped_up_balance: Option<String>,
 }
 
 /// The DEPLOYED OpenAI included-allowance spill policy (operator-verbatim):
@@ -445,6 +450,90 @@ fn classify_deepseek(state: &DeepSeekResourceState, currency: &str) -> Candidate
     }
 }
 
+/// Sanitized last-successful DeepSeek balance observation, published by the
+/// resource fact client for read-only observability (`GET /v1/resource/deepseek`).
+///
+/// Never contains credential material: no API key, no env-var value, no
+/// Authorization header, no account identity.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeepSeekTelemetrySnapshot {
+    pub is_available: Option<bool>,
+    pub currency: Option<String>,
+    pub total_balance: Option<f64>,
+    pub granted_balance: Option<f64>,
+    pub topped_up_balance: Option<f64>,
+    pub observed_at: f64,
+    pub error: String,
+}
+
+/// Shared slot holding the last successful sanitized DeepSeek observation.
+///
+/// Last-successful semantics: a failed observation cycle never overwrites the
+/// previous successful snapshot, so a stale-but-truthful `observed_at` remains
+/// detectable by downstream consumers instead of being replaced with invented
+/// zeros.
+#[derive(Clone, Default)]
+pub struct SharedDeepSeekTelemetry(Arc<Mutex<Option<DeepSeekTelemetrySnapshot>>>);
+
+impl std::fmt::Debug for SharedDeepSeekTelemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedDeepSeekTelemetry")
+            .field("state", &"<shared sanitized telemetry>")
+            .finish()
+    }
+}
+
+impl SharedDeepSeekTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publishes a successful observation snapshot (last-successful replace).
+    pub fn publish(&self, snapshot: DeepSeekTelemetrySnapshot) {
+        *self.0.lock() = Some(snapshot);
+    }
+
+    /// Returns the last successful observation, if any.
+    pub fn get(&self) -> Option<DeepSeekTelemetrySnapshot> {
+        self.0.lock().clone()
+    }
+}
+
+/// Builds a sanitized telemetry snapshot from a successful DeepSeek factual
+/// observation. The configured-currency balance info (when present) supplies the
+/// balances; `observed_at` records the observation wall-clock.
+fn deepseek_telemetry_snapshot(
+    state: &DeepSeekResourceState,
+    currency: &str,
+    observed_at: f64,
+) -> DeepSeekTelemetrySnapshot {
+    let info = state.balance_infos.as_ref().and_then(|infos| {
+        infos.iter().find(|b| {
+            b.currency
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(currency))
+        })
+    });
+    let parse = |v: &Option<String>| v.as_deref().and_then(|s| s.trim().parse::<f64>().ok());
+    DeepSeekTelemetrySnapshot {
+        is_available: state.is_available,
+        currency: info.and_then(|b| b.currency.clone()),
+        total_balance: info.and_then(|b| parse(&b.total_balance)),
+        granted_balance: info.and_then(|b| parse(&b.granted_balance)),
+        topped_up_balance: info.and_then(|b| parse(&b.topped_up_balance)),
+        observed_at,
+        error: String::new(),
+    }
+}
+
+/// Current wall-clock as UNIX epoch seconds (for `observed_at`).
+fn epoch_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 /// Read-only client for the sanitized resource-state surfaces (OpenAI weekly
 /// allowance via a provider bridge `/resource/openai-codex`, and the official
 /// DeepSeek `/user/balance` endpoint).
@@ -462,6 +551,9 @@ pub struct ResourceStateFactsClient {
     deepseek_url: Option<String>,
     deepseek_api_key_env: Option<String>,
     deepseek_currency: Option<String>,
+    /// Optional shared slot for the sanitized last-successful DeepSeek
+    /// observation (observability only; see [`SharedDeepSeekTelemetry`]).
+    deepseek_telemetry: Option<SharedDeepSeekTelemetry>,
     client: Client,
 }
 
@@ -502,8 +594,16 @@ impl ResourceStateFactsClient {
             deepseek_url,
             deepseek_api_key_env,
             deepseek_currency,
+            deepseek_telemetry: None,
             client: factual_client(),
         }
+    }
+
+    /// Attaches a shared sanitized-telemetry slot published on each successful
+    /// DeepSeek observation (read-only observability; never a fetch trigger).
+    pub fn with_deepseek_telemetry(mut self, telemetry: SharedDeepSeekTelemetry) -> Self {
+        self.deepseek_telemetry = Some(telemetry);
+        self
     }
 
     /// Configures the optional second (OpenClaw-owned) OpenAI OAuth pool.
@@ -525,7 +625,7 @@ impl ResourceStateFactsClient {
     }
 
     /// One read-only observation of the OpenAI weekly allowance via the bridge
-    /// surface. Classifies eligibility per [`classify_openai`] (confirmed
+    /// surface. Classifies eligibility per `classify_openai` (confirmed
     /// exhaustion only); any fetch failure or malformed payload fails toward
     /// `ready` (does NOT sanction a DeepSeek spill).
     pub async fn observe_openai(&self) -> CandidateState {
@@ -536,7 +636,7 @@ impl ResourceStateFactsClient {
     }
 
     /// One read-only observation of the DeepSeek configured-currency balance.
-    /// Classifies per [`classify_deepseek`]; fetch failure or missing currency
+    /// Classifies per `classify_deepseek`; fetch failure or missing currency
     /// entry resolves to `not_ready` (fail closed).
     pub async fn observe_deepseek(&self) -> CandidateState {
         let (Some(url), Some(key_env), Some(currency)) = (
@@ -555,7 +655,19 @@ impl ResourceStateFactsClient {
         let response = self.client.get(url).bearer_auth(&key).send().await;
         match response {
             Ok(r) if r.status().is_success() => match r.json::<DeepSeekResourceState>().await {
-                Ok(state) => classify_deepseek(&state, currency),
+                Ok(state) => {
+                    // Observability publication: only a SUCCESSFUL factual
+                    // observation updates the last-successful telemetry slot.
+                    // Failed cycles keep the prior snapshot (no invented zeros).
+                    if let Some(telemetry) = &self.deepseek_telemetry {
+                        telemetry.publish(deepseek_telemetry_snapshot(
+                            &state,
+                            currency,
+                            epoch_seconds(),
+                        ));
+                    }
+                    classify_deepseek(&state, currency)
+                }
                 Err(_) => CandidateState::not_ready(),
             },
             _ => CandidateState::not_ready(),
@@ -885,7 +997,8 @@ mod tests {
     use super::{
         ComfyFactsClient, DeepSeekBalanceInfo, DeepSeekResourceState, FleetReadinessMonitor,
         FleetSnapshotProducer, HtpcFactsClient, Observed, OpenAiPrimaryWindow, OpenAiResourceState,
-        OpenAiWindows, ResourceStateFactsClient, classify_deepseek, classify_openai,
+        OpenAiWindows, ResourceStateFactsClient, SharedDeepSeekTelemetry, classify_deepseek,
+        classify_openai,
     };
 
     async fn mock_server(routes: Vec<(&'static str, &'static str)>) -> String {
@@ -1718,6 +1831,7 @@ mod tests {
             balance_infos: Some(vec![DeepSeekBalanceInfo {
                 currency: Some("CNY".to_string()),
                 total_balance: Some("90.75".to_string()),
+                ..Default::default()
             }]),
         };
         assert_eq!(classify_deepseek(&healthy, "CNY"), CandidateState::ready());
@@ -1727,6 +1841,7 @@ mod tests {
             balance_infos: Some(vec![DeepSeekBalanceInfo {
                 currency: Some("CNY".to_string()),
                 total_balance: Some("0.00".to_string()),
+                ..Default::default()
             }]),
         };
         assert_eq!(
@@ -1748,6 +1863,7 @@ mod tests {
             balance_infos: Some(vec![DeepSeekBalanceInfo {
                 currency: Some("USD".to_string()),
                 total_balance: Some("90.75".to_string()),
+                ..Default::default()
             }]),
         };
         assert_eq!(
@@ -1760,6 +1876,7 @@ mod tests {
             balance_infos: Some(vec![DeepSeekBalanceInfo {
                 currency: Some("CNY".to_string()),
                 total_balance: Some("-1.0".to_string()),
+                ..Default::default()
             }]),
         };
         assert_eq!(
@@ -1871,5 +1988,89 @@ mod tests {
             "a malformed OpenAI resource payload must fail toward Luna (no DeepSeek spill)"
         );
         unsafe { std::env::remove_var("S2D_TEST_GARBAGE_TOKEN") };
+    }
+
+    // --- DeepSeek observability telemetry (regression-fix) ---
+
+    #[tokio::test]
+    async fn deepseek_success_publishes_last_successful_telemetry() {
+        let url = mock_server(vec![(
+            "/user/balance",
+            r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"55.14","granted_balance":"10.0","topped_up_balance":"45.14"}]}"#,
+        )])
+        .await;
+        let telemetry = SharedDeepSeekTelemetry::new();
+        let client = ResourceStateFactsClient::new(
+            None,
+            None,
+            Some(format!("{url}/user/balance")),
+            Some("S2D_TEST_DEEPSEEK_KEY".into()),
+            Some("CNY".into()),
+        )
+        .with_deepseek_telemetry(telemetry.clone());
+        unsafe { std::env::set_var("S2D_TEST_DEEPSEEK_KEY", "dummy") };
+        let state = client.observe_deepseek().await;
+        unsafe { std::env::remove_var("S2D_TEST_DEEPSEEK_KEY") };
+        assert_eq!(state, CandidateState::ready());
+        let snap = telemetry
+            .get()
+            .expect("successful observation must publish telemetry");
+        assert_eq!(snap.is_available, Some(true));
+        assert_eq!(snap.currency.as_deref(), Some("CNY"));
+        assert_eq!(snap.total_balance, Some(55.14));
+        assert_eq!(snap.granted_balance, Some(10.0));
+        assert_eq!(snap.topped_up_balance, Some(45.14));
+        assert!(snap.observed_at > 0.0);
+        assert!(snap.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deepseek_failure_keeps_last_successful_telemetry() {
+        let gauge = Gauge::default();
+        let ep = Endpoint::new(
+            r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"55.14"}]}"#,
+        );
+        let url = spawn_facts_server(vec![("/user/balance", ep.clone())], gauge).await;
+        let telemetry = SharedDeepSeekTelemetry::new();
+        let client = ResourceStateFactsClient::new(
+            None,
+            None,
+            Some(format!("{url}/user/balance")),
+            Some("S2D_TEST_DEEPSEEK_KEY".into()),
+            Some("CNY".into()),
+        )
+        .with_deepseek_telemetry(telemetry.clone());
+        unsafe { std::env::set_var("S2D_TEST_DEEPSEEK_KEY", "dummy") };
+        assert_eq!(client.observe_deepseek().await, CandidateState::ready());
+        let before = telemetry
+            .get()
+            .expect("successful observation must publish telemetry");
+        // Flip the factual surface to a 500: the cycle fails closed for
+        // readiness and MUST NOT overwrite the last-successful telemetry.
+        ep.set(500, r#"{"error":"boom"}"#);
+        assert_eq!(client.observe_deepseek().await, CandidateState::not_ready());
+        unsafe { std::env::remove_var("S2D_TEST_DEEPSEEK_KEY") };
+        let after = telemetry
+            .get()
+            .expect("last-successful telemetry must survive a failed cycle");
+        assert_eq!(after.total_balance, before.total_balance);
+        assert_eq!(after.observed_at, before.observed_at);
+        assert_eq!(after.currency.as_deref(), Some("CNY"));
+    }
+
+    #[tokio::test]
+    async fn deepseek_unconfigured_publishes_no_telemetry() {
+        let telemetry = SharedDeepSeekTelemetry::new();
+        let client = ResourceStateFactsClient::new(None, None, None, None, None)
+            .with_deepseek_telemetry(telemetry.clone());
+        assert_eq!(
+            client.observe_deepseek().await,
+            CandidateState::not_ready(),
+            "unconfigured DeepSeek must fail closed for readiness"
+        );
+        assert!(
+            telemetry.get().is_none(),
+            "unconfigured DeepSeek must not fabricate a telemetry snapshot"
+        );
     }
 }

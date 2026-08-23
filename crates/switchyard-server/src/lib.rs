@@ -46,7 +46,7 @@ use tracing::{Instrument, Level};
 use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
 
 use crate::config::ServerConfig;
-use crate::fleet_readiness::FleetReadinessMonitor;
+use crate::fleet_readiness::{FleetReadinessMonitor, SharedDeepSeekTelemetry};
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
@@ -213,6 +213,7 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    deepseek_telemetry: Option<SharedDeepSeekTelemetry>,
 }
 
 #[derive(Clone)]
@@ -327,7 +328,16 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            deepseek_telemetry: None,
         })
+    }
+
+    /// Attaches the shared sanitized DeepSeek telemetry slot published by the
+    /// fleet-readiness resource client (backing `GET /v1/resource/deepseek`).
+    /// Observability only: never participates in routing or readiness.
+    pub fn with_deepseek_telemetry(mut self, telemetry: SharedDeepSeekTelemetry) -> Self {
+        self.deepseek_telemetry = Some(telemetry);
+        self
     }
 
     /// Retains the validated configuration used to describe decision results.
@@ -545,7 +555,7 @@ impl BoundServer {
     /// The monitor is the runtime owner of the fleet readiness facts. Identity is
     /// structural by construction: the caller passes a [`FleetReadinessMonitor`]
     /// holding the same `Arc<SharedFleetState>` that was injected into this
-    /// server's FleetRouter (e.g. via [`ServerConfig::build`](crate::ServerConfig)),
+    /// server's FleetRouter (e.g. via `ServerConfig::build`),
     /// so the monitor and the router observe and publish through one shared state —
     /// never the fail-closed empty default while a separate monitor writes
     /// elsewhere.
@@ -713,6 +723,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
+        .route("/v1/resource/deepseek", get(get_deepseek_resource))
         .route("/metrics", get(prometheus_metrics))
         .route("/health", get(health));
     if state.routing_log.is_some() {
@@ -1402,6 +1413,39 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
     Json(state.stats.snapshot())
+}
+
+/// Read-only sanitized DeepSeek balance telemetry for observability.
+///
+/// Serves the LAST SUCCESSFUL factual observation published by the
+/// fleet-readiness resource client. This handler performs NO provider fetch and
+/// holds no credential material — bounded observability only. It never touches
+/// routing, readiness, preference, or economics state.
+async fn get_deepseek_resource(State(state): State<ServerState>) -> (StatusCode, Json<Value>) {
+    let Some(telemetry) = &state.deepseek_telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "resource_telemetry_not_attached" })),
+        );
+    };
+    let Some(snapshot) = telemetry.get() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no_resource_snapshot_yet" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "is_available": snapshot.is_available,
+            "currency": snapshot.currency,
+            "total_balance": snapshot.total_balance,
+            "granted_balance": snapshot.granted_balance,
+            "topped_up_balance": snapshot.topped_up_balance,
+            "observed_at": snapshot.observed_at,
+            "error": snapshot.error,
+        })),
+    )
 }
 
 async fn reset_stats(State(state): State<ServerState>) -> Json<Value> {

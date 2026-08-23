@@ -28,6 +28,7 @@ use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
 use crate::fleet_readiness::{
     ComfyFactsClient, FleetReadinessMonitor, HtpcFactsClient, Observed, ResourceStateFactsClient,
+    SharedDeepSeekTelemetry,
 };
 use crate::{
     CallerAuthKind, CountTokensTarget, InputTokensTarget, ModelCapabilities, ServerError,
@@ -125,15 +126,26 @@ pub fn load_server_runtime(path: impl AsRef<Path>) -> ServerResult<ServerRuntime
             let shared = Arc::new(SharedFleetState::new(
                 FleetSnapshot::new(Vec::new()).expect("empty fleet snapshot is valid"),
             ));
-            let monitor = build_fleet_readiness_monitor(readiness, Arc::clone(&shared))
-                .map_err(|error| ServerError::new(format!("invalid [fleet_readiness]: {error}")))?;
+            // ONE shared sanitized DeepSeek telemetry slot: the fleet-readiness
+            // resource client publishes the last-successful factual observation
+            // into it, and the server endpoint serves it read-only. No second
+            // provider fetch path is created.
+            let deepseek_telemetry = SharedDeepSeekTelemetry::new();
+            let monitor = build_fleet_readiness_monitor(
+                readiness,
+                Arc::clone(&shared),
+                deepseek_telemetry.clone(),
+            )
+            .map_err(|error| ServerError::new(format!("invalid [fleet_readiness]: {error}")))?;
             let state = config
                 .build(Arc::clone(&shared) as Arc<dyn FleetStateSource>)
                 .map_err(|error| {
                     ServerError::new(format!("invalid server config {}: {error}", path.display()))
                 })?;
             Ok(ServerRuntime {
-                state: state.with_config(config),
+                state: state
+                    .with_config(config)
+                    .with_deepseek_telemetry(deepseek_telemetry),
                 monitor: Some(monitor),
             })
         }
@@ -159,6 +171,7 @@ pub fn load_server_runtime(path: impl AsRef<Path>) -> ServerResult<ServerRuntime
 fn build_fleet_readiness_monitor(
     config: &FleetReadinessConfig,
     state: Arc<SharedFleetState>,
+    deepseek_telemetry: SharedDeepSeekTelemetry,
 ) -> Result<FleetReadinessMonitor, String> {
     let comfy = config.comfy.as_ref().map(|c| {
         (
@@ -243,7 +256,8 @@ fn build_fleet_readiness_monitor(
             resource.deepseek_url.clone(),
             resource.deepseek_api_key_env.clone(),
             resource.deepseek_currency.clone(),
-        );
+        )
+        .with_deepseek_telemetry(deepseek_telemetry);
         // Optional separate OpenClaw-owned OpenAI pool: only wired when both its
         // URL and credential-env are declared.
         let resource_client =

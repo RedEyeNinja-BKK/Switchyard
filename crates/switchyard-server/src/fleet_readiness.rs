@@ -218,7 +218,12 @@ fn classify_comfy(snap: ComfyResourceResponse) -> CandidateState {
     let mode = snap.state.mode.as_deref().unwrap_or("");
     let resident = snap.state.resident_qwen_profile.as_deref().unwrap_or("");
     let llama = snap.state.llama_server.as_deref().unwrap_or("");
-    let known_resident = COMFY_RESIDENT_KNOWN.contains(&resident);
+    // Profile-seam reconciliation (2026-08-24): the ComfyNinja seam now publishes
+    // lowercase "fast"/"long" (readback-derived); the legacy constants are uppercase.
+    // Match case-insensitively so both spellings classify truthfully.
+    let resident_upper = resident.to_ascii_uppercase();
+    let known_resident = COMFY_RESIDENT_KNOWN.contains(&resident)
+        || COMFY_RESIDENT_KNOWN.contains(&resident_upper.as_str());
     if mode == COMFY_MODE_IDLE && resident == COMFY_RESIDENT_UNKNOWN && llama == COMFY_LLAMA_NO {
         CandidateState::transition_required()
     } else if COMFY_SERVING_MODES.contains(&mode) && llama == COMFY_LLAMA_YES && known_resident {

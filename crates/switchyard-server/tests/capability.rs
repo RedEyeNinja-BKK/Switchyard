@@ -23,6 +23,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const EMBED_TOML: &str = r#"
 schema_version = 1
 
+[targets]
+
 [routes.noop]
 id = "switchyard/noop"
 type = "noop"
@@ -102,13 +104,24 @@ async fn upstream_404() -> Response {
 }
 
 async fn build_test_app(upstream_port: u16, _route: &str) -> TestResult<Router> {
-    let toml = EMBED_TOML.replace(":PORT", &upstream_port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &upstream_port.to_string());
     let state = load_server_state_from(toml)?;
     Ok(build_switchyard_router(state))
 }
 
 fn load_server_state_from(toml: String) -> TestResult<switchyard_server::ServerState> {
-    let dir = std::env::temp_dir().join(format!("switchyard-cap-test-{}", std::process::id()));
+    // Unique path per caller+pid: tests run concurrently and previously shared one
+    // routes.toml, racing each other's config writes (caused intermittent
+    // "missing field" / empty-file parse failures).
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "switchyard-cap-test-{}-{}",
+        std::process::id(),
+        uniq
+    ));
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("routes.toml");
     std::fs::write(&path, toml)?;
@@ -145,7 +158,7 @@ async fn embeddings_route_proxies_and_validates_dims() -> TestResult {
         .route("/v1/rerank", post(rerank_upstream).with_state(Arc::clone(&calls)))
         .route("/missing", post(upstream_404));
     let port = start_upstream(app).await?;
-    let toml = EMBED_TOML.replace(":PORT", &port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &port.to_string());
     let state = load_server_state_from(toml)?;
     let app = build_switchyard_router(state);
 
@@ -167,7 +180,7 @@ async fn embeddings_unknown_model_404() -> TestResult {
         .route("/v1/rerank", post(rerank_upstream).with_state(Arc::clone(&calls)))
         .route("/missing", post(upstream_404));
     let port = start_upstream(app).await?;
-    let toml = EMBED_TOML.replace(":PORT", &port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &port.to_string());
     let state = load_server_state_from(toml)?;
     let app = build_switchyard_router(state);
 
@@ -186,7 +199,7 @@ async fn embeddings_dimension_mismatch_fails_closed() -> TestResult {
         .route("/v1/rerank", post(rerank_upstream).with_state(Arc::clone(&calls)))
         .route("/missing", post(upstream_404));
     let port = start_upstream(app).await?;
-    let toml = EMBED_TOML.replace(":PORT", &port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &port.to_string());
     let state = load_server_state_from(toml)?;
     let app = build_switchyard_router(state);
 
@@ -205,7 +218,7 @@ async fn rerank_route_proxies_and_validates() -> TestResult {
         .route("/v1/rerank", post(rerank_upstream).with_state(Arc::clone(&calls)))
         .route("/missing", post(upstream_404));
     let port = start_upstream(app).await?;
-    let toml = EMBED_TOML.replace(":PORT", &port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &port.to_string());
     let state = load_server_state_from(toml)?;
     let app = build_switchyard_router(state);
 
@@ -228,7 +241,7 @@ async fn rerank_malformed_response_fails_closed() -> TestResult {
         .route("/v1/rerank", post(rerank_upstream_malformed).with_state(Arc::clone(&calls)))
         .route("/missing", post(upstream_404));
     let port = start_upstream(app).await?;
-    let toml = EMBED_TOML.replace(":PORT", &port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &port.to_string());
     let state = load_server_state_from(toml)?;
     let app = build_switchyard_router(state);
 
@@ -249,7 +262,7 @@ async fn rerank_bounds_enforced() -> TestResult {
         .route("/v1/rerank", post(rerank_upstream).with_state(Arc::clone(&calls)))
         .route("/missing", post(upstream_404));
     let port = start_upstream(app).await?;
-    let toml = EMBED_TOML.replace(":PORT", &port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &port.to_string());
     let state = load_server_state_from(toml)?;
     let app = build_switchyard_router(state);
 
@@ -270,7 +283,7 @@ async fn capability_routes_advertised_in_models() -> TestResult {
         .route("/v1/rerank", post(rerank_upstream).with_state(Arc::clone(&calls)))
         .route("/missing", post(upstream_404));
     let port = start_upstream(app).await?;
-    let toml = EMBED_TOML.replace(":PORT", &port.to_string());
+    let toml = EMBED_TOML.replace("PORT", &port.to_string());
     let state = load_server_state_from(toml)?;
     let app = build_switchyard_router(state);
 

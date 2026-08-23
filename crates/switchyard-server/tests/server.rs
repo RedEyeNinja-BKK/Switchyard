@@ -6240,3 +6240,71 @@ async fn deepseek_resource_failed_observation_keeps_last_successful() -> TestRes
     assert_eq!(telemetry.get().unwrap().total_balance, Some(55.14));
     Ok(())
 }
+
+#[tokio::test]
+async fn deepseek_resource_end_to_end_client_publish_and_failure_keeps_stale() -> TestResult {
+    // End-to-end through the REAL client path: a ResourceStateFactsClient
+    // sharing the same telemetry slot as the router publishes on a successful
+    // /user/balance observation; after a failed cycle the endpoint still serves
+    // the last-successful snapshot, and the endpoint reads never fetch.
+    let telemetry = SharedDeepSeekTelemetry::new();
+    let (upstream, app) = telemetry_app(telemetry.clone()).await?;
+
+    let ep_body = Arc::new(std::sync::Mutex::new(
+        r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"55.14","granted_balance":"10.0","topped_up_balance":"45.14"}]}"#
+            .to_string(),
+    ));
+    let ep_status = Arc::new(std::sync::Mutex::new(200u16));
+    let ep_body2 = Arc::clone(&ep_body);
+    let ep_status2 = Arc::clone(&ep_status);
+    let fact_router = axum::Router::new().route(
+        "/user/balance",
+        axum::routing::get(move || {
+            let body = Arc::clone(&ep_body2);
+            let status = Arc::clone(&ep_status2);
+            async move {
+                let status = axum::http::StatusCode::from_u16(*status.lock().unwrap()).unwrap();
+                let body = body.lock().unwrap().clone();
+                (status, body)
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, fact_router).await.unwrap() });
+
+    let client = ResourceStateFactsClient::new(
+        None,
+        None,
+        Some(format!("http://{addr}/user/balance")),
+        Some("S2D_TEST_DEEPSEEK_KEY".into()),
+        Some("CNY".into()),
+    )
+    .with_deepseek_telemetry(telemetry.clone());
+
+    unsafe { std::env::set_var("S2D_TEST_DEEPSEEK_KEY", "dummy") };
+    assert_eq!(client.observe_deepseek().await, CandidateState::ready());
+
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = response.json()?;
+    assert_eq!(body["total_balance"], json!(55.14));
+    assert_eq!(body["granted_balance"], json!(10.0));
+
+    // Failed cycle: readiness fails closed, endpoint keeps last-successful.
+    *ep_status.lock().unwrap() = 500;
+    *ep_body.lock().unwrap() = r#"{"error":"boom"}"#.to_string();
+    assert_eq!(client.observe_deepseek().await, CandidateState::not_ready());
+    unsafe { std::env::remove_var("S2D_TEST_DEEPSEEK_KEY") };
+
+    let response = send(&app, "GET", "/v1/resource/deepseek", None).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = response.json()?;
+    assert_eq!(body["total_balance"], json!(55.14));
+    assert_eq!(body["error"], json!(""));
+
+    // The endpoint reads performed no provider fetch (only the client's two
+    // /user/balance calls ever touch an upstream).
+    assert!(upstream.calls.lock().await.is_empty());
+    Ok(())
+}

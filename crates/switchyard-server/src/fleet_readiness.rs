@@ -127,7 +127,7 @@ impl ComfyFactsClient {
     ///   lifecycle transition that is never invoked here);
     /// - the complete **serving** signature (a known serving mode `"comfy"` or
     ///   `"studio"`, `llama_server=="yes"`, and a known `resident_qwen_profile`
-    ///   in `{"unknown","FAST","LONG"}`) → `ready`;
+    ///   in `{"unknown","qwen3.8-27b"}`) → `ready`;
     /// - any other value or combination → `not_ready` (fail closed).
     pub async fn observe(&self) -> CandidateState {
         self.fetch_snapshot()
@@ -189,18 +189,16 @@ const COMFY_LLAMA_YES: &str = "yes";
 const COMFY_LLAMA_NO: &str = "no";
 
 /// Known `resident_qwen_profile` contract values. The factual producer leaves
-/// this `"unknown"` even when a model is loaded (FAST/LONG are not factually
-/// provable without an auth-gated seam), so `"unknown"` is the expected producer
+/// this `"unknown"` even when a model is loaded (the canonical profile is named only when factually
+/// provable via the auth-gated Studio seam), so `"unknown"` is the expected producer
 /// value that, combined with a known serving mode + `llama_server=="yes"`,
 /// indicates a loaded surface — NOT an arbitrary unknown string. Any string not
 /// in this set fails closed.
 const COMFY_RESIDENT_UNKNOWN: &str = "unknown";
-const COMFY_RESIDENT_FAST: &str = "FAST";
-const COMFY_RESIDENT_LONG: &str = "LONG";
-const COMFY_RESIDENT_KNOWN: [&str; 3] = [
+const COMFY_RESIDENT_CANONICAL: &str = "qwen3.8-27b";
+const COMFY_RESIDENT_KNOWN: [&str; 2] = [
     COMFY_RESIDENT_UNKNOWN,
-    COMFY_RESIDENT_FAST,
-    COMFY_RESIDENT_LONG,
+    COMFY_RESIDENT_CANONICAL,
 ];
 
 /// Strictly classifies one ComfyNinja snapshot into a [`CandidateState`].
@@ -219,8 +217,8 @@ fn classify_comfy(snap: ComfyResourceResponse) -> CandidateState {
     let resident = snap.state.resident_qwen_profile.as_deref().unwrap_or("");
     let llama = snap.state.llama_server.as_deref().unwrap_or("");
     // Profile-seam reconciliation (2026-08-24): the ComfyNinja seam now publishes
-    // lowercase "fast"/"long" (readback-derived); the legacy constants are uppercase.
-    // Match case-insensitively so both spellings classify truthfully.
+    // the canonical "qwen3.8-27b" (or "unknown"). Case-insensitive match retained;
+    // FAST/LONG constants removed (single-profile baseline).
     let resident_upper = resident.to_ascii_uppercase();
     let known_resident = COMFY_RESIDENT_KNOWN.contains(&resident)
         || COMFY_RESIDENT_KNOWN.contains(&resident_upper.as_str());

@@ -2041,7 +2041,10 @@ async fn rerank_handler(
 // Zero-translation parity with production: capability route IDs
 // (embeddings/rerank) are advertised alongside routing routes with default
 // capabilities, so consumer pickers see the same model surface the
-// production binary exposes.
+// production binary exposes. The null capability metadata on capability
+// entries (tool_calling/context_window = null) is a DELIBERATE contract:
+// embeddings/rerank are non-LLM typed endpoints whose admission rules live
+// in their route envelopes, not in the generic model capabilities struct.
 fn advertised_models(state: &ServerState) -> Value {
     model_list_payload(
         state

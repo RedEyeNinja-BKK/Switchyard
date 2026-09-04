@@ -404,22 +404,59 @@ impl BoundServer {
         shutdown: impl Future<Output = ()> + Send + 'static,
         monitor: FleetReadinessMonitor,
     ) -> ServerResult<()> {
-        // A shared stop trigger so the monitor loop and the HTTP server stop on
-        // the same signal. `serve` swallows the caller signal; we also
-        // propagate it to the monitor via the trigger.
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let monitor_task = tokio::spawn(monitor.run(async move {
-            let _ = stop_rx.await;
-        }));
+        // ONE coordinated stop event: the process signal fans out to BOTH the
+        // HTTP server and the monitor (broadcast, so both consumers observe the
+        // same firing), and the monitor additionally stops when the serve loop
+        // ends for any reason. The join is bounded: the monitor's run loop
+        // selects its stop signal between observation cycles, but a cycle can
+        // be mid-flight (its fetches are individually time-boxed), so the
+        // runtime never waits forever on the monitor task.
+        let (signal_tx, mut server_rx, mut monitor_rx) = {
+            let (signal_tx, server_rx) = tokio::sync::broadcast::channel::<()>(1);
+            let monitor_rx = signal_tx.subscribe();
+            (signal_tx, server_rx, monitor_rx)
+        };
+        tokio::spawn(async move {
+            shutdown.await;
+            let _ = signal_tx.send(());
+            // Hold the sender so the broadcast delivery window stays open.
+            std::future::pending::<()>().await;
+        });
+        let (serve_done_tx, serve_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let monitor_stop = async move {
+            tokio::select! {
+                _ = monitor_rx.recv() => {},
+                _ = serve_done_rx => {},
+            }
+        };
+        let monitor_task = tokio::spawn(monitor.run(monitor_stop));
+        let server_stop = async move {
+            let _ = server_rx.recv().await;
+        };
         let drain_timeout = self.options.shutdown_timeout;
         let serve_result = if let Some(tls) = self.options.tls {
-            serve_tls(self.listener, self.router, tls, drain_timeout, shutdown).await
+            serve_tls(self.listener, self.router, tls, drain_timeout, server_stop).await
         } else {
-            serve(self.listener, self.router, drain_timeout, shutdown).await
+            serve(self.listener, self.router, drain_timeout, server_stop).await
         };
-        // Signal the monitor to stop; it stops cleanly without a final cycle.
-        let _ = stop_tx.send(());
-        let _ = monitor_task.await;
+        // The serve loop ended (signal or internal error); stop the monitor and
+        // wait for it briefly — never unconditionally.
+        let _ = serve_done_tx.send(());
+        match tokio::time::timeout(
+            self.options.shutdown_timeout.max(MONITOR_STOP_GRACE),
+            monitor_task,
+        )
+        .await
+        {
+            Ok(joined) => {
+                let _ = joined;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "fleet-readiness monitor did not stop within its grace window; abandoning task"
+                );
+            }
+        }
         serve_result
     }
 
@@ -796,6 +833,7 @@ async fn decision(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    let request = prepare_candidate_context_facts(route, request).await;
     let route_model = request
         .llm_request
         .model
@@ -825,6 +863,8 @@ async fn decision(
                 Ok(resolved) => resolved,
                 Err(_) => return runner_error(error),
             };
+            let escalated_request =
+                prepare_candidate_context_facts(escalation_route, escalated_request).await;
             match escalation_route.decide(escalated_request).await {
                 Ok(escalated_outcome) => {
                     escalation_evidence = Some((escalation_id, reason));
@@ -1158,6 +1198,10 @@ async fn handle_llm_request(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    // Host-owned exact context facts (BOUNDED candidates' target-specific
+    // counts) are attached before the routing Algorithm runs, keeping
+    // FleetRouter pure.
+    let request = prepare_candidate_context_facts(route, request).await;
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let observer = stats_observer(
@@ -1190,6 +1234,8 @@ async fn handle_llm_request(
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
+        let escalated_request =
+            prepare_candidate_context_facts(escalation_route, escalated_request).await;
         match escalation_route
             .execute(escalated_request, Some(observer))
             .await
@@ -1215,12 +1261,17 @@ async fn handle_llm_request(
                         wire_format,
                     ) {
                         Ok(resolved) => resolved,
-                        Err(response) => return response,
+                        // The escalation destination is config-validated as a
+                        // registered route; if resolution still fails, surface
+                        // the ORIGINAL route error, not a destination 404.
+                        Err(_) => return runner_error(error),
                     };
                     let escalated_observer = stats_observer(
                         state.stats.clone(),
                         state.routing_log.clone().zip(routing_log_context.clone()),
                     );
+                    let escalated_request =
+                        prepare_candidate_context_facts(escalation_route, escalated_request).await;
                     match escalation_route
                         .execute(escalated_request, Some(escalated_observer))
                         .await
@@ -1571,6 +1622,10 @@ fn anthropic_error_type(status: StatusCode) -> &'static str {
     }
 }
 
+/// Extra time granted to the fleet-readiness monitor to finish an in-flight
+/// observation cycle after the server stop event, before its task is abandoned.
+const MONITOR_STOP_GRACE: Duration = Duration::from_secs(30);
+
 /// Coarse deterministic estimate of the input size of a request body, used ONLY
 /// for the optional per-route context-pressure escalation gate.
 ///
@@ -1619,6 +1674,40 @@ fn escalation_reason(error: &RunnerError) -> Option<&'static str> {
             .then_some("no_eligible_candidate"),
         _ => None,
     }
+}
+
+/// Host-owned exact input-token producer for routing paths.
+///
+/// Enriches `request` with `candidate_input_tokens` from this route's
+/// explicitly-qualified input-token producer targets, using a clone of the
+/// request for each target-specific count (so a multi-candidate route counts
+/// each target's own final representation). A count failure simply leaves that
+/// candidate's fact absent - FleetRouter then fails that BOUNDED candidate
+/// closed - and never fails the whole routing request. Called only from
+/// routing-eligible paths (normal inference and `/v1/decision`), never from
+/// counting auxiliary endpoints.
+async fn prepare_candidate_context_facts(route: &Route, mut request: Request) -> Request {
+    for target in route.input_tokens_targets() {
+        match target
+            .client
+            .count_input_tokens(&target.model, &request)
+            .await
+        {
+            Ok(count) => {
+                request
+                    .candidate_input_tokens
+                    .insert(target.model.clone(), count);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    model = %target.model,
+                    error = %error,
+                    "exact input-token count unavailable for candidate; leaving its fact absent"
+                );
+            }
+        }
+    }
+    request
 }
 
 fn server_error(message: impl Into<String>) -> Response {

@@ -21,7 +21,8 @@ use libsy::SharedFleetState;
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, FleetBuildContext,
-    ModelCapabilities, Route, Runner, RunnerError,
+    FleetCandidateContextPolicyConfig, InputTokenSourceConfig, ModelCapabilities, Route, Runner,
+    RunnerError,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -360,6 +361,8 @@ impl DeploymentConfig {
                 self.build_anthropic_auxiliary_target(config, &clients);
             let responses_auxiliary_target =
                 self.build_responses_auxiliary_target(config, &clients);
+            let input_tokens_targets =
+                self.build_input_tokens_targets(route_name, config, &clients)?;
             let decision_targets = config
                 .routing_target_names()
                 .into_iter()
@@ -377,7 +380,8 @@ impl DeploymentConfig {
             .with_escalation(
                 config.escalation_route().cloned(),
                 config.escalation_input_threshold(),
-            );
+            )
+            .with_input_tokens_targets(input_tokens_targets);
             routes.push((config.id.clone(), route));
         }
         let runner = Runner::new(routes)
@@ -512,6 +516,73 @@ impl DeploymentConfig {
         route.routing_target_names().into_iter().find_map(|name| {
             self.build_auxiliary_target(name, clients, AuxiliaryOperation::ResponsesInputTokens)
         })
+    }
+
+    /// Builds the explicitly-qualified exact input-token producers for a
+    /// `fleet_router` route.
+    ///
+    /// Only `fleet_router` candidates that declare `context_policy.kind =
+    /// "bounded"` **and** `input_token_source = openai_chat_input_tokens` yield
+    /// a producer target. A declared source whose target is **not** served by
+    /// an OpenAI-chat backend is a configuration error (rejected, not silently
+    /// ignored). Non-fleet routes and bounded candidates without an explicit
+    /// producer yield no target (their fact stays absent and FleetRouter fails
+    /// closed).
+    fn build_input_tokens_targets(
+        &self,
+        route_name: &str,
+        route_config: &RouteConfig,
+        clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+    ) -> RunnerResult<Vec<AuxiliaryTarget>> {
+        let AlgorithmSpec::FleetRouter { candidates, .. } = &route_config.algorithm else {
+            return Ok(Vec::new());
+        };
+        let mut targets = Vec::new();
+        for candidate in candidates {
+            let FleetCandidateContextPolicyConfig::Bounded {
+                usable_context_tokens: _,
+                input_token_source,
+            } = candidate.context_policy
+            else {
+                continue;
+            };
+            let Some(source) = input_token_source else {
+                // Bounded without an explicit producer: no fact, must fail closed.
+                continue;
+            };
+            match source {
+                InputTokenSourceConfig::OpenAiChatInputTokens => {
+                    let target = self.targets.get(&candidate.target).ok_or_else(|| {
+                        RunnerError::configuration(format!(
+                            "route {route_name}: fleet candidate {:?} declares input_token_source \
+                             but has no [targets.*]",
+                            candidate.target
+                        ))
+                    })?;
+                    let client = clients.get(&target.llm_client).ok_or_else(|| {
+                        RunnerError::configuration(format!(
+                            "route {route_name}: fleet candidate {:?} references unknown llm_client {}",
+                            candidate.target, target.llm_client
+                        ))
+                    })?;
+                    if !client
+                        .supports_auxiliary(&target.id, AuxiliaryOperation::OpenAiChatInputTokens)
+                    {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name}: fleet candidate {:?} declares \
+                             input_token_source = openai_chat_input_tokens but its target is not \
+                             served by an OpenAI-chat backend",
+                            candidate.target
+                        )));
+                    }
+                    targets.push(AuxiliaryTarget {
+                        model: target.id.clone(),
+                        client: client.clone(),
+                    });
+                }
+            }
+        }
+        Ok(targets)
     }
 
     fn build_auxiliary_target(

@@ -20,8 +20,8 @@
 //! (tool / reasoning requirements derived from the normalized request), a
 //! **readiness filter** (`ready=false` or `transition_required=true` are never
 //! selected for an immediate request), then a deterministic **preference rank**.
-//! The highest-ranked eligible candidate becomes [`RoutingOutcome::selected_model_id`]
-//! and the remaining eligible candidates become ordered `fallback_models`.
+//! The highest-ranked eligible candidate becomes [`RoutingOutcome::selected_model_ids`]
+//! and the remaining eligible candidates become the ordered remainder of `selected_model_ids`.
 //!
 //! The Algorithm is **stateless in the routing sense**: the result depends only
 //! on the current request, the static profiles, and the injected snapshot — not

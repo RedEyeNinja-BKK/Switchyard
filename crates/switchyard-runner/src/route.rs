@@ -122,6 +122,9 @@ pub struct Route {
     escalation: Option<ModelId>,
     /// Optional context-pressure escalation threshold (estimated input tokens).
     escalation_max_input_tokens: Option<u64>,
+    /// Explicitly-qualified exact input-token producers (`fleet_router`
+    /// candidates that declare `context_policy.input_token_source`).
+    input_tokens_targets: Vec<AuxiliaryTarget>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -151,6 +154,7 @@ impl Route {
             decision_targets,
             escalation: None,
             escalation_max_input_tokens: None,
+            input_tokens_targets: Vec::new(),
         }
     }
 
@@ -174,6 +178,17 @@ impl Route {
     /// Optional context-pressure escalation threshold (estimated input tokens).
     pub fn escalation_max_input_tokens(&self) -> Option<u64> {
         self.escalation_max_input_tokens
+    }
+
+    /// Declares this route's exact input-token producer targets.
+    pub fn with_input_tokens_targets(mut self, targets: Vec<AuxiliaryTarget>) -> Self {
+        self.input_tokens_targets = targets;
+        self
+    }
+
+    /// The explicitly-qualified exact input-token producers for this route.
+    pub fn input_tokens_targets(&self) -> &[AuxiliaryTarget] {
+        &self.input_tokens_targets
     }
 
     /// Returns the configured libsy algorithm name.
@@ -245,6 +260,12 @@ impl Route {
             AuxiliaryOperation::AnthropicCountTokens => &self.anthropic_auxiliary_target,
             AuxiliaryOperation::ResponsesInputTokens | AuxiliaryOperation::ResponsesCompact => {
                 &self.responses_auxiliary_target
+            }
+            // Exact chat input-token counting is served directly through the
+            // per-candidate producer targets (`Route::input_tokens_targets`)
+            // by the host, not through the route-level auxiliary dispatch.
+            AuxiliaryOperation::OpenAiChatInputTokens => {
+                return Err(RunnerError::AuxiliaryUnsupported);
             }
         }
         .as_ref()

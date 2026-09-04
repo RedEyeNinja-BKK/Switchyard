@@ -89,6 +89,9 @@ pub enum AuxiliaryOperation {
     AnthropicCountTokens,
     /// OpenAI Responses input-token counting.
     ResponsesInputTokens,
+    /// Exact input-token count against an OpenAI-chat backend's
+    /// `/chat/completions/input_tokens` endpoint (llama.cpp-style).
+    OpenAiChatInputTokens,
     /// OpenAI Responses compaction.
     ResponsesCompact,
 }
@@ -98,6 +101,7 @@ impl AuxiliaryOperation {
         match self {
             Self::AnthropicCountTokens => WireFormat::AnthropicMessages,
             Self::ResponsesInputTokens | Self::ResponsesCompact => WireFormat::OpenAiResponses,
+            Self::OpenAiChatInputTokens => WireFormat::OpenAiChat,
         }
     }
 
@@ -105,6 +109,7 @@ impl AuxiliaryOperation {
         match self {
             Self::AnthropicCountTokens => backend.count_tokens_url(),
             Self::ResponsesInputTokens => format!("{}/input_tokens", backend.url()),
+            Self::OpenAiChatInputTokens => backend.input_tokens_url(),
             Self::ResponsesCompact => format!("{}/compact", backend.url()),
         }
     }
@@ -219,6 +224,46 @@ impl TranslatingLlmClient {
         serde_json::from_slice(&body).map_err(|error| LlmClientError::InvalidResponse {
             source: Box::new(error),
         })
+    }
+
+    /// Exact input-token count against an OpenAI-chat backend's
+    /// `/chat/completions/input_tokens` endpoint.
+    ///
+    /// The count reuses the shared [`send_encoded`](Self::send_encoded) path, so
+    /// the counted body is the same token-relevant final target representation
+    /// that generation would POST: resolved target model stamping, same-format
+    /// preservation, target `extra_body`, metadata/backend headers, auth, and
+    /// retry behavior all stay identical. Only a valid `{"input_tokens": N}`
+    /// result is accepted; `N` must be a non-negative integer representable in
+    /// [`u64`].
+    ///
+    /// Returns an error when the model has no OpenAI-chat backend, the upstream
+    /// request fails, or the response is not a valid `{"input_tokens": N}`.
+    pub async fn count_input_tokens(&self, model: &ModelId, request: &Request) -> Result<u64> {
+        let value = self
+            .call_auxiliary(
+                model,
+                request.clone(),
+                AuxiliaryOperation::OpenAiChatInputTokens,
+            )
+            .await?;
+        let input_tokens =
+            value
+                .get("input_tokens")
+                .ok_or_else(|| LlmClientError::InvalidResponse {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "input_tokens response missing `input_tokens` field",
+                    )),
+                })?;
+        input_tokens
+            .as_u64()
+            .ok_or_else(|| LlmClientError::InvalidResponse {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "input_tokens response field is not a non-negative integer",
+                )),
+            })
     }
 
     /// Encode `llm_request` for `wire_format`, POST it to `url` with the request's
@@ -2971,6 +3016,98 @@ mod tests {
                 "near-match URL must not be treated as Codex"
             );
         }
+        Ok(())
+    }
+    // --- S2-E.2: exact OpenAI-chat input-token counting -------------------------
+
+    #[tokio::test]
+    async fn count_input_tokens_returns_exact_count() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions/input_tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"input_tokens": 42, "object": "response.input_tokens"}
+            )))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let model = ModelId::from("gpt");
+        let n = client
+            .count_input_tokens(&model, &request_for(Some("gpt"), false))
+            .await?;
+        assert_eq!(n, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_input_tokens_rejects_invalid_payloads() {
+        // Rejects every non-`{ "input_tokens": N }`-with-non-negative-integer
+        // result. (A numeric literal larger than u64 cannot be held by
+        // serde_json's default Number, so the u64-overflow path is covered by
+        // the strict `as_u64` validation in `count_input_tokens`, not a
+        // constructible JSON fixture.)
+        let cases: &[serde_json::Value] = &[
+            json!({}),                     // missing field
+            json!({"input_tokens": null}), // null
+            json!({"input_tokens": -1}),   // negative
+            json!({"input_tokens": 3.5}),  // float
+            json!({"input_tokens": "12"}), // string
+        ];
+        for payload in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(payload.clone()))
+                .mount(&server)
+                .await;
+            let client =
+                TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri()))).unwrap();
+            let model = ModelId::from("gpt");
+            let result = client
+                .count_input_tokens(&model, &request_for(Some("gpt"), false))
+                .await;
+            assert!(result.is_err(), "payload {payload} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn input_tokens_count_carries_target_extra_body_and_model_stamp() -> Result<()> {
+        // The counted body is the same token-relevant final representation
+        // generation would POST: target model stamp + target extra_body.
+        let server = MockServer::start().await;
+        let seen = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        let seen_for_mock = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions/input_tokens"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                *seen_for_mock.lock().unwrap() = Some(body);
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 7}))
+            })
+            .mount(&server)
+            .await;
+        let mut backend = config(&format!("{}/v1", server.uri()));
+        backend.extra_body = BTreeMap::from([(
+            "chat_template_kwargs".to_string(),
+            json!({"enable_thinking": false}),
+        )]);
+        let client = TranslatingLlmClient::new(&vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+        let model = ModelId::from("gpt");
+        let n = client
+            .count_input_tokens(&model, &request_for(Some("wrong-model"), false))
+            .await?;
+        assert_eq!(n, 7);
+        let body = seen.lock().unwrap().clone().expect("request captured");
+        assert_eq!(body["model"], json!("gpt"), "target model stamp");
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"],
+            json!(false),
+            "target extra_body applies to the counted representation"
+        );
         Ok(())
     }
 }

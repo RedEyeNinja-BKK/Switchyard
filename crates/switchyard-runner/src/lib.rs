@@ -11,8 +11,9 @@ mod runner;
 
 pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, ClassifierMode,
-    ClassifierPolicyConfig, FleetBuildContext, FleetCandidateConfig, FleetWorkShapeSourceName,
-    InputTokenSourceConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
+    ClassifierPolicyConfig, FleetBuildContext, FleetCandidateConfig,
+    FleetCandidateContextPolicyConfig, FleetWorkShapeSourceName, InputTokenSourceConfig,
+    LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
 pub use config::{ComfyFactConfig, FleetReadinessConfig, HtpcFactConfig, ResourceFactConfig};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};

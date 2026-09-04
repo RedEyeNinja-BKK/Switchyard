@@ -295,6 +295,16 @@ impl Backend {
         format!("{}/count_tokens", anthropic_url(base_url))
     }
 
+    /// The exact input-token endpoint for [`Backend::OpenAiChat`] targets.
+    ///
+    /// Only [`Backend::OpenAiChat`] supports the exact input-token endpoint; a
+    /// caller must not call this on other backends. The derived path is
+    /// `/chat/completions/input_tokens` under the backend's resolved base.
+    pub fn input_tokens_url(&self) -> String {
+        let base_url = self.config().base_url.trim_end_matches('/');
+        openai_url(base_url, "/chat/completions/input_tokens")
+    }
+
     /// Whether an upstream 400 `body` looks like a context-window overflow for
     /// this backend's provider.
     pub(crate) fn is_context_overflow(&self, body: &str) -> bool {

@@ -143,6 +143,32 @@ impl TranslatingLlmClient {
                 backend.validate_extra_headers(&config.model_name)?;
             }
         }
+        // Provider-identity invariant: `provider_key()` derives the fallback
+        // driver's provider identity from ONE configured backend's base URL.
+        // That is exact only while every backend in a client shares the same
+        // canonical base URL (true by schema today: one scalar `base_url` per
+        // `[llm_clients.*]`). Enforce it at construction so a future
+        // multi-backend representation cannot silently undermine
+        // provider-aware fallback skip decisions. Hermes qualification
+        // finding N2 (2026-09-04).
+        for config in model_configs {
+            let mut backends: Vec<&Backend> = std::iter::once(&config.default_backend)
+                .chain(config.other_backends.iter().flatten())
+                .collect();
+            backends.dedup_by(|a, b| a.provider_identity() == b.provider_identity());
+            if backends.len() > 1 {
+                let urls: Vec<String> = backends
+                    .iter()
+                    .map(|backend| backend.provider_identity())
+                    .collect();
+                return Err(LlmClientError::RequestEncoding(format!(
+                    "client for model {} spans multiple provider identities \
+                     ({urls:?}); provider-aware fallback requires one provider \
+                     per [llm_clients.*] client",
+                    config.model_name
+                )));
+            }
+        }
         let build_client = |builder: reqwest::ClientBuilder| {
             builder.build().map_err(|error| LlmClientError::Transport {
                 source: Box::new(error),

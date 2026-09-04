@@ -151,6 +151,15 @@ impl Backend {
         }
     }
 
+    /// The canonical provider identity used by provider-aware fallback: the
+    /// normalized base URL (query/fragment stripped, trailing slash trimmed).
+    /// Two backends with the same identity belong to the same physical
+    /// provider for skip decisions.
+    pub(crate) fn provider_identity(&self) -> String {
+        let (base, _, _) = split_base_url(&self.config().base_url);
+        base.trim_end_matches('/').to_string()
+    }
+
     /// The fully resolved upstream URL for this backend's endpoint.
     ///
     /// Tolerates base URLs that already include the provider path (or a bare

@@ -1169,6 +1169,42 @@ fn encode_responses_content(
     }
     let mut blocks = Vec::new();
     for block in content {
+        // Strict Responses backends accept only output_text/refusal content in
+        // assistant message items. Non-text blocks in assistant history are
+        // deliberately degraded to textual output_text (lossy, diagnostic
+        // recorded) instead of emitting input-oriented block types that would
+        // be rejected upstream. User/developer items keep the input_* shapes.
+        if assistant
+            && !matches!(
+                block,
+                ContentBlock::Text { .. }
+                    | ContentBlock::Refusal { .. }
+                    | ContentBlock::Reasoning { .. }
+                    | ContentBlock::ToolCall(_)
+                    | ContentBlock::ToolResult(_)
+            )
+        {
+            push_lossy(
+                diagnostics,
+                policy,
+                "assistant multimodal content degraded to output_text for Responses",
+            )?;
+            let raw: Value = match block {
+                ContentBlock::Image { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::Audio { source } | ContentBlock::Video { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::File { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::Unknown { raw, .. } => raw.clone(),
+                _ => unreachable!("filtered above"),
+            };
+            blocks.push(json!({"type": "output_text", "text": json_string(&raw)}));
+            continue;
+        }
         match block {
             ContentBlock::Text { text } => blocks.push(json!({ "type": text_type, "text": text })),
             ContentBlock::Refusal { text } => {

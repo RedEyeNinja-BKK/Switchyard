@@ -96,6 +96,66 @@ mod tests {
         let body = r#"{"error":{"message":"rate limit exceeded"}}"#;
         assert!(!is_overflow_body(body, never, PHRASES));
     }
+
+    // --- permanent-quota 429 classification: realistic provider bodies ------
+
+    // POSITIVE: the real OpenAI insufficient-quota 429 body (structured code).
+    #[test]
+    fn openai_insufficient_quota_body_is_permanent() {
+        let body = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#;
+        assert!(is_permanent_quota_429(body));
+    }
+
+    // POSITIVE: short plain-text aggregator bodies (the case bare "credits"
+    // exists for).
+    #[test]
+    fn plain_text_credit_exhaustion_bodies_are_permanent() {
+        for body in [
+            "You've run out of credits. Please top up to continue.",
+            "not enough credits",
+            "Your credits have been exhausted",
+            "payment required: quota exhausted",
+            "you have used all your usage limit for this billing period",
+        ] {
+            assert!(is_permanent_quota_429(body), "body: {body}");
+        }
+    }
+
+    // NEGATIVE: realistic TRANSIENT 429 bodies must keep the bounded retry.
+    #[test]
+    fn transient_rate_limit_bodies_are_not_permanent() {
+        for body in [
+            // OpenAI TPM throttle.
+            r#"{"error":{"message":"Rate limit reached for gpt-5.6-luna on tokens per min (TPM): Limit 30000, Used 29999. Please try again in 20ms.","type":"tokens","param":null,"code":"rate_limit_exceeded"}}"#,
+            // Per-minute request cap.
+            r#"{"error":{"message":"Number of requests has exceeded your per-minute rate limit. Please slow down and try again."}}"#,
+            // Retry-After-style plain text.
+            "Too many requests. Please retry after 30 seconds.",
+            // DeepSeek transient throttle phrasing.
+            r#"{"error":{"message":"rate limit exceeded, please retry later"}}"#,
+        ] {
+            assert!(
+                !is_permanent_quota_429(body),
+                "transient body misclassified permanent: {body}"
+            );
+        }
+    }
+
+    // DOCUMENTED EDGE (accepted): an aggregator daily-cap 429 that MENTIONS
+    // credits classifies as permanent. That is the intended semantic, not a
+    // false positive: the same-candidate retry budget is futile against a
+    // daily cap (resets at midnight / requires payment), so the correct fleet
+    // behavior is to advance immediately to the next candidate — exactly what
+    // permanent-quota classification does. No realistic provider body is known
+    // where a 429 mentioning "credits" IS fixed by retrying the same
+    // candidate; if soak or runtime evidence surfaces one, narrow bare
+    // "credits" to credit-exhaustion phrases ("out of credits",
+    // "insufficient credits", ...) as the recorded follow-up.
+    #[test]
+    fn credits_mentioning_daily_cap_is_classified_permanent_intentionally() {
+        let body = "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day.";
+        assert!(is_permanent_quota_429(body));
+    }
 }
 
 /// Canonical permanent-quota markers from OpenAI and compatible providers.

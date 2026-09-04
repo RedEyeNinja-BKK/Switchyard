@@ -769,6 +769,16 @@ impl RoutedLlmClient for TranslatingLlmClient {
         // identity used by the fallback driver to skip whole providers that are
         // proven unavailable (drained balance / auth): same-provider clients use
         // the identical base_url string (config convention).
+        //
+        // IDENTITY IS EXACT, NOT HEURISTIC, for any configuration the schema
+        // can express: `LlmClientConfig` carries a single scalar `base_url`
+        // (crates/switchyard-runner/src/config.rs), so one client cannot span
+        // two upstream URLs and all `model_to_config` backends within a client
+        // share the same provider key by construction. Live-topology proof
+        // (GO-D qualification 2026-09-04): 20 clients -> 6 distinct URLs, and
+        // every URL-sharing group is one physical upstream service
+        // (deepseek x3, chatgpt-codex x3, htpc x3, openrouter x5,
+        // reninja llama.cpp profiles x5, thaillm x1).
         self.model_to_config
             .values()
             .next()

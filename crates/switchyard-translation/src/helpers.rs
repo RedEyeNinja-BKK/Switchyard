@@ -19,8 +19,8 @@ use crate::codecs::stream::encode_response_stream_event;
 use crate::sse;
 use crate::{
     AggLlmResponse, FormatId, LlmRequest, LlmResponseChunk, LlmResponseStream,
-    LlmResponseStreamEvent, LlmStreamError, Result, StreamCodecRegistry, StreamTranslationState,
-    TranslationEngine, TranslationPolicy, WireFormat,
+    LlmResponseStreamEvent, LlmStreamError, ResponsesProfile, Result, StreamCodecRegistry,
+    StreamTranslationState, TranslationEngine, TranslationPolicy, WireFormat,
 };
 
 static DEFAULT_TRANSLATION_POLICY: LazyLock<TranslationPolicy> =
@@ -39,6 +39,21 @@ pub fn decode_request(wire_format: WireFormat, body: &Value) -> Result<LlmReques
 pub fn encode_request(request: &LlmRequest, wire_format: WireFormat) -> Result<Value> {
     Ok(DEFAULT_TRANSLATION_ENGINE
         .encode_request(wire_format, request, &DEFAULT_TRANSLATION_POLICY)?
+        .body)
+}
+
+/// Encodes a normalized request into `wire_format`'s JSON body with an
+/// explicit destination profile (e.g. the strict ChatGPT-Codex Responses
+/// profile derived from the backend's path boundary).
+pub fn encode_request_with_profile(
+    request: &LlmRequest,
+    wire_format: WireFormat,
+    responses_profile: ResponsesProfile,
+) -> Result<Value> {
+    let mut policy = DEFAULT_TRANSLATION_POLICY.clone();
+    policy.responses_profile = responses_profile;
+    Ok(DEFAULT_TRANSLATION_ENGINE
+        .encode_request(wire_format, request, &policy)?
         .body)
 }
 

@@ -2575,3 +2575,137 @@ fn responses_preserved_scalar_input_replays_as_message_list() -> TestResult {
     );
     Ok(())
 }
+
+// Verifies the strict Codex Responses profile encodes assistant history as
+// output_text blocks while non-assistant items keep input-oriented encoding.
+#[test]
+fn strict_codex_profile_encodes_assistant_history_as_output_text() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "earlier answer"},
+            {"role": "user", "content": "more"}
+        ]
+    });
+    let policy = TranslationPolicy {
+        responses_profile: switchyard_translation::ResponsesProfile::StrictCodex,
+        ..normalized_policy()
+    };
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &body,
+        &policy,
+    )?;
+
+    let input = &translated.body["input"];
+    assert_eq!(input[0]["content"], json!("hi"));
+    assert_eq!(
+        input[1]["content"],
+        json!([{"type": "output_text", "text": "earlier answer"}])
+    );
+    assert_eq!(input[2]["content"], json!("more"));
+    assert!(translated.diagnostics.is_empty());
+    Ok(())
+}
+
+// The normal Responses profile never inherits the lossy Codex-specific
+// assistant encoding just because both share the same wire format.
+#[test]
+fn normal_responses_profile_keeps_input_oriented_assistant_encoding() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "earlier answer"}
+        ]
+    });
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &body,
+        &normalized_policy(),
+    )?;
+
+    let input = &translated.body["input"];
+    assert_eq!(input[0]["content"], json!("hi"));
+    assert_eq!(input[1]["content"], json!("earlier answer"));
+    assert!(translated.diagnostics.is_empty());
+    Ok(())
+}
+
+// Non-text blocks in assistant history degrade to textual output_text under
+// the strict Codex profile (with a diagnostic) instead of emitting
+// input-oriented block types the backend rejects.
+#[test]
+fn strict_codex_profile_degrades_assistant_multimodal_content_with_diagnostic() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route",
+        "messages": [
+            {"role": "user", "content": "annotate"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "see"},
+                {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}}
+            ]}
+        ]
+    });
+    let policy = TranslationPolicy {
+        responses_profile: switchyard_translation::ResponsesProfile::StrictCodex,
+        ..normalized_policy()
+    };
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &body,
+        &policy,
+    )?;
+
+    let content = translated.body["input"][1]["content"]
+        .as_array()
+        .ok_or("assistant content should be encoded as blocks")?;
+    assert_eq!(content[0], json!({"type": "output_text", "text": "see"}));
+    assert_eq!(content[1]["type"], "output_text");
+    assert!(translated.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message
+            == "assistant multimodal content degraded to output_text for strict Responses profile"
+    }));
+    Ok(())
+}
+
+// The degradation is assistant-scoped: user multimodal items keep their
+// input-oriented encoding even under the strict Codex profile.
+#[test]
+fn strict_codex_profile_keeps_user_multimodal_content_input_oriented() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}}
+            ]
+        }]
+    });
+    let policy = TranslationPolicy {
+        responses_profile: switchyard_translation::ResponsesProfile::StrictCodex,
+        ..normalized_policy()
+    };
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &body,
+        &policy,
+    )?;
+
+    let content = translated.body["input"][0]["content"]
+        .as_array()
+        .expect("multimodal content stays blocks");
+    assert_eq!(content[1]["type"], "input_image");
+    assert!(translated.diagnostics.is_empty());
+    Ok(())
+}

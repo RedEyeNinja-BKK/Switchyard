@@ -75,6 +75,25 @@ pub struct TranslationPolicy {
     pub deterministic_ids: DeterministicIdPolicy,
     pub preservation: PreservationPolicy,
     pub target_capabilities: TargetCapabilities,
+    /// Destination profile for Responses-wire legs. A strict ChatGPT-Codex
+    /// backend accepts only `output_text`/`refusal` content inside assistant
+    /// message items and rejects `stream_options`; a normal `/v1/responses`
+    /// endpoint is standards-compliant and must NOT inherit the lossy
+    /// Codex-specific encoding simply because both use the same wire format.
+    /// Derived once at the destination-backend boundary; defaults to [`ResponsesProfile::Normal`].
+    pub responses_profile: ResponsesProfile,
+}
+
+/// How the Responses destination expects message content encoded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesProfile {
+    /// Standards-compliant OpenAI `/v1/responses` behavior (the wire default).
+    #[default]
+    Normal,
+    /// Strict ChatGPT-Codex Responses: assistant history encodes as
+    /// `output_text` items (lossy degrade for non-text), stream is mandatory.
+    StrictCodex,
 }
 
 impl Default for TranslationPolicy {
@@ -87,6 +106,7 @@ impl Default for TranslationPolicy {
             },
             preservation: PreservationPolicy::InMemory,
             target_capabilities: TargetCapabilities::default(),
+            responses_profile: ResponsesProfile::Normal,
         }
     }
 }

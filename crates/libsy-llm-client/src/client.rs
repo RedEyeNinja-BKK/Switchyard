@@ -20,7 +20,8 @@ use switchyard_protocol::{
 };
 use switchyard_translation::{
     WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
+    encode_aggregated_response_with_extensions, encode_request_with_profile,
+    encode_stream_with_extensions,
 };
 use tracing::Instrument;
 
@@ -286,7 +287,17 @@ impl TranslatingLlmClient {
         model: &ModelId,
         endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
-        let mut body = encode_request(&llm_request, wire_format)
+        // The destination profile is a property of the backend class (the same
+        // path-boundary rule that classifies strict Codex endpoints), not of
+        // individual routes: a strict Codex backend encodes assistant history
+        // as output_text; normal Responses endpoints stay standards-compliant.
+        let responses_profile =
+            if matches!(wire_format, WireFormat::OpenAiResponses) && backend.is_codex() {
+                switchyard_translation::ResponsesProfile::StrictCodex
+            } else {
+                switchyard_translation::ResponsesProfile::Normal
+            };
+        let mut body = encode_request_with_profile(&llm_request, wire_format, responses_profile)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`; force the resolved model so
@@ -322,6 +333,18 @@ impl TranslatingLlmClient {
             ensure_openai_stream_usage(&mut body);
         } else if matches!(backend, Backend::OpenAiResponses(_)) {
             canonicalize_reasoning_effort(&mut body, backend.extra_body().get("reasoning"));
+            // Stream-mandatory Responses backends (chatgpt.com Codex: "Stream
+            // must be set to true") - force upstream stream=true regardless of
+            // the caller's stream value; the server layer aggregates back to
+            // buffered JSON for callers that asked for stream=false. The chat-
+            // only usage decoration above never leaks stream_options onto this
+            // Responses path (stream_options is a chat-completions parameter).
+            if backend.is_codex()
+                && body.get("stream").and_then(Value::as_bool) != Some(true)
+                && let Value::Object(object) = &mut body
+            {
+                object.insert("stream".to_string(), Value::Bool(true));
+            }
         }
         let streaming = endpoint.allows_streaming()
             && body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -2983,15 +3006,11 @@ mod tests {
                 seen_for_mock.store(body.get("max_output_tokens").is_some(), Ordering::SeqCst);
                 true
             })
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "resp_1",
-                "object": "response",
-                "status": "completed",
-                "model": "gpt",
-                "output": [{"type": "message", "role": "assistant",
-                            "content": [{"type": "output_text", "text": "ok"}]}],
-                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-            })))
+            // Codex legs are stream-mandatory; the client forces stream=true, so
+            // the mock must speak SSE (first-byte/stream-force work).
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
             .mount(&server)
             .await;
         let client = TranslatingLlmClient::new(&responses_map(&format!(
@@ -3003,18 +3022,15 @@ mod tests {
             "max_output_tokens": 4096,
             "input": "hi"
         });
-        let RawResponse::Buffered(body) = client
+        let response = client
             .call_rewrite_model_raw(
                 raw,
                 None,
                 Some(&ModelId::from("gpt")),
                 WireFormat::OpenAiResponses,
             )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
-        assert_eq!(body["status"], "completed");
+            .await?;
+        assert!(matches!(response, RawResponse::Stream(_)));
         // The parameter never reached the Codex-shaped upstream.
         assert!(
             !seen.load(Ordering::SeqCst),
@@ -3038,15 +3054,11 @@ mod tests {
                 seen_for_mock.store(body.get("max_output_tokens").is_some(), Ordering::SeqCst);
                 true
             })
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "resp_1",
-                "object": "response",
-                "status": "completed",
-                "model": "gpt",
-                "output": [{"type": "message", "role": "assistant",
-                            "content": [{"type": "output_text", "text": "ok"}]}],
-                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-            })))
+            // Codex legs are stream-mandatory; the client forces stream=true,
+            // so the mock must speak SSE.
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
             .mount(&server)
             .await;
 
@@ -3059,23 +3071,70 @@ mod tests {
             "max_tokens": 512,
             "messages": [{"role": "user", "content": "hi"}]
         });
-        // Inbound chat -> internal -> outbound Responses.
-        let RawResponse::Buffered(body) = client
+        // Inbound chat -> internal -> outbound Responses (forced stream).
+        let response = client
             .call_rewrite_model_raw(
                 raw,
                 None,
                 Some(&ModelId::from("gpt")),
                 WireFormat::OpenAiChat,
             )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
-        // Inbound chat -> the raw response comes back chat-shaped.
-        assert_eq!(body["choices"][0]["message"]["content"], json!("ok"));
+            .await?;
+        assert!(matches!(response, RawResponse::Stream(_)));
         assert!(
             !seen.load(Ordering::SeqCst),
             "translated max_output_tokens leaked upstream"
+        );
+        Ok(())
+    }
+
+    // Streaming chat requests routed to the Codex backend are forced to
+    // upstream `stream = true` (stream-mandatory API), and the chat-only
+    // `stream_options` usage decoration never leaks onto the Responses leg.
+    #[tokio::test]
+    async fn codex_responses_stream_force_without_stream_options()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let seen = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let seen_for_mock = seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_mock.lock().unwrap() = Some(body);
+                true
+            })
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map(&format!(
+            "{}/backend-api/codex",
+            server.uri()
+        )))?;
+        // Inbound chat with a buffered intent: the client forces upstream
+        // stream=true, while the server layer aggregates SSE back to buffered
+        // JSON for callers that asked for stream=false.
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let response = client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        assert!(matches!(response, RawResponse::Stream(_)));
+        let captured = seen.lock().unwrap().clone().expect("request captured");
+        assert_eq!(captured["stream"], json!(true));
+        assert!(
+            captured.get("stream_options").is_none(),
+            "chat-only stream_options leaked onto a Codex Responses request: {captured}"
         );
         Ok(())
     }
@@ -3130,6 +3189,55 @@ mod tests {
         assert!(
             seen.load(Ordering::SeqCst),
             "non-codex Responses backends keep max_output_tokens"
+        );
+        Ok(())
+    }
+
+    // Normal OpenAI Responses legs are untouched by the Codex stream-force
+    // path: a caller-supplied `stream_options` on a same-format Responses
+    // request survives verbatim (no strip, and no chat-only decoration).
+    #[tokio::test]
+    async fn openai_responses_preserves_caller_stream_options()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let seen = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let seen_for_mock = seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_mock.lock().unwrap() = Some(body);
+                true
+            })
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map(&format!("{}/v1", server.uri())))?;
+        let raw = json!({
+            "model": "client-facing",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "input": "hi"
+        });
+        let RawResponse::Stream(_) = client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
+            )
+            .await?
+        else {
+            panic!("expected a streamed response");
+        };
+        let captured = seen.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            captured["stream_options"],
+            json!({"include_usage": true}),
+            "caller-supplied stream_options must round-trip verbatim on normal Responses legs"
         );
         Ok(())
     }

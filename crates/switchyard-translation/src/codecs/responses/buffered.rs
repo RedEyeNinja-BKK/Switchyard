@@ -1074,7 +1074,8 @@ fn encode_responses_input(
             }
         }
         if !visible_content.is_empty() || !emitted_special {
-            let content = encode_responses_content(&visible_content, diagnostics, policy)?;
+            let content =
+                encode_responses_content(&visible_content, message.role, diagnostics, policy)?;
             encoded.push(json!({
                 "type": "message",
                 "role": role_to_responses(message.role),
@@ -1181,9 +1182,26 @@ fn role_to_responses(role: Role) -> &'static str {
 // Encodes normalized content into Responses message content.
 fn encode_responses_content(
     content: &[ContentBlock],
+    role: Role,
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
 ) -> Result<Value> {
+    // Strict ChatGPT-Codex Responses backends reject assistant input items whose
+    // content is a bare string or uses `input_text` (only 'output_text' and
+    // 'refusal' are supported there): assistant history must be carried as
+    // `output_text` blocks. This is a destination-PROFILE behavior, never a
+    // format-level one — a normal `/v1/responses` endpoint is standards-
+    // compliant and keeps the input-oriented encoding unchanged.
+    let assistant_strict = matches!(role, Role::Assistant)
+        && matches!(
+            policy.responses_profile,
+            crate::policy::ResponsesProfile::StrictCodex
+        );
+    let text_type = if assistant_strict {
+        "output_text"
+    } else {
+        "input_text"
+    };
     let has_non_text = content.iter().any(|block| {
         !matches!(
             block,
@@ -1193,12 +1211,53 @@ fn encode_responses_content(
         )
     });
     if !has_non_text {
-        return Ok(Value::String(text_from_blocks(content, "\n")));
+        let text = text_from_blocks(content, "\n");
+        return Ok(if assistant_strict {
+            json!([{ "type": "output_text", "text": text }])
+        } else {
+            Value::String(text)
+        });
     }
     let mut blocks = Vec::new();
     for block in content {
+        // Strict-Codex assistant items accept only output_text/refusal content.
+        // Non-text blocks in assistant history are deliberately degraded to
+        // textual output_text (lossy, diagnostic recorded) instead of emitting
+        // input-oriented block types that would be rejected upstream. Normal-
+        // profile items — and every non-assistant item — keep the input_* shapes.
+        if assistant_strict
+            && !matches!(
+                block,
+                ContentBlock::Text { .. }
+                    | ContentBlock::Refusal { .. }
+                    | ContentBlock::Reasoning { .. }
+                    | ContentBlock::ToolCall(_)
+                    | ContentBlock::ToolResult(_)
+            )
+        {
+            push_lossy(
+                diagnostics,
+                policy,
+                "assistant multimodal content degraded to output_text for strict Responses profile",
+            )?;
+            let raw: Value = match block {
+                ContentBlock::Image { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::Audio { source } | ContentBlock::Video { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::File { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::Unknown { raw, .. } => raw.clone(),
+                _ => unreachable!("filtered above"),
+            };
+            blocks.push(json!({"type": "output_text", "text": json_string(&raw)}));
+            continue;
+        }
         match block {
-            ContentBlock::Text { text } => blocks.push(json!({"type": "input_text", "text": text})),
+            ContentBlock::Text { text } => blocks.push(json!({"type": text_type, "text": text })),
             ContentBlock::Refusal { text } => {
                 blocks.push(json!({"type": "refusal", "refusal": text}));
             }

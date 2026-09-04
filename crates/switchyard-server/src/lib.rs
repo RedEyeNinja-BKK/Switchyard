@@ -1228,6 +1228,12 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
+    // Capture the caller's streaming intent before the body moves. Targets may
+    // force upstream SSE (strict Codex legs are stream-mandatory); callers that
+    // asked for buffered output must still get buffered JSON, so such responses
+    // are aggregated transparently below instead of leaking SSE frames to a
+    // caller that never requested streaming.
+    let want_streamed = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
     // The escalation walk re-resolves the destination route from the ORIGINAL
     // caller body (the destination is selected by id, not by the request's
@@ -1344,6 +1350,29 @@ async fn handle_llm_request(
     // The response carries the candidate that actually served it. Fall back to the routing
     // selection for algorithms that return a response without an offloaded model call.
     let served_model = response.served_model().cloned().or(Some(selected_model));
+    // If the caller asked for buffered output but the served leg is a stream
+    // (stream-mandatory strict Responses backends), aggregate to JSON so the
+    // caller gets the format it asked for. Streaming callers pass through.
+    let response = if want_streamed {
+        response
+    } else {
+        match response.llm_response.into_agg().await {
+            Ok(aggregated) => switchyard_protocol::Response {
+                llm_response: switchyard_protocol::LlmResponse::Agg(aggregated),
+                ..response
+            },
+            // Preserve upstream status semantics (502/504) and the
+            // x-selected-model header on aggregation failure, matching
+            // /v1/decision behavior.
+            Err(ref error) => {
+                let mut resp = client_error(error);
+                if let Some(served_model) = served_model.as_ref() {
+                    attach_routing_headers(&mut resp, served_model.as_str());
+                }
+                return resp;
+            }
+        }
+    };
     let response = if let Some(served_model) = served_model.as_ref() {
         let cache_eligible = cache_probe
             .as_ref()

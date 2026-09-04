@@ -2038,13 +2038,27 @@ async fn rerank_handler(
     }
 }
 
-async fn models(State(state): State<ServerState>) -> Json<Value> {
-    Json(model_list_payload(
+// Zero-translation parity with production: capability route IDs
+// (embeddings/rerank) are advertised alongside routing routes with default
+// capabilities, so consumer pickers see the same model surface the
+// production binary exposes.
+fn advertised_models(state: &ServerState) -> Value {
+    model_list_payload(
         state
             .runner
             .models()
-            .map(|model| (model.id.as_str(), model.capabilities)),
-    ))
+            .map(|model| (model.id.as_str(), model.capabilities))
+            .chain(
+                state
+                    .capabilities
+                    .keys()
+                    .map(|id| (id.as_str(), ModelCapabilities::default())),
+            ),
+    )
+}
+
+async fn models(State(state): State<ServerState>) -> Json<Value> {
+    Json(advertised_models(&state))
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
@@ -2657,6 +2671,98 @@ mod tests {
                 .get::<RequestLogError>()
                 .map(|error| error.0.as_str()),
             Some("invalid request")
+        );
+    }
+}
+
+#[cfg(test)]
+mod advertised_models_tests {
+    use super::*;
+
+    // Live-config shape: `[capability_clients.*]` executors + `[capabilities.*]`
+    // route declarations (contract presence selects the Embedding variant).
+    const CAPABILITY_DEPLOYMENT: &str = r#"
+schema_version = 1
+
+[llm_clients.up]
+format = "openai_chat"
+base_url = "http://127.0.0.1:1/v1"
+api_key_env = "ADVERTISED_MODELS_TEST_KEY"
+
+[targets.served]
+id = "vendor/served"
+llm_client = "up"
+
+[routes.route]
+id = "vendor/served"
+type = "passthrough"
+target = "served"
+
+[capability_clients.embed]
+format = "openai_embeddings"
+base_url = "http://127.0.0.1:1/v1"
+model = "emb"
+api_key_env = "ADVERTISED_MODELS_TEST_KEY"
+
+[capability_clients.rerank]
+format = "cohere_jina_rerank"
+base_url = "http://127.0.0.1:1/v1"
+model = "rerank"
+api_key_env = "ADVERTISED_MODELS_TEST_KEY"
+
+[capabilities."switchyard/test/embedding"]
+id = "switchyard/test/embedding"
+target = "embed"
+contract = "test-space:v1"
+dimensions = 8
+
+[capabilities."switchyard/test/rerank"]
+id = "switchyard/test/rerank"
+target = "rerank"
+max_candidates = 32
+top_n = 8
+"#;
+
+    // The advertisement must include capability route IDs alongside routing
+    // routes (zero-translation parity with production), with default
+    // capabilities for capability entries.
+    #[test]
+    fn advertisement_includes_capability_routes_with_default_capabilities() {
+        // SAFETY: single-value seeding for the fail-loud credential guard;
+        // placeholder values, never real credentials.
+        unsafe {
+            std::env::set_var("ADVERTISED_MODELS_TEST_KEY", "placeholder");
+        }
+        let runner = Runner::from_toml(CAPABILITY_DEPLOYMENT).expect("config parses");
+        let state = ServerState::from_runner(runner).expect("server state");
+        let payload = advertised_models(&state);
+        let ids: Vec<&str> = payload["data"]
+            .as_array()
+            .expect("data list")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("string id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "switchyard/test/embedding",
+                "switchyard/test/rerank",
+                "vendor/served",
+            ]
+        );
+        let embed = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "switchyard/test/embedding")
+            .expect("embedding entry");
+        assert_eq!(
+            embed["capabilities"]["tool_calling"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            embed["capabilities"]["context_window"],
+            serde_json::Value::Null
         );
     }
 }

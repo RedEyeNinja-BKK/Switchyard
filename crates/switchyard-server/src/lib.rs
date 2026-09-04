@@ -150,6 +150,10 @@ pub struct ServerState {
     /// Capability routes (`[capabilities.*]`): caller-facing typed endpoint ids
     /// (e.g. `localclaw/embed`) bound to one executor client each.
     capabilities: BTreeMap<ModelId, CapabilityRoute>,
+    /// Shared sanitized DeepSeek balance telemetry published by the
+    /// fleet-readiness resource client (backing `GET /v1/resource/deepseek`).
+    /// Observability only: never participates in routing or readiness.
+    deepseek_telemetry: Option<fleet_readiness::SharedDeepSeekTelemetry>,
 }
 
 #[derive(Clone)]
@@ -260,7 +264,19 @@ impl ServerState {
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             capabilities,
+            deepseek_telemetry: None,
         })
+    }
+
+    /// Attaches the shared sanitized DeepSeek telemetry slot published by the
+    /// fleet-readiness resource client (backing `GET /v1/resource/deepseek`).
+    /// Observability only: never participates in routing or readiness.
+    pub fn with_deepseek_telemetry(
+        mut self,
+        telemetry: fleet_readiness::SharedDeepSeekTelemetry,
+    ) -> Self {
+        self.deepseek_telemetry = Some(telemetry);
+        self
     }
 
     /// Enables durable per-request routing records at `path`.
@@ -661,6 +677,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rerank", post(rerank_handler))
         .route("/v1/models", get(models))
+        .route("/v1/resource/deepseek", get(get_deepseek_resource))
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
         .route("/metrics", get(prometheus_metrics))
@@ -2062,6 +2079,39 @@ fn advertised_models(state: &ServerState) -> Value {
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
     Json(advertised_models(&state))
+}
+
+/// Read-only sanitized DeepSeek balance telemetry for observability.
+///
+/// Serves the LAST SUCCESSFUL factual observation published by the
+/// fleet-readiness resource client. This handler performs NO provider fetch and
+/// holds no credential material — bounded observability only. It never touches
+/// routing, readiness, preference, or economics state.
+async fn get_deepseek_resource(State(state): State<ServerState>) -> (StatusCode, Json<Value>) {
+    let Some(telemetry) = &state.deepseek_telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "resource_telemetry_not_attached" })),
+        );
+    };
+    let Some(snapshot) = telemetry.get() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no_resource_snapshot_yet" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "is_available": snapshot.is_available,
+            "currency": snapshot.currency,
+            "total_balance": snapshot.total_balance,
+            "granted_balance": snapshot.granted_balance,
+            "topped_up_balance": snapshot.topped_up_balance,
+            "observed_at": snapshot.observed_at,
+            "error": snapshot.error,
+        })),
+    )
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {

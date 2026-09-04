@@ -68,6 +68,14 @@ pub(crate) struct DeploymentConfig {
     /// runtime owner keeps live readiness facts flowing into routing.
     #[serde(default)]
     fleet_readiness: Option<FleetReadinessConfig>,
+    /// Capability executor clients (`[capability_clients.<name>]`): typed
+    /// non-LLM utility endpoint executors (embeddings, rerank).
+    #[serde(default)]
+    capability_clients: BTreeMap<String, crate::capability::CapabilityClientConfig>,
+    /// Capability routes (`[capabilities.<name>]`): the caller-facing typed
+    /// endpoint ids bound to one executor each.
+    #[serde(default)]
+    capabilities: BTreeMap<String, crate::capability::CapabilityRouteConfig>,
 }
 
 #[derive(Debug)]
@@ -387,7 +395,8 @@ impl DeploymentConfig {
         let runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
             .with_fleet_state(fleet_state)
-            .with_fleet_readiness(self.fleet_readiness);
+            .with_fleet_readiness(self.fleet_readiness)
+            .with_capabilities(self.capability_clients, self.capabilities);
         Ok(runner)
     }
 
@@ -616,10 +625,10 @@ fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
 /// Holding a `HttpBaseUrl` is proof the value is an absolute HTTP(S) URL, so no
 /// later stage has to re-check it or can forget to.
 #[derive(Clone, Debug)]
-struct HttpBaseUrl(reqwest::Url);
+pub struct HttpBaseUrl(reqwest::Url);
 
 impl HttpBaseUrl {
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 }

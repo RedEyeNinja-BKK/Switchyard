@@ -4,6 +4,7 @@
 //! Shared configured routing for Switchyard serving surfaces.
 
 mod algorithm;
+pub mod capability;
 mod config;
 mod failure;
 mod route;
@@ -15,7 +16,12 @@ pub use algorithm::{
     FleetCandidateContextPolicyConfig, FleetWorkShapeSourceName, InputTokenSourceConfig,
     LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
-pub use config::{ComfyFactConfig, FleetReadinessConfig, HtpcFactConfig, ResourceFactConfig};
+pub use capability::{
+    CapabilityClientConfig, CapabilityClientFormat, CapabilityKind, CapabilityRouteConfig,
+};
+pub use config::{
+    ComfyFactConfig, FleetReadinessConfig, HtpcFactConfig, HttpBaseUrl, ResourceFactConfig,
+};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 pub use route::{
     AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,

@@ -23,6 +23,10 @@ pub struct Runner {
     fleet_state: Option<std::sync::Arc<libsy::SharedFleetState>>,
     /// The parsed `[fleet_readiness]` monitor configuration, when declared.
     fleet_readiness: Option<crate::config::FleetReadinessConfig>,
+    /// Parsed `[capability_clients.*]` executor declarations.
+    capability_clients: BTreeMap<String, crate::capability::CapabilityClientConfig>,
+    /// Parsed `[capabilities.*]` route declarations.
+    capabilities: BTreeMap<String, crate::capability::CapabilityRouteConfig>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -69,6 +73,8 @@ impl Runner {
             fallback_base_url: None,
             fleet_state: None,
             fleet_readiness: None,
+            capability_clients: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
         }
     }
 
@@ -100,6 +106,29 @@ impl Runner {
     /// The parsed `[fleet_readiness]` monitor configuration, when declared.
     pub fn fleet_readiness(&self) -> Option<&crate::config::FleetReadinessConfig> {
         self.fleet_readiness.as_ref()
+    }
+
+    /// Declares the parsed capability executor + route tables.
+    pub fn with_capabilities(
+        mut self,
+        capability_clients: BTreeMap<String, crate::capability::CapabilityClientConfig>,
+        capabilities: BTreeMap<String, crate::capability::CapabilityRouteConfig>,
+    ) -> Self {
+        self.capability_clients = capability_clients;
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// The parsed `[capability_clients.*]` executor declarations.
+    pub fn capability_clients(
+        &self,
+    ) -> &BTreeMap<String, crate::capability::CapabilityClientConfig> {
+        &self.capability_clients
+    }
+
+    /// The parsed `[capabilities.*]` route declarations.
+    pub fn capabilities(&self) -> &BTreeMap<String, crate::capability::CapabilityRouteConfig> {
+        &self.capabilities
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {

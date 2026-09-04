@@ -3,6 +3,7 @@
 
 //! Rust HTTP server for libsy algorithms.
 
+pub mod capability;
 pub mod config;
 pub mod fleet_readiness;
 mod metrics;
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::capability::{CapabilityClient, CapabilityRoute};
 use crate::fleet_readiness::FleetReadinessMonitor;
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -42,7 +44,8 @@ use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
+    CallerAuthKind, CapabilityKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner,
+    RunnerError,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -144,6 +147,9 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    /// Capability routes (`[capabilities.*]`): caller-facing typed endpoint ids
+    /// (e.g. `localclaw/embed`) bound to one executor client each.
+    capabilities: BTreeMap<ModelId, CapabilityRoute>,
 }
 
 #[derive(Clone)]
@@ -215,6 +221,37 @@ impl ServerState {
             metrics.clone(),
             runner.models().map(|model| model.algorithm),
         );
+        // Capability executor clients + routes from the parsed config tables.
+        let mut clients: BTreeMap<String, Arc<CapabilityClient>> = BTreeMap::new();
+        for (name, config) in runner.capability_clients() {
+            let client = CapabilityClient::new(config)
+                .map_err(|error| ServerError::new(error.to_string()))?;
+            clients.insert(name.clone(), Arc::new(client));
+        }
+        let mut capabilities: BTreeMap<ModelId, CapabilityRoute> = BTreeMap::new();
+        for (name, config) in runner.capabilities() {
+            let client = clients.get(&config.target).cloned().ok_or_else(|| {
+                ServerError::new(format!(
+                    "capability route {name} references unknown capability client {}",
+                    config.target
+                ))
+            })?;
+            let route_id = ModelId::from(config.id.clone());
+            if capabilities
+                .insert(
+                    route_id.clone(),
+                    CapabilityRoute {
+                        kind: config.kind.clone(),
+                        client,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ServerError::new(format!(
+                    "capability route id {route_id} is declared more than once"
+                )));
+            }
+        }
         Ok(Self {
             runner: Arc::new(runner),
             fallback_http,
@@ -222,6 +259,7 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            capabilities,
         })
     }
 
@@ -620,6 +658,8 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
             post(openai_responses_input_tokens),
         )
         .route("/v1/responses/compact", post(openai_responses_compact))
+        .route("/v1/embeddings", post(embeddings_handler))
+        .route("/v1/rerank", post(rerank_handler))
         .route("/v1/models", get(models))
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
@@ -1730,6 +1770,243 @@ fn error_response(
     code: &'static str,
 ) -> Response {
     ApiError::new(status, message, error_type, code).into_response(WireFormat::OpenAiChat)
+}
+
+/// OpenAI-compatible embeddings endpoint. Proxies the typed embedding
+/// contract to the capability executor selected by the `model` route id
+/// (e.g. `localclaw/embed`); batch bounds and response dimension admission
+/// are enforced here, fail closed.
+async fn embeddings_handler(
+    State(state): State<ServerState>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => return invalid_body_error(status, message),
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(route) = state
+        .capabilities
+        .get(&ModelId::from(model.as_str()))
+        .cloned()
+    else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown embedding model {model}"),
+            "invalid_request_error",
+            "unknown_model",
+        );
+    };
+    let CapabilityKind::Embedding {
+        dimensions,
+        max_batch,
+        ..
+    } = &route.kind
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{model} is not an embedding capability"),
+            "invalid_request_error",
+            "wrong_capability",
+        );
+    };
+    let count = match body.get("input") {
+        Some(Value::String(_)) => 1,
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    };
+    if count == 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "input must be a non-empty string or array",
+            "invalid_request_error",
+            "invalid_input",
+        );
+    }
+    if count > *max_batch {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("input exceeds max_batch {max_batch}"),
+            "invalid_request_error",
+            "batch_too_large",
+        );
+    }
+    let mut executor_body = body.clone();
+    if let Some(object) = executor_body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            Value::String(route.client.model().to_string()),
+        );
+    }
+    match route.client.call(executor_body).await {
+        Ok(value) => {
+            if let Err(message) = capability::validate_embedding_response(&value, *dimensions) {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    message,
+                    "server_error",
+                    "embedding_invalid",
+                );
+            }
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_GATEWAY,
+            error.to_string(),
+            "server_error",
+            "executor_error",
+        ),
+    }
+}
+
+/// Cohere/Jina-compatible rerank endpoint. Proxies the typed rerank contract
+/// to the capability executor selected by the `model` route id (e.g.
+/// `localclaw/rerank`); bounds (candidates, top_n) are enforced here.
+async fn rerank_handler(
+    State(state): State<ServerState>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => return invalid_body_error(status, message),
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(route) = state
+        .capabilities
+        .get(&ModelId::from(model.as_str()))
+        .cloned()
+    else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown rerank model {model}"),
+            "invalid_request_error",
+            "unknown_model",
+        );
+    };
+    let CapabilityKind::Rerank {
+        max_candidates,
+        top_n,
+        max_doc_chars,
+        max_query_chars,
+    } = &route.kind
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{model} is not a rerank capability"),
+            "invalid_request_error",
+            "wrong_capability",
+        );
+    };
+    let query = body
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if query.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "query must be a non-empty string",
+            "invalid_request_error",
+            "invalid_query",
+        );
+    }
+    if query.chars().count() > *max_query_chars {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("query exceeds max_query_chars {max_query_chars}"),
+            "invalid_request_error",
+            "query_too_long",
+        );
+    }
+    let documents = body
+        .get("documents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if documents.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "documents must be a non-empty array",
+            "invalid_request_error",
+            "invalid_documents",
+        );
+    }
+    if documents.len() > *max_candidates {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("documents exceeds max_candidates {max_candidates}"),
+            "invalid_request_error",
+            "too_many_candidates",
+        );
+    }
+    for document in &documents {
+        let text = match document {
+            Value::String(text) => text.clone(),
+            Value::Object(object) => object
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            _ => String::new(),
+        };
+        if text.chars().count() > *max_doc_chars {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("document exceeds max_doc_chars {max_doc_chars}"),
+                "invalid_request_error",
+                "document_too_long",
+            );
+        }
+    }
+    let requested_top_n = body
+        .get("top_n")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    let effective_top_n = requested_top_n.unwrap_or(*top_n).min(*max_candidates);
+    let route_model = ModelId::from(model.as_str());
+    let executor_body = match capability::rerank_executor_body(
+        &route_model,
+        route.client.model(),
+        query,
+        &documents,
+        effective_top_n,
+    ) {
+        Ok(body) => body,
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                "invalid_documents",
+            );
+        }
+    };
+    match route.client.call(executor_body).await {
+        Ok(value) => {
+            if let Err(message) = capability::validate_rerank_response(&value) {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    message,
+                    "server_error",
+                    "rerank_invalid",
+                );
+            }
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_GATEWAY,
+            error.to_string(),
+            "server_error",
+            "executor_error",
+        ),
+    }
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {

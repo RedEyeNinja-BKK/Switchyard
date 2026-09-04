@@ -2389,3 +2389,64 @@ fn responses_flat_file_data_survives_into_chat() -> TestResult {
     assert_eq!(file["file"]["filename"], "report.pdf");
     Ok(())
 }
+
+// Strict Responses backends (the chatgpt.com Codex endpoint) reject assistant
+// input items whose content is a bare string or uses `input_text`; assistant
+// history must be carried as `output_text` blocks, while user/developer
+// content keeps its existing encoding. Multi-turn chat requests with assistant
+// history otherwise fail with 400 "Invalid value: 'input_text'. Supported
+// values are: 'output_text' and 'refusal'."
+#[test]
+fn responses_assistant_history_encodes_output_text_for_strict_backends() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "TURN1_OK"},
+            {"role": "assistant", "content": [{"type": "text", "text": "structured"}]},
+            {"role": "user", "content": "Reply with exactly: TURN2_OK"}
+        ],
+        "max_tokens": 64
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let input = output["input"]
+        .as_array()
+        .ok_or("Responses input should be an array")?;
+    let mut assistant_items = 0;
+    for item in input {
+        if item["type"] == "message" && item["role"] == "assistant" {
+            assistant_items += 1;
+            let content = item["content"]
+                .as_array()
+                .ok_or("assistant message content must be an array of output blocks")?;
+            for block in content {
+                assert_eq!(
+                    block["type"], "output_text",
+                    "assistant history must use output_text, got {}",
+                    block["type"]
+                );
+            }
+        }
+    }
+    assert_eq!(assistant_items, 2, "both assistant messages must be present");
+    // User content must NOT have been switched to output_text.
+    let user_item = input
+        .iter()
+        .find(|i| i["type"] == "message" && i["role"] == "user")
+        .ok_or("user message missing")?;
+    assert!(
+        user_item["content"].is_string() || user_item["content"][0]["type"] == "input_text",
+        "user content must keep its existing encoding"
+    );
+    Ok(())
+}

@@ -97,3 +97,54 @@ mod tests {
         assert!(!is_overflow_body(body, never, PHRASES));
     }
 }
+
+/// Canonical permanent-quota markers from OpenAI and compatible providers.
+///
+/// Matched against the structured `error.code` (e.g. OpenAI's
+/// `insufficient_quota`) or the `error.message` (both the OpenAI phrasing and
+/// the provider-equivalent permanent quota conditions). Deliberately narrow so
+/// a genuinely transient rate-limit 429 (`rate_limit_exceeded`, Retry-After)
+/// is never misclassified.
+const PERMANENT_QUOTA_CODES: &[&str] = &["insufficient_quota"];
+const PERMANENT_QUOTA_MESSAGE_PHRASES: &[&str] = &[
+    "insufficient_quota",
+    "you exceeded your current quota",
+    "exceeded your current quota",
+    "your billing details",
+    "billing quota",
+    "exhausted your quota",
+    "quota has been exhausted",
+    "usage limit",
+    "payment required",
+    "credits",
+];
+
+/// Structured check: the canonical OpenAI `error.code` for a permanent quota
+/// condition.
+fn is_permanent_quota_structured(value: &serde_json::Value) -> bool {
+    value
+        .get("error")
+        .and_then(|err| err.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|code| {
+            PERMANENT_QUOTA_CODES
+                .iter()
+                .any(|canonical| code.contains(canonical))
+        })
+}
+
+/// Detects a PERMANENT quota exhaustion 429 body (OpenAI `insufficient_quota`,
+/// exhausted usage/billing quota, or provider-equivalent permanent quota).
+///
+/// This is distinct from a transient rate-limit 429: a permanent quota
+/// condition cannot be fixed by retrying the same candidate, so the caller
+/// should skip the ordinary 429 retry budget and advance to the next
+/// fleet_router candidate immediately. Reuses the overflow-body shape: parses
+/// JSON when the body is JSON, falls back to plain-text phrase matching.
+pub(crate) fn is_permanent_quota_429(body: &str) -> bool {
+    is_overflow_body(
+        body,
+        is_permanent_quota_structured,
+        PERMANENT_QUOTA_MESSAGE_PHRASES,
+    )
+}

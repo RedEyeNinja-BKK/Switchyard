@@ -25,6 +25,7 @@ use switchyard_translation::{
 use tracing::Instrument;
 
 use crate::backend::Backend;
+use crate::error::is_permanent_quota_429;
 use crate::error::{LlmClientError, Result};
 use crate::metrics;
 use crate::raw::RawResponse;
@@ -398,28 +399,103 @@ impl TranslatingLlmClient {
             &self.client
         };
         let builder = client.post(url).json(body);
-        let builder = forward_metadata_headers(builder, metadata);
+        let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
 
-        let response = match builder.send().await {
-            Ok(response) => response,
-            Err(error) => {
+        // One shared per-attempt deadline covering connect/send AND the first
+        // body byte: a hung upstream must fail over to the next candidate
+        // instead of stalling the downstream consumer until its idle timeout.
+        let deadline = tokio::time::Instant::now() + UPSTREAM_FIRST_BYTE_TIMEOUT;
+        let response = match tokio::time::timeout_at(deadline, builder.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 metrics::record_upstream_attempt(None);
                 return Err(AttemptFailure {
                     error: convert_reqwest_error(error),
                     status: None,
                     retry_after: None,
+                    deadline_elapsed: false,
+                });
+            }
+            Err(_) => {
+                metrics::record_upstream_attempt(None);
+                return Err(AttemptFailure {
+                    error: LlmClientError::Timeout {
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "upstream did not deliver response headers within {}s",
+                                UPSTREAM_FIRST_BYTE_TIMEOUT.as_secs()
+                            ),
+                        )),
+                    },
+                    status: None,
+                    retry_after: None,
+                    deadline_elapsed: true,
                 });
             }
         };
         let status = response.status();
         if status.is_success() {
             if streaming {
-                // Streaming body failures happen after the retry boundary.
+                // Do not commit this candidate until the upstream proves it will
+                // actually deliver body bytes: a hung upstream (200 headers, body
+                // never starts) must fall through to the next candidate rather
+                // than stall the downstream consumer until its idle timeout.
+                let mut stream: UpstreamByteStream = Box::pin(response.bytes_stream());
+                let first_chunk = match tokio::time::timeout_at(deadline, stream.as_mut().next())
+                    .await
+                {
+                    Ok(Some(Ok(bytes))) => Some(bytes.to_vec()),
+                    Ok(Some(Err(error))) => {
+                        metrics::record_upstream_attempt(None);
+                        return Err(AttemptFailure {
+                            error: convert_reqwest_error(error),
+                            status: Some(status),
+                            retry_after: None,
+                            deadline_elapsed: false,
+                        });
+                    }
+                    Ok(None) => {
+                        metrics::record_upstream_attempt(None);
+                        return Err(AttemptFailure {
+                            error: LlmClientError::Transport {
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "upstream closed the stream before sending any body bytes",
+                                )),
+                            },
+                            status: Some(status),
+                            retry_after: None,
+                            deadline_elapsed: false,
+                        });
+                    }
+                    Err(_) => {
+                        metrics::record_upstream_attempt(None);
+                        return Err(AttemptFailure {
+                            error: LlmClientError::Timeout {
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!(
+                                        "upstream sent no body bytes within {}s of the attempt deadline",
+                                        UPSTREAM_FIRST_BYTE_TIMEOUT.as_secs()
+                                    ),
+                                )),
+                            },
+                            status: Some(status),
+                            retry_after: None,
+                            deadline_elapsed: true,
+                        });
+                    }
+                };
                 metrics::record_upstream_attempt(Some(status.as_u16()));
-                return Ok(EncodedResponse::Streaming(response));
+                return Ok(EncodedResponse::Streaming {
+                    status: status.as_u16(),
+                    first_chunk,
+                    stream,
+                });
             }
             let body = match response.bytes().await {
                 Ok(body) => body,
@@ -429,6 +505,7 @@ impl TranslatingLlmClient {
                         error: convert_reqwest_error(error),
                         status: Some(status),
                         retry_after: None,
+                        deadline_elapsed: false,
                     });
                 }
             };
@@ -448,6 +525,7 @@ impl TranslatingLlmClient {
                     error: convert_reqwest_error(error),
                     status: Some(status),
                     retry_after,
+                    deadline_elapsed: false,
                 });
             }
         };
@@ -466,6 +544,7 @@ impl TranslatingLlmClient {
             error,
             status: Some(status),
             retry_after,
+            deadline_elapsed: false,
         })
     }
 
@@ -523,10 +602,20 @@ impl TranslatingLlmClient {
             .await?;
 
         let llm_response = match http_response {
-            EncodedResponse::Streaming(http_response) => {
+            EncodedResponse::Streaming {
+                first_chunk,
+                stream,
+                ..
+            } => {
                 // Adapt the reqwest body stream to plain bytes; the SSE-decode itself is
                 // transport-agnostic and lives in `switchyard-translation`.
-                let bytes = http_response.bytes_stream().map(|chunk| {
+                // Replay the first chunk awaited at the candidate boundary ahead of
+                // the live stream.
+                let prefix =
+                    futures_util::stream::iter(first_chunk.map(|chunk| {
+                        Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk))
+                    }));
+                let bytes = prefix.chain(stream).map(|chunk| {
                     chunk.map(|bytes| bytes.to_vec()).map_err(|error| {
                         if error.is_timeout() {
                             LlmClientError::Timeout {
@@ -650,6 +739,22 @@ impl RoutedLlmClient for TranslatingLlmClient {
     async fn call(&self, request: Request) -> Result<Response> {
         self.call_rewrite_model(request, None).await
     }
+
+    fn provider_key(&self) -> Option<&str> {
+        // One client is built per `[llm_clients.*]` section, so every model it
+        // serves shares the same upstream base URL. The base URL is the provider
+        // identity used by the fallback driver to skip whole providers that are
+        // proven unavailable (drained balance / auth): same-provider clients use
+        // the identical base_url string (config convention).
+        self.model_to_config
+            .values()
+            .next()
+            .map(|config| match &config.default_backend {
+                Backend::OpenAiChat(backend)
+                | Backend::OpenAiResponses(backend)
+                | Backend::Anthropic(backend) => backend.base_url.trim_end_matches('/'),
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -672,15 +777,39 @@ impl UpstreamEndpoint {
 }
 
 enum EncodedResponse {
-    Buffered { status: u16, body: Vec<u8> },
-    Streaming(reqwest::Response),
+    Buffered {
+        status: u16,
+        body: Vec<u8>,
+    },
+    Streaming {
+        status: u16,
+        /// First body byte already awaited at the candidate boundary (see
+        /// [`UPSTREAM_FIRST_BYTE_TIMEOUT`]); replayed ahead of the live stream.
+        first_chunk: Option<Vec<u8>>,
+        stream: UpstreamByteStream,
+    },
 }
+
+/// Type-erased upstream SSE byte stream.
+type UpstreamByteStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
+
+/// Maximum time for one upstream attempt to prove liveness: response headers
+/// received AND the first body byte delivered. Past the deadline the candidate
+/// fails and the next candidate runs.
+///
+/// A hung upstream (connect stall, or 200 headers with a body that never
+/// starts) must fail over instead of stalling the downstream consumer until its
+/// own idle timeout. Generous enough for slow first tokens on large prompts;
+/// short enough that one failover attempt still completes inside a typical
+/// downstream ~300s stream-idle budget.
+const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(45);
 
 impl EncodedResponse {
     fn status(&self) -> u16 {
         match self {
             EncodedResponse::Buffered { status, .. } => *status,
-            EncodedResponse::Streaming(response) => response.status().as_u16(),
+            EncodedResponse::Streaming { status, .. } => *status,
         }
     }
 }
@@ -691,13 +820,29 @@ struct AttemptFailure {
     error: LlmClientError,
     status: Option<StatusCode>,
     retry_after: Option<Duration>,
+    /// Set when the per-attempt liveness deadline elapsed (connect/send stall or
+    /// no first body byte). The upstream already consumed its whole budget, so a
+    /// same-candidate retry cannot help — fail over to the next candidate.
+    deadline_elapsed: bool,
 }
 
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
+        if self.deadline_elapsed {
+            return false;
+        }
         match &self.error {
             LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
-            LlmClientError::UpstreamHttp { status, .. } => {
+            LlmClientError::UpstreamHttp { status, body } => {
+                // A 429 that is a PERMANENT quota exhaustion (OpenAI
+                // `insufficient_quota` / exhausted usage-billing quota) cannot
+                // be fixed by retrying the same candidate: skip the ordinary
+                // 429 retry budget so the request advances immediately to the
+                // next fleet_router candidate. Genuinely transient 429s
+                // (`rate_limit_exceeded`, Retry-After) keep the bounded retry.
+                if *status == StatusCode::TOO_MANY_REQUESTS && is_permanent_quota_429(body) {
+                    return false;
+                }
                 metrics::is_retryable_http_status(status.as_u16())
             }
             _ => false,
@@ -786,16 +931,34 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     }
 }
 
-// Forwards caller-supplied metadata headers except credentials and client-owned headers.
+// Forwards caller-supplied metadata headers except credentials, client-owned
+// headers, and headers the backend overrides via `extra_headers`.
+//
+// A backend that configures a canonical header (e.g. ThaiLLM's `User-Agent` to a
+// fixed value the upstream WAF requires) must win exactly once: suppressing any
+// inbound header whose name matches an `extra_headers` key here means the backend
+// value applied later by `apply_extra_headers` is not duplicated or shadowed by a
+// caller-supplied one. Comparison is case-insensitive; auth/credential headers are
+// already reserved and never forwarded.
 fn forward_metadata_headers(
     mut builder: RequestBuilder,
     metadata: Option<&Metadata>,
+    backend: &Backend,
 ) -> RequestBuilder {
     let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
         return builder;
     };
     for (name, value) in headers {
         if is_reserved_header(name.as_str()) {
+            continue;
+        }
+        // The backend overrides this header via extra_headers; do not forward the
+        // inbound value so the backend's configured value is applied exactly once.
+        if backend
+            .extra_headers()
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(name.as_str()))
+        {
             continue;
         }
         builder = builder.header(name, value);
@@ -1073,6 +1236,16 @@ mod tests {
     ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.extra_body = extra_body;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    // A one-model config list whose backend carries fixed `extra_headers`.
+    fn chat_map_with_extra_headers(
+        base_url: &str,
+        extra_headers: BTreeMap<String, String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.extra_headers = extra_headers;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
@@ -1936,6 +2109,7 @@ mod tests {
             },
             status: None,
             retry_after: None,
+            deadline_elapsed: false,
         };
         assert!(transport.is_retryable());
 
@@ -1954,6 +2128,7 @@ mod tests {
                 },
                 status: Some(status),
                 retry_after: None,
+                deadline_elapsed: false,
             };
             assert!(failure.is_retryable(), "HTTP {status} should retry");
         }
@@ -1971,6 +2146,7 @@ mod tests {
                 },
                 status: Some(status),
                 retry_after: None,
+                deadline_elapsed: false,
             };
             assert!(!failure.is_retryable(), "HTTP {status} should fail fast");
         }
@@ -1981,6 +2157,7 @@ mod tests {
             },
             status: None,
             retry_after: None,
+            deadline_elapsed: false,
         };
         assert!(!configuration.is_retryable());
 
@@ -1991,6 +2168,7 @@ mod tests {
             },
             status: Some(StatusCode::BAD_REQUEST),
             retry_after: None,
+            deadline_elapsed: false,
         };
         assert!(!context_window.is_retryable());
     }
@@ -3107,6 +3285,70 @@ mod tests {
             body["chat_template_kwargs"]["enable_thinking"],
             json!(false),
             "target extra_body applies to the counted representation"
+        );
+        Ok(())
+    }
+    // A backend that configures a canonical header via `extra_headers` must win
+    // exactly once: an inbound caller header whose name matches an `extra_headers`
+    // key is suppressed so the backend value applies once (not duplicated or
+    // shadowed by a caller-supplied value). ThaiLLM's fixed User-Agent is the
+    // production case (the upstream WAF requires the canonical UA).
+    #[tokio::test]
+    async fn extra_headers_override_inbound_headers_exactly_once()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let mut extra_headers = BTreeMap::new();
+        extra_headers.insert(
+            "User-Agent".to_string(),
+            "Switchyard/backend-canonical-ua".to_string(),
+        );
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
+            "http://127.0.0.1:9/v1",
+            extra_headers,
+        ))?;
+        let backend = client
+            .backend_for(&ModelId::from("gpt"), WireFormat::OpenAiChat)
+            .unwrap();
+
+        // Caller metadata carries its own User-Agent plus a passthrough header we
+        // expect to be forwarded (the backend does not override it).
+        let mut caller_headers = http::HeaderMap::new();
+        caller_headers.insert("user-agent", http::HeaderValue::from_static("caller-ua"));
+        caller_headers.insert("x-resource-ref", http::HeaderValue::from_static("ref-1"));
+
+        let builder = reqwest::Client::new().post("http://127.0.0.1:9/v1/chat/completions");
+        let builder = forward_metadata_headers(
+            builder,
+            Some(&Metadata {
+                session_id: None,
+                agent_id: None,
+                task_id: None,
+                correlation_id: None,
+                extra_metadata: None,
+                http_headers: Some(caller_headers),
+                wire_format: None,
+                ..Default::default()
+            }),
+            backend,
+        );
+        let builder = apply_extra_headers(builder, backend);
+        let request = builder.build().expect("request builds");
+
+        // Reserved/suppressed inbound override: the caller's User-Agent is NOT
+        // forwarded; the backend's canonical value is set exactly once.
+        let ua_values: Vec<&str> = request
+            .headers()
+            .get_all("user-agent")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(ua_values, vec!["Switchyard/backend-canonical-ua"]);
+        // Non-overridden inbound header still forwards.
+        assert_eq!(
+            request
+                .headers()
+                .get("x-resource-ref")
+                .map(|v| v.to_str().unwrap()),
+            Some("ref-1"),
         );
         Ok(())
     }

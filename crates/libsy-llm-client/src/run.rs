@@ -13,7 +13,7 @@
 //! candidate exhausts its backend retry budget before fallback advances, so the worst case is
 //! `candidates × (max_retries + 1)` upstream attempts plus every candidate's backoff.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,6 +25,7 @@ use switchyard_protocol::{
 };
 use switchyard_translation::prepare_request_for_target;
 
+use crate::error::is_permanent_quota_429;
 use crate::observation::{LlmCallObservation, RunObservation, RunObserver};
 use crate::{metrics, observability};
 
@@ -175,6 +176,12 @@ enum CallPhase {
 }
 
 /// Try candidates in order until one succeeds or a failure stops fallback.
+///
+/// Provider-aware: when a candidate fails with a provider-level condition
+/// (drained balance / permanent quota / auth rejection), the whole provider is
+/// marked unavailable and remaining candidates on that provider are skipped
+/// without a wasted upstream attempt — one OpenRouter model failing with
+/// `payment_required` means every OpenRouter model will fail the same way.
 async fn call_first_available(
     clients: &ClientRouter,
     algorithm: &str,
@@ -183,7 +190,23 @@ async fn call_first_available(
     phase: CallPhase,
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
 ) -> Result<Response> {
+    let mut unavailable_providers: HashSet<String> = HashSet::new();
     for (index, target) in models.iter().enumerate() {
+        let provider = clients
+            .route(target)
+            .ok()
+            .and_then(|client| client.provider_key())
+            .map(ToOwned::to_owned);
+        if let Some(provider) = provider.as_deref()
+            && unavailable_providers.contains(provider)
+        {
+            tracing::info!(
+                provider,
+                target = %target,
+                "skipping candidate: provider unavailable (drained balance/quota/auth)"
+            );
+            continue;
+        }
         let request = match phase {
             CallPhase::Routing => clients.prepare_routing_request(request.clone(), target),
             CallPhase::Completion => clients.prepare_completion_request(request.clone(), target),
@@ -200,19 +223,60 @@ async fn call_first_available(
         .await
         {
             Ok(response) => return Ok(response),
-            Err(error) if index + 1 == models.len() => return Err(error),
-            Err(error) => match fallback_reason(&error) {
-                Some(reason) => tracing::info!(
-                    from = %target,
-                    to = %models[index + 1],
-                    reason = reason.as_str(),
-                    "model call failed; trying next candidate"
-                ),
-                None => return Err(error),
-            },
+            Err(error) => {
+                if let Some(provider) = provider.as_deref()
+                    && provider_level_failure(&error)
+                {
+                    tracing::info!(
+                        provider,
+                        target = %target,
+                        "marking provider unavailable for this request"
+                    );
+                    unavailable_providers.insert(provider.to_owned());
+                }
+                // The next candidate still worth an attempt: any remaining
+                // candidate on a provider not yet proven unavailable.
+                let next = models.iter().skip(index + 1).find(|candidate| {
+                    clients
+                        .route(candidate)
+                        .ok()
+                        .and_then(|client| client.provider_key())
+                        .is_none_or(|provider| !unavailable_providers.contains(provider))
+                });
+                match (fallback_reason(&error), next) {
+                    (Some(reason), Some(next_target)) => tracing::info!(
+                        from = %target,
+                        to = %next_target,
+                        reason = reason.as_str(),
+                        "model call failed; trying next candidate"
+                    ),
+                    _ => return Err(error),
+                }
+            }
         }
     }
     Err(LibsyError::NoTargets)
+}
+
+/// Whether a failed candidate means its WHOLE provider is currently unusable.
+///
+/// `401` (auth), `402` (drained balance — OpenRouter's documented
+/// `payment_required` for insufficient credits), and permanent-quota `429`
+/// (`insufficient_quota`) are provider-level: every model on that provider
+/// fails identically until the operator acts (top-up / key). Transient 429s,
+/// 5xx, timeouts, and transport errors stay candidate-scoped.
+fn provider_level_failure(error: &LibsyError) -> bool {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return false;
+    };
+    match source {
+        LlmClientError::UpstreamHttp { status, body } => {
+            *status == StatusCode::UNAUTHORIZED
+                || *status == StatusCode::PAYMENT_REQUIRED
+                || (*status == StatusCode::TOO_MANY_REQUESTS && is_permanent_quota_429(body))
+        }
+        _ => false,
+    }
 }
 
 /// Call one candidate model and record its observation and span.
@@ -317,7 +381,11 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         LlmClientError::UpstreamHttp { status, .. }
             if matches!(
                 *status,
-                StatusCode::FORBIDDEN | StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                StatusCode::UNAUTHORIZED
+                    | StatusCode::PAYMENT_REQUIRED
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::REQUEST_TIMEOUT
+                    | StatusCode::TOO_MANY_REQUESTS
             ) || status.is_server_error() =>
         {
             Some(RoutingFallbackReason::Unavailable)
@@ -509,6 +577,7 @@ mod tests {
     enum FirstOutcome {
         ContextWindow,
         Unauthorized,
+        PaymentRequired,
         StreamSuccess,
         MidStreamError,
     }
@@ -534,6 +603,10 @@ mod tests {
                     FirstOutcome::Unauthorized => Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::UNAUTHORIZED,
                         body: "unauthorized".to_string(),
+                    }),
+                    FirstOutcome::PaymentRequired => Err(LlmClientError::UpstreamHttp {
+                        status: StatusCode::PAYMENT_REQUIRED,
+                        body: "insufficient credits".to_string(),
                     }),
                     FirstOutcome::StreamSuccess => Ok(stream_response(vec![
                         LlmResponseChunk::TextDelta {
@@ -767,6 +840,8 @@ mod tests {
             Some(RoutingFallbackReason::ContextWindow)
         );
         for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::PAYMENT_REQUIRED,
             StatusCode::FORBIDDEN,
             StatusCode::REQUEST_TIMEOUT,
             StatusCode::TOO_MANY_REQUESTS,
@@ -783,7 +858,6 @@ mod tests {
         }
         for status in [
             StatusCode::BAD_REQUEST,
-            StatusCode::UNAUTHORIZED,
             StatusCode::NOT_FOUND,
             StatusCode::CONFLICT,
             StatusCode::from_u16(499).expect("499 is a valid status"),
@@ -817,19 +891,62 @@ mod tests {
         );
         assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
 
-        // Authentication failure is not retryable, so the second candidate is untouched.
+        // Authentication failure is a hard provider failure: not retried on the
+        // same candidate, but the chain FAILS OVER to the next candidate.
         let (client, result) = run_candidates(FirstOutcome::Unauthorized).await;
-        assert!(matches!(
-            result,
-            Err(LibsyError::ClientCall {
-                source: LlmClientError::UpstreamHttp {
-                    status: StatusCode::UNAUTHORIZED,
-                    ..
+        let (_, response) = result?;
+        assert_eq!(
+            &*client.calls.lock(),
+            &[ModelId::from("weak"), "strong".into()]
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn payment_required_and_auth_failures_fail_over_to_the_next_candidate() -> Result<()> {
+        // 402 Payment Required (exhausted credits / insufficient balance) must
+        // move to the next candidate immediately, without retrying the same one.
+        let error = |status| {
+            LibsyError::client_call(
+                "qwen",
+                LlmClientError::UpstreamHttp {
+                    status,
+                    body: "provider rejected".to_string(),
                 },
-                ..
-            })
-        ));
-        assert_eq!(&*client.calls.lock(), &[ModelId::from("weak")]);
+            )
+        };
+        assert_eq!(
+            fallback_reason(&error(StatusCode::PAYMENT_REQUIRED)),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        assert_eq!(
+            fallback_reason(&error(StatusCode::UNAUTHORIZED)),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+
+        // End-to-end: the 402 candidate is attempted exactly once, then the
+        // chain serves from the next candidate (no retry loop, no re-selection).
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::PaymentRequired,
+        });
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["weak".into(), "strong".into()],
+        });
+        let (_, response) = run(
+            algorithm,
+            ClientRouter::single(client.clone()),
+            request(),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            &*client.calls.lock(),
+            &[ModelId::from("weak"), "strong".into()]
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
         Ok(())
     }
 
@@ -1047,6 +1164,158 @@ mod tests {
             .await
             .map_err(|source| LibsyError::client_call("weak", source))?;
         assert_eq!(completion_text(&aggregate), "");
+        Ok(())
+    }
+    // Provider-aware fallback (2026-08-31): a 402 (drained balance) on one
+    // OpenRouter model proves the whole provider is unavailable — remaining
+    // OpenRouter candidates are SKIPPED (no wasted upstream attempt) and the
+    // chain serves from the next provider (DeepSeek).
+    #[tokio::test]
+    async fn provider_drained_skips_same_provider_candidates_and_lands_on_next_provider()
+    -> Result<()> {
+        #[derive(Clone)]
+        struct StubClient {
+            provider: &'static str,
+            fail_with: Option<StatusCode>,
+            calls: Arc<Mutex<Vec<ModelId>>>,
+        }
+        #[async_trait::async_trait]
+        impl RoutedLlmClient for StubClient {
+            async fn call(
+                &self,
+                request: Request,
+            ) -> std::result::Result<Response, LlmClientError> {
+                let model = request.model_id().unwrap_or_default();
+                self.calls.lock().push(model.clone());
+                match self.fail_with {
+                    Some(status) => Err(LlmClientError::UpstreamHttp {
+                        status,
+                        body: "provider rejected".to_string(),
+                    }),
+                    None => Ok(Response {
+                        llm_response: LlmResponse::Agg(text_response(
+                            Some(model.to_string()),
+                            "ok",
+                        )),
+                        metadata: None,
+                    }),
+                }
+            }
+            fn provider_key(&self) -> Option<&str> {
+                Some(self.provider)
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let glm = StubClient {
+            provider: "openrouter.ai",
+            fail_with: Some(StatusCode::PAYMENT_REQUIRED),
+            calls: Arc::clone(&calls),
+        };
+        let qwen = StubClient {
+            provider: "openrouter.ai",
+            fail_with: Some(StatusCode::PAYMENT_REQUIRED),
+            calls: Arc::clone(&calls),
+        };
+        let deepseek = StubClient {
+            provider: "api.deepseek.com",
+            fail_with: None,
+            calls: Arc::clone(&calls),
+        };
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            ModelId::from("glm"),
+            Arc::new(glm) as Arc<dyn RoutedLlmClient>,
+        );
+        by_model.insert(
+            ModelId::from("qwen"),
+            Arc::new(qwen) as Arc<dyn RoutedLlmClient>,
+        );
+        by_model.insert(
+            ModelId::from("deepseek"),
+            Arc::new(deepseek) as Arc<dyn RoutedLlmClient>,
+        );
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["glm".into(), "qwen".into(), "deepseek".into()],
+        });
+        let (_, response) = run(algorithm, ClientRouter::new(by_model), request(), None).await?;
+
+        // GLM attempted (402), Qwen SKIPPED (same provider already drained),
+        // DeepSeek attempted and serves the answer.
+        assert_eq!(&*calls.lock(), &[ModelId::from("glm"), "deepseek".into()]);
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("deepseek")
+        );
+        Ok(())
+    }
+
+    // Negative control: a transient (non-provider-level) failure on one candidate
+    // does NOT skip same-provider candidates — 503 keeps per-candidate fallback.
+    #[tokio::test]
+    async fn transient_failure_does_not_skip_same_provider_candidates() -> Result<()> {
+        #[derive(Clone)]
+        struct StubClient {
+            provider: &'static str,
+            fail_with: Option<StatusCode>,
+            calls: Arc<Mutex<Vec<ModelId>>>,
+        }
+        #[async_trait::async_trait]
+        impl RoutedLlmClient for StubClient {
+            async fn call(
+                &self,
+                request: Request,
+            ) -> std::result::Result<Response, LlmClientError> {
+                let model = request.model_id().unwrap_or_default();
+                self.calls.lock().push(model.clone());
+                match self.fail_with {
+                    Some(status) => Err(LlmClientError::UpstreamHttp {
+                        status,
+                        body: "provider rejected".to_string(),
+                    }),
+                    None => Ok(Response {
+                        llm_response: LlmResponse::Agg(text_response(
+                            Some(model.to_string()),
+                            "ok",
+                        )),
+                        metadata: None,
+                    }),
+                }
+            }
+            fn provider_key(&self) -> Option<&str> {
+                Some(self.provider)
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let weak = StubClient {
+            provider: "same.provider",
+            fail_with: Some(StatusCode::SERVICE_UNAVAILABLE),
+            calls: Arc::clone(&calls),
+        };
+        let strong = StubClient {
+            provider: "same.provider",
+            fail_with: None,
+            calls: Arc::clone(&calls),
+        };
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            ModelId::from("weak"),
+            Arc::new(weak) as Arc<dyn RoutedLlmClient>,
+        );
+        by_model.insert(
+            ModelId::from("strong"),
+            Arc::new(strong) as Arc<dyn RoutedLlmClient>,
+        );
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["weak".into(), "strong".into()],
+        });
+        let (_, response) = run(algorithm, ClientRouter::new(by_model), request(), None).await?;
+
+        // A transient 503 stays candidate-scoped: BOTH same-provider candidates
+        // were attempted, and the second served the answer.
+        assert_eq!(&*calls.lock(), &[ModelId::from("weak"), "strong".into()]);
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
         Ok(())
     }
 }

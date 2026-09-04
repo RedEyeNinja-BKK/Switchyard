@@ -4,8 +4,9 @@ static SAFETY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn live_routes_toml_parses_unchanged() {
-    let source = std::fs::read_to_string("/home/vincent/.local/lib/localclaw-switchyard/routes.toml")
-        .expect("live routes.toml readable");
+    let source =
+        std::fs::read_to_string("/home/vincent/.local/lib/localclaw-switchyard/routes.toml")
+            .expect("live routes.toml readable");
     // This smoke test validates SCHEMA parsing only: satisfy the fail-loud
     // credential guard with placeholder values for every env-var NAME the file
     // references (names are configuration, not secrets; no real credential
@@ -31,9 +32,18 @@ fn live_routes_toml_parses_unchanged() {
             println!("PARSED OK: {count} routes");
             assert!(count > 50, "expected ~58 routes, got {count}");
             assert!(runner.fleet_state().is_some(), "fleet state present");
-            assert!(runner.fleet_readiness().is_some(), "readiness config present");
-            assert!(!runner.capabilities().is_empty(), "capability routes present");
-            assert!(runner.capability_clients().len() >= 2, "capability clients present");
+            assert!(
+                runner.fleet_readiness().is_some(),
+                "readiness config present"
+            );
+            assert!(
+                !runner.capabilities().is_empty(),
+                "capability routes present"
+            );
+            assert!(
+                runner.capability_clients().len() >= 2,
+                "capability clients present"
+            );
         }
         Err(e) => panic!("LIVE CONFIG FAILED TO PARSE: {e}"),
     }

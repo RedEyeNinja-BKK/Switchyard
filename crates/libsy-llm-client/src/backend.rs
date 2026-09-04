@@ -28,6 +28,10 @@ const OPENAI_OVERFLOW_PHRASES: &[&str] = &[
     "exceeds the maximum allowed input length",
     "exceeds the maximum allowed length",
     "is longer than the model's context length",
+    // llama.cpp native: structured `error.type == "exceed_context_size_error"` is
+    // recognized separately; this exact phrase covers the same overflow when a
+    // provider/transport wrap drops the type but preserves the message.
+    "exceeds the available context size",
 ];
 
 // Anthropic has no structured `error.code`, so detection is phrase-based only.
@@ -312,11 +316,19 @@ impl Backend {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => is_overflow_body(
                 body,
                 |value| {
+                    // OpenAI canonical structured code, or the llama.cpp native
+                    // error.type (also covered by the exact message phrase when
+                    // a provider wrap drops the type but preserves the message).
                     value
                         .get("error")
                         .and_then(|err| err.get("code"))
                         .and_then(serde_json::Value::as_str)
                         == Some("context_length_exceeded")
+                        || value
+                            .get("error")
+                            .and_then(|err| err.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("exceed_context_size_error")
                 },
                 OPENAI_OVERFLOW_PHRASES,
             ),
@@ -391,6 +403,37 @@ fn anthropic_url(base_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn openai_detects_llama_cpp_exceed_context_size_error() {
+        // Exact real failure fixture from the deployed HTPC llama.cpp (Qwen3.5-9B-MTP,
+        // b10472): an oversized 66901-token prompt rejected pre-generation with HTTP 400
+        // and `error.type = "exceed_context_size_error"`. This is recognized through the
+        // structured llama.cpp type (and, equivalently, the exact message phrase).
+        let backend = Backend::OpenAiChat(config("x"));
+        let fixture = r#"{
+            "error": {
+                "code": 400,
+                "message": "request (66901 tokens) exceeds the available context size (65536 tokens), try increasing it",
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 66901,
+                "n_ctx": 65536
+            }
+        }"#;
+        assert!(
+            backend.is_context_overflow(fixture),
+            "the real llama.cpp overflow body must be classified as a context overflow"
+        );
+        // The exact phrase alone (provider/type stripped) must also be recognized.
+        assert!(backend.is_context_overflow(
+            r#"{"error":{"message":"request (66901 tokens) exceeds the available context size (65536 tokens), try increasing it"}}"#
+        ));
+        // A generic 400 must not be misclassified.
+        assert!(!backend.is_context_overflow(
+            r#"{"error":{"code":400,"message":"bad request","type":"invalid_request_error"}}"#
+        ));
+    }
+
     use super::*;
 
     fn config(base_url: &str) -> HttpBackendConfig {

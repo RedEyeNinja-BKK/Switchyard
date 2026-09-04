@@ -139,4 +139,15 @@ impl RoutingFallbackReason {
 pub trait RoutedLlmClient: Send + Sync {
     /// Make a request
     async fn call(&self, request: Request) -> Result<Response, LlmClientError>;
+
+    /// Identifies the provider serving this client (e.g. the upstream base URL
+    /// host). Used by the ordered-fallback driver to skip remaining candidates
+    /// from a provider already proven unavailable for a provider-level reason
+    /// (drained balance / permanent quota / auth rejection) — one OpenRouter
+    /// model failing with `payment_required` means every OpenRouter model will.
+    ///
+    /// `None` (the default) disables provider-aware skipping for that client.
+    fn provider_key(&self) -> Option<&str> {
+        None
+    }
 }

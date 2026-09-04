@@ -144,6 +144,20 @@ fn seed_outcome_metrics() {
 
 /// Records a request whose downstream client disconnected before a response was
 /// written. The run and its upstream calls were cancelled, so no status exists.
+pub(crate) fn record_escalation(source: &str, destination: &str, reason: &str) {
+    global::meter("switchyard")
+        .u64_counter("switchyard.escalations")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("source", source.to_string()),
+                KeyValue::new("destination", destination.to_string()),
+                KeyValue::new("reason", reason.to_string()),
+            ],
+        );
+}
+
 pub(crate) fn record_client_disconnect() {
     global::meter("switchyard")
         .u64_counter("switchyard.client_responses")

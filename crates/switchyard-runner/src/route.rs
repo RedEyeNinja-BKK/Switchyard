@@ -26,6 +26,9 @@ pub struct ModelCapabilities {
     /// probe this, so a route opts in via config; undeclared routes advertise as
     /// non-reasoning to Codex (fail closed).
     pub reasoning: Option<bool>,
+    /// Whether the routed model accepts image input. A route opts in via config;
+    /// undeclared routes advertise as non-vision (fail closed).
+    pub supports_vision: Option<bool>,
 }
 
 /// Caller credential family required by a forwarded-auth route.

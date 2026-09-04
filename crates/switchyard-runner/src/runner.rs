@@ -21,6 +21,8 @@ pub struct Runner {
     /// route; the host-owned readiness monitor replaces its snapshots. `None`
     /// when the deployment configures no `fleet_router` route.
     fleet_state: Option<std::sync::Arc<libsy::SharedFleetState>>,
+    /// The parsed `[fleet_readiness]` monitor configuration, when declared.
+    fleet_readiness: Option<crate::config::FleetReadinessConfig>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -66,6 +68,7 @@ impl Runner {
             routes,
             fallback_base_url: None,
             fleet_state: None,
+            fleet_readiness: None,
         }
     }
 
@@ -83,6 +86,20 @@ impl Runner {
     /// configured. The host monitor owns snapshot replacement through it.
     pub fn fleet_state(&self) -> Option<&std::sync::Arc<libsy::SharedFleetState>> {
         self.fleet_state.as_ref()
+    }
+
+    /// Declares the parsed `[fleet_readiness]` monitor configuration.
+    pub fn with_fleet_readiness(
+        mut self,
+        fleet_readiness: Option<crate::config::FleetReadinessConfig>,
+    ) -> Self {
+        self.fleet_readiness = fleet_readiness;
+        self
+    }
+
+    /// The parsed `[fleet_readiness]` monitor configuration, when declared.
+    pub fn fleet_readiness(&self) -> Option<&crate::config::FleetReadinessConfig> {
+        self.fleet_readiness.as_ref()
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {

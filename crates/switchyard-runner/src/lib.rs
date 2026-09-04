@@ -14,6 +14,7 @@ pub use algorithm::{
     ClassifierPolicyConfig, FleetBuildContext, FleetCandidateConfig, FleetWorkShapeSourceName,
     InputTokenSourceConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
+pub use config::{ComfyFactConfig, FleetReadinessConfig, HtpcFactConfig, ResourceFactConfig};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 pub use route::{
     AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,

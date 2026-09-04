@@ -4,6 +4,7 @@
 //! Rust HTTP server for libsy algorithms.
 
 pub mod config;
+pub mod fleet_readiness;
 mod metrics;
 mod observability;
 mod response;
@@ -23,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::fleet_readiness::FleetReadinessMonitor;
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
@@ -311,6 +313,63 @@ pub async fn run_server(state: ServerState, options: ServerRunOptions) -> Server
     server.serve(shutdown::signal()).await
 }
 
+/// A coherent production runtime bundle: the server state plus an optional
+/// fleet-readiness monitor built over the SAME `Arc<SharedFleetState>` that was
+/// injected into the server's `fleet_router` routes.
+///
+/// This is the structural shared-state guarantee for the stock CLI: the config
+/// loader creates ONE `Arc<SharedFleetState>` and hands clones of THAT object to
+/// both the routes and the monitor, so the operator never wires them manually.
+pub struct ServerRuntime {
+    /// Server state (fleet routes read the shared snapshot).
+    pub state: ServerState,
+    /// Optional fleet-readiness monitor; `Some` only when the config declares a
+    /// `[fleet_readiness]` section. When `Some`, run via
+    /// [`ServerRuntime::run`] so the background monitor keeps the shared fleet
+    /// state populated.
+    pub monitor: Option<FleetReadinessMonitor>,
+}
+
+impl ServerRuntime {
+    /// Produces a coherent bundle from a config path, sharing ONE fleet state.
+    pub fn load(path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+        config::load_server_runtime(path)
+    }
+
+    /// Runs the runtime. Chooses the monitored lifecycle when a monitor is
+    /// configured, otherwise the ordinary server lifecycle. Consumes the
+    /// runtime.
+    ///
+    /// Honors `options.dry_run`: validates the full runtime (including monitor
+    /// construction) and prints the summary WITHOUT binding a socket or
+    /// starting the background monitor.
+    pub async fn run(self, options: ServerRunOptions) -> ServerResult<()> {
+        if options.dry_run {
+            println!("{}", dry_run_summary(&self.state));
+            return Ok(());
+        }
+        match self.monitor {
+            Some(monitor) => run_server_with_fleet_monitor(self.state, options, monitor).await,
+            None => run_server(self.state, options).await,
+        }
+    }
+}
+
+/// Production runtime owner: runs the server while a fleet-readiness monitor
+/// owns the live readiness facts, sharing one `SharedFleetState` with the
+/// server's `fleet_router` routes and stopping together on the same signal.
+pub async fn run_server_with_fleet_monitor(
+    state: ServerState,
+    options: ServerRunOptions,
+    monitor: FleetReadinessMonitor,
+) -> ServerResult<()> {
+    let server = BoundServer::bind(state, options)?;
+    println!("{}", server.startup_banner(std::io::stdout().is_terminal()));
+    server
+        .serve_with_fleet_monitor(shutdown::signal(), monitor)
+        .await
+}
+
 /// A configured server with its listening socket already bound.
 pub struct BoundServer {
     listener: TcpListener,
@@ -330,6 +389,38 @@ impl BoundServer {
             options: ServerRunOptions { addr, ..options },
             state,
         })
+    }
+
+    /// Serves requests while a background fleet-readiness monitor runs,
+    /// stopping both on the same signal.
+    ///
+    /// The monitor is the runtime owner of the fleet readiness facts. Identity
+    /// is structural by construction: the caller passes a
+    /// [`FleetReadinessMonitor`] holding the same `Arc<SharedFleetState>` that
+    /// was injected into this server's `fleet_router` routes, so the monitor
+    /// and the router observe and publish through one shared state.
+    pub async fn serve_with_fleet_monitor(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        monitor: FleetReadinessMonitor,
+    ) -> ServerResult<()> {
+        // A shared stop trigger so the monitor loop and the HTTP server stop on
+        // the same signal. `serve` swallows the caller signal; we also
+        // propagate it to the monitor via the trigger.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let monitor_task = tokio::spawn(monitor.run(async move {
+            let _ = stop_rx.await;
+        }));
+        let drain_timeout = self.options.shutdown_timeout;
+        let serve_result = if let Some(tls) = self.options.tls {
+            serve_tls(self.listener, self.router, tls, drain_timeout, shutdown).await
+        } else {
+            serve(self.listener, self.router, drain_timeout, shutdown).await
+        };
+        // Signal the monitor to stop; it stops cleanly without a final cycle.
+        let _ = stop_tx.send(());
+        let _ = monitor_task.await;
+        serve_result
     }
 
     /// Returns the actual bound address, including an OS-selected port.
@@ -692,6 +783,10 @@ async fn decision(
         }
     };
     let input_format = body.input_format;
+    // The escalation walk re-resolves the destination from the ORIGINAL caller
+    // body, so both are cloned before the primary route consumes them.
+    let escalation_headers = headers.clone();
+    let escalation_request_body = body.request.clone();
     let (route, request) = match resolve_route(
         &state,
         metadata_from_headers(headers),
@@ -707,10 +802,47 @@ async fn decision(
         .as_deref()
         .map(ModelId::from)
         .unwrap_or_default();
+    // A decision mirrors the request path: when the route cannot decide for
+    // this request (capability/readiness exclusion, e.g. reasoning requested on
+    // an NT-only agentic route), the decision escalates to the parent route too.
+    let mut escalation_evidence: Option<(ModelId, &'static str)> = None;
     let mut outcome = match route.decide(request).await {
         Ok(outcome) => outcome,
-        Err(error) => return runner_error(error),
+        Err(error) => {
+            let Some(reason) = escalation_reason(&error) else {
+                return runner_error(error);
+            };
+            let Some(escalation_id) = route.escalation().cloned() else {
+                return runner_error(error);
+            };
+            let (escalation_route, escalated_request) = match resolve_route_for_model(
+                &state,
+                escalation_id.as_str(),
+                metadata_from_headers(escalation_headers),
+                escalation_request_body,
+                input_format,
+            ) {
+                Ok(resolved) => resolved,
+                Err(_) => return runner_error(error),
+            };
+            match escalation_route.decide(escalated_request).await {
+                Ok(escalated_outcome) => {
+                    escalation_evidence = Some((escalation_id, reason));
+                    escalated_outcome
+                }
+                Err(escalated_error) => return runner_error(escalated_error),
+            }
+        }
     };
+    if let Some((destination, reason)) = &escalation_evidence {
+        metrics::record_escalation(route.algorithm_name(), destination.as_str(), reason);
+        tracing::info!(
+            target: "switchyard_server::request",
+            destination_route = %destination,
+            escalation_reason = reason,
+            "decision escalated to escalation route"
+        );
+    }
     let response = match outcome.response.take() {
         Some(response) => {
             let aggregate = match response.llm_response.into_agg().await {
@@ -955,7 +1087,27 @@ fn resolve_route(
                 "invalid_request_error",
             )
         })?;
-    let route = state.route_for_model(&requested_model).ok_or_else(|| {
+    resolve_route_for_model(state, &requested_model, metadata, body, wire_format)
+}
+
+/// Resolves `model`'s route and validates the caller format against it.
+///
+/// Escalation re-routes resolve their destination through this entry: the body
+/// still names the original route model, so the destination is supplied
+/// explicitly rather than decoded from the request.
+// Both callers immediately return the `Err(Response)` as the HTTP response, so
+// the large error type is intentional, not propagated up a call stack.
+#[allow(clippy::type_complexity, clippy::result_large_err)]
+fn resolve_route_for_model<'a>(
+    state: &'a ServerState,
+    requested_model: &str,
+    metadata: Metadata,
+    body: Value,
+    wire_format: WireFormat,
+) -> std::result::Result<(&'a Route, Request), Response> {
+    let llm_request = decode_request(wire_format, &body)
+        .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let route = state.route_for_model(requested_model).ok_or_else(|| {
         error_response(
             StatusCode::NOT_FOUND,
             format!("No route registered for model {requested_model}"),
@@ -997,6 +1149,11 @@ async fn handle_llm_request(
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
+    // The escalation walk re-resolves the destination route from the ORIGINAL
+    // caller body (the destination is selected by id, not by the request's
+    // model field), so both are cloned before the primary route consumes them.
+    let escalation_metadata = metadata.clone();
+    let escalation_body = body.clone();
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
         Err(response) => return response,
@@ -1007,10 +1164,88 @@ async fn handle_llm_request(
         state.stats.clone(),
         state.routing_log.clone().zip(routing_log_context.clone()),
     );
-    let output = match route.execute(request, Some(observer)).await {
-        Ok(output) => output,
-        Err(error) => return runner_error(error),
+    // Server-side escalation, bounded to exactly one re-route per request (the
+    // destination route never declares an escalation itself - config-enforced).
+    //
+    // (a) Context pressure: when the request's estimated input size is already
+    //     above the route's configured threshold, escalate BEFORE running this
+    //     route's candidate chain at all.
+    // (b) Demonstrated difficulty: when this route's candidate chain fails
+    //     terminally (all candidates exhausted) or cannot serve the request
+    //     (capability/readiness exclusion), escalate to the destination route.
+    let pre_escalate = route.escalation().is_some()
+        && route
+            .escalation_max_input_tokens()
+            .is_some_and(|threshold| estimate_input_tokens(&escalation_body) > threshold);
+    let mut escalation_evidence: Option<(ModelId, &'static str)> = None;
+    let output = if pre_escalate {
+        let escalation_id = route.escalation().cloned().expect("checked above");
+        let (escalation_route, escalated_request) = match resolve_route_for_model(
+            &state,
+            escalation_id.as_str(),
+            escalation_metadata,
+            escalation_body,
+            wire_format,
+        ) {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        match escalation_route
+            .execute(escalated_request, Some(observer))
+            .await
+        {
+            Ok(result) => {
+                escalation_evidence = Some((escalation_id, "context_pressure"));
+                result
+            }
+            Err(error) => return runner_error(error),
+        }
+    } else {
+        match route.execute(request, Some(observer)).await {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(reason) = escalation_reason(&error)
+                    && let Some(escalation_id) = route.escalation().cloned()
+                {
+                    let (escalation_route, escalated_request) = match resolve_route_for_model(
+                        &state,
+                        escalation_id.as_str(),
+                        escalation_metadata,
+                        escalation_body,
+                        wire_format,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(response) => return response,
+                    };
+                    let escalated_observer = stats_observer(
+                        state.stats.clone(),
+                        state.routing_log.clone().zip(routing_log_context.clone()),
+                    );
+                    match escalation_route
+                        .execute(escalated_request, Some(escalated_observer))
+                        .await
+                    {
+                        Ok(result) => {
+                            escalation_evidence = Some((escalation_id, reason));
+                            result
+                        }
+                        Err(escalated_error) => return runner_error(escalated_error),
+                    }
+                } else {
+                    return runner_error(error);
+                }
+            }
+        }
     };
+    if let Some((destination, reason)) = &escalation_evidence {
+        metrics::record_escalation(route.algorithm_name(), destination.as_str(), reason);
+        tracing::info!(
+            target: "switchyard_server::request",
+            destination_route = %destination,
+            escalation_reason = reason,
+            "request escalated to escalation route"
+        );
+    }
     let RunOutput {
         selected_model,
         response,
@@ -1336,6 +1571,56 @@ fn anthropic_error_type(status: StatusCode) -> &'static str {
     }
 }
 
+/// Coarse deterministic estimate of the input size of a request body, used ONLY
+/// for the optional per-route context-pressure escalation gate.
+///
+/// Never used for context admission and never used to admit/exclude candidates.
+/// The proxy is deliberately conservative for scripts that tokenize denser than
+/// English (CJK/Thai/emoji are charged one token per character, ASCII ~4
+/// chars/token, plus a small structural overhead), so escalation fires at or
+/// before the configured threshold rather than after it. A route that does not
+/// configure `escalation_max_input_tokens` never calls this.
+fn estimate_input_tokens(body: &Value) -> u64 {
+    fn walk(value: &Value, acc: &mut u64) {
+        match value {
+            Value::String(text) => {
+                let chars = text.chars().count() as u64;
+                let ascii = text.bytes().filter(|byte| byte.is_ascii()).count() as u64;
+                let non_ascii = chars.saturating_sub(ascii);
+                *acc = acc
+                    .saturating_add(ascii.div_ceil(4))
+                    .saturating_add(non_ascii)
+                    .saturating_add(1);
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, acc)),
+            Value::Object(map) => map.values().for_each(|value| walk(value, acc)),
+            _ => {}
+        }
+    }
+    let mut total = 0u64;
+    walk(body, &mut total);
+    // Fixed structural overhead (model field, message roles, wrapper keys).
+    total.saturating_add(8)
+}
+
+/// Why a route failure (or inability to serve) justifies the single escalation
+/// re-route. `LibsyError::ClientCall`/`NoTargets` mean the route's candidate
+/// chain failed terminally ("agentic_chain_failed"); the exact fleet-router
+/// no-eligible-candidate message means the request cannot be served by any
+/// candidate of this route ("no_eligible_candidate"). Everything else is a
+/// caller or configuration error and is surfaced as-is.
+fn escalation_reason(error: &RunnerError) -> Option<&'static str> {
+    match error {
+        RunnerError::Algorithm(LibsyError::ClientCall { .. } | LibsyError::NoTargets) => {
+            Some("agentic_chain_failed")
+        }
+        RunnerError::Algorithm(LibsyError::AlgorithmError { message }) => (message
+            == "fleet router found no immediately-eligible candidate for this request")
+            .then_some("no_eligible_candidate"),
+        _ => None,
+    }
+}
+
 fn server_error(message: impl Into<String>) -> Response {
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1479,6 +1764,7 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
+            "supports_vision": capabilities.supports_vision,
             "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",

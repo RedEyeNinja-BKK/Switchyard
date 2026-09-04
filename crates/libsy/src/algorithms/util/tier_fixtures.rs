@@ -129,5 +129,6 @@ pub(crate) fn turn_request(failed: bool) -> Request {
             session_id: Some("session-1".to_string()),
             ..Default::default()
         }),
+        candidate_input_tokens: Default::default(),
     }
 }

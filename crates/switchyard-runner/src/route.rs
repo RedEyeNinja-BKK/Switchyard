@@ -115,6 +115,10 @@ pub struct Route {
     anthropic_auxiliary_target: Option<AuxiliaryTarget>,
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
+    /// Optional escalation destination route id (`fleet_router` routes only).
+    escalation: Option<ModelId>,
+    /// Optional context-pressure escalation threshold (estimated input tokens).
+    escalation_max_input_tokens: Option<u64>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -142,7 +146,31 @@ impl Route {
             anthropic_auxiliary_target,
             responses_auxiliary_target,
             decision_targets,
+            escalation: None,
+            escalation_max_input_tokens: None,
         }
+    }
+
+    /// Declares this route's escalation policy (destination + optional
+    /// context-pressure threshold). Only meaningful for `fleet_router` routes.
+    pub fn with_escalation(
+        mut self,
+        escalation: Option<ModelId>,
+        escalation_max_input_tokens: Option<u64>,
+    ) -> Self {
+        self.escalation = escalation;
+        self.escalation_max_input_tokens = escalation_max_input_tokens;
+        self
+    }
+
+    /// Optional escalation destination route id.
+    pub fn escalation(&self) -> Option<&ModelId> {
+        self.escalation.as_ref()
+    }
+
+    /// Optional context-pressure escalation threshold (estimated input tokens).
+    pub fn escalation_max_input_tokens(&self) -> Option<u64> {
+        self.escalation_max_input_tokens
     }
 
     /// Returns the configured libsy algorithm name.

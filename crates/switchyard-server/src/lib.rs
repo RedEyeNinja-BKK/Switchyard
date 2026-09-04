@@ -982,6 +982,7 @@ fn resolve_route(
     let request = Request {
         llm_request,
         raw_request: Some(body),
+        candidate_input_tokens: Default::default(),
         metadata: Some(metadata),
     };
     Ok((route, request))

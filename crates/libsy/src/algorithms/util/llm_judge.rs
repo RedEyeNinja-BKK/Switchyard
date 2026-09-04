@@ -174,6 +174,7 @@ where
             },
             raw_request: None,
             metadata: request.metadata.clone(),
+            ..Request::default()
         }
     }
 
@@ -421,6 +422,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "judge this"),
             raw_request: None,
             metadata: None,
+            candidate_input_tokens: Default::default(),
         }
     }
 

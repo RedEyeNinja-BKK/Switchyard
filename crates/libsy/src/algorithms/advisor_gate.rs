@@ -456,6 +456,7 @@ impl AdvisorGate {
             },
             raw_request: None,
             metadata: base.metadata.clone(),
+            ..Request::default()
         }
     }
 }

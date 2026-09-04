@@ -164,6 +164,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
             metadata,
+            candidate_input_tokens: Default::default(),
         }
     }
 

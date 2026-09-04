@@ -581,6 +581,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hello".to_string()),
             raw_request: None,
             metadata: None,
+            candidate_input_tokens: Default::default(),
         }
     }
 
@@ -980,6 +981,7 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            candidate_input_tokens: Default::default(),
         };
         let result = run(algorithm, ClientRouter::single(client), request, None).await;
         (server, calls, result)

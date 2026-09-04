@@ -17,6 +17,10 @@ use crate::{ModelCapabilities, Route, RunnerError};
 pub struct Runner {
     routes: Vec<(ModelId, Route)>,
     fallback_base_url: Option<String>,
+    /// Deployment-wide fleet-state handle shared by every `fleet_router`
+    /// route; the host-owned readiness monitor replaces its snapshots. `None`
+    /// when the deployment configures no `fleet_router` route.
+    fleet_state: Option<std::sync::Arc<libsy::SharedFleetState>>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -61,7 +65,24 @@ impl Runner {
         Self {
             routes,
             fallback_base_url: None,
+            fleet_state: None,
         }
+    }
+
+    /// Declares the deployment-wide fleet-state handle for the host's
+    /// readiness monitor.
+    pub fn with_fleet_state(
+        mut self,
+        fleet_state: Option<std::sync::Arc<libsy::SharedFleetState>>,
+    ) -> Self {
+        self.fleet_state = fleet_state;
+        self
+    }
+
+    /// The deployment-wide fleet-state handle, when any `fleet_router` route is
+    /// configured. The host monitor owns snapshot replacement through it.
+    pub fn fleet_state(&self) -> Option<&std::sync::Arc<libsy::SharedFleetState>> {
+        self.fleet_state.as_ref()
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {

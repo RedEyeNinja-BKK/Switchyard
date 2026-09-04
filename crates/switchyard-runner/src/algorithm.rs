@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use libsy::{
-    AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat,
-    ClassifyTrigger, CompositeRouter, CompositeRouterConfig, CustomClassifierConfig,
-    CustomClassifierPolicy, EscalationJudgeConfig, GateTrigger, HandoffNoteConfig,
+    AdvisorGate, AdvisorGateConfig, Algorithm, CandidateProfile, ClassifierContractConfig,
+    ClassifierResponseFormat, ClassifyTrigger, CompositeRouter, CompositeRouterConfig,
+    ContextAdmissionPolicy, CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig,
+    FleetRouter as FleetRouterAlgorithm, FleetStateSource, GateTrigger, HandoffNoteConfig,
     LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop, Passthrough, PickerMode, Random,
-    StageRouter, StageRouterConfig, SubagentRouter, SubagentRouterConfig, TargetPrompts,
-    TaskClassifierConfig,
+    SharedFleetState, StageRouter, StageRouterConfig, SubagentRouter, SubagentRouterConfig,
+    TargetPrompts, TaskClassifierConfig, WorkShape,
 };
 use serde::Deserialize;
 use switchyard_protocol::ModelId;
@@ -328,6 +329,203 @@ pub enum AlgorithmSpec {
         /// Maximum prompts per encoder forward pass.
         batch_size: Option<usize>,
     },
+    /// Fleet routing over a declared candidate ladder with a live readiness
+    /// snapshot injected at construction.
+    FleetRouter {
+        /// Static per-candidate capability + preference profiles.
+        #[serde(default)]
+        candidates: Vec<FleetCandidateConfig>,
+        /// When `"request"`, read the declared `work_shape` from structured
+        /// request metadata and apply per-candidate `work_shape` eligibility.
+        #[serde(default)]
+        work_shape_source: Option<FleetWorkShapeSourceName>,
+        /// Optional escalation destination: another registered route id that
+        /// serves this request when this route cannot serve it efficiently.
+        /// Escalation is server-side and bounded to exactly one re-route per
+        /// request: it fires when (a) this route's candidate chain fails
+        /// terminally (all candidates exhausted), (b) the request cannot be
+        /// served by any candidate of this route (capability/readiness
+        /// exclusion), or (c) the request's estimated input size exceeds
+        /// `escalation_max_input_tokens`. The destination must be a registered
+        /// route without its own escalation (no chains, no cycles).
+        #[serde(default)]
+        escalation: Option<ModelId>,
+        /// Estimated input-size threshold (tokens of the coarse local estimate)
+        /// that triggers context-pressure escalation. The estimate is a coarse
+        /// local proxy used only for this gate (it never admits/excludes
+        /// candidates).
+        #[serde(default)]
+        escalation_max_input_tokens: Option<u64>,
+    },
+}
+
+/// Named values for a `fleet_router` route's work-shape source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub enum FleetWorkShapeSourceName {
+    /// Read the declared `work_shape` from structured request metadata.
+    #[serde(rename = "request")]
+    Request,
+}
+
+/// Named work shapes for a `fleet_router` candidate's structural eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub enum FleetWorkShapeName {
+    #[serde(rename = "bounded")]
+    Bounded,
+    #[serde(rename = "agentic")]
+    Agentic,
+}
+
+/// Static capability + preference profile for one `fleet_router` candidate.
+///
+/// This is the durable, Algorithm-owned profile only - it carries **no live
+/// readiness** (a candidate's `ready`/`transition_required` comes from the
+/// injected [`FleetStateSource`], never from this route config). This preserves
+/// the separation of static capability from current factual state.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetCandidateConfig {
+    /// A `[targets.*]` reference this candidate may select.
+    pub target: String,
+    #[serde(default)]
+    pub tool_calling: bool,
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Whether this candidate truthfully advertises vision (image input)
+    /// support. Absent/false => never selected for image-bearing requests
+    /// (fail closed).
+    #[serde(default)]
+    pub supports_vision: bool,
+    /// Deterministic preference; lower is preferred.
+    #[serde(default)]
+    pub preference_rank: u16,
+    /// Preflight context admission policy. Absent (or `unmanaged`) means
+    /// FleetRouter does not assert preflight context fit for this candidate.
+    /// `bounded` opts this candidate into pure context admission with a
+    /// qualified usable context capacity.
+    #[serde(default)]
+    pub context_policy: FleetCandidateContextPolicyConfig,
+    /// Static qualified usable context capacity of this candidate (a capability
+    /// fact, SEPARATE from `context_policy`'s exact-request admission behavior).
+    /// Positive integer = this deployment truthfully guarantees/configured the
+    /// candidate to serve that many usable context tokens; absent = capacity
+    /// UNKNOWN; zero is invalid configuration (rejected at load). Never inferred
+    /// from provider/model names.
+    #[serde(default)]
+    pub usable_context_tokens: Option<u64>,
+    /// Optional structural work-shape limitation. `bounded` limits this
+    /// candidate to bounded requests; `agentic` to agentic requests; absent
+    /// means it serves any shape.
+    #[serde(default)]
+    pub work_shape: Option<FleetWorkShapeName>,
+}
+
+/// Durable per-candidate context admission policy (configuration only; no live
+/// counts live here).
+///
+/// Deserialized via a raw [`serde_json::Value`] so an invalid combination - an
+/// `input_token_source` under a non-`bounded` policy - is rejected rather than
+/// silently dropped (serde's internally-tagged enum cannot `deny_unknown_fields`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FleetCandidateContextPolicyConfig {
+    /// No preflight context assertion for this candidate.
+    #[default]
+    Unmanaged,
+    /// Admit only when a candidate-specific input-token fact plus an explicit
+    /// output budget fits `usable_context_tokens`.
+    Bounded {
+        /// The qualified usable context this candidate can serve.
+        usable_context_tokens: u64,
+        /// The exact input-token source this candidate is explicitly qualified
+        /// to use (reserved for the input-token producer wiring; validated for
+        /// placement here).
+        input_token_source: Option<InputTokenSourceConfig>,
+    },
+}
+
+impl FleetCandidateContextPolicyConfig {
+    /// The bounded policy's usable context capacity, when bounded.
+    pub fn bounded_capacity(&self) -> Option<u64> {
+        match self {
+            Self::Unmanaged => None,
+            Self::Bounded {
+                usable_context_tokens,
+                ..
+            } => Some(*usable_context_tokens),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FleetCandidateContextPolicyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let obj = raw.as_object().ok_or_else(|| {
+            serde::de::Error::custom("context_policy must be a table with a `kind` field")
+        })?;
+        let kind = obj
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("context_policy must have a string `kind`"))?;
+        match kind {
+            "unmanaged" => {
+                // `input_token_source` is meaningful only for a `bounded` policy; any
+                // extra field (not just `kind`) under `unmanaged` is invalid.
+                if obj.len() != 1 {
+                    return Err(serde::de::Error::custom(
+                        "context_policy kind = \"unmanaged\" accepts no other fields \
+                         (input_token_source is only valid under a bounded policy)",
+                    ));
+                }
+                Ok(FleetCandidateContextPolicyConfig::Unmanaged)
+            }
+            "bounded" => {
+                let usable_context_tokens = obj
+                    .get("usable_context_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "context_policy kind = \"bounded\" requires a numeric \
+                             `usable_context_tokens`",
+                        )
+                    })?;
+                let input_token_source = obj
+                    .get("input_token_source")
+                    .map(InputTokenSourceConfig::deserialize)
+                    .transpose()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(FleetCandidateContextPolicyConfig::Bounded {
+                    usable_context_tokens,
+                    input_token_source,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown context_policy kind {other:?} (expected \"unmanaged\" or \"bounded\")"
+            ))),
+        }
+    }
+}
+
+/// Server-only declaration of the exact input-token source a BOUNDED candidate is
+/// explicitly qualified to use. Currently the only supported source is a llama.cpp
+/// OpenAI-chat `/chat/completions/input_tokens` endpoint. Not inferred from a
+/// target merely being OpenAI-compatible; declared explicitly per candidate.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum InputTokenSourceConfig {
+    #[default]
+    #[serde(rename = "openai_chat_input_tokens")]
+    OpenAiChatInputTokens,
+}
+
+/// Build-time fleet state shared by every `fleet_router` route of one
+/// deployment: the host-owned readiness monitor replaces the snapshot behind
+/// this handle at runtime; routes only ever read coherent snapshots.
+#[derive(Clone, Default)]
+pub struct FleetBuildContext {
+    /// The deployment-wide fleet-state handle, when the host supplies one.
+    pub fleet_state: Option<Arc<SharedFleetState>>,
 }
 
 /// What fires an advisor route's review.
@@ -489,6 +687,10 @@ impl AlgorithmSpec {
                 executor_target, ..
             } => vec![executor_target],
             Self::PrefillRouter { targets, .. } => targets.iter().map(String::as_str).collect(),
+            Self::FleetRouter { candidates, .. } => candidates
+                .iter()
+                .map(|candidate| candidate.target.as_str())
+                .collect(),
         }
     }
 
@@ -532,12 +734,26 @@ impl AlgorithmSpec {
         names
     }
     /// Builds this algorithm after resolving configured target names.
+    ///
+    /// Uses a default [`FleetBuildContext`] (no shared fleet state); use
+    /// [`Self::build_with_fleet`] when a shared [`SharedFleetState`] must back
+    /// `fleet_router` routes.
     pub fn build(
         &self,
         context: &str,
         targets: &BTreeMap<String, ModelId>,
     ) -> AlgorithmResult<Arc<dyn Algorithm>> {
-        build_algorithm(context, self, targets)
+        self.build_with_fleet(context, targets, &FleetBuildContext::default())
+    }
+
+    /// Builds this algorithm with an explicit fleet build context.
+    pub fn build_with_fleet(
+        &self,
+        context: &str,
+        targets: &BTreeMap<String, ModelId>,
+        fleet: &FleetBuildContext,
+    ) -> AlgorithmResult<Arc<dyn Algorithm>> {
+        build_algorithm(context, self, targets, fleet)
     }
 }
 impl LlmClassifierRouteConfig {
@@ -836,6 +1052,7 @@ fn build_algorithm(
     route_name: &str,
     config: &AlgorithmSpec,
     targets: &BTreeMap<String, ModelId>,
+    fleet: &FleetBuildContext,
 ) -> AlgorithmResult<Arc<dyn Algorithm>> {
     match config {
         AlgorithmSpec::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -1089,6 +1306,75 @@ fn build_algorithm(
                 )
             })?;
             Ok(Arc::new(algorithm))
+        }
+        AlgorithmSpec::FleetRouter {
+            candidates,
+            work_shape_source,
+            ..
+        } => {
+            // Static profile only: capability + preference + context policy per
+            // candidate. Live readiness comes from the injected fleet state
+            // source, never this config.
+            let mut profiles = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                if candidate.usable_context_tokens == Some(0) {
+                    return Err(AlgorithmConfigError::new(format!(
+                        "fleet candidate {:?} declares an invalid zero usable_context_tokens; \
+                         a configured static capacity must be positive",
+                        candidate.target
+                    )));
+                }
+                let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
+                let mut profile = CandidateProfile::new(
+                    target,
+                    candidate.tool_calling,
+                    candidate.reasoning,
+                    candidate.preference_rank,
+                )
+                .with_supports_vision(candidate.supports_vision)
+                .with_context_policy(match candidate.context_policy {
+                    FleetCandidateContextPolicyConfig::Unmanaged => {
+                        ContextAdmissionPolicy::Unmanaged
+                    }
+                    FleetCandidateContextPolicyConfig::Bounded {
+                        usable_context_tokens,
+                        ..
+                    } => ContextAdmissionPolicy::Bounded {
+                        usable_context_tokens,
+                    },
+                });
+                if let Some(capacity) = candidate.usable_context_tokens {
+                    profile = profile.with_usable_context_tokens(capacity);
+                }
+                let profile = match candidate.work_shape {
+                    Some(FleetWorkShapeName::Bounded) => {
+                        profile.with_work_shape(WorkShape::Bounded)
+                    }
+                    Some(FleetWorkShapeName::Agentic) => {
+                        profile.with_work_shape(WorkShape::Agentic)
+                    }
+                    None => profile,
+                };
+                profiles.push(profile);
+            }
+            // One shared fleet-state handle per deployment when the host supplies
+            // one (the server-owned readiness monitor replaces its snapshots);
+            // standalone builds get a private, permanently empty snapshot -
+            // fail-closed, matching the pre-monitor default.
+            let state: Arc<dyn FleetStateSource> = fleet.fleet_state.clone().unwrap_or_else(|| {
+                Arc::new(SharedFleetState::new(libsy::FleetSnapshot::default()))
+            });
+            let mut router =
+                FleetRouterAlgorithm::with_source(profiles, state).map_err(|error| {
+                    AlgorithmConfigError::with_source(
+                        format!("fleet_router route {route_name}: {error}"),
+                        error,
+                    )
+                })?;
+            if work_shape_source == &Some(FleetWorkShapeSourceName::Request) {
+                router = router.with_request_work_shape();
+            }
+            Ok(Arc::new(router))
         }
         AlgorithmSpec::PrefillRouter {
             targets: names,

@@ -17,9 +17,11 @@ use switchyard_llm_client::{
 };
 use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
 
+use libsy::SharedFleetState;
+
 use crate::{
-    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError,
+    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, FleetBuildContext,
+    ModelCapabilities, Route, Runner, RunnerError,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -114,6 +116,19 @@ where
 
 impl RouteConfig {
     fn capabilities(&self) -> ModelCapabilities {
+        if let AlgorithmSpec::FleetRouter { candidates, .. } = &self.algorithm {
+            // Truthful fleet advertisement: when the route does not override a
+            // capability explicitly, the advertised envelope derives from the
+            // candidate set so `/v1/models` never claims more than the fleet
+            // can serve (validation below enforces the reverse direction too).
+            let any_tool = candidates.iter().any(|candidate| candidate.tool_calling);
+            let any_reasoning = candidates.iter().any(|candidate| candidate.reasoning);
+            return ModelCapabilities {
+                context_window: self.context_window,
+                tool_calling: self.tool_calling.or(Some(any_tool)),
+                reasoning: self.reasoning.or(Some(any_reasoning)),
+            };
+        }
         ModelCapabilities {
             context_window: self.context_window,
             tool_calling: self.tool_calling,
@@ -128,9 +143,129 @@ impl RouteConfig {
     fn callable_target_names(&self) -> Vec<&str> {
         self.algorithm.callable_target_names()
     }
+
+    /// The registered model id (route id) of this route.
+    fn route_id(&self) -> &ModelId {
+        &self.id
+    }
+
+    /// Optional escalation destination route id (`fleet_router` routes only).
+    fn escalation_route(&self) -> Option<&ModelId> {
+        match &self.algorithm {
+            AlgorithmSpec::FleetRouter { escalation, .. } => escalation.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Optional context-pressure escalation threshold (`fleet_router` only).
+    fn escalation_input_threshold(&self) -> Option<u64> {
+        match &self.algorithm {
+            AlgorithmSpec::FleetRouter {
+                escalation_max_input_tokens,
+                ..
+            } => *escalation_max_input_tokens,
+            _ => None,
+        }
+    }
+
+    /// A `fleet_router` route's advertised capability envelope must be
+    /// satisfiable by its candidate set (truthful model advertisement).
+    fn validate_fleet_capabilities(&self, route_name: &str) -> RunnerResult<()> {
+        let AlgorithmSpec::FleetRouter { candidates, .. } = &self.algorithm else {
+            return Ok(());
+        };
+        // The route-level flags live on the RouteConfig, not the variant.
+        let route_tool_calling = self.tool_calling;
+        let route_reasoning = self.reasoning;
+        let any_tool = candidates.iter().any(|c| c.tool_calling);
+        let any_reasoning = candidates.iter().any(|c| c.reasoning);
+        let any_tool_and_reasoning = candidates.iter().any(|c| c.tool_calling && c.reasoning);
+
+        // Explicit TRUE overrides must not exceed the candidate capability set.
+        if route_tool_calling == Some(true) && !any_tool {
+            return Err(RunnerError::configuration(format!(
+                "fleet_router route {route_name} advertises tool_calling=true but no \
+                 candidate profile supports tool calling"
+            )));
+        }
+        if route_reasoning == Some(true) && !any_reasoning {
+            return Err(RunnerError::configuration(format!(
+                "fleet_router route {route_name} advertises reasoning=true but no \
+                 candidate profile supports reasoning"
+            )));
+        }
+
+        // Effective advertised envelope after applying restrictive (false)
+        // overrides - shares its derivation with `capabilities()` so validation
+        // and advertisement can never disagree.
+        let effective = self.capabilities();
+
+        // A tools+reasoning aggregate must be satisfiable by one candidate.
+        if effective.tool_calling == Some(true)
+            && effective.reasoning == Some(true)
+            && !any_tool_and_reasoning
+        {
+            return Err(RunnerError::configuration(format!(
+                "fleet_router route {route_name} would advertise tool_calling=true and \
+                 reasoning=true, but no single candidate supports both; the aggregate \
+                 capability envelope is not representable by the candidate set"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl DeploymentConfig {
+    /// Validates every declared escalation edge before any route is built.
+    ///
+    /// Invariants (kept deliberately simple so escalation stays bounded):
+    /// * `escalation_max_input_tokens` without an `escalation` destination is a
+    ///   configuration error;
+    /// * the destination must be a registered route id and not the route itself;
+    /// * the destination must not itself declare an escalation (no chains, no
+    ///   cycles).
+    fn validate_escalations(&self) -> RunnerResult<()> {
+        let route_ids = self
+            .routes
+            .values()
+            .map(RouteConfig::route_id)
+            .collect::<HashSet<&ModelId>>();
+        for (route_name, config) in &self.routes {
+            let Some(destination) = config.escalation_route() else {
+                if config.escalation_input_threshold().is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} declares escalation_max_input_tokens without an \
+                         escalation destination"
+                    )));
+                }
+                continue;
+            };
+            if destination == &config.id {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} cannot escalate to itself"
+                )));
+            }
+            if !route_ids.contains(destination) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} escalation destination {destination:?} is not a \
+                     registered route id"
+                )));
+            }
+            let destination_config = self
+                .routes
+                .values()
+                .find(|candidate| candidate.route_id() == destination)
+                .expect("destination verified above");
+            if destination_config.escalation_route().is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} escalation destination {destination:?} must not itself \
+                     declare an escalation (no escalation chains/cycles)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn decision_target(&self, name: &str) -> Option<DecisionTarget> {
         let target = self.targets.get(name)?;
         let client = self.llm_clients.get(&target.llm_client)?;
@@ -167,6 +302,22 @@ impl DeploymentConfig {
         let clients = self.build_clients()?;
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
+        self.validate_escalations()?;
+        for (route_name, config) in &self.routes {
+            config.validate_fleet_capabilities(route_name)?;
+        }
+        // One deployment-wide fleet-state handle: every `fleet_router` route
+        // reads coherent snapshots through it, and the host-owned readiness
+        // monitor replaces snapshots behind the same handle. `None` when no
+        // fleet route is configured.
+        let has_fleet = self
+            .routes
+            .values()
+            .any(|config| matches!(config.algorithm, AlgorithmSpec::FleetRouter { .. }));
+        let fleet_state = has_fleet.then(|| Arc::new(SharedFleetState::new(Default::default())));
+        let fleet_ctx = FleetBuildContext {
+            fleet_state: fleet_state.clone(),
+        };
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             validate_value("route name", route_name)?;
@@ -186,7 +337,7 @@ impl DeploymentConfig {
             }
             let algorithm = config
                 .algorithm
-                .build(route_name, &targets)
+                .build_with_fleet(route_name, &targets, &fleet_ctx)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             let (route_clients, caller_auth) =
                 self.build_route_clients(route_name, config, &clients)?;
@@ -207,10 +358,16 @@ impl DeploymentConfig {
                 anthropic_auxiliary_target,
                 responses_auxiliary_target,
                 decision_targets,
+            )
+            .with_escalation(
+                config.escalation_route().cloned(),
+                config.escalation_input_threshold(),
             );
             routes.push((config.id.clone(), route));
         }
-        let runner = Runner::new(routes).with_fallback_url(fallback_base_url);
+        let runner = Runner::new(routes)
+            .with_fallback_url(fallback_base_url)
+            .with_fleet_state(fleet_state);
         Ok(runner)
     }
 

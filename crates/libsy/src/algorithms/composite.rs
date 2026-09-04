@@ -69,7 +69,10 @@ impl TierSetter {
 #[async_trait]
 impl Processor<State> for TierSetter {
     async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
-        let Event::Request { request, driver } = event else {
+        let Event::Request {
+            request, driver, ..
+        } = event
+        else {
             return Ok(());
         };
         let identity = retention_key(request, self.message_hash_fallback);

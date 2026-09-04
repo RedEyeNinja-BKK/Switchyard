@@ -436,6 +436,7 @@ mod tests {
                 llm_request: text_request(Some("auto".to_string()), "fix the build"),
                 raw_request: None,
                 metadata: None,
+                candidate_input_tokens: Default::default(),
             },
             recorder.serve(),
         )
@@ -503,6 +504,7 @@ mod tests {
                 session_id: Some("session-1".to_string()),
                 ..Metadata::default()
             }),
+            candidate_input_tokens: Default::default(),
         }
     }
 

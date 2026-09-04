@@ -99,6 +99,7 @@ impl SwitchyardRuntime {
         Ok(Request {
             llm_request,
             raw_request: Some(request.content),
+            candidate_input_tokens: Default::default(),
             metadata: Some(metadata),
         })
     }

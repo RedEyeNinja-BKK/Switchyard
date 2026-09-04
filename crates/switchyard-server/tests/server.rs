@@ -1840,7 +1840,10 @@ targets = ["responses", "other", "strong"]
         calls[1],
         json!({
             "path": "/v1/responses/input_tokens",
-            "body": {"model": "real/responses-model", "input": "count me"},
+            // Always-list Responses input (temp-carry-pr-619): scalar `input`
+            // strings are normalized to the canonical message-item list form on
+            // every Responses path, auxiliary endpoints included.
+            "body": {"model": "real/responses-model", "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "count me"}]}]},
             "configured_header": "responses"
         })
     );
@@ -1848,7 +1851,7 @@ targets = ["responses", "other", "strong"]
         calls[2],
         json!({
             "path": "/v1/responses/compact",
-            "body": {"model": "real/responses-model", "input": "compact me"},
+            "body": {"model": "real/responses-model", "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "compact me"}]}]},
             "configured_header": "responses"
         })
     );

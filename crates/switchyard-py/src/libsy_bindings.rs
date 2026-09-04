@@ -648,6 +648,7 @@ impl PyAlgorithm {
             llm_request: from_python(request)?,
             raw_request: None,
             metadata: headers.map(|headers| Metadata::from_headers(&headers)),
+            candidate_input_tokens: Default::default(),
         };
         let stream = {
             let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();

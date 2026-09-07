@@ -336,11 +336,12 @@ impl TranslatingLlmClient {
             strip_unsigned_thinking_blocks(&mut body);
         }
         merge_extra_body(&mut body, backend.extra_body());
-        // The ChatGPT Codex backend rejects `max_output_tokens` outright (2026-08
-        // API), on every inbound path - chat (`max_tokens`), Responses passthrough,
-        // and preserved same-format bodies alike. Strip AFTER `merge_extra_body`
-        // so no target `extra_body` can reinstate it. Normal OpenAI
-        // `/v1/responses` backends keep the parameter.
+        // The ChatGPT Codex backend rejects `max_output_tokens` (2026-08 API)
+        // and `temperature` (2026-09 API, 400 "Unsupported parameter:
+        // temperature") outright, on every inbound path - chat (`max_tokens`),
+        // Responses passthrough, and preserved same-format bodies alike. Strip
+        // AFTER `merge_extra_body` so no target `extra_body` can reinstate
+        // either field. Normal OpenAI `/v1/responses` backends keep both.
         if backend.is_codex() {
             strip_codex_incompatible_fields(&mut body);
         }
@@ -1107,9 +1108,17 @@ fn is_unsigned_thinking_block(block: &Value) -> bool {
 
 // Applies target defaults without overriding fields supplied by the caller.
 // Removes fields the ChatGPT Codex Responses backend rejects outright.
+// `temperature` (2026-09): Codex backends answer 400 "Unsupported parameter:
+// temperature" whenever the field is present — including explicit null — on
+// both wire formats. Hermes profile configs carry `temperature`, so every
+// non-streaming bounded-lane call through a Codex target fails (observed 30/30
+// failures vs 259 streamed successes before this fix; see switchyard
+// switchyard_errors_total{model="gpt-5.6-luna"} 2026-09-07 reconciliation).
+// Normal OpenAI `/v1/responses` backends keep the parameter.
 fn strip_codex_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("max_output_tokens");
+        object.remove("temperature");
     }
 }
 
@@ -3026,11 +3035,12 @@ mod tests {
         );
         Ok(())
     }
-    // The ChatGPT Codex Responses backend rejects `max_output_tokens` on every
-    // inbound path; a normal OpenAI `/v1/responses` endpoint keeps it. The
-    // strip must be Codex-specific, not a blanket Responses-format behavior.
+    // The ChatGPT Codex Responses backend rejects `max_output_tokens` AND
+    // `temperature` on every inbound path; a normal OpenAI `/v1/responses`
+    // endpoint keeps them. The strip must be Codex-specific, not a blanket
+    // Responses-format behavior.
     #[tokio::test]
-    async fn codex_responses_requests_drop_max_output_tokens()
+    async fn codex_responses_requests_drop_codex_incompatible_fields()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3039,7 +3049,10 @@ mod tests {
             .and(path("/backend-api/codex/responses"))
             .and(move |request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
-                seen_for_mock.store(body.get("max_output_tokens").is_some(), Ordering::SeqCst);
+                seen_for_mock.store(
+                    body.get("max_output_tokens").is_some() || body.get("temperature").is_some(),
+                    Ordering::SeqCst,
+                );
                 true
             })
             // Codex legs are stream-mandatory; the client forces stream=true, so
@@ -3056,6 +3069,7 @@ mod tests {
         let raw = json!({
             "model": "client-facing",
             "max_output_tokens": 4096,
+            "temperature": 0.7,
             "input": "hi"
         });
         let response = client
@@ -3067,18 +3081,19 @@ mod tests {
             )
             .await?;
         assert!(matches!(response, RawResponse::Stream(_)));
-        // The parameter never reached the Codex-shaped upstream.
+        // Neither parameter ever reached the Codex-shaped upstream.
         assert!(
             !seen.load(Ordering::SeqCst),
-            "max_output_tokens leaked upstream"
+            "max_output_tokens or temperature leaked upstream"
         );
         Ok(())
     }
 
     // Chat requests routed to the Codex backend lose the translated
-    // `max_tokens -> max_output_tokens` field too.
+    // `max_tokens -> max_output_tokens` field too, plus caller `temperature`
+    // (Hermes profile configs carry it; the 2026-09 Codex API rejects it).
     #[tokio::test]
-    async fn codex_chat_requests_drop_translated_max_output_tokens()
+    async fn codex_chat_requests_drop_codex_incompatible_fields()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3087,7 +3102,10 @@ mod tests {
             .and(path("/backend-api/codex/responses"))
             .and(move |request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
-                seen_for_mock.store(body.get("max_output_tokens").is_some(), Ordering::SeqCst);
+                seen_for_mock.store(
+                    body.get("max_output_tokens").is_some() || body.get("temperature").is_some(),
+                    Ordering::SeqCst,
+                );
                 true
             })
             // Codex legs are stream-mandatory; the client forces stream=true,
@@ -3105,6 +3123,7 @@ mod tests {
         let raw = json!({
             "model": "client-facing",
             "max_tokens": 512,
+            "temperature": 0.7,
             "messages": [{"role": "user", "content": "hi"}]
         });
         // Inbound chat -> internal -> outbound Responses (forced stream).
@@ -3119,7 +3138,7 @@ mod tests {
         assert!(matches!(response, RawResponse::Stream(_)));
         assert!(
             !seen.load(Ordering::SeqCst),
-            "translated max_output_tokens leaked upstream"
+            "translated max_output_tokens or temperature leaked upstream"
         );
         Ok(())
     }
@@ -3175,9 +3194,10 @@ mod tests {
         Ok(())
     }
 
-    // Non-Codex OpenAI Responses backends keep `max_output_tokens`.
+    // Non-Codex OpenAI Responses backends keep `max_output_tokens` and
+    // `temperature`.
     #[tokio::test]
-    async fn openai_responses_requests_keep_max_output_tokens()
+    async fn openai_responses_requests_keep_codex_incompatible_fields()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3187,7 +3207,8 @@ mod tests {
             .and(move |request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
                 seen_for_mock.store(
-                    body.get("max_output_tokens") == Some(&json!(4096)),
+                    body.get("max_output_tokens") == Some(&json!(4096))
+                        && body.get("temperature") == Some(&json!(0.7)),
                     Ordering::SeqCst,
                 );
                 true
@@ -3208,6 +3229,7 @@ mod tests {
         let raw = json!({
             "model": "client-facing",
             "max_output_tokens": 4096,
+            "temperature": 0.7,
             "input": "hi"
         });
         let RawResponse::Buffered(body) = client
@@ -3224,7 +3246,7 @@ mod tests {
         assert_eq!(body["status"], "completed");
         assert!(
             seen.load(Ordering::SeqCst),
-            "non-codex Responses backends keep max_output_tokens"
+            "non-codex Responses backends keep max_output_tokens and temperature"
         );
         Ok(())
     }
@@ -3279,9 +3301,9 @@ mod tests {
     }
 
     // Negative control: a URL that merely CONTAINS a codex-like path segment is
-    // not a Codex backend; the parameter must survive.
+    // not a Codex backend; neither field may be stripped.
     #[tokio::test]
-    async fn codex_near_match_urls_keep_max_output_tokens()
+    async fn codex_near_match_urls_keep_codex_incompatible_fields()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         for near_path in ["/backend-api/codex-compat", "/not-backend-api/codex"] {
             let server = MockServer::start().await;
@@ -3297,7 +3319,8 @@ mod tests {
                 .and(move |request: &wiremock::Request| {
                     let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
                     seen_for_mock.store(
-                        body.get("max_output_tokens") == Some(&json!(4096)),
+                        body.get("max_output_tokens") == Some(&json!(4096))
+                            && body.get("temperature") == Some(&json!(0.7)),
                         Ordering::SeqCst,
                     );
                     true
@@ -3319,6 +3342,7 @@ mod tests {
             let raw = json!({
                 "model": "client-facing",
                 "max_output_tokens": 4096,
+                "temperature": 0.7,
                 "input": "hi"
             });
             let RawResponse::Buffered(body) = client
@@ -3335,7 +3359,7 @@ mod tests {
             assert_eq!(body["status"], "completed");
             assert!(
                 seen.load(Ordering::SeqCst),
-                "near-match URL must not be treated as Codex"
+                "near-match URL must not be treated as Codex (both fields kept)"
             );
         }
         Ok(())

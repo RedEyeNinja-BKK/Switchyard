@@ -1190,7 +1190,12 @@ fn responses_image_part(source: &ImageSource) -> Option<Value> {
     let url = match source {
         ImageSource::Url { url, .. } => url.clone(),
         ImageSource::Base64 { media_type, data } => {
-            let media_type = media_type.as_deref().unwrap_or("application/octet-stream");
+            // No guessed MIME: see `raw_image_url` for the rationale (a wrong
+            // MIME is a whole-turn 400 upstream; refusing degrades one image).
+            let media_type = media_type.as_deref()?;
+            if media_type.is_empty() || data.is_empty() {
+                return None;
+            }
             format!("data:{media_type};base64,{data}")
         }
         ImageSource::Raw(raw) => raw_image_url(raw)?,
@@ -1206,6 +1211,18 @@ fn responses_image_part(source: &ImageSource) -> Option<Value> {
 /// Accepts the shapes the inbound decoders can leave un-normalized: an
 /// Anthropic-style `{"type":"image","source":{…}}` wrapper, a bare `url`, a
 /// Chat-style nested `image_url` object, and base64 `data` + `media_type`.
+///
+/// Empty strings are treated as ABSENT at every extraction step: a raw source
+/// such as `{"url":"","data":"AAAA","media_type":"image/png"}` must fall
+/// through to its base64 representation instead of being rejected on the strength
+/// of an empty placeholder (review finding 3, 2026-09-11).
+///
+/// A base64 payload with no `media_type` yields `None` rather than a guessed
+/// MIME: `data:application/octet-stream;base64,…` is *syntactically* a URL but is
+/// not a usable image, and the Responses/Codex backend validates image sources —
+/// a guessed MIME would turn one unreadable image into a 400 for the WHOLE
+/// turn, whereas refusing lets the caller degrade to a text block with a
+/// diagnostic and keeps the turn alive (review finding 1, 2026-09-11).
 fn raw_image_url(raw: &Value) -> Option<String> {
     let object = raw.as_object()?;
     let object = if object.get("type").and_then(Value::as_str) == Some("image") {
@@ -1213,25 +1230,30 @@ fn raw_image_url(raw: &Value) -> Option<String> {
     } else {
         object
     };
-    if let Some(url) = object.get("url").and_then(Value::as_str) {
-        return Some(url.to_string());
-    }
-    if let Some(url) = object.get("image_url").and_then(Value::as_str) {
-        return Some(url.to_string());
-    }
-    if let Some(url) = object
-        .get("image_url")
-        .and_then(Value::as_object)
-        .and_then(|inner| inner.get("url"))
-        .and_then(Value::as_str)
+    for candidate in [
+        object.get("url").and_then(Value::as_str),
+        object.get("image_url").and_then(Value::as_str),
+        object
+            .get("image_url")
+            .and_then(Value::as_object)
+            .and_then(|inner| inner.get("url"))
+            .and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
     {
-        return Some(url.to_string());
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
     }
     let data = object.get("data").and_then(Value::as_str)?;
-    let media_type = object
-        .get("media_type")
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream");
+    if data.is_empty() {
+        return None;
+    }
+    let media_type = object.get("media_type").and_then(Value::as_str)?;
+    if media_type.is_empty() {
+        return None;
+    }
     Some(format!("data:{media_type};base64,{data}"))
 }
 

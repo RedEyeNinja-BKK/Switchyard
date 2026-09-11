@@ -2757,3 +2757,59 @@ fn chat_image_shapes_render_as_responses_url_strings() -> TestResult {
     assert!(translated.diagnostics.is_empty());
     Ok(())
 }
+
+// Un-representable image sources must degrade to a TEXT block with a lossy
+// diagnostic rather than emitting a non-string or empty `image_url` (which the
+// upstream rejects for the whole turn). Covers the two refusal paths the
+// 2026-09-11 review required pinning: an empty URL, and an un-normalized base64
+// payload that carries no media type to build a usable data: URL from.
+#[test]
+fn unmappable_image_sources_degrade_to_text_with_diagnostic() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": ""}},
+                {"type": "image_url", "image_url": {"data": "AAAA"}},
+            ]
+        }]
+    });
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &body,
+        &normalized_policy(),
+    )?;
+
+    let content = translated.body["input"][0]["content"]
+        .as_array()
+        .expect("content stays blocks");
+    assert!(
+        content
+            .iter()
+            .all(|block| block["type"] != json!("input_image")),
+        "no image part may be emitted for an unmappable source: {content:?}"
+    );
+    assert!(
+        content.iter().all(|block| match block.get("image_url") {
+            None => true,
+            Some(value) => value.is_string() && !value.as_str().unwrap_or("").is_empty(),
+        }),
+        "an emitted image_url must be a non-empty string: {content:?}"
+    );
+    // Text-only fallbacks keep the input-oriented block type for a user turn.
+    assert!(
+        content
+            .iter()
+            .any(|block| block["type"] == json!("input_text")),
+        "expected an input_text fallback block: {content:?}"
+    );
+    assert!(
+        !translated.diagnostics.is_empty(),
+        "an unmappable image must be reported as a lossy conversion"
+    );
+    Ok(())
+}

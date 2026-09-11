@@ -2706,6 +2706,54 @@ fn strict_codex_profile_keeps_user_multimodal_content_input_oriented() -> TestRe
         .as_array()
         .expect("multimodal content stays blocks");
     assert_eq!(content[1]["type"], "input_image");
+    // The Responses API requires image_url to be a STRING. Emitting the IR
+    // object here made every upstream reject the request with "expected an image
+    // URL, but got an object instead" — pinned so the shape cannot regress.
+    assert_eq!(
+        content[1]["image_url"],
+        json!("https://example.test/x.png"),
+        "input_image.image_url must be a URL string, not the IR object"
+    );
+    assert!(translated.diagnostics.is_empty());
+    Ok(())
+}
+
+// A base64 chat image must reach the Responses wire as a data: URL string, and a
+// nested chat object shape must be unwrapped to its bare URL.
+#[test]
+fn chat_image_shapes_render_as_responses_url_strings() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "two"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "image_url", "image_url": "https://example.test/bare.png"},
+            ]
+        }]
+    });
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &body,
+        &normalized_policy(),
+    )?;
+
+    let content = translated.body["input"][0]["content"]
+        .as_array()
+        .expect("multimodal content stays blocks");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[1]["image_url"], json!("data:image/png;base64,AAAA"));
+    assert_eq!(content[2]["type"], "input_image");
+    assert_eq!(content[2]["image_url"], json!("https://example.test/bare.png"));
+    let images: Vec<_> = content
+        .iter()
+        .filter(|block| block["type"] == json!("input_image"))
+        .collect();
+    assert_eq!(images.len(), 2);
+    assert!(images.iter().all(|block| block["image_url"].is_string()));
     assert!(translated.diagnostics.is_empty());
     Ok(())
 }

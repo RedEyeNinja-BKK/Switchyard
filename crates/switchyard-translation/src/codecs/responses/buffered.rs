@@ -18,9 +18,9 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, InstructionBlock, LlmRequest, MediaSource, Message, OutputParams,
-    ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams, StopReason,
-    ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse, ContentBlock, ImageSource, InstructionBlock, LlmRequest, MediaSource, Message,
+    OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -1168,6 +1168,73 @@ fn normalize_input_to_message_list(body: &mut Value) {
     }
 }
 
+/// Maps an IR image source to a Responses `input_image` content part.
+///
+/// The Responses API requires `input_image.image_url` to be a STRING, but the IR
+/// `ImageSource` is a serde-tagged enum (`{"type":…,"data":…}`) that serialises
+/// to an OBJECT — passing it straight through makes every upstream reject the
+/// request with "expected an image URL, but got an object instead" (#vision).
+/// This renders the source into its URL string, exactly as the proven Codex
+/// transport does (`openai_codex_catalog_gateway._text_parts` emits
+/// `{"type": "input_image", "image_url": <str>}`) and as the Chat codec's
+/// sibling `openai_image_part` does for the other wire format.
+///
+/// `detail` is deliberately NOT forwarded: the proven Codex transport drops it
+/// too, and uniform behaviour across both transport paths is worth more than a
+/// hint no validated endpoint has been shown to accept. The IR keeps the field
+/// so a future profile-scoped change can forward it.
+///
+/// Returns `None` for a raw source with no extractable URL, which the caller
+/// degrades to text with a lossy diagnostic.
+fn responses_image_part(source: &ImageSource) -> Option<Value> {
+    let url = match source {
+        ImageSource::Url { url, .. } => url.clone(),
+        ImageSource::Base64 { media_type, data } => {
+            let media_type = media_type.as_deref().unwrap_or("application/octet-stream");
+            format!("data:{media_type};base64,{data}")
+        }
+        ImageSource::Raw(raw) => raw_image_url(raw)?,
+    };
+    if url.is_empty() {
+        return None;
+    }
+    Some(json!({"type": "input_image", "image_url": url}))
+}
+
+/// Best-effort URL extraction from an un-normalized provider image source.
+///
+/// Accepts the shapes the inbound decoders can leave un-normalized: an
+/// Anthropic-style `{"type":"image","source":{…}}` wrapper, a bare `url`, a
+/// Chat-style nested `image_url` object, and base64 `data` + `media_type`.
+fn raw_image_url(raw: &Value) -> Option<String> {
+    let object = raw.as_object()?;
+    let object = if object.get("type").and_then(Value::as_str) == Some("image") {
+        object.get("source").and_then(Value::as_object)?
+    } else {
+        object
+    };
+    if let Some(url) = object.get("url").and_then(Value::as_str) {
+        return Some(url.to_string());
+    }
+    if let Some(url) = object.get("image_url").and_then(Value::as_str) {
+        return Some(url.to_string());
+    }
+    if let Some(url) = object
+        .get("image_url")
+        .and_then(Value::as_object)
+        .and_then(|inner| inner.get("url"))
+        .and_then(Value::as_str)
+    {
+        return Some(url.to_string());
+    }
+    let data = object.get("data").and_then(Value::as_str)?;
+    let media_type = object
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream");
+    Some(format!("data:{media_type};base64,{data}"))
+}
+
 fn role_to_responses(role: Role) -> &'static str {
     match role {
         Role::Assistant => "assistant",
@@ -1261,9 +1328,17 @@ fn encode_responses_content(
             ContentBlock::Refusal { text } => {
                 blocks.push(json!({"type": "refusal", "refusal": text}));
             }
-            ContentBlock::Image { source } => {
-                blocks.push(json!({"type": "input_image", "image_url": source}));
-            }
+            ContentBlock::Image { source } => match responses_image_part(source) {
+                Some(part) => blocks.push(part),
+                None => {
+                    push_lossy(
+                        diagnostics,
+                        policy,
+                        "Responses codec could not map image content",
+                    )?;
+                    blocks.push(json!({"type": text_type, "text": json_string(&json!(source))}));
+                }
+            },
             ContentBlock::Audio { source } => blocks.push(match source {
                 MediaSource::Raw(raw) => json!({"type": "input_text", "text": json_string(raw)}),
                 MediaSource::Url { url, media_type } => json!({

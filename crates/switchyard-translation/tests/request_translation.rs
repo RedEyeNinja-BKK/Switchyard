@@ -2747,7 +2747,10 @@ fn chat_image_shapes_render_as_responses_url_strings() -> TestResult {
     assert_eq!(content[1]["type"], "input_image");
     assert_eq!(content[1]["image_url"], json!("data:image/png;base64,AAAA"));
     assert_eq!(content[2]["type"], "input_image");
-    assert_eq!(content[2]["image_url"], json!("https://example.test/bare.png"));
+    assert_eq!(
+        content[2]["image_url"],
+        json!("https://example.test/bare.png")
+    );
     let images: Vec<_> = content
         .iter()
         .filter(|block| block["type"] == json!("input_image"))

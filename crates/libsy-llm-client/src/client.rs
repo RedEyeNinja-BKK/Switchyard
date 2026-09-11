@@ -1126,11 +1126,20 @@ fn is_unsigned_thinking_block(block: &Value) -> bool {
 // Normal OpenAI `/v1/responses` backends keep the parameter.
 /// Removes replayed reasoning payloads from outbound chat `messages`.
 ///
-/// Scoped to `messages[]` entries: Switchyard's OpenAI-Chat encoder emits
-/// `reasoning_content` (plaintext) or `reasoning_details` (structured) on
-/// assistant turns. Bodies without a `messages` array (e.g. the Responses
-/// `input[]` shape) are left untouched - the flag is a no-op there rather than
-/// a silent rewrite of an unrelated field.
+/// Scoped to `messages[]` entries. Switchyard's OpenAI-Chat encoder produces
+/// THREE per-message shapes and all three must go:
+///   * `reasoning`         - plaintext reasoning with no structured provider
+///                           representation (codecs/openai_chat/buffered.rs
+///                           `encode_openai_message_plaintext_reasoning`)
+///   * `reasoning_content` - plaintext recovered from structured details
+///   * `reasoning_details` - the structured provider details array
+/// Removing only a subset silently defeats the opt-out for the other encoder
+/// path, so the list is deliberately exhaustive (review finding, 2026-09-12).
+///
+/// Bodies without a `messages` array (e.g. the Responses `input[]` shape) are
+/// left untouched - the flag is a no-op there rather than a silent rewrite of
+/// an unrelated field. Top-level request fields (including the target's own
+/// `reasoning` policy) are NOT touched; only message-level payloads are.
 fn strip_message_reasoning_content(body: &mut Value) {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
@@ -1139,6 +1148,7 @@ fn strip_message_reasoning_content(body: &mut Value) {
         let Value::Object(object) = message else {
             continue;
         };
+        object.remove("reasoning");
         object.remove("reasoning_content");
         object.remove("reasoning_details");
     }
@@ -3571,20 +3581,50 @@ mod strip_reasoning_content_tests {
     }
 
     #[test]
-    fn removes_both_reasoning_shapes_from_assistant_turns() {
+    fn removes_every_encoder_shaped_reasoning_key() {
         let mut body = body_with_reasoning();
         strip_message_reasoning_content(&mut body);
         let messages = body["messages"].as_array().expect("messages array");
         for message in messages {
-            assert!(
-                message.get("reasoning_content").is_none(),
-                "reasoning_content survived"
-            );
-            assert!(
-                message.get("reasoning_details").is_none(),
-                "reasoning_details survived"
-            );
+            for key in ["reasoning", "reasoning_content", "reasoning_details"] {
+                assert!(message.get(key).is_none(), "{key} survived");
+            }
         }
+    }
+
+    /// The plaintext encoder path (`encode_openai_message_plaintext_reasoning`)
+    /// emits the BARE `reasoning` key, not `reasoning_content`. This fixture
+    /// mirrors that shape exactly - the 2026-09-12 review found the original
+    /// two-key list silently missed it.
+    #[test]
+    fn removes_plaintext_encoder_key() {
+        let mut body = json!({
+            "model": "qwen/qwen3.7-flash",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "a", "reasoning": "stored CoT"}
+            ]
+        });
+        strip_message_reasoning_content(&mut body);
+        assert!(
+            body["messages"][1].get("reasoning").is_none(),
+            "plaintext `reasoning` key survived the strip"
+        );
+        assert_eq!(body["messages"][1]["content"], json!("a"));
+    }
+
+    /// A target's top-level `reasoning` policy is NOT a message payload and must
+    /// survive - the strip is message-scoped by design.
+    #[test]
+    fn leaves_top_level_reasoning_policy_alone() {
+        let mut body = json!({
+            "model": "m",
+            "reasoning": {"effort": "none"},
+            "messages": [{"role": "assistant", "content": "a", "reasoning": "CoT"}]
+        });
+        strip_message_reasoning_content(&mut body);
+        assert_eq!(body["reasoning"], json!({"effort": "none"}));
+        assert!(body["messages"][0].get("reasoning").is_none());
     }
 
     #[test]

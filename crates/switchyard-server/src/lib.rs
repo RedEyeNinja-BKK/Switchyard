@@ -1095,7 +1095,16 @@ async fn handle_endpoint_inner(
     let routing_log_context = state
         .routing_log
         .as_ref()
-        .map(|_| routing_log::RoutingLogContext::from_metadata(&metadata));
+        .map(|_| routing_log::RoutingLogContext::from_metadata(&metadata))
+        .map(|context| {
+            context.with_requested_model(
+                body.as_ref()
+                    .ok()
+                    .and_then(|body| body.0.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            )
+        });
     let request_log = RequestLogContext {
         started: started.0,
         wire_format,

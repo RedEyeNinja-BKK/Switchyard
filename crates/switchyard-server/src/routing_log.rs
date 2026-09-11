@@ -54,6 +54,7 @@ impl RoutingLog {
             task: context.task.map(Cow::Owned),
             trial_id: context.trial_id.map(Cow::Owned),
             session_id: context.session_id.map(Cow::Owned),
+            requested_model: context.requested_model.map(Cow::Owned),
             model: model.into(),
             tier: tier.unwrap_or("").into(),
             prompt_tokens: usage.prompt_tokens,
@@ -101,6 +102,14 @@ pub(crate) struct RoutingLogContext {
     task: Option<String>,
     trial_id: Option<String>,
     session_id: Option<String>,
+    /// The route id the CALLER asked for (e.g. `switchyard/deepseek/deepseek-flash-thinking`).
+    ///
+    /// Deliberately separate from the record's `model` field, which is the upstream WIRE
+    /// model id. Several targets can share one wire id while pinning different behaviour
+    /// (thinking / nothink / neutral all send `deepseek-flash`), so `model` alone cannot
+    /// attribute traffic to a lane. `model` is left byte-identical for existing consumers
+    /// (dashboards, the econ join); this field is purely additive and optional.
+    requested_model: Option<String>,
 }
 
 impl RoutingLogContext {
@@ -119,7 +128,14 @@ impl RoutingLogContext {
                     .and_then(|headers| nonempty_header(headers, LEGACY_SESSION_ID_HEADER))
                     .map(str::to_string)
             }),
+            requested_model: None,
         }
+    }
+
+    /// Attach the caller-requested route id (see the field docs).
+    pub(crate) fn with_requested_model(mut self, requested_model: Option<String>) -> Self {
+        self.requested_model = requested_model;
+        self
     }
 }
 
@@ -136,6 +152,8 @@ struct RoutingRecord<'a> {
     trial_id: Option<Cow<'a, str>>,
     #[serde(borrow)]
     session_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    requested_model: Option<Cow<'a, str>>,
     model: Cow<'a, str>,
     tier: Cow<'a, str>,
     prompt_tokens: u64,

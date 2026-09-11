@@ -60,6 +60,13 @@ pub struct HttpBackendConfig {
     pub extra_body: BTreeMap<String, Value>,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
+    /// Drop any reasoning payload carried on outbound chat `messages`.
+    ///
+    /// Some upstreams (OpenRouter-hosted reasoning models) tolerate but do not
+    /// require replayed chain-of-thought, and bill for it on every turn. Set on
+    /// the TARGET; applied after `merge_extra_body` so no `extra_body` can
+    /// reinstate the field once the target has removed it.
+    pub strip_reasoning_content: bool,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -127,6 +134,11 @@ impl Backend {
     }
 
     // Shared HTTP config, regardless of variant.
+    /// Whether this backend drops reasoning payloads from outbound messages.
+    pub fn strip_reasoning_content(&self) -> bool {
+        self.config().strip_reasoning_content
+    }
+
     fn config(&self) -> &HttpBackendConfig {
         match self {
             Backend::OpenAiChat(config)
@@ -453,6 +465,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
+            strip_reasoning_content: false,
         }
     }
 

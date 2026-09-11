@@ -30,7 +30,14 @@ fn live_routes_toml_parses_unchanged() {
         Ok(runner) => {
             let count = runner.models().count();
             println!("PARSED OK: {count} routes");
-            assert!(count > 50, "expected ~58 routes, got {count}");
+            // Guards that the LIVE config is populated and parseable, not a
+            // frozen count: 2026-09-12 retired the 9 `*-thinking` routes, taking
+            // the surface from 55 to 46 (44 routes + 2 capabilities). Keep this a
+            // lower bound so intentional retirements do not read as regressions.
+            assert!(
+                count > 40,
+                "expected a populated live config (~46), got {count}"
+            );
             assert!(runner.fleet_state().is_some(), "fleet state present");
             assert!(
                 runner.fleet_readiness().is_some(),

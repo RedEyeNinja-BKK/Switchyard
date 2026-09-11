@@ -497,6 +497,7 @@ fn random_state_with_retries(
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         max_retries,
+        strip_reasoning_content: false,
     });
     let target_models = routes
         .iter()

@@ -345,6 +345,15 @@ impl TranslatingLlmClient {
         if backend.is_codex() {
             strip_codex_incompatible_fields(&mut body);
         }
+        // Target-opted-out reasoning replay. The OpenAI-Chat encoder attaches
+        // stored/round reasoning to assistant turns (`reasoning_content`
+        // plaintext, `reasoning_details` structured); a target that neither
+        // requires nor wants it pays for those tokens on every subsequent turn.
+        // Applied AFTER `merge_extra_body`, matching the Codex strip above, so
+        // no target `extra_body` can reinstate a field the target removed.
+        if backend.strip_reasoning_content() {
+            strip_message_reasoning_content(&mut body);
+        }
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -1115,6 +1124,26 @@ fn is_unsigned_thinking_block(block: &Value) -> bool {
 // failures vs 259 streamed successes before this fix; see switchyard
 // switchyard_errors_total{model="gpt-5.6-luna"} 2026-09-07 reconciliation).
 // Normal OpenAI `/v1/responses` backends keep the parameter.
+/// Removes replayed reasoning payloads from outbound chat `messages`.
+///
+/// Scoped to `messages[]` entries: Switchyard's OpenAI-Chat encoder emits
+/// `reasoning_content` (plaintext) or `reasoning_details` (structured) on
+/// assistant turns. Bodies without a `messages` array (e.g. the Responses
+/// `input[]` shape) are left untouched - the flag is a no-op there rather than
+/// a silent rewrite of an unrelated field.
+fn strip_message_reasoning_content(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Value::Object(object) = message else {
+            continue;
+        };
+        object.remove("reasoning_content");
+        object.remove("reasoning_details");
+    }
+}
+
 fn strip_codex_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("max_output_tokens");
@@ -1279,12 +1308,14 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
+            strip_reasoning_content: false,
         }
     }
 
     fn config_with_retries(base_url: &str, max_retries: u32) -> HttpBackendConfig {
         HttpBackendConfig {
             max_retries,
+            strip_reasoning_content: false,
             ..config(base_url)
         }
     }
@@ -3519,5 +3550,61 @@ mod tests {
             Some("ref-1"),
         );
         Ok(())
+    }
+}
+#[cfg(test)]
+mod strip_reasoning_content_tests {
+    use super::strip_message_reasoning_content;
+    use serde_json::json;
+
+    fn body_with_reasoning() -> serde_json::Value {
+        json!({
+            "model": "qwen/qwen3.7-flash",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "a",
+                 "reasoning_content": "stored CoT", "reasoning_details": [{"x": 1}]},
+                {"role": "user", "content": "again"},
+                {"role": "assistant", "content": "b", "reasoning_content": ""}
+            ]
+        })
+    }
+
+    #[test]
+    fn removes_both_reasoning_shapes_from_assistant_turns() {
+        let mut body = body_with_reasoning();
+        strip_message_reasoning_content(&mut body);
+        let messages = body["messages"].as_array().expect("messages array");
+        for message in messages {
+            assert!(
+                message.get("reasoning_content").is_none(),
+                "reasoning_content survived"
+            );
+            assert!(
+                message.get("reasoning_details").is_none(),
+                "reasoning_details survived"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_other_fields_and_roles_intact() {
+        let mut body = body_with_reasoning();
+        strip_message_reasoning_content(&mut body);
+        assert_eq!(body["model"], json!("qwen/qwen3.7-flash"));
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"], json!("hi"));
+        assert_eq!(messages[1]["content"], json!("a"));
+        assert_eq!(messages[3]["role"], json!("assistant"));
+    }
+
+    #[test]
+    fn no_messages_array_is_a_noop() {
+        // Responses-shaped body: must not be rewritten.
+        let mut body = json!({"model": "m", "input": [{"reasoning_content": "keep"}]});
+        let before = body.clone();
+        strip_message_reasoning_content(&mut body);
+        assert_eq!(body, before);
     }
 }

@@ -409,7 +409,7 @@ impl DeploymentConfig {
 
         for (name, client_config) in &self.llm_clients {
             validate_value("llm client name", name)?;
-            build_backend(name, client_config, &BTreeMap::new())?;
+            build_backend(name, client_config, &BTreeMap::new(), false)?;
         }
         for (target_name, target) in &self.targets {
             let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
@@ -425,7 +425,12 @@ impl DeploymentConfig {
                 })?;
             model_configs.push(ModelConfig::new(
                 target.id.clone(),
-                build_backend(&target.llm_client, client_config, &target.extra_body)?,
+                build_backend(
+                    &target.llm_client,
+                    client_config,
+                    &target.extra_body,
+                    target.strip_reasoning_content,
+                )?,
                 None,
             ));
         }
@@ -672,6 +677,11 @@ struct TargetConfig {
     llm_client: String,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
+    /// Drop replayed reasoning payloads from outbound messages for this target.
+    /// Set on OpenRouter-hosted lanes so replayed chain-of-thought is never
+    /// forwarded to a provider that bills for it without requiring it.
+    #[serde(default)]
+    strip_reasoning_content: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -704,6 +714,7 @@ fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
+    strip_reasoning_content: bool,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -744,6 +755,7 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         max_retries: config.max_retries,
+        strip_reasoning_content,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -1436,7 +1448,7 @@ target = "azure"
         let Some(client) = config.llm_clients.get("primary") else {
             return Err(RunnerError::configuration("primary llm client is missing"));
         };
-        let backend = build_backend("primary", client, &target.extra_body)?;
+        let backend = build_backend("primary", client, &target.extra_body, false)?;
 
         assert_eq!(
             backend.extra_body().get("service_tier"),

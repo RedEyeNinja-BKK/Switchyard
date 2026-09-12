@@ -1837,18 +1837,29 @@ async fn embeddings_handler(
 ) -> Response {
     let body = match llm_json_body(body) {
         Ok(body) => body,
-        Err((status, message)) => return invalid_body_error(status, message),
+        Err((status, message)) => {
+            // Pre-identity refusal: the body could not be parsed, so there is no model
+            // string and no route to attribute this to. Counted anyway -- this is a
+            // capability request that was refused, and leaving it uncounted would make
+            // the request counter an incomplete record of admission decisions.
+            metrics::record_capability_unresolved("embedding", "invalid_body");
+            return invalid_body_error(status, message);
+        }
     };
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let Some(route) = state
-        .capabilities
-        .get(&ModelId::from(model.as_str()))
-        .cloned()
-    else {
+    // The single label source for every metric below. `ModelId::from` is an identity
+    // transform today, so this currently equals the request string -- but it is the key
+    // we actually look up with, which makes the label the RESOLVED route id by
+    // construction rather than by assumption. If `ModelId::from` ever gains
+    // normalisation, the label still tracks the real map key and cardinality stays
+    // bounded by the configured capability ids.
+    let route_id = ModelId::from(model.as_str());
+    let Some(route) = state.capabilities.get(&route_id).cloned() else {
+        metrics::record_capability_unresolved("embedding", "unknown_model");
         return error_response(
             StatusCode::NOT_FOUND,
             format!("unknown embedding model {model}"),
@@ -1856,12 +1867,16 @@ async fn embeddings_handler(
             "unknown_model",
         );
     };
+    // Instrumented from here on: everything below is either admission or executor
+    // work, and must be attributed to the resolved route id.
+    let mut call = metrics::CapabilityCall::start("embedding", route_id.as_str());
     let CapabilityKind::Embedding {
         dimensions,
         max_batch,
         ..
     } = &route.kind
     else {
+        call.outcome("wrong_capability");
         return error_response(
             StatusCode::BAD_REQUEST,
             format!("{model} is not an embedding capability"),
@@ -1875,6 +1890,7 @@ async fn embeddings_handler(
         _ => 0,
     };
     if count == 0 {
+        call.outcome("invalid_input");
         return error_response(
             StatusCode::BAD_REQUEST,
             "input must be a non-empty string or array",
@@ -1883,6 +1899,7 @@ async fn embeddings_handler(
         );
     }
     if count > *max_batch {
+        call.outcome("batch_too_large");
         return error_response(
             StatusCode::BAD_REQUEST,
             format!("input exceeds max_batch {max_batch}"),
@@ -1897,9 +1914,18 @@ async fn embeddings_handler(
             Value::String(route.client.model().to_string()),
         );
     }
-    match route.client.call(executor_body).await {
+    metrics::record_capability_items("embedding", count as u64);
+    let started = std::time::Instant::now();
+    let result = route.client.call(executor_body).await;
+    metrics::record_capability_duration(
+        "embedding",
+        route_id.as_str(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    match result {
         Ok(value) => {
             if let Err(message) = capability::validate_embedding_response(&value, *dimensions) {
+                call.outcome("embedding_invalid");
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     message,
@@ -1907,14 +1933,18 @@ async fn embeddings_handler(
                     "embedding_invalid",
                 );
             }
+            call.outcome("ok");
             (StatusCode::OK, Json(value)).into_response()
         }
-        Err(error) => error_response(
-            StatusCode::BAD_GATEWAY,
-            error.to_string(),
-            "server_error",
-            "executor_error",
-        ),
+        Err(error) => {
+            call.outcome("executor_error");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                "server_error",
+                "executor_error",
+            )
+        }
     }
 }
 
@@ -1927,18 +1957,25 @@ async fn rerank_handler(
 ) -> Response {
     let body = match llm_json_body(body) {
         Ok(body) => body,
-        Err((status, message)) => return invalid_body_error(status, message),
+        Err((status, message)) => {
+            // Pre-identity refusal: the body could not be parsed, so there is no model
+            // string and no route to attribute this to. Counted anyway -- this is a
+            // capability request that was refused, and leaving it uncounted would make
+            // the request counter an incomplete record of admission decisions.
+            metrics::record_capability_unresolved("rerank", "invalid_body");
+            return invalid_body_error(status, message);
+        }
     };
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let Some(route) = state
-        .capabilities
-        .get(&ModelId::from(model.as_str()))
-        .cloned()
-    else {
+    // The single label source for every metric below. See the embeddings handler for why
+    // this is the resolved map key rather than the raw request string.
+    let route_id = ModelId::from(model.as_str());
+    let Some(route) = state.capabilities.get(&route_id).cloned() else {
+        metrics::record_capability_unresolved("rerank", "unknown_model");
         return error_response(
             StatusCode::NOT_FOUND,
             format!("unknown rerank model {model}"),
@@ -1946,6 +1983,9 @@ async fn rerank_handler(
             "unknown_model",
         );
     };
+    // Instrumented from here on: everything below is either admission or executor
+    // work, and must be attributed to the resolved route id.
+    let mut call = metrics::CapabilityCall::start("rerank", route_id.as_str());
     let CapabilityKind::Rerank {
         max_candidates,
         top_n,
@@ -1953,6 +1993,7 @@ async fn rerank_handler(
         max_query_chars,
     } = &route.kind
     else {
+        call.outcome("wrong_capability");
         return error_response(
             StatusCode::BAD_REQUEST,
             format!("{model} is not a rerank capability"),
@@ -1965,6 +2006,7 @@ async fn rerank_handler(
         .and_then(Value::as_str)
         .unwrap_or_default();
     if query.trim().is_empty() {
+        call.outcome("invalid_query");
         return error_response(
             StatusCode::BAD_REQUEST,
             "query must be a non-empty string",
@@ -1973,6 +2015,7 @@ async fn rerank_handler(
         );
     }
     if query.chars().count() > *max_query_chars {
+        call.outcome("query_too_long");
         return error_response(
             StatusCode::BAD_REQUEST,
             format!("query exceeds max_query_chars {max_query_chars}"),
@@ -1986,6 +2029,7 @@ async fn rerank_handler(
         .cloned()
         .unwrap_or_default();
     if documents.is_empty() {
+        call.outcome("invalid_documents");
         return error_response(
             StatusCode::BAD_REQUEST,
             "documents must be a non-empty array",
@@ -1994,6 +2038,7 @@ async fn rerank_handler(
         );
     }
     if documents.len() > *max_candidates {
+        call.outcome("too_many_candidates");
         return error_response(
             StatusCode::BAD_REQUEST,
             format!("documents exceeds max_candidates {max_candidates}"),
@@ -2001,6 +2046,10 @@ async fn rerank_handler(
             "too_many_candidates",
         );
     }
+    // Track the longest document as it is validated: the distribution of this
+    // value against the 4096 boundary is what makes an instant batch-wide 400
+    // predictable rather than surprising.
+    let mut longest_doc_chars = 0usize;
     for document in &documents {
         let text = match document {
             Value::String(text) => text.clone(),
@@ -2011,7 +2060,10 @@ async fn rerank_handler(
                 .to_string(),
             _ => String::new(),
         };
-        if text.chars().count() > *max_doc_chars {
+        let chars = text.chars().count();
+        longest_doc_chars = longest_doc_chars.max(chars);
+        if chars > *max_doc_chars {
+            call.outcome("document_too_long");
             return error_response(
                 StatusCode::BAD_REQUEST,
                 format!("document exceeds max_doc_chars {max_doc_chars}"),
@@ -2020,6 +2072,7 @@ async fn rerank_handler(
             );
         }
     }
+    metrics::record_capability_max_doc_chars("rerank", longest_doc_chars as u64);
     let requested_top_n = body
         .get("top_n")
         .and_then(Value::as_u64)
@@ -2035,6 +2088,7 @@ async fn rerank_handler(
     ) {
         Ok(body) => body,
         Err(message) => {
+            call.outcome("invalid_documents");
             return error_response(
                 StatusCode::BAD_REQUEST,
                 message,
@@ -2043,9 +2097,18 @@ async fn rerank_handler(
             );
         }
     };
-    match route.client.call(executor_body).await {
+    metrics::record_capability_items("rerank", documents.len() as u64);
+    let started = std::time::Instant::now();
+    let result = route.client.call(executor_body).await;
+    metrics::record_capability_duration(
+        "rerank",
+        route_id.as_str(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    match result {
         Ok(value) => {
             if let Err(message) = capability::validate_rerank_response(&value) {
+                call.outcome("rerank_invalid");
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     message,
@@ -2053,14 +2116,18 @@ async fn rerank_handler(
                     "rerank_invalid",
                 );
             }
+            call.outcome("ok");
             (StatusCode::OK, Json(value)).into_response()
         }
-        Err(error) => error_response(
-            StatusCode::BAD_GATEWAY,
-            error.to_string(),
-            "server_error",
-            "executor_error",
-        ),
+        Err(error) => {
+            call.outcome("executor_error");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                "server_error",
+                "executor_error",
+            )
+        }
     }
 }
 

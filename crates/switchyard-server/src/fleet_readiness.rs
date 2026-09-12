@@ -983,6 +983,143 @@ impl FleetReadinessMonitor {
         }
     }
 }
+
+/// Builds a [`FleetReadinessMonitor`] from a parsed `[fleet_readiness]`
+/// configuration section over the given shared fleet state. All sub-components
+/// are optional; the monitor observes whichever of Comfy / HTPC / resource
+/// facts are configured. The shared DeepSeek telemetry slot (one instance per
+/// server) feeds the resource endpoint's `/v1/resource/deepseek` surface.
+pub fn build_fleet_readiness_monitor(
+    config: &FleetReadinessConfig,
+    state: Arc<SharedFleetState>,
+    deepseek_telemetry: SharedDeepSeekTelemetry,
+) -> Result<FleetReadinessMonitor, String> {
+    let comfy = config.comfy.as_ref().map(|c| {
+        (
+            ComfyFactsClient::new(c.url.clone(), c.auth_token_env.clone()),
+            ModelId::from(c.model.clone()),
+        )
+    });
+    let htpc = config.htpc.as_ref().map(|h| {
+        (
+            HtpcFactsClient::new(h.base_url.clone(), h.expected_model.clone()),
+            ModelId::from(h.model.clone()),
+        )
+    });
+
+    // Model ids were validated disjoint at config load; re-checked cheaply here
+    // so the builder is safe for callers that bypass the config validation.
+    let mut declared: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    let mut disjoint = |model: &str, source: &'static str| -> Result<(), String> {
+        if let Some(origin) = declared.insert(model.to_string(), source) {
+            return Err(format!(
+                "[fleet_readiness] model {model:?} appears in both {origin} and {source}"
+            ));
+        }
+        Ok(())
+    };
+    for model in &config.ready {
+        disjoint(model, "ready")?;
+    }
+    for model in &config.transition_required {
+        disjoint(model, "transition_required")?;
+    }
+    if let Some(c) = &config.comfy {
+        disjoint(&c.model, "comfy")?;
+    }
+    if let Some(h) = &config.htpc {
+        disjoint(&h.model, "htpc")?;
+    }
+    if let Some(r) = &config.resource {
+        for m in r
+            .openai_gated
+            .iter()
+            .chain(r.openclaw_openai_gated.iter())
+            .chain(r.deepseek_gated.iter())
+        {
+            disjoint(m, "resource-gated")?;
+        }
+    }
+
+    let mut cloud_base = Vec::with_capacity(config.ready.len() + config.transition_required.len());
+    for model in &config.ready {
+        cloud_base.push(Observed {
+            model: ModelId::from(model.clone()),
+            state: CandidateState::ready(),
+        });
+    }
+    for model in &config.transition_required {
+        cloud_base.push(Observed {
+            model: ModelId::from(model.clone()),
+            state: CandidateState::transition_required(),
+        });
+    }
+
+    let (comfy_client, comfy_model) = comfy.map_or((None, None), |(c, m)| (Some(c), Some(m)));
+    let (htpc_client, htpc_model) = htpc.map_or((None, None), |(h, m)| (Some(h), Some(m)));
+
+    let mut monitor = FleetReadinessMonitor::new(
+        comfy_client,
+        comfy_model,
+        htpc_client,
+        htpc_model,
+        cloud_base,
+        state,
+        Duration::from_secs(config.observe_interval_seconds.max(1)),
+    );
+
+    if let Some(resource) = &config.resource {
+        let resource_client = ResourceStateFactsClient::new(
+            resource.openai_url.clone(),
+            resource.openai_auth_token_env.clone(),
+            resource.deepseek_url.clone(),
+            resource.deepseek_api_key_env.clone(),
+            resource.deepseek_currency.clone(),
+        )
+        .with_deepseek_telemetry(deepseek_telemetry);
+        // Optional separate OpenClaw-owned OpenAI pool: only wired when both its
+        // URL and credential-env are declared.
+        let resource_client =
+            match (
+                &resource.openclaw_openai_url,
+                &resource.openclaw_openai_auth_token_env,
+            ) {
+                (Some(url), Some(env)) => {
+                    resource_client.with_openclaw_openai(url.clone(), env.clone())
+                }
+                (None, None) => resource_client,
+                _ => return Err(
+                    "openclaw_openai_url and openclaw_openai_auth_token_env must be set together"
+                        .to_string(),
+                ),
+            };
+        let openai_gated = resource
+            .openai_gated
+            .iter()
+            .map(|model| ModelId::from(model.clone()))
+            .collect();
+        let openclaw_openai_gated = resource
+            .openclaw_openai_gated
+            .iter()
+            .map(|model| ModelId::from(model.clone()))
+            .collect();
+        let deepseek_gated = resource
+            .deepseek_gated
+            .iter()
+            .map(|model| ModelId::from(model.clone()))
+            .collect();
+        monitor = monitor.with_resource(
+            resource_client,
+            openai_gated,
+            openclaw_openai_gated,
+            deepseek_gated,
+        );
+    }
+
+    Ok(monitor)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2074,140 +2211,4 @@ mod tests {
             "unconfigured DeepSeek must not fabricate a telemetry snapshot"
         );
     }
-}
-
-/// Builds a [`FleetReadinessMonitor`] from a parsed `[fleet_readiness]`
-/// configuration section over the given shared fleet state. All sub-components
-/// are optional; the monitor observes whichever of Comfy / HTPC / resource
-/// facts are configured. The shared DeepSeek telemetry slot (one instance per
-/// server) feeds the resource endpoint's `/v1/resource/deepseek` surface.
-pub fn build_fleet_readiness_monitor(
-    config: &FleetReadinessConfig,
-    state: Arc<SharedFleetState>,
-    deepseek_telemetry: SharedDeepSeekTelemetry,
-) -> Result<FleetReadinessMonitor, String> {
-    let comfy = config.comfy.as_ref().map(|c| {
-        (
-            ComfyFactsClient::new(c.url.clone(), c.auth_token_env.clone()),
-            ModelId::from(c.model.clone()),
-        )
-    });
-    let htpc = config.htpc.as_ref().map(|h| {
-        (
-            HtpcFactsClient::new(h.base_url.clone(), h.expected_model.clone()),
-            ModelId::from(h.model.clone()),
-        )
-    });
-
-    // Model ids were validated disjoint at config load; re-checked cheaply here
-    // so the builder is safe for callers that bypass the config validation.
-    let mut declared: std::collections::HashMap<String, &'static str> =
-        std::collections::HashMap::new();
-    let mut disjoint = |model: &str, source: &'static str| -> Result<(), String> {
-        if let Some(origin) = declared.insert(model.to_string(), source) {
-            return Err(format!(
-                "[fleet_readiness] model {model:?} appears in both {origin} and {source}"
-            ));
-        }
-        Ok(())
-    };
-    for model in &config.ready {
-        disjoint(model, "ready")?;
-    }
-    for model in &config.transition_required {
-        disjoint(model, "transition_required")?;
-    }
-    if let Some(c) = &config.comfy {
-        disjoint(&c.model, "comfy")?;
-    }
-    if let Some(h) = &config.htpc {
-        disjoint(&h.model, "htpc")?;
-    }
-    if let Some(r) = &config.resource {
-        for m in r
-            .openai_gated
-            .iter()
-            .chain(r.openclaw_openai_gated.iter())
-            .chain(r.deepseek_gated.iter())
-        {
-            disjoint(m, "resource-gated")?;
-        }
-    }
-
-    let mut cloud_base = Vec::with_capacity(config.ready.len() + config.transition_required.len());
-    for model in &config.ready {
-        cloud_base.push(Observed {
-            model: ModelId::from(model.clone()),
-            state: CandidateState::ready(),
-        });
-    }
-    for model in &config.transition_required {
-        cloud_base.push(Observed {
-            model: ModelId::from(model.clone()),
-            state: CandidateState::transition_required(),
-        });
-    }
-
-    let (comfy_client, comfy_model) = comfy.map_or((None, None), |(c, m)| (Some(c), Some(m)));
-    let (htpc_client, htpc_model) = htpc.map_or((None, None), |(h, m)| (Some(h), Some(m)));
-
-    let mut monitor = FleetReadinessMonitor::new(
-        comfy_client,
-        comfy_model,
-        htpc_client,
-        htpc_model,
-        cloud_base,
-        state,
-        Duration::from_secs(config.observe_interval_seconds.max(1)),
-    );
-
-    if let Some(resource) = &config.resource {
-        let resource_client = ResourceStateFactsClient::new(
-            resource.openai_url.clone(),
-            resource.openai_auth_token_env.clone(),
-            resource.deepseek_url.clone(),
-            resource.deepseek_api_key_env.clone(),
-            resource.deepseek_currency.clone(),
-        )
-        .with_deepseek_telemetry(deepseek_telemetry);
-        // Optional separate OpenClaw-owned OpenAI pool: only wired when both its
-        // URL and credential-env are declared.
-        let resource_client =
-            match (
-                &resource.openclaw_openai_url,
-                &resource.openclaw_openai_auth_token_env,
-            ) {
-                (Some(url), Some(env)) => {
-                    resource_client.with_openclaw_openai(url.clone(), env.clone())
-                }
-                (None, None) => resource_client,
-                _ => return Err(
-                    "openclaw_openai_url and openclaw_openai_auth_token_env must be set together"
-                        .to_string(),
-                ),
-            };
-        let openai_gated = resource
-            .openai_gated
-            .iter()
-            .map(|model| ModelId::from(model.clone()))
-            .collect();
-        let openclaw_openai_gated = resource
-            .openclaw_openai_gated
-            .iter()
-            .map(|model| ModelId::from(model.clone()))
-            .collect();
-        let deepseek_gated = resource
-            .deepseek_gated
-            .iter()
-            .map(|model| ModelId::from(model.clone()))
-            .collect();
-        monitor = monitor.with_resource(
-            resource_client,
-            openai_gated,
-            openclaw_openai_gated,
-            deepseek_gated,
-        );
-    }
-
-    Ok(monitor)
 }

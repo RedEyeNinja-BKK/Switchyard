@@ -37,8 +37,8 @@ const LLM_LATENCY_BUCKETS_MS: &[f64] = &[
 /// operator GO). The sub-second buckets exist so embedding calls, which are
 /// much faster, are not all collapsed into the first bucket.
 const CAPABILITY_DURATION_BUCKETS_MS: &[f64] = &[
-    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0, 20_000.0, 30_000.0,
-    60_000.0, 120_000.0,
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10_000.0, 20_000.0,
+    30_000.0, 60_000.0, 120_000.0,
 ];
 
 /// Bucket boundaries for capability batch size, in items per request.
@@ -228,7 +228,10 @@ fn seed_outcome_metrics() {
     // rows that never happened. The unlabelled sample carries only the zero and is
     // ignored by `sum by (source, ...)` queries, so a real escalation is still the
     // first labelled series to appear.
-    meter.u64_counter("switchyard.escalations").build().add(0, &[]);
+    meter
+        .u64_counter("switchyard.escalations")
+        .build()
+        .add(0, &[]);
 }
 
 /// Records one escalation: a request re-routed from `source` to `destination`
@@ -344,7 +347,10 @@ pub(crate) fn record_capability_items(capability: &str, items: u64) {
     global::meter("switchyard")
         .u64_histogram("switchyard.capability_items")
         .build()
-        .record(items, &[KeyValue::new("capability", capability.to_string())]);
+        .record(
+            items,
+            &[KeyValue::new("capability", capability.to_string())],
+        );
 }
 
 /// Records the longest single document in a rerank batch, in characters.
@@ -362,7 +368,10 @@ fn record_capability_in_flight(capability: &str, delta: i64) {
     global::meter("switchyard")
         .i64_up_down_counter("switchyard.capability_in_flight")
         .build()
-        .add(delta, &[KeyValue::new("capability", capability.to_string())]);
+        .add(
+            delta,
+            &[KeyValue::new("capability", capability.to_string())],
+        );
 }
 
 /// Encodes the current cumulative metric values in Prometheus text format.

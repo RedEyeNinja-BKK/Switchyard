@@ -66,9 +66,23 @@ async fn live_config_parses_and_advertises_exactly_like_production() {
             .expect("live routes.toml readable");
     let runner = seeded_runner_from_live_config(&source);
     let candidate = candidate_ids(&runner);
-    assert!(
-        candidate.len() >= 58,
-        "expected the full live route set (58+), got {}",
+    // The degeneracy guard is derived from the config under test, not a
+    // hardcoded fleet size: what this must catch is a parse that silently drops
+    // section(s), and a magic count goes stale on the next route retirement
+    // (it read "58+" after the 2026-09-12 alignment took the fleet to 50).
+    let declared = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            (line.starts_with("[routes.") || line.starts_with("[capabilities."))
+                && line.ends_with(']')
+        })
+        .count();
+    assert_eq!(
+        candidate.len(),
+        declared,
+        "every declared route/capability section must be advertised \
+         (declared {declared}, advertised {})",
         candidate.len()
     );
 

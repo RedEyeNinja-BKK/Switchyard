@@ -891,7 +891,14 @@ async fn decision(
         Err(response) => return response,
     };
     let request = prepare_candidate_context_facts(route, request).await;
-    let route_model = request
+    // The route that actually produced the decision: the caller's route until
+    // the walk below escalates. `describe_decision` resolves the outcome's
+    // selected model THROUGH this route's target map, so describing an escalated
+    // outcome as the caller's route either fails (no target of that route
+    // carries the escalated upstream id) or - the case seen in production -
+    // resolves to a SAME-ID target of the caller's route and reports a target
+    // that never serves the request.
+    let mut decided_model = request
         .llm_request
         .model
         .as_deref()
@@ -924,6 +931,7 @@ async fn decision(
                 prepare_candidate_context_facts(escalation_route, escalated_request).await;
             match escalation_route.decide(escalated_request).await {
                 Ok(escalated_outcome) => {
+                    decided_model = escalation_id.clone();
                     escalation_evidence = Some((escalation_id, reason));
                     escalated_outcome
                 }
@@ -960,7 +968,7 @@ async fn decision(
         }
         None => None,
     };
-    match state.decision_response(&route_model, &outcome, response) {
+    match state.decision_response(&decided_model, &outcome, response) {
         Some(response) => Json(response).into_response(),
         None => {
             server_error("routing outcome contains a model with no callable target configuration")

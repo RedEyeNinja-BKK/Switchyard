@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use libsy::{Algorithm, Random};
+use libsy::{Algorithm, CandidateState, FleetSnapshot, Random};
 use serde_json::{Value, json};
 use switchyard_llm_client::{
     Backend, ClientRouter, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
@@ -3476,5 +3476,118 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
         .ok_or("stream produced no response.completed event")?;
     assert_eq!(completed["response"]["output"][0]["name"], "search");
     assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__b");
+    Ok(())
+}
+
+/// A decision that ESCALATES must report the target of the route that would
+/// actually serve the request, not a target of the caller's route.
+///
+/// `describe_decision` resolves the outcome's selected model through the target
+/// map of the route it is handed. Handed the CALLER's route with an escalated
+/// outcome, it either fails (that route has no target carrying the escalated
+/// upstream id) or - the shape seen in production - resolves to a target of the
+/// caller's route that carries the same upstream id, reporting a target that
+/// never serves the request. Production shape: an NT-only agentic tier (all
+/// candidates `reasoning = false`) escalating to a parent tier that serves the
+/// same upstream model id on its thinking lane.
+#[tokio::test]
+async fn decision_reports_the_escalated_route_target() -> TestResult {
+    let mut config = tempfile::Builder::new()
+        .prefix("switchyard-decision-escalation-")
+        .suffix(".toml")
+        .tempfile()?;
+    config.write_all(
+        br#"
+schema_version = 1
+
+[llm_clients.nt]
+format = "openai_chat"
+base_url = "http://127.0.0.1:1/v1"
+
+[llm_clients.think]
+format = "openai_chat"
+base_url = "http://127.0.0.1:2/v1"
+
+# Two targets, ONE upstream model id: the live shape of a thinking lane and its
+# non-thinking sibling. Only the target key distinguishes them.
+[targets.nt]
+id = "model/shared"
+llm_client = "nt"
+
+[targets.think]
+id = "model/shared"
+llm_client = "think"
+
+[routes.agentic]
+id = "switchyard/agentic"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = false
+escalation = "switchyard/parent"
+
+[[routes.agentic.candidates]]
+target = "nt"
+tool_calling = true
+reasoning = false
+preference_rank = 1
+usable_context_tokens = 266000
+
+[routes.parent]
+id = "switchyard/parent"
+type = "fleet_router"
+context_window = 266000
+tool_calling = true
+reasoning = true
+
+[[routes.parent.candidates]]
+target = "think"
+tool_calling = true
+reasoning = true
+preference_rank = 1
+usable_context_tokens = 266000
+"#,
+    )?;
+    config.flush()?;
+
+    // A fleet route fails closed until readiness is published, so seed the SAME
+    // `Arc<SharedFleetState>` the routes read (normally the runtime owner's job).
+    let runner = switchyard_runner::Runner::load(config.path())?;
+    let fleet = runner
+        .fleet_state()
+        .cloned()
+        .expect("a fleet_router route installs a shared fleet state");
+    let state = ServerState::from_runner(runner)?;
+    fleet.set(FleetSnapshot::new(vec![(
+        ModelId::from("model/shared"),
+        CandidateState::ready(),
+    )])?);
+    let app = build_switchyard_router(state);
+
+    // `reasoning_effort` makes this a reasoning request: the agentic tier has no
+    // reasoning-capable candidate, so the decision escalates and the PARENT's
+    // target is the one that would serve it.
+    let response = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "switchyard/agentic",
+                "messages": [{"role": "user", "content": "think about it"}],
+                "reasoning_effort": "high"
+            }
+        })),
+    )
+    .await?;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let body = response.json()?;
+    assert_eq!(
+        body["selected"]["target"], "think",
+        "an escalated decision must name the escalated route's target"
+    );
+    assert_eq!(body["selected"]["model"], "model/shared");
     Ok(())
 }

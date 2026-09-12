@@ -1128,11 +1128,13 @@ fn is_unsigned_thinking_block(block: &Value) -> bool {
 ///
 /// Scoped to `messages[]` entries. Switchyard's OpenAI-Chat encoder produces
 /// THREE per-message shapes and all three must go:
-///   * `reasoning`         - plaintext reasoning with no structured provider
-///                           representation (codecs/openai_chat/buffered.rs
-///                           `encode_openai_message_plaintext_reasoning`)
-///   * `reasoning_content` - plaintext recovered from structured details
-///   * `reasoning_details` - the structured provider details array
+///
+/// - `reasoning` - plaintext reasoning with no structured provider
+///   representation (codecs/openai_chat/buffered.rs
+///   `encode_openai_message_plaintext_reasoning`)
+/// - `reasoning_content` - plaintext recovered from structured details
+/// - `reasoning_details` - the structured provider details array
+///
 /// Removing only a subset silently defeats the opt-out for the other encoder
 /// path, so the list is deliberately exhaustive (review finding, 2026-09-12).
 ///
@@ -3046,7 +3048,7 @@ mod tests {
         // object arrives via the raw Responses body.
         let mut backend = config(&format!("{}/v1", server.uri()));
         backend.extra_body = extra_body;
-        let client = TranslatingLlmClient::new(&vec![ModelConfig::new(
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
             "gpt",
             Backend::OpenAiResponses(backend),
             None,
@@ -3478,7 +3480,7 @@ mod tests {
             "chat_template_kwargs".to_string(),
             json!({"enable_thinking": false}),
         )]);
-        let client = TranslatingLlmClient::new(&vec![ModelConfig::new(
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
             "gpt",
             Backend::OpenAiChat(backend),
             None,

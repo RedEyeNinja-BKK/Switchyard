@@ -85,6 +85,7 @@ fn request(messages: Vec<Message>) -> Request {
             messages,
             ..LlmRequest::default()
         },
+        candidate_input_tokens: Default::default(),
         raw_request: None,
         metadata: None,
     }

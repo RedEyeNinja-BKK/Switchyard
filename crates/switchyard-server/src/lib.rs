@@ -1956,6 +1956,18 @@ async fn embeddings_handler(
     }
 }
 
+/// Positively recognizes llama.cpp's physical-batch overflow in an executor error.
+///
+/// Requires the upstream status to be 500 AND both distinctive markers of the
+/// backend's own message, so an arbitrary 500/502 is never classified as input
+/// overflow. Anything not matching stays on the existing `executor_error` path.
+fn is_physical_batch_overflow(error: &(impl std::fmt::Display + ?Sized)) -> bool {
+    let text = error.to_string();
+    text.contains("HTTP 500")
+        && text.contains("is too large to process")
+        && text.contains("increase the physical batch size")
+}
+
 /// Cohere/Jina-compatible rerank endpoint. Proxies the typed rerank contract
 /// to the capability executor selected by the `model` route id (e.g.
 /// `localclaw/rerank`); bounds (candidates, top_n) are enforced here.
@@ -2128,6 +2140,15 @@ async fn rerank_handler(
             (StatusCode::OK, Json(value)).into_response()
         }
         Err(error) => {
+            if is_physical_batch_overflow(&error) {
+                call.outcome("input_too_long");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    error.to_string(),
+                    "server_error",
+                    "input_too_long",
+                );
+            }
             call.outcome("executor_error");
             error_response(
                 StatusCode::BAD_GATEWAY,

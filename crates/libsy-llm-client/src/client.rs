@@ -364,11 +364,17 @@ impl TranslatingLlmClient {
         // merge_extra_body only fills absent keys (or_insert), so the target pin
         // must be re-asserted here; without it, a caller's own `reasoning` object
         // would silently displace the target's policy.
+        // A target-pinned chat-template thinking switch is authoritative on the
+        // same seam and for the same reason: `merge_extra_body` only fills absent
+        // top-level keys, so a caller-supplied `chat_template_kwargs` object would
+        // otherwise defeat an NT lane's pinned `enable_thinking = false`.
         if matches!(backend, Backend::OpenAiChat(_)) {
             canonicalize_reasoning_effort(&mut body, backend.extra_body().get("reasoning"));
+            canonicalize_chat_template_kwargs(&mut body, backend.extra_body().get("chat_template_kwargs"));
             ensure_openai_stream_usage(&mut body);
         } else if matches!(backend, Backend::OpenAiResponses(_)) {
             canonicalize_reasoning_effort(&mut body, backend.extra_body().get("reasoning"));
+            canonicalize_chat_template_kwargs(&mut body, backend.extra_body().get("chat_template_kwargs"));
             // Stream-mandatory Responses backends (chatgpt.com Codex: "Stream
             // must be set to true") - force upstream stream=true regardless of
             // the caller's stream value; the server layer aggregates back to
@@ -1208,6 +1214,75 @@ fn canonicalize_reasoning_effort(body: &mut Value, reasoning_pin: Option<&Value>
     // regardless of whether the object carries a string `effort`.
     if object.get("reasoning").and_then(Value::as_object).is_some() {
         object.remove("reasoning_effort");
+    }
+}
+
+// Makes a target's PINNED chat-template thinking switch authoritative over
+// caller input, on the same post-merge seam as `canonicalize_reasoning_effort`.
+//
+// Why this is needed even though the target already carries the pin:
+// `merge_extra_body` is SHALLOW (`object.entry(key).or_insert_with`), so it
+// fills a key only when absent. A caller that sends its own
+// `chat_template_kwargs` object therefore prevents insertion of the target's
+// entire nested object, and the caller's nested `enable_thinking = true`
+// survives. Observed on the ComfyNinja Qwen3.8 NT lanes: the route advertised
+// non-thinking and normally emitted none, yet a caller sending
+// `enable_thinking = true` produced 180 chars of `reasoning_content`, EMPTY
+// content and `finish_reason = "length"` - the pinned NT invariant was silently
+// defeated and output was lost to hidden thinking.
+//
+// Scope is deliberately one KEY, not the whole object: the pin is an authority
+// rule for the keys the target actually declares. Other caller fields inside
+// `chat_template_kwargs` (e.g. `reasoning_effort`) are preserved exactly as
+// today, and a target that pins no boolean thinking switch is untouched.
+// Non-boolean pin values are ignored rather than interpreted, so a malformed
+// config cannot silently become a permissive request.
+//
+// The rule is deliberately SYMMETRIC, and the symmetry is intended target policy
+// rather than an accident of implementation: a boolean pin is enforced in BOTH
+// directions, so a target pinning `true` likewise cannot be switched off by a
+// caller (live precedent: the htpc MTP thinking lane). A caller that wants the
+// other mode selects the sibling target - the thinking/non-thinking target pair
+// IS the supported mode selector, not a caller-tunable default.
+//
+// Empirical basis for the sibling-key case, measured on the live ComfyNinja
+// Qwen3.8 NT lane (2026-09-14): a caller object of `{preserve_thinking: true}`
+// ALONE turned thinking ON (273 chars of `reasoning_content`), while
+// `{enable_thinking: false, preserve_thinking: true}` stayed OFF - i.e. the pinned
+// switch wins whenever it is present. The residual hole was therefore only that a
+// caller object OMITTING the switch left the shallow merge with no switch at all;
+// inserting the pinned key into the caller's existing object closes it while
+// preserving the sibling key.
+//
+// A caller-supplied non-object `chat_template_kwargs` is canonicalised TO the
+// pinned policy instead of being left in place: leaving it would ship an
+// unvalidated shape upstream while the pin stayed unenforced, and this request is
+// not authorised to carry anything else in that field.
+fn canonicalize_chat_template_kwargs(body: &mut Value, template_pin: Option<&Value>) {
+    let Some(pin) = template_pin.and_then(Value::as_object) else {
+        return;
+    };
+    let Some(enable_thinking) = pin.get("enable_thinking") else {
+        return;
+    };
+    if !enable_thinking.is_boolean() {
+        return;
+    }
+    let Value::Object(object) = body else {
+        return;
+    };
+    let entry = object
+        .entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    match entry {
+        Value::Object(nested) => {
+            nested.insert("enable_thinking".to_string(), enable_thinking.clone());
+        }
+        other => {
+            let mut nested = serde_json::Map::new();
+            nested.insert("enable_thinking".to_string(), enable_thinking.clone());
+            *other = Value::Object(nested);
+        }
     }
 }
 
@@ -3566,6 +3641,7 @@ mod tests {
 }
 #[cfg(test)]
 mod strip_reasoning_content_tests {
+    use super::canonicalize_chat_template_kwargs;
     use super::strip_message_reasoning_content;
     use serde_json::json;
 
@@ -3647,6 +3723,127 @@ mod strip_reasoning_content_tests {
         let mut body = json!({"model": "m", "input": [{"reasoning_content": "keep"}]});
         let before = body.clone();
         strip_message_reasoning_content(&mut body);
+        assert_eq!(body, before);
+    }
+
+    // ---- target-pinned chat-template thinking switch -------------------------
+    // These assert the exact serialized upstream body, because the defect they
+    // cover (shallow `merge_extra_body` letting a caller defeat an NT pin) is
+    // invisible to response-level assertions: the pre-fix lane returned HTTP 200
+    // with EMPTY content and finish_reason=length.
+
+    fn nt_pin() -> serde_json::Value {
+        json!({"enable_thinking": false})
+    }
+
+    #[test]
+    fn nt_pin_inserts_false_when_caller_sends_nothing() {
+        let mut body = json!({"model": "m"});
+        canonicalize_chat_template_kwargs(&mut body, Some(&nt_pin()));
+        assert_eq!(
+            body,
+            json!({"model": "m", "chat_template_kwargs": {"enable_thinking": false}})
+        );
+    }
+
+    #[test]
+    fn nt_pin_wins_over_caller_enable_thinking_true() {
+        // The exact hostile override that defeated the ComfyNinja NT lanes.
+        let mut body = json!({"model": "m", "chat_template_kwargs": {"enable_thinking": true}});
+        canonicalize_chat_template_kwargs(&mut body, Some(&nt_pin()));
+        assert_eq!(
+            body,
+            json!({"model": "m", "chat_template_kwargs": {"enable_thinking": false}})
+        );
+    }
+
+    #[test]
+    fn nt_pin_preserves_unrelated_caller_nested_keys() {
+        // Authority is per-KEY: a caller's other legitimate template knobs survive.
+        let mut body = json!({"model": "m", "chat_template_kwargs": {
+            "enable_thinking": true, "some_other_supported_key": "X"}});
+        canonicalize_chat_template_kwargs(&mut body, Some(&nt_pin()));
+        assert_eq!(
+            body,
+            json!({"model": "m", "chat_template_kwargs": {
+                "enable_thinking": false, "some_other_supported_key": "X"}})
+        );
+    }
+
+    #[test]
+    fn nt_pin_wins_over_a_sibling_template_switch_that_alone_enables_thinking() {
+        // Measured on the live ComfyNinja Qwen3.8 NT lane (2026-09-14):
+        //   caller `{"preserve_thinking": true}` alone  -> 273 chars of reasoning (thinking ON)
+        //   caller `{"enable_thinking": false,
+        //            "preserve_thinking": true}`       -> 0 chars (enable_thinking WINS)
+        // So `preserve_thinking` cannot defeat the pin, but an object that OMITS
+        // `enable_thinking` leaves the shallow merge with no switch at all. Because this
+        // helper inserts the pinned key into the caller's existing object, both shapes are
+        // covered: the switch is present, and the sibling key is preserved.
+        let mut body = json!({"model": "m", "chat_template_kwargs": {"preserve_thinking": true}});
+        canonicalize_chat_template_kwargs(&mut body, Some(&nt_pin()));
+        assert_eq!(
+            body,
+            json!({"model": "m", "chat_template_kwargs": {
+                "preserve_thinking": true, "enable_thinking": false}})
+        );
+    }
+
+    #[test]
+    fn forced_thinking_pin_wins_over_caller_false() {
+        // Symmetric authority: a target pinning true is equally authoritative
+        // (live precedent: the htpc MTP thinking lane pins enable_thinking=true).
+        let mut body = json!({"model": "m", "chat_template_kwargs": {"enable_thinking": false}});
+        canonicalize_chat_template_kwargs(&mut body, Some(&json!({"enable_thinking": true})));
+        assert_eq!(
+            body,
+            json!({"model": "m", "chat_template_kwargs": {"enable_thinking": true}})
+        );
+    }
+
+    #[test]
+    fn pin_without_a_thinking_switch_is_ignored() {
+        // The ComfyNinja thinking lanes pin only `reasoning_effort`; that pin must
+        // stay caller-overridable exactly as today - no scope creep.
+        let pin = json!({"reasoning_effort": "medium"});
+        let mut body = json!({"model": "m", "chat_template_kwargs": {"reasoning_effort": "high"}});
+        let before = body.clone();
+        canonicalize_chat_template_kwargs(&mut body, Some(&pin));
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn no_pin_leaves_the_caller_object_alone() {
+        let mut body = json!({"model": "m", "chat_template_kwargs": {"enable_thinking": true}});
+        let before = body.clone();
+        canonicalize_chat_template_kwargs(&mut body, None);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn non_boolean_pin_is_not_interpreted() {
+        // A malformed config must not silently become a permissive request.
+        let mut body = json!({"model": "m", "chat_template_kwargs": {"enable_thinking": true}});
+        let before = body.clone();
+        canonicalize_chat_template_kwargs(&mut body, Some(&json!({"enable_thinking": "false"})));
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn non_object_caller_value_is_canonicalised_to_the_pin() {
+        let mut body = json!({"model": "m", "chat_template_kwargs": "garbage"});
+        canonicalize_chat_template_kwargs(&mut body, Some(&nt_pin()));
+        assert_eq!(
+            body,
+            json!({"model": "m", "chat_template_kwargs": {"enable_thinking": false}})
+        );
+    }
+
+    #[test]
+    fn non_object_body_is_left_alone() {
+        let mut body = json!([1, 2, 3]);
+        let before = body.clone();
+        canonicalize_chat_template_kwargs(&mut body, Some(&nt_pin()));
         assert_eq!(body, before);
     }
 }

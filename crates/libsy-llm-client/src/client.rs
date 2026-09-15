@@ -353,6 +353,7 @@ impl TranslatingLlmClient {
         // no target `extra_body` can reinstate a field the target removed.
         if backend.strip_reasoning_content() {
             strip_message_reasoning_content(&mut body);
+            strip_input_reasoning_items(&mut body);
         }
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
@@ -1145,9 +1146,10 @@ fn is_unsigned_thinking_block(block: &Value) -> bool {
 /// path, so the list is deliberately exhaustive (review finding, 2026-09-12).
 ///
 /// Bodies without a `messages` array (e.g. the Responses `input[]` shape) are
-/// left untouched - the flag is a no-op there rather than a silent rewrite of
-/// an unrelated field. Top-level request fields (including the target's own
-/// `reasoning` policy) are NOT touched; only message-level payloads are.
+/// left untouched - the Responses leg carries replayed CoT as `input[]` items,
+/// handled by `strip_input_reasoning_items`. Top-level request fields
+/// (including the target's own `reasoning` policy) are NOT touched; only
+/// message-level payloads are.
 fn strip_message_reasoning_content(body: &mut Value) {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
@@ -1160,6 +1162,28 @@ fn strip_message_reasoning_content(body: &mut Value) {
         object.remove("reasoning_content");
         object.remove("reasoning_details");
     }
+}
+
+/// Removes replayed reasoning items from an OpenAI Responses body.
+///
+/// The Responses leg encodes replayed chain-of-thought as top-level `input[]`
+/// items of type `reasoning` (see `codecs/responses/buffered.rs`,
+/// `encode_responses_special_input`), never as message-level fields, so
+/// `strip_message_reasoning_content` cannot reach them: a target that opted
+/// into `strip_reasoning_content` would keep paying for replayed CoT unchanged
+/// once its client moves to the Responses format (2026-09-15 OpenRouter
+/// migration finding).
+///
+/// Only items carrying `"type": "reasoning"` are removed; message, tool-call,
+/// and tool-result items are preserved so tool-call adjacency survives. Bodies
+/// whose `input` is a plain string, absent, or not an array are left untouched -
+/// the flag stays a no-op there rather than a silent rewrite of an unrelated
+/// field.
+fn strip_input_reasoning_items(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    input.retain(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
 }
 
 fn strip_codex_incompatible_fields(body: &mut Value) {
@@ -3642,6 +3666,7 @@ mod tests {
 #[cfg(test)]
 mod strip_reasoning_content_tests {
     use super::canonicalize_chat_template_kwargs;
+    use super::strip_input_reasoning_items;
     use super::strip_message_reasoning_content;
     use serde_json::json;
 
@@ -3724,6 +3749,76 @@ mod strip_reasoning_content_tests {
         let before = body.clone();
         strip_message_reasoning_content(&mut body);
         assert_eq!(body, before);
+    }
+
+    // ---- Responses-leg reasoning strip -------------------------------------
+    // 2026-09-15 (OpenRouter Responses migration): the chat-scoped strip cannot
+    // reach the Responses `input[]` shape, so a `strip_reasoning_content` target
+    // would silently keep paying for replayed CoT on the new wire.
+
+    #[test]
+    fn removes_responses_reasoning_items() {
+        let mut body = json!({
+            "model": "qwen/qwen3.8-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "stored CoT"}], "summary": []},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "again"}]}
+            ]
+        });
+        strip_input_reasoning_items(&mut body);
+        let items = body["input"].as_array().expect("input array");
+        assert_eq!(items.len(), 4, "only the reasoning item should go");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning")),
+            "a reasoning item survived"
+        );
+        // Tool-call adjacency and message order survive the retain.
+        assert_eq!(items[1]["type"], json!("function_call"));
+        assert_eq!(items[2]["type"], json!("function_call_output"));
+        assert_eq!(items[3]["role"], json!("user"));
+    }
+
+    #[test]
+    fn responses_scalar_input_is_a_noop() {
+        let mut body = json!({"model": "m", "input": "plain string prompt"});
+        let before = body.clone();
+        strip_input_reasoning_items(&mut body);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn responses_top_level_reasoning_policy_survives() {
+        let mut body = json!({
+            "model": "m",
+            "reasoning": {"effort": "none"},
+            "input": [{"type": "reasoning", "content": [], "summary": []}]
+        });
+        strip_input_reasoning_items(&mut body);
+        assert_eq!(body["reasoning"], json!({"effort": "none"}));
+        assert_eq!(body["input"].as_array().expect("input").len(), 0);
+    }
+
+    /// A message item that happens to carry a `reasoning`-shaped field is not an
+    /// input item of type `reasoning` and must not be dropped.
+    #[test]
+    fn responses_keeps_non_reasoning_typed_items() {
+        let mut body = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a"}], "reasoning_content": "keep"},
+                {"type": "reasoning", "content": [], "summary": []}
+            ]
+        });
+        strip_input_reasoning_items(&mut body);
+        let items = body["input"].as_array().expect("input");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], json!("message"));
+        assert_eq!(items[0]["reasoning_content"], json!("keep"));
     }
 
     // ---- target-pinned chat-template thinking switch -------------------------

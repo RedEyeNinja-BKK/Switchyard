@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use opentelemetry::{KeyValue, global};
-use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
+use switchyard_protocol::{LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Response, Usage};
 
 use crate::SharedRoutingLog;
 use crate::routing_log::RoutingLogContext;
@@ -42,16 +42,23 @@ pub(crate) fn observe(
                 let mut terminal_seen = false;
                 let mut recorded = false;
                 while let Some(item) = stream.next().await {
-                    let failed = match &item {
-                        Err(_) => true,
-                        Ok(event) => event.normalized().iter().any(|chunk| {
-                            matches!(
-                                chunk,
-                                LlmResponseChunk::StreamError { .. }
-                                    | LlmResponseChunk::DecodeError { .. }
-                            )
-                        }),
-                    };
+                    let failure = stream_failure_reason(&item);
+                    let failed = failure.is_some();
+                    if let Some((kind, head)) = failure {
+                        // An in-band failure arrives AFTER the response headers were already
+                        // sent (the client-facing status is 200), so the request-level log
+                        // records a clean success and this line is the only journal record of
+                        // the event. Without it the class was invisible: the counter moved
+                        // while the journal showed only successes (2026-09-15 finding, the
+                        // gpt-5.6-luna and Qwen3.5-9B-MTP error series).
+                        // `head` is bounded and sanitised - never the raw provider text.
+                        tracing::warn!(
+                            model = %model,
+                            failure_kind = kind,
+                            reason_head = %head,
+                            "stream terminated with an in-band error (counted in switchyard_errors_total)"
+                        );
+                    }
                     if let Ok(event) = &item {
                         for chunk in event.normalized() {
                             match chunk {
@@ -109,6 +116,54 @@ fn record_stream_error(stats: &StatsAccumulator, model: &str) {
         .u64_counter("switchyard.errors")
         .build()
         .add(1, &attributes(model));
+}
+
+/// Human-readable reason when this stream item is a failure, else `None`.
+///
+/// Two failure shapes reach here, both counted in `switchyard_errors_total` by
+/// [`record_stream_error`]: a transport error on the item itself, and a
+/// well-formed provider event that carries an in-band error (`StreamError`) or a
+/// decoding failure (`DecodeError`). Neither is a HTTP-level failure - the
+/// headers were already sent - which is why this record is the only place the
+/// class becomes visible in the journal.
+///
+/// The text is provider-controlled, so only a bounded, sanitised head is kept
+/// ([`bounded_reason_head`]); the classification is a fixed vocabulary word.
+fn stream_failure_reason(
+    item: &Result<LlmResponseStreamEvent, switchyard_protocol::LlmClientError>,
+) -> Option<(&'static str, String)> {
+    match item {
+        Err(error) => Some(("transport", bounded_reason_head(&error.to_string()))),
+        Ok(event) => event.normalized().iter().find_map(|chunk| match chunk {
+            LlmResponseChunk::StreamError { message } => {
+                Some(("stream_error", bounded_reason_head(message)))
+            }
+            LlmResponseChunk::DecodeError { message } => {
+                Some(("decode_error", bounded_reason_head(message)))
+            }
+            _ => None,
+        }),
+    }
+}
+
+/// Bytes of provider-supplied error text kept for the journal (review finding
+/// 2026-09-15: provider bodies are arbitrary in size and content, so the record
+/// is bounded and control characters are flattened - an embedded newline could
+/// otherwise forge log structure). Beyond this the text is cut, never buffered.
+const FAILURE_REASON_HEAD_BYTES: usize = 200;
+
+/// Bounded, single-line head of provider-supplied error text.
+fn bounded_reason_head(text: &str) -> String {
+    let mut head = String::new();
+    for character in text.chars() {
+        let width = character.len_utf8();
+        if head.len() + width > FAILURE_REASON_HEAD_BYTES {
+            head.push('\u{2026}');
+            break;
+        }
+        head.push(if character.is_control() { ' ' } else { character });
+    }
+    head
 }
 
 pub(crate) fn token_usage(usage: &Usage) -> TokenUsage {
@@ -188,6 +243,116 @@ mod tests {
     use switchyard_protocol::{LlmResponseChunk, LlmResponseStreamEvent, Metadata, Response};
 
     use super::*;
+
+    // ---- in-band stream failure classification -------------------------------
+    // These pin the reason text that makes the class visible in the journal: the
+    // counter (switchyard_errors_total) moves for in-band failures while the
+    // request-level log still shows a 200, so the WARN in the stream wrapper is the
+    // only record. 2026-09-15: gpt-5.6-luna (409) and Qwen3.5-9B-MTP (28) errors
+    // were unattributable for exactly this reason.
+
+    #[test]
+    fn healthy_event_has_no_failure_reason() {
+        let event = LlmResponseStreamEvent::new(vec![LlmResponseChunk::MessageStop { reason: None }]);
+        assert_eq!(stream_failure_reason(&Ok(event)), None);
+    }
+
+    #[test]
+    fn in_band_stream_error_reports_kind_and_message() {
+        let event = LlmResponseStreamEvent::new(vec![LlmResponseChunk::StreamError {
+            message: "unknown Responses stream error".to_string(),
+        }]);
+        let (kind, head) = stream_failure_reason(&Ok(event)).expect("failure classified");
+        assert_eq!(kind, "stream_error");
+        assert_eq!(head, "unknown Responses stream error");
+    }
+
+    #[test]
+    fn decode_error_reports_kind_and_message() {
+        let event = LlmResponseStreamEvent::new(vec![LlmResponseChunk::DecodeError {
+            message: "upstream transport error: error decoding response body".to_string(),
+        }]);
+        let (kind, head) = stream_failure_reason(&Ok(event)).expect("failure classified");
+        assert_eq!(kind, "decode_error");
+        assert_eq!(head, "upstream transport error: error decoding response body");
+    }
+
+    #[test]
+    fn transport_error_reports_its_kind_and_display() {
+        let failure = Err(switchyard_protocol::LlmClientError::Transport {
+            source: Box::new(std::io::Error::other("connection reset")),
+        });
+        let (kind, head) = stream_failure_reason(&failure).expect("transport failure classified");
+        assert_eq!(kind, "transport");
+        assert!(head.contains("connection reset"), "unexpected head: {head}");
+    }
+
+    /// Provider text is unbounded and may contain newlines that would forge log
+    /// structure; the journal record is bounded and single-line by construction
+    /// (review finding, 2026-09-15).
+    #[test]
+    fn reason_head_is_bounded_and_flattened() {
+        let huge = format!("line one\nline two\t{}", "x".repeat(10_000));
+        let head = bounded_reason_head(&huge);
+        assert!(
+            head.len() <= FAILURE_REASON_HEAD_BYTES + '\u{2026}'.len_utf8(),
+            "head was not bounded: {} bytes",
+            head.len()
+        );
+        assert!(!head.contains('\n') && !head.contains('\t'), "control chars survived: {head:?}");
+        assert!(head.starts_with("line one line two"), "unexpected head: {head:?}");
+        assert!(head.ends_with('\u{2026}'), "truncation was not marked: {head:?}");
+    }
+
+    #[test]
+    fn short_reason_head_is_not_marked() {
+        assert_eq!(bounded_reason_head("shorter than the bound"), "shorter than the bound");
+    }
+
+    /// Behavioural coverage for the changed path (review finding 2, 2026-09-15):
+    /// a failing item must be yielded unchanged, counted exactly once, and the
+    /// wrapper must stop without consuming the items after it.
+    #[tokio::test]
+    async fn failing_item_is_yielded_counted_once_and_ends_the_stream() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = SharedRoutingLog::new(dir.path().join("routing.jsonl")).expect("routing log");
+        let stats = StatsAccumulator::default();
+        let failed_event = LlmResponseStreamEvent::new(vec![LlmResponseChunk::StreamError {
+            message: "unknown Responses stream error".to_string(),
+        }]);
+        let after = LlmResponseStreamEvent::new(vec![LlmResponseChunk::MessageStop { reason: None }]);
+        let source = stream::iter([
+            Ok(failed_event.clone()),
+            Ok(after.clone()),
+        ]);
+        let response = Response {
+            llm_response: LlmResponse::Stream(Box::pin(source)),
+            metadata: None,
+        };
+        let observed = observe(
+            response,
+            "model/worker",
+            Instant::now(),
+            stats.clone(),
+            0.0,
+            Some((
+                log,
+                RoutingLogContext::from_metadata(&Metadata::default()),
+            )),
+        );
+        let LlmResponse::Stream(mut observed) = observed.llm_response else {
+            panic!("expected stream");
+        };
+
+        let first = observed.next().await.expect("failing item is still delivered");
+        assert_eq!(first.expect("item unchanged"), failed_event);
+        assert!(
+            observed.next().await.is_none(),
+            "the wrapper must stop after a failed item"
+        );
+        drop(observed);
+        assert_eq!(stats.snapshot().models["model/worker"].errors, 1);
+    }
 
     /// An OpenAI Responses client may stop polling immediately after receiving the
     /// terminal `response.completed` event. Switchyard must record usage and routing

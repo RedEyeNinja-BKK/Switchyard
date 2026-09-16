@@ -15,10 +15,9 @@ remaining targets in configured order for that request. See
 
 ## How it works
 
-A coding agent's run moves through stages: early on it explores the codebase and
-recovers from errors, and later it settles into more mechanical implementation.
-Those stages call for different amounts of model capability, which is what the
-router keys on.
+A tool-using agent's run moves through stages that call for different amounts of
+model capability. The built-in vocabulary is calibrated for coding agents: it
+recognizes file observation, mutation, planning, shell activity, and test results.
 
 For each LLM call, stage-router estimates which stage the agent is in from the
 **tool-result history** on the conversation, scoring two axes:
@@ -32,7 +31,7 @@ For each LLM call, stage-router estimates which stage the agent is in from the
 The axes are **corroborative**: the signed score is `tanh`-squashed to a
 confidence in `[0, 1]`, so one full signal alone scores ~`0.46` and a second
 corroborating signal is what pushes it decisively past a `0.5` threshold. A
-critical-error severity is a hard override that escalates on its own. The router
+repeated failures and critical-error severity are hard overrides that escalate. The router
 then routes:
 
 - the **capable** tier for uncertain, exploratory, or error-recovery turns, and
@@ -185,10 +184,12 @@ api_key_env = "OPENROUTER_API_KEY"
 [targets.strong]
 id = "openai/gpt-4o"
 llm_client = "openrouter"
+# system_prompt = "diagnose before you edit"  # optional
 
 [targets.weak]
 id = "openai/gpt-4o-mini"
 llm_client = "openrouter"
+# system_prompt = "follow the settled plan"  # optional
 
 [routes.stage]
 id = "switchyard/stage"
@@ -198,6 +199,7 @@ efficient_target = "weak"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3          # optional, defaults to 3
+capable_hold_turns = 2          # optional, defaults to 2
 ```
 
 Save as `routes.toml` and start the server:
@@ -208,27 +210,47 @@ switchyard-server --config routes.toml --port 4000
 
 This is the recommended default: routing on tool signals alone, no classifier.
 
+### Optional: custom tool semantics
+
+Extend the built-in coding vocabulary when an agent uses domain-specific tool
+names. Mappings are route-scoped, additive, and matched by exact name without
+regard to ASCII case:
+
+```toml
+[routes.stage.tool_semantics]
+observe = ["KB_search", "get_customer_by_phone"]
+mutate = ["send_payment_request", "update_inventory"]
+plan = ["create_research_plan"]
+new = ["start_conversation", "send_message_to_user"]
+```
+
+The categories affect existing stage signals:
+
+- `observe` counts as investigation, like the built-in read and search tools.
+- `mutate` counts as production, like the built-in write and edit tools.
+- `plan` counts as investigation, like the built-in planning tools.
+- `new` records forward activity that suppresses false `spinning` and
+  `exploring` signals, but does not otherwise favor either tier.
+- `unknown` remains the fallback for tools that match neither the built-in
+  vocabulary nor configured semantics.
+
+Configuration cannot reclassify a built-in tool. Empty names, duplicate names
+across categories, and unknown category keys are rejected when the route is
+loaded. Argument-aware wrapper tools, inferred semantics, and learned routing
+rules are outside this exact-name configuration.
+
 ### Optional: handoff notes
 
 Add a `[routes.stage.handoff_notes]` section to pass a contextual note to the
 model the router switches to. The escalation note is sent to the capable tier on
-a signal-driven escalation; the de-escalation note is sent back to the efficient
-tier when a settled signal drops the turn there.
+a signal-driven escalation; the de-escalation note is sent when the scorer
+decisively picks the efficient tier.
 
 ```toml
 [routes.stage.handoff_notes]
 escalation_note = "the previous model was stalling; pick up the diagnosis"
 # deescalation_note = "..."          # optional
 # only_on_wrong_signal_escalation = true  # default; set false to always send
-```
-
-### Optional: per-tier system prompts
-
-```toml
-[routes.stage]
-# ...
-capable_system_prompt = "diagnose before you edit"
-efficient_system_prompt = "follow the settled plan"
 ```
 
 ### Optional: LLM classifier fallback
@@ -281,8 +303,8 @@ paths through its cascade:
 
 | Source | When |
 |---|---|
-| `override` | A critical-error severity (or a context-compaction marker) forced the capable tier. |
-| `tests_passed` | A settled run — a recent test pass with a recent write and no windowed error — landed the turn on the efficient tier. |
+| `override` | A repeated failure, critical-error severity, or context-compaction marker forced the capable tier. Structured logs set `override_reason` to `repeated_failure`, `critical_error`, or `compaction`. |
+| `capable_hold` | A recent escalation kept this recovery turn on the capable tier. |
 | `dimensions` | The corroborative scorer crossed `confidence_threshold` and picked the tier by the sign of the score. |
 | `llm-classifier` | The signals were ambiguous and the classifier returned a verdict. |
 | `fall_open` | The signals were ambiguous and the classifier failed or wasn't configured; the default tier was used. |

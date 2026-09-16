@@ -3,14 +3,18 @@
 
 //! Buffered codec for OpenAI Responses request and response JSON.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
 use crate::codecs::common::{
+    collect_responses_reasoning_text, encrypted_reasoning_data, encrypted_reasoning_item_id,
     is_known_role_name, provider_extensions, reasoning_text_from_blocks, text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
+use crate::codecs::openai_media::{
+    ImagePayload, file_payload, file_source_text, image_payload, image_source_text,
+};
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
 };
@@ -18,9 +22,26 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, ImageSource, InstructionBlock, LlmRequest, MediaSource, Message,
-    OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams,
-    StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse,
+    ContentBlock,
+    FileSource,
+    ImageSource,
+    InstructionBlock,
+    LlmRequest,
+    MediaSource,
+    Message,
+    OutputParams,
+    ProviderExtensions,
+    ReasoningParams,
+    ResponseOutput,
+    Role,
+    SamplingParams,
+    StopReason,
+    ToolCall,
+    ToolChoice,
+    ToolDefinition,
+    ToolResult,
+    Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -39,6 +60,11 @@ impl FormatCodec for OpenAiResponsesCodec {
 
     fn decode_request(&self, body: &Value, policy: &TranslationPolicy) -> Result<DecodedRequest> {
         let body = crate::util::object(body, "$")?;
+        // Codex marks remote-compact requests with a `compaction_trigger` input
+        // item. It is codex-internal protocol that strict upstream parsers
+        // reject, so drop it before preservation capture and normalization.
+        let sanitized = strip_codex_compaction_markers(body);
+        let body = sanitized.as_ref().unwrap_or(body);
         let mut diagnostics = Vec::new();
         let mut request = LlmRequest {
             model: body
@@ -82,15 +108,46 @@ impl FormatCodec for OpenAiResponsesCodec {
                 }],
             });
         }
+        // With `previous_response_id`, the provider holds the earlier turns, so a tool output
+        // may answer a call that is not in this body.
+        let stored_state = body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty());
+        let mut custom_call_outputs = Vec::new();
         let (messages, instructions) = decode_responses_input(
             body.get("input").unwrap_or(&Value::String(String::new())),
+            stored_state,
+            &mut custom_call_outputs,
             &mut diagnostics,
             policy,
         )?;
         request.messages = messages;
         request.instructions.extend(instructions);
         let mut tool_namespaces = Map::new();
-        request.tools = decode_responses_tools(body.get("tools"), &mut tool_namespaces);
+        let mut custom_tools = Map::new();
+        request.tools =
+            decode_responses_tools(body.get("tools"), &mut tool_namespaces, &mut custom_tools);
+        // Responses-lite clients (Codex with a GPT-5 model) carry the tool definitions inside
+        // `input` as an `additional_tools` developer item instead of top-level `tools`. Those
+        // definitions are the request's tools; the item itself is kept verbatim so the request
+        // can be re-emitted in the shape the client used.
+        let mut additional_tools = Vec::new();
+        if let Some(items) = body.get("input").and_then(Value::as_array) {
+            for item in items {
+                if let Some(item) = item.as_object()
+                    && item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                    && let Some(tools) = item.get("tools").and_then(Value::as_array)
+                {
+                    request.tools.extend(decode_responses_tools(
+                        Some(&Value::Array(tools.clone())),
+                        &mut tool_namespaces,
+                        &mut custom_tools,
+                    ));
+                    additional_tools.extend(tools.iter().cloned());
+                }
+            }
+        }
         request.tool_choice = body
             .get("tool_choice")
             .and_then(decode_responses_tool_choice);
@@ -111,6 +168,15 @@ impl FormatCodec for OpenAiResponsesCodec {
             ],
         );
         crate::codex_namespaces::attach_tool_namespaces(&mut request.extensions, tool_namespaces);
+        crate::codex_custom_tools::attach_custom_tools(&mut request.extensions, custom_tools);
+        crate::codex_custom_tools::attach_custom_call_outputs(
+            &mut request.extensions,
+            custom_call_outputs,
+        );
+        crate::codex_custom_tools::attach_additional_tools(
+            &mut request.extensions,
+            additional_tools,
+        );
         Ok(DecodedRequest {
             request,
             diagnostics,
@@ -164,14 +230,37 @@ impl FormatCodec for OpenAiResponsesCodec {
                 &mut diagnostics,
                 _policy,
                 crate::codex_namespaces::tool_namespaces(&request.extensions),
+                &crate::codex_custom_tools::custom_tool_names(&request.extensions),
+                crate::codex_custom_tools::custom_call_outputs(&request.extensions),
             )?,
         );
-        if !request.tools.is_empty() {
+        if let Some(additional) = crate::codex_custom_tools::additional_tools(&request.extensions) {
+            // A Responses-lite request carried its tools inside `input`; give them back the same
+            // way, verbatim, and leave top-level `tools` absent as the client did. A request that
+            // reduced to a single user text encodes `input` as a plain string, which has no
+            // room for an item, so it is widened to the equivalent one-message array first.
+            let item = json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": additional,
+            });
+            match body.get_mut("input") {
+                Some(Value::Array(input)) => input.insert(0, item),
+                Some(input @ Value::String(_)) => {
+                    let text = input.take();
+                    *input = Value::Array(vec![item, json!({"role": "user", "content": text})]);
+                }
+                _ => body
+                    .insert("input".to_string(), Value::Array(vec![item]))
+                    .map_or((), |_| ()),
+            }
+        } else if !request.tools.is_empty() {
             body.insert(
                 "tools".to_string(),
                 encode_responses_tools(
                     &request.tools,
                     crate::codex_namespaces::tool_namespaces(&request.extensions),
+                    crate::codex_custom_tools::custom_tools(&request.extensions),
                 ),
             );
         }
@@ -212,6 +301,19 @@ impl FormatCodec for OpenAiResponsesCodec {
 
     fn decode_response(&self, body: &Value, policy: &TranslationPolicy) -> Result<DecodedResponse> {
         let body = crate::util::object(body, "$")?;
+        // Providers can return HTTP 200 when generation fails. Check `status`
+        // before treating an empty `output` as a completed turn.
+        if body.get("status").and_then(Value::as_str) == Some("failed") {
+            return Err(TranslationError::UpstreamFailure {
+                error: body
+                    .get("error")
+                    .filter(|error| error.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        json!({ "message": "provider reported status \"failed\" without error details" })
+                    }),
+            });
+        }
         let mut diagnostics = Vec::new();
         let mut content = Vec::new();
         let mut role = Role::Assistant;
@@ -341,6 +443,8 @@ impl FormatCodec for OpenAiResponsesCodec {
 /// item from flushing pending reasoning or disturbing tool-call grouping.
 fn decode_responses_input(
     value: &Value,
+    stored_state: bool,
+    custom_call_outputs: &mut Vec<String>,
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
 ) -> Result<(Vec<Message>, Vec<InstructionBlock>)> {
@@ -482,17 +586,91 @@ fn decode_responses_input(
                             arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
                         });
                     }
-                    Some("function_call_output") => {
+                    kind @ (Some("function_call_output") | Some("custom_tool_call_output")) => {
                         let tool_call_id = item
                             .get("call_id")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
-                        let output_text = item.get("output").map(json_string).unwrap_or_default();
+                        // A structured output keeps its typed text, image, and file parts;
+                        // any other shape rides through as one text block.
+                        let content = match item.get("output") {
+                            Some(output @ Value::Array(_)) => decode_responses_content(output),
+                            output => vec![ContentBlock::Text {
+                                text: output.map(json_string).unwrap_or_default(),
+                            }],
+                        };
+                        // An output whose call is not in this body answers a call the provider
+                        // holds behind `previous_response_id`; it stays a tool result so routing
+                        // sees a tool continuation, not a new user turn. Without stored state
+                        // the request is malformed, and the output becomes readable user text.
+                        let answers_pending_call = pending_tool_calls
+                            .iter()
+                            .any(|call| call.id == tool_call_id);
+                        if !answers_pending_call && !stored_state {
+                            let output_text = text_from_blocks(&content, " ");
+                            let message = Message::text(
+                                Role::User,
+                                format!("Tool result {tool_call_id}: {output_text}"),
+                            );
+                            push_responses_non_tool_message(
+                                &mut messages,
+                                &mut pending_tool_calls,
+                                &mut pending_tool_outputs,
+                                &mut deferred_messages,
+                                &mut pending_reasoning,
+                                message,
+                            );
+                            continue;
+                        }
+                        // The encoder types an output by the call it answers; a stored custom
+                        // output has no call in this body, so its type is carried separately.
+                        if !answers_pending_call && kind == Some("custom_tool_call_output") {
+                            custom_call_outputs.push(tool_call_id.clone());
+                        }
                         pending_tool_outputs.push(ToolResult {
                             tool_call_id,
-                            content: vec![ContentBlock::Text { text: output_text }],
+                            content,
                             is_error: None,
+                        });
+                    }
+                    Some("custom_tool_call") => {
+                        // A freeform call carries a raw `input` string; it rides through the IR
+                        // as the single `input` argument of a function-style call.
+                        if !pending_tool_outputs.is_empty() {
+                            flush_responses_tool_block(
+                                &mut messages,
+                                &mut pending_tool_calls,
+                                &mut pending_tool_outputs,
+                                &mut deferred_messages,
+                                &mut pending_reasoning,
+                            );
+                        }
+                        let id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| match &policy.deterministic_ids {
+                                DeterministicIdPolicy::GenerateStable { prefix } => {
+                                    stable_id(prefix, index + 1)
+                                }
+                                DeterministicIdPolicy::Preserve => String::new(),
+                            });
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let input = item
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        pending_tool_calls.push(ToolCall {
+                            id,
+                            name,
+                            arguments: json!({crate::codex_custom_tools::INPUT_ARGUMENT: input}),
                         });
                     }
                     None => {
@@ -502,6 +680,9 @@ fn decode_responses_input(
                                 .to_string(),
                         });
                     }
+                    // Tool definitions, not conversation; decoded separately by the request
+                    // decoder and re-emitted in place by the request encoder.
+                    Some("additional_tools") => {}
                     _ => {
                         let message = Message {
                             role: Role::User,
@@ -616,11 +797,6 @@ fn flush_responses_tool_block(
     deferred_messages: &mut Vec<Message>,
     pending_reasoning: &mut Vec<ContentBlock>,
 ) {
-    let tool_call_ids = pending_tool_calls
-        .iter()
-        .map(|call| call.id.clone())
-        .collect::<HashSet<_>>();
-
     if !pending_tool_calls.is_empty() {
         let mut content = std::mem::take(pending_reasoning);
         content.extend(
@@ -635,19 +811,10 @@ fn flush_responses_tool_block(
     }
 
     for output in std::mem::take(pending_tool_outputs) {
-        if tool_call_ids.contains(&output.tool_call_id) {
-            messages.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult(output)],
-            });
-        } else {
-            let tool_call_id = output.tool_call_id;
-            let output_text = text_from_blocks(&output.content, " ");
-            messages.push(Message::text(
-                Role::User,
-                format!("Tool result {tool_call_id}: {output_text}"),
-            ));
-        }
+        messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult(output)],
+        });
     }
 
     messages.append(deferred_messages);
@@ -661,37 +828,18 @@ fn decode_responses_reasoning_item(item: &Map<String, Value>) -> Vec<ContentBloc
     if let Some(text) = item.get("text").and_then(Value::as_str) {
         parts.push(text.to_string());
     }
+    // Encrypted reasoning must be replayed under the provider-issued item id;
+    // retain the original item only when it carries that opaque payload.
+    let details = if item.get("encrypted_content").is_some() {
+        vec![Value::Object(item.clone())]
+    } else {
+        Vec::new()
+    };
     vec![ContentBlock::Reasoning {
         text: parts.join("\n"),
         signature: None,
-        details: Vec::new(),
+        details,
     }]
-}
-
-// Collects text from the known Responses reasoning content/summary shapes.
-fn collect_responses_reasoning_text(value: Option<&Value>, out: &mut Vec<String>) {
-    match value {
-        Some(Value::String(text)) if !text.is_empty() => out.push(text.clone()),
-        Some(Value::Array(items)) => {
-            for item in items {
-                match item {
-                    Value::String(text) if !text.is_empty() => out.push(text.clone()),
-                    Value::Object(object) => {
-                        if matches!(
-                            object.get("type").and_then(Value::as_str),
-                            Some("reasoning_text" | "summary_text" | "text")
-                        ) && let Some(text) = object.get("text").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
-                            out.push(text.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 // Decodes Responses content arrays or strings into normalized content blocks.
@@ -802,6 +950,7 @@ fn request_role_from_responses(role: Option<&str>, path: &str) -> Result<Role> {
 fn decode_responses_tools(
     value: Option<&Value>,
     namespaces: &mut Map<String, Value>,
+    custom_tools: &mut Map<String, Value>,
 ) -> Vec<ToolDefinition> {
     let Some(tools) = value.and_then(Value::as_array) else {
         return Vec::new();
@@ -818,7 +967,7 @@ fn decode_responses_tools(
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty());
-            for mut child in decode_responses_tools(tool.get("tools"), namespaces) {
+            for mut child in decode_responses_tools(tool.get("tools"), namespaces, custom_tools) {
                 // A nested container already qualified its own children, and the
                 // innermost name is the one that identifies the tool.
                 let already_qualified = namespaces.contains_key(&child.name);
@@ -833,6 +982,29 @@ fn decode_responses_tools(
                     child.name = qualified;
                 }
                 out.push(child);
+            }
+        } else if tool.get("type").and_then(Value::as_str) == Some("custom") {
+            // A freeform tool takes a raw string, not JSON arguments. The IR sees it as a
+            // function with a single `input` argument; the verbatim definition is kept so a
+            // Responses upstream still receives the freeform tool. The definition is keyed by
+            // the tool's own name: Codex defines its freeform tools at the top level, so a
+            // custom tool nested in a namespace container (which would be renamed above) is
+            // not restored verbatim and goes upstream as the equivalent function tool.
+            if let Some(name) = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                custom_tools.insert(name.to_string(), Value::Object(tool.clone()));
+                out.push(ToolDefinition {
+                    name: name.to_string(),
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    parameters: crate::codex_custom_tools::input_schema(),
+                    strict: None,
+                });
             }
         } else if tool.get("type").and_then(Value::as_str) == Some("function") {
             if let Some(function) = tool.get("function").and_then(Value::as_object) {
@@ -1029,8 +1201,32 @@ fn encode_responses_input(
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
     namespaces: Option<&Map<String, Value>>,
+    custom_tools: &std::collections::HashSet<String>,
+    mut custom_call_ids: std::collections::HashSet<String>,
 ) -> Result<Value> {
+    // Call ids of freeform tool calls emitted by this pass, seeded with the ids of stored-state
+    // custom outputs. A tool result is typed by the call it answers, and Responses history
+    // always lists the call before its output, so recording ids as calls are encoded is enough
+    // to type the outputs that follow.
+    if messages.len() == 1
+        && matches!(messages[0].role, Role::User)
+        && messages[0].content.len() == 1
+        && matches!(messages[0].content[0], ContentBlock::Text { .. })
+        && let ContentBlock::Text { text } = &messages[0].content[0]
+    {
+        return Ok(Value::String(text.clone()));
+    }
     let mut encoded = Vec::new();
+    // Some upstream translators (Kimi K3) resolve a tool output by an explicit
+    // `name`, so pair every output with the name of the call it answers.
+    let mut call_names: HashMap<&str, &str> = HashMap::new();
+    for message in messages {
+        for block in &message.content {
+            if let ContentBlock::ToolCall(call) = block {
+                call_names.insert(call.id.as_str(), call.name.as_str());
+            }
+        }
+    }
     for message in messages {
         // Anthropic-signed thinking cannot be sent as Responses input.
         let content = message
@@ -1056,26 +1252,44 @@ fn encode_responses_input(
                 ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
             )
         }) {
-            encoded.extend(
-                content
-                    .iter()
-                    .filter_map(|block| encode_responses_special_input(block, namespaces)),
-            );
+            for block in &content {
+                if let Some(item) = encode_responses_special_input(
+                    block,
+                    namespaces,
+                    &call_names,
+                    custom_tools,
+                    &mut custom_call_ids,
+                    diagnostics,
+                    policy,
+                )? {
+                    encoded.push(item);
+                }
+            }
             continue;
         }
         let mut visible_content = Vec::new();
         let mut emitted_special = false;
+        let mut omitted_reasoning = false;
         for block in &content {
-            if let Some(item) = encode_responses_special_input(block, namespaces) {
+            if let Some(item) = encode_responses_special_input(
+                block,
+                namespaces,
+                &call_names,
+                custom_tools,
+                &mut custom_call_ids,
+                diagnostics,
+                policy,
+            )? {
                 encoded.push(item);
                 emitted_special = true;
-            } else {
+            } else if !matches!(block, ContentBlock::Reasoning { .. }) {
                 visible_content.push(block.clone());
+            } else {
+                omitted_reasoning = true;
             }
         }
-        if !visible_content.is_empty() || !emitted_special {
-            let content =
-                encode_responses_content(&visible_content, message.role, diagnostics, policy)?;
+        if !visible_content.is_empty() || (!emitted_special && !omitted_reasoning) {
+            let content = encode_responses_content(&visible_content, diagnostics, policy)?;
             encoded.push(json!({
                 "type": "message",
                 "role": role_to_responses(message.role),
@@ -1083,24 +1297,94 @@ fn encode_responses_input(
             }));
         }
     }
+    pair_tool_calls_with_outputs(&mut encoded);
     Ok(Value::Array(encoded))
+}
+
+// Moves each tool output directly behind the call it answers. A turn with
+// parallel tool calls otherwise serializes as call,call,output,output, which
+// upstreams that pair by adjacency (Kimi K3) resolve to the wrong call.
+fn pair_tool_calls_with_outputs(items: &mut Vec<Value>) {
+    let call_id = |item: &Value, kind: &str| {
+        (item.get("type").and_then(Value::as_str) == Some(kind))
+            .then(|| {
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+    };
+    let mut index = 0;
+    while index < items.len() {
+        // Freeform (`custom`) calls pair with `custom_tool_call_output` the same way.
+        let (id, output_kind) = match call_id(&items[index], "function_call") {
+            Some(id) => (id, "function_call_output"),
+            None => match call_id(&items[index], "custom_tool_call") {
+                Some(id) => (id, "custom_tool_call_output"),
+                None => {
+                    index += 1;
+                    continue;
+                }
+            },
+        };
+        let output = items
+            .iter()
+            .skip(index + 1)
+            .position(|item| call_id(item, output_kind).as_deref() == Some(&id))
+            .map(|offset| index + 1 + offset);
+        if let Some(output) = output
+            && output != index + 1
+        {
+            let item = items.remove(output);
+            items.insert(index + 1, item);
+        }
+        index += 1;
+    }
+}
+
+// Returns the body without Codex `compaction_trigger` input items, or `None`
+// when there are none (the common case, sparing the clone).
+fn strip_codex_compaction_markers(body: &Map<String, Value>) -> Option<Map<String, Value>> {
+    fn is_marker(item: &Value) -> bool {
+        item.get("type").and_then(Value::as_str) == Some("compaction_trigger")
+    }
+    let input = body.get("input")?.as_array()?;
+    if !input.iter().any(is_marker) {
+        return None;
+    }
+    let mut sanitized = body.clone();
+    if let Some(Value::Array(items)) = sanitized.get_mut("input") {
+        items.retain(|item| !is_marker(item));
+    }
+    Some(sanitized)
 }
 
 // Encodes IR blocks that Responses represents as top-level input items.
 fn encode_responses_special_input(
     block: &ContentBlock,
     namespaces: Option<&Map<String, Value>>,
-) -> Option<Value> {
-    match block {
+    call_names: &HashMap<&str, &str>,
+    custom_tools: &std::collections::HashSet<String>,
+    custom_call_ids: &mut std::collections::HashSet<String>,
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Option<Value>> {
+    Ok(match block {
         ContentBlock::Reasoning {
             text,
             signature: None,
-            ..
-        } => Some(json!({
-            "type": "reasoning",
-            "content": [{"type": "reasoning_text", "text": text}],
-            "summary": [],
-        })),
+            details,
+        } => encode_responses_reasoning_input(text, details),
+        ContentBlock::ToolCall(call) if custom_tools.contains(&call.name) => {
+            // A freeform tool call replays as `custom_tool_call` with its raw input.
+            custom_call_ids.insert(call.id.clone());
+            Some(json!({
+                "type": "custom_tool_call",
+                "call_id": call.id,
+                "name": call.name,
+                "input": crate::codex_custom_tools::input_from_arguments(&call.arguments),
+            }))
+        }
         ContentBlock::ToolCall(call) => {
             // A Responses client dispatches on name plus namespace, so undo the
             // qualification this request applied for a flat upstream.
@@ -1122,13 +1406,63 @@ fn encode_responses_special_input(
             }
             Some(item)
         }
-        ContentBlock::ToolResult(result) => Some(json!({
-            "type": "function_call_output",
-            "call_id": result.tool_call_id,
-            "output": text_from_blocks(&result.content, " "),
-        })),
+        ContentBlock::ToolResult(result) => {
+            // A result answering a freeform call replays as `custom_tool_call_output`; anything
+            // else is a `function_call_output`.
+            let mut item = json!({
+                "type": if custom_call_ids.contains(&result.tool_call_id) {
+                    "custom_tool_call_output"
+                } else {
+                    "function_call_output"
+                },
+                "call_id": result.tool_call_id,
+                "output": encode_responses_tool_output(&result.content, diagnostics, policy)?,
+            });
+            // Carry the paired call's name, un-qualified to match the emitted
+            // function_call, for upstreams that resolve outputs by name.
+            if let Some(name) = call_names.get(result.tool_call_id.as_str()) {
+                let name = namespaces
+                    .and_then(|namespaces| {
+                        crate::codex_namespaces::split_qualified_name(namespaces, name)
+                    })
+                    .map_or_else(|| (*name).to_string(), |(name, _)| name);
+                item["name"] = Value::String(name);
+            }
+            Some(item)
+        }
         _ => None,
+    })
+}
+
+// Encodes reasoning in the shape accepted for Responses input history. Response
+// output items may carry `content`, but replayed input items must avoid it.
+fn encode_responses_reasoning_input(text: &str, details: &[Value]) -> Option<Value> {
+    for detail in details {
+        let Some(detail) = detail.as_object() else {
+            continue;
+        };
+        if detail.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        let mut item = Map::new();
+        item.insert("type".to_string(), Value::String("reasoning".to_string()));
+        for field in ["id", "summary", "encrypted_content"] {
+            if let Some(value) = detail.get(field) {
+                item.insert(field.to_string(), value.clone());
+            }
+        }
+        item.entry("summary".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        return Some(Value::Object(item));
     }
+
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": text}],
+    }))
 }
 
 // Maps normalized roles back to Responses role strings.
@@ -1358,7 +1692,7 @@ fn encode_responses_content(
                         policy,
                         "Responses codec could not map image content",
                     )?;
-                    blocks.push(json!({"type": text_type, "text": json_string(&json!(source))}));
+                    blocks.push(json!({"type": "input_text", "text": image_source_text(source)}));
                 }
             },
             ContentBlock::Audio { source } => blocks.push(match source {
@@ -1385,9 +1719,17 @@ fn encode_responses_content(
                     "video": {"media_type": media_type, "data": data},
                 }),
             }),
-            ContentBlock::File { source } => {
-                blocks.push(json!({"type": "input_file", "file": source}));
-            }
+            ContentBlock::File { source } => match responses_file_part(source) {
+                Some(part) => blocks.push(part),
+                None => {
+                    push_lossy(
+                        diagnostics,
+                        policy,
+                        "Responses codec could not map file content",
+                    )?;
+                    blocks.push(json!({"type": "input_text", "text": file_source_text(source)}));
+                }
+            },
             ContentBlock::Unknown { raw, .. } => {
                 push_lossy(
                     diagnostics,
@@ -1404,6 +1746,41 @@ fn encode_responses_content(
     Ok(Value::Array(blocks))
 }
 
+// Encodes tool-result content as a `function_call_output.output`: a string when it is
+// text only, otherwise the typed `input_text` / `input_image` / `input_file` parts.
+fn encode_responses_tool_output(
+    content: &[ContentBlock],
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Value> {
+    let text_only = content.iter().all(|block| {
+        matches!(
+            block,
+            ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
+        )
+    });
+    if text_only {
+        return Ok(Value::String(text_from_blocks(content, " ")));
+    }
+    encode_responses_content(content, diagnostics, policy)
+}
+
+fn responses_image_part(source: &ImageSource) -> Option<Value> {
+    let ImagePayload { url, detail } = image_payload(source)?;
+    let mut part = json!({"type": "input_image"});
+    part["image_url"] = Value::String(url);
+    if let Some(detail) = detail {
+        part["detail"] = Value::String(detail);
+    }
+    Some(part)
+}
+
+fn responses_file_part(source: &FileSource) -> Option<Value> {
+    let mut part = file_payload(source)?;
+    part.insert("type".to_string(), Value::String("input_file".to_string()));
+    Some(Value::Object(part))
+}
+
 // Encodes normalized tool definitions into Responses tool JSON.
 // Encodes normalized tools as Responses entries.
 //
@@ -1412,10 +1789,16 @@ fn encode_responses_content(
 fn encode_responses_tools(
     tools: &[ToolDefinition],
     namespaces: Option<&Map<String, Value>>,
+    custom_tools: Option<&Map<String, Value>>,
 ) -> Value {
     let mut out: Vec<Value> = Vec::new();
     let mut containers: Vec<(String, Vec<Value>)> = Vec::new();
     for tool in tools {
+        // A freeform tool goes back out exactly as the client defined it.
+        if let Some(custom) = custom_tools.and_then(|custom| custom.get(&tool.name)) {
+            out.push(custom.clone());
+            continue;
+        }
         let mut item = json!({
             "type": "function",
             "name": tool.name,
@@ -1513,6 +1896,26 @@ fn decode_responses_output_item(
             })],
             stop_reason: Some(StopReason::ToolUse),
         })),
+        Some("custom_tool_call") => Ok(Some(ResponseOutput {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                arguments: json!({
+                    crate::codex_custom_tools::INPUT_ARGUMENT:
+                        item.get("input").and_then(Value::as_str).unwrap_or_default()
+                }),
+            })],
+            stop_reason: Some(StopReason::ToolUse),
+        })),
         Some("reasoning") => Ok(Some(ResponseOutput {
             role: Role::Assistant,
             content: decode_responses_reasoning_item(item),
@@ -1541,8 +1944,20 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                 };
                 let mut items = Vec::new();
 
-                if !reasoning.is_empty() {
-                    items.push(encode_responses_reasoning_output(&reasoning));
+                let encrypted_reasoning = output.content.iter().find_map(|block| match block {
+                    ContentBlock::Reasoning { details, .. } => encrypted_reasoning_data(details),
+                    _ => None,
+                });
+                let encrypted_reasoning_id = output.content.iter().find_map(|block| match block {
+                    ContentBlock::Reasoning { details, .. } => encrypted_reasoning_item_id(details),
+                    _ => None,
+                });
+                if !reasoning.is_empty() || encrypted_reasoning.is_some() {
+                    items.push(encode_responses_reasoning_output(
+                        &reasoning,
+                        encrypted_reasoning.as_deref(),
+                        encrypted_reasoning_id.as_deref(),
+                    ));
                 }
 
                 if !text.is_empty() || (!has_tool_calls && reasoning.is_empty()) {
@@ -1575,18 +1990,29 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
     )
 }
 
-// Encodes private reasoning as a separate Responses output item.
-fn encode_responses_reasoning_output(text: &str) -> Value {
-    json!({
+// Encodes private reasoning as a separate Responses output item. An encrypted-only item
+// carries no text part but keeps `encrypted_content` so the client can replay it.
+fn encode_responses_reasoning_output(
+    text: &str,
+    encrypted: Option<&str>,
+    item_id: Option<&str>,
+) -> Value {
+    // Standard Responses shape: text as `summary_text` parts, which is what clients record.
+    let mut summary = Vec::new();
+    if !text.is_empty() {
+        summary.push(json!({"type": "summary_text", "text": text}));
+    }
+    // Encrypted reasoning verifies only under the id it was issued with, so reuse it.
+    let mut item = json!({
         "type": "reasoning",
-        "id": "rs_switchyard",
+        "id": item_id.unwrap_or("rs_switchyard"),
         "status": "completed",
-        "content": [{
-            "type": "reasoning_text",
-            "text": text,
-        }],
-        "summary": [],
-    })
+        "summary": summary,
+    });
+    if let Some(encrypted) = encrypted {
+        item["encrypted_content"] = Value::String(encrypted.to_string());
+    }
+    item
 }
 
 // Serializes JSON with Python-like spacing to match legacy converter behavior.
@@ -1697,6 +2123,7 @@ fn copy_responses_request_extensions(
     for field in [
         "metadata",
         "parallel_tool_calls",
+        "previous_response_id",
         "prompt_cache_key",
         "prompt_cache_retention",
         "safety_identifier",

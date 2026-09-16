@@ -13,15 +13,14 @@ use futures_util::{StreamExt, stream};
 use http::StatusCode;
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use switchyard_protocol::{
-    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Metadata, ModelId, Request,
-    Response, RoutedLlmClient,
+    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
+    ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
-    WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request_with_profile,
-    encode_stream_with_extensions,
+    TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
+    encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
 };
 use tracing::Instrument;
 
@@ -31,28 +30,27 @@ use crate::error::{LlmClientError, Result};
 use crate::metrics;
 use crate::raw::RawResponse;
 
-// Headers this client owns or that are hop-by-hop. Backends apply an explicitly
-// enabled caller credential after generic metadata forwarding skips these.
-// Azure/OpenAI credentials and tenant selectors are also backend-owned.
-const RESERVED_HEADERS: &[&str] = &[
+// Caller headers safe to send when caller auth forwarding is disabled.
+const ALLOWED_METADATA_HEADERS: &[&str] = &["x-request-id"];
+
+// Headers tied to the inbound connection, destination, or body. The HTTP client
+// must rebuild these for the upstream request, even when forwarding auth.
+const NON_FORWARDABLE_HEADERS: &[&str] = &[
     "host",
     "content-length",
     "connection",
-    "authorization",
-    "proxy-authorization",
+    "proxy-connection",
+    "keep-alive",
     "proxy-authenticate",
-    "cookie",
-    "set-cookie",
-    "x-api-key",
-    "chatgpt-account-id",
-    "x-openai-fedramp",
-    "api-key",
-    "openai-organization",
-    "openai-project",
-    "anthropic-beta",
-    "anthropic-version",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
     "content-type",
+    "content-encoding",
     "accept-encoding",
+    "expect",
 ];
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -298,7 +296,7 @@ impl TranslatingLlmClient {
     /// forwarded headers plus the backend's static headers and auth, and return the
     /// successful upstream response. A
     /// buffered response is fully collected within the retry boundary; a streamed
-    /// response is returned as soon as its successful headers arrive. A non-success
+    /// response has its first decoded event checked within that boundary. A non-success
     /// status maps to a typed error — a 400 is classified as a context-window
     /// overflow via the backend's provider rules. Shared by
     /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
@@ -329,6 +327,9 @@ impl TranslatingLlmClient {
         // which keeps the caller's original `model`; force the resolved model so
         // the upstream always sees the target id.
         set_json_model(&mut body, model);
+        if matches!(backend, Backend::OpenAiResponses(_)) {
+            sanitize_openai_responses_provider_body(&mut body);
+        }
         // Strip before `merge_extra_body` so a target can reinstate either field
         // deliberately via `extra_body`.
         if matches!(backend, Backend::Anthropic(_)) {
@@ -355,6 +356,9 @@ impl TranslatingLlmClient {
             strip_message_reasoning_content(&mut body);
             strip_input_reasoning_items(&mut body);
         }
+        // After the merge on purpose: the effort override must win over both the caller's
+        // value and any `reasoning` default a target set through `extra_body`.
+        apply_reasoning_effort(&mut body, backend);
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -563,6 +567,7 @@ impl TranslatingLlmClient {
                     stream,
                 });
             }
+            let upstream_headers = response.headers().clone();
             let body = match response.bytes().await {
                 Ok(body) => body,
                 Err(error) => {
@@ -579,6 +584,7 @@ impl TranslatingLlmClient {
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
                 body: body.to_vec(),
+                upstream_headers,
             });
         }
 
@@ -595,7 +601,7 @@ impl TranslatingLlmClient {
                 });
             }
         };
-        let body = backend.redact_forwarded_auth(body, metadata);
+        let body = redact_forwarded_headers(body, metadata, backend.is_forwarding_auth());
         metrics::record_upstream_attempt(Some(status.as_u16()));
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
@@ -716,15 +722,32 @@ impl TranslatingLlmClient {
                 let body = serde_json::from_slice::<Value>(&body).map_err(|error| {
                     LlmClientError::ResponseTranslation(format!("invalid upstream JSON: {error}"))
                 })?;
-                let agg = decode_aggregated_response(&body, wire_format)
-                    .map_err(|error| LlmClientError::ResponseTranslation(error.to_string()))?;
-                LlmResponse::Agg(agg)
+                // Map a provider's failed generation to 502, even under HTTP 200.
+                // Redact forwarded credentials before returning the provider error.
+                let agg =
+                    decode_aggregated_response(&body, wire_format).map_err(
+                        |error| match error {
+                            TranslationError::UpstreamFailure { error } => {
+                                LlmClientError::UpstreamHttp {
+                                    status: StatusCode::BAD_GATEWAY,
+                                    body: redact_forwarded_headers(
+                                        json!({ "error": error }).to_string(),
+                                        metadata.as_ref(),
+                                        backend.is_forwarding_auth(),
+                                    ),
+                                }
+                            }
+                            error => LlmClientError::ResponseTranslation(error.to_string()),
+                        },
+                    )?;
+                (LlmResponse::Agg(agg), upstream_headers)
             }
         };
 
         Ok(Response {
             llm_response,
             metadata,
+            upstream_headers,
         })
     }
 
@@ -740,8 +763,10 @@ impl TranslatingLlmClient {
     /// model that answered rather than the route the caller addressed.
     ///
     /// `http_headers` are carried through as the request's
-    /// [`Metadata::http_headers`] and forwarded to the upstream (minus the reserved
-    /// set); pass `None` to forward nothing.
+    /// [`Metadata::http_headers`]. Backends with `forward_auth` disabled forward only
+    /// allowed metadata headers; `forward_auth` backends forward all application
+    /// headers. All backends reachable through a forwarding route must use the same
+    /// provider. Transport headers are always rebuilt. Pass `None` to forward nothing.
     pub async fn call_rewrite_model_raw(
         &self,
         raw_http_request: Value,
@@ -926,6 +951,36 @@ impl AttemptFailure {
     }
 }
 
+async fn prepare_response_stream(
+    response: reqwest::Response,
+    backend: &Backend,
+    model: &ModelId,
+) -> Result<LlmResponseStream> {
+    let bytes = response.bytes_stream().map(|chunk| {
+        chunk
+            .map(|bytes| bytes.to_vec())
+            .map_err(convert_reqwest_error)
+    });
+    let mut chunks = decode_stream(bytes, backend.wire_format())?;
+    match chunks.next().await {
+        None => Ok(stream::empty().boxed()),
+        // Nothing has reached the caller, so transport failures can still be retried.
+        Some(Err(error @ (LlmClientError::Transport { .. } | LlmClientError::Timeout { .. }))) => {
+            Err(error)
+        }
+        Some(first) => {
+            // An in-band context overflow skips retries and advances to another candidate.
+            if let Some(message) = first_event_overflow(&first, backend) {
+                return Err(LlmClientError::ContextWindowExceeded {
+                    model: model.clone(),
+                    message,
+                });
+            }
+            Ok(stream::once(ready(first)).chain(chunks).boxed())
+        }
+    }
+}
+
 // The overflow message when a stream's first event is an in-band provider rejection
 // of the whole request, rather than the start of a response.
 fn first_event_overflow(
@@ -992,6 +1047,7 @@ fn record_gen_ai_request(url: &str, model: &str, streaming: bool) {
 fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     // Reqwest labels truncated or otherwise unreadable response bodies as decode
     // errors, so distinguish them from serde JSON failures at the call site.
+    let error = error.without_url();
     if error.is_timeout() {
         LlmClientError::Timeout {
             source: Box::new(error),
@@ -1017,15 +1073,22 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
 // caller-supplied one. Comparison is case-insensitive; auth/credential headers are
 // already reserved and never forwarded.
 fn forward_metadata_headers(
-    mut builder: RequestBuilder,
+    builder: RequestBuilder,
     metadata: Option<&Metadata>,
     backend: &Backend,
 ) -> RequestBuilder {
     let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
         return builder;
     };
+    let mut forwarded = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
-        if is_reserved_header(name.as_str()) {
+        let is_allowed = if backend.is_forwarding_auth() {
+            !is_non_forwardable_header(name.as_str(), headers)
+                && !backend.is_provider_owned_header(name.as_str())
+        } else {
+            is_allowed_metadata_header(name.as_str())
+        };
+        if !is_allowed {
             continue;
         }
         // The backend overrides this header via extra_headers; do not forward the
@@ -1038,8 +1101,10 @@ fn forward_metadata_headers(
             continue;
         }
         builder = builder.header(name, value);
+
+forwarded.append(name, value.clone());
     }
-    builder
+    builder.headers(forwarded)
 }
 
 // Adds the backend's custom per-call headers.
@@ -1054,6 +1119,124 @@ fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> Reques
 fn set_json_model(body: &mut Value, model: &str) {
     if let Value::Object(object) = body {
         object.insert("model".to_string(), Value::String(model.to_string()));
+    }
+}
+
+const CODEX_NAMESPACE_SEPARATOR: &str = "__";
+
+// Codex extends Responses with namespace containers and namespaced function
+// calls. OpenAI-compatible providers expect a flat Responses tool namespace.
+fn sanitize_openai_responses_provider_body(body: &mut Value) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    sanitize_openai_responses_input_for_provider(object.get_mut("input"));
+    sanitize_openai_responses_tools_for_provider(object.get_mut("tools"));
+    sanitize_openai_responses_tool_choice_for_provider(object.get_mut("tool_choice"));
+}
+
+fn sanitize_openai_responses_input_for_provider(input: Option<&mut Value>) {
+    let Some(Value::Array(items)) = input else {
+        return;
+    };
+    for item in items {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) == Some("function_call") {
+            qualify_responses_function_name(object);
+        }
+    }
+}
+
+fn sanitize_openai_responses_tools_for_provider(tools: Option<&mut Value>) {
+    let Some(Value::Array(tools)) = tools else {
+        return;
+    };
+    let mut flat_tools = Vec::with_capacity(tools.len());
+    for tool in std::mem::take(tools) {
+        push_sanitized_openai_responses_tool(&mut flat_tools, tool);
+    }
+    *tools = flat_tools;
+}
+
+fn push_sanitized_openai_responses_tool(out: &mut Vec<Value>, tool: Value) {
+    let Value::Object(mut object) = tool else {
+        out.push(tool);
+        return;
+    };
+    if object.get("type").and_then(Value::as_str) == Some("namespace") {
+        let namespace = object
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let Some(Value::Array(children)) = object.remove("tools") else {
+            out.push(Value::Object(object));
+            return;
+        };
+        for child in children {
+            push_sanitized_namespaced_tool(out, &namespace, child);
+        }
+        return;
+    }
+    ensure_responses_function_tool_description(&mut object);
+    out.push(Value::Object(object));
+}
+
+fn push_sanitized_namespaced_tool(out: &mut Vec<Value>, namespace: &str, tool: Value) {
+    let Value::Object(mut object) = tool else {
+        out.push(tool);
+        return;
+    };
+    if object.get("type").and_then(Value::as_str) == Some("function") {
+        qualify_responses_function_name_with_namespace(&mut object, namespace);
+        ensure_responses_function_tool_description(&mut object);
+    }
+    out.push(Value::Object(object));
+}
+
+fn sanitize_openai_responses_tool_choice_for_provider(tool_choice: Option<&mut Value>) {
+    let Some(Value::Object(object)) = tool_choice else {
+        return;
+    };
+    if object.get("type").and_then(Value::as_str) == Some("function") {
+        qualify_responses_function_name(object);
+    }
+}
+
+fn qualify_responses_function_name(object: &mut Map<String, Value>) {
+    let namespace = object
+        .remove("namespace")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    let Some(namespace) = namespace.as_deref() else {
+        return;
+    };
+    qualify_responses_function_name_with_namespace(object, namespace);
+}
+
+fn qualify_responses_function_name_with_namespace(
+    object: &mut Map<String, Value>,
+    namespace: &str,
+) {
+    if namespace.is_empty() {
+        return;
+    }
+    let Some(name) = object.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    let prefix = format!("{namespace}{CODEX_NAMESPACE_SEPARATOR}");
+    if name.starts_with(&prefix) {
+        return;
+    }
+    object.insert("name".to_string(), Value::String(format!("{prefix}{name}")));
+}
+
+fn ensure_responses_function_tool_description(object: &mut Map<String, Value>) {
+    if object.get("type").and_then(Value::as_str) == Some("function")
+        && !matches!(object.get("description"), Some(Value::String(_)))
+    {
+        object.insert("description".to_string(), Value::String(String::new()));
     }
 }
 
@@ -1120,6 +1303,44 @@ fn is_unsigned_thinking_block(block: &Value) -> bool {
         block.get("signature").and_then(Value::as_str),
         Some(signature) if !signature.is_empty()
     )
+}
+
+// Forces the target's configured reasoning effort onto the outbound body, replacing the
+// caller's value. Unlike `extra_body`, this is an override: a route that sends one model at a
+// higher effort than the client asked for is the point of the setting.
+fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
+    let Some(effort) = backend.reasoning_effort() else {
+        return;
+    };
+    let Value::Object(object) = body else {
+        return;
+    };
+    match backend {
+        Backend::OpenAiResponses(_) => {
+            // Responses nests effort under `reasoning` next to fields the caller may have set
+            // (`summary`, for example), so only the `effort` key is replaced. A `reasoning`
+            // value that is not an object is malformed and is replaced whole.
+            let reasoning = object
+                .entry("reasoning".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if !reasoning.is_object() {
+                *reasoning = Value::Object(serde_json::Map::new());
+            }
+            if let Value::Object(reasoning) = reasoning {
+                reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+            }
+        }
+        Backend::OpenAiChat(_) => {
+            // Chat Completions takes effort as a top-level field.
+            object.insert(
+                "reasoning_effort".to_string(),
+                Value::String(effort.to_string()),
+            );
+        }
+        // Anthropic has no effort field (thinking is a token budget); the runner rejects the
+        // setting on Anthropic clients at load time, so this arm is unreachable in practice.
+        Backend::Anthropic(_) => {}
+    }
 }
 
 // Applies target defaults without overriding fields supplied by the caller.
@@ -1387,11 +1608,48 @@ fn ensure_openai_stream_usage(body: &mut Value) {
     }
 }
 
-// Case-insensitive membership test against RESERVED_HEADERS.
-fn is_reserved_header(name: &str) -> bool {
-    RESERVED_HEADERS
+fn is_allowed_metadata_header(name: &str) -> bool {
+    ALLOWED_METADATA_HEADERS
         .iter()
-        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+fn is_non_forwardable_header(name: &str, headers: &HeaderMap) -> bool {
+    NON_FORWARDABLE_HEADERS
+        .iter()
+        .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        || headers.get_all("connection").iter().any(|value| {
+            value
+                .as_bytes()
+                .split(|byte| *byte == b',')
+                .any(|option| option.trim_ascii().eq_ignore_ascii_case(name.as_bytes()))
+        })
+}
+
+// Unknown application headers can carry credentials when auth forwarding is enabled.
+fn redact_forwarded_headers(
+    mut body: String,
+    metadata: Option<&Metadata>,
+    is_forwarding_auth: bool,
+) -> String {
+    if !is_forwarding_auth {
+        return body;
+    }
+    let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
+        return body;
+    };
+    for (name, value) in headers {
+        if is_non_forwardable_header(name.as_str(), headers) {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        if !value.is_empty() {
+            body = body.replace(value, "[REDACTED]");
+        }
+    }
+    body
 }
 
 #[cfg(test)]
@@ -1404,7 +1662,7 @@ mod tests {
     use std::thread::JoinHandle;
 
     use serde_json::json;
-    use switchyard_protocol::{LlmRequest, completion_text, text_request};
+    use switchyard_protocol::{completion_text, text_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1418,6 +1676,7 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            reasoning_effort: None,
             max_retries: 0,
             strip_reasoning_content: false,
         }
@@ -1431,11 +1690,27 @@ mod tests {
         }
     }
 
+    fn forwarding_config(base_url: &str) -> HttpBackendConfig {
+        HttpBackendConfig {
+            api_key: None,
+            forward_auth: true,
+            ..config(base_url)
+        }
+    }
+
     // A one-model config list: "gpt" served over OpenAI Chat at base_url.
     fn chat_map(base_url: &str) -> Vec<ModelConfig> {
         vec![ModelConfig::new(
             "gpt",
             Backend::OpenAiChat(config(base_url)),
+            None,
+        )]
+    }
+
+    fn responses_map(base_url: &str) -> Vec<ModelConfig> {
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(config(base_url)),
             None,
         )]
     }
@@ -1449,14 +1724,20 @@ mod tests {
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
-    // A one-model config list whose backend carries fixed `extra_headers`.
-    fn chat_map_with_extra_headers(
-        base_url: &str,
-        extra_headers: BTreeMap<String, String>,
-    ) -> Vec<ModelConfig> {
+    fn chat_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
-        backend.extra_headers = extra_headers;
+        backend.reasoning_effort = Some(effort.to_string());
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn responses_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.reasoning_effort = Some(effort.to_string());
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
     }
 
     fn anthropic_map(base_url: &str) -> Vec<ModelConfig> {
@@ -1548,6 +1829,26 @@ mod tests {
             metadata: None,
             candidate_input_tokens: Default::default(),
         }
+    }
+
+    fn request_with_headers(model: &str, headers: HeaderMap) -> Request {
+        let mut request = request_for(Some(model), false);
+        request.metadata = Some(Metadata {
+            http_headers: Some(headers),
+            ..Default::default()
+        });
+        request
+    }
+
+    #[tokio::test]
+    async fn transport_errors_drop_the_upstream_url() {
+        let error = reqwest::Client::new()
+            .post("http://127.0.0.1:1/v1?key=CANARY")
+            .send()
+            .await
+            .expect_err("closed port");
+
+        assert!(!convert_reqwest_error(error).to_string().contains("CANARY"));
     }
 
     #[test]
@@ -1862,6 +2163,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_first_event_transport_failure_uses_retry_budget()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let truncated = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                         Content-Length: 100\r\nConnection: close\r\n\r\n";
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        for second in [success, truncated.to_string()] {
+            let is_exhausted = second == truncated;
+            let (base_url, server) = response_sequence_server(vec![truncated.to_string(), second])?;
+            let client = TranslatingLlmClient::new(&chat_map_with_retries(&base_url, 1))?;
+            let result = client
+                .call_rewrite_model(request_for(Some("gpt"), true), None)
+                .await;
+            if is_exhausted {
+                assert!(matches!(result, Err(LlmClientError::Transport { .. })));
+            } else {
+                assert_eq!(
+                    completion_text(&result?.llm_response.into_agg().await?),
+                    "recovered"
+                );
+            }
+            server
+                .join()
+                .map_err(|_| std::io::Error::other("response server thread panicked"))??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn streaming_body_io_failure_preserves_transport_error()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
@@ -1908,6 +2243,89 @@ mod tests {
             )
             .await?;
         // The body_partial_json matcher asserts the upstream saw model "gpt".
+        Ok(())
+    }
+
+    /// A configured reasoning effort replaces the caller's value on both OpenAI wire formats,
+    /// which `extra_body` (defaults only) cannot do.
+    #[tokio::test]
+    async fn reasoning_effort_override_replaces_the_callers_effort()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "gpt",
+                "reasoning_effort": "max"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map_with_effort(
+            &format!("{}/v1", server.uri()),
+            "max",
+        ))?;
+        client
+            .call_rewrite_model_raw(
+                json!({
+                    "model": "client-facing",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "reasoning_effort": "high"
+                }),
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "gpt",
+                "reasoning": {"effort": "max", "summary": "auto"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_effort(
+            &format!("{}/v1", server.uri()),
+            "max",
+        ))?;
+        client
+            .call_rewrite_model_raw(
+                json!({
+                    "model": "client-facing",
+                    "input": [{"role": "user", "content": "hi"}],
+                    "reasoning": {"effort": "high", "summary": "auto"}
+                }),
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
+            )
+            .await?;
         Ok(())
     }
 
@@ -2457,7 +2875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwards_metadata_headers_except_reserved()
+    async fn forwards_only_allowlisted_metadata_headers()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2479,12 +2897,12 @@ mod tests {
             http::HeaderValue::from_static("Bearer client-key"),
         );
         headers.insert(
-            "accept-encoding",
-            http::HeaderValue::from_static("gzip, br"),
+            "x-goog-api-key",
+            http::HeaderValue::from_static("client-google-key"),
         );
         headers.insert(
-            "api-key",
-            http::HeaderValue::from_static("client-azure-key"),
+            "x-custom-internal-secret",
+            http::HeaderValue::from_static("client-custom-key"),
         );
         headers.insert(
             "openai-organization",
@@ -2515,18 +2933,143 @@ mod tests {
 
         let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
 
-        // Matchers assert forwarded x-request-id survives and reserved
-        // authorization is the backend's, not the client's.
+        // The allowed request id survives and caller authorization cannot replace
+        // the backend's credential.
         client.call_rewrite_model(request, None).await?;
         let received = server
             .received_requests()
             .await
             .ok_or("request recording should be enabled")?;
         let received = received.first().ok_or("expected one upstream request")?;
-        assert!(!received.headers.contains_key("accept-encoding"));
-        assert!(!received.headers.contains_key("api-key"));
-        assert!(!received.headers.contains_key("openai-organization"));
-        assert!(!received.headers.contains_key("openai-project"));
+        assert!(!received.headers.contains_key("x-goog-api-key"));
+        assert!(!received.headers.contains_key("x-custom-internal-secret"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwards_application_headers_with_forward_auth()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer client-key",
+            ))
+            .and(wiremock::matchers::header(
+                "x-goog-api-key",
+                "client-google-key",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer client-key"),
+        );
+        headers.insert(
+            "x-goog-api-key",
+            http::HeaderValue::from_static("client-google-key"),
+        );
+        headers.insert("host", http::HeaderValue::from_static("client.example"));
+        headers.insert("content-type", http::HeaderValue::from_static("text/plain"));
+        headers.insert("connection", http::HeaderValue::from_static("x-hop-by-hop"));
+        headers.insert(
+            "x-hop-by-hop",
+            http::HeaderValue::from_static("client-only"),
+        );
+        let request = request_with_headers("gpt", headers);
+        let backend_config = forwarding_config(&format!("{}/v1", server.uri()));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend_config),
+            None,
+        )])?;
+
+        client.call_rewrite_model(request, None).await?;
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let received = received.first().ok_or("expected one upstream request")?;
+        assert_ne!(received.headers["host"], "client.example");
+        assert_eq!(received.headers["content-type"], "application/json");
+        assert!(!received.headers.contains_key("connection"));
+        assert!(!received.headers.contains_key("x-hop-by-hop"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forward_auth_preserves_anthropic_headers_and_redacts_errors()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(|request: &wiremock::Request| {
+                request
+                    .headers
+                    .get("anthropic-beta")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("oauth-2025-04-20")
+                    && request.headers.get_all("anthropic-version").iter().count() == 1
+                    && request
+                        .headers
+                        .get("anthropic-version")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("2023-06-01")
+            })
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "rejected client-google-key"}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer client-key"),
+        );
+        headers.insert(
+            "x-goog-api-key",
+            http::HeaderValue::from_static("client-google-key"),
+        );
+        headers.insert(
+            "anthropic-beta",
+            http::HeaderValue::from_static("oauth-2025-04-20,prompt-caching-2024-07-31"),
+        );
+        headers.insert(
+            "anthropic-version",
+            http::HeaderValue::from_static("caller-version"),
+        );
+        let backend_config = forwarding_config(&server.uri());
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend_config),
+            None,
+        )])?;
+        let raw = json!({
+            "model": "claude",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let Err(LlmClientError::UpstreamHttp { body, .. }) = client
+            .call_rewrite_model_raw(
+                raw,
+                Some(headers),
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
+            .await
+        else {
+            panic!("expected an upstream HTTP error");
+        };
+        assert_eq!(body, r#"{"error":{"message":"rejected [REDACTED]"}}"#);
         Ok(())
     }
 
@@ -2699,6 +3242,99 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn openai_responses_backend_flattens_codex_namespaces_before_upstream()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "model": "gpt",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "mcp__open_websearch__search",
+                    "arguments": "{\"q\":\"rust\"}"
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map(&format!("{}/v1", server.uri())))?;
+        let parameters = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let raw = json!({
+            "model": "client-facing",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_0",
+                "name": "search",
+                "namespace": "mcp__open_websearch",
+                "arguments": "{}"
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "search",
+                "namespace": "mcp__open_websearch"
+            },
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__open_websearch",
+                "tools": [{
+                    "type": "function",
+                    "name": "search",
+                    "parameters": parameters.clone()
+                }]
+            }]
+        });
+
+        let RawResponse::Buffered(body) = client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
+            )
+            .await?
+        else {
+            panic!("expected a buffered response");
+        };
+
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let request_body: Value = serde_json::from_slice(&received[0].body)?;
+        assert_eq!(request_body["model"], "gpt");
+        assert_eq!(
+            request_body["tools"],
+            json!([{
+                "type": "function",
+                "name": "mcp__open_websearch__search",
+                "description": "",
+                "parameters": parameters
+            }])
+        );
+        assert_eq!(
+            request_body["tool_choice"],
+            json!({"type": "function", "name": "mcp__open_websearch__search"})
+        );
+        assert_eq!(
+            request_body["input"][0]["name"],
+            "mcp__open_websearch__search"
+        );
+        assert!(request_body["input"][0].get("namespace").is_none());
+
+        assert_eq!(body["output"][0]["type"], "function_call");
+        assert_eq!(body["output"][0]["name"], "search");
+        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch");
+        Ok(())
+    }
+
     // Raw path, streaming: an inbound `stream: true` request yields an unframed stream
     // of OpenAI Chat chunk objects whose deltas reassemble the completion.
     #[tokio::test]
@@ -2747,7 +3383,7 @@ mod tests {
         Ok(())
     }
 
-    // Raw path forwards caller headers (minus the reserved set) to the upstream.
+    // Raw path forwards allowed caller headers to the upstream.
     #[tokio::test]
     async fn call_rewrite_model_raw_forwards_headers()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -2773,8 +3409,8 @@ mod tests {
 
         let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
         let raw = json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}]});
-        // Matchers assert the forwarded x-request-id survives and reserved
-        // authorization is the backend's, not the client's.
+        // The allowed request id survives and caller authorization cannot replace
+        // the backend's credential.
         client
             .call_rewrite_model_raw(
                 raw,

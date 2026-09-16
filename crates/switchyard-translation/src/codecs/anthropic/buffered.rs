@@ -935,14 +935,20 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
             FileSource::FileId(file_id) => {
                 json!({"type": "document", "source": {"type": "file", "file_id": file_id}})
             }
-            FileSource::FileData { data, filename } => json!({
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "data": data,
-                    "filename": filename,
-                },
-            }),
+            // OpenAI carries `file_data` as raw base64 or a data URI. Anthropic wants raw
+            // base64 with a media type, and takes the name as the block `title`.
+            FileSource::FileData { data, filename } => {
+                let (media_type, data) = split_base64_data_uri(data)
+                    .unwrap_or_else(|| (document_media_type(filename.as_deref()), data.as_str()));
+                let mut block = json!({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": media_type, "data": data},
+                });
+                if let Some(filename) = filename {
+                    block["title"] = Value::String(filename.clone());
+                }
+                block
+            }
             FileSource::Raw(raw) => raw.clone(),
         }],
         ContentBlock::Audio { source } => vec![match source {
@@ -1000,6 +1006,20 @@ fn encode_one_anthropic_tool_result_block(block: &ContentBlock) -> Vec<Value> {
     }
 }
 
+// Anthropic accepts PDF and plain-text documents; a file with no media type is a PDF
+// unless its name says otherwise.
+fn document_media_type(filename: Option<&str>) -> &'static str {
+    match filename
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+    {
+        Some(ext) if ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("md") => {
+            "text/plain"
+        }
+        _ => "application/pdf",
+    }
+}
+
 // Splits `data:<media type>[;<parameter>...];base64,<payload>`, the form OpenAI-compatible
 // clients use for inline images. A percent-encoded payload has to be decoded before it is
 // base64, and a data URI with no media type leaves Anthropic's `media_type` with nothing to
@@ -1044,11 +1064,15 @@ fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Value {
         tools
             .iter()
             .map(|tool| {
-                json!({
+                let mut item = json!({
                     "name": tool.name,
                     "description": tool.description.clone().unwrap_or_default(),
                     "input_schema": tool.parameters,
-                })
+                });
+                if let Some(strict) = tool.strict {
+                    item["strict"] = Value::Bool(strict);
+                }
+                item
             })
             .collect(),
     )

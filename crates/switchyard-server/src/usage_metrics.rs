@@ -25,6 +25,7 @@ pub(crate) fn observe(
     let Response {
         llm_response,
         metadata,
+        upstream_headers,
     } = response;
     let model = model.to_string();
 
@@ -106,6 +107,7 @@ pub(crate) fn observe(
     Response {
         llm_response,
         metadata,
+        upstream_headers,
     }
 }
 
@@ -378,6 +380,7 @@ mod tests {
         let response = Response {
             llm_response: LlmResponse::Stream(Box::pin(source)),
             metadata: None,
+            upstream_headers: http::HeaderMap::new(),
         };
         let stats = StatsAccumulator::default();
         let observed = observe(

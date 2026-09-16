@@ -23,7 +23,7 @@ Switchyard runs inside gateways you may already have.
 - **NeMo Relay** — a native plugin. Load a `routes.toml` into a Relay deployment
   you already run. [Setup →](#path-1--load-the-nemo-relay-plugin)
 - **LiteLLM** — a routing plugin for LiteLLM's `Router` and proxy.
-  [`examples/litellm`](examples/litellm/README.md)
+  [Setup →](examples/litellm/README.md)
 - **More integrations** coming soon.
 
 ```mermaid
@@ -64,15 +64,13 @@ flowchart LR
 
 ### Run Switchyard as a standalone proxy
 
-A server in front of an agent, when you have no gateway to put Switchyard in:
-
-```bash
-cargo install --locked switchyard-server
-switchyard-server --config routes.toml --port 4000
-```
-
-Point Claude Code, Codex CLI, or any OpenAI/Anthropic SDK client at the proxy.
+A server in front of an agent, when you have no gateway to put Switchyard in.
+Point Claude Code, Codex CLI, or any OpenAI/Anthropic SDK client at it;
 Switchyard decides per turn which model serves it.
+
+- Install: `cargo install --locked switchyard-server`
+- Then follow [Path 3 — Run the Standalone Proxy](#path-3--run-the-standalone-proxy):
+  write `routes.toml`, start the server, point your agent at it.
 
 ```mermaid
 flowchart LR
@@ -98,40 +96,19 @@ releases — pin the version you integrate.
 
 ## Get Started
 
-Three paths, in the same order as above. Each is self-contained: start at
-step 1, stop when you reach the result named under the heading.
+Three paths, in the same order as above. Using Claude Code or Codex? Point it
+at this README and ask it to set up the path you want.
 
 ### Path 1 — Load the NeMo Relay Plugin
 
 You finish with an existing NeMo Relay deployment routing through Switchyard.
-Requires NeMo Relay `>=0.8.1,<0.9.0`.
+Requires NeMo Relay `>=0.8.0, <1.0.0` and a Rust toolchain.
 
-**1. Build the plugin bundle.**
-
-```bash
-python crates/switchyard-nemo-relay-plugin/scripts/package_bundle.py
-```
-
-**2. Write the Switchyard deployment** to `/etc/switchyard/routes.toml` — the
-same version-1 TOML the proxy uses. Copy the file from step 2 of Path 3 below.
-
-**3. Point Relay at the generated manifest.** Use exactly one deployment
-source: a path, as here, or the config nested under `switchyard_config`.
-
-```toml
-[[plugins.dynamic]]
-manifest = "./plugins/switchyard/relay-plugin.toml"
-
-[plugins.dynamic.config]
-priority = 0
-switchyard_config_path = "/etc/switchyard/routes.toml"
-```
-
-**4. Restart Relay.** It now runs any algorithm `switchyard-runner` supports,
-while Switchyard owns provider HTTP dispatch.
-
-Details: [`switchyard-nemo-relay-plugin`](crates/switchyard-nemo-relay-plugin/README.md)
-and the [server configuration guide](crates/switchyard-server/CONFIGURATION.md).
+Follow the plugin README's
+[Install](crates/switchyard-nemo-relay-plugin/README.md#install) and
+[Configure Relay](crates/switchyard-nemo-relay-plugin/README.md#configure-relay)
+sections. For the deployment file, use the `routes.toml` from
+[Path 3, step 2](#path-3--run-the-standalone-proxy).
 
 ### Path 2 — Embed the Library
 
@@ -141,68 +118,46 @@ every model call itself. Shown in Python; the Rust API has the same shape.
 **1. Install.**
 
 ```bash
-pip install nemo-switchyard
+pip install git+https://github.com/NVIDIA-NeMo/Switchyard.git
 ```
 
-For Rust, add the crates to your `Cargo.toml` instead:
+The API below is newer than `nemo-switchyard` 0.2.0 on PyPI, so install from
+source until the next release. Rust: depend on `switchyard-libsy` and
+`switchyard-protocol` from this repository instead. Pin both to the commit you
+tested — `@<sha>` for pip, `rev = "<sha>"` for Cargo — before depending on them.
 
-```toml
-[dependencies]
-async-trait = "0.1"
-futures = "0.3"
-switchyard-libsy = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", tag = "v0.2.0" }
-switchyard-protocol = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", tag = "v0.2.0" }
-tokio = { version = "1", features = ["macros", "rt"] }
-```
-
-**2. Construct an algorithm.** Target names are whatever your harness calls its
-models. This is the stage router from the benchmark; `random`,
-`llm_task_classifier`, and `llm_classifier` are built the same way.
+**2. Construct an algorithm.** It selects a category — `efficient` or
+`capable` — and you map categories to model IDs when each request runs.
 
 ```python
 from switchyard.libsy import LlmResponse, Step
 from switchyard.libsy.algorithms import stage_router
 
-algorithm = stage_router(
-    "capable",
-    "efficient",
-    picker="efficient_first",
-    confidence_threshold=0.5,
-)
+algorithm = stage_router(picker="efficient_first", confidence_threshold=0.5)
 ```
 
-**3. Drive it.** `run_stream` takes an OpenAI-style request dict and yields
-steps. A `CallModel` step is a classifier or judge call — make it with your own
-client and hand the result back. `Done` carries the pick.
+**3. Drive it.** `run_stream` yields steps. Serve each `CallModel` with your own
+client — `call.models` is ordered by preference, and `call.fail(error)` reports
+a failed call; `Done` carries the pick.
 
 ```python
-async def route(request: dict, clients: dict) -> tuple[str, dict]:
-    async for step in algorithm.run_stream(request):
-        match step:
-            case Step.CallModel(call):
-                target = call.models[0]
-                try:
-                    response = await clients[target].call({**call.request, "model": target})
-                except Exception as error:
-                    call.fail(error)
-                else:
-                    call.respond(LlmResponse.Agg(response))
-            case Step.Done(outcome):
-                return outcome.selected_model_ids[0], outcome.request
+models = {"efficient": ["fast"], "capable": ["quality"], "any": ["quality", "fast"]}
+
+async for step in algorithm.run_stream(request, models):
+    match step:
+        case Step.CallModel(call):
+            call.respond(LlmResponse.Agg(await my_client(call.request, call.models[0])))
+        case Step.Done(outcome):
+            model, request = outcome.selected_model_ids[0], outcome.request
 ```
 
-`clients` is your existing per-model client map. `call.models` lists fallbacks
-in order; `outcome.request` is the request to send, which may carry a rewrite
-the algorithm applied.
+**4. Make the answer call** with `model` and `request`, using your own HTTP
+client, retries, and credentials.
 
-**4. Make the answer call** with the returned model and request, using your own
-HTTP client, retries, and credentials. If `outcome.response` is set, routing
-already produced the answer and you can return it directly.
-
-Type reference: [`switchyard-libsy`](crates/libsy/README.md) and
-[`switchyard-protocol`](crates/protocol/README.md). In Rust the loop is
-`Algorithm::run_stream` yielding `Step::CallModel` and `Step::Done`, with
-`switchyard-llm-client`'s `run` available to drive it for you.
+The complete runnable version — streaming and a working client — is
+[`examples/libsy.py`](examples/libsy.py). Types:
+[`switchyard-libsy`](crates/libsy/README.md),
+[`switchyard-protocol`](crates/protocol/README.md).
 
 ### Path 3 — Run the Standalone Proxy
 
@@ -246,8 +201,7 @@ confidence_threshold = 0.5
 TOML
 ```
 
-Every key is documented in the
-[server configuration guide](crates/switchyard-server/CONFIGURATION.md).
+Every key is documented in the [TOML schema reference](docs/reference/toml_schema.md).
 
 **3. Start it.** `--dry-run` loads the config, prints `server OK:` and the model
 IDs it exposes, then exits without starting the server.
@@ -312,11 +266,11 @@ the common route shape and self-hosted targets.
 - **[Routing Overview](docs/routing_algorithms/overview.md)**: choose and configure a routing algorithm
 - **[TOML Schema](docs/reference/toml_schema.md)**: every configuration key
 - **[Architecture](docs/architecture.md)**: how the proxy and library components fit together
-- **[`switchyard-server`](crates/switchyard-server/README.md)**: server configuration, routing algorithms, and metrics
-- **[`switchyard-libsy`](crates/libsy/README.md)**: embed routing algorithms in a Rust application
-- **[`switchyard-protocol`](crates/protocol/README.md)**: provider-neutral request, response, and streaming types
-- **[`switchyard-translation`](crates/switchyard-translation/README.md)**: request, response, and stream translation
-- **[`switchyard-nemo-relay-plugin`](crates/switchyard-nemo-relay-plugin/README.md)**: install Switchyard as a native NeMo Relay plugin
+- **[switchyard-server](crates/switchyard-server/README.md)**: server configuration, routing algorithms, and metrics
+- **[switchyard-libsy](crates/libsy/README.md)**: embed routing algorithms in a Rust application
+- **[switchyard-protocol](crates/protocol/README.md)**: provider-neutral request, response, and streaming types
+- **[switchyard-translation](crates/switchyard-translation/README.md)**: request, response, and stream translation
+- **[switchyard-nemo-relay-plugin](crates/switchyard-nemo-relay-plugin/README.md)**: install Switchyard as a native NeMo Relay plugin
 
 ## Benchmark Provenance
 

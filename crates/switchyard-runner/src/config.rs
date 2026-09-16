@@ -311,19 +311,34 @@ impl DeploymentConfig {
         for (target_name, target) in &self.targets {
             validate_value("target name", target_name)?;
             validate_value(&format!("target {target_name} id"), &target.id)?;
-            if !seen_client_model_ids.insert((target.llm_client.as_str(), target.id.as_str())) {
-                tracing::warn!(
-                    "target {target_name} reuses model id {} on llm client {}; only one target per id is kept and the other is dropped. Give each target a unique model id, or point both routes at one target.",
-                    target.id,
-                    target.llm_client
-                );
+            match seen_client_model_ids.entry((target.llm_client.as_str(), target.id.as_str())) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((target_name, target));
+                }
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    let (first_name, first) = slot.get();
+                    if first.reasoning_effort != target.reasoning_effort
+                        || first.extra_body != target.extra_body
+                    {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort or extra_body; one target per model id is kept, so give each its own model id or llm client",
+                            target.id, target.llm_client
+                        )));
+                    }
+                    tracing::warn!(
+                        "target {target_name} reuses model id {} on llm client {}; only one target per id is kept and the other is dropped. Give each target a unique model id, or point both routes at one target.",
+                        target.id,
+                        target.llm_client
+                    );
+                }
             }
         }
 
         if let Some(readiness) = &self.fleet_readiness {
             readiness.validate()?;
         }
-        let clients = self.build_clients()?;
+        let mut provider_api_keys = Vec::new();
+        let clients = self.build_clients(&mut provider_api_keys)?;
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
         self.validate_escalations()?;
@@ -376,6 +391,14 @@ impl DeploymentConfig {
                 .into_iter()
                 .filter_map(|name| self.decision_target(name))
                 .collect();
+            let names = config
+                .algorithm
+                .runtime_model_names(route_name)
+                .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+            let mut models = RuntimeModels::new(resolve_category_models(names.parent, &targets)?);
+            if let Some(subagent) = names.subagent {
+                models = models.with_subagent(resolve_category_models(subagent, &targets)?);
+            }
             let route = Route::new(
                 algorithm,
                 route_clients,
@@ -384,6 +407,7 @@ impl DeploymentConfig {
                 anthropic_auxiliary_target,
                 responses_auxiliary_target,
                 decision_targets,
+                models,
             )
             .with_escalation(
                 config.escalation_route().cloned(),
@@ -396,11 +420,15 @@ impl DeploymentConfig {
             .with_fallback_url(fallback_base_url)
             .with_fleet_state(fleet_state)
             .with_fleet_readiness(self.fleet_readiness)
-            .with_capabilities(self.capability_clients, self.capabilities);
+            .with_capabilities(self.capability_clients, self.capabilities)
+            .with_provider_api_keys(provider_api_keys);
         Ok(runner)
     }
 
-    fn build_clients(&self) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
+    fn build_clients(
+        &self,
+        provider_api_keys: &mut Vec<String>,
+    ) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
         let mut models_by_client = self
             .llm_clients
             .keys()
@@ -409,7 +437,13 @@ impl DeploymentConfig {
 
         for (name, client_config) in &self.llm_clients {
             validate_value("llm client name", name)?;
-            build_backend(name, client_config, &BTreeMap::new(), false)?;
+            let backend = build_backend(name, client_config, &BTreeMap::new(), false, None)?;
+            let (Backend::OpenAiChat(config)
+            | Backend::OpenAiResponses(config)
+            | Backend::Anthropic(config)) = backend;
+            if let Some(key) = config.api_key {
+                provider_api_keys.push(key);
+            }
         }
         for (target_name, target) in &self.targets {
             let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
@@ -423,6 +457,18 @@ impl DeploymentConfig {
                 .ok_or_else(|| {
                     RunnerError::configuration("validated llm client was not initialized")
                 })?;
+            if let Some(effort) = &target.reasoning_effort {
+                if effort.trim().is_empty() {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} reasoning_effort must not be empty"
+                    )));
+                }
+                if matches!(client_config.format, ClientFormat::AnthropicMessages) {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} reasoning_effort is only supported on openai_chat and openai_responses clients"
+                    )));
+                }
+            }
             model_configs.push(ModelConfig::new(
                 target.id.clone(),
                 build_backend(
@@ -430,6 +476,7 @@ impl DeploymentConfig {
                     client_config,
                     &target.extra_body,
                     target.strip_reasoning_content,
+                    target.reasoning_effort.clone(),
                 )?,
                 None,
             ));
@@ -682,6 +729,9 @@ struct TargetConfig {
     /// forwarded to a provider that bills for it without requiring it.
     #[serde(default)]
     strip_reasoning_content: bool,
+    /// Reasoning effort forced on every request to this target, replacing the caller's value.
+    /// Only meaningful on `openai_chat` and `openai_responses` clients.
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -715,6 +765,7 @@ fn build_backend(
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
     strip_reasoning_content: bool,
+    reasoning_effort: Option<String>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -754,6 +805,7 @@ fn build_backend(
         forward_auth: config.forward_auth,
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
+        reasoning_effort,
         max_retries: config.max_retries,
         strip_reasoning_content,
     };

@@ -52,19 +52,49 @@ pub struct StreamTranslationState {
     pub(crate) text_block_started: bool,
     pub(crate) emitted_content_block: bool,
     pub(crate) tool_states: BTreeMap<usize, StreamToolState>,
+    /// Reasoning text observed while DECODING, per output index, so a completed item
+    /// that repeats already-streamed text is not decoded twice.
+    pub(crate) decoded_reasoning: BTreeMap<usize, String>,
+    /// Output indexes whose encrypted reasoning payload was already decoded.
+    pub(crate) decoded_reasoning_encrypted: std::collections::BTreeSet<usize>,
+    /// Set once a tool call was observed while DECODING, so a terminal event that names no
+    /// stop reason can still report tool use.
+    pub(crate) decoded_tool_call: bool,
 
     pub(crate) response_created: bool,
     pub(crate) response_text_started: bool,
     pub(crate) response_text_output_index: Option<usize>,
     pub(crate) response_text: String,
-    pub(crate) response_reasoning_started: bool,
-    pub(crate) response_reasoning_output_index: Option<usize>,
-    pub(crate) response_reasoning_text: String,
+    /// Reasoning items being ENCODED, keyed by source content index. A response can carry
+    /// several reasoning items (GPT-5 emits one ahead of each tool call); each becomes its
+    /// own output item so none of their encrypted payloads is lost.
+    pub(crate) response_reasoning: BTreeMap<usize, ResponseReasoningState>,
+    /// Source indexes whose provider reasoning item id was already announced while DECODING.
+    pub(crate) decoded_reasoning_ids: std::collections::BTreeSet<usize>,
     pub(crate) next_response_output_index: usize,
     pub(crate) response_sequence_number: u64,
+    pub(crate) next_chat_tool_index: usize,
 
     pub(crate) reasoning_block_index: Option<usize>,
     pub(crate) reasoning_block_started: bool,
+}
+
+// One Responses reasoning output item under construction by the encoder.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResponseReasoningState {
+    /// Set once the item's `added` event was emitted.
+    pub(crate) started: bool,
+    /// Set once the item's summary part opened, which happens on the first text delta. An
+    /// encrypted-only item never opens one, so it never has to close one either.
+    pub(crate) summary_started: bool,
+    pub(crate) output_index: Option<usize>,
+    /// Provider item id the encrypted reasoning was issued under. Used as the emitted item id
+    /// so the client's replay verifies upstream; `None` falls back to a synthesized id.
+    pub(crate) item_id: Option<String>,
+    pub(crate) text: String,
+    /// Opaque `encrypted_content` carried by a Responses reasoning item. Kept verbatim so
+    /// the emitted item stays replayable by the client even when no plaintext streamed.
+    pub(crate) encrypted: Option<String>,
 }
 
 // Tracks an in-progress streamed tool call across provider-specific deltas.
@@ -84,6 +114,10 @@ pub(crate) struct StreamToolState {
     pub(crate) pending_arguments: String,
     pub(crate) started: bool,
     pub(crate) content_index: Option<usize>,
+    /// Position in the OpenAI Chat `tool_calls` array, assigned when ENCODING. Chat numbers
+    /// tool calls on their own, while Anthropic and Responses index the whole content array,
+    /// so the source index cannot be reused.
+    pub(crate) chat_tool_index: Option<usize>,
     pub(crate) response_output_index: Option<usize>,
     pub(crate) response_item_id: Option<String>,
 }

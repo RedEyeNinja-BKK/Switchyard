@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::{LlmRequest, LlmResponse, Metadata, ModelId};
+use http::HeaderMap;
 
 /// A request an algorithm routes: the normalized [`LlmRequest`] plus optional
 /// host-owned raw data and correlation [`Metadata`].
@@ -50,6 +51,10 @@ pub struct Response {
     pub llm_response: LlmResponse,
     /// Correlation metadata carried through the response.
     pub metadata: Option<Metadata>,
+    /// Upstream HTTP response headers preserved from the LLM backend (or proxy).
+    /// Populated by the LLM client; consumers (e.g. switchyard-server) may forward
+    /// these to the downstream client for observability.
+    pub upstream_headers: HeaderMap,
 }
 
 impl Response {
@@ -85,6 +90,7 @@ mod tests {
         let mut response = Response {
             llm_response: LlmResponse::Agg(text_response(None, "answer")),
             metadata: None,
+            upstream_headers: HeaderMap::new(),
         };
 
         assert_eq!(response.served_model(), None);

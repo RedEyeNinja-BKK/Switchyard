@@ -12,11 +12,14 @@
 
 #![allow(dead_code)]
 
+use std::path::Path;
+
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 use switchyard_protocol::{ContentBlock, Request, Role};
 
-use crate::Result;
+use crate::{LibsyError, Result};
 
 use crate::core::processor::{Event, Processor};
 use crate::core::state::State;
@@ -38,7 +41,7 @@ static ERROR_PATTERNS: &[(&str, f32, &[&str])] = &[
     ),
     (
         "connection_refused",
-        CRITICAL,
+        HARD,
         &[
             "connection refused",
             "connectionrefusederror",
@@ -82,17 +85,14 @@ static ERROR_PATTERNS: &[(&str, f32, &[&str])] = &[
         ],
     ),
     // SOFT: plain non-zero exit without a recognisable exception traceback.
-    (
-        "exit_nonzero",
-        SOFT,
-        &[
-            "exit code 1",
-            "exit code 2",
-            "exit status 1",
-            "returned non-zero",
-            "exited with code",
-        ],
-    ),
+    ("exit_nonzero", SOFT, &["returned non-zero"]),
+];
+
+static NONZERO_EXIT_PHRASES: &[&str] = &[
+    "exit code",
+    "exit status",
+    "exited with code",
+    "exited with status",
 ];
 
 static EDIT_TOOL_NAMES: &[&str] = &[
@@ -131,6 +131,13 @@ static BASH_WRITE_PATTERNS: &[&str] = &[
 /// interpreter is running them rather than a search looking for them.
 static PYTHON_WRITE_PATTERNS: &[&str] = &["write_text(", "writelines(", ".write("];
 
+static JAVASCRIPT_WRITE_PATTERNS: &[&str] = &[
+    "writefilesync(",
+    "writefile(",
+    "appendfilesync(",
+    "appendfile(",
+];
+
 static BASH_EDIT_PATTERNS: &[&str] = &[
     "sed -i",
     "sed --in-place",
@@ -148,6 +155,31 @@ static BASH_EDIT_PATTERNS: &[&str] = &[
 static BASH_READ_PATTERNS: &[&str] = &[
     "cat /", "cat ./", "cat ../", "grep ", "ls ", "ls -", "find ", "head ", "tail ", "wc ",
     "diff ", "which ", "ps ", "df ", "du ", "stat ", "file ", "less ", "more ",
+];
+
+/// Read-only shell programs seen in Codex trajectories. Matching is limited to
+/// command-segment starts so prose and arguments do not masquerade as actions.
+static BASH_READ_COMMANDS: &[&str] = &[
+    "cat", "rg", "nl", "jq", "pwd", "tree", "sed", "grep", "ls", "find", "head", "tail", "wc",
+    "diff", "which", "ps", "df", "du", "stat", "file", "less", "more", "readlink", "realpath",
+    "basename", "dirname", "printenv",
+];
+
+static GIT_READ_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "diff",
+    "log",
+    "show",
+    "show-ref",
+    "rev-parse",
+    "ls-files",
+    "ls-remote",
+    "ls-tree",
+    "grep",
+    "blame",
+    "merge-base",
+    "check-ignore",
+    "tag",
 ];
 
 static READ_TOOL_NAMES: &[&str] = &["read", "view", "read_file", "search_files"];
@@ -169,8 +201,8 @@ static BASH_TOOL_NAMES: &[&str] = &[
     "exec_command", // codex
 ];
 
-// Prefer false negatives: tests_passed routes the picker to EFFICIENT, so a false
-// positive would drop tier on an unfinished task.
+// Prefer false negatives: tests_passed clears a capable hold, so a false positive
+// could hand an unfinished task back too early.
 static TEST_PASS_PHRASES: &[&str] = &[
     " passed",
     "passed in",
@@ -203,6 +235,83 @@ static NUMERIC_FAILURE_KEYWORDS: &[&str] = &["failed", "failure", "failures", "e
 /// passing a window to [`ToolSignals::from_request`].
 pub const DEFAULT_RECENT_WINDOW: usize = 3;
 
+/// Exact tool-name semantics added to the stage router's built-in vocabulary.
+///
+/// Matching is ASCII case-insensitive. These lists are additive: built-in tool
+/// names cannot be reclassified.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolSemantics {
+    /// Read-only lookup or inspection tools.
+    pub observe: Vec<String>,
+    /// Tools that change task or external state.
+    pub mutate: Vec<String>,
+    /// Explicit planning or task-decomposition tools.
+    pub plan: Vec<String>,
+    /// Tools that demonstrate new forward activity without favoring either tier.
+    pub new: Vec<String>,
+}
+
+impl ToolSemantics {
+    /// Rejects ambiguous mappings and attempts to reclassify built-in tools.
+    pub fn validate(&self) -> Result<()> {
+        let mut seen: Vec<(String, &'static str)> = Vec::new();
+        for (category, names) in [
+            ("observe", &self.observe),
+            ("mutate", &self.mutate),
+            ("plan", &self.plan),
+            ("new", &self.new),
+        ] {
+            for name in names {
+                if name.trim().is_empty() {
+                    return Err(tool_semantics_error(format!(
+                        "tool_semantics.{category} contains an empty tool name"
+                    )));
+                }
+                let normalized = name.to_ascii_lowercase();
+                if is_builtin_tool_name(&name.to_lowercase()) {
+                    return Err(tool_semantics_error(format!(
+                        "tool {name:?} already has built-in semantics and cannot be reclassified"
+                    )));
+                }
+                if let Some((_, previous)) = seen.iter().find(|(seen, _)| seen == &normalized) {
+                    return Err(tool_semantics_error(format!(
+                        "tool {name:?} appears in both tool_semantics.{previous} and tool_semantics.{category}"
+                    )));
+                }
+                seen.push((normalized, category));
+            }
+        }
+        Ok(())
+    }
+
+    fn classify(&self, name: &str) -> Option<ToolSemantic> {
+        if contains_name(&self.observe, name) {
+            Some(ToolSemantic::Observe)
+        } else if contains_name(&self.mutate, name) {
+            // The stage scorer treats writes and edits identically. Custom
+            // mutations use the write counter to preserve the public signal shape.
+            Some(ToolSemantic::Mutate(MutationKind::Write))
+        } else if contains_name(&self.plan, name) {
+            Some(ToolSemantic::Plan)
+        } else if contains_name(&self.new, name) {
+            Some(ToolSemantic::New)
+        } else {
+            None
+        }
+    }
+}
+
+fn contains_name(names: &[String], candidate: &str) -> bool {
+    names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(candidate))
+}
+
+fn tool_semantics_error(message: String) -> LibsyError {
+    LibsyError::AlgorithmError { message }
+}
+
 // ─── output type ─────────────────────────────────────────────────────────────
 
 /// Tool-execution signals extracted from a normalized [`Request`].
@@ -218,6 +327,9 @@ pub struct ToolSignals {
     /// Windowed so an error persists through the recovery turns instead of clearing
     /// the instant the next result is clean.
     pub severity: f32,
+    /// The same hard-or-critical failure appeared at least twice in the recent
+    /// tool-result window.
+    pub repeated_failure: bool,
     /// Consecutive clean tool results back from the most recent. `0` if the last failed.
     pub no_error_streak: u32,
     /// Total edit-style tool calls in the request.
@@ -237,10 +349,14 @@ pub struct ToolSignals {
     pub recent_read_count: u32,
     /// TodoWrite calls within the configured recent window (default: [`DEFAULT_RECENT_WINDOW`]).
     pub recent_todowrite_count: u32,
-    /// Consecutive trailing tool calls in the `Other` category (no Write/Edit/Read/
+    /// Configured `new` tool calls across the full request history.
+    pub new_count: u32,
+    /// Configured `new` tool calls within the recent window.
+    pub recent_new_count: u32,
+    /// Consecutive trailing tool calls in the `Unknown` category (no Write/Edit/Read/
     /// Plan match). Surfaced in the classifier state summary; not scored directly.
     pub pure_bash_streak: u32,
-    /// At least one of the last three tool results matched a test-pass pattern.
+    /// A tool result after the latest recent failure matched a test-pass pattern.
     pub tests_passed: bool,
     /// Total `ToolResult` blocks, counted per block (a message batching N
     /// results contributes N) and including empty-content results.
@@ -261,12 +377,25 @@ pub struct ToolSignals {
 }
 
 impl ToolSignals {
-    /// Extracts tool and progress signals from `request`.
+    /// Extracts tool and activity signals from `request`.
     ///
     /// `window_size` limits recent counters to the newest tool results. `None`
     /// uses [`DEFAULT_RECENT_WINDOW`].
     pub fn from_request(request: &Request, window_size: Option<usize>) -> Self {
-        extract_tool_signals_with_window(request, window_size.unwrap_or(DEFAULT_RECENT_WINDOW))
+        Self::from_request_with_semantics(request, window_size, &ToolSemantics::default())
+    }
+
+    /// Extracts signals using the built-in vocabulary plus additive semantics.
+    pub fn from_request_with_semantics(
+        request: &Request,
+        window_size: Option<usize>,
+        semantics: &ToolSemantics,
+    ) -> Self {
+        extract_tool_signals_with_window_and_semantics(
+            request,
+            window_size.unwrap_or(DEFAULT_RECENT_WINDOW),
+            semantics,
+        )
     }
 }
 
@@ -278,12 +407,19 @@ struct ObservedToolCall {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolCategory {
+enum MutationKind {
     Write,
     Edit,
-    Read,
+}
+
+/// Domain-neutral meaning assigned to an observed tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSemantic {
+    Mutate(MutationKind),
+    Observe,
     Plan,
-    Other,
+    New,
+    Unknown,
 }
 
 /// Request-side processor that extracts tool-result signals from each request
@@ -293,12 +429,15 @@ pub struct ToolSignalProcessor {
     /// Number of trailing tool results the `recent_*` counts and windowed
     /// severity are computed over.
     pub recent_window: usize,
+    /// Route-scoped additions to the built-in tool vocabulary.
+    pub tool_semantics: ToolSemantics,
 }
 
 impl Default for ToolSignalProcessor {
     fn default() -> Self {
         Self {
             recent_window: DEFAULT_RECENT_WINDOW,
+            tool_semantics: ToolSemantics::default(),
         }
     }
 }
@@ -307,45 +446,243 @@ impl Default for ToolSignalProcessor {
 impl Processor<State> for ToolSignalProcessor {
     async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
         if let Event::Request { request: req, .. } = event {
-            let tool_signal = ToolSignals::from_request(req, Some(self.recent_window));
+            let tool_signal = ToolSignals::from_request_with_semantics(
+                req,
+                Some(self.recent_window),
+                &self.tool_semantics,
+            );
             state.tool_signals = Some(tool_signal);
         }
         Ok(())
     }
 }
 
-fn classify_tool_call(name: &str, command: Option<&str>) -> ToolCategory {
+fn classify_tool_call(name: &str, command: Option<&str>) -> ToolSemantic {
+    classify_tool_call_with_semantics(name, command, &ToolSemantics::default())
+}
+
+fn classify_tool_call_with_semantics(
+    name: &str,
+    command: Option<&str>,
+    semantics: &ToolSemantics,
+) -> ToolSemantic {
+    // Built-in names and Bash command inference take precedence over route-scoped mappings.
     let lower = name.to_lowercase();
     if WRITE_TOOL_NAMES.contains(&lower.as_str()) {
-        return ToolCategory::Write;
+        return ToolSemantic::Mutate(MutationKind::Write);
     }
     if EDIT_TOOL_NAMES.contains(&lower.as_str()) {
-        return ToolCategory::Edit;
+        return ToolSemantic::Mutate(MutationKind::Edit);
     }
     if READ_TOOL_NAMES.contains(&lower.as_str()) {
-        return ToolCategory::Read;
+        return ToolSemantic::Observe;
     }
     if PLAN_TOOL_NAMES.contains(&lower.as_str()) {
-        return ToolCategory::Plan;
+        return ToolSemantic::Plan;
     }
     if BASH_TOOL_NAMES.contains(&lower.as_str())
         && let Some(cmd) = command
     {
         // Write/edit redirection trumps read-like operands.
-        if BASH_WRITE_PATTERNS.iter().any(|p| cmd.contains(p)) {
-            return ToolCategory::Write;
+        if BASH_WRITE_PATTERNS.iter().any(|p| cmd.contains(p)) || shell_command_is_write(cmd) {
+            return ToolSemantic::Mutate(MutationKind::Write);
         }
         if cmd.contains("python") && PYTHON_WRITE_PATTERNS.iter().any(|p| cmd.contains(p)) {
-            return ToolCategory::Write;
+            return ToolSemantic::Mutate(MutationKind::Write);
         }
-        if BASH_EDIT_PATTERNS.iter().any(|p| cmd.contains(p)) {
-            return ToolCategory::Edit;
+        if shell_invokes_program(cmd, "node")
+            && JAVASCRIPT_WRITE_PATTERNS
+                .iter()
+                .any(|pattern| cmd.contains(pattern))
+        {
+            return ToolSemantic::Mutate(MutationKind::Write);
         }
-        if BASH_READ_PATTERNS.iter().any(|p| cmd.contains(p)) {
-            return ToolCategory::Read;
+        if BASH_EDIT_PATTERNS.iter().any(|p| cmd.contains(p)) || shell_command_is_edit(cmd) {
+            return ToolSemantic::Mutate(MutationKind::Edit);
+        }
+        if BASH_READ_PATTERNS.iter().any(|p| cmd.contains(p)) || shell_command_is_read(cmd) {
+            return ToolSemantic::Observe;
         }
     }
-    ToolCategory::Other
+    semantics.classify(name).unwrap_or(ToolSemantic::Unknown)
+}
+
+fn is_builtin_tool_name(lower: &str) -> bool {
+    WRITE_TOOL_NAMES.contains(&lower)
+        || EDIT_TOOL_NAMES.contains(&lower)
+        || READ_TOOL_NAMES.contains(&lower)
+        || PLAN_TOOL_NAMES.contains(&lower)
+        || BASH_TOOL_NAMES.contains(&lower)
+}
+
+/// Split a shell line at unquoted command separators. This intentionally avoids
+/// pretending to be a full shell parser; only the leading program and flags of
+/// each segment are inspected below.
+fn shell_segments(command: &str) -> impl Iterator<Item = &str> {
+    let mut chars = command.char_indices();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut finished = false;
+
+    std::iter::from_fn(move || {
+        loop {
+            for (index, character) in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' && quote != Some('\'') {
+                    escaped = true;
+                } else if quote == Some(character) {
+                    quote = None;
+                } else if quote.is_none() && matches!(character, '\'' | '"') {
+                    quote = Some(character);
+                } else if quote.is_none() && matches!(character, '\n' | ';' | '|' | '&') {
+                    let segment = command[start..index].trim();
+                    start = index + character.len_utf8();
+                    if !segment.is_empty() {
+                        return Some(segment);
+                    }
+                }
+            }
+
+            if finished {
+                return None;
+            }
+            finished = true;
+            let segment = command[start..].trim();
+            if !segment.is_empty() {
+                return Some(segment);
+            }
+        }
+    })
+}
+
+fn shell_words(segment: &str) -> std::iter::Peekable<std::str::SplitAsciiWhitespace<'_>> {
+    let mut words = segment.split_ascii_whitespace().peekable();
+
+    if words.peek().copied() == Some("env") {
+        words.next();
+        while words.peek().is_some_and(|word| word.starts_with('-')) {
+            words.next();
+        }
+    }
+    while words
+        .peek()
+        .is_some_and(|word| word.contains('=') && !word.starts_with('='))
+    {
+        words.next();
+    }
+
+    words
+}
+
+fn program_name(word: &str) -> &str {
+    Path::new(word)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(word)
+}
+
+fn shell_invokes_program(command: &str, expected: &str) -> bool {
+    shell_segments(command).any(|segment| {
+        shell_words(segment)
+            .next()
+            .is_some_and(|word| program_name(word) == expected)
+    })
+}
+
+fn shell_command_is_write(command: &str) -> bool {
+    shell_segments(command).any(|segment| {
+        let mut words = shell_words(segment);
+        let Some(program) = words.next().map(program_name) else {
+            return false;
+        };
+        if matches!(program, "cp" | "mkdir" | "touch" | "install") {
+            return true;
+        }
+
+        let redirects_output = words.any(|word| matches!(word, ">" | ">>"));
+        redirects_output
+            && (matches!(program, "echo" | "printf" | "git")
+                || BASH_READ_COMMANDS.contains(&program))
+    })
+}
+
+fn shell_command_is_edit(command: &str) -> bool {
+    shell_segments(command).any(|segment| {
+        let mut words = shell_words(segment);
+        let Some(program) = words.next().map(program_name) else {
+            return false;
+        };
+        let has_arg = |arg: &str| words.clone().any(|word| word == arg);
+
+        match program {
+            "mv" | "rm" => true,
+            "perl" => words
+                .take_while(|word| word.starts_with('-'))
+                .any(|option| {
+                    option
+                        .trim_start_matches('-')
+                        .chars()
+                        .any(|flag| flag == 'i')
+                }),
+            "git" => words
+                .next()
+                .is_some_and(|subcommand| matches!(subcommand, "apply" | "am" | "restore")),
+            "gofmt" => has_arg("-w"),
+            "cargo" => words.clone().next() == Some("fmt") && !has_arg("--check"),
+            "ruff" => {
+                let subcommand = words.clone().next();
+                (subcommand == Some("format") && !has_arg("--check"))
+                    || (subcommand == Some("check") && has_arg("--fix"))
+            }
+            "prettier" => has_arg("--write"),
+            "black" => !has_arg("--check"),
+            _ => {
+                (words.clone().any(|word| program_name(word) == "prettier") && has_arg("--write"))
+                    || (words.clone().any(|word| program_name(word) == "ruff")
+                        && ((has_arg("format") && !has_arg("--check"))
+                            || (has_arg("check") && has_arg("--fix"))))
+            }
+        }
+    })
+}
+
+fn shell_command_is_read(command: &str) -> bool {
+    shell_segments(command).any(|segment| {
+        if segment == "env" {
+            return true;
+        }
+        let mut words = shell_words(segment);
+        let Some(program) = words.next().map(program_name) else {
+            return false;
+        };
+
+        if BASH_READ_COMMANDS.contains(&program) {
+            return true;
+        }
+        if program == "command" && words.next() == Some("-v") {
+            return true;
+        }
+        if program == "type" {
+            return true;
+        }
+        if program != "git" {
+            return false;
+        }
+
+        match words.next() {
+            Some("branch") => words.next().is_none_or(|arg| arg.starts_with('-')),
+            Some("remote") => words
+                .next()
+                .is_none_or(|arg| arg.starts_with('-') || arg == "get-url"),
+            Some("config") => words
+                .next()
+                .is_some_and(|arg| matches!(arg, "--get" | "--get-all" | "--list" | "-l")),
+            Some(subcommand) => GIT_READ_SUBCOMMANDS.contains(&subcommand),
+            None => false,
+        }
+    })
 }
 
 // ─── extraction entry point ───────────────────────────────────────────────────
@@ -355,6 +692,18 @@ fn classify_tool_call(name: &str, command: Option<&str>) -> ToolCategory {
 /// Returns [`ToolSignals::default()`] when the message history contains no tool
 /// activity, so callers can always inspect the signal fields.
 fn extract_tool_signals_with_window(request: &Request, recent_window: usize) -> ToolSignals {
+    extract_tool_signals_with_window_and_semantics(
+        request,
+        recent_window,
+        &ToolSemantics::default(),
+    )
+}
+
+fn extract_tool_signals_with_window_and_semantics(
+    request: &Request,
+    recent_window: usize,
+    semantics: &ToolSemantics,
+) -> ToolSignals {
     // Read the decoded conversation, not the raw body: every inbound format lands
     // in the same shape here, so the signals do not depend on knowing which one it
     // arrived as.
@@ -401,7 +750,13 @@ fn extract_tool_signals_with_window(request: &Request, recent_window: usize) -> 
         }
     }
 
-    let mut signal = build_signal(tool_texts, tool_calls, messages.len() as u32, recent_window);
+    let mut signal = build_signal(
+        tool_texts,
+        tool_calls,
+        messages.len() as u32,
+        recent_window,
+        semantics,
+    );
     signal.compacted = compacted;
     signal.tool_result_count = u32::try_from(tool_result_count).unwrap_or(u32::MAX);
     signal.assistant_turn_count = u32::try_from(assistant_turn_count).unwrap_or(u32::MAX);
@@ -456,6 +811,7 @@ fn build_signal(
     tool_calls: Vec<ObservedToolCall>,
     turn_depth: u32,
     recent_window: usize,
+    semantics: &ToolSemantics,
 ) -> ToolSignals {
     // Windowed severity: take the MAX severity across the last `recent_window` tool
     // results rather than only the last one. An error's severity then persists for
@@ -464,17 +820,23 @@ fn build_signal(
     // error signal instead of the router flapping straight back to the weak tier.
     let sev_start = tool_texts.len().saturating_sub(recent_window.max(1));
     let mut severity = 0.0f32;
+    let mut failure_fingerprints = Vec::new();
+    let mut repeated_failure = false;
     for text in &tool_texts[sev_start..] {
         let (sev, _patterns) = classify_text(text);
         if sev > severity {
             severity = sev;
+        }
+        if let Some(fingerprint) = failure_fingerprint(text) {
+            repeated_failure |= failure_fingerprints.contains(&fingerprint);
+            failure_fingerprints.push(fingerprint);
         }
     }
 
     let no_error_streak = compute_no_error_streak(&tool_texts);
 
     // Single pass: cumulative + sliding-window counters together. Also tracks
-    // the trailing pure-bash streak (consecutive `Other`-category calls back
+    // the trailing pure-bash streak (consecutive `Unknown` calls back
     // from the end) — the build-pit proxy.
     let recent_start = tool_calls.len().saturating_sub(recent_window);
     let mut write_count = 0u32;
@@ -485,43 +847,51 @@ fn build_signal(
     let mut recent_edit_count = 0u32;
     let mut recent_read_count = 0u32;
     let mut recent_todowrite_count = 0u32;
+    let mut new_count = 0u32;
+    let mut recent_new_count = 0u32;
     let mut pure_bash_streak = 0u32;
     let mut streak_open = true;
     for (i, tc) in tool_calls.iter().enumerate().rev() {
-        let cat = classify_tool_call(&tc.name, tc.command.as_deref());
+        let cat = classify_tool_call_with_semantics(&tc.name, tc.command.as_deref(), semantics);
         if streak_open {
-            if matches!(cat, ToolCategory::Other) {
+            if matches!(cat, ToolSemantic::Unknown) {
                 pure_bash_streak += 1;
             } else {
                 streak_open = false;
             }
         }
         match cat {
-            ToolCategory::Write => {
+            ToolSemantic::Mutate(MutationKind::Write) => {
                 write_count += 1;
                 if i >= recent_start {
                     recent_write_count += 1;
                 }
             }
-            ToolCategory::Edit => {
+            ToolSemantic::Mutate(MutationKind::Edit) => {
                 edit_count += 1;
                 if i >= recent_start {
                     recent_edit_count += 1;
                 }
             }
-            ToolCategory::Read => {
+            ToolSemantic::Observe => {
                 read_count += 1;
                 if i >= recent_start {
                     recent_read_count += 1;
                 }
             }
-            ToolCategory::Plan => {
+            ToolSemantic::Plan => {
                 todowrite_count += 1;
                 if i >= recent_start {
                     recent_todowrite_count += 1;
                 }
             }
-            ToolCategory::Other => {}
+            ToolSemantic::New => {
+                new_count += 1;
+                if i >= recent_start {
+                    recent_new_count += 1;
+                }
+            }
+            ToolSemantic::Unknown => {}
         }
     }
 
@@ -529,6 +899,7 @@ fn build_signal(
 
     ToolSignals {
         severity,
+        repeated_failure,
         no_error_streak,
         edit_count,
         write_count,
@@ -538,6 +909,8 @@ fn build_signal(
         recent_write_count,
         recent_read_count,
         recent_todowrite_count,
+        new_count,
+        recent_new_count,
         pure_bash_streak,
         tests_passed,
         turn_depth,
@@ -589,7 +962,169 @@ pub(crate) fn classify_text(text: &str) -> (f32, Vec<String>) {
             severity = severity.max(*sev);
         }
     }
+    if has_nonzero_exit_status(&lower) && !patterns.iter().any(|p| p == "exit_nonzero") {
+        patterns.push("exit_nonzero".to_string());
+        severity = severity.max(SOFT);
+    }
+    for (name, matched) in [
+        ("compile_error", has_compiler_diagnostic(&lower)),
+        ("runtime_exception", has_runtime_exception(&lower)),
+        ("runtime_panic", has_runtime_panic(&lower)),
+        ("patch_error", has_patch_failure(&lower)),
+    ] {
+        if matched && !patterns.iter().any(|pattern| pattern == name) {
+            patterns.push(name.to_string());
+            severity = severity.max(HARD);
+        }
+    }
     (severity, patterns)
+}
+
+/// Stable identity for a material failure. Soft non-zero exits are excluded:
+/// they are too generic to prove that an agent is repeating the same mistake.
+fn failure_fingerprint(text: &str) -> Option<String> {
+    let (severity, patterns) = classify_text(text);
+    if severity < HARD {
+        return None;
+    }
+
+    let lower = text.to_lowercase();
+    let diagnostic = lower
+        .lines()
+        .find(|line| is_failure_diagnostic(line))
+        .or_else(|| lower.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or_default();
+    let normalized = normalize_failure_text(diagnostic);
+    Some(format!("{}|{normalized}", patterns.join(",")))
+}
+
+fn is_failure_diagnostic(line: &str) -> bool {
+    let line = line.trim();
+    [
+        "error",
+        "exception",
+        "panic",
+        "failed",
+        "timed out",
+        "timeout",
+        "connection refused",
+        "cannot allocate memory",
+        "out of memory",
+        "not found",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker))
+}
+
+/// Removes values that normally change between retries while retaining the
+/// diagnostic wording that distinguishes one failure from another.
+fn normalize_failure_text(text: &str) -> String {
+    let mut normalized = String::new();
+    for word in text.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        let mut in_digits = false;
+        if word.starts_with('/') || word.contains("/src/") || word.contains("/tmp/") {
+            normalized.push_str("<path>");
+            continue;
+        }
+        for character in word.chars() {
+            if character.is_ascii_digit() {
+                if !in_digits {
+                    normalized.push('#');
+                    in_digits = true;
+                }
+            } else {
+                normalized.push(character);
+                in_digits = false;
+            }
+        }
+    }
+    normalized.chars().take(240).collect()
+}
+
+fn has_compiler_diagnostic(lower: &str) -> bool {
+    lower.lines().any(|line| {
+        let line = line.trim_start();
+        if matches!(
+            line,
+            "compilation failed" | "error: compilation failed" | "error: could not compile"
+        ) || line.starts_with("error: could not compile ")
+        {
+            return true;
+        }
+
+        let Some(rest) = line.strip_prefix("error[e") else {
+            return false;
+        };
+        let Some((code, _)) = rest.split_once("]:") else {
+            return false;
+        };
+        !code.is_empty() && code.chars().all(|character| character.is_ascii_digit())
+    })
+}
+
+fn has_runtime_exception(lower: &str) -> bool {
+    let has_exception_line = lower.lines().any(|line| {
+        let line = line.trim_start();
+        [
+            "typeerror:",
+            "referenceerror:",
+            "rangeerror:",
+            "runtimeerror:",
+            "keyerror:",
+            "attributeerror:",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    });
+    has_exception_line && (lower.contains("\n    at ") || lower.contains("\n  at "))
+}
+
+fn has_runtime_panic(lower: &str) -> bool {
+    lower
+        .lines()
+        .any(|line| line.trim_start().starts_with("panic: runtime error:"))
+        && (lower.contains("\ngoroutine ") || lower.contains("[signal sig"))
+}
+
+fn has_patch_failure(lower: &str) -> bool {
+    lower.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("error: patch failed:")
+            || line.starts_with("patch failed:")
+            || line.contains(": patch does not apply")
+            || line.starts_with("invalid context")
+    })
+}
+
+/// Detects `exit_nonzero` only when a supported exit phrase is followed by a
+/// nonzero decimal status.
+///
+/// Codex includes "Process exited with code 0" on clean tool results, so exit
+/// phrases must parse their numeric status instead of matching the phrase alone.
+fn has_nonzero_exit_status(lower: &str) -> bool {
+    NONZERO_EXIT_PHRASES
+        .iter()
+        .any(|phrase| phrase_followed_by_nonzero_integer(lower, phrase))
+}
+
+/// Matches common "exit code/status N" spellings after optional separators.
+fn phrase_followed_by_nonzero_integer(lower: &str, phrase: &str) -> bool {
+    let mut cursor = 0usize;
+    while let Some(rel) = lower[cursor..].find(phrase) {
+        let value_start = cursor + rel + phrase.len();
+        let rest = lower[value_start..].trim_start_matches(|c: char| {
+            c.is_ascii_whitespace() || matches!(c, ':' | '=' | '\'' | '"' | '`')
+        });
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && digits.chars().any(|d| d != '0') {
+            return true;
+        }
+        cursor = value_start;
+    }
+    false
 }
 
 fn compute_no_error_streak(tool_texts: &[String]) -> u32 {
@@ -606,7 +1141,12 @@ fn compute_no_error_streak(tool_texts: &[String]) -> u32 {
 
 fn detect_tests_passed(tool_texts: &[String], recent_window: usize) -> bool {
     let start = tool_texts.len().saturating_sub(recent_window.max(1));
-    tool_texts[start..].iter().any(|text| {
+    let recent = &tool_texts[start..];
+    let after_latest_failure = recent
+        .iter()
+        .rposition(|text| classify_text(text).0 > 0.0)
+        .map_or(recent, |index| &recent[index + 1..]);
+    after_latest_failure.iter().any(|text| {
         let lower = text.to_lowercase();
         TEST_PASS_PHRASES.iter().any(|p| lower.contains(p))
             && !TEST_FAILURE_LITERAL.iter().any(|p| lower.contains(p))
@@ -654,8 +1194,11 @@ fn has_nonzero_failure_count(lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algorithms::util::stage::score_signal;
     use serde_json::json;
-    use switchyard_protocol::{ContentBlock, LlmRequest, Message, Role, ToolCall, ToolResult};
+    use switchyard_protocol::{
+        ContentBlock, LlmRequest, Message, Metadata, Role, ToolCall, ToolResult,
+    };
 
     fn with_messages(messages: Vec<Message>) -> Request {
         Request {
@@ -728,10 +1271,98 @@ mod tests {
     }
 
     #[test]
+    fn connection_refused_is_hard() {
+        let (severity, _) = classify_text("Connection refused on port 8000");
+        assert_eq!(severity, HARD);
+    }
+
+    #[test]
+    fn repeated_failure_ignores_volatile_paths_and_numbers() {
+        let request = with_messages(vec![
+            tr("error[E0308]: mismatched types at /tmp/a/src/lib.rs:12"),
+            tr("error[E0308]: mismatched types at /tmp/b/src/lib.rs:47"),
+        ]);
+        assert!(ToolSignals::from_request(&request, None).repeated_failure);
+    }
+
+    #[test]
+    fn different_failures_are_not_repeated() {
+        let request = with_messages(vec![
+            tr("error[E0308]: mismatched types"),
+            tr("error[E0509]: cannot move out"),
+        ]);
+        assert!(!ToolSignals::from_request(&request, None).repeated_failure);
+    }
+
+    #[test]
+    fn one_material_failure_is_not_repeated() {
+        let request = with_messages(vec![tr("Connection refused on port 8000")]);
+        assert!(!ToolSignals::from_request(&request, None).repeated_failure);
+    }
+
+    #[test]
     fn severity_is_max_across_patterns() {
         // exit_nonzero (SOFT) + traceback (HARD) → HARD.
         let (sev, _) = classify_text("exit code 1\nTraceback (most recent call last):");
         assert_eq!(sev, HARD);
+    }
+
+    #[test]
+    fn codex_process_exit_zero_stays_clean() {
+        let (sev, patterns) =
+            classify_text("Chunk ID: abc\nProcess exited with code 0\nOutput:\nok");
+        assert_eq!(sev, 0.0);
+        assert!(!patterns.contains(&"exit_nonzero".to_string()));
+    }
+
+    #[test]
+    fn nonzero_exit_codes_are_soft_errors() {
+        let cases = [
+            "Process exited with code 1",
+            "Process exited with code 127",
+            "exit code: 2",
+            "exit status 3",
+            "exited with status 9",
+        ];
+        for case in cases {
+            let (sev, patterns) = classify_text(case);
+            assert_eq!(sev, SOFT, "expected soft severity for {case}");
+            assert!(patterns.contains(&"exit_nonzero".to_string()));
+        }
+    }
+
+    #[test]
+    fn partial_process_failures_are_hard_errors() {
+        let cases = [
+            (
+                "Process running with session ID 12\nOutput:\nerror[E0509]: cannot move out",
+                "compile_error",
+            ),
+            (
+                "Process exited with code 0\nOutput:\nTypeError: value is undefined\n    at main.js:1:2",
+                "runtime_exception",
+            ),
+            (
+                "Process running with session ID 13\nOutput:\npanic: runtime error: index out of range\n\ngoroutine 6 [running]:",
+                "runtime_panic",
+            ),
+            (
+                "Process exited with code 0\nOutput:\nerror: patch failed: src/lib.rs:4\nerror: src/lib.rs: patch does not apply",
+                "patch_error",
+            ),
+        ];
+        for (text, expected_pattern) in cases {
+            let (severity, patterns) = classify_text(text);
+            assert_eq!(severity, HARD, "expected hard severity for {text}");
+            assert!(patterns.iter().any(|pattern| pattern == expected_pattern));
+        }
+    }
+
+    #[test]
+    fn source_text_that_names_exceptions_stays_clean() {
+        let text =
+            "pub enum TypeError: this is documentation\nlet sample = 'panic: runtime error:';";
+        assert_eq!(classify_text(text).0, 0.0);
     }
 
     #[test]
@@ -779,6 +1410,25 @@ mod tests {
     fn tests_passed_ignores_partial_failures() {
         assert!(!detect_tests_passed(
             &["2 failed, 5 passed in 0.56s".to_string()],
+            DEFAULT_RECENT_WINDOW
+        ));
+    }
+
+    #[test]
+    fn tests_passed_must_follow_the_latest_failure() {
+        assert!(!detect_tests_passed(
+            &[
+                "5 passed in 0.12s".to_string(),
+                "Traceback (most recent call last):\nValueError".to_string(),
+                "edit applied".to_string(),
+            ],
+            DEFAULT_RECENT_WINDOW
+        ));
+        assert!(detect_tests_passed(
+            &[
+                "Traceback (most recent call last):\nValueError".to_string(),
+                "5 passed in 0.12s".to_string(),
+            ],
             DEFAULT_RECENT_WINDOW
         ));
     }
@@ -975,6 +1625,17 @@ mod tests {
     }
 
     #[test]
+    fn codex_compaction_metadata_stays_on_parent_route() {
+        let mut request = with_messages(vec![bash("ls")]);
+        request.metadata = Some(Metadata {
+            is_subagent: true,
+            agent_kind: Some("compact".to_string()),
+            ..Default::default()
+        });
+        assert!(!ToolSignals::from_request(&request, None).compacted);
+    }
+
+    #[test]
     fn no_compaction_marker_stays_uncompacted() {
         let request = with_messages(vec![
             Message::text(Role::User, "Write a script that parses the log file."),
@@ -1100,13 +1761,13 @@ mod tests {
 
     #[test]
     fn todowrite_classifies_as_plan() {
-        assert_eq!(classify_tool_call("TodoWrite", None), ToolCategory::Plan);
-        assert_eq!(classify_tool_call("todo_write", None), ToolCategory::Plan);
+        assert_eq!(classify_tool_call("TodoWrite", None), ToolSemantic::Plan);
+        assert_eq!(classify_tool_call("todo_write", None), ToolSemantic::Plan);
     }
 
     #[test]
     fn codex_update_plan_classifies_as_plan() {
-        assert_eq!(classify_tool_call("update_plan", None), ToolCategory::Plan);
+        assert_eq!(classify_tool_call("update_plan", None), ToolSemantic::Plan);
     }
 
     #[test]
@@ -1114,46 +1775,55 @@ mod tests {
         // shell_command + heredoc -> Write.
         assert_eq!(
             classify_tool_call("shell_command", Some("cat > /app/foo.py <<'eof'\nx=1\neof")),
-            ToolCategory::Write,
+            ToolSemantic::Mutate(MutationKind::Write),
         );
         // shell_command + read-like inspection -> Read.
         assert_eq!(
             classify_tool_call("shell_command", Some("ls /app")),
-            ToolCategory::Read,
+            ToolSemantic::Observe,
         );
-        // shell_command without matching patterns -> Other.
+        // shell_command without matching patterns -> Unknown.
         assert_eq!(
             classify_tool_call("shell_command", Some("./run_tests.sh")),
-            ToolCategory::Other,
+            ToolSemantic::Unknown,
         );
     }
 
     #[test]
     fn read_tool_classifies_as_read() {
-        assert_eq!(classify_tool_call("Read", None), ToolCategory::Read);
-        assert_eq!(classify_tool_call("View", None), ToolCategory::Read);
+        assert_eq!(classify_tool_call("Read", None), ToolSemantic::Observe);
+        assert_eq!(classify_tool_call("View", None), ToolSemantic::Observe);
     }
 
     #[test]
     fn hermes_tool_names_classify() {
         // Hermes (NousResearch) file tools route by name.
-        assert_eq!(classify_tool_call("write_file", None), ToolCategory::Write);
-        assert_eq!(classify_tool_call("patch", None), ToolCategory::Edit);
-        assert_eq!(classify_tool_call("read_file", None), ToolCategory::Read);
-        assert_eq!(classify_tool_call("search_files", None), ToolCategory::Read);
+        assert_eq!(
+            classify_tool_call("write_file", None),
+            ToolSemantic::Mutate(MutationKind::Write)
+        );
+        assert_eq!(
+            classify_tool_call("patch", None),
+            ToolSemantic::Mutate(MutationKind::Edit)
+        );
+        assert_eq!(classify_tool_call("read_file", None), ToolSemantic::Observe);
+        assert_eq!(
+            classify_tool_call("search_files", None),
+            ToolSemantic::Observe
+        );
         // Hermes runs shell through `terminal`, which carries a `command` arg,
         // so its intent comes from the Bash-pattern match like codex's shell_command.
         assert_eq!(
             classify_tool_call("terminal", Some("sed -i 's/a/b/' /app/x.py")),
-            ToolCategory::Edit,
+            ToolSemantic::Mutate(MutationKind::Edit),
         );
         assert_eq!(
             classify_tool_call("terminal", Some("grep foo /app")),
-            ToolCategory::Read,
+            ToolSemantic::Observe,
         );
         assert_eq!(
             classify_tool_call("terminal", Some("./run_tests.sh")),
-            ToolCategory::Other,
+            ToolSemantic::Unknown,
         );
     }
 
@@ -1168,10 +1838,106 @@ mod tests {
         for cmd in cases {
             assert_eq!(
                 classify_tool_call("Bash", Some(cmd)),
-                ToolCategory::Read,
+                ToolSemantic::Observe,
                 "expected Read for {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn codex_inspection_commands_classify_as_read() {
+        let cases = [
+            "sed -n '1,80p' src/lib.rs",
+            "rg -n 'needle' src",
+            "nl -ba src/lib.rs",
+            "cat package.json",
+            "jq '.scripts' package.json",
+            "git status --short",
+            "git log --oneline -5",
+            "git show HEAD:src/lib.rs",
+            "git branch --show-current",
+            "git remote -v",
+            "git config --get remote.origin.url",
+        ];
+        for command in cases {
+            assert_eq!(
+                classify_tool_call("exec_command", Some(command)),
+                ToolSemantic::Observe,
+                "expected Read for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_shell_separators_do_not_create_commands() {
+        for command in ["rg 'foo|rm obsolete.rs'", "rg \"foo; rm obsolete.rs\""] {
+            assert_eq!(
+                classify_tool_call("exec_command", Some(command)),
+                ToolSemantic::Observe,
+                "quoted text must not be parsed as a command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_shell_mutations_classify_as_production() {
+        let writes = [
+            "cp source.rs destination.rs",
+            "mkdir -p src/generated",
+            "touch src/generated/mod.rs",
+            "git show HEAD:file.rs > file.rs",
+            "node <<'node'\nfs.writefilesync('file.js', text)\nnode",
+        ];
+        for command in writes {
+            assert_eq!(
+                classify_tool_call("exec_command", Some(command)),
+                ToolSemantic::Mutate(MutationKind::Write),
+                "expected Write for {command}"
+            );
+        }
+
+        let edits = [
+            "mv old.rs new.rs",
+            "rm obsolete.rs",
+            "gofmt -w main.go",
+            "cargo fmt",
+            "ruff check --fix src",
+            "perl -0pi -e 's/old/new/' src/lib.rs",
+            "npx prettier --write src/lib.ts",
+            "uv run ruff format src",
+            "git apply fix.patch",
+        ];
+        for command in edits {
+            assert_eq!(
+                classify_tool_call("exec_command", Some(command)),
+                ToolSemantic::Mutate(MutationKind::Edit),
+                "expected Edit for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn formatter_checks_are_not_edits() {
+        for command in [
+            "cargo fmt --check",
+            "ruff format --check src",
+            "black --check src",
+        ] {
+            assert_ne!(
+                classify_tool_call("exec_command", Some(command)),
+                ToolSemantic::Mutate(MutationKind::Edit),
+                "read-only formatter check must not be Edit: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_comparison_is_not_a_shell_write() {
+        let command = "node <<'node'\nif (index > 0) console.log(index)\nnode";
+        assert_eq!(
+            classify_tool_call("exec_command", Some(command)),
+            ToolSemantic::Unknown
+        );
     }
 
     #[test]
@@ -1180,7 +1946,7 @@ mod tests {
         // write redirection must win.
         assert_eq!(
             classify_tool_call("Bash", Some("cat /etc/hosts > /tmp/out")),
-            ToolCategory::Write,
+            ToolSemantic::Mutate(MutationKind::Write),
         );
     }
 
@@ -1231,5 +1997,217 @@ mod tests {
         assert_eq!(sig.recent_todowrite_count, 2);
         assert_eq!(sig.read_count, 1);
         assert_eq!(sig.recent_read_count, 1);
+    }
+
+    #[test]
+    fn configured_tool_semantics_extend_the_builtin_vocabulary() {
+        let semantics = ToolSemantics {
+            observe: vec!["KB_search".to_string()],
+            mutate: vec!["send_payment_request".to_string()],
+            plan: vec!["create_research_plan".to_string()],
+            new: vec!["send_message_to_user".to_string()],
+        };
+        semantics.validate().expect("valid additive semantics");
+        let request = with_messages(vec![
+            tc("Read"),
+            tc("Write"),
+            tc("TodoWrite"),
+            tc("kb_SEARCH"),
+            tc("send_payment_request"),
+            tc("create_research_plan"),
+            tc("send_message_to_user"),
+            tc("unlisted_tool"),
+        ]);
+
+        let signal = ToolSignals::from_request_with_semantics(&request, None, &semantics);
+
+        assert_eq!(signal.read_count, 2);
+        assert_eq!(signal.write_count, 2);
+        assert_eq!(signal.todowrite_count, 2);
+        assert_eq!(signal.new_count, 1);
+        assert_eq!(signal.recent_new_count, 1);
+        assert_eq!(signal.pure_bash_streak, 1);
+    }
+
+    #[test]
+    fn configured_tool_semantics_only_fold_ascii_case() {
+        let semantics = ToolSemantics {
+            observe: vec!["kb_search".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_tool_call_with_semantics("KB_SEARCH", None, &semantics),
+            ToolSemantic::Observe
+        );
+        // U+212A lowercases to ASCII `k` under Unicode rules, but custom names
+        // intentionally ignore only ASCII case.
+        assert_eq!(
+            classify_tool_call_with_semantics("KB_SEARCH", None, &semantics),
+            ToolSemantic::Unknown
+        );
+    }
+
+    #[test]
+    fn custom_semantics_preserve_builtin_unicode_lowercasing() {
+        let semantics = ToolSemantics {
+            observe: vec!["lookup_customer".to_string()],
+            ..Default::default()
+        };
+
+        // This matched the built-in `notebookedit` before custom semantics existed.
+        assert_eq!(
+            classify_tool_call_with_semantics("notebooKedit", None, &semantics),
+            ToolSemantic::Mutate(MutationKind::Edit)
+        );
+    }
+
+    #[test]
+    fn configured_semantics_never_replace_builtin_classifications() {
+        let semantics = ToolSemantics {
+            observe: vec!["lookup_customer".to_string()],
+            mutate: vec!["send_payment".to_string()],
+            plan: vec!["create_workflow".to_string()],
+            new: vec!["send_message".to_string()],
+        };
+
+        for name in WRITE_TOOL_NAMES {
+            assert_eq!(
+                classify_tool_call_with_semantics(name, None, &semantics),
+                ToolSemantic::Mutate(MutationKind::Write),
+                "write tool {name:?} changed classification"
+            );
+        }
+        for name in EDIT_TOOL_NAMES {
+            assert_eq!(
+                classify_tool_call_with_semantics(name, None, &semantics),
+                ToolSemantic::Mutate(MutationKind::Edit),
+                "edit tool {name:?} changed classification"
+            );
+        }
+        for name in READ_TOOL_NAMES {
+            assert_eq!(
+                classify_tool_call_with_semantics(name, None, &semantics),
+                ToolSemantic::Observe,
+                "read tool {name:?} changed classification"
+            );
+        }
+        for name in PLAN_TOOL_NAMES {
+            assert_eq!(
+                classify_tool_call_with_semantics(name, None, &semantics),
+                ToolSemantic::Plan,
+                "plan tool {name:?} changed classification"
+            );
+        }
+
+        for (command, expected) in [
+            ("cat /tmp/input", ToolSemantic::Observe),
+            (
+                "cat /tmp/input > /tmp/output",
+                ToolSemantic::Mutate(MutationKind::Write),
+            ),
+            (
+                "sed -i 's/a/b/' /tmp/file",
+                ToolSemantic::Mutate(MutationKind::Edit),
+            ),
+            ("./run_tests.sh", ToolSemantic::Unknown),
+        ] {
+            assert_eq!(
+                classify_tool_call_with_semantics("BASH", Some(command), &semantics),
+                expected,
+                "bash command {command:?} changed classification"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_semantics_score_like_their_builtin_equivalents() {
+        let semantics = ToolSemantics {
+            observe: vec!["lookup_customer".to_string()],
+            mutate: vec!["send_payment".to_string()],
+            plan: vec!["create_workflow".to_string()],
+            ..Default::default()
+        };
+
+        for (builtin, configured) in [
+            ("Read", "lookup_customer"),
+            ("Write", "send_payment"),
+            ("TodoWrite", "create_workflow"),
+        ] {
+            let messages_before_tool = || {
+                vec![
+                    Message::text(Role::User, "start"),
+                    Message::text(Role::Assistant, "working"),
+                    Message::text(Role::User, "continue"),
+                    Message::text(Role::Assistant, "working"),
+                    Message::text(Role::User, "continue"),
+                    Message::text(Role::Assistant, "working"),
+                    Message::text(Role::User, "continue"),
+                ]
+            };
+            let mut builtin_messages = messages_before_tool();
+            builtin_messages.push(tc(builtin));
+            let mut configured_messages = messages_before_tool();
+            configured_messages.push(tc(configured));
+
+            let builtin_score = score_signal(&ToolSignals::from_request(
+                &with_messages(builtin_messages),
+                None,
+            ));
+            let configured_score = score_signal(&ToolSignals::from_request_with_semantics(
+                &with_messages(configured_messages),
+                None,
+                &semantics,
+            ));
+
+            assert_ne!(
+                builtin_score.score, 0.0,
+                "the {builtin:?} control must exercise a scoring dimension"
+            );
+            assert_eq!(
+                configured_score, builtin_score,
+                "configured tool {configured:?} must score exactly like {builtin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_semantics_reject_duplicates_and_builtin_reclassification() {
+        let duplicate = ToolSemantics {
+            observe: vec!["lookup".to_string()],
+            mutate: vec!["LOOKUP".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            duplicate
+                .validate()
+                .expect_err("duplicate should fail")
+                .to_string()
+                .contains("appears in both")
+        );
+
+        let builtin = ToolSemantics {
+            new: vec!["write_file".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            builtin
+                .validate()
+                .expect_err("built-in should fail")
+                .to_string()
+                .contains("built-in semantics")
+        );
+
+        let empty = ToolSemantics {
+            observe: vec![" \t".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            empty
+                .validate()
+                .expect_err("empty name should fail")
+                .to_string()
+                .contains("empty tool name")
+        );
     }
 }

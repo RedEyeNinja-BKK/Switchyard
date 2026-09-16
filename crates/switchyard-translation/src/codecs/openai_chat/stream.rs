@@ -214,6 +214,18 @@ fn encode_openai_chat_stream(
             )]
         }
         LlmResponseChunk::ReasoningDetailsDelta { details, text, .. } => {
+            // A Responses decoder announces a reasoning item's provider id ahead of its
+            // payload; that announcement carries nothing a chat client can use.
+            let details: Vec<Value> = details
+                .into_iter()
+                .filter(|detail| {
+                    detail.get("type").and_then(Value::as_str) != Some("reasoning.encrypted")
+                        || detail.get("data").is_some()
+                })
+                .collect();
+            if details.is_empty() && text.is_empty() {
+                return Vec::new();
+            }
             let details_text = reasoning_text_from_details(&details);
             let mut delta = json!({"reasoning_details": details});
             if !text.is_empty() && details_text.as_deref() != Some(text.as_str()) {
@@ -226,13 +238,29 @@ fn encode_openai_chat_stream(
             id,
             name,
             arguments_delta,
-        } => vec![openai_tool_call_chunk(
-            state,
-            index,
-            id,
-            name,
-            arguments_delta,
-        )],
+        } => {
+            // The source index counts every content block (Anthropic) or output item
+            // (Responses), so text ahead of the first tool call shifts it. Chat clients use
+            // the index as a subscript into `tool_calls`, so number calls in that array
+            // instead, in order of first appearance.
+            let tool = state.tool_states.entry(index).or_default();
+            let chat_index = match tool.chat_tool_index {
+                Some(chat_index) => chat_index,
+                None => {
+                    let chat_index = state.next_chat_tool_index;
+                    state.next_chat_tool_index += 1;
+                    state.tool_states.entry(index).or_default().chat_tool_index = Some(chat_index);
+                    chat_index
+                }
+            };
+            vec![openai_tool_call_chunk(
+                state,
+                chat_index,
+                id,
+                name,
+                arguments_delta,
+            )]
+        }
         LlmResponseChunk::Usage(usage) => {
             state.usage = usage;
             state.saw_backend_usage = true;

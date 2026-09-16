@@ -1285,6 +1285,203 @@ fn responses_buffered_and_streamed_outputs_match() -> TestResult {
     Ok(())
 }
 
+// The Responses events a provider streams for one completed function call, ending with a
+// `response.completed` whose output repeats the finished call.
+fn responses_function_call_stream() -> Vec<Value> {
+    let call = json!({
+        "id": "fc_1",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_1",
+        "name": "get_weather",
+        "arguments": "{\"city\":\"Paris\"}"
+    });
+    vec![
+        json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5.6", "status": "in_progress", "output": []}
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "output_index": 0,
+            "delta": "{\"city\":\"Paris\"}"
+        }),
+        json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 0,
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}"
+        }),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": call}),
+        json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "model": "gpt-5.6", "status": "completed", "output": [call]}
+        }),
+    ]
+}
+
+// Translates a whole source stream into `target` events, including the encoder's finish.
+fn translate_stream(
+    engine: &TranslationEngine,
+    source: WireFormat,
+    target: WireFormat,
+    events: &[Value],
+) -> std::result::Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut state = StreamTranslationState::new(source, target);
+    let mut out = Vec::new();
+    for event in events {
+        out.extend(engine.translate_event(&mut state, source, target, event)?);
+    }
+    out.extend(engine.finish_stream(&mut state, target)?);
+    Ok(out)
+}
+
+// A streamed Responses function call must end with the tool-use stop reason the buffered decoder
+// reports: Anthropic `tool_use`, Chat `tool_calls`. Anthropic's tool runners dispatch on it;
+// `end_turn` makes them return the unfinished tool-use turn without running the tool. A bare
+// `response.completed` with no output array falls back to the argument deltas already decoded,
+// while a text-only stream still reports no reason.
+#[test]
+fn responses_function_call_stream_ends_with_tool_use_on_every_wire() -> TestResult {
+    let engine = TranslationEngine::default();
+    let stream = responses_function_call_stream();
+
+    let anthropic = translate_stream(
+        &engine,
+        WireFormat::OpenAiResponses,
+        WireFormat::AnthropicMessages,
+        &stream,
+    )?;
+    let stop_reasons: Vec<&Value> = anthropic
+        .iter()
+        .filter(|event| event["type"] == "message_delta")
+        .map(|event| &event["delta"]["stop_reason"])
+        .collect();
+    assert_eq!(stop_reasons, vec![&json!("tool_use")]);
+    assert!(anthropic.iter().any(|event| {
+        event["type"] == "content_block_start"
+            && event["content_block"]["type"] == "tool_use"
+            && event["content_block"]["name"] == "get_weather"
+    }));
+
+    let chat = translate_stream(
+        &engine,
+        WireFormat::OpenAiResponses,
+        WireFormat::OpenAiChat,
+        &stream,
+    )?;
+    let finish_reasons: Vec<&Value> = chat
+        .iter()
+        .filter_map(|event| event["choices"][0].get("finish_reason"))
+        .filter(|reason| !reason.is_null())
+        .collect();
+    assert_eq!(finish_reasons, vec![&json!("tool_calls")]);
+    assert!(chat.iter().any(|event| {
+        event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "get_weather"
+    }));
+
+    // Delta-only fallback: `response.created`, one argument delta, then a bare completion with
+    // no output-item events at all.
+    let bare_completed = json!({"type": "response.completed", "response": {}});
+    let mut state =
+        StreamTranslationState::new(WireFormat::OpenAiResponses, WireFormat::OpenAiResponses);
+    let mut last = Vec::new();
+    for event in [&stream[0], &stream[2], &bare_completed] {
+        last = decode_stream_event(&mut state, WireFormat::OpenAiResponses, event);
+    }
+    assert_eq!(
+        last,
+        vec![LlmResponseChunk::MessageStop {
+            reason: Some("tool_use".to_string())
+        }]
+    );
+
+    let mut state =
+        StreamTranslationState::new(WireFormat::OpenAiResponses, WireFormat::OpenAiResponses);
+    let text = json!({"type": "response.output_text.delta", "output_index": 0, "delta": "hi"});
+    decode_stream_event(&mut state, WireFormat::OpenAiResponses, &text);
+    assert_eq!(
+        decode_stream_event(&mut state, WireFormat::OpenAiResponses, &bare_completed),
+        vec![LlmResponseChunk::MessageStop { reason: None }]
+    );
+    Ok(())
+}
+
+// Chat clients subscript `tool_calls` with the streamed index, so tool calls must be numbered
+// within that array. Anthropic and Responses index the whole content array, where text ahead
+// of the first tool call pushes it to 1; the OpenAI SDK then indexes past a one-element array.
+#[test]
+fn chat_tool_call_index_counts_tool_calls_not_content_blocks() -> TestResult {
+    let engine = TranslationEngine::default();
+    let tool_indices = |events: &[Value]| -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
+            .flat_map(|calls| calls.iter().map(|call| call["index"].clone()))
+            .collect()
+    };
+
+    // Anthropic: text at content index 0, then two tool calls at 1 and 2.
+    let tool_block = |index: usize, id: &str| {
+        vec![
+            json!({"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": id, "name": "lookup", "input": {}}}),
+            json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": "{\"q\":\"rust\"}"}}),
+            json!({"type": "content_block_stop", "index": index}),
+        ]
+    };
+    let mut anthropic = vec![
+        json!({"type": "message_start", "message": {"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test", "content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Checking now."}}),
+        json!({"type": "content_block_stop", "index": 0}),
+    ];
+    anthropic.extend(tool_block(1, "toolu_01"));
+    anthropic.extend(tool_block(2, "toolu_02"));
+    anthropic.push(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 8}}));
+    anthropic.push(json!({"type": "message_stop"}));
+    let chat = translate_stream(
+        &engine,
+        WireFormat::AnthropicMessages,
+        WireFormat::OpenAiChat,
+        &anthropic,
+    )?;
+    assert_eq!(
+        tool_indices(&chat),
+        vec![json!(0), json!(0), json!(1), json!(1)]
+    );
+
+    // Responses: a message item at output index 0, then a function call at 1.
+    let responses = [
+        json!({"type": "response.created", "response": {"id": "resp_1", "model": "gpt-5.6"}}),
+        json!({"type": "response.output_text.delta", "output_index": 0, "delta": "Checking now."}),
+        json!({"type": "response.output_item.added", "output_index": 1, "item": {"id": "fc_1", "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": ""}}),
+        json!({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "{\"q\":\"rust\"}"}),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let chat = translate_stream(
+        &engine,
+        WireFormat::OpenAiResponses,
+        WireFormat::OpenAiChat,
+        &responses,
+    )?;
+    assert_eq!(tool_indices(&chat), vec![json!(0), json!(0)]);
+    Ok(())
+}
+
 // An OpenAI-shaped error frame carries no `choices`, so it must decode to a stream error
 // instead of a bare message start that silently drops the upstream message.
 #[test]
@@ -1407,12 +1604,129 @@ fn responses_completed_event_is_schema_complete_and_retains_message_id() -> Test
             "missing response field {field}"
         );
     }
-    assert_eq!(response["output"][0]["id"], "msg_0");
+    // Synthesized item ids carry the response id so they stay unique across turns.
+    assert_eq!(response["output"][0]["id"], "msg_chatcmpl-test_0");
     let done = events
         .iter()
         .find(|event| event["type"] == "response.output_item.done")
         .ok_or("expected response.output_item.done")?;
-    assert_eq!(done["item"]["id"], "msg_0");
+    assert_eq!(done["item"]["id"], "msg_chatcmpl-test_0");
+    Ok(())
+}
+
+// Some upstreams issue response ids several hundred characters long. Synthesized item ids
+// embed the response id for uniqueness, but OpenAI rejects item ids over 64 characters, so long
+// discriminators must be digested while staying distinct across responses.
+#[test]
+fn responses_synthesized_item_ids_stay_within_the_openai_length_limit() -> TestResult {
+    let engine = TranslationEngine::default();
+    let mut ids = Vec::new();
+    for suffix in ["a", "b"] {
+        let long_id = format!("chatcmpl-{}{suffix}", "x".repeat(360));
+        let mut state =
+            StreamTranslationState::new(WireFormat::OpenAiChat, WireFormat::OpenAiResponses);
+        let chunk = json!({
+            "id": long_id,
+            "object": "chat.completion.chunk",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "hello"},
+                "finish_reason": "stop"
+            }]
+        });
+        let mut events = engine.translate_event(
+            &mut state,
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            &chunk,
+        )?;
+        events.extend(engine.finish_stream(&mut state, WireFormat::OpenAiResponses)?);
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .ok_or("expected response.output_item.done")?;
+        let id = done["item"]["id"]
+            .as_str()
+            .ok_or("item id should be a string")?
+            .to_string();
+        assert!(id.starts_with("msg_"), "{id}");
+        assert!(id.ends_with("_0"), "{id}");
+        assert!(
+            id.chars().count() <= 64,
+            "{id} is {} chars",
+            id.chars().count()
+        );
+        ids.push(id);
+    }
+    assert_ne!(
+        ids[0], ids[1],
+        "distinct responses must yield distinct item ids"
+    );
+    Ok(())
+}
+
+// Encrypted reasoning is bound to the item id the provider issued it under. When a buffered
+// reply is re-streamed to the client, the emitted reasoning item must reuse that id or the
+// client's replay fails verification upstream.
+#[test]
+fn responses_stream_reuses_provider_id_for_encrypted_reasoning() -> TestResult {
+    let engine = TranslationEngine::default();
+    let mut state =
+        StreamTranslationState::new(WireFormat::OpenAiResponses, WireFormat::OpenAiResponses);
+    let chunks = vec![
+        LlmResponseChunk::MessageStart {
+            id: Some("resp_upstream".to_string()),
+            model: Some("gpt-5.6-luna".to_string()),
+        },
+        LlmResponseChunk::ReasoningDetailsDelta {
+            index: 0,
+            details: vec![json!({
+                "type": "reasoning.encrypted",
+                "data": "opaque-encrypted-reasoning",
+                "id": "rs_provider_issued"
+            })],
+            text: String::new(),
+        },
+        LlmResponseChunk::ReasoningDelta {
+            index: 0,
+            text: "thinking".to_string(),
+        },
+        LlmResponseChunk::TextDelta {
+            index: 1,
+            text: "done".to_string(),
+        },
+        LlmResponseChunk::MessageStop { reason: None },
+    ];
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(engine.encode_stream_event(
+            &mut state,
+            WireFormat::OpenAiResponses,
+            LlmResponseStreamEvent::new(vec![chunk]),
+        )?);
+    }
+    events.extend(engine.finish_stream(&mut state, WireFormat::OpenAiResponses)?);
+
+    let reasoning_done = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning"
+        })
+        .ok_or("expected a completed reasoning item")?;
+    assert_eq!(reasoning_done["item"]["id"], "rs_provider_issued");
+    assert_eq!(
+        reasoning_done["item"]["encrypted_content"],
+        "opaque-encrypted-reasoning"
+    );
+    // Every reasoning event references the same provider id.
+    for event in events.iter().filter(|event| {
+        event["type"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("response.reasoning_summary"))
+    }) {
+        assert_eq!(event["item_id"], "rs_provider_issued", "{event}");
+    }
     Ok(())
 }
 
@@ -1544,5 +1858,629 @@ fn responses_decode_emits_tool_arguments_once() -> TestResult {
     }
 
     assert_eq!(seen, arguments);
+    Ok(())
+}
+
+// A Responses `reasoning` output item may carry only `encrypted_content`, with no
+// plaintext. The stream decoder must surface it as a `reasoning.encrypted` detail so a
+// caller that buffers the stream (the escalation router) still holds something the
+// client can replay; otherwise the reasoning is dropped before it reaches the IR.
+#[test]
+fn responses_stream_decodes_encrypted_reasoning_item_into_details() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut state = StreamTranslationState::new(format, format);
+    let event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "reasoning",
+            "id": "rs_upstream",
+            "status": "completed",
+            "summary": [],
+            "encrypted_content": "opaque-encrypted-reasoning"
+        }
+    });
+
+    let decoded = engine.decode_stream_event(&mut state, format, event)?;
+
+    assert_eq!(
+        decoded.normalized(),
+        &[LlmResponseChunk::ReasoningDetailsDelta {
+            index: 0,
+            details: vec![json!({
+                "type": "reasoning.encrypted",
+                "data": "opaque-encrypted-reasoning",
+                "id": "rs_upstream"
+            })],
+            text: String::new(),
+        }]
+    );
+    Ok(())
+}
+
+// The synthesized encode path (no preserved provider JSON, as produced by
+// `AggLlmResponse::into_stream`) must emit an encrypted-only reasoning detail as a
+// Responses `reasoning` item carrying `encrypted_content`, not drop it.
+#[test]
+fn responses_stream_encodes_encrypted_reasoning_details_as_reasoning_item() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut state = StreamTranslationState::new(format, format);
+    let chunks = vec![
+        LlmResponseChunk::MessageStart {
+            id: Some("resp_1".to_string()),
+            model: Some(REASONING_MODEL.to_string()),
+        },
+        LlmResponseChunk::ReasoningDetailsDelta {
+            index: 0,
+            details: vec![json!({
+                "type": "reasoning.encrypted",
+                "data": "opaque-encrypted-reasoning"
+            })],
+            text: String::new(),
+        },
+        LlmResponseChunk::MessageStop { reason: None },
+    ];
+
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(engine.encode_stream_event(
+            &mut state,
+            format,
+            LlmResponseStreamEvent::new(vec![chunk]),
+        )?);
+    }
+    events.extend(engine.finish_stream(&mut state, format)?);
+
+    let done_item = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .map(|event| &event["item"])
+        .find(|item| item["type"] == "reasoning")
+        .ok_or("expected a completed reasoning output item")?;
+    assert_eq!(done_item["encrypted_content"], "opaque-encrypted-reasoning");
+
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .ok_or("expected response.completed")?;
+    let final_reasoning = completed["response"]["output"]
+        .as_array()
+        .ok_or("output should be an array")?
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .ok_or("final output should include the reasoning item")?;
+    assert_eq!(
+        final_reasoning["encrypted_content"],
+        "opaque-encrypted-reasoning"
+    );
+    Ok(())
+}
+
+// Some providers deliver a reasoning item only in `response.output_item.done`, as
+// plaintext in a top-level `text` field, with no streamed `reasoning_text.delta` events.
+// The decoder must surface that text so a buffering caller can re-emit the item.
+#[test]
+fn responses_stream_decodes_text_only_reasoning_item_from_done() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut state = StreamTranslationState::new(format, format);
+    let event = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {"type": "reasoning", "id": "rs_upstream", "text": "Let me explore the repo first."}
+    });
+
+    let decoded = engine.decode_stream_event(&mut state, format, event)?;
+
+    assert_eq!(
+        decoded.normalized(),
+        &[
+            LlmResponseChunk::ReasoningDetailsDelta {
+                index: 0,
+                details: vec![json!({"type": "reasoning.encrypted", "id": "rs_upstream"})],
+                text: String::new(),
+            },
+            LlmResponseChunk::ReasoningDelta {
+                index: 0,
+                text: "Let me explore the repo first.".to_string(),
+            }
+        ]
+    );
+    Ok(())
+}
+
+// When reasoning text already streamed through `reasoning_text.delta`, the completed item
+// that repeats it must not be decoded a second time.
+#[test]
+fn responses_stream_does_not_duplicate_streamed_reasoning_on_done() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut state = StreamTranslationState::new(format, format);
+    let delta = json!({
+        "type": "response.reasoning_text.delta",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "Let me explore"
+    });
+    let done = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "reasoning",
+            "id": "rs_upstream",
+            "content": [{"type": "reasoning_text", "text": "Let me explore"}]
+        }
+    });
+
+    let first = engine.decode_stream_event(&mut state, format, delta)?;
+    let second = engine.decode_stream_event(&mut state, format, done)?;
+
+    assert_eq!(first.normalized().len(), 1);
+    // The done item contributes only its provider id, never the text again.
+    assert_eq!(
+        second.normalized(),
+        &[LlmResponseChunk::ReasoningDetailsDelta {
+            index: 0,
+            details: vec![json!({"type": "reasoning.encrypted", "id": "rs_upstream"})],
+            text: String::new(),
+        }]
+    );
+    Ok(())
+}
+
+// Providers differ in which event carries a reasoning item's text. Each carrier must decode
+// exactly once: `output_item.added` with text, a `reasoning_text.done` with no prior deltas,
+// and a reasoning item that appears only inside `response.completed`'s output array.
+#[test]
+fn responses_stream_decodes_reasoning_text_from_added_done_and_completed_once() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+
+    // (a) only in output_item.added
+    let mut state = StreamTranslationState::new(format, format);
+    let added = json!({"type": "response.output_item.added", "output_index": 0,
+        "item": {"type": "reasoning", "id": "rs_a", "text": "from added"}});
+    let decoded = engine.decode_stream_event(&mut state, format, added)?;
+    assert_eq!(
+        decoded.normalized(),
+        &[
+            LlmResponseChunk::ReasoningDetailsDelta {
+                index: 0,
+                details: vec![json!({"type": "reasoning.encrypted", "id": "rs_a"})],
+                text: String::new(),
+            },
+            LlmResponseChunk::ReasoningDelta {
+                index: 0,
+                text: "from added".into()
+            }
+        ]
+    );
+    // the matching done repeats it and must be skipped
+    let done = json!({"type": "response.output_item.done", "output_index": 0,
+        "item": {"type": "reasoning", "id": "rs_a", "text": "from added"}});
+    assert_eq!(
+        engine
+            .decode_stream_event(&mut state, format, done)?
+            .normalized(),
+        &[]
+    );
+
+    // (b) only in reasoning_text.done
+    let mut state = StreamTranslationState::new(format, format);
+    let text_done = json!({"type": "response.reasoning_text.done", "output_index": 1,
+        "content_index": 0, "text": "from text done"});
+    let decoded = engine.decode_stream_event(&mut state, format, text_done)?;
+    assert_eq!(
+        decoded.normalized(),
+        &[LlmResponseChunk::ReasoningDelta {
+            index: 1,
+            text: "from text done".into()
+        }]
+    );
+
+    // (c) only inside response.completed output; emitted before the stop
+    let mut state = StreamTranslationState::new(format, format);
+    let completed = json!({"type": "response.completed", "response": {"id": "resp_1",
+        "output": [{"type": "reasoning", "id": "rs_c", "text": "from completed"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}});
+    let decoded = engine.decode_stream_event(&mut state, format, completed)?;
+    let kinds: Vec<&str> = decoded
+        .normalized()
+        .iter()
+        .map(|c| match c {
+            LlmResponseChunk::ReasoningDelta { text, .. } => {
+                assert_eq!(text, "from completed");
+                "reasoning"
+            }
+            LlmResponseChunk::ReasoningDetailsDelta { .. } => "id",
+            LlmResponseChunk::Usage(_) => "usage",
+            LlmResponseChunk::MessageStop { .. } => "stop",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, vec!["id", "reasoning", "usage", "stop"]);
+
+    // (d) completed output repeating already-streamed reasoning adds nothing
+    let mut state = StreamTranslationState::new(format, format);
+    let delta =
+        json!({"type": "response.reasoning_text.delta", "output_index": 0, "delta": "streamed"});
+    engine.decode_stream_event(&mut state, format, delta)?;
+    let completed = json!({"type": "response.completed", "response": {"id": "resp_2",
+        "output": [{"type": "reasoning", "id": "rs_d", "text": "streamed"}]}});
+    let decoded = engine.decode_stream_event(&mut state, format, completed)?;
+    assert!(
+        decoded
+            .normalized()
+            .iter()
+            .all(|c| !matches!(c, LlmResponseChunk::ReasoningDelta { .. }))
+    );
+    Ok(())
+}
+
+// Codex records a reasoning item only in the standard Responses shape: text lives in
+// `summary: [{"type": "summary_text", ...}]` and streams as `reasoning_summary_part.added`,
+// `reasoning_summary_text.delta`, `reasoning_summary_text.done`, `reasoning_summary_part.done`.
+// The encoder must emit that shape, not a `content: [reasoning_text]` item, or the client
+// silently drops the reasoning.
+#[test]
+fn responses_stream_encodes_reasoning_as_summary_text() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut state = StreamTranslationState::new(format, format);
+    let chunks = vec![
+        LlmResponseChunk::MessageStart {
+            id: Some("resp_1".into()),
+            model: Some(REASONING_MODEL.into()),
+        },
+        LlmResponseChunk::ReasoningDelta {
+            index: 0,
+            text: "Let me ".into(),
+        },
+        LlmResponseChunk::ReasoningDelta {
+            index: 0,
+            text: "think.".into(),
+        },
+        LlmResponseChunk::TextDelta {
+            index: 1,
+            text: "done".into(),
+        },
+        LlmResponseChunk::MessageStop { reason: None },
+    ];
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(engine.encode_stream_event(
+            &mut state,
+            format,
+            LlmResponseStreamEvent::new(vec![chunk]),
+        )?);
+    }
+    events.extend(engine.finish_stream(&mut state, format)?);
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+
+    assert!(
+        types.contains(&"response.reasoning_summary_part.added"),
+        "{types:?}"
+    );
+    assert_eq!(
+        types
+            .iter()
+            .filter(|t| **t == "response.reasoning_summary_text.delta")
+            .count(),
+        2,
+        "{types:?}"
+    );
+    assert!(
+        types.contains(&"response.reasoning_summary_text.done"),
+        "{types:?}"
+    );
+    assert!(
+        types.contains(&"response.reasoning_summary_part.done"),
+        "{types:?}"
+    );
+    assert!(
+        !types
+            .iter()
+            .any(|t| t.starts_with("response.reasoning_text.")),
+        "legacy reasoning_text events must not be emitted: {types:?}"
+    );
+
+    let done = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_item.done")
+        .map(|e| &e["item"])
+        .find(|i| i["type"] == "reasoning")
+        .ok_or("reasoning output_item.done")?;
+    assert_eq!(
+        done["summary"],
+        json!([{"type": "summary_text", "text": "Let me think."}])
+    );
+    assert!(
+        done.get("content")
+            .is_none_or(|c| c.as_array().is_some_and(Vec::is_empty)),
+        "no content part: {done}"
+    );
+
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "response.completed")
+        .ok_or("completed")?;
+    let final_reasoning = completed["response"]["output"]
+        .as_array()
+        .ok_or("output")?
+        .iter()
+        .find(|i| i["type"] == "reasoning")
+        .ok_or("final reasoning item")?;
+    assert_eq!(final_reasoning["summary"][0]["text"], "Let me think.");
+    Ok(())
+}
+
+// Item ids the encoder synthesizes must be unique across responses. A client replays the
+// whole conversation, so two turns whose reasoning items are both `rs_0` (and whose tool
+// calls are both `fc_1`) hand the upstream a history with colliding ids. Passthrough carries
+// the provider's unique ids; the synthesized path must not be worse.
+#[test]
+fn responses_stream_synthesized_item_ids_are_unique_across_responses() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut ids = Vec::new();
+    for resp in ["resp_first", "resp_second"] {
+        let mut state = StreamTranslationState::new(format, format);
+        let chunks = vec![
+            LlmResponseChunk::MessageStart {
+                id: Some(resp.into()),
+                model: Some(REASONING_MODEL.into()),
+            },
+            LlmResponseChunk::ReasoningDelta {
+                index: 0,
+                text: "think".into(),
+            },
+            LlmResponseChunk::ToolCallDelta {
+                index: 1,
+                id: Some("call_x".into()),
+                name: Some("exec_command".into()),
+                arguments_delta: Some("{}".into()),
+            },
+            LlmResponseChunk::TextDelta {
+                index: 2,
+                text: "done".into(),
+            },
+            LlmResponseChunk::MessageStop { reason: None },
+        ];
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(engine.encode_stream_event(
+                &mut state,
+                format,
+                LlmResponseStreamEvent::new(vec![chunk]),
+            )?);
+        }
+        events.extend(engine.finish_stream(&mut state, format)?);
+        for e in events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.done")
+        {
+            ids.push((
+                e["item"]["type"].as_str().unwrap_or("").to_string(),
+                e["item"]["id"].as_str().unwrap_or("").to_string(),
+            ));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (kind, id) in &ids {
+        assert!(!id.is_empty(), "{kind} item without id");
+        assert!(
+            seen.insert(id.clone()),
+            "item id {id} ({kind}) repeated across responses: {ids:?}"
+        );
+    }
+    Ok(())
+}
+
+// Decodes a provider Responses stream and re-encodes it the way the buffered/escalation path
+// does: from normalized chunks, with no preserved provider JSON.
+fn reencode_responses_events(
+    events: Vec<Value>,
+) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut decode_state = StreamTranslationState::new(format, format);
+    let mut encode_state = StreamTranslationState::new(format, format);
+    let mut out = Vec::new();
+    for event in events {
+        let decoded = engine.decode_stream_event(&mut decode_state, format, event)?;
+        for chunk in decoded.normalized() {
+            out.extend(engine.encode_stream_event(
+                &mut encode_state,
+                format,
+                LlmResponseStreamEvent::new(vec![chunk.clone()]),
+            )?);
+        }
+    }
+    out.extend(engine.finish_stream(&mut encode_state, format)?);
+    Ok(out)
+}
+
+// GPT-5 emits a reasoning item ahead of each tool call. Every one of them must reach the
+// client under its provider id with its encrypted payload, in the provider's order.
+#[test]
+fn responses_stream_keeps_every_reasoning_item_of_a_response() -> TestResult {
+    let events = vec![
+        json!({"type": "response.created", "response": {"id": "resp_up", "model": "gpt-5.6-luna"}}),
+        json!({"type": "response.output_item.added", "output_index": 0,
+               "item": {"type": "reasoning", "id": "rs_a", "summary": []}}),
+        json!({"type": "response.output_item.done", "output_index": 0,
+               "item": {"type": "reasoning", "id": "rs_a", "summary": [], "encrypted_content": "enc-a"}}),
+        json!({"type": "response.output_item.added", "output_index": 1,
+               "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "exec", "arguments": ""}}),
+        json!({"type": "response.output_item.done", "output_index": 1,
+               "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "exec", "arguments": "{\"cmd\":\"ls\"}"}}),
+        json!({"type": "response.output_item.added", "output_index": 2,
+               "item": {"type": "reasoning", "id": "rs_b", "summary": []}}),
+        json!({"type": "response.output_item.done", "output_index": 2,
+               "item": {"type": "reasoning", "id": "rs_b", "summary": [], "encrypted_content": "enc-b"}}),
+        json!({"type": "response.output_item.added", "output_index": 3,
+               "item": {"type": "function_call", "id": "fc_3", "call_id": "call_3", "name": "exec", "arguments": ""}}),
+        json!({"type": "response.output_item.done", "output_index": 3,
+               "item": {"type": "function_call", "id": "fc_3", "call_id": "call_3", "name": "exec", "arguments": "{\"cmd\":\"pwd\"}"}}),
+    ];
+    let events = reencode_responses_events(events)?;
+
+    let reasoning_done: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning"
+        })
+        .collect();
+    assert_eq!(reasoning_done.len(), 2, "both reasoning items must close");
+    assert_eq!(reasoning_done[0]["item"]["id"], "rs_a");
+    assert_eq!(reasoning_done[0]["item"]["encrypted_content"], "enc-a");
+    assert_eq!(reasoning_done[1]["item"]["id"], "rs_b");
+    assert_eq!(reasoning_done[1]["item"]["encrypted_content"], "enc-b");
+
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .ok_or("expected response.completed")?;
+    let kinds: Vec<&str> = completed["response"]["output"]
+        .as_array()
+        .ok_or("output array")?
+        .iter()
+        .filter_map(|item| item["type"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["reasoning", "function_call", "reasoning", "function_call"]
+    );
+    Ok(())
+}
+
+// Summary text streams before the encrypted payload arrives on `done`. The item must open
+// under the provider id announced by `added`, not a synthesized one, so the payload is kept.
+#[test]
+fn responses_stream_opens_reasoning_under_provider_id_before_payload_arrives() -> TestResult {
+    let events = vec![
+        json!({"type": "response.created", "response": {"id": "resp_up", "model": "gpt-5.6-luna"}}),
+        json!({"type": "response.output_item.added", "output_index": 0,
+               "item": {"type": "reasoning", "id": "rs_a", "summary": []}}),
+        json!({"type": "response.reasoning_summary_text.delta", "output_index": 0, "item_id": "rs_a",
+               "summary_index": 0, "delta": "plan"}),
+        json!({"type": "response.output_item.done", "output_index": 0,
+               "item": {"type": "reasoning", "id": "rs_a", "summary": [{"type": "summary_text", "text": "plan"}],
+                        "encrypted_content": "enc-a"}}),
+    ];
+    let events = reencode_responses_events(events)?;
+
+    let added: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.added" && event["item"]["type"] == "reasoning"
+        })
+        .collect();
+    assert_eq!(added.len(), 1, "one reasoning item opens");
+    assert_eq!(added[0]["item"]["id"], "rs_a");
+    let done = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning"
+        })
+        .ok_or("expected a completed reasoning item")?;
+    assert_eq!(done["item"]["id"], "rs_a");
+    assert_eq!(done["item"]["encrypted_content"], "enc-a");
+    assert_eq!(done["item"]["summary"][0]["text"], "plan");
+    Ok(())
+}
+
+// An encrypted-only reasoning item streams no text, so it must not open a summary part it can
+// never close; the client should see the item open, then close with an empty `summary` and the
+// encrypted payload attached.
+#[test]
+fn responses_stream_encrypted_only_reasoning_opens_no_summary_part() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut state = StreamTranslationState::new(format, format);
+    let chunks = vec![
+        LlmResponseChunk::MessageStart {
+            id: Some("resp_1".into()),
+            model: Some(REASONING_MODEL.into()),
+        },
+        LlmResponseChunk::ReasoningDetailsDelta {
+            index: 0,
+            details: vec![json!({"type": "reasoning.encrypted", "data": "opaque", "id": "rs_1"})],
+            text: String::new(),
+        },
+        LlmResponseChunk::TextDelta {
+            index: 1,
+            text: "done".into(),
+        },
+        LlmResponseChunk::MessageStop { reason: None },
+    ];
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(engine.encode_stream_event(
+            &mut state,
+            format,
+            LlmResponseStreamEvent::new(vec![chunk]),
+        )?);
+    }
+    events.extend(engine.finish_stream(&mut state, format)?);
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+
+    assert!(
+        !types
+            .iter()
+            .any(|t| t.starts_with("response.reasoning_summary")),
+        "{types:?}"
+    );
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "response.output_item.done" && e["item"]["type"] == "reasoning")
+        .ok_or("expected the reasoning item to close")?;
+    assert_eq!(done["item"]["id"], "rs_1");
+    assert_eq!(done["item"]["encrypted_content"], "opaque");
+    assert_eq!(done["item"]["summary"], json!([]));
+    Ok(())
+}
+
+// An empty reasoning delta opens the item but not a summary part, so a provider that sends a
+// blank first delta does not leave the client with an unclosed part.
+#[test]
+fn responses_stream_empty_reasoning_delta_opens_no_summary_part() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let mut state = StreamTranslationState::new(format, format);
+    let chunks = vec![
+        LlmResponseChunk::MessageStart {
+            id: Some("resp_1".into()),
+            model: Some(REASONING_MODEL.into()),
+        },
+        LlmResponseChunk::ReasoningDelta {
+            index: 0,
+            text: String::new(),
+        },
+        LlmResponseChunk::TextDelta {
+            index: 1,
+            text: "done".into(),
+        },
+        LlmResponseChunk::MessageStop { reason: None },
+    ];
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(engine.encode_stream_event(
+            &mut state,
+            format,
+            LlmResponseStreamEvent::new(vec![chunk]),
+        )?);
+    }
+    events.extend(engine.finish_stream(&mut state, format)?);
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+    assert!(
+        !types
+            .iter()
+            .any(|t| t.starts_with("response.reasoning_summary")),
+        "{types:?}"
+    );
+    assert!(types.contains(&"response.output_item.added"), "{types:?}");
     Ok(())
 }

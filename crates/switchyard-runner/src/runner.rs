@@ -27,6 +27,7 @@ pub struct Runner {
     capability_clients: BTreeMap<String, crate::capability::CapabilityClientConfig>,
     /// Parsed `[capabilities.*]` route declarations.
     capabilities: BTreeMap<String, crate::capability::CapabilityRouteConfig>,
+    provider_api_keys: Vec<String>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -129,6 +130,20 @@ impl Runner {
     /// The parsed `[capabilities.*]` route declarations.
     pub fn capabilities(&self) -> &BTreeMap<String, crate::capability::CapabilityRouteConfig> {
         &self.capabilities
+            provider_api_keys: Vec::new(),
+        }
+    }
+
+    /// Registers deployment-owned API keys for server response redaction.
+    /// TOML loading registers these automatically; programmatic hosts must supply them.
+    pub fn with_provider_api_keys(mut self, keys: Vec<String>) -> Self {
+        self.provider_api_keys = keys;
+        self
+    }
+
+    /// Returns deployment-owned secrets for the server's response redactor.
+    pub fn provider_api_keys(&self) -> &[String] {
+        &self.provider_api_keys
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {

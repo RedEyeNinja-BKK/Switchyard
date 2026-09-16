@@ -11,7 +11,7 @@ mod route;
 mod runner;
 
 pub use algorithm::{
-    AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, ClassifierMode,
+    AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, CategoryModelConfig, ClassifierMode,
     ClassifierPolicyConfig, FleetBuildContext, FleetCandidateConfig,
     FleetCandidateContextPolicyConfig, FleetWorkShapeSourceName, InputTokenSourceConfig,
     LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
@@ -23,6 +23,8 @@ pub use config::{
     ComfyFactConfig, FleetReadinessConfig, HtpcFactConfig, HttpBaseUrl, ResourceFactConfig,
 };
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
+// Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.
+pub use libsy::RuntimeModels;
 pub use route::{
     AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
 };

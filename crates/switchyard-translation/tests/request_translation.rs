@@ -8,8 +8,8 @@ pub mod common;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
-    FormatId, LossyConversionPolicy, TranslationEngine, TranslationPolicy, WireFormat,
-    prepare_request_for_target, sanitize_anthropic_tool_use_id,
+    ContentBlock, FormatId, LossyConversionPolicy, TranslationEngine, TranslationPolicy,
+    WireFormat, prepare_request_for_target, sanitize_anthropic_tool_use_id,
 };
 
 use common::{REASONING_MODEL, normalized_policy, shell_tool_call};
@@ -47,6 +47,27 @@ fn preparing_a_target_prompt_invalidates_exact_replay() -> TestResult {
     assert_eq!(encoded["messages"][0]["content"], "target prompt");
     assert_eq!(encoded["messages"][1]["content"], "client prompt");
     assert!(encoded["messages"][1].get("name").is_none());
+    Ok(())
+}
+
+// Rebuilding for target instructions must preserve the Responses conversation link.
+#[test]
+fn responses_previous_response_id_survives_target_prompt() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy::default();
+    let body = json!({"model": "route", "input": "hi", "previous_response_id": "resp_1"});
+    let mut request = engine
+        .decode_request(WireFormat::OpenAiResponses, &body, &policy)?
+        .request;
+
+    prepare_request_for_target(&mut request, &"target".into(), Some("target prompt"));
+
+    let output = engine
+        .encode_request(WireFormat::OpenAiResponses, &request, &policy)?
+        .body;
+
+    assert_eq!(output["instructions"], "target prompt");
+    assert_eq!(output["previous_response_id"], "resp_1");
     Ok(())
 }
 
@@ -1437,10 +1458,108 @@ fn responses_reasoning_items_round_trip_through_decode_and_encode() -> TestResul
         ]
     );
     assert_eq!(
-        input[1]["content"],
-        json!([{"type": "reasoning_text", "text": "Simple ls."}])
+        input[1]["summary"],
+        json!([{"type": "summary_text", "text": "Simple ls."}])
     );
+    assert!(input[1].get("content").is_none());
     assert_eq!(input[2]["call_id"], "call-ls");
+    // Outputs carry the paired call's name for upstreams (Kimi K3) that
+    // resolve tool results by name rather than by call order.
+    assert_eq!(input[3]["name"], "shell");
+    Ok(())
+}
+
+// Verifies Codex-style encrypted reasoning remains replayable after a prompt
+// mutation drops exact replay, without synthesizing invalid reasoning content.
+#[test]
+fn responses_encrypted_reasoning_replays_without_input_content() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "switchyard",
+        "input": [
+            {"type": "message", "role": "user", "content": "Inspect"},
+            {
+                "type": "reasoning",
+                "id": "rs_prior",
+                "summary": [],
+                "encrypted_content": "opaque-encrypted-reasoning"
+            },
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call-1",
+                "arguments": "{\"cmd\":\"pwd\"}"
+            },
+            {"type": "function_call_output", "call_id": "call-1", "output": "/app"}
+        ]
+    });
+
+    let policy = TranslationPolicy::default();
+    let mut request = engine
+        .decode_request(WireFormat::OpenAiResponses, &body, &policy)?
+        .request;
+    prepare_request_for_target(
+        &mut request,
+        &"openai/openai/gpt-5.6-sol".into(),
+        Some("[router-guidance] Continue from the current state."),
+    );
+
+    let output = engine
+        .encode_request(WireFormat::OpenAiResponses, &request, &policy)?
+        .body;
+
+    assert_eq!(output["model"], "openai/openai/gpt-5.6-sol");
+    assert_eq!(
+        output["instructions"],
+        "[router-guidance] Continue from the current state."
+    );
+    let input = output["input"].as_array().ok_or("input is not an array")?;
+    let reasoning = input
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .ok_or("reasoning item was not replayed")?;
+    assert_eq!(reasoning["id"], "rs_prior");
+    assert_eq!(reasoning["summary"], json!([]));
+    assert_eq!(reasoning["encrypted_content"], "opaque-encrypted-reasoning");
+    assert!(reasoning.get("content").is_none());
+    Ok(())
+}
+
+// Verifies an empty non-encrypted reasoning item is omitted instead of being
+// replayed as an empty assistant message.
+#[test]
+fn responses_empty_reasoning_without_encrypted_content_is_omitted() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+    let body = json!({
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "Inspect"},
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "role": "user", "content": "Continue"}
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    let input = output["input"].as_array().ok_or("input is not an array")?;
+    let item_types = input
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(item_types, vec!["message", "message"]);
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[1]["role"], "user");
     Ok(())
 }
 
@@ -1892,6 +2011,44 @@ fn openai_schema_constraints_are_removed_from_anthropic_output_format() -> TestR
         body["response_format"]["json_schema"]["schema"]["properties"]["p_solve"]["minimum"],
         0
     );
+    Ok(())
+}
+
+// Verifies OpenAI tool strictness survives translation to Anthropic.
+#[test]
+fn openai_tool_strictness_is_preserved_for_anthropic() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "Use a tool."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "strict", "parameters": {}, "strict": true}
+            },
+            {
+                "type": "function",
+                "function": {"name": "non_strict", "parameters": {}, "strict": false}
+            },
+            {
+                "type": "function",
+                "function": {"name": "unspecified", "parameters": {}}
+            }
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::AnthropicMessages,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(output["tools"][0]["strict"], true);
+    assert_eq!(output["tools"][1]["strict"], false);
+    assert!(output["tools"][2].get("strict").is_none());
     Ok(())
 }
 
@@ -2461,6 +2618,25 @@ fn responses_embed_preservation_replay_has_no_system_role_items() -> TestResult 
             {"type": "message", "role": "user", "content": "hi"}
         ],
         "stream": true
+
+// Verifies parallel tool calls serialize as adjacent call/output pairs so
+// upstreams that resolve tool outputs by adjacency match the right call.
+#[test]
+fn responses_parallel_tool_calls_pair_with_their_outputs() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+    let body = json!({
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "Inspect"},
+            {"type": "function_call", "name": "shell", "call_id": "call-a", "arguments": "{}"},
+            {"type": "function_call", "name": "shell", "call_id": "call-b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-a", "output": "a"},
+            {"type": "function_call_output", "call_id": "call-b", "output": "b"}
+        ]
     });
 
     let output = engine
@@ -2487,6 +2663,20 @@ fn responses_embed_preservation_replay_has_no_system_role_items() -> TestResult 
     assert!(
         output["input"].is_array(),
         "replay must keep a canonical input array"
+
+    let input = output["input"].as_array().ok_or("input is not an array")?;
+    let pairs = input
+        .iter()
+        .filter_map(|item| Some((item["type"].as_str()?, item["call_id"].as_str()?)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pairs,
+        vec![
+            ("function_call", "call-a"),
+            ("function_call_output", "call-a"),
+            ("function_call", "call-b"),
+            ("function_call_output", "call-b"),
+        ]
     );
     Ok(())
 }
@@ -2502,6 +2692,342 @@ fn responses_encode_never_emits_scalar_string_input() -> TestResult {
         "model": "gpt-4o",
         "max_tokens": 16,
         "messages": [{"role": "user", "content": "hi"}],
+
+// Verifies Codex `compaction_trigger` marker items never reach the upstream.
+#[test]
+fn responses_codex_compaction_markers_are_stripped() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+    let body = json!({
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "Continue"},
+            {"type": "compaction_trigger"},
+            {"type": "function_call", "name": "shell", "call_id": "call-a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-a", "output": "ok"}
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    let types = output["input"]
+        .as_array()
+        .ok_or("input is not an array")?
+        .iter()
+        .filter_map(|item| item["type"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types,
+        vec!["message", "function_call", "function_call_output"]
+    );
+    Ok(())
+}
+
+// Codex drives GPT-5 models with freeform ("custom") tools. Through a Responses upstream the
+// definition must go out verbatim and the replayed history must keep `custom_tool_call` items
+// with their raw `input`; through a chat upstream the tool degrades to a single-argument function.
+#[test]
+fn responses_request_round_trips_custom_tools_and_custom_tool_calls() -> TestResult {
+    let engine = TranslationEngine::default();
+    let custom_tool = json!({
+        "type": "custom",
+        "name": "exec",
+        "description": "Runs a shell command.",
+        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"}
+    });
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "role": "user", "content": "List files"},
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "ls -la"},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"}
+        ],
+        "tools": [
+            custom_tool,
+            {"type": "function", "name": "update_plan", "description": "Plan", "parameters": {"type": "object"}}
+        ]
+    });
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+
+    let same = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+    let tools = same["tools"].as_array().ok_or("tools should be an array")?;
+    assert!(
+        tools.iter().any(|tool| tool == &custom_tool),
+        "custom tool must be re-emitted verbatim: {tools:?}"
+    );
+    let input = same["input"].as_array().ok_or("input should be an array")?;
+    let call = input
+        .iter()
+        .find(|item| item["type"] == "custom_tool_call")
+        .ok_or("history must keep the custom_tool_call")?;
+    assert_eq!(call["name"], "exec");
+    assert_eq!(call["call_id"], "call_1");
+    assert_eq!(call["input"], "ls -la");
+    assert!(call.get("arguments").is_none(), "{call}");
+    let output = input
+        .iter()
+        .find(|item| item["type"] == "custom_tool_call_output")
+        .ok_or("history must keep the custom_tool_call_output")?;
+    assert_eq!(output["call_id"], "call_1");
+
+    let chat = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+    let exec = chat["tools"]
+        .as_array()
+        .ok_or("chat tools should be an array")?
+        .iter()
+        .find(|tool| tool["function"]["name"] == "exec")
+        .ok_or("chat upstream should still see the tool")?;
+    assert_eq!(
+        exec["function"]["parameters"]["required"],
+        json!(["input"]),
+        "{exec}"
+    );
+    Ok(())
+}
+
+// Codex sends GPT-5 requests in the Responses-lite shape: no top-level `tools`, empty
+// `instructions`, the tool definitions inside `input[0]` as an `additional_tools` developer
+// item, and the base instructions as a developer message. Those definitions are the request's
+// tools, the item must not leak into the conversation, and a Responses upstream must receive
+// the request in the same shape.
+#[test]
+fn responses_lite_additional_tools_item_is_the_tool_list() -> TestResult {
+    let engine = TranslationEngine::default();
+    let tools = json!([
+        {"type": "custom", "name": "exec", "description": "Run JS.",
+         "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"}},
+        {"type": "function", "name": "update_plan", "description": "Plan",
+         "parameters": {"type": "object", "properties": {}}}
+    ]);
+    let body = json!({
+        "model": "gpt-5.6-luna-switchyard",
+        "instructions": "",
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": tools},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex."}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List files"}]},
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "ls"},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"}
+        ],
+        "stream": true
+    });
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+
+    let decoded = engine.decode_request(WireFormat::OpenAiResponses, &body, &policy)?;
+    let names = decoded
+        .request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["exec", "update_plan"]);
+    assert!(
+        !decoded.request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, switchyard_protocol::ContentBlock::Unknown { .. }))
+        }),
+        "the additional_tools item must not become a conversation message"
+    );
+
+    let same = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+    assert!(same.get("tools").is_none(), "{same}");
+    let input = same["input"].as_array().ok_or("input should be an array")?;
+    assert_eq!(input[0]["type"], "additional_tools");
+    assert_eq!(input[0]["role"], "developer");
+    assert_eq!(input[0]["tools"], tools);
+    assert!(
+        input
+            .iter()
+            .skip(1)
+            .all(|item| item["type"] != "additional_tools"),
+        "{same}"
+    );
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "custom_tool_call" && item["input"] == "ls"),
+        "{same}"
+    );
+
+    let chat = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+    let chat_tools = chat["tools"]
+        .as_array()
+        .ok_or("chat tools should be an array")?;
+    let chat_names = chat_tools
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(chat_names, vec!["exec", "update_plan"]);
+    let messages = chat["messages"]
+        .as_array()
+        .ok_or("messages should be an array")?;
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message["content"].to_string().contains("additional_tools")),
+        "{chat}"
+    );
+    Ok(())
+}
+
+/// A lite request whose whole conversation is one user text still carries its tools: the
+/// encoder widens the string `input` to an array so the `additional_tools` item has a place.
+#[test]
+fn responses_lite_additional_tools_survive_a_single_text_input() -> TestResult {
+    let engine = TranslationEngine::default();
+    let tools = json!([
+        {"type": "custom", "name": "exec", "description": "Run a shell command.",
+         "format": {"type": "text"}}
+    ]);
+    let body = json!({
+        "model": "gpt-5.6-luna-switchyard",
+        "instructions": "",
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": tools},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "List files"}]}
+        ]
+    });
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+
+    let same = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+    assert!(same.get("tools").is_none(), "{same}");
+    let input = same["input"]
+        .as_array()
+        .ok_or("input must be an array when tools ride inside it")?;
+    assert_eq!(input[0]["type"], "additional_tools");
+    assert_eq!(input[0]["tools"], tools);
+    assert_eq!(input.len(), 2, "{same}");
+    assert_eq!(input[1]["role"], "user");
+    assert_eq!(input[1]["content"], "List files");
+    Ok(())
+}
+
+// Parallel freeform calls must pair with their `custom_tool_call_output` items the same way
+// function calls do (#664), so upstreams that resolve outputs by adjacency see call, output,
+// call, output.
+#[test]
+fn responses_parallel_custom_tool_calls_pair_with_their_outputs() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "tools": [{"type": "custom", "name": "exec", "description": "Run.", "format": {"type": "text"}}],
+        "input": [
+            {"type": "message", "role": "user", "content": "Inspect"},
+            {"type": "custom_tool_call", "name": "exec", "call_id": "call-a", "input": "ls"},
+            {"type": "custom_tool_call", "name": "exec", "call_id": "call-b", "input": "pwd"},
+            {"type": "custom_tool_call_output", "call_id": "call-a", "output": "a"},
+            {"type": "custom_tool_call_output", "call_id": "call-b", "output": "b"}
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    let input = output["input"].as_array().ok_or("input is not an array")?;
+    let pairs = input
+        .iter()
+        .filter_map(|item| Some((item["type"].as_str()?, item["call_id"].as_str()?)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pairs,
+        vec![
+            ("custom_tool_call", "call-a"),
+            ("custom_tool_call_output", "call-a"),
+            ("custom_tool_call", "call-b"),
+            ("custom_tool_call_output", "call-b"),
+        ]
+    );
+    Ok(())
+}
+
+// Verifies Chat image and file parts encode as wire-valid Responses input parts,
+// not serialized IR enums (image_url must be a string and file fields must be flat).
+#[test]
+fn openai_chat_image_and_file_parts_translate_to_valid_responses_input() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe these."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,YQ==", "detail": "high"}
+                },
+                {"type": "file", "file": {"file_id": "file_123"}},
+                {
+                    "type": "file",
+                    "file": {"file_data": "ZG9jdW1lbnQ=", "filename": "report.pdf"}
+                }
+            ]
+        }]
     });
 
     let output = engine
@@ -2540,6 +3066,57 @@ fn responses_preserved_scalar_input_replays_as_message_list() -> TestResult {
         "model": "gpt-5.6-luna",
         "input": "hi",
         "stream": true
+
+    assert_eq!(
+        output["input"][0]["content"],
+        json!([
+            {"type": "input_text", "text": "Describe these."},
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,YQ==",
+                "detail": "high"
+            },
+            {"type": "input_file", "file_id": "file_123"},
+            {
+                "type": "input_file",
+                "file_data": "ZG9jdW1lbnQ=",
+                "filename": "report.pdf"
+            }
+        ])
+    );
+    Ok(())
+}
+
+// Verifies Anthropic base64 media becomes valid Responses image and file parts.
+#[test]
+fn anthropic_base64_media_translates_to_responses() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aW1hZ2U="
+                    }
+                },
+                {
+                    "type": "document",
+                    "title": "report.pdf",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "ZG9jdW1lbnQ="
+                    }
+                }
+            ]
+        }]
     });
 
     let output = engine
@@ -2814,5 +3391,178 @@ fn unmappable_image_sources_degrade_to_text_with_diagnostic() -> TestResult {
         !translated.diagnostics.is_empty(),
         "an unmappable image must be reported as a lossy conversion"
     );
+
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(
+        output["input"][0]["content"],
+        json!([
+            {"type": "input_text", "text": "What is this?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+            {
+                "type": "input_file",
+                "file_data": "ZG9jdW1lbnQ=",
+                "filename": "report.pdf"
+            }
+        ])
+    );
+    Ok(())
+}
+
+// Verifies tool-result image and file content survives translation in both directions between
+// Anthropic Messages and OpenAI Responses.
+#[test]
+fn tool_result_media_survives_anthropic_and_responses_translation() -> TestResult {
+    let engine = TranslationEngine::default();
+    let image = json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}
+    });
+    let document = json!({
+        "type": "document",
+        "title": "report.pdf",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "ZG9jdW1lbnQ="}
+    });
+    let anthropic_request = |content: Value| {
+        json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 32,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "capture", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}
+                ]}
+            ]
+        })
+    };
+    let to_responses = |body: &Value| -> TestResult<Value> {
+        let output = engine
+            .translate_request(
+                WireFormat::AnthropicMessages,
+                WireFormat::OpenAiResponses,
+                body,
+                &TranslationPolicy::default(),
+            )?
+            .body;
+        Ok(output["input"][1]["output"].clone())
+    };
+
+    // Anthropic -> Responses: typed parts, an image-only result, and unchanged plain text.
+    assert_eq!(
+        to_responses(&anthropic_request(json!([
+            {"type": "text", "text": "media attached"},
+            image,
+            document
+        ])))?,
+        json!([
+            {"type": "input_text", "text": "media attached"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+            {"type": "input_file", "file_data": "ZG9jdW1lbnQ=", "filename": "report.pdf"}
+        ])
+    );
+    assert_eq!(
+        to_responses(&anthropic_request(json!([image])))?,
+        json!([{"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}])
+    );
+    assert_eq!(
+        to_responses(&anthropic_request(json!("plain")))?,
+        json!("plain")
+    );
+
+    // Responses -> Anthropic: typed blocks instead of one JSON string.
+    let body = json!({
+        "model": "gpt-5.2",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "capture", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [
+                {"type": "input_text", "text": "media attached"},
+                {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U=", "detail": "low"},
+                {
+                    "type": "input_file",
+                    "file_data": "data:application/pdf;base64,ZG9jdW1lbnQ=",
+                    "filename": "report.pdf"
+                }
+            ]}
+        ]
+    });
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+    let result = &output["messages"][1]["content"][0];
+    assert_eq!(result["type"], "tool_result");
+    assert_eq!(result["tool_use_id"], "call_1");
+    assert_eq!(
+        result["content"],
+        json!([
+            {"type": "text", "text": "media attached"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}
+            },
+            {
+                "type": "document",
+                "title": "report.pdf",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "ZG9jdW1lbnQ="}
+            }
+        ])
+    );
+    Ok(())
+}
+
+// Verifies Responses tool outputs answering calls held behind `previous_response_id` stay
+// tool results, so a user-turn classifier does not treat them as a new user message, and
+// re-encode with their original item types.
+#[test]
+fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
+    let engine = TranslationEngine::default();
+    let outputs = json!([
+        {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"},
+        {"type": "custom_tool_call_output", "call_id": "call_shell", "output": "README.md"}
+    ]);
+    let body = json!({
+        "model": "gpt-5.2",
+        "previous_response_id": "resp_1",
+        "input": outputs
+    });
+
+    let request = engine
+        .decode_request(
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .request;
+    let tool_call_ids = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .map(|block| match block {
+            ContentBlock::ToolResult(result) => Ok(result.tool_call_id.as_str()),
+            other => Err(format!("expected a tool result, got {other:?}")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(tool_call_ids, ["call_weather", "call_shell"]);
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &normalized_policy(),
+        )?
+        .body;
+    assert_eq!(output["input"], outputs);
     Ok(())
 }

@@ -18,6 +18,7 @@ use crate::usage_metrics::token_usage;
 use crate::{ServerError, ServerResult};
 
 const LEGACY_SESSION_ID_HEADER: &str = "proxy_x_session_id";
+const ORIGIN_HEADER: &str = "x-switchyard-origin";
 const TASK_HEADER: &str = "x-switchyard-intake-task";
 const TRIAL_ID_HEADER: &str = "x-switchyard-trial-id";
 
@@ -51,6 +52,9 @@ impl RoutingLog {
         let usage = token_usage(usage);
         let record = RoutingRecord {
             ts: format_rfc3339_millis(SystemTime::now()).to_string().into(),
+            route_id: context.route_id.into(),
+            algorithm: context.algorithm.into(),
+            origin: context.origin.map(Cow::Owned),
             task: context.task.map(Cow::Owned),
             trial_id: context.trial_id.map(Cow::Owned),
             session_id: context.session_id.map(Cow::Owned),
@@ -96,9 +100,12 @@ pub(crate) fn snapshot(
     Ok((snapshot.total_calls > 0).then_some(snapshot))
 }
 
-/// Request fields retained until terminal usage and routing are available.
+/// Holds request metadata until route resolution attaches the durable route identity.
 #[derive(Clone)]
 pub(crate) struct RoutingLogContext {
+    route_id: String,
+    algorithm: String,
+    origin: Option<String>,
     task: Option<String>,
     trial_id: Option<String>,
     session_id: Option<String>,
@@ -117,6 +124,11 @@ impl RoutingLogContext {
     pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
         let headers = metadata.http_headers.as_ref();
         Self {
+            route_id: String::new(),
+            algorithm: String::new(),
+            origin: headers
+                .and_then(|headers| nonempty_header(headers, ORIGIN_HEADER))
+                .map(str::to_string),
             task: headers
                 .and_then(|headers| nonempty_header(headers, TASK_HEADER))
                 .map(str::to_string),
@@ -135,6 +147,15 @@ impl RoutingLogContext {
     /// Attach the caller-requested route id (see the field docs).
     pub(crate) fn with_requested_model(mut self, requested_model: Option<String>) -> Self {
         self.requested_model = requested_model;
+
+        self
+    }
+
+    /// Attaches the resolved route identity shared by every log entry for this request.
+    pub(crate) fn with_route(mut self, route_id: impl Into<String>, algorithm: &str) -> Self {
+        self.route_id = route_id.into();
+        self.algorithm = algorithm.to_string();
+
         self
     }
 }
@@ -146,6 +167,10 @@ impl RoutingLogContext {
 #[serde(default)]
 struct RoutingRecord<'a> {
     ts: Cow<'a, str>,
+    route_id: Cow<'a, str>,
+    algorithm: Cow<'a, str>,
+    #[serde(borrow)]
+    origin: Option<Cow<'a, str>>,
     #[serde(borrow)]
     task: Option<Cow<'a, str>>,
     #[serde(borrow)]
@@ -253,6 +278,35 @@ fn routing_log_error(path: &Path, error: std::io::Error) -> ServerError {
 mod tests {
     use super::*;
 
+    /// Missing, empty, and non-text origin headers remain absent even with a User-Agent.
+    #[test]
+    fn unusable_origin_is_not_inferred_from_user_agent() {
+        for origin in [
+            None,
+            Some(http::HeaderValue::from_static("")),
+            Some(http::HeaderValue::from_bytes(b"\xff").expect("header")),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "user-agent",
+                http::HeaderValue::from_static("codex-cli/1.0"),
+            );
+            if let Some(origin) = origin {
+                headers.insert(ORIGIN_HEADER, origin);
+            }
+            let metadata = Metadata {
+                http_headers: Some(headers),
+                ..Default::default()
+            };
+            assert!(RoutingLogContext::from_metadata(&metadata).origin.is_none());
+        }
+        assert!(
+            RoutingLogContext::from_metadata(&Metadata::default())
+                .origin
+                .is_none()
+        );
+    }
+
     /// Only the requested session is counted, absent fields fall back to zero
     /// and `unknown`, and an unparseable line does not abort the scan.
     #[test]
@@ -267,7 +321,7 @@ mod tests {
                 r#"{"session_id":"b","model":"m1","prompt_tokens":99,"completion_tokens":99}"#,
                 "\n",
                 "not json\n",
-                r#"{"session_id":"a","prompt_tokens":5}"#,
+                r#"{"session_id":"a","origin":"custom-agent","prompt_tokens":5}"#,
                 "\n",
             ),
         )

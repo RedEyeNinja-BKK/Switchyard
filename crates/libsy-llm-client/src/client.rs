@@ -20,7 +20,8 @@ use switchyard_protocol::{
 };
 use switchyard_translation::{
     TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
+    encode_aggregated_response_with_extensions, encode_request, encode_request_with_profile,
+    encode_stream_with_extensions,
 };
 use tracing::Instrument;
 
@@ -31,7 +32,7 @@ use crate::metrics;
 use crate::raw::RawResponse;
 
 // Caller headers safe to send when caller auth forwarding is disabled.
-const ALLOWED_METADATA_HEADERS: &[&str] = &["x-request-id"];
+const ALLOWED_METADATA_HEADERS: &[&str] = &["x-request-id", "x-resource-ref"];
 
 // Headers tied to the inbound connection, destination, or body. The HTTP client
 // must rebuild these for the upstream request, even when forwarding auth.
@@ -375,11 +376,17 @@ impl TranslatingLlmClient {
         // otherwise defeat an NT lane's pinned `enable_thinking = false`.
         if matches!(backend, Backend::OpenAiChat(_)) {
             canonicalize_reasoning_effort(&mut body, backend.extra_body().get("reasoning"));
-            canonicalize_chat_template_kwargs(&mut body, backend.extra_body().get("chat_template_kwargs"));
+            canonicalize_chat_template_kwargs(
+                &mut body,
+                backend.extra_body().get("chat_template_kwargs"),
+            );
             ensure_openai_stream_usage(&mut body);
         } else if matches!(backend, Backend::OpenAiResponses(_)) {
             canonicalize_reasoning_effort(&mut body, backend.extra_body().get("reasoning"));
-            canonicalize_chat_template_kwargs(&mut body, backend.extra_body().get("chat_template_kwargs"));
+            canonicalize_chat_template_kwargs(
+                &mut body,
+                backend.extra_body().get("chat_template_kwargs"),
+            );
             // Stream-mandatory Responses backends (chatgpt.com Codex: "Stream
             // must be set to true") - force upstream stream=true regardless of
             // the caller's stream value; the server layer aggregates back to
@@ -508,6 +515,7 @@ impl TranslatingLlmClient {
             }
         };
         let status = response.status();
+        let upstream_headers = response.headers().clone();
         if status.is_success() {
             if streaming {
                 // Do not commit this candidate until the upstream proves it will
@@ -565,9 +573,9 @@ impl TranslatingLlmClient {
                     status: status.as_u16(),
                     first_chunk,
                     stream,
+                    upstream_headers: upstream_headers,
                 });
             }
-            let upstream_headers = response.headers().clone();
             let body = match response.bytes().await {
                 Ok(body) => body,
                 Err(error) => {
@@ -677,6 +685,7 @@ impl TranslatingLlmClient {
             EncodedResponse::Streaming {
                 first_chunk,
                 stream,
+                upstream_headers,
                 ..
             } => {
                 // Adapt the reqwest body stream to plain bytes; the SSE-decode itself is
@@ -705,8 +714,8 @@ impl TranslatingLlmClient {
                 // error event on an HTTP 200. Classify the first event before returning
                 // the stream: nothing has reached the caller yet, so an overflow can
                 // still fail the call and let routing try the next candidate.
-                match chunks.next().await {
-                    None => LlmResponse::Stream(stream::empty().boxed()),
+                let llm_stream = match chunks.next().await {
+                    None => stream::empty().boxed(),
                     Some(first) => {
                         if let Some(message) = first_event_overflow(&first, backend) {
                             return Err(LlmClientError::ContextWindowExceeded {
@@ -714,11 +723,16 @@ impl TranslatingLlmClient {
                                 message,
                             });
                         }
-                        LlmResponse::Stream(stream::once(ready(first)).chain(chunks).boxed())
+                        stream::once(ready(first)).chain(chunks).boxed()
                     }
-                }
+                };
+                (LlmResponse::Stream(llm_stream), upstream_headers)
             }
-            EncodedResponse::Buffered { body, .. } => {
+            EncodedResponse::Buffered {
+                body,
+                upstream_headers,
+                ..
+            } => {
                 let body = serde_json::from_slice::<Value>(&body).map_err(|error| {
                     LlmClientError::ResponseTranslation(format!("invalid upstream JSON: {error}"))
                 })?;
@@ -743,6 +757,7 @@ impl TranslatingLlmClient {
                 (LlmResponse::Agg(agg), upstream_headers)
             }
         };
+        let (llm_response, upstream_headers) = llm_response;
 
         Ok(Response {
             llm_response,
@@ -881,6 +896,7 @@ enum EncodedResponse {
     Buffered {
         status: u16,
         body: Vec<u8>,
+        upstream_headers: HeaderMap,
     },
     Streaming {
         status: u16,
@@ -888,6 +904,7 @@ enum EncodedResponse {
         /// [`UPSTREAM_FIRST_BYTE_TIMEOUT`]); replayed ahead of the live stream.
         first_chunk: Option<Vec<u8>>,
         stream: UpstreamByteStream,
+        upstream_headers: HeaderMap,
     },
 }
 
@@ -1073,7 +1090,7 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
 // caller-supplied one. Comparison is case-insensitive; auth/credential headers are
 // already reserved and never forwarded.
 fn forward_metadata_headers(
-    builder: RequestBuilder,
+    mut builder: RequestBuilder,
     metadata: Option<&Metadata>,
     backend: &Backend,
 ) -> RequestBuilder {
@@ -1100,9 +1117,7 @@ fn forward_metadata_headers(
         {
             continue;
         }
-        builder = builder.header(name, value);
-
-forwarded.append(name, value.clone());
+        forwarded.append(name, value.clone());
     }
     builder.headers(forwarded)
 }
@@ -1715,12 +1730,14 @@ mod tests {
         )]
     }
 
-    fn chat_map_with_extra_body(
+    fn chat_map_with_extra_headers(
         base_url: &str,
         extra_body: BTreeMap<String, Value>,
+        extra_headers: BTreeMap<String, String>,
     ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.extra_body = extra_body;
+        backend.extra_headers = extra_headers;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
@@ -1749,13 +1766,6 @@ mod tests {
     }
 
     // A one-model config list: "gpt" served over OpenAI Responses at base_url.
-    fn responses_map(base_url: &str) -> Vec<ModelConfig> {
-        vec![ModelConfig::new(
-            "gpt",
-            Backend::OpenAiResponses(config(base_url)),
-            None,
-        )]
-    }
 
     fn chat_map_with_retries(base_url: &str, max_retries: u32) -> Vec<ModelConfig> {
         vec![ModelConfig::new(
@@ -2357,9 +2367,10 @@ mod tests {
             ("max_tokens".to_string(), json!(999)),
             ("service_tier".to_string(), json!("priority")),
         ]);
-        let client = TranslatingLlmClient::new(&chat_map_with_extra_body(
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
             &format!("{}/v1", server.uri()),
             extra_body,
+            BTreeMap::new(),
         ))?;
         let raw = json!({
             "model": "client-facing",
@@ -3453,9 +3464,10 @@ mod tests {
             .await;
 
         let extra_body = BTreeMap::from([("reasoning".to_string(), json!({"effort": "none"}))]);
-        let client = TranslatingLlmClient::new(&chat_map_with_extra_body(
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
             &format!("{}/v1", server.uri()),
             extra_body,
+            BTreeMap::new(),
         ))?;
         let raw = json!({
             "model": "client-facing",
@@ -3519,9 +3531,10 @@ mod tests {
             .await;
 
         let extra_body = BTreeMap::from([("reasoning".to_string(), json!({"enabled": false}))]);
-        let client = TranslatingLlmClient::new(&chat_map_with_extra_body(
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
             &format!("{}/v1", server.uri()),
             extra_body,
+            BTreeMap::new(),
         ))?;
         let raw = json!({
             "model": "client-facing",
@@ -3588,9 +3601,10 @@ mod tests {
             "reasoning".to_string(),
             json!({"enabled": true, "effort": "low"}),
         )]);
-        let client = TranslatingLlmClient::new(&chat_map_with_extra_body(
+        let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
             &format!("{}/v1", server.uri()),
             extra_body,
+            BTreeMap::new(),
         ))?;
         let raw = json!({
             "model": "client-facing",
@@ -4242,14 +4256,20 @@ mod tests {
     #[tokio::test]
     async fn extra_headers_override_inbound_headers_exactly_once()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        let mut extra_headers = BTreeMap::new();
-        extra_headers.insert(
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert(
+            "x_marker".to_string(),
+            Value::String("backend-canonical".to_string()),
+        );
+        let mut expected_headers = BTreeMap::new();
+        expected_headers.insert(
             "User-Agent".to_string(),
             "Switchyard/backend-canonical-ua".to_string(),
         );
         let client = TranslatingLlmClient::new(&chat_map_with_extra_headers(
             "http://127.0.0.1:9/v1",
-            extra_headers,
+            extra_body,
+            expected_headers,
         ))?;
         let backend = client
             .backend_for(&ModelId::from("gpt"), WireFormat::OpenAiChat)
@@ -4260,6 +4280,7 @@ mod tests {
         let mut caller_headers = http::HeaderMap::new();
         caller_headers.insert("user-agent", http::HeaderValue::from_static("caller-ua"));
         caller_headers.insert("x-resource-ref", http::HeaderValue::from_static("ref-1"));
+        let caller_headers_map = caller_headers.clone();
 
         let builder = reqwest::Client::new().post("http://127.0.0.1:9/v1/chat/completions");
         let builder = forward_metadata_headers(
@@ -4270,7 +4291,7 @@ mod tests {
                 task_id: None,
                 correlation_id: None,
                 extra_metadata: None,
-                http_headers: Some(caller_headers),
+                http_headers: Some(caller_headers_map),
                 wire_format: None,
                 ..Default::default()
             }),
@@ -4410,7 +4431,8 @@ mod strip_reasoning_content_tests {
         assert!(
             items
                 .iter()
-                .all(|item| item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning")),
+                .all(|item| item.get("type").and_then(serde_json::Value::as_str)
+                    != Some("reasoning")),
             "a reasoning item survived"
         );
         // Tool-call adjacency and message order survive the retain.

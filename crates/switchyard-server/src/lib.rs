@@ -930,7 +930,8 @@ async fn decision(
     // A decision mirrors the request path: when the route cannot decide for
     // this request (capability/readiness exclusion, e.g. reasoning requested on
     // an NT-only agentic route), the decision escalates to the parent route too.
-    let mut escalation_evidence: Option<(ModelId, &'static str)> = None;    let mut outcome = match route.decide(request).await {
+    let mut escalation_evidence: Option<(ModelId, &'static str)> = None;
+    let mut outcome = match route.decide(request).await {
         Ok(outcome) => outcome,
         Err(error) => {
             let Some(reason) = escalation_reason(&error) else {
@@ -957,7 +958,9 @@ async fn decision(
                     escalation_evidence = Some((escalation_id, reason));
                     escalated_outcome
                 }
-                Err(escalated_error) => return runner_error(escalated_error),
+                Err(escalated_error) => {
+                    return runner_error(escalated_error);
+                }
             }
         }
     };
@@ -1310,7 +1313,7 @@ async fn handle_llm_request(
             request.llm_request.model.as_deref().unwrap_or_default(),
             route.algorithm_name(),
         )
-    });    // Only the Codex namespace mapping is needed downstream, not the whole request.
+    }); // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let observer = stats_observer(
         state.stats.clone(),
@@ -1388,13 +1391,16 @@ async fn handle_llm_request(
                             escalation_evidence = Some((escalation_id, reason));
                             result
                         }
-                        Err(escalated_error) => return runner_error(escalated_error),
+                        Err(escalated_error) => {
+                            return runner_error(escalated_error);
+                        }
                     }
                 } else {
                     return runner_error(error);
                 }
             }
-        }    };
+        }
+    };
     if let Some((destination, reason)) = &escalation_evidence {
         metrics::record_escalation(route.algorithm_name(), destination.as_str(), reason);
         tracing::info!(
@@ -1434,7 +1440,8 @@ async fn handle_llm_request(
             }
         }
     };
-    let response = if let Some(served_model) = served_model.as_ref() {        let cache_eligible = cache_probe
+    let mut response = if let Some(served_model) = served_model.as_ref() {
+        let cache_eligible = cache_probe
             .as_ref()
             .map(|probe| state.stats.prefix_eligibility(served_model, probe))
             .unwrap_or(0.0);
@@ -2363,7 +2370,8 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
-            "supports_vision": capabilities.supports_vision,            "context_window": capabilities.context_window,
+            "vision": capabilities.supports_vision,
+            "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",
                 "openai-responses",

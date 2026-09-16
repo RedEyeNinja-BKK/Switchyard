@@ -878,6 +878,7 @@ mod tests {
         SharedFleetState, WorkShape,
     };
     use crate::Algorithm;
+    use crate::RuntimeModels;
     use std::sync::Arc;
     use switchyard_protocol::{ModelId, ReasoningParams, Request, text_request};
 
@@ -1268,6 +1269,7 @@ mod tests {
         let outcome = drive(
             StdArc::clone(&router),
             text_req(),
+            StdArc::new(RuntimeModels::default()),
             // FleetRouter makes no offloaded calls, so serve is never invoked;
             // provide a stub satisfying the drive contract.
             |_call: CallModel| async { Ok(()) },
@@ -1300,7 +1302,14 @@ mod tests {
         ];
         let router: std::sync::Arc<dyn Algorithm> =
             std::sync::Arc::new(FleetRouter::new(profiles(), states).unwrap());
-        let err = match drive(router, text_req(), |_call: CallModel| async { Ok(()) }).await {
+        let err = match drive(
+            router,
+            text_req(),
+            std::sync::Arc::new(RuntimeModels::default()),
+            |_call: CallModel| async { Ok(()) },
+        )
+        .await
+        {
             Ok(_) => panic!("expected fail-closed error, got a RoutingOutcome"),
             Err(e) => e,
         };

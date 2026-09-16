@@ -17,11 +17,13 @@ use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use libsy::{Algorithm, CandidateState, FleetSnapshot, Random};
+use libsy::{Algorithm, Random};
+use libsy::{CandidateState, FleetSnapshot};
 use serde_json::{Value, json};
 use switchyard_llm_client::{
     Backend, ClientRouter, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
 };
+use switchyard_protocol::ModelId as TestModelId;
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_protocol::{Category, ModelId, WireFormat};
 use switchyard_runner::{DecisionTarget, ModelCapabilities, Route, Runner, RuntimeModels};
@@ -633,6 +635,7 @@ fn random_state_with_retries(
     max_retries: u32,
 ) -> TestResult<ServerState> {
     let backend = Backend::OpenAiChat(HttpBackendConfig {
+        strip_reasoning_content: false,
         base_url: base_url.to_string(),
         api_key: Some("test-key".to_string()),
         forward_auth: false,
@@ -640,7 +643,6 @@ fn random_state_with_retries(
         extra_body: BTreeMap::new(),
         reasoning_effort: None,
         max_retries,
-        strip_reasoning_content: false,
     });
     let target_models = routes
         .iter()
@@ -2334,10 +2336,7 @@ targets = ["responses", "other", "strong"]
         calls[1],
         json!({
             "path": "/v1/responses/input_tokens",
-            // Always-list Responses input (temp-carry-pr-619): scalar `input`
-            // strings are normalized to the canonical message-item list form on
-            // every Responses path, auxiliary endpoints included.
-            "body": {"model": "real/responses-model", "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "count me"}]}]},
+            "body": {"model": "real/responses-model", "input": "count me"},
             "configured_header": "responses"
         })
     );
@@ -2345,7 +2344,7 @@ targets = ["responses", "other", "strong"]
         calls[2],
         json!({
             "path": "/v1/responses/compact",
-            "body": {"model": "real/responses-model", "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "compact me"}]}]},
+            "body": {"model": "real/responses-model", "input": "compact me"},
             "configured_header": "responses"
         })
     );
@@ -4340,6 +4339,108 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
     Ok(())
 }
 
+/// Allowed upstream response headers ride through to the client, while body, cookie,
+/// and Switchyard-owned headers do not; a header this server writes always beats an
+/// upstream echo of the same name.
+#[tokio::test]
+async fn upstream_headers_forward_but_switchyard_writes_win() -> TestResult {
+    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
+    let body = json!({
+        "model": ROUTE_MODEL,
+        "messages": [{"role": "user", "content": "upstream-headers"}]
+    });
+    let response = send(&app, "POST", "/v1/chat/completions", Some(body)).await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    // Observability headers survive the proxy hop.
+    let traces = response
+        .headers
+        .get_all("x-upstream-trace")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(traces, ["trace-123", "trace-456"]);
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req-42")
+    );
+    // Anthropic spells its correlation id without the `x-` prefix.
+    assert_eq!(
+        response
+            .headers
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_anthropic_42")
+    );
+    assert!(!response.headers.contains_key("link"));
+
+    // Upstream cookies must never become Switchyard-origin cookies.
+    assert!(!response.headers.contains_key("set-cookie"));
+
+    // Switchyard's own namespace never forwards from upstream.
+    assert!(!response.headers.contains_key("x-switchyard-session-id"));
+
+    // …and Switchyard's routing write beats the upstream echo.
+    assert_eq!(
+        response
+            .headers
+            .get("x-model-router-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("model/a")
+    );
+    Ok(())
+}
+
+/// A streamed reply captures its headers off the response head, on a branch the
+/// buffered path never touches, so the same contract is asserted there too.
+#[tokio::test]
+async fn upstream_headers_forward_on_streaming_responses() -> TestResult {
+    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
+    let body = json!({
+        "model": ROUTE_MODEL,
+        "stream": true,
+        "messages": [{"role": "user", "content": "upstream-headers"}]
+    });
+    let response = send(&app, "POST", "/v1/chat/completions", Some(body)).await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let traces = response
+        .headers
+        .get_all("x-upstream-trace")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(traces, ["trace-123", "trace-456"]);
+    assert_eq!(
+        response
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req-42")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_anthropic_42")
+    );
+    assert!(!response.headers.contains_key("link"));
+    assert!(!response.headers.contains_key("set-cookie"));
+    assert!(!response.headers.contains_key("x-switchyard-session-id"));
+    assert_eq!(
+        response
+            .headers
+            .get("x-model-router-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some("model/a")
+    );
+    Ok(())
+}
+
 /// A decision that ESCALATES must report the target of the route that would
 /// actually serve the request, not a target of the caller's route.
 ///
@@ -4450,107 +4551,5 @@ usable_context_tokens = 266000
         "an escalated decision must name the escalated route's target"
     );
     assert_eq!(body["selected"]["model"], "model/shared");
-}
-
-/// Allowed upstream response headers ride through to the client, while body, cookie,
-/// and Switchyard-owned headers do not; a header this server writes always beats an
-/// upstream echo of the same name.
-#[tokio::test]
-async fn upstream_headers_forward_but_switchyard_writes_win() -> TestResult {
-    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
-    let body = json!({
-        "model": ROUTE_MODEL,
-        "messages": [{"role": "user", "content": "upstream-headers"}]
-    });
-    let response = send(&app, "POST", "/v1/chat/completions", Some(body)).await?;
-    assert_eq!(response.status, StatusCode::OK);
-
-    // Observability headers survive the proxy hop.
-    let traces = response
-        .headers
-        .get_all("x-upstream-trace")
-        .iter()
-        .map(|value| value.to_str())
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(traces, ["trace-123", "trace-456"]);
-    assert_eq!(
-        response
-            .headers
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok()),
-        Some("req-42")
-    );
-    // Anthropic spells its correlation id without the `x-` prefix.
-    assert_eq!(
-        response
-            .headers
-            .get("request-id")
-            .and_then(|value| value.to_str().ok()),
-        Some("req_anthropic_42")
-    );
-    assert!(!response.headers.contains_key("link"));
-
-    // Upstream cookies must never become Switchyard-origin cookies.
-    assert!(!response.headers.contains_key("set-cookie"));
-
-    // Switchyard's own namespace never forwards from upstream.
-    assert!(!response.headers.contains_key("x-switchyard-session-id"));
-
-    // …and Switchyard's routing write beats the upstream echo.
-    assert_eq!(
-        response
-            .headers
-            .get("x-model-router-selected-model")
-            .and_then(|value| value.to_str().ok()),
-        Some("model/a")
-    );
-    Ok(())
-}
-
-/// A streamed reply captures its headers off the response head, on a branch the
-/// buffered path never touches, so the same contract is asserted there too.
-#[tokio::test]
-async fn upstream_headers_forward_on_streaming_responses() -> TestResult {
-    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
-    let body = json!({
-        "model": ROUTE_MODEL,
-        "stream": true,
-        "messages": [{"role": "user", "content": "upstream-headers"}]
-    });
-    let response = send(&app, "POST", "/v1/chat/completions", Some(body)).await?;
-    assert_eq!(response.status, StatusCode::OK);
-
-    let traces = response
-        .headers
-        .get_all("x-upstream-trace")
-        .iter()
-        .map(|value| value.to_str())
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(traces, ["trace-123", "trace-456"]);
-    assert_eq!(
-        response
-            .headers
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok()),
-        Some("req-42")
-    );
-    assert_eq!(
-        response
-            .headers
-            .get("request-id")
-            .and_then(|value| value.to_str().ok()),
-        Some("req_anthropic_42")
-    );
-    assert!(!response.headers.contains_key("link"));
-    assert!(!response.headers.contains_key("set-cookie"));
-    assert!(!response.headers.contains_key("x-switchyard-session-id"));
-    assert_eq!(
-        response
-            .headers
-            .get("x-model-router-selected-model")
-            .and_then(|value| value.to_str().ok()),
-        Some("model/a")
-    );
-
     Ok(())
 }

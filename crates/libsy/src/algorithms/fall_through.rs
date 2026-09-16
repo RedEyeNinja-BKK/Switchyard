@@ -455,6 +455,7 @@ mod tests {
             Request {
                 llm_request: text_request(Some("auto".to_string()), "fix the build"),
                 raw_request: None,
+                candidate_input_tokens: Default::default(),
                 metadata: None,
             },
             category_models(Category::Any, &["capable", "efficient"]),

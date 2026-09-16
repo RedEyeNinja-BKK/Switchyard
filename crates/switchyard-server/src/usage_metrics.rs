@@ -163,7 +163,11 @@ fn bounded_reason_head(text: &str) -> String {
             head.push('\u{2026}');
             break;
         }
-        head.push(if character.is_control() { ' ' } else { character });
+        head.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
     }
     head
 }
@@ -255,7 +259,8 @@ mod tests {
 
     #[test]
     fn healthy_event_has_no_failure_reason() {
-        let event = LlmResponseStreamEvent::new(vec![LlmResponseChunk::MessageStop { reason: None }]);
+        let event =
+            LlmResponseStreamEvent::new(vec![LlmResponseChunk::MessageStop { reason: None }]);
         assert_eq!(stream_failure_reason(&Ok(event)), None);
     }
 
@@ -276,7 +281,10 @@ mod tests {
         }]);
         let (kind, head) = stream_failure_reason(&Ok(event)).expect("failure classified");
         assert_eq!(kind, "decode_error");
-        assert_eq!(head, "upstream transport error: error decoding response body");
+        assert_eq!(
+            head,
+            "upstream transport error: error decoding response body"
+        );
     }
 
     #[test]
@@ -301,14 +309,26 @@ mod tests {
             "head was not bounded: {} bytes",
             head.len()
         );
-        assert!(!head.contains('\n') && !head.contains('\t'), "control chars survived: {head:?}");
-        assert!(head.starts_with("line one line two"), "unexpected head: {head:?}");
-        assert!(head.ends_with('\u{2026}'), "truncation was not marked: {head:?}");
+        assert!(
+            !head.contains('\n') && !head.contains('\t'),
+            "control chars survived: {head:?}"
+        );
+        assert!(
+            head.starts_with("line one line two"),
+            "unexpected head: {head:?}"
+        );
+        assert!(
+            head.ends_with('\u{2026}'),
+            "truncation was not marked: {head:?}"
+        );
     }
 
     #[test]
     fn short_reason_head_is_not_marked() {
-        assert_eq!(bounded_reason_head("shorter than the bound"), "shorter than the bound");
+        assert_eq!(
+            bounded_reason_head("shorter than the bound"),
+            "shorter than the bound"
+        );
     }
 
     /// Behavioural coverage for the changed path (review finding 2, 2026-09-15):
@@ -322,14 +342,13 @@ mod tests {
         let failed_event = LlmResponseStreamEvent::new(vec![LlmResponseChunk::StreamError {
             message: "unknown Responses stream error".to_string(),
         }]);
-        let after = LlmResponseStreamEvent::new(vec![LlmResponseChunk::MessageStop { reason: None }]);
-        let source = stream::iter([
-            Ok(failed_event.clone()),
-            Ok(after.clone()),
-        ]);
+        let after =
+            LlmResponseStreamEvent::new(vec![LlmResponseChunk::MessageStop { reason: None }]);
+        let source = stream::iter([Ok(failed_event.clone()), Ok(after.clone())]);
         let response = Response {
             llm_response: LlmResponse::Stream(Box::pin(source)),
             metadata: None,
+            upstream_headers: Default::default(),
         };
         let observed = observe(
             response,
@@ -337,16 +356,16 @@ mod tests {
             Instant::now(),
             stats.clone(),
             0.0,
-            Some((
-                log,
-                RoutingLogContext::from_metadata(&Metadata::default()),
-            )),
+            Some((log, RoutingLogContext::from_metadata(&Metadata::default()))),
         );
         let LlmResponse::Stream(mut observed) = observed.llm_response else {
             panic!("expected stream");
         };
 
-        let first = observed.next().await.expect("failing item is still delivered");
+        let first = observed
+            .next()
+            .await
+            .expect("failing item is still delivered");
         assert_eq!(first.expect("item unchanged"), failed_event);
         assert!(
             observed.next().await.is_none(),

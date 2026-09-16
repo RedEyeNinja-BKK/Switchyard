@@ -717,6 +717,25 @@ impl StageClassifierConfig {
 }
 
 impl AlgorithmSpec {
+    /// The context-pressure escalation input threshold, when declared.
+    pub fn escalation_threshold(&self) -> Option<u64> {
+        match self {
+            Self::FleetRouter {
+                escalation_max_input_tokens,
+                ..
+            } => *escalation_max_input_tokens,
+            _ => None,
+        }
+    }
+
+    /// The escalation destination route id, when this algorithm declares one.
+    pub fn escalation_destination(&self) -> Option<&ModelId> {
+        match self {
+            Self::FleetRouter { escalation, .. } => escalation.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Completion targets in algorithm order; judge-only targets are excluded.
     pub fn routing_target_names(&self) -> Vec<&str> {
         match self {
@@ -907,6 +926,12 @@ impl AlgorithmSpec {
                 (Category::Any, vec![executor_target.clone()]),
                 (Category::Judge, vec![advisor_target.clone()]),
             ]),
+            // The fleet router scores candidates itself; every declared candidate
+            // must be resolvable through the driver, so they all land in `Any`.
+            Self::FleetRouter { candidates, .. } => category_models([(
+                Category::Any,
+                candidates.iter().map(|c| c.target.clone()).collect(),
+            )]),
         };
 
         let subagents = match self {
@@ -947,7 +972,8 @@ impl AlgorithmSpec {
             | Self::StageRouter { .. }
             | Self::Auto { .. }
             | Self::Composite { .. }
-            | Self::PrefillRouter { .. } => None,
+            | Self::PrefillRouter { .. }
+            | Self::FleetRouter { .. } => None,
         }
     }
 

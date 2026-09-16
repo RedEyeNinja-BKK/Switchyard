@@ -22,26 +22,9 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse,
-    ContentBlock,
-    FileSource,
-    ImageSource,
-    InstructionBlock,
-    LlmRequest,
-    MediaSource,
-    Message,
-    OutputParams,
-    ProviderExtensions,
-    ReasoningParams,
-    ResponseOutput,
-    Role,
-    SamplingParams,
-    StopReason,
-    ToolCall,
-    ToolChoice,
-    ToolDefinition,
-    ToolResult,
-    Usage,
+    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
+    MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
+    SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -193,12 +176,9 @@ impl FormatCodec for OpenAiResponsesCodec {
         {
             // Strict Responses backends reject `system`-role input items ("System
             // messages are not allowed"); they require `developer`. The preserved
-            // body replays verbatim, so normalize it here to keep exact-request
-            // passthrough wire-legal. A scalar string `input` is likewise
-            // converted to the canonical message-item list so preserved bodies
-            // keep the always-list wire shape the encode path guarantees.
+            // body replays verbatim otherwise, so normalize only that wire-illegal
+            // role here to keep exact-request passthrough wire-legal.
             normalize_system_input_roles(&mut body);
-            normalize_input_to_message_list(&mut body);
             return Ok(EncodedRequest {
                 body,
                 diagnostics: Vec::new(),
@@ -1208,14 +1188,6 @@ fn encode_responses_input(
     // custom outputs. A tool result is typed by the call it answers, and Responses history
     // always lists the call before its output, so recording ids as calls are encoded is enough
     // to type the outputs that follow.
-    if messages.len() == 1
-        && matches!(messages[0].role, Role::User)
-        && messages[0].content.len() == 1
-        && matches!(messages[0].content[0], ContentBlock::Text { .. })
-        && let ContentBlock::Text { text } = &messages[0].content[0]
-    {
-        return Ok(Value::String(text.clone()));
-    }
     let mut encoded = Vec::new();
     // Some upstream translators (Kimi K3) resolve a tool output by an explicit
     // `name`, so pair every output with the name of the call it answers.
@@ -1289,7 +1261,8 @@ fn encode_responses_input(
             }
         }
         if !visible_content.is_empty() || (!emitted_special && !omitted_reasoning) {
-            let content = encode_responses_content(&visible_content, diagnostics, policy)?;
+            let content =
+                encode_responses_content(&visible_content, message.role, diagnostics, policy)?;
             encoded.push(json!({
                 "type": "message",
                 "role": role_to_responses(message.role),
@@ -1500,44 +1473,6 @@ fn normalize_input_to_message_list(body: &mut Value) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("input".to_string(), Value::Array(vec![item]));
     }
-}
-
-/// Maps an IR image source to a Responses `input_image` content part.
-///
-/// The Responses API requires `input_image.image_url` to be a STRING, but the IR
-/// `ImageSource` is a serde-tagged enum (`{"type":…,"data":…}`) that serialises
-/// to an OBJECT — passing it straight through makes every upstream reject the
-/// request with "expected an image URL, but got an object instead" (#vision).
-/// This renders the source into its URL string, exactly as the proven Codex
-/// transport does (`openai_codex_catalog_gateway._text_parts` emits
-/// `{"type": "input_image", "image_url": <str>}`) and as the Chat codec's
-/// sibling `openai_image_part` does for the other wire format.
-///
-/// `detail` is deliberately NOT forwarded: the proven Codex transport drops it
-/// too, and uniform behaviour across both transport paths is worth more than a
-/// hint no validated endpoint has been shown to accept. The IR keeps the field
-/// so a future profile-scoped change can forward it.
-///
-/// Returns `None` for a raw source with no extractable URL, which the caller
-/// degrades to text with a lossy diagnostic.
-fn responses_image_part(source: &ImageSource) -> Option<Value> {
-    let url = match source {
-        ImageSource::Url { url, .. } => url.clone(),
-        ImageSource::Base64 { media_type, data } => {
-            // No guessed MIME: see `raw_image_url` for the rationale (a wrong
-            // MIME is a whole-turn 400 upstream; refusing degrades one image).
-            let media_type = media_type.as_deref()?;
-            if media_type.is_empty() || data.is_empty() {
-                return None;
-            }
-            format!("data:{media_type};base64,{data}")
-        }
-        ImageSource::Raw(raw) => raw_image_url(raw)?,
-    };
-    if url.is_empty() {
-        return None;
-    }
-    Some(json!({"type": "input_image", "image_url": url}))
 }
 
 /// Best-effort URL extraction from an un-normalized provider image source.
@@ -1762,7 +1697,7 @@ fn encode_responses_tool_output(
     if text_only {
         return Ok(Value::String(text_from_blocks(content, " ")));
     }
-    encode_responses_content(content, diagnostics, policy)
+    encode_responses_content(content, Role::User, diagnostics, policy)
 }
 
 fn responses_image_part(source: &ImageSource) -> Option<Value> {

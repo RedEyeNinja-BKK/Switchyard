@@ -6,6 +6,7 @@
 mod algorithm;
 pub mod capability;
 mod config;
+mod facts_config;
 mod failure;
 mod route;
 mod runner;
@@ -19,9 +20,8 @@ pub use algorithm::{
 pub use capability::{
     CapabilityClientConfig, CapabilityClientFormat, CapabilityKind, CapabilityRouteConfig,
 };
-pub use config::{
-    ComfyFactConfig, FleetReadinessConfig, HtpcFactConfig, HttpBaseUrl, ResourceFactConfig,
-};
+pub use config::HttpBaseUrl;
+pub use facts_config::{ComfyFactConfig, FleetReadinessConfig, HtpcFactConfig, ResourceFactConfig};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 // Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.
 pub use libsy::RuntimeModels;

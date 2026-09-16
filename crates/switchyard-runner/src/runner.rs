@@ -22,7 +22,7 @@ pub struct Runner {
     /// when the deployment configures no `fleet_router` route.
     fleet_state: Option<std::sync::Arc<libsy::SharedFleetState>>,
     /// The parsed `[fleet_readiness]` monitor configuration, when declared.
-    fleet_readiness: Option<crate::config::FleetReadinessConfig>,
+    fleet_readiness: Option<crate::facts_config::FleetReadinessConfig>,
     /// Parsed `[capability_clients.*]` executor declarations.
     capability_clients: BTreeMap<String, crate::capability::CapabilityClientConfig>,
     /// Parsed `[capabilities.*]` route declarations.
@@ -76,6 +76,7 @@ impl Runner {
             fleet_readiness: None,
             capability_clients: BTreeMap::new(),
             capabilities: BTreeMap::new(),
+            provider_api_keys: Vec::new(),
         }
     }
 
@@ -98,14 +99,14 @@ impl Runner {
     /// Declares the parsed `[fleet_readiness]` monitor configuration.
     pub fn with_fleet_readiness(
         mut self,
-        fleet_readiness: Option<crate::config::FleetReadinessConfig>,
+        fleet_readiness: Option<crate::facts_config::FleetReadinessConfig>,
     ) -> Self {
         self.fleet_readiness = fleet_readiness;
         self
     }
 
     /// The parsed `[fleet_readiness]` monitor configuration, when declared.
-    pub fn fleet_readiness(&self) -> Option<&crate::config::FleetReadinessConfig> {
+    pub fn fleet_readiness(&self) -> Option<&crate::facts_config::FleetReadinessConfig> {
         self.fleet_readiness.as_ref()
     }
 
@@ -130,8 +131,6 @@ impl Runner {
     /// The parsed `[capabilities.*]` route declarations.
     pub fn capabilities(&self) -> &BTreeMap<String, crate::capability::CapabilityRouteConfig> {
         &self.capabilities
-            provider_api_keys: Vec::new(),
-        }
     }
 
     /// Registers deployment-owned API keys for server response redaction.

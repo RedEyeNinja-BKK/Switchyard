@@ -3,11 +3,12 @@
 
 //! Version-1 TOML deployment loading for the shared runner.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use libsy::RuntimeModels;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -15,14 +16,11 @@ use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
-use switchyard_protocol::{ModelId, RoutedLlmClient, WireFormat};
-
-use libsy::SharedFleetState;
+use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, FleetBuildContext,
-    FleetCandidateContextPolicyConfig, InputTokenSourceConfig, ModelCapabilities, Route, Runner,
-    RunnerError,
+    ModelCapabilities, Route, Runner, RunnerError,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -62,18 +60,14 @@ pub(crate) struct DeploymentConfig {
     llm_clients: BTreeMap<String, LlmClientConfig>,
     targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
-    /// Optional fleet-readiness monitor configuration. When present, the config
-    /// load also builds a `FleetReadinessMonitor` over the SAME
-    /// `Arc<SharedFleetState>` the `fleet_router` routes read, so the stock CLI
-    /// runtime owner keeps live readiness facts flowing into routing.
+    /// LocalClaw extension: the host-owned fleet-readiness monitor config.
     #[serde(default)]
-    fleet_readiness: Option<FleetReadinessConfig>,
-    /// Capability executor clients (`[capability_clients.<name>]`): typed
-    /// non-LLM utility endpoint executors (embeddings, rerank).
+    fleet_readiness: Option<crate::facts_config::FleetReadinessConfig>,
+    /// LocalClaw extension: capability executor routes (embeddings/rerank).
+    /// Parsed by the capability layer; accepted here so the live deployment
+    /// file parses as a whole.
     #[serde(default)]
     capability_clients: BTreeMap<String, crate::capability::CapabilityClientConfig>,
-    /// Capability routes (`[capabilities.<name>]`): the caller-facing typed
-    /// endpoint ids bound to one executor each.
     #[serde(default)]
     capabilities: BTreeMap<String, crate::capability::CapabilityRouteConfig>,
 }
@@ -84,8 +78,13 @@ struct RouteConfig {
     context_window: Option<u32>,
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
-    supports_vision: Option<bool>,
+    vision: Option<bool>,
     algorithm: AlgorithmSpec,
+}
+
+struct TargetPromptPolicy {
+    prompts: HashMap<ModelId, String>,
+    routing_answer_target: Option<ModelId>,
 }
 
 impl<'de> Deserialize<'de> for RouteConfig {
@@ -98,7 +97,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let context_window = take_optional(&mut table, "context_window")?;
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
-        let supports_vision = take_optional(&mut table, "supports_vision")?;
+        let vision =
+            take_optional(&mut table, "vision")?.or(take_optional(&mut table, "supports_vision")?);
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -106,7 +106,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             context_window,
             tool_calling,
             reasoning,
-            supports_vision,
+            vision,
             algorithm,
         })
     }
@@ -133,76 +133,17 @@ where
 }
 
 impl RouteConfig {
-    fn capabilities(&self) -> ModelCapabilities {
-        if let AlgorithmSpec::FleetRouter { candidates, .. } = &self.algorithm {
-            // Truthful fleet advertisement: when the route does not override a
-            // capability explicitly, the advertised envelope derives from the
-            // candidate set so `/v1/models` never claims more than the fleet
-            // can serve (validation below enforces the reverse direction too).
-            let any_tool = candidates.iter().any(|candidate| candidate.tool_calling);
-            let any_reasoning = candidates.iter().any(|candidate| candidate.reasoning);
-            let any_vision = candidates.iter().any(|candidate| candidate.supports_vision);
-            return ModelCapabilities {
-                context_window: self.context_window,
-                tool_calling: self.tool_calling.or(Some(any_tool)),
-                reasoning: self.reasoning.or(Some(any_reasoning)),
-                supports_vision: self.supports_vision.or(Some(any_vision)),
-            };
-        }
-        ModelCapabilities {
-            context_window: self.context_window,
-            tool_calling: self.tool_calling,
-            reasoning: self.reasoning,
-            supports_vision: self.supports_vision,
-        }
-    }
-
-    fn routing_target_names(&self) -> Vec<&str> {
-        self.algorithm.routing_target_names()
-    }
-
-    fn callable_target_names(&self) -> Vec<&str> {
-        self.algorithm.callable_target_names()
-    }
-
-    /// The registered model id (route id) of this route.
-    fn route_id(&self) -> &ModelId {
-        &self.id
-    }
-
-    /// Optional escalation destination route id (`fleet_router` routes only).
-    fn escalation_route(&self) -> Option<&ModelId> {
-        match &self.algorithm {
-            AlgorithmSpec::FleetRouter { escalation, .. } => escalation.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// Optional context-pressure escalation threshold (`fleet_router` only).
-    fn escalation_input_threshold(&self) -> Option<u64> {
-        match &self.algorithm {
-            AlgorithmSpec::FleetRouter {
-                escalation_max_input_tokens,
-                ..
-            } => *escalation_max_input_tokens,
-            _ => None,
-        }
-    }
-
     /// A `fleet_router` route's advertised capability envelope must be
     /// satisfiable by its candidate set (truthful model advertisement).
     fn validate_fleet_capabilities(&self, route_name: &str) -> RunnerResult<()> {
         let AlgorithmSpec::FleetRouter { candidates, .. } = &self.algorithm else {
             return Ok(());
         };
-        // The route-level flags live on the RouteConfig, not the variant.
         let route_tool_calling = self.tool_calling;
         let route_reasoning = self.reasoning;
-        let any_tool = candidates.iter().any(|c| c.tool_calling);
-        let any_reasoning = candidates.iter().any(|c| c.reasoning);
-        let any_tool_and_reasoning = candidates.iter().any(|c| c.tool_calling && c.reasoning);
+        let any_tool = candidates.iter().any(|candidate| candidate.tool_calling);
+        let any_reasoning = candidates.iter().any(|candidate| candidate.reasoning);
 
-        // Explicit TRUE overrides must not exceed the candidate capability set.
         if route_tool_calling == Some(true) && !any_tool {
             return Err(RunnerError::configuration(format!(
                 "fleet_router route {route_name} advertises tool_calling=true but no \
@@ -215,24 +156,23 @@ impl RouteConfig {
                  candidate profile supports reasoning"
             )));
         }
-
-        // Effective advertised envelope after applying restrictive (false)
-        // overrides - shares its derivation with `capabilities()` so validation
-        // and advertisement can never disagree.
-        let effective = self.capabilities();
-
-        // A tools+reasoning aggregate must be satisfiable by one candidate.
-        if effective.tool_calling == Some(true)
-            && effective.reasoning == Some(true)
-            && !any_tool_and_reasoning
-        {
-            return Err(RunnerError::configuration(format!(
-                "fleet_router route {route_name} would advertise tool_calling=true and \
-                 reasoning=true, but no single candidate supports both; the aggregate \
-                 capability envelope is not representable by the candidate set"
-            )));
-        }
         Ok(())
+    }
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            context_window: self.context_window,
+            tool_calling: self.tool_calling,
+            reasoning: self.reasoning,
+            supports_vision: self.vision,
+        }
+    }
+
+    fn routing_target_names(&self) -> Vec<&str> {
+        self.algorithm.routing_target_names()
+    }
+
+    fn callable_target_names(&self) -> Vec<&str> {
+        self.algorithm.callable_target_names()
     }
 }
 
@@ -249,11 +189,11 @@ impl DeploymentConfig {
         let route_ids = self
             .routes
             .values()
-            .map(RouteConfig::route_id)
-            .collect::<HashSet<&ModelId>>();
+            .map(|config| &config.id)
+            .collect::<std::collections::HashSet<&ModelId>>();
         for (route_name, config) in &self.routes {
-            let Some(destination) = config.escalation_route() else {
-                if config.escalation_input_threshold().is_some() {
+            let Some(destination) = config.algorithm.escalation_destination() else {
+                if config.algorithm.escalation_threshold().is_some() {
                     return Err(RunnerError::configuration(format!(
                         "route {route_name} declares escalation_max_input_tokens without an \
                          escalation destination"
@@ -275,9 +215,13 @@ impl DeploymentConfig {
             let destination_config = self
                 .routes
                 .values()
-                .find(|candidate| candidate.route_id() == destination)
+                .find(|candidate| candidate.id == *destination)
                 .expect("destination verified above");
-            if destination_config.escalation_route().is_some() {
+            if destination_config
+                .algorithm
+                .escalation_destination()
+                .is_some()
+            {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} escalation destination {destination:?} must not itself \
                      declare an escalation (no escalation chains/cycles)"
@@ -307,7 +251,42 @@ impl DeploymentConfig {
             )));
         }
 
-        let mut seen_client_model_ids = HashSet::new();
+        let mut route_names_by_id = HashMap::new();
+        for (route_name, config) in &self.routes {
+            validate_value("route name", route_name)?;
+            validate_value(&format!("route {route_name} id"), &config.id)?;
+            if let Some(first_route_name) =
+                route_names_by_id.insert(config.id.as_str(), route_name.as_str())
+            {
+                return Err(RunnerError::configuration(format!(
+                    "routes {first_route_name} and {route_name} both use id {}; route ids must be unique",
+                    config.id
+                )));
+            }
+        }
+
+        if let Some(readiness) = &self.fleet_readiness {
+            readiness.validate()?;
+        }
+        self.validate_escalations()?;
+        let fleet_state = if self
+            .routes
+            .values()
+            .any(|route| matches!(route.algorithm, AlgorithmSpec::FleetRouter { .. }))
+        {
+            Some(std::sync::Arc::new(libsy::SharedFleetState::new(
+                libsy::FleetSnapshot::default(),
+            )))
+        } else {
+            None
+        };
+
+        // The LLM client keeps one backend per model id, so two targets naming the same model on
+        // the same client share it. That is harmless when their request settings agree (an alias
+        // for a different system prompt, say) and silently wrong when they do not: the second
+        // target's reasoning_effort or extra_body would never reach the wire.
+        let mut seen_client_model_ids: HashMap<(&str, &str), (&String, &TargetConfig)> =
+            HashMap::new();
         for (target_name, target) in &self.targets {
             validate_value("target name", target_name)?;
             validate_value(&format!("target {target_name} id"), &target.id)?;
@@ -334,33 +313,12 @@ impl DeploymentConfig {
             }
         }
 
-        if let Some(readiness) = &self.fleet_readiness {
-            readiness.validate()?;
-        }
         let mut provider_api_keys = Vec::new();
         let clients = self.build_clients(&mut provider_api_keys)?;
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
-        self.validate_escalations()?;
-        for (route_name, config) in &self.routes {
-            config.validate_fleet_capabilities(route_name)?;
-        }
-        // One deployment-wide fleet-state handle: every `fleet_router` route
-        // reads coherent snapshots through it, and the host-owned readiness
-        // monitor replaces snapshots behind the same handle. `None` when no
-        // fleet route is configured.
-        let has_fleet = self
-            .routes
-            .values()
-            .any(|config| matches!(config.algorithm, AlgorithmSpec::FleetRouter { .. }));
-        let fleet_state = has_fleet.then(|| Arc::new(SharedFleetState::new(Default::default())));
-        let fleet_ctx = FleetBuildContext {
-            fleet_state: fleet_state.clone(),
-        };
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
-            validate_value("route name", route_name)?;
-            validate_value(&format!("route {route_name} id"), &config.id)?;
             for target_name in config.callable_target_names() {
                 self.targets.get(target_name).ok_or_else(|| {
                     RunnerError::configuration(format!(
@@ -368,15 +326,26 @@ impl DeploymentConfig {
                     ))
                 })?;
             }
-            let capabilities = config.capabilities();
+            config.validate_fleet_capabilities(route_name)?;
+            let mut capabilities = config.capabilities();
+            if let AlgorithmSpec::FleetRouter { candidates, .. } = &config.algorithm {
+                let any_vision = candidates.iter().any(|candidate| candidate.supports_vision);
+                capabilities.supports_vision = capabilities.supports_vision.or(Some(any_vision));
+            }
             if capabilities.context_window == Some(0) {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
+            let fleet_context = match fleet_state.as_ref() {
+                Some(state) => FleetBuildContext {
+                    fleet_state: Some(std::sync::Arc::clone(state)),
+                },
+                None => FleetBuildContext::default(),
+            };
             let algorithm = config
                 .algorithm
-                .build_with_fleet(route_name, &targets, &fleet_ctx)
+                .build_with_fleet(route_name, &targets, &fleet_context)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             let (route_clients, caller_auth) =
                 self.build_route_clients(route_name, config, &clients)?;
@@ -384,8 +353,6 @@ impl DeploymentConfig {
                 self.build_anthropic_auxiliary_target(config, &clients);
             let responses_auxiliary_target =
                 self.build_responses_auxiliary_target(config, &clients);
-            let input_tokens_targets =
-                self.build_input_tokens_targets(route_name, config, &clients)?;
             let decision_targets = config
                 .routing_target_names()
                 .into_iter()
@@ -408,20 +375,19 @@ impl DeploymentConfig {
                 responses_auxiliary_target,
                 decision_targets,
                 models,
-            )
-            .with_escalation(
-                config.escalation_route().cloned(),
-                config.escalation_input_threshold(),
-            )
-            .with_input_tokens_targets(input_tokens_targets);
+            );
+            let route = route.with_escalation(
+                config.algorithm.escalation_destination().cloned(),
+                config.algorithm.escalation_threshold(),
+            );
             routes.push((config.id.clone(), route));
         }
         let runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
+            .with_provider_api_keys(provider_api_keys)
             .with_fleet_state(fleet_state)
             .with_fleet_readiness(self.fleet_readiness)
-            .with_capabilities(self.capability_clients, self.capabilities)
-            .with_provider_api_keys(provider_api_keys);
+            .with_capabilities(self.capability_clients, self.capabilities);
         Ok(runner)
     }
 
@@ -437,7 +403,7 @@ impl DeploymentConfig {
 
         for (name, client_config) in &self.llm_clients {
             validate_value("llm client name", name)?;
-            let backend = build_backend(name, client_config, &BTreeMap::new(), false, None)?;
+            let backend = build_backend(name, client_config, &BTreeMap::new(), None, false)?;
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
             | Backend::Anthropic(config)) = backend;
@@ -475,8 +441,8 @@ impl DeploymentConfig {
                     &target.llm_client,
                     client_config,
                     &target.extra_body,
-                    target.strip_reasoning_content,
                     target.reasoning_effort.clone(),
+                    target.strip_reasoning_content,
                 )?,
                 None,
             ));
@@ -533,7 +499,67 @@ impl DeploymentConfig {
             let client: Arc<dyn RoutedLlmClient> = client.clone();
             by_model.insert(target.id.clone(), client);
         }
-        Ok((ClientRouter::new(by_model), caller_auth))
+        let TargetPromptPolicy {
+            prompts,
+            routing_answer_target,
+        } = self.build_route_target_prompts(route_name, route)?;
+        let router =
+            ClientRouter::new_with_target_prompts(by_model, prompts, routing_answer_target);
+        Ok((router, caller_auth))
+    }
+
+    /// Builds the effective prompt policy for this route's completion targets.
+    fn build_route_target_prompts(
+        &self,
+        route_name: &str,
+        route: &RouteConfig,
+    ) -> RunnerResult<TargetPromptPolicy> {
+        let mut prompts = HashMap::new();
+        let mut aliases = HashMap::<&ModelId, Option<&str>>::new();
+        for name in route.algorithm.routing_target_names() {
+            let target = self.targets.get(name).ok_or_else(|| {
+                RunnerError::configuration(format!("route references unknown target {name}"))
+            })?;
+            let prompt = target.system_prompt.as_deref();
+            if aliases
+                .insert(&target.id, prompt)
+                .is_some_and(|configured| configured != prompt)
+            {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} maps completion target aliases to model {} with different system_prompt values",
+                    target.id
+                )));
+            }
+            if let Some(prompt) = prompt {
+                prompts.insert(target.id.clone(), prompt.to_string());
+            }
+        }
+        let mut policy = TargetPromptPolicy {
+            prompts,
+            routing_answer_target: None,
+        };
+        let Some((response_name, dependency_name)) =
+            route.algorithm.routing_response_and_dependency()
+        else {
+            return Ok(policy);
+        };
+        let response = self.targets.get(response_name).ok_or_else(|| {
+            RunnerError::configuration(format!("route references unknown target {response_name}"))
+        })?;
+        if !policy.prompts.contains_key(&response.id) {
+            return Ok(policy);
+        }
+        let dependency = self.targets.get(dependency_name).ok_or_else(|| {
+            RunnerError::configuration(format!("route references unknown target {dependency_name}"))
+        })?;
+        if response.id == dependency.id {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} cannot apply system_prompt to target {response_name}: model {} is also used by routing-only target {dependency_name}",
+                response.id,
+            )));
+        }
+        policy.routing_answer_target = Some(response.id.clone());
+        Ok(policy)
     }
 
     fn fallback_base_url(&self) -> RunnerResult<Option<String>> {
@@ -579,73 +605,6 @@ impl DeploymentConfig {
         })
     }
 
-    /// Builds the explicitly-qualified exact input-token producers for a
-    /// `fleet_router` route.
-    ///
-    /// Only `fleet_router` candidates that declare `context_policy.kind =
-    /// "bounded"` **and** `input_token_source = openai_chat_input_tokens` yield
-    /// a producer target. A declared source whose target is **not** served by
-    /// an OpenAI-chat backend is a configuration error (rejected, not silently
-    /// ignored). Non-fleet routes and bounded candidates without an explicit
-    /// producer yield no target (their fact stays absent and FleetRouter fails
-    /// closed).
-    fn build_input_tokens_targets(
-        &self,
-        route_name: &str,
-        route_config: &RouteConfig,
-        clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
-    ) -> RunnerResult<Vec<AuxiliaryTarget>> {
-        let AlgorithmSpec::FleetRouter { candidates, .. } = &route_config.algorithm else {
-            return Ok(Vec::new());
-        };
-        let mut targets = Vec::new();
-        for candidate in candidates {
-            let FleetCandidateContextPolicyConfig::Bounded {
-                usable_context_tokens: _,
-                input_token_source,
-            } = candidate.context_policy
-            else {
-                continue;
-            };
-            let Some(source) = input_token_source else {
-                // Bounded without an explicit producer: no fact, must fail closed.
-                continue;
-            };
-            match source {
-                InputTokenSourceConfig::OpenAiChatInputTokens => {
-                    let target = self.targets.get(&candidate.target).ok_or_else(|| {
-                        RunnerError::configuration(format!(
-                            "route {route_name}: fleet candidate {:?} declares input_token_source \
-                             but has no [targets.*]",
-                            candidate.target
-                        ))
-                    })?;
-                    let client = clients.get(&target.llm_client).ok_or_else(|| {
-                        RunnerError::configuration(format!(
-                            "route {route_name}: fleet candidate {:?} references unknown llm_client {}",
-                            candidate.target, target.llm_client
-                        ))
-                    })?;
-                    if !client
-                        .supports_auxiliary(&target.id, AuxiliaryOperation::OpenAiChatInputTokens)
-                    {
-                        return Err(RunnerError::configuration(format!(
-                            "route {route_name}: fleet candidate {:?} declares \
-                             input_token_source = openai_chat_input_tokens but its target is not \
-                             served by an OpenAI-chat backend",
-                            candidate.target
-                        )));
-                    }
-                    targets.push(AuxiliaryTarget {
-                        model: target.id.clone(),
-                        client: client.clone(),
-                    });
-                }
-            }
-        }
-        Ok(targets)
-    }
-
     fn build_auxiliary_target(
         &self,
         name: &str,
@@ -677,7 +636,7 @@ fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
 /// Holding a `HttpBaseUrl` is proof the value is an absolute HTTP(S) URL, so no
 /// later stage has to re-check it or can forget to.
 #[derive(Clone, Debug)]
-pub struct HttpBaseUrl(reqwest::Url);
+pub struct HttpBaseUrl(pub(crate) reqwest::Url);
 
 impl HttpBaseUrl {
     pub fn as_str(&self) -> &str {
@@ -724,14 +683,15 @@ struct TargetConfig {
     llm_client: String,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
+    system_prompt: Option<String>,
+    /// Reasoning effort forced on every request to this target, replacing the caller's value.
+    /// Only meaningful on `openai_chat` and `openai_responses` clients.
+    reasoning_effort: Option<String>,
     /// Drop replayed reasoning payloads from outbound messages for this target.
     /// Set on OpenRouter-hosted lanes so replayed chain-of-thought is never
     /// forwarded to a provider that bills for it without requiring it.
     #[serde(default)]
     strip_reasoning_content: bool,
-    /// Reasoning effort forced on every request to this target, replacing the caller's value.
-    /// Only meaningful on `openai_chat` and `openai_responses` clients.
-    reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -760,12 +720,36 @@ impl ClientFormat {
         }
     }
 }
+
+/// Resolves one scope's configured target names to the models the driver serves.
+fn resolve_category_models(
+    names: HashMap<Category, Vec<String>>,
+    targets: &BTreeMap<String, ModelId>,
+) -> RunnerResult<HashMap<Category, Vec<ModelId>>> {
+    names
+        .into_iter()
+        .map(|(category, names)| {
+            let models = names
+                .into_iter()
+                .map(|name| {
+                    targets.get(&name).cloned().ok_or_else(|| {
+                        RunnerError::configuration(format!(
+                            "route references unknown target {name}"
+                        ))
+                    })
+                })
+                .collect::<RunnerResult<Vec<_>>>()?;
+            Ok((category, models))
+        })
+        .collect()
+}
+
 fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
-    strip_reasoning_content: bool,
     reasoning_effort: Option<String>,
+    strip_reasoning_content: bool,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -806,8 +790,8 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         reasoning_effort,
+        strip_reasoning_content: false,
         max_retries: config.max_retries,
-        strip_reasoning_content,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -945,9 +929,50 @@ target = "weak"
     fn public_runner_from_toml_builds_a_deployment() -> RunnerResult<()> {
         let runner = Runner::from_toml(VALID_CONFIG)?;
 
-        assert!(runner.route("switchyard/classifier").is_some());
+        let classifier = runner
+            .route("switchyard/classifier")
+            .expect("classifier route should exist");
+        let models = classifier.models();
+        assert_eq!(
+            models.models_for(&Category::Judge),
+            [ModelId::from("classifier/model")]
+        );
+        assert_eq!(
+            models.models_for(&Category::Efficient),
+            [ModelId::from("weak/model")]
+        );
+        assert_eq!(
+            models.models_for(&Category::Capable),
+            [ModelId::from("strong/model")]
+        );
+        assert_eq!(
+            models.models_for(&Category::Any),
+            [ModelId::from("weak/model"), ModelId::from("strong/model")]
+        );
         assert!(runner.route("switchyard/passthrough").is_some());
         Ok(())
+    }
+
+    #[test]
+    fn duplicate_route_ids_are_rejected() {
+        let config = format!(
+            r#"{VALID_CONFIG}
+
+[routes.duplicate]
+id = "switchyard/passthrough"
+type = "passthrough"
+target = "strong"
+"#
+        );
+
+        let error = error_message(&config);
+
+        assert!(
+            error.contains(
+                "routes duplicate and passthrough both use id switchyard/passthrough; route ids must be unique"
+            ),
+            "{error}"
+        );
     }
 
     fn error_message(toml: &str) -> String {
@@ -963,16 +988,37 @@ target = "weak"
         configured.push_str(
             r#"type = "llm_classifier"
 mode = "custom"
-classifier_target = "classifier"
-targets = ["strong", "weak"]
-default_target = "weak"
+models = { judge = ["classifier"], capable = ["strong"], efficient = ["weak"], any = ["strong", "weak"] }
+default_target = "efficient"
 prompt = "Select a target for this delegated task."
-response_schema = '{"type":"object","properties":{"target":{"type":"string","enum":["strong","weak"]}},"required":["target"],"additionalProperties":false}'
+response_schema = '{"type":"object","properties":{"target":{"type":"string","enum":["capable","efficient"]}},"required":["target"],"additionalProperties":false}'
 policy = { type = "target_selector", selector = "/target" }
 classify_trigger = "new_session""#,
         );
         configured.push_str(extra);
         configured
+    }
+
+    #[test]
+    fn subagent_models_stay_separate_from_the_parent_tiers() -> RunnerResult<()> {
+        // The sub-agent target is also the parent's capable tier. Merged into one group it
+        // would be indistinguishable from that tier, and delegated work would follow the
+        // parent's ordering instead of its own configured target.
+        let runner = runner_from_toml(&with_subagent_passthrough(&stage_config(), "stage"))?;
+        let models = runner
+            .route("switchyard/stage")
+            .expect("stage route should exist")
+            .models();
+
+        assert_eq!(
+            models.subagent_models_for(&Category::Any),
+            [ModelId::from("strong/model")]
+        );
+        assert_eq!(
+            models.models_for(&Category::Any),
+            [ModelId::from("strong/model"), ModelId::from("weak/model")]
+        );
+        Ok(())
     }
 
     fn with_subagent_passthrough(config: &str, route: &str) -> String {
@@ -993,6 +1039,13 @@ capable_target = "strong"
 efficient_target = "weak"
 picker = "efficient_first"
 confidence_threshold = 1.0
+capable_hold_turns = 2
+
+[routes.stage.tool_semantics]
+observe = ["lookup_customer"]
+mutate = ["send_payment"]
+plan = ["create_workflow"]
+new = ["send_message"]
 
 [routes.stage.classifier]
 target = "stage_judge"
@@ -1021,6 +1074,10 @@ classify_trigger = "user_turn"
 capable_target = "strong"
 efficient_target = "weak"
 confidence_threshold = 0.5
+capable_hold_turns = 2
+
+[routes.composed.stage.tool_semantics]
+new = ["send_message"]
 "#
         )
     }
@@ -1056,6 +1113,33 @@ confidence_threshold = 0.5
     }
 
     #[test]
+    fn stage_rejects_ambiguous_or_non_additive_tool_semantics() {
+        for (configured, expected) in [
+            (
+                stage_config().replace(
+                    "mutate = [\"send_payment\"]",
+                    "mutate = [\"LOOKUP_CUSTOMER\"]",
+                ),
+                "appears in both tool_semantics.observe and tool_semantics.mutate",
+            ),
+            (
+                stage_config().replace("new = [\"send_message\"]", "new = [\"Read\"]"),
+                "already has built-in semantics and cannot be reclassified",
+            ),
+            (
+                stage_config().replace("observe = [\"lookup_customer\"]", "observe = [\" \"]"),
+                "contains an empty tool name",
+            ),
+        ] {
+            let message = error_message(&configured);
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in error, got: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn passthrough_and_stage_accept_subagent_routing() -> RunnerResult<()> {
         let stage = stage_config();
         let stage_with_classifier = with_subagent_llm_classifier(&stage, "stage", "");
@@ -1079,6 +1163,49 @@ confidence_threshold = 0.5
             runner_from_toml(&configured)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn aliased_completion_targets_reject_prompt_conflicts() {
+        let configured = stage_config()
+            .replace(
+                "id = \"strong/model\"\nllm_client = \"responses\"",
+                "id = \"strong/model\"\nllm_client = \"responses\"\nsystem_prompt = \"capable\"",
+            )
+            .replace(
+                "[routes.stage]",
+                "[targets.strong_alias]\nid = \"strong/model\"\nllm_client = \"responses\"\n\n[routes.stage]",
+            )
+            .replace("efficient_target = \"weak\"", "efficient_target = \"strong_alias\"");
+        let message = error_message(&configured);
+        assert!(
+            message.contains("completion target aliases to model strong/model with different system_prompt values"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn prompted_routing_response_cannot_share_a_model_with_a_dependency() {
+        let configured = VALID_CONFIG
+            .replace(
+                "id = \"classifier/model\"\nllm_client = \"primary\"",
+                "id = \"weak/model\"\nllm_client = \"primary\"",
+            )
+            .replace(
+                "id = \"weak/model\"\nllm_client = \"anthropic\"",
+                "id = \"weak/model\"\nllm_client = \"anthropic\"\nsystem_prompt = \"answer prompt\"",
+            )
+            .replace(
+                "base_threshold = 0.5",
+                "base_threshold = 0.5\nescalation = { confirmations = 1 }",
+            );
+
+        let message = error_message(&configured);
+
+        assert!(
+            message.contains("cannot apply system_prompt to target weak: model weak/model is also used by routing-only target classifier"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
@@ -1114,6 +1241,51 @@ confidence_threshold = 0.5
             "base_threshold = 0.5\nescalation = { confirmations = 0 }",
         );
         assert!(error_message(&starved).contains("confirmations must be at least 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_target_reasoning_effort_parses_and_is_rejected_where_unsupported() -> RunnerResult<()> {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        let weak = "[targets.weak]\nid = \"weak/model\"\nllm_client = \"anthropic\"";
+        assert!(VALID_CONFIG.contains(strong) && VALID_CONFIG.contains(weak));
+
+        let forced = VALID_CONFIG.replace(strong, &format!("{strong}\nreasoning_effort = \"max\""));
+        runner_from_toml(&forced)?;
+
+        let blank = VALID_CONFIG.replace(strong, &format!("{strong}\nreasoning_effort = \" \""));
+        assert!(error_message(&blank).contains("reasoning_effort must not be empty"));
+
+        let anthropic = VALID_CONFIG.replace(weak, &format!("{weak}\nreasoning_effort = \"high\""));
+        assert!(
+            error_message(&anthropic)
+                .contains("only supported on openai_chat and openai_responses")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_targets_with_conflicting_settings_are_rejected() -> RunnerResult<()> {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        assert!(VALID_CONFIG.contains(strong));
+        // Same model, same client, different effort: the second target could never take effect.
+        let conflicting = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\n\n[targets.strong_max]\nid = \"strong/model\"\nllm_client = \"responses\"\nreasoning_effort = \"max\""
+            ),
+        );
+        assert!(
+            error_message(&conflicting).contains("different reasoning_effort or extra_body"),
+            "{}",
+            error_message(&conflicting)
+        );
+        // An alias with identical settings is still allowed (it only warns).
+        let alias = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\n\n[targets.strong_alias]\nid = \"strong/model\"\nllm_client = \"responses\""),
+        );
+        runner_from_toml(&alias)?;
         Ok(())
     }
 
@@ -1184,6 +1356,22 @@ confidence_threshold = 0.5
             "picker = \"efficient_first\"\nmagic = true",
         );
         assert!(error_message(&config).contains("unknown field"));
+    }
+
+    #[test]
+    fn auto_route_builds_a_stage_router_with_no_extra_fields() -> RunnerResult<()> {
+        let config = format!(
+            r#"{VALID_CONFIG}
+[routes.auto]
+id = "switchyard/auto"
+type = "auto"
+capable_target = "strong"
+efficient_target = "weak"
+"#
+        );
+        let runner = runner_from_toml(&config)?;
+        assert!(runner.route("switchyard/auto").is_some());
+        Ok(())
     }
 
     #[test]
@@ -1268,9 +1456,16 @@ classifier_magic = true
             (
                 VALID_CONFIG.replace(
                     "targets = [\"strong\", \"weak\"]",
+                    "targets = [\"strong\", \"weak\"]\nweights = [0, 0]",
+                ),
+                "at least one weight must be positive",
+            ),
+            (
+                VALID_CONFIG.replace(
+                    "targets = [\"strong\", \"weak\"]",
                     "targets = [\"strong\", \"strong\"]",
                 ),
-                "random targets must be unique",
+                "targets must be unique, strong is repeated",
             ),
             (
                 VALID_CONFIG.replace(
@@ -1278,13 +1473,6 @@ classifier_magic = true
                     "targets = [\"strong\", \"weak\"]\nweights = [1]",
                 ),
                 "expected 2 weights, got 1",
-            ),
-            (
-                VALID_CONFIG.replace(
-                    "targets = [\"strong\", \"weak\"]",
-                    "targets = [\"strong\", \"weak\"]\nweights = [0, 0]",
-                ),
-                "at least one weight must be positive",
             ),
             (
                 VALID_CONFIG.replace("base_threshold = 0.5", "base_threshold = 1.5"),
@@ -1500,7 +1688,7 @@ target = "azure"
         let Some(client) = config.llm_clients.get("primary") else {
             return Err(RunnerError::configuration("primary llm client is missing"));
         };
-        let backend = build_backend("primary", client, &target.extra_body, false)?;
+        let backend = build_backend("primary", client, &target.extra_body, None, false)?;
 
         assert_eq!(
             backend.extra_body().get("service_tier"),
@@ -1719,6 +1907,24 @@ advisor_target = "advisor"
     #[test]
     fn advisor_route_parses_with_defaults_and_builds() -> RunnerResult<()> {
         let state = runner_from_toml(ADVISOR_CONFIG)?;
+        let route = state
+            .route("switchyard/advisor")
+            .expect("advisor route should exist");
+        let models = route.models();
+        // The gate calls the executor through `efficient`; `any` keeps it in the
+        // route's last-resort pool.
+        assert_eq!(
+            models.models_for(&Category::Efficient),
+            [ModelId::from("executor/model")]
+        );
+        assert_eq!(
+            models.models_for(&Category::Any),
+            [ModelId::from("executor/model")]
+        );
+        assert_eq!(
+            models.models_for(&Category::Judge),
+            [ModelId::from("advisor/model")]
+        );
         assert_eq!(
             state
                 .models()
@@ -1816,173 +2022,5 @@ advisor_target = "advisor"
             "advisor_target = \"advisor\"\nmax_reviews = 0",
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
-    }
-}
-
-/// Declares the fleet-readiness monitor components for the stock CLI runtime
-/// owner. All sub-sections are optional; a fully-absent `fleet_readiness` means
-/// no monitor is constructed and the server runs fail-closed for fleet routes.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FleetReadinessConfig {
-    /// Seconds between observation cycles.
-    #[serde(default = "default_fleet_observe_interval")]
-    pub observe_interval_seconds: u64,
-    /// ComfyNinja factual-readiness probe (read-only `/v1/resource`).
-    #[serde(default)]
-    pub comfy: Option<ComfyFactConfig>,
-    /// HTPC factual-readiness probe (read-only `/health` + `/v1/models`).
-    #[serde(default)]
-    pub htpc: Option<HtpcFactConfig>,
-    /// Live resource-state facts (OpenAI weekly allowance + DeepSeek balance).
-    #[serde(default)]
-    pub resource: Option<ResourceFactConfig>,
-    /// Static `(model-id, ready)` base entries for cloud candidates that need
-    /// no live resource/health probe (immediately attemptable).
-    #[serde(default)]
-    pub ready: Vec<String>,
-    /// Static `(model-id, transition-required)` entries (e.g. a sealed-idle
-    /// locally-resident model that is valid but not yet loaded).
-    #[serde(default)]
-    pub transition_required: Vec<String>,
-}
-
-const fn default_fleet_observe_interval() -> u64 {
-    30
-}
-
-/// ComfyNinja factual-readiness probe (read-only `/v1/resource`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ComfyFactConfig {
-    /// Read-only resource endpoint URL.
-    pub url: String,
-    /// Environment variable holding the bearer token.
-    pub auth_token_env: String,
-    /// The candidate target model id this fact gates.
-    pub model: String,
-}
-
-/// HTPC factual-readiness probe (read-only `/health` + `/v1/models`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HtpcFactConfig {
-    /// HTPC base URL (health + models are joined onto it).
-    pub base_url: String,
-    /// Model basename that must be served for readiness.
-    pub expected_model: String,
-    /// The candidate target model id this fact gates.
-    pub model: String,
-}
-
-/// Live resource-state facts (OpenAI weekly allowance + DeepSeek balance) that
-/// gate cloud candidate readiness according to the operator
-/// confirmed-exhaustion policy.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceFactConfig {
-    #[serde(default)]
-    pub openai_url: Option<String>,
-    #[serde(default)]
-    pub openai_auth_token_env: Option<String>,
-    #[serde(default)]
-    pub openclaw_openai_url: Option<String>,
-    #[serde(default)]
-    pub openclaw_openai_auth_token_env: Option<String>,
-    #[serde(default)]
-    pub deepseek_url: Option<String>,
-    #[serde(default)]
-    pub deepseek_api_key_env: Option<String>,
-    #[serde(default)]
-    pub deepseek_currency: Option<String>,
-    /// Target model ids gated by the primary OpenAI weekly allowance.
-    #[serde(default)]
-    pub openai_gated: Vec<String>,
-    /// Target model ids gated by the separate OpenClaw-owned OpenAI allowance.
-    #[serde(default)]
-    pub openclaw_openai_gated: Vec<String>,
-    /// Target model ids gated by the DeepSeek configured-currency balance.
-    #[serde(default)]
-    pub deepseek_gated: Vec<String>,
-}
-
-impl FleetReadinessConfig {
-    /// Validates the declared readiness sources: every gated model list must
-    /// have its observation source configured (otherwise that candidate is
-    /// silently excluded every cycle - fail loud at load time), and model ids
-    /// must be disjoint across sources (a duplicate key would make every
-    /// snapshot cycle fail and the fleet stay at the fail-closed empty
-    /// snapshot).
-    pub(crate) fn validate(&self) -> RunnerResult<()> {
-        // Disjointness across readiness sources (F2 review invariant).
-        let mut declared: std::collections::HashMap<String, &'static str> =
-            std::collections::HashMap::new();
-        let mut disjoint = |model: &str, source: &'static str| -> RunnerResult<()> {
-            if let Some(origin) = declared.insert(model.to_string(), source) {
-                return Err(RunnerError::configuration(format!(
-                    "[fleet_readiness] model {model:?} appears in both {origin} and {source}"
-                )));
-            }
-            Ok(())
-        };
-        for model in &self.ready {
-            disjoint(model, "ready")?;
-        }
-        for model in &self.transition_required {
-            disjoint(model, "transition_required")?;
-        }
-        if let Some(c) = &self.comfy {
-            disjoint(c.model.as_str(), "comfy")?;
-        }
-        if let Some(h) = &self.htpc {
-            disjoint(h.model.as_str(), "htpc")?;
-        }
-        if let Some(r) = &self.resource {
-            for m in r
-                .openai_gated
-                .iter()
-                .chain(r.openclaw_openai_gated.iter())
-                .chain(r.deepseek_gated.iter())
-            {
-                disjoint(m, "resource-gated")?;
-            }
-        }
-        // Gated lists require their observation source (F1 review invariant).
-        if let Some(r) = &self.resource {
-            if !r.openai_gated.is_empty()
-                && (r.openai_url.is_none() || r.openai_auth_token_env.is_none())
-            {
-                return Err(RunnerError::configuration(
-                    "openai_gated candidates require openai_url and openai_auth_token_env",
-                ));
-            }
-            if !r.openclaw_openai_gated.is_empty()
-                && (r.openclaw_openai_url.is_none() || r.openclaw_openai_auth_token_env.is_none())
-            {
-                return Err(RunnerError::configuration(
-                    "openclaw_openai_gated candidates require openclaw_openai_url and openclaw_openai_auth_token_env",
-                ));
-            }
-            if !r.deepseek_gated.is_empty()
-                && (r.deepseek_url.is_none()
-                    || r.deepseek_api_key_env.is_none()
-                    || r.deepseek_currency.is_none())
-            {
-                return Err(RunnerError::configuration(
-                    "deepseek_gated candidates require deepseek_url, deepseek_api_key_env and deepseek_currency",
-                ));
-            }
-            // Both-or-neither for the optional OpenClaw pool credentials.
-            match (&r.openclaw_openai_url, &r.openclaw_openai_auth_token_env) {
-                (None, None) => {}
-                (Some(_), Some(_)) => {}
-                _ => {
-                    return Err(RunnerError::configuration(
-                        "openclaw_openai_url and openclaw_openai_auth_token_env must be set together",
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 }

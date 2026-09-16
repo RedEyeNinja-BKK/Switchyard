@@ -972,13 +972,12 @@ mod tests {
             requests: Mutex::new(Vec::new()),
             first: FirstOutcome::PaymentRequired,
         });
-        let algorithm = Arc::new(CandidateAlgorithm {
-            models: vec!["weak".into(), "strong".into()],
-        });
+        let algorithm = Arc::new(CandidateAlgorithm {});
         let (_, response) = run(
             algorithm,
             ClientRouter::single(client.clone()),
             request(),
+            to_category_map(&["weak", "strong"]),
             None,
         )
         .await?;
@@ -1252,6 +1251,7 @@ mod tests {
                             "ok",
                         )),
                         metadata: None,
+                        upstream_headers: Default::default(),
                     }),
                 }
             }
@@ -1289,10 +1289,15 @@ mod tests {
             ModelId::from("deepseek"),
             Arc::new(deepseek) as Arc<dyn RoutedLlmClient>,
         );
-        let algorithm = Arc::new(CandidateAlgorithm {
-            models: vec!["glm".into(), "qwen".into(), "deepseek".into()],
-        });
-        let (_, response) = run(algorithm, ClientRouter::new(by_model), request(), None).await?;
+        let algorithm = Arc::new(CandidateAlgorithm {});
+        let (_, response) = run(
+            algorithm,
+            ClientRouter::new(by_model),
+            request(),
+            to_category_map(&["glm", "qwen", "deepseek"]),
+            None,
+        )
+        .await?;
 
         // GLM attempted (402), Qwen SKIPPED (same provider already drained),
         // DeepSeek attempted and serves the answer.
@@ -1333,6 +1338,7 @@ mod tests {
                             "ok",
                         )),
                         metadata: None,
+                        upstream_headers: Default::default(),
                     }),
                 }
             }
@@ -1361,10 +1367,15 @@ mod tests {
             ModelId::from("strong"),
             Arc::new(strong) as Arc<dyn RoutedLlmClient>,
         );
-        let algorithm = Arc::new(CandidateAlgorithm {
-            models: vec!["weak".into(), "strong".into()],
-        });
-        let (_, response) = run(algorithm, ClientRouter::new(by_model), request(), None).await?;
+        let algorithm = Arc::new(CandidateAlgorithm {});
+        let (_, response) = run(
+            algorithm,
+            ClientRouter::new(by_model),
+            request(),
+            to_category_map(&["weak", "strong"]),
+            None,
+        )
+        .await?;
 
         // A transient 503 stays candidate-scoped: BOTH same-provider candidates
         // were attempted, and the second served the answer.

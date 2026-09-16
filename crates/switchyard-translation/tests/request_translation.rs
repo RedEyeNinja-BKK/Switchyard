@@ -7,13 +7,13 @@ pub mod common;
 
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
+use switchyard_translation::PreservationPolicy;
 use switchyard_translation::{
     ContentBlock, FormatId, LossyConversionPolicy, TranslationEngine, TranslationPolicy,
     WireFormat, prepare_request_for_target, sanitize_anthropic_tool_use_id,
 };
 
 use common::{REASONING_MODEL, normalized_policy, shell_tool_call};
-use switchyard_translation::PreservationPolicy;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -2548,77 +2548,6 @@ fn responses_flat_file_data_survives_into_chat() -> TestResult {
     Ok(())
 }
 
-// Strict Codex Responses backends reject `system`-role input items ("System
-// messages are not allowed"); they require `developer`. Typed items
-// ({"type":"message","role":"system"}) and untyped role-keyed items alike must
-// normalize to `developer` in the raw body BEFORE preservation capture, so
-// exact-request passthrough stays wire-legal too.
-#[test]
-fn responses_system_role_items_normalize_to_developer_typed_and_untyped() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "gpt-5.6-luna",
-        "input": [
-            {"type": "message", "role": "system", "content": [
-                {"type": "input_text", "text": "typed system"}
-            ]},
-            {"role": "system", "content": [
-                {"type": "input_text", "text": "untyped system"}
-            ]},
-            {"type": "message", "role": "user", "content": [
-                {"type": "input_text", "text": "hi"}
-            ]}
-        ],
-        "stream": true
-    });
-
-    let output = engine
-        .translate_request(
-            WireFormat::OpenAiResponses,
-            WireFormat::OpenAiResponses,
-            &body,
-            &TranslationPolicy::default(),
-        )?
-        .body;
-
-    let input = output["input"]
-        .as_array()
-        .ok_or("Responses input should remain an array")?;
-    assert_eq!(
-        input[0]["role"], "developer",
-        "typed system item must normalize to developer"
-    );
-    assert_eq!(
-        input[1]["role"], "developer",
-        "untyped system item must normalize to developer"
-    );
-    assert_eq!(input[2]["role"], "user", "user item must be untouched");
-    let serialized = serde_json::to_string(&output)?;
-    assert!(
-        !serialized.contains("\"role\":\"system\"") && !serialized.contains("\"role\": \"system\""),
-        "no system role may survive on the Responses wire"
-    );
-    Ok(())
-}
-
-// Embed-preservation replay must also stay wire-legal: preservation metadata is
-// embedded in the translated body, but no `system`-role input item may survive
-// into the outgoing input array.
-#[test]
-fn responses_embed_preservation_replay_has_no_system_role_items() -> TestResult {
-    let engine = TranslationEngine::default();
-    let policy = TranslationPolicy {
-        preservation: PreservationPolicy::Embed,
-        ..TranslationPolicy::default()
-    };
-    let body = json!({
-        "model": "gpt-5.6-luna",
-        "input": [
-            {"type": "message", "role": "system", "content": "Be terse."},
-            {"type": "message", "role": "user", "content": "hi"}
-        ],
-        "stream": true
-
 // Verifies parallel tool calls serialize as adjacent call/output pairs so
 // upstreams that resolve tool outputs by adjacency match the right call.
 #[test]
@@ -2648,22 +2577,6 @@ fn responses_parallel_tool_calls_pair_with_their_outputs() -> TestResult {
         )?
         .body;
 
-    if let Some(input) = output["input"].as_array() {
-        for item in input {
-            assert_ne!(
-                item.get("role").and_then(Value::as_str),
-                Some("system"),
-                "embed-preservation replay must not re-emit system-role items"
-            );
-        }
-    }
-    // Same-format requests under the Embed policy replay the exact preserved
-    // body (cross-format hops carry the metadata envelope instead); the replay
-    // must be a canonical input array with no `system`-role items.
-    assert!(
-        output["input"].is_array(),
-        "replay must keep a canonical input array"
-
     let input = output["input"].as_array().ok_or("input is not an array")?;
     let pairs = input
         .iter()
@@ -2680,18 +2593,6 @@ fn responses_parallel_tool_calls_pair_with_their_outputs() -> TestResult {
     );
     Ok(())
 }
-
-// The Responses encoder must never emit the scalar string `input` shape:
-// single-user-text requests encode as the canonical message-item list (strict
-// Codex backends reject the scalar form; list input is universally accepted by
-// normal /v1/responses endpoints). CodeRabbit finding on PR #619.
-#[test]
-fn responses_encode_never_emits_scalar_string_input() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "gpt-4o",
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "hi"}],
 
 // Verifies Codex `compaction_trigger` marker items never reach the upstream.
 #[test]
@@ -3039,34 +2940,6 @@ fn openai_chat_image_and_file_parts_translate_to_valid_responses_input() -> Test
         )?
         .body;
 
-    let input = output["input"]
-        .as_array()
-        .expect("encoded input must be a message-item list, never a scalar string");
-    assert_eq!(input.len(), 1, "single user text becomes one message item");
-    assert_eq!(
-        input[0].get("type").and_then(Value::as_str),
-        Some("message")
-    );
-    assert_eq!(input[0].get("role").and_then(Value::as_str), Some("user"));
-    Ok(())
-}
-
-// Preserved replay must also stay wire-legal for scalar input: a preserved
-// body carrying the scalar string `input` would otherwise bypass the
-// always-list guarantee, so the replay normalizes it to the canonical single
-// user message-item list. CodeRabbit finding on PR #619.
-#[test]
-fn responses_preserved_scalar_input_replays_as_message_list() -> TestResult {
-    let engine = TranslationEngine::default();
-    let policy = TranslationPolicy {
-        preservation: PreservationPolicy::Embed,
-        ..TranslationPolicy::default()
-    };
-    let body = json!({
-        "model": "gpt-5.6-luna",
-        "input": "hi",
-        "stream": true
-
     assert_eq!(
         output["input"][0]["content"],
         json!([
@@ -3121,277 +2994,6 @@ fn anthropic_base64_media_translates_to_responses() -> TestResult {
 
     let output = engine
         .translate_request(
-            WireFormat::OpenAiResponses,
-            WireFormat::OpenAiResponses,
-            &body,
-            &policy,
-        )?
-        .body;
-
-    let input = output["input"]
-        .as_array()
-        .expect("preserved replay must keep a canonical input list");
-    assert_eq!(
-        input.len(),
-        1,
-        "scalar input becomes exactly one message item"
-    );
-    assert_eq!(
-        input[0].get("type").and_then(Value::as_str),
-        Some("message")
-    );
-    assert_eq!(input[0].get("role").and_then(Value::as_str), Some("user"));
-    assert_eq!(
-        input[0].pointer("/content/0/type").and_then(Value::as_str),
-        Some("input_text")
-    );
-    assert_eq!(
-        input[0].pointer("/content/0/text").and_then(Value::as_str),
-        Some("hi"),
-        "scalar input text must be preserved verbatim"
-    );
-    Ok(())
-}
-
-// Verifies the strict Codex Responses profile encodes assistant history as
-// output_text blocks while non-assistant items keep input-oriented encoding.
-#[test]
-fn strict_codex_profile_encodes_assistant_history_as_output_text() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "route",
-        "messages": [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "earlier answer"},
-            {"role": "user", "content": "more"}
-        ]
-    });
-    let policy = TranslationPolicy {
-        responses_profile: switchyard_translation::ResponsesProfile::StrictCodex,
-        ..normalized_policy()
-    };
-    let translated = engine.translate_request(
-        WireFormat::OpenAiChat,
-        WireFormat::OpenAiResponses,
-        &body,
-        &policy,
-    )?;
-
-    let input = &translated.body["input"];
-    assert_eq!(input[0]["content"], json!("hi"));
-    assert_eq!(
-        input[1]["content"],
-        json!([{"type": "output_text", "text": "earlier answer"}])
-    );
-    assert_eq!(input[2]["content"], json!("more"));
-    assert!(translated.diagnostics.is_empty());
-    Ok(())
-}
-
-// The normal Responses profile never inherits the lossy Codex-specific
-// assistant encoding just because both share the same wire format.
-#[test]
-fn normal_responses_profile_keeps_input_oriented_assistant_encoding() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "route",
-        "messages": [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "earlier answer"}
-        ]
-    });
-    let translated = engine.translate_request(
-        WireFormat::OpenAiChat,
-        WireFormat::OpenAiResponses,
-        &body,
-        &normalized_policy(),
-    )?;
-
-    let input = &translated.body["input"];
-    assert_eq!(input[0]["content"], json!("hi"));
-    assert_eq!(input[1]["content"], json!("earlier answer"));
-    assert!(translated.diagnostics.is_empty());
-    Ok(())
-}
-
-// Non-text blocks in assistant history degrade to textual output_text under
-// the strict Codex profile (with a diagnostic) instead of emitting
-// input-oriented block types the backend rejects.
-#[test]
-fn strict_codex_profile_degrades_assistant_multimodal_content_with_diagnostic() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "route",
-        "messages": [
-            {"role": "user", "content": "annotate"},
-            {"role": "assistant", "content": [
-                {"type": "text", "text": "see"},
-                {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}}
-            ]}
-        ]
-    });
-    let policy = TranslationPolicy {
-        responses_profile: switchyard_translation::ResponsesProfile::StrictCodex,
-        ..normalized_policy()
-    };
-    let translated = engine.translate_request(
-        WireFormat::OpenAiChat,
-        WireFormat::OpenAiResponses,
-        &body,
-        &policy,
-    )?;
-
-    let content = translated.body["input"][1]["content"]
-        .as_array()
-        .ok_or("assistant content should be encoded as blocks")?;
-    assert_eq!(content[0], json!({"type": "output_text", "text": "see"}));
-    assert_eq!(content[1]["type"], "output_text");
-    assert!(translated.diagnostics.iter().any(|diagnostic| {
-        diagnostic.message
-            == "assistant multimodal content degraded to output_text for strict Responses profile"
-    }));
-    Ok(())
-}
-
-// The degradation is assistant-scoped: user multimodal items keep their
-// input-oriented encoding even under the strict Codex profile.
-#[test]
-fn strict_codex_profile_keeps_user_multimodal_content_input_oriented() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "route",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "what is this"},
-                {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}}
-            ]
-        }]
-    });
-    let policy = TranslationPolicy {
-        responses_profile: switchyard_translation::ResponsesProfile::StrictCodex,
-        ..normalized_policy()
-    };
-    let translated = engine.translate_request(
-        WireFormat::OpenAiChat,
-        WireFormat::OpenAiResponses,
-        &body,
-        &policy,
-    )?;
-
-    let content = translated.body["input"][0]["content"]
-        .as_array()
-        .expect("multimodal content stays blocks");
-    assert_eq!(content[1]["type"], "input_image");
-    // The Responses API requires image_url to be a STRING. Emitting the IR
-    // object here made every upstream reject the request with "expected an image
-    // URL, but got an object instead" — pinned so the shape cannot regress.
-    assert_eq!(
-        content[1]["image_url"],
-        json!("https://example.test/x.png"),
-        "input_image.image_url must be a URL string, not the IR object"
-    );
-    assert!(translated.diagnostics.is_empty());
-    Ok(())
-}
-
-// A base64 chat image must reach the Responses wire as a data: URL string, and a
-// nested chat object shape must be unwrapped to its bare URL.
-#[test]
-fn chat_image_shapes_render_as_responses_url_strings() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "route",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "two"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-                {"type": "image_url", "image_url": "https://example.test/bare.png"},
-            ]
-        }]
-    });
-    let translated = engine.translate_request(
-        WireFormat::OpenAiChat,
-        WireFormat::OpenAiResponses,
-        &body,
-        &normalized_policy(),
-    )?;
-
-    let content = translated.body["input"][0]["content"]
-        .as_array()
-        .expect("multimodal content stays blocks");
-    assert_eq!(content[1]["type"], "input_image");
-    assert_eq!(content[1]["image_url"], json!("data:image/png;base64,AAAA"));
-    assert_eq!(content[2]["type"], "input_image");
-    assert_eq!(
-        content[2]["image_url"],
-        json!("https://example.test/bare.png")
-    );
-    let images: Vec<_> = content
-        .iter()
-        .filter(|block| block["type"] == json!("input_image"))
-        .collect();
-    assert_eq!(images.len(), 2);
-    assert!(images.iter().all(|block| block["image_url"].is_string()));
-    assert!(translated.diagnostics.is_empty());
-    Ok(())
-}
-
-// Un-representable image sources must degrade to a TEXT block with a lossy
-// diagnostic rather than emitting a non-string or empty `image_url` (which the
-// upstream rejects for the whole turn). Covers the two refusal paths the
-// 2026-09-11 review required pinning: an empty URL, and an un-normalized base64
-// payload that carries no media type to build a usable data: URL from.
-#[test]
-fn unmappable_image_sources_degrade_to_text_with_diagnostic() -> TestResult {
-    let engine = TranslationEngine::default();
-    let body = json!({
-        "model": "route",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "look"},
-                {"type": "image_url", "image_url": {"url": ""}},
-                {"type": "image_url", "image_url": {"data": "AAAA"}},
-            ]
-        }]
-    });
-    let translated = engine.translate_request(
-        WireFormat::OpenAiChat,
-        WireFormat::OpenAiResponses,
-        &body,
-        &normalized_policy(),
-    )?;
-
-    let content = translated.body["input"][0]["content"]
-        .as_array()
-        .expect("content stays blocks");
-    assert!(
-        content
-            .iter()
-            .all(|block| block["type"] != json!("input_image")),
-        "no image part may be emitted for an unmappable source: {content:?}"
-    );
-    assert!(
-        content.iter().all(|block| match block.get("image_url") {
-            None => true,
-            Some(value) => value.is_string() && !value.as_str().unwrap_or("").is_empty(),
-        }),
-        "an emitted image_url must be a non-empty string: {content:?}"
-    );
-    // Text-only fallbacks keep the input-oriented block type for a user turn.
-    assert!(
-        content
-            .iter()
-            .any(|block| block["type"] == json!("input_text")),
-        "expected an input_text fallback block: {content:?}"
-    );
-    assert!(
-        !translated.diagnostics.is_empty(),
-        "an unmappable image must be reported as a lossy conversion"
-    );
-
             WireFormat::AnthropicMessages,
             WireFormat::OpenAiResponses,
             &body,
@@ -3564,5 +3166,104 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
         )?
         .body;
     assert_eq!(output["input"], outputs);
+    Ok(())
+}
+
+// Strict Codex Responses backends reject `system`-role input items ("System
+// messages are not allowed"); they require `developer`. Typed items
+// ({"type":"message","role":"system"}) and untyped role-keyed items alike must
+// normalize to `developer` in the raw body BEFORE preservation capture, so
+// exact-request passthrough stays wire-legal too.
+#[test]
+fn responses_system_role_items_normalize_to_developer_typed_and_untyped() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "role": "system", "content": [
+                {"type": "input_text", "text": "typed system"}
+            ]},
+            {"role": "system", "content": [
+                {"type": "input_text", "text": "untyped system"}
+            ]},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}
+        ],
+        "stream": true
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let input = output["input"]
+        .as_array()
+        .ok_or("Responses input should remain an array")?;
+    assert_eq!(
+        input[0]["role"], "developer",
+        "typed system item must normalize to developer"
+    );
+    assert_eq!(
+        input[1]["role"], "developer",
+        "untyped system item must normalize to developer"
+    );
+    assert_eq!(input[2]["role"], "user", "user item must be untouched");
+    let serialized = serde_json::to_string(&output)?;
+    assert!(
+        !serialized.contains("\"role\":\"system\"") && !serialized.contains("\"role\": \"system\""),
+        "no system role may survive on the Responses wire"
+    );
+    Ok(())
+}
+// Embed-preservation replay must also stay wire-legal: preservation metadata is
+// embedded in the translated body, but no `system`-role input item may survive
+// into the outgoing input array.
+#[test]
+fn responses_embed_preservation_replay_has_no_system_role_items() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: PreservationPolicy::Embed,
+        ..TranslationPolicy::default()
+    };
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "role": "system", "content": "Be terse."},
+            {"type": "message", "role": "user", "content": "hi"}
+        ],
+        "stream": true
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    if let Some(input) = output["input"].as_array() {
+        for item in input {
+            assert_ne!(
+                item.get("role").and_then(Value::as_str),
+                Some("system"),
+                "embed-preservation replay must not re-emit system-role items"
+            );
+        }
+    }
+    // Same-format requests under the Embed policy replay the exact preserved
+    // body (cross-format hops carry the metadata envelope instead); the replay
+    // must be a canonical input array with no `system`-role items.
+    assert!(
+        output["input"].is_array(),
+        "replay must keep a canonical input array"
+    );
     Ok(())
 }

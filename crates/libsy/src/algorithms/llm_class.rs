@@ -1546,6 +1546,7 @@ mod tests {
                 ..LlmRequest::default()
             },
             raw_request: None,
+            candidate_input_tokens: Default::default(),
             metadata: None,
         };
 

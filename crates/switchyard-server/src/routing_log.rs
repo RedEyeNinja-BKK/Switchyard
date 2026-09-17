@@ -59,6 +59,7 @@ impl RoutingLog {
             trial_id: context.trial_id.map(Cow::Owned),
             session_id: context.session_id.map(Cow::Owned),
             requested_model: context.requested_model.map(Cow::Owned),
+            route_reasoning_policy: context.route_reasoning_policy,
             model: model.into(),
             tier: tier.unwrap_or("").into(),
             prompt_tokens: usage.prompt_tokens,
@@ -117,6 +118,10 @@ pub(crate) struct RoutingLogContext {
     /// attribute traffic to a lane. `model` is left byte-identical for existing consumers
     /// (dashboards, the econ join); this field is purely additive and optional.
     requested_model: Option<String>,
+    /// The serving route's authoritative reasoning policy (`"none"`, `"medium"`,
+    /// ...), or `None` when the route declares no policy. Purely additive and
+    /// optional: consumers see the key only when a policy exists.
+    route_reasoning_policy: Option<String>,
 }
 
 impl RoutingLogContext {
@@ -126,6 +131,7 @@ impl RoutingLogContext {
         Self {
             route_id: String::new(),
             algorithm: String::new(),
+            route_reasoning_policy: None,
             origin: headers
                 .and_then(|headers| nonempty_header(headers, ORIGIN_HEADER))
                 .map(str::to_string),
@@ -148,6 +154,15 @@ impl RoutingLogContext {
     pub(crate) fn with_requested_model(mut self, requested_model: Option<String>) -> Self {
         self.requested_model = requested_model;
 
+        self
+    }
+
+    /// Attaches the route's authoritative reasoning policy for this record.
+    pub(crate) fn with_route_reasoning_policy(
+        mut self,
+        policy: Option<switchyard_protocol::ReasoningPolicy>,
+    ) -> Self {
+        self.route_reasoning_policy = policy.map(|policy| policy.as_str().to_string());
         self
     }
 
@@ -187,6 +202,9 @@ struct RoutingRecord<'a> {
     completion_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
+    /// Route-authoritative reasoning policy in force for this record's route
+    /// (`"none"`, `"low"`, ...). Absent for routes without a policy.
+    route_reasoning_policy: Option<String>,
 }
 
 /// Session totals returned by the routing stats endpoint.

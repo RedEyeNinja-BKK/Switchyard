@@ -139,6 +139,16 @@ pub type ServerResult<T> = std::result::Result<T, ServerError>;
 struct DecisionResponse {
     selected: DecisionTargetResponse,
     fallbacks: Vec<DecisionTargetResponse>,
+    /// The route's declared authoritative reasoning policy (`"none"`,
+    /// `"low"`, ...). `null` = absent: the route carries no policy and
+    /// caller/target reasoning semantics apply unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_reasoning_policy: Option<&'static str>,
+    /// Whether the policy above was explicitly declared (forced) on the
+    /// route or simply absent. Always `false` today; the explicit flag
+    /// keeps the distinction observable once aliases are activated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_reasoning_policy_source: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response: Option<Value>,
 }
@@ -319,9 +329,15 @@ impl ServerState {
             },
             extra_body: target.extra_body,
         };
+        let route_reasoning_policy = self
+            .runner
+            .route(route_model.as_str())
+            .and_then(|route| route.reasoning_policy());
         Some(DecisionResponse {
             selected: convert(description.selected),
             fallbacks: description.fallbacks.into_iter().map(convert).collect(),
+            route_reasoning_policy: route_reasoning_policy.map(|policy| policy.as_str()),
+            route_reasoning_policy_source: route_reasoning_policy.map(|_| "route_declaration"),
             response,
         })
     }
@@ -1314,10 +1330,12 @@ async fn handle_llm_request(
     // FleetRouter pure.
     let request = prepare_candidate_context_facts(route, request).await;
     let routing_log_context = routing_log_context.map(|context| {
-        context.with_route(
-            request.llm_request.model.as_deref().unwrap_or_default(),
-            route.algorithm_name(),
-        )
+        context
+            .with_route(
+                request.llm_request.model.as_deref().unwrap_or_default(),
+                route.algorithm_name(),
+            )
+            .with_route_reasoning_policy(route.reasoning_policy())
     }); // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let observer = stats_observer(

@@ -1381,6 +1381,88 @@ base_threshold = 0.5
 
 /// Decision-only routing returns callable metadata and preserves any answer produced while routing.
 #[tokio::test]
+async fn decision_reports_route_reasoning_policy_fields() -> TestResult {
+    // §5 observability: /v1/decision must expose the route's declared
+    // reasoning policy (and its source) so Gate 2/3 qualifications can prove
+    // the effective policy without reading configs; routes without a policy
+    // must omit the fields entirely (backward-compatible shape).
+    let model_upstream = MockUpstream::start().await?;
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.provider]
+format = "openai_chat"
+base_url = "{model_url}"
+reasoning_dialect = "openai_effort"
+
+[targets.neutral]
+id = "model/neutral"
+llm_client = "provider"
+
+[routes.policy_route]
+id = "switchyard/policy"
+type = "passthrough"
+target = "neutral"
+reasoning_policy = "none"
+
+[routes.plain_route]
+id = "switchyard/plain"
+type = "passthrough"
+target = "neutral"
+"#,
+        model_url = model_upstream.base_url,
+    ))?;
+    let app = build_switchyard_router(state);
+
+    let with_policy = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "switchyard/policy",
+                "messages": [{"role": "user", "content": "hi"}]
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(with_policy.status, StatusCode::OK);
+    let body = with_policy.json()?;
+    assert_eq!(body["route_reasoning_policy"], json!("none"));
+    assert_eq!(
+        body["route_reasoning_policy_source"],
+        json!("route_declaration")
+    );
+    assert_eq!(body["selected"]["target"], json!("neutral"));
+
+    let without_policy = send(
+        &app,
+        "POST",
+        "/v1/decision",
+        Some(json!({
+            "input_format": "openai_chat",
+            "request": {
+                "model": "switchyard/plain",
+                "messages": [{"role": "user", "content": "hi"}]
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(without_policy.status, StatusCode::OK);
+    let body = without_policy.json()?;
+    assert!(
+        body.get("route_reasoning_policy").is_none(),
+        "policy-absent routes must omit the field: {body}"
+    );
+    assert!(
+        body.get("route_reasoning_policy_source").is_none(),
+        "policy-absent routes must omit the source field: {body}"
+    );
+    Ok(())
+}
+
 async fn decision_returns_callable_target_and_routing_answer() -> TestResult {
     let judge_upstream = MockUpstream::start().await?;
     let model_upstream = MockUpstream::start().await?;

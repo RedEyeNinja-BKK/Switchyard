@@ -107,7 +107,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
             .map(|value| {
                 switchyard_protocol::ReasoningPolicy::parse(&value).ok_or_else(|| {
                     serde::de::Error::custom(format!(
-                        "unknown reasoning_policy {value:?}; expected one of none, low, medium, high, max"
+                        "unknown reasoning_policy {value:?}; expected one of none, enabled, low, \
+                         medium, high, xhigh, max"
                     ))
                 })
             })
@@ -254,8 +255,14 @@ impl DeploymentConfig {
     /// * the target's llm client MUST declare a `reasoning_dialect` — a
     ///   policy-bearing route reaching a dialect-less client is a configuration
     ///   error, never a runtime downgrade;
-    /// * the dialect must honor the policy (every current dialect expresses
-    ///   both modes; unknown future dialects fail here);
+    /// * the dialect must honor the policy under the client's DECLARED
+    ///   vocabulary (`honors_with_vocabulary`): the boolean dialects accept
+    ///   only `none`/`enabled`, effort-bearing dialects require the exact
+    ///   policy to be listed in `reasoning_efforts` (`enabled` is rejected
+    ///   there — there is no tested provider-default-effort representation),
+    ///   and `chat_template_reasoning_effort` additionally gives `none` its
+    ///   fixed observed shape without needing a vocabulary; unknown future
+    ///   dialects fail here;
     /// * a hard reasoning pin on the TARGET (`reasoning_effort` or a reasoning
     ///   key in `extra_body`) CONTRADICTS the route policy — two authoritative
     ///   sources must not fight; the neutral-target end state is no target pin.
@@ -830,8 +837,9 @@ struct LlmClientConfig {
     ///   `chat_template_kwargs.reasoning_effort = "<policy>"` (the ComfyNinja
     ///   Q3/Q4 contract: effort-bearing thinking side, boolean NT side).
     ///
-    /// Effort vocabulary: boolean dialects collapse any thinking policy to
-    /// their native "on" semantic (part of the dialect contract, tested). An
+    /// Effort vocabulary: boolean dialects express exactly `none` and
+    /// `enabled` (their native off/on semantics) and REJECT every exact
+    /// effort rather than collapsing it to a bare switch. An
     /// `openai_effort` client passes the effort string through VERBATIM, and
     /// providers differ on what they accept (e.g. DeepSeek documents
     /// none|low|high|max with no `medium`; OpenRouter and OpenAI vocabularies
@@ -842,7 +850,9 @@ struct LlmClientConfig {
     /// outside it is a configuration error, never a silent approximation.
     reasoning_dialect: Option<switchyard_protocol::ReasoningDialect>,
     /// The authoritative effort vocabulary of this client's upstream, required
-    /// for `openai_effort` clients reachable from policy-bearing routes.
+    /// for every effort-bearing dialect (`openai_effort`,
+    /// `chat_template_reasoning_effort`) reachable from policy-bearing routes;
+    /// boolean-dialect clients never need one.
     /// Values use the dialect's wire spelling (e.g. "none", "medium").
     reasoning_efforts: Option<Vec<String>>,
 }

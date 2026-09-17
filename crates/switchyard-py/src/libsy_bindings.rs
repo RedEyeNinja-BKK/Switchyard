@@ -693,6 +693,8 @@ impl PyAlgorithm {
             raw_request: None,
             metadata: headers.map(|headers| Metadata::from_headers(&headers)),
             candidate_input_tokens: Default::default(),
+            // Python binding entry path: no route reasoning policy.
+            route_reasoning_policy: None,
         };
         let mut runtime_models = RuntimeModels::new(category_models_from_python(models)?);
         if let Some(subagent_models) = subagent_models {

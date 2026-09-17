@@ -59,6 +59,7 @@ fn request(headers: &[(&str, &str)]) -> Request {
         raw_request: None,
         metadata: Some(Metadata::from_headers(&slice_to_header_map(headers))),
         candidate_input_tokens: Default::default(),
+        ..Default::default()
     }
 }
 

@@ -332,6 +332,7 @@ async fn call_one(
     // count is for span log
     count: usize,
 ) -> Result<Response> {
+    let route_policy = request.route_reasoning_policy;
     let span = tracing::Span::current();
     observability::record_gen_ai_request(&span, &request.llm_request);
     if let Some(session_id) = request
@@ -350,6 +351,17 @@ async fn call_one(
         Err(error) => Err(error),
     }
     .map_err(|source| LibsyError::client_call(model_id.clone(), source));
+    // Gate 1 observability: a route-imposed reasoning policy must be
+    // attributable per attempt - requested policy, selected target, outcome.
+    if let Some(policy) = route_policy {
+        tracing::info!(
+            target: "switchyard_server::request",
+            target = %model_id,
+            route_reasoning_policy = %policy,
+            outcome = if result.is_ok() { "ok" } else { "error" },
+            "route reasoning policy applied to candidate"
+        );
+    }
     let duration = started.elapsed();
 
     let result = result.map(|mut response| {
@@ -517,8 +529,8 @@ mod tests {
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
     use switchyard_protocol::{
-        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, completion_text,
-        text_request, text_response,
+        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, ReasoningPolicy,
+        completion_text, text_request, text_response,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -659,6 +671,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -1030,6 +1043,7 @@ mod tests {
                 reasoning_effort: None,
                 max_retries: 2,
                 strip_reasoning_content: false,
+                reasoning_dialect: None,
             })
         };
         let client = Arc::new(
@@ -1128,6 +1142,7 @@ mod tests {
                 reasoning_effort: None,
                 max_retries: 0,
                 strip_reasoning_content: false,
+                reasoning_dialect: None,
             })
         };
         let client = Arc::new(
@@ -1145,6 +1160,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         };
         let result = run(
             algorithm,
@@ -1381,6 +1397,51 @@ mod tests {
         // were attempted, and the second served the answer.
         assert_eq!(&*calls.lock(), &[ModelId::from("weak"), "strong".into()]);
         assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn route_reasoning_policy_survives_fallback_to_next_candidate() -> Result<()> {
+        // Gate 1 contract: the route's reasoning policy must ride the request
+        // through candidate selection, retry, and FALLBACK unchanged. The
+        // first candidate fails with a context-window overflow (a fallback-
+        // worthy failure); the fallback candidate's captured request must
+        // still carry the route policy stamped at entry.
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::ContextWindow,
+        });
+        let routed_client: Arc<dyn RoutedLlmClient> = client.clone();
+        let clients = ClientRouter::new(HashMap::from([
+            (ModelId::from("weak"), routed_client.clone()),
+            (ModelId::from("strong"), routed_client),
+        ]));
+
+        let mut request = request();
+        request.route_reasoning_policy = Some(ReasoningPolicy::None);
+        run(
+            Arc::new(CandidateAlgorithm {}),
+            clients,
+            request,
+            to_category_map(&["weak", "strong"]),
+            None,
+        )
+        .await?;
+
+        let requests = client.requests.lock();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one failed attempt + one fallback attempt"
+        );
+        for (index, captured) in requests.iter().enumerate() {
+            assert_eq!(
+                captured.route_reasoning_policy,
+                Some(ReasoningPolicy::None),
+                "attempt {index} must carry the route policy unchanged"
+            );
+        }
         Ok(())
     }
 }

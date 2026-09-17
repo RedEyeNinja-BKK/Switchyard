@@ -1275,6 +1275,11 @@ fn resolve_route_for_model<'a>(
         raw_request: Some(body),
         candidate_input_tokens: Default::default(),
         metadata: Some(metadata),
+        // Caller input can never carry the route's authoritative reasoning
+        // policy: it is stamped by the route itself at execution entry, which
+        // is what makes it authoritative. Unknown caller body keys are never
+        // decoded into the envelope, so there is nothing to reject here.
+        route_reasoning_policy: None,
     };
     Ok((route, request))
 }

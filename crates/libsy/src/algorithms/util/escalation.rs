@@ -371,6 +371,7 @@ pub(crate) fn request_at_turn(session_id: Option<&str>, turn: usize) -> Request 
             ..Metadata::default()
         }),
         candidate_input_tokens: Default::default(),
+        ..Default::default()
     }
 }
 

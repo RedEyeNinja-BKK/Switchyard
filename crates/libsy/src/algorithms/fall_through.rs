@@ -383,6 +383,7 @@ mod tests {
                 ..Metadata::default()
             }),
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -457,6 +458,7 @@ mod tests {
                 raw_request: None,
                 candidate_input_tokens: Default::default(),
                 metadata: None,
+                ..Default::default()
             },
             category_models(Category::Any, &["capable", "efficient"]),
             capturing(Arc::clone(&captured)),

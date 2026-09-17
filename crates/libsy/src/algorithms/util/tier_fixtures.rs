@@ -130,5 +130,6 @@ pub(crate) fn turn_request(failed: bool) -> Request {
             ..Default::default()
         }),
         candidate_input_tokens: Default::default(),
+        route_reasoning_policy: None,
     }
 }

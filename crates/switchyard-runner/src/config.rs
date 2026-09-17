@@ -79,6 +79,10 @@ struct RouteConfig {
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
     vision: Option<bool>,
+    /// Route-authoritative reasoning policy (`reasoning_policy = "none" | "low" |
+    /// "medium" | "high" | "max"`). Intent, not provider syntax: every target the
+    /// route can reach must be able to honor it, checked at load time.
+    reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
     algorithm: AlgorithmSpec,
 }
 
@@ -99,6 +103,15 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision =
             take_optional(&mut table, "vision")?.or(take_optional(&mut table, "supports_vision")?);
+        let reasoning_policy = take_optional::<String, _>(&mut table, "reasoning_policy")?
+            .map(|value| {
+                switchyard_protocol::ReasoningPolicy::parse(&value).ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "unknown reasoning_policy {value:?}; expected one of none, low, medium, high, max"
+                    ))
+                })
+            })
+            .transpose()?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -107,6 +120,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             tool_calling,
             reasoning,
             vision,
+            reasoning_policy,
             algorithm,
         })
     }
@@ -231,6 +245,76 @@ impl DeploymentConfig {
         Ok(())
     }
 
+    /// Validates a route's authoritative reasoning policy against every target
+    /// the route can reach (candidates, routing targets, escalation excluded —
+    /// the destination route re-validates under its own policy at its own
+    /// entry).
+    ///
+    /// Fail-closed rules, evaluated per reachable target:
+    /// * the target's llm client MUST declare a `reasoning_dialect` — a
+    ///   policy-bearing route reaching a dialect-less client is a configuration
+    ///   error, never a runtime downgrade;
+    /// * the dialect must honor the policy (every current dialect expresses
+    ///   both modes; unknown future dialects fail here);
+    /// * a hard reasoning pin on the TARGET (`reasoning_effort` or a reasoning
+    ///   key in `extra_body`) CONTRADICTS the route policy — two authoritative
+    ///   sources must not fight; the neutral-target end state is no target pin.
+    fn validate_route_reasoning_policy(
+        &self,
+        route_name: &str,
+        route: &RouteConfig,
+        policy: &switchyard_protocol::ReasoningPolicy,
+        llm_clients: &BTreeMap<String, LlmClientConfig>,
+    ) -> RunnerResult<()> {
+        let mut checked = std::collections::BTreeSet::new();
+        for target_name in route.callable_target_names() {
+            let target = self.targets.get(target_name).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "route {route_name} references unknown target {target_name}"
+                ))
+            })?;
+            if !checked.insert(target_name) {
+                continue;
+            }
+            let client_config = llm_clients.get(&target.llm_client).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} references unknown llm client {}",
+                    target.llm_client
+                ))
+            })?;
+            if target.reasoning_effort.is_some()
+                || target_extra_body_pins_reasoning(&target.extra_body)
+            {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares reasoning_policy = {policy} but target {target_name} \
+                     also carries a hard reasoning pin (reasoning_effort or extra_body reasoning key); \
+                     route policy and target hard pins must not fight — give the target no reasoning \
+                     pin (that is what makes it neutral) and let the route decide"
+                )));
+            }
+            match &client_config.reasoning_dialect {
+                None => {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                         llm client {} declares no reasoning_dialect; add reasoning_dialect to the \
+                         [llm_clients.{}] section or drop the route policy",
+                        target.llm_client, target.llm_client
+                    )));
+                }
+                Some(dialect) => {
+                    if !dialect.honors(*policy) {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                             llm client {} speaks dialect {dialect:?} which cannot express it",
+                            target.llm_client
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn decision_target(&self, name: &str) -> Option<DecisionTarget> {
         let target = self.targets.get(name)?;
         let client = self.llm_clients.get(&target.llm_client)?;
@@ -327,10 +411,25 @@ impl DeploymentConfig {
                 })?;
             }
             config.validate_fleet_capabilities(route_name)?;
+            if let Some(policy) = &config.reasoning_policy {
+                self.validate_route_reasoning_policy(
+                    route_name,
+                    config,
+                    policy,
+                    &self.llm_clients,
+                )?;
+            }
             let mut capabilities = config.capabilities();
             if let AlgorithmSpec::FleetRouter { candidates, .. } = &config.algorithm {
                 let any_vision = candidates.iter().any(|candidate| candidate.supports_vision);
                 capabilities.supports_vision = capabilities.supports_vision.or(Some(any_vision));
+            }
+            // A declared reasoning policy IS the route's reasoning capability:
+            // advertisement derives from the effective policy (the legacy
+            // `reasoning` boolean remains an independent declaration and is
+            // only overridden where the policy actually governs).
+            if let Some(policy) = &config.reasoning_policy {
+                capabilities.reasoning = Some(policy.is_thinking());
             }
             if capabilities.context_window == Some(0) {
                 return Err(RunnerError::configuration(format!(
@@ -380,6 +479,7 @@ impl DeploymentConfig {
                 config.algorithm.escalation_destination().cloned(),
                 config.algorithm.escalation_threshold(),
             );
+            let route = route.with_reasoning_policy(config.reasoning_policy);
             routes.push((config.id.clone(), route));
         }
         let runner = Runner::new(routes)
@@ -674,6 +774,24 @@ struct LlmClientConfig {
     extra_headers: BTreeMap<String, String>,
     #[serde(default = "default_max_retries")]
     max_retries: u32,
+    /// Reasoning-control dialect of this client's upstream: how an abstract
+    /// route [`ReasoningPolicy`] is expressed on the wire. `Responses is the
+    /// common transport, not the reasoning dialect` — two clients can share
+    /// `format = "openai_responses"` yet speak different reasoning controls.
+    /// Required whenever some route policy must be enforced through this
+    /// client; a route that declares a `reasoning_policy` and reaches a
+    /// client without one fails configuration.
+    ///
+    /// * `openai_effort` — `reasoning.effort = "<policy>"` with effort `none`
+    ///   disabling reasoning (DeepSeek, OpenAI, and OpenAI-compatible
+    ///   Responses endpoints); preserves effort gradations verbatim.
+    /// * `openrouter_enabled` — `reasoning = { enabled = <bool> }` (OpenRouter);
+    ///   a thinking policy collapses to "enabled" (the endpoint cannot
+    ///   express amounts).
+    /// * `llama_cpp_enable_thinking` —
+    ///   `chat_template_kwargs.enable_thinking = <bool>` (llama.cpp-derived
+    ///   Qwen template endpoints); same boolean-collapse semantics.
+    reasoning_dialect: Option<switchyard_protocol::ReasoningDialect>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -744,6 +862,18 @@ fn resolve_category_models(
         .collect()
 }
 
+/// Whether a target's `extra_body` carries a hard reasoning-control pin
+/// (`reasoning`, `reasoning_effort`, or `chat_template_kwargs.enable_thinking`
+/// at the top level of the target's defaults).
+fn target_extra_body_pins_reasoning(extra_body: &BTreeMap<String, Value>) -> bool {
+    extra_body.contains_key("reasoning")
+        || extra_body.contains_key("reasoning_effort")
+        || extra_body
+            .get("chat_template_kwargs")
+            .and_then(Value::as_object)
+            .is_some_and(|kwargs| kwargs.contains_key("enable_thinking"))
+}
+
 fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
@@ -791,6 +921,7 @@ fn build_backend(
         extra_body: extra_body.clone(),
         reasoning_effort,
         strip_reasoning_content,
+        reasoning_dialect: config.reasoning_dialect,
         max_retries: config.max_retries,
     };
     let backend = match config.format {
@@ -2022,5 +2153,138 @@ advisor_target = "advisor"
             "advisor_target = \"advisor\"\nmax_reviews = 0",
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
+    }
+
+    // ---- Route-authoritative reasoning policy (Gate 1 P-battery) ------------
+
+    const POLICY_TOML_NONE: &str = "reasoning_policy = \"none\"";
+
+    fn policy_config(route_block: &str, extra: &str) -> String {
+        // A minimal fleet-free route set: one passthrough route on the primary
+        // (chat) client plus one on the responses client, each with its own
+        // target and a declared reasoning dialect.
+        format!(
+            r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+reasoning_dialect = "openai_effort"
+
+[targets.neutral_chat]
+id = "neutral-chat/model"
+llm_client = "primary"
+
+[targets.neutral_responses]
+id = "neutral-responses/model"
+llm_client = "responses"
+
+[routes.passthrough]
+id = "switchyard/passthrough"
+type = "passthrough"
+target = "neutral_chat"
+{route_block}
+
+[routes.passthrough_responses]
+id = "switchyard/passthrough-responses"
+type = "passthrough"
+target = "neutral_responses"
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn route_policy_none_with_dialect_parses_and_builds() -> RunnerResult<()> {
+        let configured = policy_config(POLICY_TOML_NONE, "");
+        let runner = runner_from_toml(&configured)?;
+        // Build succeeded: route policy accepted with a declared dialect.
+        assert!(runner.route("switchyard/passthrough").is_some());
+        assert_eq!(
+            runner
+                .route("switchyard/passthrough")
+                .and_then(|route| route.reasoning_policy()),
+            Some(switchyard_protocol::ReasoningPolicy::None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn route_policy_requires_dialect_on_every_reachable_client() {
+        // Strip the chat client's dialect, then give its route a policy —
+        // the policy-bearing route reaches a dialect-less client and must fail.
+        let configured = policy_config(POLICY_TOML_NONE, "")
+            .replace("reasoning_dialect = \"llama_cpp_enable_thinking\"\n", "");
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("declares no reasoning_dialect"),
+            "unexpected error: {actual}"
+        );
+    }
+
+    #[test]
+    fn route_policy_rejects_target_hard_reasoning_pin() {
+        // A target carrying a reasoning pin + a route policy = contradictory
+        // authoritative sources -> configuration error.
+        let configured = policy_config(POLICY_TOML_NONE, "").replace(
+            "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"",
+            "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"\n\
+             reasoning_effort = \"medium\"",
+        );
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("must not fight"),
+            "unexpected error: {actual}"
+        );
+    }
+
+    #[test]
+    fn route_policy_rejects_target_extra_body_reasoning_pin() {
+        for pin in [
+            "extra_body = { reasoning = { effort = \"none\" } }",
+            "extra_body = { reasoning_effort = \"low\" }",
+            "extra_body = { chat_template_kwargs = { enable_thinking = true } }",
+        ] {
+            let configured = policy_config(POLICY_TOML_NONE, "").replace(
+                "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"",
+                &format!(
+                    "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"\n{pin}"
+                ),
+            );
+            let actual = error_message(&configured);
+            assert!(
+                actual.contains("must not fight"),
+                "unexpected error for pin {pin}: {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_policy_unknown_value_fails_parse() {
+        let configured = policy_config("reasoning_policy = \"sometimes\"", "");
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("unknown reasoning_policy"),
+            "unexpected error: {actual}"
+        );
+    }
+
+    #[test]
+    fn target_pins_without_route_policy_unchanged() -> RunnerResult<()> {
+        // The fail-closed rule is scoped to policy-bearing routes: a plain
+        // target pin with NO route policy keeps today's behavior exactly.
+        let configured = policy_config("", "").replace(
+            "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"",
+            "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"\n\
+             reasoning_effort = \"medium\"",
+        );
+        runner_from_toml(&configured)?;
+        Ok(())
     }
 }

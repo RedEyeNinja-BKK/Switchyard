@@ -618,6 +618,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         }
     }
 

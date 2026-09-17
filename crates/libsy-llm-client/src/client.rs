@@ -241,6 +241,10 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 model,
                 UpstreamEndpoint::Auxiliary(operation),
+                // Auxiliary operations (token counting, compaction) carry no
+                // route reasoning policy: they are infrastructure calls, not
+                // completion traffic, and their bodies must not be policy-shaped.
+                None,
             )
             .await?;
         let EncodedResponse::Buffered { body, .. } = http_response else {
@@ -303,6 +307,10 @@ impl TranslatingLlmClient {
     /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
     /// backend's completion URL and decodes a response) and
     /// the model-bearing auxiliary operations, which return raw JSON.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the route policy rides alongside the existing send parameters; a params struct would churn every caller"
+    )]
     async fn send_encoded(
         &self,
         backend: &Backend,
@@ -311,6 +319,7 @@ impl TranslatingLlmClient {
         metadata: Option<&Metadata>,
         model: &ModelId,
         endpoint: UpstreamEndpoint,
+        route_policy: Option<switchyard_protocol::ReasoningPolicy>,
     ) -> Result<EncodedResponse> {
         // The destination profile is a property of the backend class (the same
         // path-boundary rule that classifies strict Codex endpoints), not of
@@ -398,6 +407,35 @@ impl TranslatingLlmClient {
                 && let Value::Object(object) = &mut body
             {
                 object.insert("stream".to_string(), Value::Bool(true));
+            }
+        }
+        // Route-authoritative reasoning policy (opt-in per route): translated
+        // through the backend's declared dialect and merged AFTER the target
+        // defaults + the target effort override so the route's intent is the
+        // final authority for any target it reaches. A policy-bearing request
+        // reaching a dialect-less backend fails closed here — downgrade-by-
+        // silence is exactly what this mechanism must never do.
+        if let Some(policy) = route_policy {
+            match backend.reasoning_dialect() {
+                Some(dialect) => match dialect.wire_body(policy) {
+                    Some(wire) => merge_authoritative_object(&mut body, &wire),
+                    None => {
+                        return Err(LlmClientError::Configuration {
+                            message: format!(
+                                "route reasoning policy {policy} cannot be expressed by dialect {dialect:?} \
+                                 on model {model:?}; refusing to send a downgraded request"
+                            ),
+                        });
+                    }
+                },
+                None => {
+                    return Err(LlmClientError::Configuration {
+                        message: format!(
+                            "request carries route reasoning policy {policy} but model {model:?}'s backend \
+                             declares no reasoning_dialect; refusing to send an uncontrolled request"
+                        ),
+                    });
+                }
             }
         }
         let streaming = endpoint.allows_streaming()
@@ -644,6 +682,7 @@ impl TranslatingLlmClient {
         let Request {
             mut llm_request,
             metadata,
+            route_reasoning_policy,
             ..
         } = request;
 
@@ -678,6 +717,7 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 &model_id,
                 UpstreamEndpoint::Completion,
+                route_reasoning_policy,
             )
             .await?;
 
@@ -813,6 +853,9 @@ impl TranslatingLlmClient {
                 ..Default::default()
             }),
             candidate_input_tokens: Default::default(),
+            // call_rewrite_model_raw is a raw-body entry (test/console paths);
+            // no route policy is attached here.
+            route_reasoning_policy: None,
         };
         let response = self.call_rewrite_model(request, model).await?;
 
@@ -1438,6 +1481,27 @@ fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     }
 }
 
+/// Merges an authoritative policy object into the outbound body: the policy's
+/// top-level key (e.g. `reasoning`, `chat_template_kwargs`) REPLACES any
+/// caller-supplied value wholesale, and a caller's flat `reasoning_effort` is
+/// dropped when the policy key is `reasoning` (one canonical representation
+/// per request). Applied after `merge_extra_body` and after the target effort
+/// override — the route policy is the final authority for targets it reaches.
+fn merge_authoritative_object(body: &mut Value, policy_wire: &Value) {
+    let Value::Object(policy) = policy_wire else {
+        return;
+    };
+    let Value::Object(object) = body else {
+        return;
+    };
+    for (key, value) in policy {
+        object.insert(key.clone(), value.clone());
+    }
+    if policy.contains_key("reasoning") {
+        object.remove("reasoning_effort");
+    }
+}
+
 // Enforces exactly ONE canonical reasoning representation per upstream request
 // on OpenAI-family backends (OpenAI Chat and OpenAI Responses; Anthropic has a
 // separate thinking contract), and makes the TARGET's reasoning pin
@@ -1677,7 +1741,7 @@ mod tests {
     use std::thread::JoinHandle;
 
     use serde_json::json;
-    use switchyard_protocol::{completion_text, text_request};
+    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy, completion_text, text_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1694,6 +1758,7 @@ mod tests {
             reasoning_effort: None,
             max_retries: 0,
             strip_reasoning_content: false,
+            reasoning_dialect: None,
         }
     }
 
@@ -1838,6 +1903,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2940,6 +3006,7 @@ mod tests {
                 ..Default::default()
             }),
             candidate_input_tokens: Default::default(),
+            route_reasoning_policy: None,
         };
 
         let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
@@ -4318,6 +4385,282 @@ mod tests {
             Some("ref-1"),
         );
         Ok(())
+    }
+    // ---- Route-authoritative reasoning policy: outbound-wire proofs ---------
+    // These tests are the "independent outbound-wire proof" the patch's
+    // acceptance contract requires: a wiremock capture of the actual upstream
+    // body, not a trace of received events.
+
+    fn chat_map_with_dialect(base_url: &str, dialect: ReasoningDialect) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.reasoning_dialect = Some(dialect);
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn responses_map_with_dialect(base_url: &str, dialect: ReasoningDialect) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.reasoning_dialect = Some(dialect);
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
+    }
+
+    fn policy_request(policy: ReasoningPolicy, caller_reasoning: Value) -> Request {
+        let mut llm_request = text_request(Some("gpt".to_string()), "hi");
+        if !caller_reasoning.is_null() {
+            // Caller-supplied reasoning rides the provider extensions map the
+            // same way a real caller's effort knob does on the chat leg.
+            llm_request
+                .extensions
+                .fields
+                .insert("reasoning".to_string(), caller_reasoning);
+        }
+        Request {
+            llm_request,
+            raw_request: None,
+            metadata: None,
+            candidate_input_tokens: Default::default(),
+            route_reasoning_policy: Some(policy),
+        }
+    }
+
+    async fn captured_chat_body(
+        dialect: ReasoningDialect,
+        policy: ReasoningPolicy,
+        caller_reasoning: Value,
+        merge_reasoning_pin: Option<Value>,
+    ) -> Value {
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let models = match merge_reasoning_pin {
+            Some(pin) => {
+                let mut backend = config(&format!("{}/v1", server.uri()));
+                backend.reasoning_dialect = Some(dialect);
+                backend.extra_body.insert("reasoning".to_string(), pin);
+                vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+            }
+            None => chat_map_with_dialect(&format!("{}/v1", server.uri()), dialect),
+        };
+        let client = TranslatingLlmClient::new(&models).unwrap();
+        client
+            .call_rewrite_model(policy_request(policy, caller_reasoning), None)
+            .await
+            .expect("policy-bearing request must serve");
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_defeats_caller_high_on_the_wire() {
+        let body = captured_chat_body(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::None,
+            json!({"effort": "high"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("none"),
+            "route policy none must be the final wire authority over caller high: {body}"
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "flat reasoning_effort must not ride alongside the route policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_medium_defeats_caller_none_on_the_wire() {
+        let body = captured_chat_body(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::Medium,
+            json!({"effort": "none"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("medium"),
+            "route policy medium must re-enable reasoning against caller none: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_translates_through_openrouter_dialect() {
+        let body = captured_chat_body(
+            ReasoningDialect::OpenRouterEnabled,
+            ReasoningPolicy::None,
+            json!({"effort": "high"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/reasoning/enabled").and_then(Value::as_bool),
+            Some(false),
+            "openrouter dialect must express none as reasoning.enabled=false: {body}"
+        );
+        assert!(
+            body.pointer("/reasoning/effort").is_none(),
+            "the effort key must not leak into the openrouter dialect body"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_translates_through_llamacpp_dialect() {
+        let body = captured_chat_body(
+            ReasoningDialect::LlamaCppEnableThinking,
+            ReasoningPolicy::None,
+            json!({"effort": "high"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/chat_template_kwargs/enable_thinking")
+                .and_then(Value::as_bool),
+            Some(false),
+            "llama.cpp dialect must express none as enable_thinking=false: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_beats_a_target_reasoning_pin() {
+        // Defense in depth: a target hard pin cannot coexist with a policy on
+        // the SAME route (config error), but a caller could still hand-craft a
+        // policy-bearing request at the client layer - the route policy must
+        // still be the final writer on the wire.
+        let body = captured_chat_body(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::None,
+            json!({"effort": "high"}),
+            Some(json!({"effort": "high"})),
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("none"),
+            "route policy must overwrite even a target's merged reasoning pin: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_bearing_request_to_dialectless_backend_fails_closed() {
+        let server = MockServer::start().await;
+        // No dialect declared on this backend.
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri()))).unwrap();
+        let error = match client
+            .call_rewrite_model(policy_request(ReasoningPolicy::None, Value::Null), None)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("policy without a dialect must fail closed"),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("declares no reasoning_dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_lands_on_the_responses_wire() {
+        // PRIMARY acceptance contract: the canonical Responses control
+        // `"reasoning": { "effort": "none" }` on the /v1/responses wire -
+        // the format the whole fleet is standardized on.
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1", "model": "gpt", "status": "completed",
+                "output": [{"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}]}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_dialect(
+            &format!("{}/v1", server.uri()),
+            ReasoningDialect::OpenAiEffort,
+        ))
+        .unwrap();
+        let mut request = policy_request(ReasoningPolicy::None, json!({"effort": "high"}));
+        request.metadata = None;
+        client
+            .call_rewrite_model(request, None)
+            .await
+            .expect("policy-bearing Responses request must serve");
+        let body = seen.lock().unwrap().clone();
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("none"),
+            "Responses wire must carry the canonical reasoning.effort=none control: {body}"
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "chat-only flat reasoning_effort must never appear on the Responses wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn auxiliary_calls_never_carry_route_policy() {
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri()))).unwrap();
+        // A policy-bearing request reaching an auxiliary operation (compaction)
+        // must send a body WITHOUT the route's reasoning policy: auxiliary
+        // operations are infrastructure, not completion traffic.
+        let mut request = policy_request(ReasoningPolicy::None, Value::Null);
+        request.route_reasoning_policy = None; // auxiliary path ignores it by construction
+        client
+            .call_rewrite_model(request, None)
+            .await
+            .expect("plain request must serve");
+        let body = seen.lock().unwrap().clone();
+        assert!(
+            body.get("reasoning").is_none() && body.get("reasoning_effort").is_none(),
+            "no policy shape may appear when no policy is set: {body}"
+        );
     }
 }
 #[cfg(test)]

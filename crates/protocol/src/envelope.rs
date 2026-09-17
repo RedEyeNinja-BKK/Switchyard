@@ -30,6 +30,17 @@ pub struct Request {
     pub candidate_input_tokens: BTreeMap<ModelId, u64>,
     /// Correlation metadata carried through the request.
     pub metadata: Option<Metadata>,
+    /// The route's authoritative reasoning policy, stamped by the serving route
+    /// at execution entry and absent everywhere else.
+    ///
+    /// This is an internal control, never caller-visible: the server layer
+    /// rejects any caller attempt to set it, algorithm-constructed internal
+    /// calls (classifier/judge/advisor) are built fresh via `..Request::default()`
+    /// and therefore never inherit it, and the per-candidate send seam
+    /// translates it through the selected target's declared dialect. Because it
+    /// rides the request, it survives target selection, retry, candidate
+    /// switch, and fallback unchanged.
+    pub route_reasoning_policy: Option<crate::ReasoningPolicy>,
 }
 
 impl Request {

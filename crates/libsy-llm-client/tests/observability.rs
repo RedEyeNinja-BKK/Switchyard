@@ -575,6 +575,7 @@ fn request_with_metadata(session_id: &str, correlation_id: &str) -> Request {
             ..Metadata::default()
         }),
         candidate_input_tokens: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -656,6 +657,7 @@ fn classifier_request() -> Request {
         raw_request: None,
         metadata: None,
         candidate_input_tokens: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -734,6 +736,7 @@ async fn affinity_warns_once_when_request_has_no_usable_identity() -> switchyard
         raw_request: None,
         metadata: None,
         candidate_input_tokens: Default::default(),
+        ..Default::default()
     };
 
     for _ in 0..2 {
@@ -1146,6 +1149,7 @@ async fn stage_router_records_algorithm_owned_metrics() -> switchyard_libsy::Res
             ..Metadata::default()
         }),
         candidate_input_tokens: Default::default(),
+        ..Default::default()
     };
     let client = Arc::new(UsageClient {
         usage: Usage::default(),

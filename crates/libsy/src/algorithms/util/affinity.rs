@@ -321,6 +321,7 @@ mod tests {
             raw_request: None,
             metadata: Some(metadata),
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -346,6 +347,7 @@ mod tests {
             raw_request: None,
             metadata,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -589,6 +591,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         };
         let text_only = request(Message::text(Role::User, "Implement the parser."));
         let text_with_reasoning = request(Message {

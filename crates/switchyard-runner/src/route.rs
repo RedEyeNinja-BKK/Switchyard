@@ -124,6 +124,10 @@ pub struct Route {
     /// Explicitly-qualified exact input-token producers (`fleet_router`
     /// candidates that declare `context_policy.input_token_source`).
     input_tokens_targets: Vec<AuxiliaryTarget>,
+    /// Authoritative reasoning policy stamped onto every request this route
+    /// serves (opt-in via the route's `reasoning_policy` config key). Absent
+    /// policies stamp nothing: the request passes through exactly as before.
+    reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -157,7 +161,23 @@ impl Route {
             escalation: None,
             escalation_max_input_tokens: None,
             input_tokens_targets: Vec::new(),
+            reasoning_policy: None,
         }
+    }
+
+    /// Declares this route's authoritative reasoning policy. Opt-in: called
+    /// only when the route's config declares `reasoning_policy`.
+    pub fn with_reasoning_policy(
+        mut self,
+        policy: Option<switchyard_protocol::ReasoningPolicy>,
+    ) -> Self {
+        self.reasoning_policy = policy;
+        self
+    }
+
+    /// This route's authoritative reasoning policy, if declared.
+    pub fn reasoning_policy(&self) -> Option<switchyard_protocol::ReasoningPolicy> {
+        self.reasoning_policy
     }
 
     /// Declares this route's escalation policy (destination + optional
@@ -234,9 +254,17 @@ impl Route {
     /// Executes the configured route without consuming or proxying streamed responses.
     pub async fn execute(
         &self,
-        request: Request,
+        mut request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
+        // Route-authoritative reasoning policy is stamped here, at the single
+        // entry every completion/decision path crosses (direct calls, escalated
+        // legs re-entering through the destination route, agent-mapped
+        // subagent routes). Internal algorithm calls (classifier/judge/
+        // advisor) are built fresh downstream and never see it.
+        if let Some(policy) = self.reasoning_policy {
+            request.route_reasoning_policy = Some(policy);
+        }
         let (selected_model, response) = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
@@ -252,7 +280,10 @@ impl Route {
     }
 
     /// Completes routing-time calls without serving a post-routing completion.
-    pub async fn decide(&self, request: Request) -> Result<RoutingOutcome, RunnerError> {
+    pub async fn decide(&self, mut request: Request) -> Result<RoutingOutcome, RunnerError> {
+        if let Some(policy) = self.reasoning_policy {
+            request.route_reasoning_policy = Some(policy);
+        }
         switchyard_llm_client::decide(
             Arc::clone(&self.algorithm),
             self.clients.clone(),

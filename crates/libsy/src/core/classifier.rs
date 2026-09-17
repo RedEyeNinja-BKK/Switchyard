@@ -208,6 +208,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         };
         let (classification, _) = RecordingClassifier
             .score(&mut state, &mut request, &empty_driver())
@@ -251,6 +252,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             candidate_input_tokens: Default::default(),
+            ..Default::default()
         };
 
         RewritingClassifier

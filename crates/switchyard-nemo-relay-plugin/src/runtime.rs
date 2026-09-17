@@ -112,6 +112,9 @@ impl SwitchyardRuntime {
             raw_request: Some(request.content),
             candidate_input_tokens: Default::default(),
             metadata: Some(metadata),
+            // The nemo relay is a plugin entry path, not a route; it carries
+            // no route reasoning policy.
+            route_reasoning_policy: None,
         })
     }
 

@@ -73,6 +73,11 @@ pub struct HttpBackendConfig {
     /// the TARGET; applied after `merge_extra_body` so no `extra_body` can
     /// reinstate the field once the target has removed it.
     pub strip_reasoning_content: bool,
+    /// How this backend expresses a route-imposed [`ReasoningPolicy`] on the
+    /// wire (see the runner's `reasoning_dialect` client declaration). `None`
+    /// means the backend can only serve policy-free requests: a policy-bearing
+    /// request reaching such a backend fails closed at the send seam.
+    pub reasoning_dialect: Option<switchyard_protocol::ReasoningDialect>,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -84,6 +89,7 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("reasoning_dialect", &self.reasoning_dialect)
             .field("max_retries", &self.max_retries)
             .finish()
     }
@@ -303,6 +309,13 @@ impl Backend {
         self.config().reasoning_effort.as_deref()
     }
 
+    /// The reasoning-control dialect this backend's upstream speaks, declared
+    /// on the llm client. `None` means the backend cannot serve a
+    /// policy-bearing request (the send seam fails closed).
+    pub fn reasoning_dialect(&self) -> Option<switchyard_protocol::ReasoningDialect> {
+        self.config().reasoning_dialect
+    }
+
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
@@ -468,6 +481,7 @@ mod tests {
             reasoning_effort: None,
             max_retries: 0,
             strip_reasoning_content: false,
+            reasoning_dialect: None,
         }
     }
 

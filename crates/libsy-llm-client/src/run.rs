@@ -1044,6 +1044,7 @@ mod tests {
                 max_retries: 2,
                 strip_reasoning_content: false,
                 reasoning_dialect: None,
+                reasoning_efforts: None,
             })
         };
         let client = Arc::new(
@@ -1143,6 +1144,7 @@ mod tests {
                 max_retries: 0,
                 strip_reasoning_content: false,
                 reasoning_dialect: None,
+                reasoning_efforts: None,
             })
         };
         let client = Arc::new(

@@ -302,35 +302,45 @@ impl DeploymentConfig {
                     )));
                 }
                 Some(dialect) => {
-                    if !dialect.honors(*policy) {
-                        return Err(RunnerError::configuration(format!(
-                            "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
-                             llm client {} speaks dialect {dialect:?} which cannot express it",
-                            target.llm_client
-                        )));
-                    }
-                    // Effort passthrough dialects take the policy spelling
-                    // verbatim, and upstream effort vocabularies differ —
-                    // force the operator to declare (and thereby validate)
-                    // the vocabulary instead of assuming a universal set.
-                    if matches!(dialect, switchyard_protocol::ReasoningDialect::OpenAiEffort) {
-                        let efforts = client_config.reasoning_efforts.as_ref().ok_or_else(|| {
-                            RunnerError::configuration(format!(
-                                "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
-                                 llm client {} uses dialect openai_effort without declaring reasoning_efforts; \
-                                 declare the upstream's accepted effort vocabulary (e.g. reasoning_efforts = \
-                                 [\"none\", \"low\", \"high\", \"max\"]) so unsupported values fail at load time",
-                                target.llm_client
-                            ))
-                        })?;
-                        if !efforts.iter().any(|effort| effort == policy.as_str()) {
-                            return Err(RunnerError::configuration(format!(
-                                "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
-                                 llm client {} declares reasoning_efforts = {efforts:?} which does not include it; \
-                                 widen the declared vocabulary or drop the policy",
-                                target.llm_client
-                            )));
-                        }
+                    // Generalized expressibility invariant (steering §1.3/§1.4):
+                    // `honors` must be true only when the dialect can faithfully
+                    // express the EXACT policy. Effort-bearing dialects
+                    // (openai_effort, chat_template_reasoning_effort) pass the
+                    // policy spelling verbatim and upstream vocabularies differ,
+                    // so they require the operator-declared `reasoning_efforts`
+                    // list; boolean dialects reject every exact effort outright
+                    // (an exact effort must never collapse to a bare switch).
+                    if !dialect
+                        .honors_with_vocabulary(*policy, client_config.reasoning_efforts.as_deref())
+                    {
+                        let effort_bearing = matches!(
+                            dialect,
+                            switchyard_protocol::ReasoningDialect::OpenAiEffort
+                                | switchyard_protocol::ReasoningDialect::ChatTemplateReasoningEffort
+                        );
+                        return Err(RunnerError::configuration(
+                            // Effort-bearing dialect with NO declared vocabulary:
+                            // the operator must declare what the upstream accepts.
+                            if effort_bearing && client_config.reasoning_efforts.is_none() {
+                                format!(
+                                    "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                                     llm client {} uses effort-bearing dialect {dialect:?} without declaring reasoning_efforts; \
+                                     declare the upstream's accepted effort vocabulary (e.g. reasoning_efforts = \
+                                     [\"none\", \"low\", \"high\", \"max\"]) so unsupported values fail at load time",
+                                    target.llm_client
+                                )
+                            }
+                            // Vocabulary declared (or boolean dialect): the policy
+                            // simply is not faithfully expressible on this target.
+                            else {
+                                format!(
+                                    "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                                     llm client {} (dialect {dialect:?}, declared vocabulary {:?}) cannot faithfully \
+                                     express it; widen the declared vocabulary, switch dialect, or drop the policy",
+                                    target.llm_client, client_config.reasoning_efforts
+                                )
+                            },
+                        ));
                     }
                 }
             }
@@ -965,6 +975,7 @@ fn build_backend(
         reasoning_effort,
         strip_reasoning_content,
         reasoning_dialect: config.reasoning_dialect,
+        reasoning_efforts: config.reasoning_efforts.clone(),
         max_retries: config.max_retries,
     };
     let backend = match config.format {
@@ -2331,14 +2342,16 @@ target = "neutral_responses"
             actual.contains("without declaring reasoning_efforts"),
             "unexpected error: {actual}"
         );
-        // ...policy outside the declared list = config error...
+        // ...policy outside the declared list (no `none` in it) = config error;
+        // the vocabulary is quoted so the operator can widen it deliberately...
         let configured = policy_config(POLICY_TOML_NONE, "").replace(
             "reasoning_dialect = \"llama_cpp_enable_thinking\"",
             "reasoning_dialect = \"openai_effort\"\nreasoning_efforts = [\"low\", \"medium\"]",
         );
         let actual = error_message(&configured);
         assert!(
-            actual.contains("does not include it"),
+            actual.contains("cannot faithfully express it")
+                && actual.contains("[\"low\", \"medium\"]"),
             "unexpected error: {actual}"
         );
         // ...and a policy inside the declared list builds.
@@ -2350,6 +2363,91 @@ target = "neutral_responses"
         if let Err(error) = runner_from_toml(&configured) {
             panic!("policy inside the declared vocabulary must build: {error}");
         }
+    }
+
+    #[test]
+    fn s03_row10_11_openai_effort_vocabulary_gating() {
+        // openai_effort accepts ONLY values listed in reasoning_efforts...
+        let configured = policy_config(POLICY_TOML_NONE, "").replace(
+            "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+            "reasoning_dialect = \"openai_effort\"\nreasoning_efforts = [\"none\", \"low\", \"high\", \"max\"]",
+        );
+        runner_from_toml(&configured).expect("declared policy must build");
+        // ...and rejects unsupported values at load time.
+        for policy in ["medium", "xhigh"] {
+            let configured = policy_config(&format!("reasoning_policy = \"{policy}\""), "").replace(
+                "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+                "reasoning_dialect = \"openai_effort\"\nreasoning_efforts = [\"none\", \"low\", \"high\", \"max\"]",
+            );
+            let actual = error_message(&configured);
+            assert!(
+                actual.contains("cannot faithfully express it") && actual.contains(policy),
+                "unexpected error for {policy}: {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn s03_row12_chat_template_dialect_requires_vocabulary() {
+        // chat_template_reasoning_effort: `none` has a fixed observed NT shape
+        // and needs no vocabulary (steering §1.3), but a CONCRETE EFFORT is
+        // accepted only from the operator-declared vocabulary: without one it
+        // fails at load time...
+        let configured = policy_config("reasoning_policy = \"medium\"", "").replace(
+            "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+            "reasoning_dialect = \"chat_template_reasoning_effort\"",
+        );
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("without declaring reasoning_efforts"),
+            "unexpected error: {actual}"
+        );
+        // ...and accepts only declared effort values (DeepSeek-style: no medium).
+        let configured = policy_config(POLICY_TOML_NONE, "").replace(
+            "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+            "reasoning_dialect = \"chat_template_reasoning_effort\"\n             reasoning_efforts = [\"none\", \"low\", \"high\", \"max\"]",
+        );
+        runner_from_toml(&configured).expect("declared none must build");
+        let configured = policy_config("reasoning_policy = \"medium\"", "").replace(
+            "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+            "reasoning_dialect = \"chat_template_reasoning_effort\"\n             reasoning_efforts = [\"none\", \"low\", \"high\", \"max\"]",
+        );
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("cannot faithfully express it"),
+            "unexpected error: {actual}"
+        );
+    }
+
+    #[test]
+    fn s03_row18_route_policy_plus_target_pin_still_rejected() {
+        // The dialect rework must not have weakened the hard-pin contradiction rule.
+        let configured = policy_config(POLICY_TOML_NONE, "").replace(
+            "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"",
+            "[targets.neutral_chat]\nid = \"neutral-chat/model\"\nllm_client = \"primary\"\n\
+             reasoning_effort = \"medium\"",
+        );
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("must not fight"),
+            "unexpected error: {actual}"
+        );
+    }
+
+    #[test]
+    fn s03_row20_unsupported_candidate_fails_at_load_time() {
+        // A policy-bearing route whose reachable target's client cannot express
+        // the policy (boolean dialect + exact effort) must fail at LOAD time,
+        // not at request time.
+        let configured = policy_config("reasoning_policy = \"high\"", "").replace(
+            "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+            "reasoning_dialect = \"openrouter_enabled\"",
+        );
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("cannot faithfully express it"),
+            "unexpected error: {actual}"
+        );
     }
 
     #[test]

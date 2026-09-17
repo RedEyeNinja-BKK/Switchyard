@@ -78,6 +78,11 @@ pub struct HttpBackendConfig {
     /// means the backend can only serve policy-free requests: a policy-bearing
     /// request reaching such a backend fails closed at the send seam.
     pub reasoning_dialect: Option<switchyard_protocol::ReasoningDialect>,
+    /// The operator-declared accepted effort vocabulary for effort-bearing
+    /// dialects (mirrors the runner's `reasoning_efforts` client declaration).
+    /// Load-time validation already proves every route policy fits; carried
+    /// here so the send seam can re-check as defense-in-depth.
+    pub reasoning_efforts: Option<Vec<String>>,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -90,6 +95,13 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_body_keys", &self.extra_body.keys())
             .field("reasoning_effort", &self.reasoning_effort)
             .field("reasoning_dialect", &self.reasoning_dialect)
+            .field(
+                "reasoning_efforts",
+                &self
+                    .reasoning_efforts
+                    .as_ref()
+                    .map(|efforts| efforts.join(",")),
+            )
             .field("max_retries", &self.max_retries)
             .finish()
     }
@@ -316,6 +328,11 @@ impl Backend {
         self.config().reasoning_dialect
     }
 
+    /// The declared accepted effort vocabulary for effort-bearing dialects.
+    pub fn reasoning_efforts(&self) -> Option<&[String]> {
+        self.config().reasoning_efforts.as_deref()
+    }
+
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
@@ -482,6 +499,7 @@ mod tests {
             max_retries: 0,
             strip_reasoning_content: false,
             reasoning_dialect: None,
+            reasoning_efforts: None,
         }
     }
 

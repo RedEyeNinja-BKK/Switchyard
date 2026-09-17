@@ -790,7 +790,7 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         reasoning_effort,
-        strip_reasoning_content: false,
+        strip_reasoning_content,
         max_retries: config.max_retries,
     };
     let backend = match config.format {

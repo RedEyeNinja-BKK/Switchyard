@@ -203,7 +203,9 @@ struct RoutingRecord<'a> {
     reasoning_tokens: u64,
     total_tokens: u64,
     /// Route-authoritative reasoning policy in force for this record's route
-    /// (`"none"`, `"low"`, ...). Absent for routes without a policy.
+    /// (`"none"`, `"low"`, ...). Omitted entirely for routes without a policy,
+    /// so policy-free deployments keep byte-identical record lines.
+    #[serde(skip_serializing_if = "Option::is_none")]
     route_reasoning_policy: Option<String>,
 }
 

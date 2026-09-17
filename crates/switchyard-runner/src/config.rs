@@ -309,6 +309,29 @@ impl DeploymentConfig {
                             target.llm_client
                         )));
                     }
+                    // Effort passthrough dialects take the policy spelling
+                    // verbatim, and upstream effort vocabularies differ —
+                    // force the operator to declare (and thereby validate)
+                    // the vocabulary instead of assuming a universal set.
+                    if matches!(dialect, switchyard_protocol::ReasoningDialect::OpenAiEffort) {
+                        let efforts = client_config.reasoning_efforts.as_ref().ok_or_else(|| {
+                            RunnerError::configuration(format!(
+                                "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                                 llm client {} uses dialect openai_effort without declaring reasoning_efforts; \
+                                 declare the upstream's accepted effort vocabulary (e.g. reasoning_efforts = \
+                                 [\"none\", \"low\", \"high\", \"max\"]) so unsupported values fail at load time",
+                                target.llm_client
+                            ))
+                        })?;
+                        if !efforts.iter().any(|effort| effort == policy.as_str()) {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                                 llm client {} declares reasoning_efforts = {efforts:?} which does not include it; \
+                                 widen the declared vocabulary or drop the policy",
+                                target.llm_client
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -790,8 +813,28 @@ struct LlmClientConfig {
     ///   express amounts).
     /// * `llama_cpp_enable_thinking` —
     ///   `chat_template_kwargs.enable_thinking = <bool>` (llama.cpp-derived
-    ///   Qwen template endpoints); same boolean-collapse semantics.
+    ///   Qwen template endpoints); same boolean-collapse semantics (HTPC
+    ///   contract).
+    /// * `chat_template_reasoning_effort` — none =
+    ///   `chat_template_kwargs.enable_thinking = false`, any thinking policy =
+    ///   `chat_template_kwargs.reasoning_effort = "<policy>"` (the ComfyNinja
+    ///   Q3/Q4 contract: effort-bearing thinking side, boolean NT side).
+    ///
+    /// Effort vocabulary: boolean dialects collapse any thinking policy to
+    /// their native "on" semantic (part of the dialect contract, tested). An
+    /// `openai_effort` client passes the effort string through VERBATIM, and
+    /// providers differ on what they accept (e.g. DeepSeek documents
+    /// none|low|high|max with no `medium`; OpenRouter and OpenAI vocabularies
+    /// differ again), so an `openai_effort` client serving a policy-bearing
+    /// route MUST also declare `reasoning_efforts` — the operator-validated
+    /// vocabulary for that upstream — and every policy-bearing route reaching
+    /// it is checked against that list at load time. Missing list or a policy
+    /// outside it is a configuration error, never a silent approximation.
     reasoning_dialect: Option<switchyard_protocol::ReasoningDialect>,
+    /// The authoritative effort vocabulary of this client's upstream, required
+    /// for `openai_effort` clients reachable from policy-bearing routes.
+    /// Values use the dialect's wire spelling (e.g. "none", "medium").
+    reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2273,6 +2316,40 @@ target = "neutral_responses"
             actual.contains("unknown reasoning_policy"),
             "unexpected error: {actual}"
         );
+    }
+
+    #[test]
+    fn openai_effort_policy_requires_declared_vocabulary() {
+        // Review finding: effort passthrough must not assume a universal
+        // five-value set. Missing list = config error...
+        let configured = policy_config(POLICY_TOML_NONE, "").replace(
+            "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+            "reasoning_dialect = \"openai_effort\"",
+        );
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("without declaring reasoning_efforts"),
+            "unexpected error: {actual}"
+        );
+        // ...policy outside the declared list = config error...
+        let configured = policy_config(POLICY_TOML_NONE, "").replace(
+            "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+            "reasoning_dialect = \"openai_effort\"\nreasoning_efforts = [\"low\", \"medium\"]",
+        );
+        let actual = error_message(&configured);
+        assert!(
+            actual.contains("does not include it"),
+            "unexpected error: {actual}"
+        );
+        // ...and a policy inside the declared list builds.
+        let configured = policy_config(POLICY_TOML_NONE, "")
+            .replace(
+                "reasoning_dialect = \"llama_cpp_enable_thinking\"",
+                "reasoning_dialect = \"openai_effort\"\nreasoning_efforts = [\"none\", \"low\", \"high\", \"max\"]",
+            );
+        if let Err(error) = runner_from_toml(&configured) {
+            panic!("policy inside the declared vocabulary must build: {error}");
+        }
     }
 
     #[test]

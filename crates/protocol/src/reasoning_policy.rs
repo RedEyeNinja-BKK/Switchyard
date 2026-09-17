@@ -91,9 +91,22 @@ pub enum ReasoningDialect {
     #[serde(rename = "openrouter_enabled")]
     OpenRouterEnabled,
     /// `chat_template_kwargs.enable_thinking = <bool>` (llama.cpp-derived Qwen
-    /// template endpoints). Boolean switch only.
+    /// template endpoints). Boolean switch only. This is the HTPC contract:
+    /// thinking = `enable_thinking = true`, none = `enable_thinking = false`
+    /// (both shapes observed live in the Gate 0 decision snapshot).
     #[serde(rename = "llama_cpp_enable_thinking")]
     LlamaCppEnableThinking,
+    /// Effort-bearing chat-template control (llama.cpp Qwen3 template
+    /// endpoints whose thinking side takes `chat_template_kwargs.reasoning_effort`):
+    /// none = `enable_thinking = false`, any thinking policy =
+    /// `reasoning_effort = <policy>` (the ComfyNinja Q3/Q4 contract observed
+    /// live in the Gate 0 decision snapshot: NT twins pin
+    /// `enable_thinking = false` while the thinking twin pins
+    /// `reasoning_effort = "medium"`). Distinct from
+    /// [`ReasoningDialect::LlamaCppEnableThinking`] precisely because that
+    /// dialect cannot express the thinking-side effort.
+    #[serde(rename = "chat_template_reasoning_effort")]
+    ChatTemplateReasoningEffort,
 }
 
 impl ReasoningDialect {
@@ -118,6 +131,19 @@ impl ReasoningDialect {
             Self::LlamaCppEnableThinking => Some(serde_json::json!(
                 { "chat_template_kwargs": { "enable_thinking": policy.is_thinking() } }
             )),
+            Self::ChatTemplateReasoningEffort => {
+                if policy.is_thinking() {
+                    Some(serde_json::json!(
+                        { "chat_template_kwargs": { "reasoning_effort": policy.as_str() } }
+                    ))
+                } else {
+                    // The observed NT contract is the boolean switch, not
+                    // `reasoning_effort = "none"`.
+                    Some(serde_json::json!(
+                        { "chat_template_kwargs": { "enable_thinking": false } }
+                    ))
+                }
+            }
         }
     }
 
@@ -194,6 +220,19 @@ mod tests {
                 .unwrap(),
             json!({ "chat_template_kwargs": { "enable_thinking": true } })
         );
+        // ComfyNinja-shaped dialect: effort-bearing thinking side, boolean NT side.
+        assert_eq!(
+            ReasoningDialect::ChatTemplateReasoningEffort
+                .wire_body(ReasoningPolicy::Medium)
+                .unwrap(),
+            json!({ "chat_template_kwargs": { "reasoning_effort": "medium" } })
+        );
+        assert_eq!(
+            ReasoningDialect::ChatTemplateReasoningEffort
+                .wire_body(ReasoningPolicy::None)
+                .unwrap(),
+            json!({ "chat_template_kwargs": { "enable_thinking": false } })
+        );
     }
 
     #[test]
@@ -210,6 +249,11 @@ mod tests {
             serde_json::from_value::<ReasoningDialect>(json!("llama_cpp_enable_thinking")).unwrap(),
             ReasoningDialect::LlamaCppEnableThinking
         );
+        assert_eq!(
+            serde_json::from_value::<ReasoningDialect>(json!("chat_template_reasoning_effort"))
+                .unwrap(),
+            ReasoningDialect::ChatTemplateReasoningEffort
+        );
         assert!(serde_json::from_value::<ReasoningDialect>(json!("chat_template")).is_err());
     }
 
@@ -219,6 +263,7 @@ mod tests {
             ReasoningDialect::OpenAiEffort,
             ReasoningDialect::OpenRouterEnabled,
             ReasoningDialect::LlamaCppEnableThinking,
+            ReasoningDialect::ChatTemplateReasoningEffort,
         ] {
             for policy in [
                 ReasoningPolicy::None,

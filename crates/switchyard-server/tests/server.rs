@@ -1395,6 +1395,7 @@ schema_version = 1
 format = "openai_chat"
 base_url = "{model_url}"
 reasoning_dialect = "openai_effort"
+reasoning_efforts = ["none", "low", "medium", "high", "max"]
 
 [targets.neutral]
 id = "model/neutral"

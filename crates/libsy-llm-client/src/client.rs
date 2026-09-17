@@ -417,17 +417,38 @@ impl TranslatingLlmClient {
         // silence is exactly what this mechanism must never do.
         if let Some(policy) = route_policy {
             match backend.reasoning_dialect() {
-                Some(dialect) => match dialect.wire_body(policy) {
-                    Some(wire) => merge_authoritative_object(&mut body, &wire),
-                    None => {
+                Some(dialect) => {
+                    // Defense in depth: expressibility is re-checked HERE, with
+                    // the backend's declared vocabulary — not only in runner
+                    // load validation. `wire_body` alone is not a sufficient
+                    // gate: it renders a shape for policies the dialect does
+                    // NOT honor (e.g. `enabled` on an effort dialect, which
+                    // renders as an un-declared effort string or, on the
+                    // chat-template dialect, as an inverted thinking-off body).
+                    // A policy reaching this seam without load validation must
+                    // therefore fail closed rather than be sent un-declared.
+                    let vocabulary = backend.reasoning_efforts();
+                    if !dialect.honors_with_vocabulary(policy, vocabulary) {
                         return Err(LlmClientError::Configuration {
                             message: format!(
-                                "route reasoning policy {policy} cannot be expressed by dialect {dialect:?} \
-                                 on model {model:?}; refusing to send a downgraded request"
+                                "route reasoning policy {policy} is not expressible by dialect {dialect:?} \
+                                 on model {model:?} with the declared reasoning_efforts vocabulary \
+                                 {vocabulary:?}; refusing to send an un-declared request"
                             ),
                         });
                     }
-                },
+                    match dialect.wire_body(policy) {
+                        Some(wire) => merge_authoritative_object(&mut body, &wire),
+                        None => {
+                            return Err(LlmClientError::Configuration {
+                                message: format!(
+                                    "route reasoning policy {policy} cannot be expressed by dialect {dialect:?} \
+                                     on model {model:?}; refusing to send a downgraded request"
+                                ),
+                            });
+                        }
+                    }
+                }
                 None => {
                     return Err(LlmClientError::Configuration {
                         message: format!(
@@ -4392,15 +4413,32 @@ mod tests {
     // acceptance contract requires: a wiremock capture of the actual upstream
     // body, not a trace of received events.
 
-    fn chat_map_with_dialect(base_url: &str, dialect: ReasoningDialect) -> Vec<ModelConfig> {
+    /// Declared `reasoning_efforts` vocabulary for a fixture backend. The send
+    /// seam re-checks expressibility against this list, so effort-dialect
+    /// fixtures declare one exactly as a policy-bearing route's config does.
+    fn declared_vocabulary(efforts: Option<&[&str]>) -> Option<Vec<String>> {
+        efforts.map(|values| values.iter().map(|value| value.to_string()).collect())
+    }
+
+    fn chat_map_with_dialect(
+        base_url: &str,
+        dialect: ReasoningDialect,
+        efforts: Option<&[&str]>,
+    ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.reasoning_dialect = Some(dialect);
+        backend.reasoning_efforts = declared_vocabulary(efforts);
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
-    fn responses_map_with_dialect(base_url: &str, dialect: ReasoningDialect) -> Vec<ModelConfig> {
+    fn responses_map_with_dialect(
+        base_url: &str,
+        dialect: ReasoningDialect,
+        efforts: Option<&[&str]>,
+    ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.reasoning_dialect = Some(dialect);
+        backend.reasoning_efforts = declared_vocabulary(efforts);
         vec![ModelConfig::new(
             "gpt",
             Backend::OpenAiResponses(backend),
@@ -4432,6 +4470,7 @@ mod tests {
         policy: ReasoningPolicy,
         caller_reasoning: Value,
         merge_reasoning_pin: Option<Value>,
+        efforts: Option<&[&str]>,
     ) -> Value {
         use std::sync::Mutex as StdMutex;
         let server = MockServer::start().await;
@@ -4455,10 +4494,11 @@ mod tests {
             Some(pin) => {
                 let mut backend = config(&format!("{}/v1", server.uri()));
                 backend.reasoning_dialect = Some(dialect);
+                backend.reasoning_efforts = declared_vocabulary(efforts);
                 backend.extra_body.insert("reasoning".to_string(), pin);
                 vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
             }
-            None => chat_map_with_dialect(&format!("{}/v1", server.uri()), dialect),
+            None => chat_map_with_dialect(&format!("{}/v1", server.uri()), dialect, efforts),
         };
         let client = TranslatingLlmClient::new(&models).unwrap();
         client
@@ -4475,6 +4515,7 @@ mod tests {
             ReasoningPolicy::None,
             json!({"effort": "high"}),
             None,
+            Some(&["none", "low", "medium", "high"]),
         )
         .await;
         assert_eq!(
@@ -4495,6 +4536,7 @@ mod tests {
             ReasoningPolicy::Medium,
             json!({"effort": "none"}),
             None,
+            Some(&["none", "low", "medium", "high"]),
         )
         .await;
         assert_eq!(
@@ -4510,6 +4552,7 @@ mod tests {
             ReasoningDialect::OpenRouterEnabled,
             ReasoningPolicy::None,
             json!({"effort": "high"}),
+            None,
             None,
         )
         .await;
@@ -4530,6 +4573,7 @@ mod tests {
             ReasoningDialect::LlamaCppEnableThinking,
             ReasoningPolicy::None,
             json!({"effort": "high"}),
+            None,
             None,
         )
         .await;
@@ -4552,6 +4596,7 @@ mod tests {
             ReasoningPolicy::None,
             json!({"effort": "high"}),
             Some(json!({"effort": "high"})),
+            Some(&["none", "low", "medium", "high"]),
         )
         .await;
         assert_eq!(
@@ -4577,6 +4622,135 @@ mod tests {
         assert!(
             message.contains("declares no reasoning_dialect"),
             "unexpected error: {message}"
+        );
+    }
+
+    /// Shared helper for the seam fail-closed proofs: a policy the dialect's
+    /// own verdict rejects must never reach the wire, even though `wire_body`
+    /// would happily render a shape for it.
+    async fn policy_rejection_message(
+        dialect: ReasoningDialect,
+        policy: ReasoningPolicy,
+        efforts: Option<&[&str]>,
+    ) -> String {
+        let server = MockServer::start().await;
+        let client = TranslatingLlmClient::new(&chat_map_with_dialect(
+            &format!("{}/v1", server.uri()),
+            dialect,
+            efforts,
+        ))
+        .unwrap();
+        match client
+            .call_rewrite_model(policy_request(policy, Value::Null), None)
+            .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!(
+                "policy {policy} must fail closed on dialect {dialect:?} (vocabulary {efforts:?})"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_policy_enabled_fails_closed_on_effort_dialect() {
+        // `enabled` has no tested provider-default-effort representation. The
+        // seam must refuse it rather than serialize the literal "enabled"
+        // string into `reasoning.effort`.
+        let message = policy_rejection_message(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::Enabled,
+            Some(&["none", "low", "high"]),
+        )
+        .await;
+        assert!(
+            message.contains("is not expressible by dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_enabled_fails_closed_on_chat_template_dialect() {
+        // The inversion case: wire_body renders every non-exact policy on this
+        // dialect as `enable_thinking = false`, so an unchecked `enabled`
+        // (whose `is_thinking()` is true) would be sent as a thinking-OFF
+        // body - the exact opposite of the policy author's intent.
+        let message = policy_rejection_message(
+            ReasoningDialect::ChatTemplateReasoningEffort,
+            ReasoningPolicy::Enabled,
+            None,
+        )
+        .await;
+        assert!(
+            message.contains("is not expressible by dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_exact_effort_outside_vocabulary_fails_closed() {
+        // `medium` is absent from the declared vocabulary, so this endpoint
+        // never promised to accept it.
+        let message = policy_rejection_message(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::Medium,
+            Some(&["none", "low", "high"]),
+        )
+        .await;
+        assert!(
+            message.contains("is not expressible by dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_needs_vocabulary_on_effort_dialect() {
+        // openai_effort is fully vocabulary-gated, `none` included: with no
+        // declared list the endpoint's accepted values are unknown.
+        let message =
+            policy_rejection_message(ReasoningDialect::OpenAiEffort, ReasoningPolicy::None, None)
+                .await;
+        assert!(
+            message.contains("is not expressible by dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_declared_exact_effort_lands_on_the_wire() {
+        // Positive control for the strict matrix: a vocabulary-declared exact
+        // effort still renders its shape (the fix must not over-reject).
+        let body = captured_chat_body(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::Medium,
+            json!({"effort": "none"}),
+            None,
+            Some(&["none", "low", "medium", "high"]),
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("medium"),
+            "a declared exact effort must still reach the wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_lands_on_chat_template_without_vocabulary() {
+        // Positive control for the fixed-shape leg: `none` needs no vocabulary
+        // on the chat-template dialect (Gate 0 observed shape).
+        let body = captured_chat_body(
+            ReasoningDialect::ChatTemplateReasoningEffort,
+            ReasoningPolicy::None,
+            json!({"effort": "high"}),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/chat_template_kwargs/enable_thinking")
+                .and_then(Value::as_bool),
+            Some(false),
+            "chat-template none must use the observed NT shape: {body}"
         );
     }
 
@@ -4607,6 +4781,7 @@ mod tests {
         let client = TranslatingLlmClient::new(&responses_map_with_dialect(
             &format!("{}/v1", server.uri()),
             ReasoningDialect::OpenAiEffort,
+            Some(&["none", "low", "medium", "high"]),
         ))
         .unwrap();
         let mut request = policy_request(ReasoningPolicy::None, json!({"effort": "high"}));

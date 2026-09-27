@@ -692,6 +692,9 @@ impl PyAlgorithm {
             llm_request: from_python(request)?,
             raw_request: None,
             metadata: headers.map(|headers| Metadata::from_headers(&headers)),
+            // Python callers cannot set a route reasoning policy; the route
+            // stamps it at execution entry if one governs this path.
+            ..Request::default()
         };
         let mut runtime_models = RuntimeModels::new(category_models_from_python(models)?);
         if let Some(subagent_models) = subagent_models {

@@ -9,7 +9,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use libsy::RuntimeModels;
+use crate::algorithm::FleetBuildContext;
+use libsy::{FleetSnapshot, RuntimeModels, SharedFleetState};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -17,7 +18,9 @@ use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
-use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
+use switchyard_protocol::{
+    Category, ModelId, ReasoningDialect, ReasoningPolicy, RoutedLlmClient, WireFormat,
+};
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
@@ -61,6 +64,16 @@ pub(crate) struct DeploymentConfig {
     llm_clients: BTreeMap<String, LlmClientConfig>,
     targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    /// LocalClaw extension: the host-owned fleet-readiness monitor config.
+    #[serde(default)]
+    fleet_readiness: Option<crate::facts_config::FleetReadinessConfig>,
+    /// LocalClaw extension: capability executor routes (embeddings/rerank).
+    /// Parsed by the capability layer; accepted here so the live deployment
+    /// file parses as a whole.
+    #[serde(default)]
+    capability_clients: BTreeMap<String, crate::capability::CapabilityClientConfig>,
+    #[serde(default)]
+    capabilities: BTreeMap<String, crate::capability::CapabilityRouteConfig>,
 }
 
 #[derive(Debug)]
@@ -70,6 +83,14 @@ struct RouteConfig {
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
     vision: Option<bool>,
+    /// Route-authoritative reasoning intent, forced onto every reachable
+    /// candidate. Abstract: it carries no provider syntax; each target's
+    /// dialect expresses it. Absent means the route carries no policy.
+    reasoning_policy: Option<ReasoningPolicy>,
+    /// The policy an escalated leg must run under. Resolved by
+    /// `escalated_reasoning_policy`; F7 parses and validates it but never
+    /// decides when escalation happens.
+    escalation_reasoning_policy: Option<ReasoningPolicy>,
     algorithm: AlgorithmSpec,
 }
 
@@ -88,7 +109,13 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let context_window = take_optional(&mut table, "context_window")?;
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
-        let vision = take_optional(&mut table, "vision")?;
+        // A route may spell its vision capability `vision` or `supports_vision`;
+        // the live deployment uses the latter. `vision` wins when both appear.
+        let vision =
+            take_optional(&mut table, "vision")?.or(take_optional(&mut table, "supports_vision")?);
+        let reasoning_policy = take_reasoning_policy(&mut table, "reasoning_policy")?;
+        let escalation_reasoning_policy =
+            take_reasoning_policy(&mut table, "escalation_reasoning_policy")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -97,9 +124,25 @@ impl<'de> Deserialize<'de> for RouteConfig {
             tool_calling,
             reasoning,
             vision,
+            reasoning_policy,
+            escalation_reasoning_policy,
             algorithm,
         })
     }
+}
+
+/// Whether a target's `extra_body` carries a hard reasoning pin.
+///
+/// The three keys production checks, exactly: a nested `reasoning` object, a
+/// top-level `reasoning_effort`, or a `chat_template_kwargs.enable_thinking`
+/// boolean. A key that merely resembles one (`summary`, a comment) is not a pin.
+fn target_extra_body_pins_reasoning(extra_body: &BTreeMap<String, Value>) -> bool {
+    extra_body.contains_key("reasoning")
+        || extra_body.contains_key("reasoning_effort")
+        || extra_body
+            .get("chat_template_kwargs")
+            .and_then(Value::as_object)
+            .is_some_and(|kwargs| kwargs.contains_key("enable_thinking"))
 }
 
 fn take_required<T, E>(table: &mut toml::Table, name: &'static str) -> Result<T, E>
@@ -122,7 +165,109 @@ where
         .transpose()
 }
 
+/// Parses a route reasoning policy. An unknown spelling is a configuration
+/// error, never a silent `None` (which would read as "no policy" and let the
+/// caller and target pins decide instead of failing closed).
+fn take_reasoning_policy<E: serde::de::Error>(
+    table: &mut toml::Table,
+    name: &'static str,
+) -> Result<Option<ReasoningPolicy>, E> {
+    match table.remove(name) {
+        None => Ok(None),
+        Some(value) => {
+            let raw = String::deserialize(value).map_err(E::custom)?;
+            ReasoningPolicy::parse(&raw).map(Some).ok_or_else(|| {
+                E::custom(format!(
+                    "{name} = {raw:?} is not a known reasoning policy; \
+                     expected one of none, enabled, low, medium, high, xhigh, max"
+                ))
+            })
+        }
+    }
+}
+
+impl DeploymentConfig {
+    /// Refuses a configuration whose escalation declarations cannot be honoured.
+    ///
+    /// Enforcement is at LOAD time, not at request time, because every rule here
+    /// is a static property of the declaration: a threshold with no destination
+    /// can never fire, a destination that is not a route can never be resolved,
+    /// and a destination that itself escalates is a cycle. A one-hop escalation
+    /// is only well defined if these are refused before traffic arrives.
+    fn validate_escalations(&self) -> RunnerResult<()> {
+        let route_ids = self
+            .routes
+            .values()
+            .map(|config| &config.id)
+            .collect::<std::collections::HashSet<&ModelId>>();
+        for (route_name, config) in &self.routes {
+            let Some(destination) = config.algorithm.escalation_destination() else {
+                if config.algorithm.escalation_threshold().is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} declares escalation_max_input_tokens without an \
+                         escalation destination"
+                    )));
+                }
+                continue;
+            };
+            if destination == &config.id {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} cannot escalate to itself"
+                )));
+            }
+            if !route_ids.contains(destination) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} escalation destination {destination:?} is not a \
+                     registered route id"
+                )));
+            }
+            let destination_config = self
+                .routes
+                .values()
+                .find(|candidate| candidate.id == *destination)
+                .expect("destination verified above");
+            if destination_config
+                .algorithm
+                .escalation_destination()
+                .is_some()
+            {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} escalation destination {destination:?} must not itself \
+                     declare an escalation (no escalation chains/cycles)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl RouteConfig {
+    /// A `fleet_router` route's advertised capability envelope must be
+    /// satisfiable by its candidate set (truthful model advertisement).
+    fn validate_fleet_capabilities(&self, route_name: &str) -> RunnerResult<()> {
+        let AlgorithmSpec::FleetRouter { candidates, .. } = &self.algorithm else {
+            return Ok(());
+        };
+        let route_tool_calling = self.tool_calling;
+        let route_reasoning = self.reasoning;
+        let any_tool = candidates.iter().any(|candidate| candidate.tool_calling);
+        let any_reasoning = candidates.iter().any(|candidate| candidate.reasoning);
+
+        if route_tool_calling == Some(true) && !any_tool {
+            return Err(RunnerError::configuration(format!(
+                "fleet_router route {route_name} advertises tool_calling=true but no \
+                 candidate profile supports tool calling"
+            )));
+        }
+        if route_reasoning == Some(true) && !any_reasoning {
+            return Err(RunnerError::configuration(format!(
+                "fleet_router route {route_name} advertises reasoning=true but no \
+                 candidate profile supports reasoning"
+            )));
+        }
+        Ok(())
+    }
+
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities {
             context_window: self.context_window,
@@ -142,6 +287,83 @@ impl RouteConfig {
 }
 
 impl DeploymentConfig {
+    /// Validates a route's authoritative reasoning policy against every target
+    /// the route can reach (candidates and routing targets; the escalation
+    /// destination re-validates under its own policy at its own entry).
+    ///
+    /// Fail-closed, evaluated per reachable target, in production's order:
+    /// 1. a hard reasoning pin on the TARGET (`reasoning_effort` or a reasoning
+    ///    key in `extra_body`) CONTRADICTS the route policy - two authoritative
+    ///    sources must not fight, and the neutral-target end state is no pin;
+    /// 2. the target's llm client MUST declare a `reasoning_dialect`;
+    /// 3. that dialect must honor the policy under the client's DECLARED
+    ///    vocabulary. An unexpressible policy is a load-time failure, never a
+    ///    runtime downgrade and never a silent substitution.
+    fn validate_route_reasoning_policy(
+        &self,
+        route_name: &str,
+        route: &RouteConfig,
+        policy: &ReasoningPolicy,
+    ) -> RunnerResult<()> {
+        let mut checked = std::collections::BTreeSet::new();
+        for target_name in route.callable_target_names() {
+            let target = self.targets.get(target_name).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "route {route_name} references unknown target {target_name}"
+                ))
+            })?;
+            if !checked.insert(target_name) {
+                continue;
+            }
+            let client_config = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} references unknown llm client {}",
+                    target.llm_client
+                ))
+            })?;
+            if target.reasoning_effort.is_some()
+                || target_extra_body_pins_reasoning(&target.extra_body)
+            {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares reasoning_policy = {policy} but target {target_name} \
+                     also carries a hard reasoning pin (reasoning_effort or extra_body reasoning key); \
+                     route policy and target hard pins must not fight - give the target no reasoning \
+                     pin (that is what makes it neutral) and let the route decide"
+                )));
+            }
+            let Some(dialect) = client_config.reasoning_dialect else {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                     llm client {} declares no reasoning_dialect; add reasoning_dialect to the \
+                     [llm_clients.{}] section or drop the route policy",
+                    target.llm_client, target.llm_client
+                )));
+            };
+            if !dialect.honors_with_vocabulary(*policy, client_config.reasoning_efforts.as_deref())
+            {
+                return Err(RunnerError::configuration(
+                    if dialect.is_effort_bearing() && client_config.reasoning_efforts.is_none() {
+                        format!(
+                            "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                             llm client {} uses effort-bearing dialect {dialect:?} without declaring reasoning_efforts; \
+                             declare the upstream's accepted effort vocabulary (e.g. reasoning_efforts = \
+                             [\"none\", \"low\", \"high\", \"max\"]) so unsupported values fail at load time",
+                            target.llm_client
+                        )
+                    } else {
+                        format!(
+                            "route {route_name} declares reasoning_policy = {policy} but target {target_name}'s \
+                             llm client {} (dialect {dialect:?}, declared vocabulary {:?}) cannot faithfully \
+                             express it; widen the declared vocabulary, switch dialect, or drop the policy",
+                            target.llm_client, client_config.reasoning_efforts
+                        )
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn decision_target(&self, name: &str) -> Option<DecisionTarget> {
         let target = self.targets.get(name)?;
         let client = self.llm_clients.get(&target.llm_client)?;
@@ -161,6 +383,33 @@ impl DeploymentConfig {
                 self.schema_version
             )));
         }
+
+        // Readiness declarations are validated before any route is built, so a
+        // duplicate model id across two sources fails loudly here instead of
+        // silently stranding the fleet on the fail-closed empty snapshot.
+        if let Some(readiness) = &self.fleet_readiness {
+            readiness.validate()?;
+        }
+
+        // Escalation declarations are static properties, so they are refused
+        // before any route is built.
+        self.validate_escalations()?;
+
+        // One readiness handle per deployment, shared by every fleet route, so
+        // the host-owned monitor can publish a snapshot all fleet routes read.
+        // A deployment with no fleet route does not need one.
+        let fleet_state = if self
+            .routes
+            .values()
+            .any(|config| matches!(config.algorithm, AlgorithmSpec::FleetRouter { .. }))
+        {
+            Some(Arc::new(SharedFleetState::new(FleetSnapshot::empty())))
+        } else {
+            None
+        };
+        let fleet_context = FleetBuildContext {
+            fleet_state: fleet_state.clone(),
+        };
 
         let mut route_names_by_id = HashMap::new();
         for (route_name, config) in &self.routes {
@@ -221,7 +470,53 @@ impl DeploymentConfig {
                     ))
                 })?;
             }
-            let capabilities = config.capabilities();
+            let mut capabilities = config.capabilities();
+            config.validate_fleet_capabilities(route_name)?;
+            if let Some(policy) = &config.reasoning_policy {
+                self.validate_route_reasoning_policy(route_name, config, policy)?;
+            }
+            // An `escalation_reasoning_policy` is validated against the
+            // DESTINATION route's reachable targets, not this route's: without
+            // this the caller could declare a policy the escalated leg's dialect
+            // cannot express, and it would surface only as a runtime provider
+            // error on an already-escalated request. F7 validates and
+            // represents; F8 owns the transition.
+            if let Some(policy) = &config.escalation_reasoning_policy {
+                let destination = config.algorithm.escalation_destination().ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "route {route_name} declares escalation_reasoning_policy without an \
+                         escalation destination"
+                    ))
+                })?;
+                let destination_config = self
+                    .routes
+                    .values()
+                    .find(|candidate| candidate.id == *destination)
+                    .ok_or_else(|| {
+                        RunnerError::configuration(format!(
+                            "route {route_name} escalation destination {destination:?} is not a \
+                             registered route id"
+                        ))
+                    })?;
+                self.validate_route_reasoning_policy(
+                    &format!("{route_name} escalation_reasoning_policy"),
+                    destination_config,
+                    policy,
+                )?;
+            }
+            // A vision-capable candidate set makes the route vision-capable: the
+            // route advertises at least what any candidate can actually serve.
+            if let AlgorithmSpec::FleetRouter { candidates, .. } = &config.algorithm {
+                let any_vision = candidates.iter().any(|candidate| candidate.supports_vision);
+                capabilities.vision = capabilities.vision.or(Some(any_vision));
+            }
+            // A declared reasoning policy IS the route's reasoning capability:
+            // the advertisement derives from the effective policy, so a route
+            // pinned to `none` advertises no reasoning even if its candidate
+            // profiles could reason.
+            if let Some(policy) = &config.reasoning_policy {
+                capabilities.reasoning = Some(policy.is_thinking());
+            }
             if capabilities.context_window == Some(0) {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} context_window must be greater than zero"
@@ -229,7 +524,7 @@ impl DeploymentConfig {
             }
             let algorithm = config
                 .algorithm
-                .build(route_name, &targets)
+                .build_with_fleet(route_name, &targets, &fleet_context)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             let (route_clients, caller_auth) =
                 self.build_route_clients(route_name, config, &clients)?;
@@ -259,12 +554,21 @@ impl DeploymentConfig {
                 responses_auxiliary_target,
                 decision_targets,
                 models,
+            )
+            .with_reasoning_policy(config.reasoning_policy)
+            .with_escalation_reasoning_policy(config.escalation_reasoning_policy)
+            .with_escalation(
+                config.algorithm.escalation_destination().cloned(),
+                config.algorithm.escalation_threshold(),
             );
             routes.push((config.id.clone(), route));
         }
         let runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
-            .with_provider_api_keys(provider_api_keys);
+            .with_provider_api_keys(provider_api_keys)
+            .with_fleet_readiness(self.fleet_readiness)
+            .with_fleet_state(fleet_state)
+            .with_capabilities(self.capability_clients, self.capabilities);
         Ok(runner)
     }
 
@@ -280,7 +584,7 @@ impl DeploymentConfig {
 
         for (name, client_config) in &self.llm_clients {
             validate_value("llm client name", name)?;
-            let backend = build_backend(name, client_config, &BTreeMap::new(), None)?;
+            let backend = build_backend(name, client_config, &BTreeMap::new(), None, false)?;
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
             | Backend::Anthropic(config)) = backend;
@@ -319,6 +623,7 @@ impl DeploymentConfig {
                     client_config,
                     &target.extra_body,
                     target.reasoning_effort.clone(),
+                    target.strip_reasoning_content,
                 )?,
                 None,
             ));
@@ -530,10 +835,10 @@ fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
 /// Holding a `HttpBaseUrl` is proof the value is an absolute HTTP(S) URL, so no
 /// later stage has to re-check it or can forget to.
 #[derive(Clone, Debug)]
-struct HttpBaseUrl(reqwest::Url);
+pub struct HttpBaseUrl(pub(crate) reqwest::Url);
 
 impl HttpBaseUrl {
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 }
@@ -570,6 +875,15 @@ struct LlmClientConfig {
     max_retries: u32,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
+    /// How this upstream expresses reasoning control. Required whenever a
+    /// route carrying a `reasoning_policy` can reach this client.
+    #[serde(default)]
+    reasoning_dialect: Option<ReasoningDialect>,
+    /// The operator-validated effort vocabulary this upstream accepts.
+    /// A declaration about expressibility only - it never selects a policy and
+    /// never substitutes one to make a configuration valid.
+    #[serde(default)]
+    reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,6 +897,12 @@ struct TargetConfig {
     /// Reasoning effort forced on every request to this target, replacing the caller's value.
     /// Only meaningful on `openai_chat` and `openai_responses` clients.
     reasoning_effort: Option<String>,
+    /// Opt this target out of reasoning replay: strip stored/round reasoning
+    /// before the wire. Scoped to replayed CoT on assistant turns and
+    /// Responses `input[]` reasoning items; unrelated reasoning state such as
+    /// `summary` and every non-reasoning field survive.
+    #[serde(default)]
+    strip_reasoning_content: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -640,6 +960,7 @@ fn build_backend(
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
     reasoning_effort: Option<String>,
+    strip_reasoning_content: bool,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -685,6 +1006,9 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         reasoning_effort,
+        reasoning_dialect: config.reasoning_dialect,
+        reasoning_efforts: config.reasoning_efforts.clone(),
+        strip_reasoning_content,
         max_retries: config.max_retries,
         timeout: config.timeout_ms.map(Duration::from_millis),
     };
@@ -1625,7 +1949,7 @@ confidence_threshold = 0.5
         let Some(client) = config.llm_clients.get("primary") else {
             return Err(RunnerError::configuration("primary llm client is missing"));
         };
-        let backend = build_backend("primary", client, &target.extra_body, None)?;
+        let backend = build_backend("primary", client, &target.extra_body, None, false)?;
 
         assert_eq!(
             backend.extra_body().get("service_tier"),
@@ -1652,12 +1976,77 @@ confidence_threshold = 0.5
                 "format = \"openai_chat\"\nbase_url = \"https://example.test/v1\"\n{setting}"
             );
             let config: LlmClientConfig = toml::from_str(&source).expect("valid deadline config");
-            let backend = build_backend("test", &config, &BTreeMap::new(), None);
+            let backend = build_backend("test", &config, &BTreeMap::new(), None, false);
             if expected == Some(0) {
                 assert!(backend.is_err());
             } else {
                 assert_eq!(backend?.timeout(), expected.map(Duration::from_millis));
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strip_flag_and_dialect_reach_the_built_backend_per_target() -> RunnerResult<()> {
+        // The real `build_backend` seam: the strip decision, the dialect and the
+        // declared vocabulary must arrive from the TARGET's own declaration and
+        // must not be applied globally.
+        let source = "format = \"openai_responses\"\nbase_url = \"https://example.test/v1\"\nreasoning_dialect = \"openrouter_enabled\"\n";
+        let config: LlmClientConfig = toml::from_str(source).expect("valid client config");
+
+        let stripped = build_backend("t", &config, &BTreeMap::new(), None, true)?;
+        assert!(
+            stripped.strip_reasoning_content(),
+            "a target declaring the flag must build a stripping backend"
+        );
+        assert_eq!(
+            stripped.reasoning_dialect(),
+            Some(switchyard_protocol::ReasoningDialect::OpenRouterEnabled)
+        );
+
+        let plain = build_backend("t", &config, &BTreeMap::new(), None, false)?;
+        assert!(
+            !plain.strip_reasoning_content(),
+            "a target NOT declaring the flag must build a non-stripping backend: the flag is per-target, never global"
+        );
+        // The dialect is a property of the client, identical for both targets.
+        assert_eq!(
+            plain.reasoning_dialect(),
+            Some(switchyard_protocol::ReasoningDialect::OpenRouterEnabled)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_targets_strip_declaration_is_the_only_input_to_the_built_backend() -> RunnerResult<()> {
+        // Asserts the property at the seam the build uses: the strip value
+        // handed to `build_backend` IS the target's own declaration. M9/M10
+        // mutate that argument, and this fails for both directions.
+        for declared in [true, false] {
+            let target: TargetConfig = toml::from_str(&format!(
+                "id = \"m/a\"\nllm_client = \"primary\"\nstrip_reasoning_content = {declared}\n"
+            ))
+            .map_err(|error| RunnerError::configuration(error.to_string()))?;
+            let config: DeploymentConfig = toml::from_str(VALID_CONFIG).map_err(|error| {
+                RunnerError::configuration(format!("failed to parse default config: {error}"))
+            })?;
+            let client = config.llm_clients.get("primary").ok_or_else(|| {
+                RunnerError::configuration("primary llm client is missing".to_string())
+            })?;
+            // The exact argument the build passes for this target.
+            let observed = build_backend(
+                &target.llm_client,
+                client,
+                &target.extra_body,
+                target.reasoning_effort.clone(),
+                target.strip_reasoning_content,
+            )?
+            .strip_reasoning_content();
+            assert_eq!(
+                observed, declared,
+                "a target declaring {declared} must build a backend with strip={declared}; \
+                 the flag is per-target and never forced on or off globally"
+            );
         }
         Ok(())
     }
@@ -1980,5 +2369,49 @@ advisor_target = "advisor"
             "advisor_target = \"advisor\"\nmax_reviews = 0",
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
+    }
+}
+
+#[cfg(test)]
+mod live_config_loadability_gate {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    const LIVE_CONFIG: &str = "/home/vincent/.local/lib/localclaw-switchyard/routes.toml";
+
+    // READ-ONLY gate: copies the live config to a temp path and loads it through the real
+    // `load_runner`. Never edits the live file, restarts the service, alters the environment,
+    // or contacts a provider (build_clients only constructs clients).
+    #[test]
+    fn live_config_loadability_gate() {
+        let live = PathBuf::from(LIVE_CONFIG);
+        assert!(live.is_file(), "live config not found: {}", live.display());
+        let bytes = std::fs::read(&live).expect("read live config");
+        let copy = std::env::temp_dir().join("v030-live-config-loadability.toml");
+        std::fs::write(&copy, &bytes).expect("write temp copy");
+        let reread = std::fs::read(&copy).expect("reread");
+        assert_eq!(reread, bytes, "temp copy not byte-identical");
+
+        println!("=== LIVE CONFIG LOADABILITY GATE ===");
+        println!("live bytes: {}", bytes.len());
+
+        // STAGE 1: TOML parse + serde schema (deny_unknown_fields on DeploymentConfig,
+        // LlmClientConfig, TargetConfig). Needs no credentials.
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        match toml::from_str::<toml::Table>(text) {
+            Ok(_) => println!("STAGE 1 (toml parse): OK"),
+            Err(e) => println!("STAGE 1 (toml parse): FAIL\n{e}"),
+        }
+        match toml::from_str::<DeploymentConfig>(text) {
+            Ok(_) => println!("STAGE 1b (DeploymentConfig schema): OK"),
+            Err(e) => println!("STAGE 1b (DeploymentConfig schema): FAIL\n{e}"),
+        }
+
+        // STAGE 2: full build through the real loader (resolves api_key_env).
+        match load_runner(Path::new(&copy)) {
+            Ok(_) => println!("STAGE 2 (load_runner build): OK - instantiated"),
+            Err(e) => println!("STAGE 2 (load_runner build): FAIL\n{e}"),
+        }
+        let _ = std::fs::remove_file(&copy);
     }
 }

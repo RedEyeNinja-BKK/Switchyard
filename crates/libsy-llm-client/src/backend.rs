@@ -61,6 +61,17 @@ pub struct HttpBackendConfig {
     /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
     /// Anthropic has no equivalent and rejects the setting at configuration time.
     pub reasoning_effort: Option<String>,
+    /// How this upstream expresses reasoning control. Used to translate a
+    /// route's abstract `ReasoningPolicy` into this endpoint's wire keys.
+    pub reasoning_dialect: Option<switchyard_protocol::ReasoningDialect>,
+    /// The operator-validated effort vocabulary this upstream accepts. An
+    /// expressibility declaration only: it never selects a policy, and it never
+    /// substitutes one to make an otherwise-invalid configuration valid.
+    pub reasoning_efforts: Option<Vec<String>>,
+    /// Opt this target out of reasoning replay: remove stored/round reasoning
+    /// before it reaches the wire. Applied after the target defaults merge, so
+    /// no target `extra_body` can reinstate a field the target removed.
+    pub strip_reasoning_content: bool,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
@@ -77,6 +88,9 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("reasoning_dialect", &self.reasoning_dialect)
+            .field("reasoning_efforts", &self.reasoning_efforts)
+            .field("strip_reasoning_content", &self.strip_reasoning_content)
             .field("max_retries", &self.max_retries)
             .field("timeout", &self.timeout)
             .finish()
@@ -140,6 +154,22 @@ impl Backend {
             Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
             | Backend::Anthropic(config) => config,
+        }
+    }
+
+    /// Whether this backend targets the ChatGPT Codex backend
+    /// (`chatgpt.com/backend-api/codex`), which applies stricter wire rules
+    /// than normal OpenAI `/v1/responses` endpoints.
+    pub fn is_codex(&self) -> bool {
+        matches!(self, Backend::OpenAiResponses(_)) && {
+            // Path-boundary match, not a substring match: the base URL is
+            // normalized ONCE (its path is the parsed URL's path component, so
+            // any query/fragment is already excluded) and the path must END with
+            // /backend-api/codex. Near-matches (e.g.
+            // https://proxy.example/backend-api/codex-compat or
+            // https://proxy.example/not-backend-api/codex) are NOT Codex.
+            codex_base_path(&self.config().base_url)
+                .is_some_and(|path| path.ends_with("/backend-api/codex"))
         }
     }
 
@@ -260,6 +290,21 @@ impl Backend {
         self.config().reasoning_effort.as_deref()
     }
 
+    /// The reasoning-control dialect this backend speaks, if declared.
+    pub fn reasoning_dialect(&self) -> Option<switchyard_protocol::ReasoningDialect> {
+        self.config().reasoning_dialect
+    }
+
+    /// The operator-declared effort vocabulary this backend accepts.
+    pub fn reasoning_efforts(&self) -> Option<&[String]> {
+        self.config().reasoning_efforts.as_deref()
+    }
+
+    /// Whether this target opted out of reasoning replay.
+    pub fn strip_reasoning_content(&self) -> bool {
+        self.config().strip_reasoning_content
+    }
+
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
@@ -332,6 +377,32 @@ fn oauth_beta_header(value: &HeaderValue) -> Option<HeaderValue> {
     Some(value)
 }
 
+// Normalizes a configured base URL to its path component for Codex
+// classification. Two normalizations are applied, both mirroring the join rules
+// that `openai_url` applies when it builds the request URL, so classification
+// and URL construction never disagree about what the base URL means:
+//
+//   * the query and fragment are excluded by the parser,
+//   * a trailing slash is trimmed so `.../backend-api/codex/` classifies,
+//   * an already-specific endpoint suffix is stripped — BOTH suffixes that
+//     `openai_url` accepts (`/responses` and `/chat/completions`) — so a base URL
+//     written as `.../backend-api/codex/responses` (or the chat spelling) still
+//     classifies as Codex rather than silently losing the strip, the stream force
+//     and the strict profile. Mirroring only one of the two would leave the
+//     classification disagreeing with URL construction for the other.
+//
+// A base URL that does not parse yields None (never Codex): the same
+// path `url()` would fail on, so it cannot be a routable Codex endpoint.
+fn codex_base_path(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let path = url.path().trim_end_matches('/');
+    let path = path
+        .strip_suffix("/responses")
+        .or_else(|| path.strip_suffix("/chat/completions"))
+        .unwrap_or(path);
+    Some(path.to_string())
+}
+
 // Accept either a root `/v1` URL or an already-specific OpenAI endpoint URL.
 pub(crate) fn openai_url(base_url: &str, suffix: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(base_url).map_err(|error| LlmClientError::Configuration {
@@ -375,6 +446,9 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             reasoning_effort: None,
+            reasoning_dialect: None,
+            reasoning_efforts: None,
+            strip_reasoning_content: false,
             max_retries: 0,
             timeout: None,
         }
@@ -384,6 +458,101 @@ mod tests {
     fn openai_chat_url_joins_bare_v1() {
         let backend = Backend::OpenAiChat(config("https://api.openai.com/v1"));
         assert_eq!(backend.url(), "https://api.openai.com/v1/chat/completions");
+    }
+
+    // Codex classification and endpoint construction share ONE base-URL
+    // normalization: a base URL carrying a query or fragment is classified on
+    // its path alone, and the endpoint path is appended before the query.
+    #[test]
+    fn codex_base_url_with_query_appends_endpoint_before_query() {
+        let backend = Backend::OpenAiResponses(config("https://host/backend-api/codex?route=x"));
+        assert!(backend.is_codex());
+        assert_eq!(
+            backend.url(),
+            "https://host/backend-api/codex/responses?route=x"
+        );
+    }
+
+    #[test]
+    fn codex_base_url_with_fragment_keeps_the_endpoint_path() {
+        let backend = Backend::OpenAiResponses(config("https://host/backend-api/codex#frag"));
+        assert!(backend.is_codex());
+        assert_eq!(
+            backend.url(),
+            "https://host/backend-api/codex/responses#frag"
+        );
+    }
+
+    #[test]
+    fn codex_near_matches_with_query_remain_non_codex() {
+        assert!(
+            !Backend::OpenAiResponses(config("https://host/backend-api/codex-compat?v=1"))
+                .is_codex()
+        );
+        assert!(
+            !Backend::OpenAiResponses(config("https://host/not-backend-api/codex?x=1")).is_codex()
+        );
+    }
+
+    #[test]
+    fn normal_responses_base_url_is_unaffected_by_query_splitting() {
+        let backend = Backend::OpenAiResponses(config("https://api.openai.com/v1"));
+        assert!(!backend.is_codex());
+        assert_eq!(backend.url(), "https://api.openai.com/v1/responses");
+    }
+
+    // A base URL written with the endpoint suffix already attached resolves to
+    // the SAME request URL as the bare prefix, so it must classify identically.
+    // Otherwise the config spelling would silently decide whether the strip,
+    // the stream force and the strict profile apply at all.
+    #[test]
+    fn codex_base_url_with_endpoint_suffix_still_classifies() {
+        let bare = Backend::OpenAiResponses(config("https://host/backend-api/codex"));
+        let suffixed = Backend::OpenAiResponses(config("https://host/backend-api/codex/responses"));
+        assert!(bare.is_codex());
+        assert!(
+            suffixed.is_codex(),
+            "an endpoint-suffixed Codex base URL must classify the same as the bare prefix"
+        );
+        assert_eq!(bare.url(), suffixed.url());
+    }
+
+    // Stripping the suffix must not make a deeper Codex path match.
+    #[test]
+    fn deeper_codex_path_with_suffix_stays_non_codex() {
+        assert!(
+            !Backend::OpenAiResponses(config("https://host/backend-api/codex/v2/responses"))
+                .is_codex()
+        );
+    }
+
+    // `openai_url` strips BOTH endpoint suffixes, so classification must too --
+    // otherwise a chat-suffixed base URL on the Codex path resolves to the right
+    // URL while silently losing the strip, the stream force and the profile.
+    #[test]
+    fn codex_base_url_with_chat_suffix_still_classifies() {
+        let suffixed =
+            Backend::OpenAiResponses(config("https://host/backend-api/codex/chat/completions"));
+        assert!(suffixed.is_codex());
+        assert_eq!(
+            suffixed.url(),
+            Backend::OpenAiResponses(config("https://host/backend-api/codex")).url()
+        );
+    }
+
+    // Only the Responses variant is strict-Codex: a Chat backend pointed at the
+    // same path is NOT, and a Responses backend on a non-Codex path is not.
+    #[test]
+    fn is_codex_is_responses_only_and_path_bounded() {
+        assert!(!Backend::OpenAiChat(config("https://host/backend-api/codex")).is_codex());
+        assert!(!Backend::Anthropic(config("https://host/backend-api/codex")).is_codex());
+        assert!(Backend::OpenAiResponses(config("https://host/backend-api/codex")).is_codex());
+        // Trailing slash still classifies (the URL path is trimmed).
+        assert!(Backend::OpenAiResponses(config("https://host/backend-api/codex/")).is_codex());
+        // A deeper path under the Codex prefix is NOT (path must END there).
+        assert!(!Backend::OpenAiResponses(config("https://host/backend-api/codex/v2")).is_codex());
+        // An unparseable base URL cannot be a routable Codex endpoint.
+        assert!(!Backend::OpenAiResponses(config("not a url")).is_codex());
     }
 
     #[test]

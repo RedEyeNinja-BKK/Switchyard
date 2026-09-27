@@ -18,6 +18,15 @@ pub struct Request {
     pub raw_request: Option<serde_json::Value>,
     /// Correlation metadata carried through the request.
     pub metadata: Option<Metadata>,
+    /// The calling route's authoritative reasoning policy for this request.
+    ///
+    /// Stamped by the route at the single entry every completion/decision path
+    /// crosses, then read at the LLM-client send seam. The policy is
+    /// route intent, not a client default: the target's own reasoning pin is
+    /// applied first and this value is the FINAL authority for any target the
+    /// route reaches. `None` leaves the target's declaration governing
+    /// unchanged, which is what every non-policy-bearing route needs.
+    pub route_reasoning_policy: Option<crate::ReasoningPolicy>,
 }
 
 impl Request {

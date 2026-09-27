@@ -67,6 +67,9 @@ fn delegated_prompt_request(request: &Request) -> Option<Request> {
         },
         raw_request: None,
         metadata: request.metadata.clone(),
+        // An internal subagent call is not the route's leg: it must not inherit
+        // the route reasoning policy.
+        ..Request::default()
     })
 }
 
@@ -163,6 +166,7 @@ mod tests {
             llm_request: text_request(Some(ModelId::from("auto").to_string()), "hi"),
             raw_request: None,
             metadata,
+            ..Default::default()
         }
     }
 

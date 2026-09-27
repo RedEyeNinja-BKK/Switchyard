@@ -1264,6 +1264,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Default::default()
         }
     }
 

@@ -207,6 +207,7 @@ mod tests {
             llm_request: text_request(Some("strong".to_string()), "hi"),
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
         let (classification, _) = RecordingClassifier
             .score(&mut state, &mut request, &empty_driver())
@@ -249,6 +250,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
 
         RewritingClassifier

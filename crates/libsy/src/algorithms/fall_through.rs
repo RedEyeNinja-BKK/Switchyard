@@ -382,6 +382,7 @@ mod tests {
                 session_id: Some("session-1".to_string()),
                 ..Metadata::default()
             }),
+            ..Default::default()
         }
     }
 
@@ -455,6 +456,7 @@ mod tests {
                 llm_request: text_request(Some("auto".to_string()), "fix the build"),
                 raw_request: None,
                 metadata: None,
+                ..Default::default()
             },
             category_models(Category::Any, &["capable", "efficient"]),
             capturing(Arc::clone(&captured)),

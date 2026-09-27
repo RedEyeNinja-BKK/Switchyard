@@ -524,6 +524,9 @@ impl AdvisorGate {
             },
             raw_request: None,
             metadata: base.metadata.clone(),
+            // An internal reviewer call is not the route's leg: it must not
+            // inherit the route reasoning policy.
+            ..Request::default()
         }
     }
 }

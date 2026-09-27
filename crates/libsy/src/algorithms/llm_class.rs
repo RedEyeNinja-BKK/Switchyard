@@ -944,6 +944,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "classify this task"),
             raw_request: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -1364,6 +1365,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
         Ok(judge
             .build_request(&State::default(), &request)
@@ -1601,6 +1603,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
 
         let built = TaskInput {
@@ -1640,6 +1643,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
 
         let built = judge.build_request(&State::default(), &request);
@@ -1681,6 +1685,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
         let judge_request = judge.build_request(&State::default(), &request);
 

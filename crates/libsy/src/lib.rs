@@ -19,6 +19,16 @@ pub use error::{DriverError, LibsyError, Result};
 mod algorithms;
 pub use algorithms::advisor_gate::{AdvisorGate, AdvisorGateConfig, GateTrigger};
 pub use algorithms::composite::{CompositeRouter, CompositeRouterConfig};
+pub use algorithms::fleet_router::{
+    CandidateEligibility, CandidateInputTokens, CandidateState, ContextAdmittedCandidate,
+    ContextIneligibleReason, ContextVerdict, EligibilityFacts, FleetCandidate, FleetRouter,
+    FleetSnapshot, FleetStateSource, IneligibleReason, ReadinessVerdict, ReadyCandidate,
+    SharedFleetState, StaticFleetState, candidate_context_verdict,
+    candidate_is_statically_eligible, candidate_readiness, compare_preference,
+    context_admission_filter, fleet_category_models, preference_order, readiness_filter,
+    ready_candidates, reasoning_requested, record_input_token_fact, request_output_budget,
+    request_requires_tools, request_requires_vision, static_eligibility,
+};
 pub use algorithms::llm_class::{
     CustomClassifierConfig, CustomClassifierPolicy, LlmClassifierConfig, LlmTaskClassifier,
     TaskClassifierConfig,

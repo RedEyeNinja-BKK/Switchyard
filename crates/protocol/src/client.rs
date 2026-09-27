@@ -152,4 +152,22 @@ impl RoutingFallbackReason {
 pub trait RoutedLlmClient: Send + Sync {
     /// Make a request
     async fn call(&self, request: Request) -> Result<Response, LlmClientError>;
+
+    /// Identity of the upstream service this client talks to, used to scope how far a
+    /// failed call's damage reaches across that service's other models.
+    ///
+    /// A drained account, an expired credential, or a host-wide outage is a property of the
+    /// UPSTREAM SERVICE, not of one model: one OpenRouter model rejecting with
+    /// `payment_required` says nothing about which other models on that host can serve. The
+    /// fallback driver uses this key to skip only the candidates a failure actually covers.
+    ///
+    /// The key must be the exact upstream base URL. It is used only to group candidates
+    /// that share a provider; it never makes a candidate eligible on its own, and no other
+    /// decision (preference, ordering, readiness) rides on it.
+    ///
+    /// `None` (the default) disables provider-aware skipping for that client, which is the
+    /// correct and conservative behavior for a client with no configured base URL.
+    fn provider_key(&self) -> Option<&str> {
+        None
+    }
 }

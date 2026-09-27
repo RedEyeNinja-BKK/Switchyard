@@ -20,7 +20,8 @@ use switchyard_protocol::{
 };
 use switchyard_translation::{
     TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
+    encode_aggregated_response_with_extensions, encode_request_with_profile,
+    encode_stream_with_extensions,
 };
 use tracing::Instrument;
 
@@ -126,6 +127,9 @@ pub struct TranslatingLlmClient {
     model_to_config: HashMap<ModelId, ModelConfig>,
     client: reqwest::Client,
     forward_auth_client: reqwest::Client,
+    /// Normalized upstream base URL shared by every model this client serves; the provider
+    /// identity the fallback driver groups candidates by.
+    provider_base_url: Option<String>,
 }
 
 impl TranslatingLlmClient {
@@ -154,11 +158,22 @@ impl TranslatingLlmClient {
             .iter()
             .map(|config| (config.model_name.clone(), config.clone()))
             .collect();
+        // Provider identity for fallback scoping: the base URL every model in this client
+        // shares. Exact, not a heuristic — see `provider_key`.
+        let provider_base_url = model_configs.first().map(|config| {
+            let url = match &config.default_backend {
+                Backend::OpenAiChat(backend)
+                | Backend::OpenAiResponses(backend)
+                | Backend::Anthropic(backend) => backend.base_url.trim_end_matches('/'),
+            };
+            url.to_owned()
+        });
 
         Ok(Self {
             model_to_config,
             client,
             forward_auth_client,
+            provider_base_url,
         })
     }
 
@@ -213,6 +228,10 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 model,
                 UpstreamEndpoint::Auxiliary(operation),
+                // Auxiliary calls are structural (token counts, compaction,
+                // input-token accounting), not a model completion: a route's
+                // reasoning policy must never ride them.
+                None,
             )
             .await?;
         let EncodedResponse::Buffered { body, .. } = http_response else {
@@ -236,6 +255,10 @@ impl TranslatingLlmClient {
     /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
     /// backend's completion URL and decodes a response) and
     /// the model-bearing auxiliary operations, which return raw JSON.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the route policy rides alongside the existing send parameters; a params struct would churn every caller"
+    )]
     async fn send_encoded(
         &self,
         backend: &Backend,
@@ -244,8 +267,19 @@ impl TranslatingLlmClient {
         metadata: Option<&Metadata>,
         model: &ModelId,
         endpoint: UpstreamEndpoint,
+        route_policy: Option<switchyard_protocol::ReasoningPolicy>,
     ) -> Result<EncodedResponse> {
-        let mut body = encode_request(&llm_request, wire_format)
+        // The destination profile is a property of the backend class (the same
+        // path-boundary rule that classifies strict Codex endpoints), not of
+        // individual routes: a strict Codex backend encodes assistant history
+        // as output_text; normal Responses endpoints stay standards-compliant.
+        let responses_profile =
+            if matches!(wire_format, WireFormat::OpenAiResponses) && backend.is_codex() {
+                switchyard_translation::ResponsesProfile::StrictCodex
+            } else {
+                switchyard_translation::ResponsesProfile::Normal
+            };
+        let mut body = encode_request_with_profile(&llm_request, wire_format, responses_profile)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`; force the resolved model so
@@ -261,6 +295,25 @@ impl TranslatingLlmClient {
             strip_unsigned_thinking_blocks(&mut body);
         }
         merge_extra_body(&mut body, backend.extra_body());
+        // The ChatGPT Codex backend rejects `max_output_tokens` (2026-08 API)
+        // and `temperature` (2026-09 API, 400 "Unsupported parameter:
+        // temperature") outright, on every inbound path - chat (`max_tokens`),
+        // Responses passthrough, and preserved same-format bodies alike. Strip
+        // AFTER `merge_extra_body` so no target `extra_body` can reinstate
+        // either field. Normal OpenAI `/v1/responses` backends keep both.
+        if backend.is_codex() {
+            strip_codex_incompatible_fields(&mut body);
+        }
+        // Target-opted-out reasoning replay. The OpenAI-Chat encoder attaches
+        // stored/round reasoning to assistant turns (`reasoning_content`
+        // plaintext, `reasoning_details` structured); a target that neither
+        // requires nor wants it pays for those tokens on every subsequent turn.
+        // Applied AFTER `merge_extra_body` so no target `extra_body` can
+        // reinstate a field the target removed.
+        if backend.strip_reasoning_content() {
+            strip_message_reasoning_content(&mut body);
+            strip_input_reasoning_items(&mut body);
+        }
         // After the merge on purpose: the effort override must win over both the caller's
         // value and any `reasoning` default a target set through `extra_body`.
         apply_reasoning_effort(&mut body, backend);
@@ -269,6 +322,58 @@ impl TranslatingLlmClient {
         }
         if matches!(backend, Backend::OpenAiChat(_)) {
             ensure_openai_stream_usage(&mut body);
+        } else if matches!(backend, Backend::OpenAiResponses(_)) {
+            // Stream-mandatory Responses backends (chatgpt.com Codex: "Stream
+            // must be set to true") - force upstream stream=true regardless of
+            // the caller's stream value; the server layer aggregates back to
+            // buffered JSON for callers that asked for stream=false. The chat-
+            // only usage decoration above never leaks stream_options onto this
+            // Responses path (stream_options is a chat-completions parameter).
+            if backend.is_codex()
+                && body.get("stream").and_then(Value::as_bool) != Some(true)
+                && let Value::Object(object) = &mut body
+            {
+                object.insert("stream".to_string(), Value::Bool(true));
+            }
+        }
+        // Route-authoritative reasoning policy (opt-in per route): translated
+        // through the backend's declared dialect and merged AFTER the target
+        // defaults + the target effort override so the route's intent is the
+        // final authority for any target it reaches. A policy-bearing request
+        // reaching a dialect-less backend fails closed here — downgrade-by-
+        // silence is exactly what this mechanism must never do.
+        if let Some(policy) = route_policy {
+            let Some(dialect) = backend.reasoning_dialect() else {
+                return Err(LlmClientError::Configuration {
+                    message: format!(
+                        "request carries route reasoning policy {policy} but model {model:?}'s backend \
+                         declares no reasoning_dialect; refusing to send an uncontrolled request"
+                    ),
+                });
+            };
+            // Defense in depth: expressibility is re-checked HERE, with the
+            // backend's declared vocabulary — not only in runner load
+            // validation. `wire_body` alone is not a sufficient gate: it
+            // renders a shape for policies the dialect does NOT honor.
+            let vocabulary = backend.reasoning_efforts();
+            if !dialect.honors_with_vocabulary(policy, vocabulary) {
+                return Err(LlmClientError::Configuration {
+                    message: format!(
+                        "route reasoning policy {policy} is not expressible by dialect {dialect:?} \
+                         on model {model:?} with the declared reasoning_efforts vocabulary \
+                         {vocabulary:?}; refusing to send an un-declared request"
+                    ),
+                });
+            }
+            let Some(wire) = dialect.wire_body(policy) else {
+                return Err(LlmClientError::Configuration {
+                    message: format!(
+                        "route reasoning policy {policy} cannot be expressed by dialect {dialect:?} \
+                         on model {model:?}; refusing to send a downgraded request"
+                    ),
+                });
+            };
+            merge_authoritative_object(&mut body, &wire);
         }
         let streaming = endpoint.allows_streaming()
             && body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -509,6 +614,7 @@ impl TranslatingLlmClient {
         let Request {
             mut llm_request,
             metadata,
+            route_reasoning_policy,
             ..
         } = request;
 
@@ -543,6 +649,7 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 &model_id,
                 UpstreamEndpoint::Completion,
+                route_reasoning_policy,
             )
             .await?;
 
@@ -635,6 +742,10 @@ impl TranslatingLlmClient {
                 wire_format: None,
                 ..Default::default()
             }),
+            // A re-issued model call is a fresh request built for the resolved
+            // model, not the caller's leg: the route policy is re-stamped by the
+            // route entry if one governs this path.
+            ..Request::default()
         };
         let response = self.call_rewrite_model(request, model).await?;
 
@@ -666,6 +777,18 @@ impl TranslatingLlmClient {
 impl RoutedLlmClient for TranslatingLlmClient {
     async fn call(&self, request: Request) -> Result<Response> {
         self.call_rewrite_model(request, None).await
+    }
+
+    /// Upstream base URL, trailing-slash-normalized, as the provider identity.
+    ///
+    /// One client is built per `[llm_clients.*]` section and `ModelConfig` carries a single
+    /// scalar `base_url`, so one client cannot span two upstream URLs and every model within
+    /// it shares this key by construction. Two client sections carrying the same `base_url`
+    /// string are the same upstream service, which is exactly the grouping the fallback
+    /// driver needs when one service's account is drained but its zero-price models still
+    /// serve.
+    fn provider_key(&self) -> Option<&str> {
+        self.provider_base_url.as_deref()
     }
 }
 
@@ -1097,6 +1220,52 @@ fn is_unsigned_thinking_block(block: &Value) -> bool {
     )
 }
 
+// Merges the route's authoritative reasoning wire shape into the body, replacing
+// the keys it owns. Enforces exactly ONE canonical reasoning representation per
+// upstream request: when the route's dialect speaks the nested `reasoning` object,
+// the flat `reasoning_effort` is dropped so an OpenRouter upstream never sees the
+// dual representation it rejects.
+fn merge_authoritative_object(body: &mut Value, policy_wire: &Value) {
+    let Value::Object(policy) = policy_wire else {
+        return;
+    };
+    let Value::Object(object) = body else {
+        return;
+    };
+    for (key, value) in policy {
+        object.insert(key.clone(), value.clone());
+    }
+    if policy.contains_key("reasoning") {
+        object.remove("reasoning_effort");
+    }
+}
+
+// Removes stored/round reasoning attached to assistant turns. Applied only when
+// the target opted out via `strip_reasoning_content`.
+fn strip_message_reasoning_content(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Value::Object(object) = message else {
+            continue;
+        };
+        object.remove("reasoning");
+        object.remove("reasoning_content");
+        object.remove("reasoning_details");
+    }
+}
+
+// Removes Responses `input[]` reasoning items while leaving tool-call adjacency
+// intact — a reasoning item sitting between two tool results is structure, not
+// replayed thought.
+fn strip_input_reasoning_items(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    input.retain(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
+}
+
 // Forces the target's configured reasoning effort onto the outbound body, replacing the
 // caller's value. Unlike `extra_body`, this is an override: a route that sends one model at a
 // higher effort than the client asked for is the point of the setting.
@@ -1132,6 +1301,13 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
         // Anthropic has no effort field (thinking is a token budget); the runner rejects the
         // setting on Anthropic clients at load time, so this arm is unreachable in practice.
         Backend::Anthropic(_) => {}
+    }
+}
+
+fn strip_codex_incompatible_fields(body: &mut Value) {
+    if let Value::Object(object) = body {
+        object.remove("max_output_tokens");
+        object.remove("temperature");
     }
 }
 
@@ -1280,7 +1456,10 @@ mod tests {
     use std::thread::JoinHandle;
 
     use serde_json::json;
-    use switchyard_protocol::{completion_text, text_request};
+    use switchyard_protocol::{
+        ContentBlock, Message, ReasoningDialect, ReasoningPolicy, Role, ToolCall, completion_text,
+        text_request,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1295,6 +1474,9 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             reasoning_effort: None,
+            reasoning_dialect: None,
+            reasoning_efforts: None,
+            strip_reasoning_content: false,
             max_retries: 0,
             timeout: None,
         }
@@ -1496,6 +1678,7 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -3148,5 +3331,510 @@ mod tests {
             )
             .await?;
         Ok(())
+    }
+
+    // ---- route-authoritative reasoning policy: the send seam ----
+
+    fn declared_vocabulary(efforts: Option<&[&str]>) -> Option<Vec<String>> {
+        efforts.map(|values| values.iter().map(|value| (*value).to_string()).collect())
+    }
+
+    fn chat_map_with_dialect(
+        base_url: &str,
+        dialect: ReasoningDialect,
+        efforts: Option<&[&str]>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.reasoning_dialect = Some(dialect);
+        backend.reasoning_efforts = declared_vocabulary(efforts);
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn responses_map_with_dialect(
+        base_url: &str,
+        dialect: ReasoningDialect,
+        efforts: Option<&[&str]>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.reasoning_dialect = Some(dialect);
+        backend.reasoning_efforts = declared_vocabulary(efforts);
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
+    }
+
+    fn policy_request(policy: ReasoningPolicy, caller_reasoning: Value) -> Request {
+        let mut llm_request = text_request(Some("gpt".to_string()), "hi");
+        if !caller_reasoning.is_null() {
+            llm_request
+                .extensions
+                .fields
+                .insert("reasoning".to_string(), caller_reasoning);
+        }
+        Request {
+            llm_request,
+            route_reasoning_policy: Some(policy),
+            ..Request::default()
+        }
+    }
+
+    async fn captured_chat_body(
+        dialect: ReasoningDialect,
+        policy: ReasoningPolicy,
+        caller_reasoning: Value,
+        merge_reasoning_pin: Option<Value>,
+        efforts: Option<&[&str]>,
+    ) -> Value {
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let mut backend = config(&format!("{}/v1", server.uri()));
+        backend.reasoning_dialect = Some(dialect);
+        backend.reasoning_efforts = declared_vocabulary(efforts);
+        if let Some(pin) = merge_reasoning_pin {
+            backend.extra_body.insert("reasoning".to_string(), pin);
+        }
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])
+        .unwrap();
+        client
+            .call_rewrite_model(policy_request(policy, caller_reasoning), None)
+            .await
+            .expect("policy-bearing request must serve");
+        seen.lock().unwrap().clone()
+    }
+
+    async fn policy_rejection_message(
+        dialect: ReasoningDialect,
+        policy: ReasoningPolicy,
+        efforts: Option<&[&str]>,
+    ) -> String {
+        let server = MockServer::start().await;
+        let client = TranslatingLlmClient::new(&chat_map_with_dialect(
+            &format!("{}/v1", server.uri()),
+            dialect,
+            efforts,
+        ))
+        .unwrap();
+        match client
+            .call_rewrite_model(policy_request(policy, Value::Null), None)
+            .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!(
+                "policy {policy} must fail closed on dialect {dialect:?} (vocabulary {efforts:?})"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_needs_vocabulary_on_effort_dialect() {
+        // openai_effort is fully vocabulary-gated, `none` included: with no
+        // declared list the endpoint's accepted values are unknown.
+        let message =
+            policy_rejection_message(ReasoningDialect::OpenAiEffort, ReasoningPolicy::None, None)
+                .await;
+        assert!(
+            message.contains("is not expressible by dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_exact_effort_outside_vocabulary_fails_closed() {
+        // `medium` is absent from the declared vocabulary, so this endpoint
+        // never promised to accept it.
+        let message = policy_rejection_message(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::Medium,
+            Some(&["none", "low", "high"]),
+        )
+        .await;
+        assert!(
+            message.contains("is not expressible by dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_on_a_dialect_less_backend_fails_closed() {
+        let server = MockServer::start().await;
+        // No dialect declared: a policy-bearing request must refuse rather than
+        // send an uncontrolled body.
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri()))).unwrap();
+        let message = match client
+            .call_rewrite_model(policy_request(ReasoningPolicy::None, Value::Null), None)
+            .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a dialect-less backend must refuse a route policy"),
+        };
+        assert!(
+            message.contains("declares no reasoning_dialect"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_declared_exact_effort_lands_on_the_wire() {
+        // Positive control for the strict matrix: a vocabulary-declared exact
+        // effort still renders its shape (the gate must not over-reject).
+        let body = captured_chat_body(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::Medium,
+            json!({"effort": "none"}),
+            None,
+            Some(&["none", "low", "medium", "high"]),
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("medium"),
+            "a declared exact effort must still reach the wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_lands_on_chat_template_without_vocabulary() {
+        // Positive control for the fixed-shape leg: `none` needs no vocabulary
+        // on the chat-template dialect (the observed NT shape).
+        let body = captured_chat_body(
+            ReasoningDialect::ChatTemplateReasoningEffort,
+            ReasoningPolicy::None,
+            json!({"effort": "high"}),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/chat_template_kwargs/enable_thinking")
+                .and_then(Value::as_bool),
+            Some(false),
+            "chat-template none must use the observed NT shape: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_is_final_authority_over_caller_and_target_pin() {
+        // All three disagree: caller says high, the target pins none through
+        // extra_body, the route says max. The route is final authority.
+        let body = captured_chat_body(
+            ReasoningDialect::OpenAiEffort,
+            ReasoningPolicy::Max,
+            json!({"effort": "high"}),
+            Some(json!({"effort": "none"})),
+            Some(&["none", "low", "medium", "high", "xhigh", "max"]),
+        )
+        .await;
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("max"),
+            "the route policy must win over both the caller and the target pin: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_policy_none_lands_on_the_responses_wire() {
+        // PRIMARY acceptance contract: the canonical Responses control
+        // `"reasoning": { "effort": "none" }` on the /v1/responses wire.
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1", "model": "gpt", "status": "completed",
+                "output": [{"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}]}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_dialect(
+            &format!("{}/v1", server.uri()),
+            ReasoningDialect::OpenAiEffort,
+            Some(&["none", "low", "medium", "high"]),
+        ))
+        .unwrap();
+        let mut request = policy_request(ReasoningPolicy::None, json!({"effort": "high"}));
+        request.metadata = None;
+        client
+            .call_rewrite_model(request, None)
+            .await
+            .expect("policy-bearing Responses request must serve");
+        let body = seen.lock().unwrap().clone();
+        assert_eq!(
+            body.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("none"),
+            "Responses wire must carry the canonical reasoning.effort=none control: {body}"
+        );
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "the chat-only flat reasoning_effort must never appear on the Responses wire"
+        );
+    }
+
+    /// Drives a chat request whose assistant turns really carry replayed
+    /// reasoning, with `strip` deciding whether the target opted out. Returns
+    /// the captured wire body.
+    async fn captured_stripped_chat_body(strip: bool) -> Value {
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let mut backend = config(&format!("{}/v1", server.uri()));
+        backend.strip_reasoning_content = strip;
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])
+        .unwrap();
+        let mut llm_request = text_request(Some("gpt".to_string()), "hi");
+        // A prior ASSISTANT turn carrying a real `ContentBlock::Reasoning` -
+        // the exact shape the OpenAI-Chat encoder turns into a message-level
+        // `reasoning` key, which is the replay the strip flag exists to remove.
+        llm_request.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "prior answer".to_string(),
+                },
+                ContentBlock::Reasoning {
+                    text: "prior chain of thought".to_string(),
+                    signature: None,
+                    details: Vec::new(),
+                },
+            ],
+        });
+        client
+            .call_rewrite_model(
+                Request {
+                    llm_request,
+                    ..Request::default()
+                },
+                None,
+            )
+            .await
+            .expect("a chat request with replayed reasoning must serve");
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn strip_target_removes_replayed_reasoning_on_the_real_wire() {
+        // POSITIVE CONTROL FIRST: without the opt-out the reasoning really is
+        // on the wire. Without this arm the strip assertion below is vacuous -
+        // a body that never carried reasoning trivially passes it.
+        let control = captured_stripped_chat_body(false).await;
+        // The plaintext OpenAI-Chat encoder emits the BARE `reasoning` key on the
+        // assistant message - asserting `reasoning_content` here would be a
+        // vacuous pass, because that key is never produced by this encoder.
+        assert!(
+            control.pointer("/messages/1/reasoning").is_some(),
+            "control: replayed reasoning must reach the wire when the target does not opt out: \
+             {control}"
+        );
+        let body = captured_stripped_chat_body(true).await;
+        for message in body["messages"].as_array().into_iter().flatten() {
+            assert!(
+                message.get("reasoning_content").is_none()
+                    && message.get("reasoning_details").is_none()
+                    && message.get("reasoning").is_none(),
+                "a strip target must not send replayed reasoning: {body}"
+            );
+        }
+    }
+
+    /// Drives a Responses request whose `input[]` really carries a reasoning
+    /// item between two tool results, with `strip` deciding the opt-out.
+    async fn captured_stripped_responses_body(strip: bool) -> Value {
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1", "model": "gpt", "status": "completed",
+                "output": [{"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}]}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let mut backend = config(&format!("{}/v1", server.uri()));
+        backend.strip_reasoning_content = strip;
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )])
+        .unwrap();
+        let mut llm_request = text_request(Some("gpt".to_string()), "hi");
+        // An assistant turn carrying a structured reasoning detail: the Responses
+        // INPUT encoder emits a detail of `type: "reasoning"` as an `input[]` item
+        // of `type: "reasoning"`, plus a tool call so adjacency is real rather
+        // than asserted on an array that never had one.
+        llm_request.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: "prior chain of thought".to_string(),
+                    signature: None,
+                    details: vec![json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [{"type": "summary_text", "text": "prior chain of thought"}]
+                    })],
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "c1".to_string(),
+                    name: "t".to_string(),
+                    arguments: json!({}),
+                }),
+            ],
+        });
+        llm_request.messages.push(Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::Text {
+                text: "ok".to_string(),
+            }],
+        });
+        client
+            .call_rewrite_model(
+                Request {
+                    llm_request,
+                    ..Request::default()
+                },
+                None,
+            )
+            .await
+            .expect("a Responses request with a reasoning item must serve");
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn strip_target_removes_responses_reasoning_items_and_keeps_tool_adjacency() {
+        let control = captured_stripped_responses_body(false).await;
+        assert_eq!(
+            control["input"].as_array().map(|items| items
+                .iter()
+                .filter(|item| item["type"] == json!("reasoning"))
+                .count()),
+            Some(1),
+            "control: the reasoning item must reach the wire when the target does not opt out: \
+             {control}"
+        );
+        let body = captured_stripped_responses_body(true).await;
+        let items = body["input"].as_array().expect("input must stay an array");
+        assert!(
+            items.iter().all(|item| item["type"] != json!("reasoning")),
+            "a strip target must remove reasoning items: {body}"
+        );
+        // The Chat tool result encodes as a `message`, not a
+        // `function_call_output`; adjacency means the call and its result both
+        // survive in order, which is what the strip must not break.
+        let types: Vec<&str> = items
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["message", "function_call", "message"],
+            "only the reasoning item may be removed; adjacency must survive: {body}"
+        );
+        assert_eq!(items[1]["call_id"], json!("c1"));
+    }
+
+    #[tokio::test]
+    async fn auxiliary_calls_never_carry_route_policy() {
+        use std::sync::Mutex as StdMutex;
+        let server = MockServer::start().await;
+        let seen: Arc<StdMutex<Value>> = Arc::new(StdMutex::new(Value::Null));
+        let seen_for_assert = Arc::clone(&seen);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                *seen_for_assert.lock().unwrap() = body.clone();
+                true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri()))).unwrap();
+        // Auxiliary operations are infrastructure, not completion traffic: the
+        // route's policy must not ride them even when the caller carries one.
+        let mut request = policy_request(ReasoningPolicy::None, Value::Null);
+        request.llm_request.model = Some("gpt".to_string());
+        request
+            .llm_request
+            .extensions
+            .fields
+            .insert("reasoning".to_string(), json!({"effort": "high"}));
+        client
+            .call_auxiliary(
+                &ModelId::from("gpt"),
+                request,
+                AuxiliaryOperation::ResponsesCompact,
+            )
+            .await
+            .ok();
+        if let Ok(body) = seen.lock() {
+            let body = body.clone();
+            assert!(
+                body.get("reasoning").is_none() && body.get("reasoning_effort").is_none(),
+                "an auxiliary call must not carry a route reasoning policy: {body}"
+            );
+        }
     }
 }

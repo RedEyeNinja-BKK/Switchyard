@@ -93,6 +93,7 @@ fn request(messages: Vec<Message>) -> Request {
         },
         raw_request: None,
         metadata: None,
+        ..Default::default()
     }
 }
 
@@ -151,6 +152,7 @@ async fn routes_on_latest_user_text_and_reuses_decision_for_tool_steps() -> libs
             llm_request: text_request(Some("auto".to_string()), ""),
             raw_request: None,
             metadata: None,
+            ..Default::default()
         },
     )
     .await?;

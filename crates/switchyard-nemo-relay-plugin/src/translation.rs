@@ -6,8 +6,8 @@ use serde_json::Value as Json;
 use switchyard_protocol::{AggLlmResponse, LlmRequest, ProviderExtensions, WireFormat};
 use switchyard_translation::{
     DeterministicIdPolicy, DiagnosticSeverity, LossyConversionPolicy, PreservationPolicy,
-    TargetCapabilities, TranslationDiagnostic, TranslationEngine, TranslationPolicy,
-    UnknownFieldPolicy,
+    ResponsesProfile, TargetCapabilities, TranslationDiagnostic, TranslationEngine,
+    TranslationPolicy, UnknownFieldPolicy,
 };
 
 pub(crate) fn decode_request(
@@ -44,6 +44,7 @@ fn policy() -> TranslationPolicy {
         },
         preservation: PreservationPolicy::InMemory,
         target_capabilities: TargetCapabilities::default(),
+        responses_profile: ResponsesProfile::default(),
     }
 }
 

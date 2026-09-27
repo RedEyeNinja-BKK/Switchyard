@@ -174,6 +174,9 @@ where
             },
             raw_request: None,
             metadata: request.metadata.clone(),
+            // An internal judge call is not the route's leg: it must not inherit
+            // the route reasoning policy.
+            ..Request::default()
         }
     }
 
@@ -461,6 +464,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "judge this"),
             raw_request: None,
             metadata: None,
+            ..Default::default()
         }
     }
 

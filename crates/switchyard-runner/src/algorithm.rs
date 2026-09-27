@@ -12,10 +12,11 @@ use std::sync::Arc;
 use libsy::{
     AdvisorGate, AdvisorGateConfig, Algorithm, ClassifierContractConfig, ClassifierResponseFormat,
     ClassifyTrigger, CompositeRouter, CompositeRouterConfig, CustomClassifierConfig,
-    CustomClassifierPolicy, EscalationJudgeConfig, GateTrigger, HandoffNoteConfig,
-    LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop, Passthrough, PickerMode,
-    PlanExecute, PlanExecuteConfig, Random, StageRouter, StageRouterConfig, SubagentRouter,
-    SubagentRouterConfig, TaskClassifierConfig, ToolSemantics,
+    CustomClassifierPolicy, EscalationJudgeConfig, FleetCandidate, FleetRouter, FleetSnapshot,
+    FleetStateSource, GateTrigger, HandoffNoteConfig, LlmClassifierConfig, LlmFallback,
+    LlmTaskClassifier, Noop, Passthrough, PickerMode, PlanExecute, PlanExecuteConfig, Random,
+    SharedFleetState, StageRouter, StageRouterConfig, SubagentRouter, SubagentRouterConfig,
+    TaskClassifierConfig, ToolSemantics,
 };
 use serde::Deserialize;
 use switchyard_protocol::{Category, ModelId};
@@ -444,6 +445,68 @@ pub enum AlgorithmSpec {
         /// Maximum prompts per encoder forward pass.
         batch_size: Option<usize>,
     },
+    /// Schema-only carrier for a fleet route's declared candidate ladder.
+    ///
+    /// This variant parses and preserves exactly the keys the live deployment
+    /// file uses: `candidates`, `escalation`, `escalation_max_input_tokens`.
+    /// The runtime layer's own keys - `context_policy`, `work_shape`,
+    /// `work_shape_source` - are absent from that file and are deliberately
+    /// not carried here, so `deny_unknown_fields` on this enum rejects a
+    /// config that uses one instead of ignoring it.
+    ///
+    /// Turning this declaration into a runnable algorithm belongs to the
+    /// runtime layer, not to this schema. Until that layer exists,
+    /// [`build_algorithm`]'s `FleetRouter` arm returns a legible configuration
+    /// error rather than falling back to another algorithm or reporting
+    /// success.
+    FleetRouter {
+        /// Static per-candidate capability and preference declarations, in the
+        /// order the deployment file declares them. This schema carries the
+        /// order and the values; the runtime layer consumes them.
+        #[serde(default)]
+        candidates: Vec<FleetCandidateConfig>,
+        /// Optional escalation destination: another registered route id.
+        ///
+        /// Carried and preserved only. Whether and when an escalation fires is
+        /// runtime behavior, so this schema never acts on the value.
+        #[serde(default)]
+        escalation: Option<ModelId>,
+        /// Optional estimated-input-size threshold paired with the escalation
+        /// destination. Carried and preserved only; see the `escalation` field.
+        #[serde(default)]
+        escalation_max_input_tokens: Option<u64>,
+    },
+}
+
+/// One fleet route's candidate declaration: the keys the live deployment file
+/// sets, each with the owner's default.
+///
+/// Deliberately absent are the runtime layer's `context_policy` and
+/// `work_shape` keys, which no live route sets. `deny_unknown_fields` rejects
+/// them rather than dropping them silently.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetCandidateConfig {
+    /// A `[targets.*]` reference this candidate may select.
+    pub target: String,
+    /// Whether this candidate declares tool-calling support.
+    #[serde(default)]
+    pub tool_calling: bool,
+    /// Whether this candidate declares reasoning support.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Whether this candidate truthfully advertises image-input support.
+    #[serde(default)]
+    pub supports_vision: bool,
+    /// Deterministic preference; lower is preferred.
+    #[serde(default)]
+    pub preference_rank: u16,
+    /// Declared usable context capacity, when the deployment asserts one.
+    ///
+    /// Absent means the capacity is unknown; nothing here infers it from a
+    /// provider or model name.
+    #[serde(default)]
+    pub usable_context_tokens: Option<u64>,
 }
 
 /// What fires an advisor route's review.
@@ -535,6 +598,31 @@ impl StageClassifierConfig {
 }
 
 impl AlgorithmSpec {
+    /// The route id an escalation would hand off to, when one is declared.
+    ///
+    /// Only a fleet route declares an escalation destination. F7 reads this to
+    /// validate an `escalation_reasoning_policy` against the DESTINATION's
+    /// reachable targets; it never fires the escalation and never chooses a
+    /// destination of its own.
+    pub fn escalation_destination(&self) -> Option<&ModelId> {
+        match self {
+            Self::FleetRouter { escalation, .. } => escalation.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The declared pre-execution input-size threshold, when any. A threshold
+    /// without a destination is a configuration error, refused at load.
+    pub fn escalation_threshold(&self) -> Option<u64> {
+        match self {
+            Self::FleetRouter {
+                escalation_max_input_tokens,
+                ..
+            } => *escalation_max_input_tokens,
+            _ => None,
+        }
+    }
+
     /// Completion targets in algorithm order; judge-only targets are excluded.
     pub fn routing_target_names(&self) -> Vec<&str> {
         match self {
@@ -607,6 +695,12 @@ impl AlgorithmSpec {
                 executor_target, ..
             } => vec![executor_target],
             Self::PrefillRouter { targets, .. } => targets.iter().map(String::as_str).collect(),
+            // Declared order is the declared preference order; this schema only
+            // reports which targets the route may reach.
+            Self::FleetRouter { candidates, .. } => candidates
+                .iter()
+                .map(|candidate| candidate.target.as_str())
+                .collect(),
         }
     }
 
@@ -738,6 +832,12 @@ impl AlgorithmSpec {
                 (Category::Any, vec![executor_target.clone()]),
                 (Category::Judge, vec![advisor_target.clone()]),
             ]),
+            // The runtime layer scores candidates itself, so every declared
+            // candidate must be resolvable through the driver; all land in `Any`.
+            Self::FleetRouter { candidates, .. } => category_models([(
+                Category::Any,
+                candidates.iter().map(|c| c.target.clone()).collect(),
+            )]),
         };
 
         let subagents = match self {
@@ -780,6 +880,9 @@ impl AlgorithmSpec {
             | Self::Auto { .. }
             | Self::Composite { .. }
             | Self::PrefillRouter { .. } => None,
+            // A fleet route has no routing-time response of its own; its response
+            // comes from whichever candidate the runtime layer selects.
+            Self::FleetRouter { .. } => None,
         }
     }
 
@@ -789,8 +892,29 @@ impl AlgorithmSpec {
         context: &str,
         targets: &BTreeMap<String, ModelId>,
     ) -> AlgorithmResult<Arc<dyn Algorithm>> {
-        build_algorithm(context, self, targets)
+        self.build_with_fleet(context, targets, &FleetBuildContext::default())
     }
+
+    /// Builds this algorithm with an injected deployment-wide fleet readiness
+    /// handle, so a host-owned readiness monitor can publish snapshots that every
+    /// fleet route in this deployment reads.
+    pub fn build_with_fleet(
+        &self,
+        context: &str,
+        targets: &BTreeMap<String, ModelId>,
+        fleet: &FleetBuildContext,
+    ) -> AlgorithmResult<Arc<dyn Algorithm>> {
+        build_algorithm(context, self, targets, fleet)
+    }
+}
+
+/// Build-time fleet readiness shared by every `fleet_router` route of one
+/// deployment: the host-owned readiness monitor replaces the snapshot behind
+/// this handle at runtime; routes only ever read coherent snapshots.
+#[derive(Clone, Default)]
+pub struct FleetBuildContext {
+    /// The deployment-wide fleet-state handle, when the host supplies one.
+    pub fleet_state: Option<Arc<SharedFleetState>>,
 }
 
 /// One route's target names, grouped by category and by routing scope.
@@ -1163,6 +1287,7 @@ fn build_algorithm(
     route_name: &str,
     config: &AlgorithmSpec,
     targets: &BTreeMap<String, ModelId>,
+    fleet: &FleetBuildContext,
 ) -> AlgorithmResult<Arc<dyn Algorithm>> {
     match config {
         AlgorithmSpec::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -1454,7 +1579,100 @@ fn build_algorithm(
                 )))
             }
         }
+        AlgorithmSpec::FleetRouter {
+            candidates,
+            escalation,
+            escalation_max_input_tokens,
+        } => {
+            let candidates = build_fleet_router_candidates(route_name, candidates, targets)?;
+            // One shared readiness handle per deployment when the host supplies
+            // one. Standalone builds get a private, permanently empty snapshot:
+            // fail-closed, because a router with no readiness producer has no
+            // factual basis for selecting anything.
+            let state: Arc<dyn FleetStateSource> = fleet
+                .fleet_state
+                .clone()
+                .unwrap_or_else(|| Arc::new(SharedFleetState::new(FleetSnapshot::empty())));
+            Ok(Arc::new(FleetRouter::with_source(
+                candidates,
+                escalation.clone(),
+                *escalation_max_input_tokens,
+                state,
+            )))
+        }
     }
+}
+
+/// Converts a parsed `fleet_router` route's candidates into a constructed
+/// [`FleetRouter`], resolving each candidate's declared target.
+///
+/// Construction is faithful and total. Every declared candidate becomes a runtime
+/// candidate, in declared order, carrying its declared metadata. Nothing is
+/// filtered, sorted, or deduplicated: deciding which candidate may serve a
+/// request belongs to the selection layers, and a candidate they would later
+/// reject must still exist here.
+///
+/// Each candidate must name a target the deployment defines. That is a
+/// construction-time integrity check rather than a selection decision - an
+/// unresolvable target could never be served by any layer - so an unresolvable
+/// target fails at load instead of at request time.
+pub fn build_fleet_router(
+    route_name: &str,
+    candidates: &[FleetCandidateConfig],
+    escalation: &Option<ModelId>,
+    escalation_max_input_tokens: Option<u64>,
+    targets: &BTreeMap<String, ModelId>,
+) -> AlgorithmResult<FleetRouter> {
+    Ok(FleetRouter::new(
+        build_fleet_router_candidates(route_name, candidates, targets)?,
+        escalation.clone(),
+        escalation_max_input_tokens,
+    ))
+}
+
+/// Validates and resolves a fleet route's declared candidates into runtime
+/// candidates, in declared order.
+pub(crate) fn build_fleet_router_candidates(
+    route_name: &str,
+    candidates: &[FleetCandidateConfig],
+    targets: &BTreeMap<String, ModelId>,
+) -> AlgorithmResult<Vec<libsy::FleetCandidate>> {
+    let mut profiles = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        // A configured capacity of zero is an invalid admission contract, not an
+        // unlimited one, so it is refused at load rather than at request time.
+        if candidate.usable_context_tokens == Some(0) {
+            return Err(AlgorithmConfigError::new(format!(
+                "fleet candidate {:?} declares an invalid zero usable_context_tokens; \
+                 a configured static capacity must be positive",
+                candidate.target
+            )));
+        }
+        // The candidate's runtime identity is the RESOLVED target model id, not
+        // the `[targets.*]` configuration key. The key is a configuration
+        // lookup handle; the model id is what every runtime consumer names:
+        // readiness lookup (`FleetSnapshot::state_for`), execution
+        // (`ClientRouter::route`, keyed by `target.id`), and decision/response
+        // attribution (`Route::decision_target`, which matches on
+        // `target.model`).
+        //
+        // Keying the candidate by the config key silently desynchronises those
+        // namespaces: the readiness producer publishes under the model id, so a
+        // key-keyed candidate never matches and every fleet route fails closed
+        // as `Unobserved`. It also breaks execution, because no `ClientRouter`
+        // entry exists for a key. The key remains available in the config
+        // layer, which is where configuration lookups genuinely need it.
+        let target = resolve_target_model_id(route_name, &candidate.target, targets)?;
+        profiles.push(FleetCandidate {
+            target,
+            tool_calling: candidate.tool_calling,
+            reasoning: candidate.reasoning,
+            supports_vision: candidate.supports_vision,
+            preference_rank: candidate.preference_rank,
+            usable_context_tokens: candidate.usable_context_tokens,
+        });
+    }
+    Ok(profiles)
 }
 
 const fn default_max_reviews() -> u32 {

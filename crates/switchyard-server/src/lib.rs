@@ -4,7 +4,9 @@
 //! Rust HTTP server for libsy algorithms.
 
 mod capabilities;
+pub mod capability;
 pub mod config;
+pub mod fleet_readiness;
 mod metrics;
 mod observability;
 mod redaction;
@@ -26,6 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use crate::fleet_readiness::FleetReadinessMonitor;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
 use axum::http::header::CONTENT_TYPE;
@@ -42,7 +45,8 @@ use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
+    CallerAuthKind, CapabilityKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner,
+    RunnerError,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -50,6 +54,7 @@ use tracing::{Instrument, Level};
 
 use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
 
+use crate::capability::{CapabilityClient, CapabilityRoute};
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
@@ -165,6 +170,14 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    /// Capability routes (`[capabilities.*]`): caller-facing typed endpoint ids
+    /// resolved to their executor client. Backs `POST /v1/embeddings` and
+    /// `POST /v1/rerank`; never participates in FleetRouter routing or readiness.
+    capabilities: BTreeMap<ModelId, CapabilityRoute>,
+    /// Shared sanitized DeepSeek balance telemetry published by the
+    /// fleet-readiness resource client (backing `GET /v1/resource/deepseek`).
+    /// Observability only: never participates in routing or readiness.
+    deepseek_telemetry: Option<fleet_readiness::SharedDeepSeekTelemetry>,
 }
 
 #[derive(Clone)]
@@ -214,6 +227,37 @@ impl ServerState {
             runner.models().map(|model| model.algorithm),
         );
         let redactor = redaction::Redactor::new(runner.provider_api_keys());
+        // Capability executor clients + routes from the parsed config tables.
+        let mut clients: BTreeMap<String, Arc<CapabilityClient>> = BTreeMap::new();
+        for (name, config) in runner.capability_clients() {
+            let client = CapabilityClient::new(config)
+                .map_err(|error| ServerError::new(error.to_string()))?;
+            clients.insert(name.clone(), Arc::new(client));
+        }
+        let mut capabilities: BTreeMap<ModelId, CapabilityRoute> = BTreeMap::new();
+        for (name, config) in runner.capabilities() {
+            let client = clients.get(&config.target).cloned().ok_or_else(|| {
+                ServerError::new(format!(
+                    "capability route {name} references unknown capability client {}",
+                    config.target
+                ))
+            })?;
+            let route_id = ModelId::from(config.id.clone());
+            if capabilities
+                .insert(
+                    route_id.clone(),
+                    CapabilityRoute {
+                        kind: config.kind.clone(),
+                        client,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ServerError::new(format!(
+                    "capability route id {route_id} is declared more than once"
+                )));
+            }
+        }
         Ok(Self {
             redactor: Arc::new(redactor),
             runner: Arc::new(runner),
@@ -222,7 +266,20 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            capabilities,
+            deepseek_telemetry: None,
         })
+    }
+
+    /// Attaches the shared sanitized DeepSeek telemetry slot published by the
+    /// fleet-readiness resource client (backing `GET /v1/resource/deepseek`).
+    /// Observability only: never participates in routing or readiness.
+    pub fn with_deepseek_telemetry(
+        mut self,
+        telemetry: fleet_readiness::SharedDeepSeekTelemetry,
+    ) -> Self {
+        self.deepseek_telemetry = Some(telemetry);
+        self
     }
 
     /// Enables durable per-request routing records at `path`.
@@ -234,6 +291,18 @@ impl ServerState {
     /// Returns the route model IDs served by the configured algorithms.
     pub fn models(&self) -> impl Iterator<Item = &str> {
         self.runner.models().map(|model| model.id.as_str())
+    }
+
+    /// The deployment-wide fleet-readiness handle the `fleet_router` routes
+    /// read, when this deployment has any.
+    ///
+    /// This is the SAME `Arc<SharedFleetState>` the readiness monitor publishes
+    /// into, so it is the only observation seam over which handle identity can
+    /// be proven: reading a snapshot here after a cycle shows exactly what the
+    /// routes see. It exists for that purpose and for read-only introspection;
+    /// publishing is the monitor's job, not a caller's.
+    pub fn fleet_state(&self) -> Option<&Arc<libsy::SharedFleetState>> {
+        self.runner.fleet_state()
     }
 
     /// Returns the caller credential family used by `model`, if any.
@@ -313,6 +382,62 @@ pub async fn run_server(state: ServerState, options: ServerRunOptions) -> Server
     server.serve(shutdown::signal()).await
 }
 
+/// A coherent production runtime bundle: the server state plus an optional
+/// fleet-readiness monitor built over the SAME `Arc<SharedFleetState>` that was
+/// injected into the server's `fleet_router` routes.
+///
+/// This is the structural shared-state guarantee for the stock CLI: the config
+/// loader creates ONE `Arc<SharedFleetState>` and hands clones of THAT object to
+/// both the routes and the monitor, so the operator never wires them manually.
+pub struct ServerRuntime {
+    /// Server state (fleet routes read the shared snapshot).
+    pub state: ServerState,
+    /// Optional fleet-readiness monitor; `Some` only when the config declares a
+    /// `[fleet_readiness]` section. When `Some`, run via [`ServerRuntime::run`]
+    /// so the background monitor keeps the shared fleet state populated.
+    pub monitor: Option<FleetReadinessMonitor>,
+}
+
+impl ServerRuntime {
+    /// Produces a coherent bundle from a config path, sharing ONE fleet state.
+    pub fn load(path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+        config::load_server_runtime(path)
+    }
+
+    /// Runs the runtime. Chooses the monitored lifecycle when a monitor is
+    /// configured, otherwise the ordinary server lifecycle. Consumes the
+    /// runtime.
+    ///
+    /// Honors `options.dry_run`: validates the full runtime (including monitor
+    /// construction) and prints the summary WITHOUT binding a socket or
+    /// starting the background monitor.
+    pub async fn run(self, options: ServerRunOptions) -> ServerResult<()> {
+        if options.dry_run {
+            println!("{}", dry_run_summary(&self.state));
+            return Ok(());
+        }
+        match self.monitor {
+            Some(monitor) => run_server_with_fleet_monitor(self.state, options, monitor).await,
+            None => run_server(self.state, options).await,
+        }
+    }
+}
+
+/// Production runtime owner: runs the server while a fleet-readiness monitor
+/// owns the live readiness facts, sharing one `SharedFleetState` with the
+/// server's `fleet_router` routes and stopping together on the same signal.
+pub async fn run_server_with_fleet_monitor(
+    state: ServerState,
+    options: ServerRunOptions,
+    monitor: FleetReadinessMonitor,
+) -> ServerResult<()> {
+    let server = BoundServer::bind(state, options)?;
+    println!("{}", server.startup_banner(std::io::stdout().is_terminal()));
+    server
+        .serve_with_fleet_monitor(shutdown::signal(), monitor)
+        .await
+}
+
 /// A configured server with its listening socket already bound.
 pub struct BoundServer {
     listener: TcpListener,
@@ -339,6 +464,75 @@ impl BoundServer {
         self.options.addr
     }
 
+    /// Serves requests while a background fleet-readiness monitor runs,
+    /// stopping both on the same signal.
+    ///
+    /// The monitor is the runtime owner of the fleet readiness facts. Identity
+    /// is structural by construction: the caller passes a
+    /// [`FleetReadinessMonitor`] holding the same `Arc<SharedFleetState>` that
+    /// was injected into this server's `fleet_router` routes, so the monitor
+    /// and the router observe and publish through one shared state.
+    pub async fn serve_with_fleet_monitor(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        monitor: FleetReadinessMonitor,
+    ) -> ServerResult<()> {
+        // ONE coordinated stop event: the process signal fans out to BOTH the
+        // HTTP server and the monitor (broadcast, so both consumers observe the
+        // same firing), and the monitor additionally stops when the serve loop
+        // ends for any reason. The join is bounded: the monitor's run loop
+        // selects its stop signal between observation cycles, but a cycle can
+        // be mid-flight (its fetches are individually time-boxed), so the
+        // runtime never waits forever on the monitor task.
+        let (signal_tx, mut server_rx, mut monitor_rx) = {
+            let (signal_tx, server_rx) = tokio::sync::broadcast::channel::<()>(1);
+            let monitor_rx = signal_tx.subscribe();
+            (signal_tx, server_rx, monitor_rx)
+        };
+        tokio::spawn(async move {
+            shutdown.await;
+            let _ = signal_tx.send(());
+            // Hold the sender so the broadcast delivery window stays open.
+            std::future::pending::<()>().await;
+        });
+        let (serve_done_tx, serve_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let monitor_stop = async move {
+            tokio::select! {
+                _ = monitor_rx.recv() => {},
+                _ = serve_done_rx => {},
+            }
+        };
+        let monitor_task = tokio::spawn(monitor.run(monitor_stop));
+        let server_stop = async move {
+            let _ = server_rx.recv().await;
+        };
+        let drain_timeout = self.options.shutdown_timeout;
+        let serve_result = if let Some(tls) = self.options.tls {
+            serve_tls(self.listener, self.router, tls, drain_timeout, server_stop).await
+        } else {
+            serve(self.listener, self.router, drain_timeout, server_stop).await
+        };
+        // The serve loop ended (signal or internal error); stop the monitor and
+        // wait for it briefly - never unconditionally.
+        let _ = serve_done_tx.send(());
+        match tokio::time::timeout(
+            self.options.shutdown_timeout.max(MONITOR_STOP_GRACE),
+            monitor_task,
+        )
+        .await
+        {
+            Ok(joined) => {
+                let _ = joined;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "fleet-readiness monitor did not stop within its grace window; abandoning task"
+                );
+            }
+        }
+        serve_result
+    }
+
     /// Serves requests until the supplied shutdown future resolves.
     pub async fn serve(
         self,
@@ -356,6 +550,10 @@ impl BoundServer {
         startup_banner(&self.options, &self.state, color)
     }
 }
+
+/// Extra time granted to the fleet-readiness monitor to finish an in-flight
+/// observation cycle after the server stop event, before its task is abandoned.
+const MONITOR_STOP_GRACE: Duration = Duration::from_secs(30);
 
 async fn serve_tls(
     listener: TcpListener,
@@ -501,7 +699,10 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
             post(openai_responses_input_tokens),
         )
         .route("/v1/responses/compact", post(openai_responses_compact))
+        .route("/v1/embeddings", post(embeddings_handler))
+        .route("/v1/rerank", post(rerank_handler))
         .route("/v1/models", get(models))
+        .route("/v1/resource/deepseek", get(get_deepseek_resource))
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
         .route("/metrics", get(prometheus_metrics))
@@ -1026,8 +1227,186 @@ fn resolve_route(
         llm_request,
         raw_request: Some(body),
         metadata: Some(metadata),
+        // Caller input can never carry the route's authoritative reasoning
+        // policy: it is stamped by the route itself at execution entry, which
+        // is what makes it authoritative. Unknown caller body keys are never
+        // decoded into the envelope, so there is nothing to reject here.
+        ..Request::default()
     };
     Ok((route, request))
+}
+
+/// Resolves the ESCALATION destination route for a request.
+///
+/// Deliberately narrower than [`resolve_route`], matching production: the
+/// destination is named by the calling route, so the body's `model` is replaced
+/// with the destination id and decoded again. Caller-format compatibility is
+/// still enforced - the destination must accept the caller's wire format -
+/// but the CALLER-CAPABILITY check is not re-applied here. The request was
+/// already admitted against the primary route, and the destination is reached
+/// because the primary could not serve, not because the caller asked for it
+/// directly. Everything else about the request, including its content and
+/// metadata, is carried across unchanged.
+// The `Err` variant is an axum `Response`, which is large by nature. This mirrors
+// production's own `resolve_route_for_model`, which carries the same allowance
+// for the same reason; boxing the response here would diverge from the shape the
+// rest of this module already returns.
+#[allow(clippy::type_complexity, clippy::result_large_err)]
+fn resolve_escalation_route<'a>(
+    state: &'a ServerState,
+    destination: &str,
+    metadata: Metadata,
+    mut body: Value,
+    wire_format: WireFormat,
+) -> std::result::Result<(&'a Route, Request), Response> {
+    if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
+        metadata.remove(switchyard_translation::util::SWITCHYARD_METADATA_KEY);
+    }
+    match body.as_object_mut() {
+        Some(object) => {
+            object.insert("model".to_string(), Value::String(destination.to_string()));
+        }
+        None => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "request body must be a JSON object",
+                "invalid_request_error",
+                "invalid_request_error",
+            ));
+        }
+    }
+    let llm_request = decode_request(wire_format, &body)
+        .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let route = state.route_for_model(destination).ok_or_else(|| {
+        error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route registered for model {destination}"),
+            "model_not_found",
+            "model_not_found",
+        )
+    })?;
+    if let Err(RunnerError::IncompatibleCallerFormat(caller_auth)) =
+        route.check_caller_format(wire_format)
+    {
+        let (provider, expected_endpoint) = match caller_auth {
+            CallerAuthKind::Anthropic => ("Anthropic", "/v1/messages"),
+            CallerAuthKind::OpenAi => ("OpenAI", "/v1/chat/completions or /v1/responses"),
+        };
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "route {destination} forwards an {provider} login; call it through {expected_endpoint}",
+            ),
+            "invalid_request_error",
+            "invalid_request_error",
+        ));
+    }
+    let request = Request {
+        llm_request,
+        raw_request: Some(body),
+        metadata: Some(metadata),
+        // The destination stamps its own policy at its own entry, exactly as it
+        // would if the caller had named it directly.
+        ..Request::default()
+    };
+    Ok((route, request))
+}
+
+/// Runs the escalated leg of a request: one hop, host-owned.
+///
+/// The destination is a SEPARATELY RESOLVED route, so it runs its own decision
+/// over its own readiness generation, and the primary route's candidate ladder,
+/// provider-failure state, and retry counters do not cross this seam.
+///
+/// Reasoning policy is RE-STAMPED here, and this is the only place it happens,
+/// so escalation can never run with the primary route's policy still applied:
+/// `Route::escalated_reasoning_policy()` resolves an explicit
+/// `escalation_reasoning_policy` first, then keeps a `none` caller non-thinking,
+/// and otherwise leaves the DESTINATION's own declaration in force.
+async fn run_escalated_leg(
+    state: &ServerState,
+    primary: &Route,
+    destination: &ModelId,
+    metadata: Metadata,
+    body: Value,
+    wire_format: WireFormat,
+    routing_log_context: Option<routing_log::RoutingLogContext>,
+) -> std::result::Result<(RunOutput, Route), Response> {
+    let (escalation_route, escalated_request) =
+        match resolve_escalation_route(state, destination.as_str(), metadata, body, wire_format) {
+            Ok(resolved) => resolved,
+            Err(response) => return Err(response),
+        };
+    // F7 RE-STAMP: the escalated leg's reasoning intent comes from this seam,
+    // never from the primary route's already-applied policy. When this route
+    // declares no escalation policy, the DESTINATION's own declaration is left
+    // untouched and its own route object is executed as resolved.
+    let escalation_route = match primary.escalated_reasoning_policy() {
+        Some(policy) => escalation_route.clone().with_reasoning_policy(Some(policy)),
+        None => escalation_route.clone(),
+    };
+    let escalated_observer = stats_observer(
+        state.stats.clone(),
+        state.routing_log.clone().zip(routing_log_context),
+    );
+    let output = escalation_route
+        .execute(escalated_request, Some(escalated_observer))
+        .await
+        .map_err(runner_error)?;
+    Ok((output, escalation_route))
+}
+
+/// Estimates a caller body's input size, for the pre-execution escalation
+/// threshold.
+///
+/// This is a HOST-SIDE ESTIMATE over the raw caller body, deliberately distinct
+/// from row 40's `candidate_input_tokens`: that fact is per-candidate and
+/// dormant (its producer is unwired), while this threshold needs only a cheap
+/// caller-side number. Using it therefore preserves R40-B dormancy rather than
+/// activating a token producer.
+fn estimate_input_tokens(body: &Value) -> u64 {
+    fn walk(value: &Value, acc: &mut u64) {
+        match value {
+            Value::String(text) => {
+                let chars = text.chars().count() as u64;
+                let ascii = text.bytes().filter(|byte| byte.is_ascii()).count() as u64;
+                let non_ascii = chars.saturating_sub(ascii);
+                *acc = acc
+                    .saturating_add(ascii.div_ceil(4))
+                    .saturating_add(non_ascii)
+                    .saturating_add(1);
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, acc)),
+            Value::Object(map) => map.values().for_each(|value| walk(value, acc)),
+            _ => {}
+        }
+    }
+    let mut total = 0u64;
+    walk(body, &mut total);
+    // Fixed structural overhead (model field, message roles, wrapper keys).
+    total.saturating_add(8)
+}
+
+/// Whether a terminal primary-route failure is escalation-eligible.
+///
+/// Only two recovered classes escalate:
+/// - `ClientCall` / `NoTargets` mean this route's candidate chain failed
+///   terminally ("agentic_chain_failed");
+/// - the exact fleet no-eligible-candidate message means no candidate of this
+///   route can serve the request ("no_eligible_candidate").
+///
+/// Everything else is a caller or configuration error and is surfaced as-is, so
+/// a bad request never silently becomes an escalation.
+fn escalation_reason(error: &RunnerError) -> Option<&'static str> {
+    match error {
+        RunnerError::Algorithm(LibsyError::ClientCall { .. } | LibsyError::NoTargets) => {
+            Some("agentic_chain_failed")
+        }
+        RunnerError::Algorithm(LibsyError::AlgorithmError { message }) => (message
+            == "fleet router found no immediately-eligible candidate for this request")
+            .then_some("no_eligible_candidate"),
+        _ => None,
+    }
 }
 
 /// Resolves and executes an LLM request, attaching route identity when durable logging is enabled.
@@ -1040,6 +1419,12 @@ async fn handle_llm_request(
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
+    // The caller's body and metadata are RETAINED before the primary route
+    // consumes them: the escalated leg re-routes this same caller intent, and
+    // an escalated leg that could not reproduce the original request would
+    // silently serve something else.
+    let escalation_body = body.clone();
+    let escalation_metadata = metadata.clone();
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
         Err(response) => return response,
@@ -1057,21 +1442,103 @@ async fn handle_llm_request(
         state.routing_log.clone().zip(routing_log_context.clone()),
     );
 
-    let output = match route.execute(request, Some(observer)).await {
-        Ok(output) => output,
-        Err(error) => {
-            if let RunnerError::Algorithm(LibsyError::ClientCall {
-                target,
-                source:
-                    LlmClientError::ResponseStateLimitExceeded { .. }
-                    | LlmClientError::ResponseStateConflict,
-            }) = &error
-            {
-                state.stats.record_response_error(target);
+    // ---- Host-owned escalation (F8) ----------------------------------------
+    //
+    // Two recovered triggers, and no more:
+    // (a) CONTEXT PRESSURE: when the estimated caller input already exceeds the
+    //     route's declared threshold, escalate BEFORE this route's candidate
+    //     ladder runs at all. The threshold is a TRIGGER, not a cap, and the
+    //     comparison is strictly greater-than, so a request exactly AT the
+    //     threshold stays on the primary route.
+    // (b) CHAIN FAILURE: when this route's chain fails terminally or no
+    //     candidate can serve, escalate to the declared destination.
+    //
+    // Escalation is host-owned and lives entirely OUTSIDE FleetRouter::decide().
+    // The primary ladder is never appended to, never re-sorted, and never
+    // re-decided; the destination is a separately resolved route that starts
+    // its own decision and its own readiness generation.
+    let pre_escalate = route.escalation().is_some()
+        && route
+            .escalation_max_input_tokens()
+            .is_some_and(|threshold| estimate_input_tokens(&escalation_body) > threshold);
+
+    let mut escalation_evidence: Option<(ModelId, &'static str)> = None;
+    let output = if pre_escalate {
+        let escalation_id = route.escalation().cloned().expect("checked above");
+        match run_escalated_leg(
+            &state,
+            route,
+            &escalation_id,
+            escalation_metadata,
+            escalation_body,
+            wire_format,
+            routing_log_context.clone(),
+        )
+        .await
+        {
+            Ok((result, _route_used)) => {
+                escalation_evidence = Some((escalation_id, "context_pressure"));
+                result
             }
-            return runner_error(error);
+            Err(response) => return response,
+        }
+    } else {
+        match route.execute(request, Some(observer)).await {
+            Ok(output) => output,
+            Err(error) => {
+                if let RunnerError::Algorithm(LibsyError::ClientCall {
+                    target,
+                    source:
+                        LlmClientError::ResponseStateLimitExceeded { .. }
+                        | LlmClientError::ResponseStateConflict,
+                }) = &error
+                {
+                    state.stats.record_response_error(target);
+                }
+                // Post-chain escalation fires ONLY for the recovered terminal
+                // classes. A caller or configuration error is surfaced as-is,
+                // so escalation never becomes a way to paper over a bad request.
+                let Some(reason) = escalation_reason(&error) else {
+                    return runner_error(error);
+                };
+                let Some(escalation_id) = route.escalation().cloned() else {
+                    return runner_error(error);
+                };
+                match run_escalated_leg(
+                    &state,
+                    route,
+                    &escalation_id,
+                    escalation_metadata,
+                    escalation_body,
+                    wire_format,
+                    routing_log_context.clone(),
+                )
+                .await
+                {
+                    Ok((result, _)) => {
+                        escalation_evidence = Some((escalation_id, reason));
+                        result
+                    }
+                    // The DESTINATION's own failure is what the caller should see,
+                    // exactly as if it had called the destination directly. The
+                    // primary route's error would be the wrong error to report: it
+                    // describes a route the caller never chose and the response
+                    // path has no way to say "the primary failed, and then the
+                    // destination failed too".
+                    Err(escalated_response) => return escalated_response,
+                }
+            }
         }
     };
+    if let Some((destination, reason)) = &escalation_evidence {
+        metrics::record_escalation(route.algorithm_name(), destination.as_str(), reason);
+        tracing::info!(
+            target: "switchyard_server::request",
+            destination_route = %destination,
+            escalation_reason = reason,
+            "request escalated to escalation route"
+        );
+    }
     let RunOutput {
         selected_model,
         response,
@@ -1440,17 +1907,391 @@ fn error_response(
     ApiError::new(status, message, error_type, code).into_response(WireFormat::OpenAiChat)
 }
 
-async fn models(State(state): State<ServerState>) -> Json<Value> {
-    Json(model_list_payload(
+/// OpenAI-compatible embeddings endpoint. Proxies the typed embedding
+/// contract to the capability executor selected by the `model` route id
+/// (e.g. `localclaw/embed`); batch bounds and response dimension admission
+/// are enforced here, fail closed.
+async fn embeddings_handler(
+    State(state): State<ServerState>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => {
+            // Pre-identity refusal: the body could not be parsed, so there is no model
+            // string and no route to attribute this to. Counted anyway -- this is a
+            // capability request that was refused, and leaving it uncounted would make
+            // the request counter an incomplete record of admission decisions.
+            metrics::record_capability_unresolved("embedding", "invalid_body");
+            return invalid_body_error(status, message);
+        }
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // The single label source for every metric below. `ModelId::from` is an identity
+    // transform today, so this currently equals the request string -- but it is the key
+    // we actually look up with, which makes the label the RESOLVED route id by
+    // construction rather than by assumption. If `ModelId::from` ever gains
+    // normalisation, the label still tracks the real map key and cardinality stays
+    // bounded by the configured capability ids.
+    let route_id = ModelId::from(model.as_str());
+    let Some(route) = state.capabilities.get(&route_id).cloned() else {
+        metrics::record_capability_unresolved("embedding", "unknown_model");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown embedding model {model}"),
+            "invalid_request_error",
+            "unknown_model",
+        );
+    };
+    // Instrumented from here on: everything below is either admission or executor
+    // work, and must be attributed to the resolved route id.
+    let mut call = metrics::CapabilityCall::start("embedding", route_id.as_str());
+    let CapabilityKind::Embedding {
+        dimensions,
+        max_batch,
+        ..
+    } = &route.kind
+    else {
+        call.outcome("wrong_capability");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{model} is not an embedding capability"),
+            "invalid_request_error",
+            "wrong_capability",
+        );
+    };
+    let count = match body.get("input") {
+        Some(Value::String(_)) => 1,
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    };
+    if count == 0 {
+        call.outcome("invalid_input");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "input must be a non-empty string or array",
+            "invalid_request_error",
+            "invalid_input",
+        );
+    }
+    if count > *max_batch {
+        call.outcome("batch_too_large");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("input exceeds max_batch {max_batch}"),
+            "invalid_request_error",
+            "batch_too_large",
+        );
+    }
+    let mut executor_body = body.clone();
+    if let Some(object) = executor_body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            Value::String(route.client.model().to_string()),
+        );
+    }
+    metrics::record_capability_items("embedding", count as u64);
+    let started = std::time::Instant::now();
+    let result = route.client.call(executor_body).await;
+    metrics::record_capability_duration(
+        "embedding",
+        route_id.as_str(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    match result {
+        Ok(value) => {
+            if let Err(message) = capability::validate_embedding_response(&value, *dimensions) {
+                call.outcome("embedding_invalid");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    message,
+                    "server_error",
+                    "embedding_invalid",
+                );
+            }
+            call.outcome("ok");
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Err(error) => {
+            call.outcome("executor_error");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                "server_error",
+                "executor_error",
+            )
+        }
+    }
+}
+
+/// Positively recognizes llama.cpp's physical-batch overflow in an executor error.
+///
+/// Requires the upstream status to be 500 AND both distinctive markers of the
+/// backend's own message, so an arbitrary 500/502 is never classified as input
+/// overflow. Anything not matching stays on the existing `executor_error` path.
+fn is_physical_batch_overflow(error: &(impl std::fmt::Display + ?Sized)) -> bool {
+    let text = error.to_string();
+    text.contains("HTTP 500")
+        && text.contains("is too large to process")
+        && text.contains("increase the physical batch size")
+}
+
+/// Cohere/Jina-compatible rerank endpoint. Proxies the typed rerank contract
+/// to the capability executor selected by the `model` route id (e.g.
+/// `localclaw/rerank`); bounds (candidates, top_n) are enforced here.
+async fn rerank_handler(
+    State(state): State<ServerState>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => {
+            // Pre-identity refusal: the body could not be parsed, so there is no model
+            // string and no route to attribute this to. Counted anyway -- this is a
+            // capability request that was refused, and leaving it uncounted would make
+            // the request counter an incomplete record of admission decisions.
+            metrics::record_capability_unresolved("rerank", "invalid_body");
+            return invalid_body_error(status, message);
+        }
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // The single label source for every metric below. See the embeddings handler for why
+    // this is the resolved map key rather than the raw request string.
+    let route_id = ModelId::from(model.as_str());
+    let Some(route) = state.capabilities.get(&route_id).cloned() else {
+        metrics::record_capability_unresolved("rerank", "unknown_model");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown rerank model {model}"),
+            "invalid_request_error",
+            "unknown_model",
+        );
+    };
+    // Instrumented from here on: everything below is either admission or executor
+    // work, and must be attributed to the resolved route id.
+    let mut call = metrics::CapabilityCall::start("rerank", route_id.as_str());
+    let CapabilityKind::Rerank {
+        max_candidates,
+        top_n,
+        max_doc_chars,
+        max_query_chars,
+    } = &route.kind
+    else {
+        call.outcome("wrong_capability");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{model} is not a rerank capability"),
+            "invalid_request_error",
+            "wrong_capability",
+        );
+    };
+    let query = body
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if query.trim().is_empty() {
+        call.outcome("invalid_query");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "query must be a non-empty string",
+            "invalid_request_error",
+            "invalid_query",
+        );
+    }
+    if query.chars().count() > *max_query_chars {
+        call.outcome("query_too_long");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("query exceeds max_query_chars {max_query_chars}"),
+            "invalid_request_error",
+            "query_too_long",
+        );
+    }
+    let documents = body
+        .get("documents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if documents.is_empty() {
+        call.outcome("invalid_documents");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "documents must be a non-empty array",
+            "invalid_request_error",
+            "invalid_documents",
+        );
+    }
+    if documents.len() > *max_candidates {
+        call.outcome("too_many_candidates");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("documents exceeds max_candidates {max_candidates}"),
+            "invalid_request_error",
+            "too_many_candidates",
+        );
+    }
+    // Track the longest document as it is validated: the distribution of this
+    // value against the 4096 boundary is what makes an instant batch-wide 400
+    // predictable rather than surprising.
+    let mut longest_doc_chars = 0usize;
+    for document in &documents {
+        let text = match document {
+            Value::String(text) => text.clone(),
+            Value::Object(object) => object
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            _ => String::new(),
+        };
+        let chars = text.chars().count();
+        longest_doc_chars = longest_doc_chars.max(chars);
+        if chars > *max_doc_chars {
+            call.outcome("document_too_long");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("document exceeds max_doc_chars {max_doc_chars}"),
+                "invalid_request_error",
+                "document_too_long",
+            );
+        }
+    }
+    metrics::record_capability_max_doc_chars("rerank", longest_doc_chars as u64);
+    let requested_top_n = body
+        .get("top_n")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    let effective_top_n = requested_top_n.unwrap_or(*top_n).min(*max_candidates);
+    let route_model = ModelId::from(model.as_str());
+    let executor_body = match capability::rerank_executor_body(
+        &route_model,
+        route.client.model(),
+        query,
+        &documents,
+        effective_top_n,
+    ) {
+        Ok(body) => body,
+        Err(message) => {
+            call.outcome("invalid_documents");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                "invalid_documents",
+            );
+        }
+    };
+    metrics::record_capability_items("rerank", documents.len() as u64);
+    let started = std::time::Instant::now();
+    let result = route.client.call(executor_body).await;
+    metrics::record_capability_duration(
+        "rerank",
+        route_id.as_str(),
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    match result {
+        Ok(value) => {
+            if let Err(message) = capability::validate_rerank_response(&value) {
+                call.outcome("rerank_invalid");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    message,
+                    "server_error",
+                    "rerank_invalid",
+                );
+            }
+            call.outcome("ok");
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Err(error) => {
+            if is_physical_batch_overflow(&error) {
+                call.outcome("input_too_long");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    error.to_string(),
+                    "server_error",
+                    "input_too_long",
+                );
+            }
+            call.outcome("executor_error");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                "server_error",
+                "executor_error",
+            )
+        }
+    }
+}
+
+// Zero-translation parity with production: capability route IDs
+// (embeddings/rerank) are advertised alongside routing routes with default
+// capabilities, so consumer pickers see the same model surface the
+// production binary exposes. The null capability metadata on capability
+// entries (tool_calling/context_window = null) is a DELIBERATE contract:
+// embeddings/rerank are non-LLM typed endpoints whose admission rules live
+// in their route envelopes, not in the generic model capabilities struct.
+fn advertised_models(state: &ServerState) -> Value {
+    model_list_payload(
         state
             .runner
             .models()
-            .map(|model| (model.id.as_str(), model.capabilities)),
-    ))
+            .map(|model| (model.id.as_str(), model.capabilities))
+            .chain(
+                state
+                    .capabilities
+                    .keys()
+                    .map(|id| (id.as_str(), ModelCapabilities::default())),
+            ),
+    )
 }
 
-async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
-    Json(state.stats.snapshot())
+async fn models(State(state): State<ServerState>) -> Json<Value> {
+    Json(advertised_models(&state))
+}
+
+/// Read-only sanitized DeepSeek balance telemetry for observability.
+///
+/// Serves the LAST SUCCESSFUL factual observation published by the
+/// fleet-readiness resource client. This handler performs NO provider fetch and
+/// holds no credential material - bounded observability only. It never touches
+/// routing, readiness, preference, or economics state.
+async fn get_deepseek_resource(State(state): State<ServerState>) -> (StatusCode, Json<Value>) {
+    let Some(telemetry) = &state.deepseek_telemetry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "resource_telemetry_not_attached" })),
+        );
+    };
+    let Some(snapshot) = telemetry.get() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no_resource_snapshot_yet" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "is_available": snapshot.is_available,
+            "currency": snapshot.currency,
+            "total_balance": snapshot.total_balance,
+            "granted_balance": snapshot.granted_balance,
+            "topped_up_balance": snapshot.topped_up_balance,
+            "observed_at": snapshot.observed_at,
+            "error": snapshot.error,
+        })),
+    )
+}
+
+async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {    Json(state.stats.snapshot())
 }
 
 async fn reset_stats(State(state): State<ServerState>) -> Json<Value> {
@@ -1985,6 +2826,32 @@ mod tests {
                 .get::<RequestLogError>()
                 .map(|error| error.0.as_str()),
             Some("invalid request")
+        );
+    }
+
+    /// The pre-execution escalation threshold compares a HOST-SIDE ESTIMATE of
+    /// the caller's raw body, so that estimate is the load-bearing quantity in
+    /// the strict-greater-than comparison.
+    ///
+    /// This pins the value for the body the F8 host-boundary suite sends: the
+    /// two string values total 10 (each ASCII run counted at four characters per
+    /// token, plus one per string) and the estimator adds a fixed structural
+    /// overhead of 8, giving 18.
+    ///
+    /// That suite probes the boundary behaviourally, which is deliberately
+    /// self-referential and therefore CANNOT detect the comparison being turned
+    /// into `>=`; this assertion supplies the independent anchor that makes such
+    /// a change visible.
+    #[test]
+    fn the_pre_execution_estimate_of_the_f8_fixture_body_is_eighteen() {
+        let body = serde_json::json!({
+            "model": "primary",
+            "messages": [{ "role": "user", "content": "boundary probe" }],
+        });
+        assert_eq!(
+            estimate_input_tokens(&body),
+            18,
+            "the escalation threshold boundary is expressed against this exact value"
         );
     }
 }

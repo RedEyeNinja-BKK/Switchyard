@@ -8,8 +8,8 @@ pub mod common;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
-    ContentBlock, FormatId, LossyConversionPolicy, TranslationEngine, TranslationPolicy,
-    WireFormat, prepare_request_for_target, sanitize_anthropic_tool_use_id,
+    ContentBlock, FormatId, LlmRequest, LossyConversionPolicy, Message, Role, TranslationEngine,
+    TranslationPolicy, WireFormat, prepare_request_for_target, sanitize_anthropic_tool_use_id,
 };
 
 use common::{REASONING_MODEL, normalized_policy, shell_tool_call};
@@ -4108,5 +4108,353 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
         )?
         .body;
     assert_eq!(output["input"], outputs);
+    Ok(())
+}
+
+/// The #619 semantic contract, realized on the v0.3.0 candidate.
+///
+/// Temporary local carry of upstream PR #619's CONTRACT (still open/unmerged at
+/// `1f9d50b6`), not a cherry-pick of its implementation. Automatically reconsidered once
+/// #619 or an equivalent upstream change merges. See the carry ledger.
+///
+/// Four properties, asserted separately so a regression names itself:
+///   1. generated `input` is ALWAYS list-shaped, including the single-user-text fast path;
+///   2. generated `System` and `Developer` instruction roles both encode as `developer`;
+///   3. preserved caller JSON stays byte-preserved (scalar `input` stays scalar, a
+///      `system` role stays `system`) - preservation is a different path and must not be
+///      normalized;
+///   4. no unrelated Responses normalization hitchhikes into the carry.
+///
+/// Property 1's decisive case is the BARE single-user-text request. The codec has a
+/// separate widening path for `additional_tools` that also turns a scalar `input` into an
+/// array; that path only fires when a request carries that extension, so it must not be
+/// mistaken for evidence that the general canonical rule is implemented. The plain case
+/// below has no such extension and is the one that must hold.
+#[test]
+fn generated_responses_input_is_always_list_shaped() -> TestResult {
+    let engine = TranslationEngine::default();
+
+    // (1) DECISIVE: the single-user-text fast path, no extra tool item, no extension.
+    let chat = json!({
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let out = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &chat,
+        &TranslationPolicy::default(),
+    )?;
+    assert!(
+        out.body["input"].is_array(),
+        "generated single-user-text input must be a list, got {}",
+        out.body["input"]
+    );
+    assert_eq!(
+        out.body["input"].as_array().map(Vec::len),
+        Some(1),
+        "a single user text encodes as exactly one message item"
+    );
+    // One canonical item shape: the same `type: "message"` discriminator every other
+    // generated turn carries. A hand-rolled single-turn fast path that omitted it would
+    // make one turn structurally different from the rest of the conversation.
+    assert_eq!(out.body["input"][0]["type"], "message");
+    assert_eq!(out.body["input"][0]["role"], "user");
+    assert_eq!(out.body["input"][0]["content"], "hello");
+
+    // A single Anthropic user turn is the same case via the other generated source.
+    let anthropic = json!({
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 8
+    });
+    let out = engine.translate_request(
+        WireFormat::AnthropicMessages,
+        WireFormat::OpenAiResponses,
+        &anthropic,
+        &TranslationPolicy::default(),
+    )?;
+    assert!(
+        out.body["input"].is_array(),
+        "generated Anthropic->Responses input must be a list, got {}",
+        out.body["input"]
+    );
+
+    // A multi-message request was already list-shaped and must stay so.
+    let multi = json!({
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"}
+        ]
+    });
+    let out = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &multi,
+        &TranslationPolicy::default(),
+    )?;
+    assert!(out.body["input"].is_array());
+    assert_eq!(out.body["input"].as_array().map(Vec::len), Some(3));
+    Ok(())
+}
+
+// Instruction roles in normalized IR encode as `developer`: strict Responses backends reject
+// `system`-role input items. Every inbound decoder folds wire-level `system`/`developer`
+// content into `instructions` (and the encoder joins that into top-level `instructions`),
+// so no wire-body translation can ever place those roles on the input path. This drives the
+// IR directly, which is the only surface where the rule is observable.
+#[test]
+fn generated_instruction_roles_encode_as_developer() -> TestResult {
+    let engine = TranslationEngine::default();
+    let request = LlmRequest {
+        model: Some("route".to_string()),
+        messages: vec![
+            Message::text(Role::System, "system rules"),
+            Message::text(Role::Developer, "developer rules"),
+            Message::text(Role::User, "hi"),
+        ],
+        ..LlmRequest::default()
+    };
+
+    let encoded = engine.encode_request(
+        WireFormat::OpenAiResponses,
+        &request,
+        &TranslationPolicy::default(),
+    )?;
+    let input = encoded.body["input"]
+        .as_array()
+        .ok_or("encoded input must be a message-item list")?;
+
+    assert_eq!(input.len(), 3);
+    assert_eq!(
+        input[0]["role"], "developer",
+        "Role::System must encode as developer"
+    );
+    assert_eq!(
+        input[1]["role"], "developer",
+        "Role::Developer must stay developer"
+    );
+    assert_eq!(input[2]["role"], "user");
+    for item in input {
+        assert_ne!(
+            item["role"], "system",
+            "no generated system role may reach the Responses wire"
+        );
+    }
+    Ok(())
+}
+
+// A real wire-level proof that a decoded `system` message never reaches the input path at all:
+// the decoder hoists it to top-level `instructions`. This is what makes the IR-driven test
+// above necessary rather than redundant, and it pins the hoisting behaviour itself.
+#[test]
+fn decoded_system_message_becomes_instructions_not_an_input_item() -> TestResult {
+    let engine = TranslationEngine::default();
+    // Deliberately multi-turn: a single user turn collapses to a scalar `input` on pristine
+    // v0.3.0, which would make a shape-agnostic role read impossible. A multi-turn body is a
+    // list in every version, so this isolates WHERE the system turn lands (hoisting) from how
+    // `input` is shaped (property 1, covered separately).
+    let chat_system = json!({
+        "messages": [
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"}
+        ]
+    });
+    let out = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &chat_system,
+        &TranslationPolicy::default(),
+    )?;
+    assert_eq!(out.body["instructions"], "be terse");
+    // Read the roles without depending on the list-vs-scalar shape: this test is about WHERE
+    // the system turn lands, not about how `input` is shaped. (Shape is property 1, covered
+    // separately, so a shape failure must not be reported as a hoisting failure.)
+    let roles: Vec<String> = out.body["input"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item["role"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user"],
+        "the system turn must not appear as an input item"
+    );
+    Ok(())
+}
+
+// Embed-preservation replay must also stay wire-legal: preservation metadata is
+// embedded in the translated body, but no `system`-role input item may survive
+// into the outgoing input array, because strict Responses backends (the
+// chatgpt.com Codex endpoint) reject `system`-role input items and require
+// `developer`. Ported from production, which carries the same guard.
+#[test]
+fn responses_embed_preservation_replay_has_no_system_role_items() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Embed,
+        ..TranslationPolicy::default()
+    };
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "role": "system", "content": "Be terse."},
+            {"type": "message", "role": "user", "content": "hi"}
+        ],
+        "stream": true
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    if let Some(input) = output["input"].as_array() {
+        for item in input {
+            assert_ne!(
+                item.get("role").and_then(Value::as_str),
+                Some("system"),
+                "embed-preservation replay must not re-emit system-role items"
+            );
+        }
+    }
+    assert!(
+        output["input"].is_array(),
+        "replay must keep a canonical input array"
+    );
+    Ok(())
+}
+
+#[test]
+fn preserved_responses_requests_stay_byte_preserved() -> TestResult {
+    let engine = TranslationEngine::default();
+
+    // Preservation is a DIFFERENT path: the same-format request is forwarded unchanged.
+    // A preserved scalar `input` stays scalar and no unrelated field is rewritten.
+    // The ONE exception is the wire-illegal `system` input role: strict Responses
+    // backends (the chatgpt.com Codex endpoint) reject `system`-role input items
+    // and require `developer`, so the replay fixes that role up. This mirrors
+    // production, where `normalize_system_input_roles` runs on the preserved
+    // branch for exactly that reason.
+    for body in [
+        json!({"model": "route", "input": "hi", "metadata": {"trace": "t1"}}),
+        json!({
+            "model": "route",
+            "input": [
+                {"role": "user", "content": "hi"}
+            ]
+        }),
+    ] {
+        let out = engine.translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?;
+        assert_eq!(
+            out.body, body,
+            "a preserved Responses request must be forwarded unchanged"
+        );
+    }
+
+    // The `system`-role case is preserved too, EXCEPT that the wire-illegal role
+    // is rewritten to the role the strict endpoint accepts.
+    let sys_body = json!({
+        "model": "route",
+        "input": [
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let sys_out = engine.translate_request(
+        WireFormat::OpenAiResponses,
+        WireFormat::OpenAiResponses,
+        &sys_body,
+        &TranslationPolicy::default(),
+    )?;
+    let roles: Vec<String> = sys_out.body["input"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|i| i.get("role").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        roles,
+        ["developer", "user"],
+        "a preserved system role must be rewritten to developer for wire legality"
+    );
+
+    // The scalar preserved case in particular must NOT have been widened to an array.
+    let scalar = json!({"model": "route", "input": "hi"});
+    let out = engine.translate_request(
+        WireFormat::OpenAiResponses,
+        WireFormat::OpenAiResponses,
+        &scalar,
+        &TranslationPolicy::default(),
+    )?;
+    assert!(
+        out.body["input"].is_string(),
+        "preserved scalar input must stay scalar, got {}",
+        out.body["input"]
+    );
+    Ok(())
+}
+
+#[test]
+fn responses_carry_changes_nothing_unrelated() -> TestResult {
+    let engine = TranslationEngine::default();
+
+    // (4) No hitchhiking: beyond `input` list-shape and the instruction role, the generated
+    // Responses body must be unchanged by this carry. Pin the neighbouring fields the
+    // translation already produces, so a future edit to this codec that widens scope fails
+    // here instead of shipping silently.
+    let chat = json!({
+        "messages": [
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"}
+        ],
+        "max_tokens": 64
+    });
+    let out = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &chat,
+        &TranslationPolicy::default(),
+    )?;
+
+    // The conversation turns are untouched. The `system` message is not one of them: the
+    // decoder hoists it to top-level `instructions`, so four wire messages encode as three
+    // input items plus one instructions string.
+    assert_eq!(out.body["instructions"], "be terse");
+    assert_eq!(out.body["input"].as_array().map(Vec::len), Some(3));
+    assert_eq!(out.body["input"][0]["role"], "user");
+    assert_eq!(out.body["input"][0]["content"], "first");
+    assert_eq!(out.body["input"][1]["role"], "assistant");
+    assert_eq!(out.body["input"][2]["role"], "user");
+    assert_eq!(out.body["input"][2]["content"], "third");
+
+    // Every generated turn carries the same item shape.
+    for item in out.body["input"].as_array().expect("input is a list") {
+        assert_eq!(item["type"], "message", "one canonical item shape");
+    }
+
+    // The output budget still carries across.
+    assert_eq!(out.body["max_output_tokens"], 64);
+
+    // The assistant turn is not re-encoded as a tool call.
+    assert!(out.body["input"][1].get("tool_calls").is_none());
     Ok(())
 }

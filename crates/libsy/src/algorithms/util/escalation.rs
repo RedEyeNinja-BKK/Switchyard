@@ -397,6 +397,7 @@ pub(crate) fn request_at_turn(session_id: Option<&str>, turn: usize) -> Request 
             session_id: Some(id.to_string()),
             ..Metadata::default()
         }),
+        ..Default::default()
     }
 }
 

@@ -57,6 +57,7 @@ fn request(messages: Vec<Message>) -> Request {
         },
         raw_request: None,
         metadata: None,
+        ..Default::default()
     }
 }
 

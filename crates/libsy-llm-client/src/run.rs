@@ -207,7 +207,32 @@ async fn call_first_available(
     models: &[ModelId],
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
 ) -> Result<Response> {
+    // How far a failed candidate's damage reaches across its provider, tracked per request.
+    //
+    // A single upstream service can fail in ways that do NOT take all of its models down, so
+    // one blanket "provider is down" flag silently disables candidates the failure does not
+    // cover. Measured 2026-09-19: with the OpenRouter balance at 0 the paid lanes returned 402
+    // while `nex-agi/nex-n2.5-pro:free` on the SAME base_url returned 200, so a free candidate
+    // ranked below a paid one became unreachable by construction.
+    let mut unavailable: HashMap<String, ProviderFailures> = HashMap::new();
     for (index, target) in models.iter().enumerate() {
+        let provider = clients
+            .route(target)
+            .ok()
+            .and_then(|client| client.provider_key())
+            .map(ToOwned::to_owned);
+        if let Some(provider) = provider.as_deref()
+            && unavailable
+                .get(provider)
+                .is_some_and(|failures| failures.blocks(target))
+        {
+            tracing::info!(
+                provider,
+                target = %target,
+                "skipping candidate: provider unavailable for this model (balance/quota/auth)"
+            );
+            continue;
+        }
         let request = clients.prepare_completion_request(request.clone(), target);
         match call_one(
             clients,
@@ -223,18 +248,163 @@ async fn call_first_available(
         {
             Ok(response) => return Ok(response),
             Err(error) if index + 1 == models.len() => return Err(error),
-            Err(error) => match fallback_reason(&error) {
-                Some(reason) => tracing::info!(
-                    from = %target,
-                    to = %models[index + 1],
-                    reason = reason.as_str(),
-                    "model call failed; trying next candidate"
-                ),
-                None => return Err(error),
-            },
+            Err(error) => {
+                if let Some(provider) = provider.as_deref()
+                    && let Some(failure) = provider_failure_class(&error)
+                {
+                    tracing::info!(
+                        provider,
+                        target = %target,
+                        failure = failure.as_str(),
+                        "marking provider failure for this request"
+                    );
+                    unavailable
+                        .entry(provider.to_owned())
+                        .or_default()
+                        .record(failure);
+                }
+                // Advance to the next candidate still worth an attempt: any remaining candidate
+                // whose own cost class is not covered by what has been proven about its provider.
+                let next = models.iter().skip(index + 1).find(|candidate| {
+                    clients
+                        .route(candidate)
+                        .ok()
+                        .and_then(|client| client.provider_key())
+                        .is_none_or(|provider| {
+                            unavailable
+                                .get(provider)
+                                .is_none_or(|failures| !failures.blocks(candidate))
+                        })
+                });
+                match (fallback_reason(&error), next) {
+                    (Some(reason), Some(next_target)) => tracing::info!(
+                        from = %target,
+                        to = %next_target,
+                        reason = reason.as_str(),
+                        "model call failed; trying next candidate"
+                    ),
+                    _ => return Err(error),
+                }
+            }
         }
     }
     Err(LibsyError::NoTargets)
+}
+
+/// How far a failed candidate's damage reaches across its provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderFailure {
+    /// Every model on the host fails identically until the operator acts.
+    Whole,
+    /// Only models that COST something fail (payment required on a metered account).
+    Billing,
+    /// Only models that cost NOTHING fail — the provider's free-tier daily cap.
+    ZeroPriceQuota,
+}
+
+impl ProviderFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProviderFailure::Whole => "whole-provider",
+            ProviderFailure::Billing => "billing",
+            ProviderFailure::ZeroPriceQuota => "zero-price-quota",
+        }
+    }
+}
+
+/// Provider failures observed for one provider during a single request.
+#[derive(Default)]
+struct ProviderFailures(Vec<ProviderFailure>);
+
+impl ProviderFailures {
+    fn record(&mut self, failure: ProviderFailure) {
+        if !self.0.contains(&failure) {
+            self.0.push(failure);
+        }
+    }
+
+    /// Whether this provider is currently unusable FOR THIS MODEL.
+    ///
+    /// The three reaches do not overlap, which is why this asks about the model rather than
+    /// returning a single flag: a billing failure says nothing about a zero-price model, and a
+    /// zero-price quota says nothing about a paid one. A provider can hold both observations in
+    /// one request without either masking the other.
+    fn blocks(&self, model: &ModelId) -> bool {
+        let zero_price = is_zero_price_model(model);
+        self.0.iter().any(|failure| match failure {
+            ProviderFailure::Whole => true,
+            ProviderFailure::Billing => !zero_price,
+            ProviderFailure::ZeroPriceQuota => zero_price,
+        })
+    }
+}
+
+/// Classify a failed candidate's provider reach, or `None` for a candidate-scoped failure.
+///
+/// A generic permanent-quota `429` (`insufficient_quota`) is account-wide: every model on
+/// that provider fails identically, free or not — `Whole`.
+///
+/// `401` (auth) is NOT classified here. It is terminal for fallback upstream of this function
+/// (`fallback_reason` returns `None`), so no provider-failure state is ever recorded for it.
+/// Our pre-v0.3.0 fork classified it as `Whole` and advanced; that behavior was intentionally
+/// retired in this reconciliation — see AUTH-401 CONFLICT RESOLUTION in the carry ledger.
+///
+/// `402` (`payment_required`, OpenRouter's insufficient-credits signal) is NOT account-wide in
+/// reach: it says the account cannot pay for a model, which is true only of models that charge.
+/// OpenRouter serves zero-price models from the same base_url, and they demonstrably keep
+/// serving on a zero balance (2026-09-19: the paid lanes returned 402 while
+/// `nex-agi/nex-n2.5-pro:free` returned 200). Treating 402 as `Whole` therefore disabled every
+/// free candidate ranked below a paid one — see `is_zero_price_model`.
+///
+/// OpenRouter's free-tier daily cap is the MIRROR case: it fails every zero-price model on the
+/// host while paid models keep working, so it is `ZeroPriceQuota`, not `Whole`. Its body is
+/// pinned by a test in `error.rs` ("Rate limit exceeded: free-models-per-day. Add 10 credits to
+/// unlock 1000 free model requests per day."), and before this it was classified `Whole`, which
+/// skipped the paid candidates too and would have made a free fallback lane useless in exactly
+/// the situation it exists for.
+///
+/// Transient 429s, 5xx, timeouts and transport errors are candidate-scoped.
+fn provider_failure_class(error: &LibsyError) -> Option<ProviderFailure> {
+    use crate::error::is_permanent_quota_429;
+
+    let LibsyError::ClientCall { source, .. } = error else {
+        return None;
+    };
+    match source {
+        LlmClientError::UpstreamHttp { status, body } => {
+            if *status == StatusCode::PAYMENT_REQUIRED {
+                Some(ProviderFailure::Billing)
+            } else if *status == StatusCode::TOO_MANY_REQUESTS && is_permanent_quota_429(body) {
+                if is_free_tier_cap_429(body) {
+                    Some(ProviderFailure::ZeroPriceQuota)
+                } else {
+                    Some(ProviderFailure::Whole)
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a 429 body is the provider's FREE-TIER DAILY CAP rather than an account-wide quota.
+///
+/// OpenRouter states it as "free-models-per-day"; it limits only zero-price models, so the
+/// candidates it covers are the opposite set from a billing failure.
+fn is_free_tier_cap_429(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("free-models-per-day")
+}
+
+/// Whether calling this upstream model costs nothing.
+///
+/// OpenRouter marks zero-price models with a `:free` suffix on the upstream id, and those do
+/// not draw on the account balance, so an account-level billing failure says nothing about
+/// them. This is the only thing the predicate is used for: it widens which candidates are
+/// still worth an attempt after a billing failure. It never makes a candidate eligible on its
+/// own, and nothing else (preference, ordering, readiness) rides on it.
+fn is_zero_price_model(model: &ModelId) -> bool {
+    model.as_str().ends_with(":free")
 }
 
 /// Call one candidate model and record its observation and span.
@@ -289,6 +459,7 @@ async fn call_one(
     count: usize,
     buffer: bool,
 ) -> Result<Response> {
+    let route_policy = request.route_reasoning_policy;
     let span = tracing::Span::current();
     observability::record_gen_ai_request(&span, &request.llm_request);
     if let Some(session_id) = request
@@ -311,6 +482,17 @@ async fn call_one(
     }
     .await
     .map_err(|source| LibsyError::client_call(model_id.clone(), source));
+    // A route-imposed reasoning policy must be attributable per attempt:
+    // requested policy, selected target, outcome.
+    if let Some(policy) = route_policy {
+        tracing::info!(
+            target: "switchyard_server::request",
+            target = %model_id,
+            route_reasoning_policy = %policy,
+            outcome = if result.is_ok() { "ok" } else { "error" },
+            "route reasoning policy applied to candidate"
+        );
+    }
     let duration = started.elapsed();
 
     let result = result.map(|mut response| {
@@ -382,7 +564,19 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         LlmClientError::UpstreamHttp { status, .. }
             if matches!(
                 *status,
-                StatusCode::FORBIDDEN | StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                // 402 is fallback-eligible so a drained or exhausted account can still be
+                // served by an eligible alternative under the provider-failure reach rules.
+                //
+                // 401 is deliberately ABSENT and stays terminal: authentication failure is not
+                // a reason to try another candidate, and advancing on it would override an
+                // upstream safety contract. Our pre-v0.3.0 fork advanced on 401; that behavior
+                // was intentionally retired in this reconciliation (operator decision) because
+                // no reproduced production failure required it. See AUTH-401 CONFLICT RESOLUTION
+                // in the carry ledger.
+                StatusCode::PAYMENT_REQUIRED
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::REQUEST_TIMEOUT
+                    | StatusCode::TOO_MANY_REQUESTS
             ) || status.is_server_error() =>
         {
             Some(RoutingFallbackReason::Unavailable)
@@ -1048,6 +1242,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hello".to_string()),
             raw_request: None,
             metadata: None,
+            ..Default::default()
         }
     }
 
@@ -1208,6 +1403,9 @@ mod tests {
                         extra_headers: BTreeMap::new(),
                         extra_body: BTreeMap::from([("store".to_string(), json!(store))]),
                         reasoning_effort: None,
+                        reasoning_dialect: None,
+                        reasoning_efforts: None,
+                        strip_reasoning_content: false,
                         max_retries: 0,
                         timeout: None,
                     };
@@ -1353,6 +1551,9 @@ mod tests {
                     extra_headers: BTreeMap::new(),
                     extra_body: BTreeMap::new(),
                     reasoning_effort: None,
+                    reasoning_dialect: None,
+                    reasoning_efforts: None,
+                    strip_reasoning_content: false,
                     max_retries: 0,
                     timeout: None,
                 }),
@@ -1379,6 +1580,7 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding seed request", error))?,
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1417,6 +1619,7 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding continuation request", error))?,
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1449,6 +1652,7 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding chained request", error))?,
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
         let history = clients
             .stored_state_owner(&third)
@@ -2024,6 +2228,9 @@ mod tests {
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 reasoning_effort: None,
+                reasoning_dialect: None,
+                reasoning_efforts: None,
+                strip_reasoning_content: false,
                 max_retries: 2,
                 timeout: None,
             })
@@ -2122,6 +2329,9 @@ mod tests {
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 reasoning_effort: None,
+                reasoning_dialect: None,
+                reasoning_efforts: None,
+                strip_reasoning_content: false,
                 max_retries: 0,
                 timeout: None,
             })
@@ -2140,6 +2350,7 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            ..Default::default()
         };
         let result = run(
             algorithm,
@@ -2212,6 +2423,389 @@ mod tests {
             .await
             .map_err(|source| LibsyError::client_call("weak", source))?;
         assert_eq!(completion_text(&aggregate), "");
+        Ok(())
+    }
+
+    /// A billing failure (402) covers only the models that COST something.
+    ///
+    /// Live failure this protects (2026-09-19): with the OpenRouter balance at 0 the paid lanes
+    /// returned 402 while `nex-agi/nex-n2.5-pro:free` on the SAME base_url returned 200. As a
+    /// whole-provider failure the free candidate ranked below a paid one became unreachable by
+    /// construction, and an operator-requested free fallback lane silently did nothing.
+    #[tokio::test]
+    async fn drained_provider_still_attempts_zero_price_candidates_on_the_same_provider()
+    -> Result<()> {
+        #[derive(Clone)]
+        struct StubClient {
+            provider: &'static str,
+            fail_with: Option<StatusCode>,
+            calls: Arc<Mutex<Vec<ModelId>>>,
+        }
+        #[async_trait::async_trait]
+        impl RoutedLlmClient for StubClient {
+            async fn call(
+                &self,
+                request: Request,
+            ) -> std::result::Result<Response, LlmClientError> {
+                let model = request.model_id().unwrap_or_default();
+                self.calls.lock().push(model.clone());
+                match self.fail_with {
+                    Some(status) => Err(LlmClientError::UpstreamHttp {
+                        status,
+                        body: "provider rejected".to_string(),
+                    }),
+                    None => Ok(Response {
+                        llm_response: LlmResponse::Agg(text_response(
+                            Some(model.to_string()),
+                            "ok",
+                        )),
+                        metadata: None,
+                        upstream_headers: Default::default(),
+                    }),
+                }
+            }
+            fn provider_key(&self) -> Option<&str> {
+                Some(self.provider)
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut by_model = HashMap::new();
+        for (model, fail) in [
+            ("z-ai/glm-5.3-flash", true),
+            ("qwen/qwen3.8-flash", true),
+            ("nex-agi/nex-n2.5-pro:free", false),
+        ] {
+            by_model.insert(
+                ModelId::from(model),
+                Arc::new(StubClient {
+                    provider: "openrouter.ai",
+                    fail_with: fail.then_some(StatusCode::PAYMENT_REQUIRED),
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn RoutedLlmClient>,
+            );
+        }
+        let algorithm = Arc::new(CandidateAlgorithm {});
+        let (_, response) = run(
+            algorithm,
+            ClientRouter::new(by_model),
+            request(),
+            to_category_map(&[
+                "z-ai/glm-5.3-flash",
+                "qwen/qwen3.8-flash",
+                "nex-agi/nex-n2.5-pro:free",
+            ]),
+            None,
+        )
+        .await?;
+
+        // First paid candidate attempted (402); the second PAID same-provider candidate SKIPPED;
+        // the FREE one on that provider ATTEMPTED and served.
+        assert_eq!(
+            &*calls.lock(),
+            &[
+                ModelId::from("z-ai/glm-5.3-flash"),
+                "nex-agi/nex-n2.5-pro:free".into()
+            ]
+        );
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("nex-agi/nex-n2.5-pro:free")
+        );
+        Ok(())
+    }
+
+    /// The MIRROR case: the free-tier daily cap covers only the models that cost NOTHING.
+    ///
+    /// A paid candidate must stay eligible when the free tier is exhausted. Classified as a
+    /// whole-provider failure this would skip the paid candidate too and make a free fallback
+    /// lane useless in exactly the situation it exists for.
+    #[tokio::test]
+    async fn free_tier_cap_skips_zero_price_candidates_but_not_paid_ones() -> Result<()> {
+        const CAP_BODY: &str = "Rate limit exceeded: free-models-per-day. Add 10 credits to \
+                                 unlock 1000 free model requests per day.";
+
+        #[derive(Clone)]
+        struct StubClient {
+            provider: &'static str,
+            body: Option<&'static str>,
+            calls: Arc<Mutex<Vec<ModelId>>>,
+        }
+        #[async_trait::async_trait]
+        impl RoutedLlmClient for StubClient {
+            async fn call(
+                &self,
+                request: Request,
+            ) -> std::result::Result<Response, LlmClientError> {
+                let model = request.model_id().unwrap_or_default();
+                self.calls.lock().push(model.clone());
+                match self.body {
+                    Some(body) => Err(LlmClientError::UpstreamHttp {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        body: body.to_string(),
+                    }),
+                    None => Ok(Response {
+                        llm_response: LlmResponse::Agg(text_response(
+                            Some(model.to_string()),
+                            "ok",
+                        )),
+                        metadata: None,
+                        upstream_headers: Default::default(),
+                    }),
+                }
+            }
+            fn provider_key(&self) -> Option<&str> {
+                Some(self.provider)
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut by_model = HashMap::new();
+        for (model, capped) in [
+            ("nex-agi/nex-n2.5-pro:free", true),
+            ("inclusionai/ling-3.0-flash-fin:free", false),
+            ("qwen/qwen3.8-flash", false),
+        ] {
+            by_model.insert(
+                ModelId::from(model),
+                Arc::new(StubClient {
+                    provider: "openrouter.ai",
+                    body: capped.then_some(CAP_BODY),
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn RoutedLlmClient>,
+            );
+        }
+        let algorithm = Arc::new(CandidateAlgorithm {});
+        let (_, response) = run(
+            algorithm,
+            ClientRouter::new(by_model),
+            request(),
+            to_category_map(&[
+                "nex-agi/nex-n2.5-pro:free",
+                "inclusionai/ling-3.0-flash-fin:free",
+                "qwen/qwen3.8-flash",
+            ]),
+            None,
+        )
+        .await?;
+
+        // The capped free candidate is attempted; the OTHER free candidate on the same provider
+        // is skipped; the PAID candidate is still attempted and serves.
+        assert_eq!(
+            &*calls.lock(),
+            &[
+                ModelId::from("nex-agi/nex-n2.5-pro:free"),
+                "qwen/qwen3.8-flash".into()
+            ]
+        );
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("qwen/qwen3.8-flash")
+        );
+        Ok(())
+    }
+
+    /// Classifier unit assertions, including the reaches this carry must NOT absorb.
+    ///
+    /// `402` is absent from upstream's `fallback_reason` by design, so the advance decision
+    /// depends on the `next` candidate existing; transient failures stay candidate-scoped.
+    #[test]
+    fn provider_reach_classes_are_scoped_by_cost() {
+        let error = |source| LibsyError::client_call("target", source);
+        let http = |status, body: &str| {
+            error(LlmClientError::UpstreamHttp {
+                status,
+                body: body.to_string(),
+            })
+        };
+
+        // 402 -> Billing: covers paid, never zero-price.
+        assert_eq!(
+            provider_failure_class(&http(StatusCode::PAYMENT_REQUIRED, "insufficient credits")),
+            Some(ProviderFailure::Billing)
+        );
+        // 401 is NOT a provider failure: it is terminal for fallback upstream of this
+        // function, so nothing is ever recorded for it. Converged to upstream by decision.
+        assert_eq!(
+            provider_failure_class(&http(StatusCode::UNAUTHORIZED, "bad key")),
+            None
+        );
+        // A generic permanent quota IS account-wide.
+        assert_eq!(
+            provider_failure_class(&http(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"code":"insufficient_quota"}}"#
+            )),
+            Some(ProviderFailure::Whole)
+        );
+        // Free-tier daily cap -> ZeroPriceQuota: covers zero-price, never paid.
+        // The real provider body is used verbatim: it is classified permanent via the
+        // "credits" phrase, which is deliberate and pinned by an error.rs test.
+        assert_eq!(
+            provider_failure_class(&http(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day."
+            )),
+            Some(ProviderFailure::ZeroPriceQuota)
+        );
+        // A transient 429 is NOT a provider failure and must not be recorded.
+        assert_eq!(
+            provider_failure_class(&http(StatusCode::TOO_MANY_REQUESTS, "slow down")),
+            None
+        );
+        // A 5xx is candidate-scoped.
+        assert_eq!(
+            provider_failure_class(&http(StatusCode::INTERNAL_SERVER_ERROR, "boom")),
+            None
+        );
+
+        // The reach gate itself: each reach covers exactly its own cost class.
+        let paid = ModelId::from("qwen/qwen3.8-flash");
+        let free = ModelId::from("nex-agi/nex-n2.5-pro:free");
+        let billing = ProviderFailures(vec![ProviderFailure::Billing]);
+        assert!(billing.blocks(&paid));
+        assert!(
+            !billing.blocks(&free),
+            "a billing failure says nothing about a free model"
+        );
+        let quota = ProviderFailures(vec![ProviderFailure::ZeroPriceQuota]);
+        assert!(quota.blocks(&free));
+        assert!(
+            !quota.blocks(&paid),
+            "a free-tier cap says nothing about a paid model"
+        );
+        let whole = ProviderFailures(vec![ProviderFailure::Whole]);
+        assert!(whole.blocks(&paid) && whole.blocks(&free));
+        // Both observations can coexist without either masking the other.
+        let both = ProviderFailures(vec![
+            ProviderFailure::Billing,
+            ProviderFailure::ZeroPriceQuota,
+        ]);
+        assert!(both.blocks(&paid) && both.blocks(&free));
+    }
+
+    /// The permanent boundary between `401` and `402`, proven on BOTH sides.
+    ///
+    /// These two cases look alike and were historically treated alike. They are not:
+    ///
+    /// * `401` is TERMINAL. The first candidate is the only one attempted, the original 401
+    ///   propagates unchanged, and the second candidate is never touched. This converges to
+    ///   upstream v0.3.0/current-main semantics; our pre-v0.3.0 fork advanced on 401 and that
+    ///   behavior was intentionally retired (operator decision, no reproduced production
+    ///   failure required it).
+    /// * `402` IS fallback-eligible. A drained or exhausted account still routes to an eligible
+    ///   alternative under the carried provider-failure reach rules — this is the case backed by
+    ///   a reproduced production failure.
+    ///
+    /// Asserting both together makes the boundary permanent: a future change that re-joins the
+    /// two cases fails here rather than silently altering production routing.
+    #[tokio::test]
+    async fn auth_401_is_terminal_while_payment_402_falls_back() -> Result<()> {
+        #[derive(Clone)]
+        struct StubClient {
+            provider: &'static str,
+            fail_with: Option<StatusCode>,
+            calls: Arc<Mutex<Vec<ModelId>>>,
+        }
+        #[async_trait::async_trait]
+        impl RoutedLlmClient for StubClient {
+            async fn call(
+                &self,
+                request: Request,
+            ) -> std::result::Result<Response, LlmClientError> {
+                let model = request.model_id().unwrap_or_default();
+                self.calls.lock().push(model.clone());
+                match self.fail_with {
+                    Some(status) => Err(LlmClientError::UpstreamHttp {
+                        status,
+                        body: "rejected".to_string(),
+                    }),
+                    None => Ok(Response {
+                        llm_response: LlmResponse::Agg(text_response(
+                            Some(model.to_string()),
+                            "ok",
+                        )),
+                        metadata: None,
+                        upstream_headers: Default::default(),
+                    }),
+                }
+            }
+            fn provider_key(&self) -> Option<&str> {
+                Some(self.provider)
+            }
+        }
+
+        // --- 401: terminal. First candidate only, original error propagates. ---
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut by_model = HashMap::new();
+        for (model, fail) in [("weak", true), ("strong", false)] {
+            by_model.insert(
+                ModelId::from(model),
+                Arc::new(StubClient {
+                    provider: "openrouter.ai",
+                    fail_with: fail.then_some(StatusCode::UNAUTHORIZED),
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn RoutedLlmClient>,
+            );
+        }
+        let algorithm = Arc::new(CandidateAlgorithm {});
+        let result = run(
+            Arc::clone(&algorithm) as Arc<dyn Algorithm>,
+            ClientRouter::new(by_model),
+            request(),
+            to_category_map(&["weak", "strong"]),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(LibsyError::ClientCall {
+                    source: LlmClientError::UpstreamHttp {
+                        status: StatusCode::UNAUTHORIZED,
+                        ..
+                    },
+                    ..
+                })
+            ),
+            "a 401 must propagate as the original error"
+        );
+        assert_eq!(
+            &*calls.lock(),
+            &[ModelId::from("weak")],
+            "401 must NOT advance to the second candidate"
+        );
+
+        // --- 402: fallback-eligible. A different provider still serves. ---
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut by_model = HashMap::new();
+        for (model, provider, fail) in [
+            ("weak", "openrouter.ai", true),
+            ("strong", "deepseek.example", false),
+        ] {
+            by_model.insert(
+                ModelId::from(model),
+                Arc::new(StubClient {
+                    provider,
+                    fail_with: fail.then_some(StatusCode::PAYMENT_REQUIRED),
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn RoutedLlmClient>,
+            );
+        }
+        let (_, response) = run(
+            algorithm as Arc<dyn Algorithm>,
+            ClientRouter::new(by_model),
+            request(),
+            to_category_map(&["weak", "strong"]),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            &*calls.lock(),
+            &[ModelId::from("weak"), ModelId::from("strong")],
+            "402 must advance to an eligible alternative provider"
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
         Ok(())
     }
 }

@@ -47,6 +47,54 @@ fn contains_any(message: &str, phrases: &[&str]) -> bool {
     phrases.iter().any(|phrase| lower.contains(phrase))
 }
 
+/// Canonical permanent-quota markers from OpenAI and compatible providers, matched against
+/// the structured `error.code`.
+const PERMANENT_QUOTA_CODES: &[&str] = &["insufficient_quota"];
+
+/// Message phrases that mean the quota is PERMANENTLY exhausted rather than transiently
+/// rate-limited. Matching these is what separates "retry the same candidate later" from
+/// "this account cannot serve this model at all".
+const PERMANENT_QUOTA_MESSAGE_PHRASES: &[&str] = &[
+    "insufficient_quota",
+    "you exceeded your current quota",
+    "exceeded your current quota",
+    "your billing details",
+    "billing quota",
+    "exhausted your quota",
+    "quota has been exhausted",
+    "usage limit",
+    "payment required",
+    "credits",
+];
+
+/// Structured check: the canonical `error.code` for a permanent quota condition.
+fn is_permanent_quota_structured(value: &Value) -> bool {
+    value
+        .get("error")
+        .and_then(|err| err.get("code"))
+        .and_then(Value::as_str)
+        .is_some_and(|code| {
+            PERMANENT_QUOTA_CODES
+                .iter()
+                .any(|canonical| code.contains(canonical))
+        })
+}
+
+/// Detects a PERMANENT quota exhaustion 429 body (OpenAI `insufficient_quota`, exhausted
+/// usage/billing quota, or a provider-equivalent permanent quota).
+///
+/// This is distinct from a transient rate-limit 429: a permanent quota condition cannot be
+/// fixed by retrying the same candidate, so the caller should skip the ordinary 429 retry
+/// budget and advance to the next candidate immediately. Reuses the overflow-body shape:
+/// parses JSON when the body is JSON, falls back to plain-text phrase matching.
+pub(crate) fn is_permanent_quota_429(body: &str) -> bool {
+    is_overflow_body(
+        body,
+        is_permanent_quota_structured,
+        PERMANENT_QUOTA_MESSAGE_PHRASES,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

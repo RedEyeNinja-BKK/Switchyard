@@ -120,6 +120,7 @@ async fn reflected_response(format: WireFormat, streaming: bool, fail: bool) {
             session_id: Some(KEY.into()),
             ..Default::default()
         }),
+        ..Default::default()
     };
     let captured = Arc::new(Mutex::new(Vec::new()));
     let output = if streaming {

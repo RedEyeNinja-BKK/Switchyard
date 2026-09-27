@@ -9,7 +9,9 @@ use std::sync::Arc;
 use libsy::{Algorithm, LibsyError, RoutingOutcome, RuntimeModels};
 use serde_json::Value;
 use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObserver, TranslatingLlmClient};
-use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat};
+use switchyard_protocol::{
+    LlmClientError, ModelId, ReasoningPolicy, Request, Response, WireFormat,
+};
 use thiserror::Error;
 
 use crate::DecisionTarget;
@@ -106,6 +108,12 @@ impl RunnerError {
 }
 
 /// A configured algorithm and the per-target clients its calls resolve through.
+///
+/// Every field is an `Arc`, an `Option`, or a plain value, so a clone shares
+/// the same algorithm and clients rather than rebuilding them. This is what
+/// lets the host-owned escalation seam re-stamp a resolved route's reasoning
+/// policy for one leg without disturbing the destination's own declaration.
+#[derive(Clone)]
 pub struct Route {
     algorithm: Arc<dyn Algorithm>,
     // Resolves each offloaded call to the client configured for the target the algorithm
@@ -118,6 +126,21 @@ pub struct Route {
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
     models: Arc<RuntimeModels>,
+    /// Route-authoritative reasoning intent, when the config declares one.
+    /// Abstract: it carries no provider syntax. Each target's dialect
+    /// expresses it on the wire.
+    reasoning_policy: Option<ReasoningPolicy>,
+    /// The policy an escalated leg must run under, when declared.
+    escalation_reasoning_policy: Option<ReasoningPolicy>,
+    /// The escalation destination route id, when declared. Carried, not fired:
+    /// firing is the host's decision, and only after this route's own chain is
+    /// exhausted (or, for context pressure, before it starts).
+    escalation: Option<ModelId>,
+    /// Context-pressure escalation threshold in estimated input tokens.
+    ///
+    /// This is a TRIGGER, not a cap: a request whose estimated input already
+    /// exceeds it escalates before this route's candidates run at all.
+    escalation_max_input_tokens: Option<u64>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -148,12 +171,80 @@ impl Route {
             responses_auxiliary_target,
             decision_targets,
             models: Arc::new(models),
+            reasoning_policy: None,
+            escalation_reasoning_policy: None,
+            escalation: None,
+            escalation_max_input_tokens: None,
+        }
+    }
+
+    /// Declares this route's exact reasoning intent.
+    pub fn with_reasoning_policy(mut self, policy: Option<ReasoningPolicy>) -> Self {
+        self.reasoning_policy = policy;
+        self
+    }
+
+    /// Declares the policy an escalated leg must run under.
+    pub fn with_escalation_reasoning_policy(mut self, policy: Option<ReasoningPolicy>) -> Self {
+        self.escalation_reasoning_policy = policy;
+        self
+    }
+
+    /// Declares this route's escalation destination and pre-execution threshold.
+    ///
+    /// Both are carried, never fired here: the host decides when a primary leg
+    /// escalates, and a destination that could itself escalate is refused at
+    /// configuration load.
+    pub fn with_escalation(
+        mut self,
+        destination: Option<ModelId>,
+        max_input_tokens: Option<u64>,
+    ) -> Self {
+        self.escalation = destination;
+        self.escalation_max_input_tokens = max_input_tokens;
+        self
+    }
+
+    /// This route's declared reasoning intent, if any. Absent means the route
+    /// carries no policy and caller/target pins decide, exactly as before.
+    pub fn reasoning_policy(&self) -> Option<ReasoningPolicy> {
+        self.reasoning_policy
+    }
+
+    /// The policy an escalated leg must run under, given this route.
+    ///
+    /// Three-rung precedence, pure and side-effect free:
+    /// 1. an explicit `escalation_reasoning_policy`;
+    /// 2. otherwise a caller that declared `none` stays `none` - a non-thinking
+    ///    route must never silently become thinking at the seam, and `none` is
+    ///    representable in every dialect;
+    /// 3. otherwise `None` - the DESTINATION's own declaration governs.
+    ///
+    /// F8 owns the transition itself: nothing here decides when escalation
+    /// happens, fires it, or chooses its target.
+    pub fn escalated_reasoning_policy(&self) -> Option<ReasoningPolicy> {
+        match self.escalation_reasoning_policy {
+            Some(policy) => Some(policy),
+            None => match self.reasoning_policy {
+                Some(ReasoningPolicy::None) => Some(ReasoningPolicy::None),
+                _ => None,
+            },
         }
     }
 
     /// Returns the configured libsy algorithm name.
     pub fn algorithm_name(&self) -> &str {
         self.algorithm.name()
+    }
+
+    /// The escalation destination route id, when this route declares one.
+    pub fn escalation(&self) -> Option<&ModelId> {
+        self.escalation.as_ref()
+    }
+
+    /// The context-pressure escalation threshold, when this route declares one.
+    pub fn escalation_max_input_tokens(&self) -> Option<u64> {
+        self.escalation_max_input_tokens
     }
 
     /// Returns model-list capability metadata.
@@ -192,9 +283,15 @@ impl Route {
     /// Executes the configured route without consuming or proxying streamed responses.
     pub async fn execute(
         &self,
-        request: Request,
+        mut request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
+        // Route-authoritative reasoning policy is stamped here, at the single
+        // entry every completion/decision path crosses. Internal algorithm calls
+        // (classifier/judge/advisor) are built fresh downstream and never see it.
+        if let Some(policy) = self.reasoning_policy {
+            request.route_reasoning_policy = Some(policy);
+        }
         let (selected_model, response) = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
@@ -210,7 +307,10 @@ impl Route {
     }
 
     /// Completes routing-time calls without serving a post-routing completion.
-    pub async fn decide(&self, request: Request) -> Result<RoutingOutcome, RunnerError> {
+    pub async fn decide(&self, mut request: Request) -> Result<RoutingOutcome, RunnerError> {
+        if let Some(policy) = self.reasoning_policy {
+            request.route_reasoning_policy = Some(policy);
+        }
         switchyard_llm_client::decide(
             Arc::clone(&self.algorithm),
             self.clients.clone(),

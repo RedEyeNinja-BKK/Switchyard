@@ -171,9 +171,14 @@ impl FormatCodec for OpenAiResponsesCodec {
         request: &LlmRequest,
         _policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
-        if let Some(body) =
+        if let Some(mut body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiResponses, _policy)
         {
+            // Strict Responses backends reject `system`-role input items ("System
+            // messages are not allowed"); they require `developer`. The preserved
+            // body replays verbatim otherwise, so normalize only that wire-illegal
+            // role here to keep exact-request passthrough wire-legal.
+            normalize_system_input_roles(&mut body);
             return Ok(EncodedRequest {
                 body,
                 diagnostics: Vec::new(),
@@ -1248,14 +1253,11 @@ fn encode_responses_input(
     // custom outputs. A tool result is typed by the call it answers, and Responses history
     // always lists the call before its output, so recording ids as calls are encoded is enough
     // to type the outputs that follow.
-    if messages.len() == 1
-        && matches!(messages[0].role, Role::User)
-        && messages[0].content.len() == 1
-        && matches!(messages[0].content[0], ContentBlock::Text { .. })
-        && let ContentBlock::Text { text } = &messages[0].content[0]
-    {
-        return Ok(Value::String(text.clone()));
-    }
+    // There is deliberately NO single-user-text fast path here. A scalar string `input` is
+    // rejected by strict Responses backends, and a hand-rolled list replacement would emit a
+    // different item shape than the loop below (which carries `type: "message"`). Letting the
+    // general loop encode every turn keeps one canonical item shape. Temporary local carry of
+    // the #619 contract — see the carry ledger.
     let mut encoded = Vec::new();
     // Some upstream translators (Kimi K3) resolve a tool output by an explicit
     // `name`, so pair every output with the name of the call it answers.
@@ -1314,8 +1316,12 @@ fn encode_responses_input(
                     policy,
                 )? {
                     if !visible_content.is_empty() {
-                        let content =
-                            encode_responses_content(&visible_content, diagnostics, policy)?;
+                        let content = encode_responses_content(
+                            &visible_content,
+                            message.role,
+                            diagnostics,
+                            policy,
+                        )?;
                         encoded.push(json!({
                             "type": "message",
                             "role": role_to_responses(message.role),
@@ -1329,7 +1335,8 @@ fn encode_responses_input(
                 }
             }
             if !visible_content.is_empty() {
-                let content = encode_responses_content(&visible_content, diagnostics, policy)?;
+                let content =
+                    encode_responses_content(&visible_content, message.role, diagnostics, policy)?;
                 encoded.push(json!({
                     "type": "message",
                     "role": role_to_responses(message.role),
@@ -1360,7 +1367,8 @@ fn encode_responses_input(
             }
         }
         if !visible_content.is_empty() || (!emitted_special && !omitted_reasoning) {
-            let content = encode_responses_content(&visible_content, diagnostics, policy)?;
+            let content =
+                encode_responses_content(&visible_content, message.role, diagnostics, policy)?;
             encoded.push(json!({
                 "type": "message",
                 "role": role_to_responses(message.role),
@@ -1538,21 +1546,62 @@ fn encode_responses_reasoning_input(text: &str, details: &[Value]) -> Option<Val
 }
 
 // Maps normalized roles back to Responses role strings.
+//
+// Instruction roles both encode as `developer`. Strict Responses backends reject
+// `system`-role input items, and `developer` is the instruction role every Responses
+// implementation accepts; emitting `system` on the GENERATED path produces a request the
+// strict end of this ecosystem refuses. This is a temporary local carry of the #619
+// semantic contract (upstream PR #619 is still open/unmerged) — see the carry ledger.
 fn role_to_responses(role: Role) -> &'static str {
     match role {
         Role::Assistant => "assistant",
-        Role::System => "system",
-        Role::Developer => "developer",
+        // `developer`, not `system`: the strict-backend instruction role.
+        Role::System | Role::Developer => "developer",
         Role::User | Role::Tool => "user",
+    }
+}
+
+// Rewrites `system`-role items in a raw Responses `input` array to `developer`.
+// Strict Responses backends (chatgpt.com Codex endpoint) reject `system`-role
+// input items ("System messages are not allowed"); they require `developer`.
+// Handles both typed items ({"type":"message","role":"system"}) and untyped
+// role-keyed items.
+fn normalize_system_input_roles(body: &mut Value) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input.iter_mut() {
+        if item.get("role").and_then(Value::as_str) == Some("system")
+            && let Some(obj) = item.as_object_mut()
+        {
+            obj.insert("role".to_string(), Value::String("developer".to_string()));
+        }
     }
 }
 
 // Encodes normalized content into Responses message content.
 fn encode_responses_content(
     content: &[ContentBlock],
+    role: Role,
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
 ) -> Result<Value> {
+    // Strict ChatGPT-Codex Responses backends reject assistant input items whose
+    // content is a bare string or uses `input_text` (only 'output_text' and
+    // 'refusal' are supported there): assistant history must be carried as
+    // `output_text` blocks. This is a destination-PROFILE behavior, never a
+    // format-level one — a normal `/v1/responses` endpoint is standards-
+    // compliant and keeps the input-oriented encoding unchanged.
+    let assistant_strict = matches!(role, Role::Assistant)
+        && matches!(
+            policy.responses_profile,
+            crate::policy::ResponsesProfile::StrictCodex
+        );
+    let text_type = if assistant_strict {
+        "output_text"
+    } else {
+        "input_text"
+    };
     let has_non_text = content.iter().any(|block| {
         !matches!(
             block,
@@ -1562,12 +1611,53 @@ fn encode_responses_content(
         )
     });
     if !has_non_text {
-        return Ok(Value::String(text_from_blocks(content, "\n")));
+        let text = text_from_blocks(content, "\n");
+        return Ok(if assistant_strict {
+            json!([{ "type": "output_text", "text": text }])
+        } else {
+            Value::String(text)
+        });
     }
     let mut blocks = Vec::new();
     for block in content {
+        // Strict-Codex assistant items accept only output_text/refusal content.
+        // Non-text blocks in assistant history are deliberately degraded to
+        // textual output_text (lossy, diagnostic recorded) instead of emitting
+        // input-oriented block types that would be rejected upstream. Normal-
+        // profile items — and every non-assistant item — keep the input_* shapes.
+        if assistant_strict
+            && !matches!(
+                block,
+                ContentBlock::Text { .. }
+                    | ContentBlock::Refusal { .. }
+                    | ContentBlock::Reasoning { .. }
+                    | ContentBlock::ToolCall(_)
+                    | ContentBlock::ToolResult(_)
+            )
+        {
+            push_lossy(
+                diagnostics,
+                policy,
+                "assistant multimodal content degraded to output_text for strict Responses profile",
+            )?;
+            let raw: Value = match block {
+                ContentBlock::Image { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::Audio { source } | ContentBlock::Video { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::File { source } => {
+                    serde_json::to_value(source).unwrap_or(Value::Null)
+                }
+                ContentBlock::Unknown { raw, .. } => raw.clone(),
+                _ => unreachable!("filtered above"),
+            };
+            blocks.push(json!({"type": "output_text", "text": json_string(&raw)}));
+            continue;
+        }
         match block {
-            ContentBlock::Text { text } => blocks.push(json!({"type": "input_text", "text": text})),
+            ContentBlock::Text { text } => blocks.push(json!({"type": text_type, "text": text})),
             ContentBlock::Refusal { text } => {
                 blocks.push(json!({"type": "refusal", "refusal": text}));
             }
@@ -1640,7 +1730,7 @@ fn encode_responses_tool_output(
     if text_only {
         return Ok(Value::String(text_from_blocks(content, " ")));
     }
-    encode_responses_content(content, diagnostics, policy)
+    encode_responses_content(content, Role::User, diagnostics, policy)
 }
 
 fn responses_image_part(source: &ImageSource) -> Option<Value> {

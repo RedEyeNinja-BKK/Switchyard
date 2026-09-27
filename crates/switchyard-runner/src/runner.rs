@@ -5,12 +5,15 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use libsy::RoutingOutcome;
+use libsy::{FleetSnapshot, RoutingOutcome, SharedFleetState};
 use serde_json::Value;
 use switchyard_protocol::{ModelId, WireFormat};
 
+use crate::capability::{CapabilityClientConfig, CapabilityRouteConfig};
 use crate::config;
+use crate::facts_config::FleetReadinessConfig;
 use crate::{ModelCapabilities, Route, RunnerError};
 
 /// Immutable named route table.
@@ -18,6 +21,15 @@ pub struct Runner {
     routes: Vec<(ModelId, Route)>,
     fallback_base_url: Option<String>,
     provider_api_keys: Vec<String>,
+    capability_clients: BTreeMap<String, CapabilityClientConfig>,
+    capabilities: BTreeMap<String, CapabilityRouteConfig>,
+    fleet_readiness: Option<FleetReadinessConfig>,
+    /// The deployment-wide fleet readiness handle, when any fleet route exists.
+    ///
+    /// This is the seam a host-owned readiness monitor publishes through: it
+    /// replaces the whole snapshot atomically, and every fleet route reads
+    /// exactly one immutable generation per decision.
+    fleet_state: Option<Arc<SharedFleetState>>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -63,6 +75,10 @@ impl Runner {
             routes,
             fallback_base_url: None,
             provider_api_keys: Vec::new(),
+            capability_clients: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
+            fleet_readiness: None,
+            fleet_state: None,
         }
     }
 
@@ -81,6 +97,74 @@ impl Runner {
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
         self.fallback_base_url = fallback_base_url;
         self
+    }
+
+    /// Registers the parsed fleet-readiness monitor declaration.
+    ///
+    /// This is the *declaration* only. A host that constructs the monitor
+    /// publishes readiness observations through its own producer; until then
+    /// every governed candidate stays fail-closed.
+    pub fn with_fleet_readiness(mut self, fleet_readiness: Option<FleetReadinessConfig>) -> Self {
+        self.fleet_readiness = fleet_readiness;
+        self
+    }
+
+    /// The parsed `[fleet_readiness]` monitor declaration, when present.
+    pub fn fleet_readiness(&self) -> Option<&FleetReadinessConfig> {
+        self.fleet_readiness.as_ref()
+    }
+
+    /// Attaches the deployment-wide fleet readiness handle.
+    pub fn with_fleet_state(mut self, fleet_state: Option<Arc<SharedFleetState>>) -> Self {
+        self.fleet_state = fleet_state;
+        self
+    }
+
+    /// The deployment-wide fleet readiness handle, when any fleet route exists.
+    ///
+    /// A host readiness monitor calls [`SharedFleetState::set`] on this to
+    /// publish a new generation. A deployment with no `fleet_router` route has
+    /// no handle, and therefore nothing that would read the result.
+    pub fn fleet_state(&self) -> Option<&Arc<SharedFleetState>> {
+        self.fleet_state.as_ref()
+    }
+
+    /// Replaces the deployment-wide fleet readiness snapshot.
+    ///
+    /// Refuses a deployment with no fleet route rather than inventing a
+    /// receiver, because nothing would read the result.
+    pub fn set_fleet_snapshot(&self, snapshot: FleetSnapshot) -> Result<(), String> {
+        match self.fleet_state.as_ref() {
+            Some(state) => {
+                state.set(snapshot);
+                Ok(())
+            }
+            None => Err("deployment declares no fleet_router route".to_string()),
+        }
+    }
+
+    /// Registers the parsed capability executor and route declarations.
+    ///
+    /// These describe typed non-LLM utility endpoints. They are served by the
+    /// host, not by the named route table, and take no part in model routing.
+    pub fn with_capabilities(
+        mut self,
+        capability_clients: BTreeMap<String, CapabilityClientConfig>,
+        capabilities: BTreeMap<String, CapabilityRouteConfig>,
+    ) -> Self {
+        self.capability_clients = capability_clients;
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// The parsed `[capability_clients.*]` executor declarations.
+    pub fn capability_clients(&self) -> &BTreeMap<String, CapabilityClientConfig> {
+        &self.capability_clients
+    }
+
+    /// The parsed `[capabilities.*]` route declarations.
+    pub fn capabilities(&self) -> &BTreeMap<String, CapabilityRouteConfig> {
+        &self.capabilities
     }
 
     /// Returns the route registered for a model.

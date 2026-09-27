@@ -132,6 +132,9 @@ impl SwitchyardRuntime {
             llm_request,
             raw_request: Some(request.content),
             metadata: Some(metadata),
+            // A relayed caller's body cannot carry a route reasoning policy; the
+            // route stamps it at execution entry if one governs this path.
+            ..Request::default()
         })
     }
 

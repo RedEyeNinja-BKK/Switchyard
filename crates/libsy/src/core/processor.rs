@@ -85,6 +85,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
             metadata: None,
+            ..Default::default()
         }
     }
 

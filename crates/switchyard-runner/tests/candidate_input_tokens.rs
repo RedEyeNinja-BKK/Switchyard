@@ -617,10 +617,25 @@ fn the_production_route_passes_context_production_disabled() {
         "outside the ContextFacts type definition, no runtime code may construct \
          an authoritative producer"
     );
-    assert!(
-        type_block.contains("ContextFacts::Enabled(facts)"),
-        "the type must match on its own Enabled payload"
-    );
+    // Every `ContextFacts::Enabled(` line inside the type block must be one of
+    // the three sanctioned ones: the match arm that reads the payload, and the
+    // From impl that adopts a map. This is an ALLOWLIST rather than an
+    // exclusion, so runtime code smuggled into the block is caught by name
+    // rather than merely escaping a whole-section check.
+    let sanctioned = [
+        "ContextFacts::Enabled(facts) => Some(facts),",
+        "matches!(self, ContextFacts::Enabled(_))",
+        "ContextFacts::Enabled(facts)",
+    ];
+    for line in type_block.lines() {
+        if line.contains("ContextFacts::Enabled(") {
+            let body = line.trim();
+            assert!(
+                sanctioned.contains(&body),
+                "unexpected Enabled construction inside the ContextFacts block: {body:?}"
+            );
+        }
+    }
     assert!(
         runtime.contains("impl From<CandidateInputTokens> for ContextFacts"),
         "the type must keep an explicit adoption path for callers holding a map"

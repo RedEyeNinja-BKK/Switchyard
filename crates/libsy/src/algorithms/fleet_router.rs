@@ -147,7 +147,7 @@ impl FleetRouter {
     pub fn decide(
         &self,
         request: &Request,
-        facts: &CandidateInputTokens,
+        facts: &ContextFacts,
     ) -> Result<(ModelId, Vec<ModelId>)> {
         // ONE snapshot for the whole decision. Read before the loop and never
         // again, so every surviving candidate was judged against the same
@@ -276,7 +276,12 @@ impl Algorithm for FleetRouter {
     /// walker in `llm-client`; no candidate attempt re-runs this or re-reads
     /// readiness.
     async fn route(self: Arc<Self>, _driver: Driver, request: Request) -> Result<RoutingOutcome> {
-        let (selected, fallbacks) = self.decide(&request, &CandidateInputTokens::new())?;
+        // R40-B DORMANCY: no context-fact producer is wired on this path, so
+        // context admission is not an active filter. The row-40 CONTRACT still
+        // exists (candidates may declare `usable_context_tokens`); only the
+        // PRODUCER is absent, and its absence must not reject bounded
+        // candidates. Activating a producer is separate work.
+        let (selected, fallbacks) = self.decide(&request, &ContextFacts::Disabled)?;
         tracing::debug!(
             algorithm = "fleet_router",
             selected = %selected,
@@ -770,6 +775,56 @@ impl std::fmt::Display for ContextIneligibleReason {
 /// never "zero".
 pub type CandidateInputTokens = std::collections::BTreeMap<ModelId, u64>;
 
+/// Whether a context-fact producer is authoritative for this decision, and the
+/// facts it produced when it is.
+///
+/// The row-40 CONTRACT and the row-40 PRODUCER are separate. A deployment may
+/// carry the contract (candidates declare `usable_context_tokens`) with no
+/// producer wired at all - the current production state, R40-B dormancy. In
+/// that state context admission is NOT an active filter: a bounded candidate is
+/// not excluded merely for lacking a fact, because no producer exists that
+/// could have supplied one.
+///
+/// When a producer IS authoritative the admission rule is unchanged and still
+/// fail-closed: a bounded candidate with no fact of its own is excluded.
+///
+/// Activation is therefore carried EXPLICITLY, never inferred from the map's
+/// contents. An empty map under an enabled producer means "the producer ran and
+/// published no fact", which must fail closed; an empty map under a disabled
+/// producer means no producer exists, which must not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ContextFacts {
+    /// No context-fact producer is wired for this route/request. Context
+    /// admission does not participate.
+    #[default]
+    Disabled,
+    /// A producer is authoritative; the inner map holds the facts it published
+    /// (a missing key is a missing fact, never zero).
+    Enabled(CandidateInputTokens),
+}
+
+impl ContextFacts {
+    /// The authoritative fact map, or `None` when no producer is wired.
+    pub fn facts(&self) -> Option<&CandidateInputTokens> {
+        match self {
+            ContextFacts::Disabled => None,
+            ContextFacts::Enabled(facts) => Some(facts),
+        }
+    }
+
+    /// Whether a producer is authoritative for this decision.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, ContextFacts::Enabled(_))
+    }
+}
+
+impl From<CandidateInputTokens> for ContextFacts {
+    /// Adopting a map means a producer was authoritative for it.
+    fn from(facts: CandidateInputTokens) -> Self {
+        ContextFacts::Enabled(facts)
+    }
+}
+
 /// The context standing of one candidate for one request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextVerdict {
@@ -800,10 +855,16 @@ impl ContextVerdict {
 /// * overflow -> excluded, identical to a non-fit.
 pub fn candidate_context_verdict(
     candidate: &FleetCandidate,
-    facts: &CandidateInputTokens,
+    facts: &ContextFacts,
     max_output: Option<u64>,
 ) -> ContextVerdict {
     let Some(capacity) = candidate.usable_context_tokens else {
+        return ContextVerdict::Unmanaged;
+    };
+    // No producer is wired: this admission policy is not participating, so a
+    // bounded candidate is NOT rejected for a fact nobody could produce. This
+    // preserves the pre-row-40 production behaviour for R40-B deployments.
+    let Some(facts) = facts.facts() else {
         return ContextVerdict::Unmanaged;
     };
     let Some(input) = facts.get(&candidate.target) else {
@@ -847,7 +908,7 @@ impl<'a> ContextAdmittedCandidate<'a> {
 /// is ever used as a ranking signal.
 pub fn context_admission_filter<'a>(
     eligible: &[CandidateEligibility<'a>],
-    facts: &CandidateInputTokens,
+    facts: &ContextFacts,
     max_output: Option<u64>,
 ) -> Vec<ContextAdmittedCandidate<'a>> {
     eligible
@@ -1529,7 +1590,7 @@ mod tests {
 
     /// The decision, without driving a model.
     fn decide_over(router: &FleetRouter, request: &Request) -> Result<(ModelId, Vec<ModelId>)> {
-        router.decide(request, &CandidateInputTokens::new())
+        router.decide(request, &ContextFacts::Disabled)
     }
 
     /// One ready candidate serves, and it is the one the ladder head names.
@@ -1774,11 +1835,40 @@ mod tests {
         assert!(fallbacks.is_empty(), "alpha is now excluded, not carried");
     }
 
-    /// Row 40 stays dormant: with no producer, a `Bounded` candidate is excluded
-    /// on a MISSING FACT, and the router selects nothing rather than guessing a
-    /// capacity or activating a producer.
+    /// Row 40 stays dormant: with NO PRODUCER WIRED, context admission is not
+    /// an active filter, so a `Bounded` candidate is admitted on readiness
+    /// alone rather than excluded for a fact nobody could produce.
+    ///
+    /// This is the 0.3.0 cutover defect. The previous expectation here asserted
+    /// the opposite - that a bounded candidate with no producer stays excluded -
+    /// which is exactly what zeroed every bounded production route and returned
+    /// "no immediately-eligible candidate". The row-40 CONTRACT may exist
+    /// without the row-40 PRODUCER; a dormant producer means the admission
+    /// policy is not participating, not that every candidate lacks evidence.
     #[tokio::test]
-    async fn a_bounded_candidate_with_no_producer_stays_excluded() {
+    async fn a_bounded_candidate_with_no_producer_is_admitted() {
+        let candidates = vec![FleetCandidate {
+            target: ModelId::from("bounded"),
+            tool_calling: true,
+            reasoning: true,
+            supports_vision: true,
+            preference_rank: 1,
+            usable_context_tokens: Some(4096),
+        }];
+        let snapshot = FleetSnapshot::new(vec![(ModelId::from("bounded"), CandidateState::ready())])
+            .expect("key");
+        let router =
+            FleetRouter::with_source(candidates, None, None, Arc::new(StaticFleetState::new(snapshot)));
+
+        let (selected, _) = decide_over(&router, &text_req())
+            .expect("a bounded candidate is admitted while the producer is dormant");
+        assert_eq!(selected, ModelId::from("bounded"));
+    }
+
+    /// With a producer AUTHORITATIVE, the same bounded candidate fails closed
+    /// when its fact is missing. Dormancy and fail-closed are distinct.
+    #[tokio::test]
+    async fn a_bounded_candidate_with_an_active_producer_and_no_fact_is_excluded() {
         let candidates = vec![FleetCandidate {
             target: ModelId::from("bounded"),
             tool_calling: true,
@@ -1793,8 +1883,10 @@ mod tests {
             FleetRouter::with_source(candidates, None, None, Arc::new(StaticFleetState::new(snapshot)));
 
         assert!(
-            decide_over(&router, &text_req()).is_err(),
-            "an absent input-token fact must fail closed, never assume a fit"
+            router
+                .decide(&text_req(), &ContextFacts::Enabled(CandidateInputTokens::new()))
+                .is_err(),
+            "an active producer that published no fact must fail closed, never assume a fit"
         );
     }
 

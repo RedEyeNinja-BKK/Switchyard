@@ -1042,17 +1042,23 @@ async fn a_new_readiness_generation_is_visible_to_the_next_decision() -> TestRes
 // 12. R40-B dormancy survives the escalation wiring.
 // ---------------------------------------------------------------------------
 
-/// A BOUNDED candidate with no producer fact must stay excluded. The escalation
-/// path must not have activated a token producer.
+/// The escalation path must not have ACTIVATED a token producer.
+///
+/// With no producer wired, context admission is not an active filter, so a
+/// BOUNDED candidate is admitted on readiness alone and the PRIMARY route
+/// serves the request. That is the corrected row-40 contract: the contract may
+/// exist without the producer, and a dormant producer must not remove every
+/// bounded candidate.
+///
+/// (This test previously asserted the opposite — the bounded primary failing
+/// closed and the destination serving. That assertion encoded the 0.3.0 cutover
+/// defect: it made "every bounded route is excluded" look correct.)
 #[tokio::test]
 async fn row_40_stays_dormant_through_the_escalation_path() -> TestResult {
     let upstream = MockUpstream::start().await?;
     // The primary candidate is genuinely BOUNDED: it declares a usable context
-    // capacity, so row 40 governs it. With the producer unwired, the fact is
-    // absent and the candidate fails closed, so the primary chain cannot serve.
-    //
-    // If F8 had activated a token producer, the bounded candidate would have
-    // been admitted, `good-bounded` would have been contacted, and this changes.
+    // capacity, so row 40's CONTRACT governs it. With the producer unwired the
+    // policy is not participating, so the primary serves.
     let (state, _) = fleet_state(
         &upstream.base_url,
         &[
@@ -1066,17 +1072,14 @@ async fn row_40_stays_dormant_through_the_escalation_path() -> TestResult {
 
     let (status, body) = post_chat(&app, "primary", "hello").await?;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    // The claim under test is NOT that the request fails. A bounded primary with
-    // no producer fact yields the terminal no-eligible class, which is a
-    // documented escalation trigger, so the destination legitimately serves.
-    //
-    // The claim is that the BOUNDED candidate was never admitted: had a token
-    // producer been activated, `good-bounded` would appear in the served list.
+    // The claim under test is that NO producer was activated. If a token
+    // producer had been wired, the bounded candidate would have been judged on
+    // a fact and this ladder would differ; instead the primary serves directly.
     assert_eq!(
         upstream.served_models().await,
-        vec!["good-destination".to_string()],
-        "the bounded primary candidate must fail closed and be skipped entirely: it may \
-         neither be contacted nor appear anywhere in the ladder"
+        vec!["good-bounded".to_string()],
+        "a bounded candidate must be admitted while the producer is dormant: the \
+         escalation path must not have activated one"
     );
     Ok(())
 }

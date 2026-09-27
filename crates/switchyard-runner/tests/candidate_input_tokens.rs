@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 
 use libsy::{
-    CandidateEligibility, CandidateInputTokens, ContextIneligibleReason, ContextVerdict,
+    CandidateEligibility, CandidateInputTokens, ContextFacts, ContextIneligibleReason, ContextVerdict,
     FleetCandidate, candidate_context_verdict, context_admission_filter, record_input_token_fact,
     request_output_budget,
 };
@@ -42,12 +42,21 @@ fn candidate(target: &str, capacity: Option<u64>) -> FleetCandidate {
     }
 }
 
-fn facts(entries: &[(&str, u64)]) -> CandidateInputTokens {
+/// Facts from an AUTHORITATIVE producer: the admission rule is active and
+/// fail-closed. Every pre-existing assertion in this file is a producer-active
+/// case, so this helper carries the activation bit explicitly.
+fn facts(entries: &[(&str, u64)]) -> ContextFacts {
     let mut map = CandidateInputTokens::new();
     for (target, count) in entries {
         record_input_token_fact(&mut map, &model(target), *count);
     }
-    map
+    ContextFacts::Enabled(map)
+}
+
+/// An active producer that published NO fact (it ran, but measured nothing).
+/// Distinct from [`ContextFacts::Disabled`], which means no producer exists.
+fn enabled_empty() -> ContextFacts {
+    ContextFacts::Enabled(CandidateInputTokens::new())
 }
 
 fn eligible(candidates: &[FleetCandidate]) -> Vec<CandidateEligibility<'_>> {
@@ -65,7 +74,7 @@ fn eligible(candidates: &[FleetCandidate]) -> Vec<CandidateEligibility<'_>> {
 fn an_undeclared_capacity_is_unmanaged_and_always_admitted() {
     let c = candidate("m/a", None);
     assert_eq!(
-        candidate_context_verdict(&c, &CandidateInputTokens::new(), None),
+        candidate_context_verdict(&c, &enabled_empty(), None),
         ContextVerdict::Unmanaged,
         "a candidate with no declared capacity asserts nothing to enforce"
     );
@@ -81,7 +90,7 @@ fn an_undeclared_capacity_is_unmanaged_and_always_admitted() {
 fn a_declared_capacity_with_no_fact_is_excluded() {
     let c = candidate("m/a", Some(1000));
     assert_eq!(
-        candidate_context_verdict(&c, &CandidateInputTokens::new(), Some(100)),
+        candidate_context_verdict(&c, &enabled_empty(), Some(100)),
         ContextVerdict::Ineligible(ContextIneligibleReason::NoInputTokenFact),
         "an unknown input count cannot be treated as zero or as fitting"
     );
@@ -289,9 +298,13 @@ fn facts_are_keyed_per_target_so_alias_targets_can_differ() {
     // Two distinct target names resolving to distinct model ids may legitimately
     // carry different counts; the map is keyed by resolved model id.
     let map = facts(&[("m/one", 10), ("m/two", 20)]);
-    assert_eq!(map.len(), 2);
-    assert_eq!(map.get(&model("m/one")), Some(&10));
-    assert_eq!(map.get(&model("m/two")), Some(&20));
+    let published = map
+        .facts()
+        .expect("an active producer carries the published fact map");
+    assert_eq!(published.len(), 2);
+    assert_eq!(published.get(&model("m/one")), Some(&10));
+    assert_eq!(published.get(&model("m/two")), Some(&20));
+    assert!(map.is_enabled());
 }
 
 #[test]
@@ -433,4 +446,199 @@ candidates = [
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ACTIVATION-STATE CONTRACT (the 0.3.0 cutover defect).
+//
+// The row-40 contract (candidates declare `usable_context_tokens`) and the
+// row-40 PRODUCER (per-candidate input-token facts) are separate. With no
+// producer wired, context admission must NOT participate; with one
+// authoritative, the rule stays fail-closed. Activation is explicit and is
+// NEVER inferred from the map's contents.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_disabled_producer_leaves_a_bounded_candidate_admitted() {
+    // THE REGRESSION: this state zeroed every bounded production route and
+    // returned "no immediately-eligible candidate".
+    let c = candidate("m/a", Some(1000));
+    let verdict = candidate_context_verdict(&c, &ContextFacts::Disabled, Some(100));
+    assert_eq!(
+        verdict,
+        ContextVerdict::Unmanaged,
+        "with no producer wired, admission does not participate and a bounded \
+         candidate must not be rejected for a fact nobody could produce"
+    );
+    assert!(verdict.is_admitted());
+}
+
+#[test]
+fn a_disabled_producer_admits_through_the_real_filter() {
+    let c = candidate("m/a", Some(1000));
+    let admitted = context_admission_filter(
+        &eligible(std::slice::from_ref(&c)),
+        &ContextFacts::Disabled,
+        Some(100),
+    );
+    assert_eq!(admitted.len(), 1, "the filter must not drop the candidate");
+    assert!(admitted[0].is_admitted());
+}
+
+#[test]
+fn an_enabled_producer_still_fails_closed_on_a_missing_fact() {
+    let c = candidate("m/a", Some(1000));
+    let verdict = candidate_context_verdict(&c, &enabled_empty(), Some(100));
+    assert_eq!(
+        verdict,
+        ContextVerdict::Ineligible(ContextIneligibleReason::NoInputTokenFact),
+        "an enabled producer that published nothing must fail closed, not open"
+    );
+    assert!(!verdict.is_admitted());
+}
+
+#[test]
+fn an_empty_map_is_not_an_activation_signal() {
+    // The two states carry byte-identical maps and must still differ.
+    let c = candidate("m/a", Some(1000));
+    let disabled = candidate_context_verdict(&c, &ContextFacts::Disabled, Some(100));
+    let enabled = candidate_context_verdict(&c, &enabled_empty(), Some(100));
+    assert_eq!(disabled, ContextVerdict::Unmanaged);
+    assert_eq!(
+        enabled,
+        ContextVerdict::Ineligible(ContextIneligibleReason::NoInputTokenFact)
+    );
+    assert_ne!(
+        disabled, enabled,
+        "an empty fact map must never be read as the activation bit"
+    );
+}
+
+#[test]
+fn enabled_admits_below_and_at_the_bound_and_excludes_one_over() {
+    let c = candidate("m/a", Some(1000));
+    assert_eq!(
+        candidate_context_verdict(&c, &facts(&[("m/a", 500)]), Some(100)),
+        ContextVerdict::Fits
+    );
+    assert_eq!(
+        candidate_context_verdict(&c, &facts(&[("m/a", 900)]), Some(100)),
+        ContextVerdict::Fits,
+        "exact equality with the bound is a fit, not an overflow"
+    );
+    assert_eq!(
+        candidate_context_verdict(&c, &facts(&[("m/a", 901)]), Some(100)),
+        ContextVerdict::Ineligible(ContextIneligibleReason::DoesNotFit),
+        "one token over the bound must be excluded"
+    );
+}
+
+#[test]
+fn a_collected_failure_is_excluded_not_treated_as_absent_evidence() {
+    // The producer ran; it simply published no count for this candidate.
+    let c = candidate("m/a", Some(1000));
+    let verdict = candidate_context_verdict(
+        &c,
+        &facts(&[("m/other", 42)]),
+        Some(100),
+    );
+    assert_eq!(
+        verdict,
+        ContextVerdict::Ineligible(ContextIneligibleReason::NoInputTokenFact),
+        "another target's fact is not this candidate's fact"
+    );
+}
+
+#[test]
+fn an_unbounded_candidate_is_unaffected_in_both_states() {
+    let c = candidate("m/a", None);
+    assert_eq!(
+        candidate_context_verdict(&c, &ContextFacts::Disabled, Some(u64::MAX)),
+        ContextVerdict::Unmanaged
+    );
+    assert_eq!(
+        candidate_context_verdict(&c, &enabled_empty(), Some(u64::MAX)),
+        ContextVerdict::Unmanaged
+    );
+    assert_eq!(
+        candidate_context_verdict(&c, &facts(&[("m/a", u64::MAX)]), Some(u64::MAX)),
+        ContextVerdict::Unmanaged,
+        "no declared capacity asserts nothing to enforce in any producer state"
+    );
+}
+
+#[test]
+fn the_default_activation_state_is_disabled() {
+    assert_eq!(ContextFacts::default(), ContextFacts::Disabled);
+    assert!(!ContextFacts::default().is_enabled());
+    assert!(ContextFacts::default().facts().is_none());
+}
+
+
+/// R40-B DORMANCY, asserted positively over the real production source.
+///
+/// The row-40 CONTRACT may exist (candidates declare a capacity) while the
+/// row-40 PRODUCER is absent. This asserts the production decision path
+/// activates context production explicitly as Disabled, and that nothing at
+/// runtime constructs an authoritative producer - so activating the producer
+/// remains separate, deliberate work.
+#[test]
+fn the_production_route_passes_context_production_disabled() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../libsy/src/algorithms/fleet_router.rs"),
+    )
+    .expect("the routing source must be readable");
+    assert!(
+        source.contains("self.decide(&request, &ContextFacts::Disabled)"),
+        "the production route must decide with context production explicitly Disabled"
+    );
+    // No runtime construction of an authoritative producer. The production
+    // decision path is the `Algorithm::route` body; nothing between the file's
+    // start and the `#[cfg(test)]` module may build an Enabled producer.
+    // Everything before the test module is runtime code. The ONLY places a
+    // runtime `ContextFacts::Enabled(` may appear are the type's own match arms
+    // and its From impl, which both live between the `ContextFacts` enum
+    // declaration and the context-verdict section.
+    let (runtime, test_module) = source
+        .split_once("#[cfg(test)]")
+        .expect("the routing source has a test module");
+    let type_start = runtime
+        .find("pub enum ContextFacts")
+        .expect("the ContextFacts type must exist");
+    let type_end = runtime
+        .find("/// The context standing of one candidate")
+        .expect("the context-verdict section must follow the type");
+    assert!(type_start < type_end, "the type must precede the verdict section");
+    let (before_type, type_block, after_type) =
+        (&runtime[..type_start], &runtime[type_start..type_end], &runtime[type_end..]);
+    assert!(
+        !before_type.contains("ContextFacts::Enabled(")
+            && !after_type.contains("ContextFacts::Enabled("),
+        "outside the ContextFacts type definition, no runtime code may construct \
+         an authoritative producer"
+    );
+    assert!(
+        type_block.contains("ContextFacts::Enabled(facts)"),
+        "the type must match on its own Enabled payload"
+    );
+    assert!(
+        runtime.contains("impl From<CandidateInputTokens> for ContextFacts"),
+        "the type must keep an explicit adoption path for callers holding a map"
+    );
+    // And the production decision really does say Disabled, somewhere in the
+    // runtime section (it precedes the type definition in this file).
+    assert!(
+        runtime.contains("self.decide(&request, &ContextFacts::Disabled)?"),
+        "the production route must decide with context production Disabled"
+    );
+    // The active-producer fail-closed case IS exercised, inside the test module.
+    assert!(
+        test_module.contains("ContextFacts::Enabled(CandidateInputTokens::new())"),
+        "the producer-active fail-closed case must remain covered by tests"
+    );
+    // The producer seam still exists and is still uncalled outside tests.
+    assert!(
+        source.contains("pub fn record_input_token_fact"),
+        "the row-40 producer seam must remain available for separate activation"
+    );
 }

@@ -31,8 +31,8 @@ use axum::Router;
 use axum::routing::get;
 use http_body_util::BodyExt;
 use libsy::{
-    CandidateEligibility, CandidateInputTokens, CandidateState, EligibilityFacts, FleetCandidate,
-    FleetRouter, FleetSnapshot, FleetStateSource, ReadinessVerdict,
+    CandidateEligibility, CandidateInputTokens, CandidateState, ContextFacts, EligibilityFacts,
+    FleetCandidate, FleetRouter, FleetSnapshot, FleetStateSource, ReadinessVerdict,
     candidate_is_statically_eligible, candidate_readiness, ready_candidates,
 };
 use switchyard_protocol::{ModelId, Request, text_request};
@@ -400,7 +400,7 @@ async fn an_existing_fleet_router_decides_against_the_published_generation() {
     // PROOF 2 restated at the router: with NOTHING observed, the decision
     // fails closed with an explicit no-eligible-candidate error. It must not
     // silently pick a rung, and in particular must not guess ready.
-    let before = router.decide(&text_req(), &CandidateInputTokens::new());
+    let before = router.decide(&text_req(), &ContextFacts::Disabled);
     let message = match &before {
         Ok(_) => panic!("an entirely unobserved fleet must NOT produce a decision"),
         Err(error) => error.to_string(),
@@ -415,7 +415,7 @@ async fn an_existing_fleet_router_decides_against_the_published_generation() {
 
     // The SAME router now decides, and the published local target is selected.
     let (after_selected, _) = router
-        .decide(&text_req(), &CandidateInputTokens::new())
+        .decide(&text_req(), &ContextFacts::Disabled)
         .expect("a decision must be possible once a generation is published");
     assert_eq!(
         after_selected.as_str(),

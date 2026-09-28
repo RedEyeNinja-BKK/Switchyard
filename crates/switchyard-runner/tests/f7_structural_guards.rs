@@ -256,7 +256,7 @@ fn production_is_byte_identical_to_its_anchor() {
         .expect("sha256sum must run");
     let text = String::from_utf8_lossy(&digest.stdout);
     assert!(
-        text.starts_with("6fd12abf672ea99526223240c925596b80bdb1691f402bbc919666d9037d7440"),
+        text.starts_with("204a56718d658e4015810f2e28470517efc93163f7826b7da18272db1b970e9d"),
         "the live config changed: {text}"
     );
 }

@@ -2124,7 +2124,7 @@ async fn decisions_handler(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let question_count = questions.len();
+    let question_ids: Vec<String> = questions.keys().cloned().collect();
     if questions.is_empty() {
         call.outcome("invalid_questions");
         return error_response(
@@ -2175,13 +2175,17 @@ async fn decisions_handler(
                 "\n[{key}] {instructions}\n{criteria}\n"
             ));
             input.push_str(
-                "Reply as JSON: {\"type\": \"noul|choice|score\", \"value\": <number>}\n",
+                "Reply as JSON: {\"<question id>\": {\"type\": \"noul|choice|score\", \"value\": <number>}}\n",
             );
         }
         json!({
             "model": route.client.model(),
             "input": format!("{state_text}\n\nAnswer each question below.{input}"),
             "stream": false,
+            // The free fallback reasons by default and will spend the whole
+            // output budget on reasoning tokens, never emitting an answer. Cap
+            // reasoning so the decision text is actually produced.
+            "reasoning": {"effort": "low", "max_tokens": 256},
         })
     } else {
         let mut object = serde_json::Map::new();
@@ -2200,7 +2204,7 @@ async fn decisions_handler(
             // decision answers the primary leg returns, so the consumer cannot
             // tell which leg answered.
             let response = if generative {
-                normalize_generative_decisions(&upstream, question_count)
+                normalize_generative_decisions(&upstream, &question_ids)
             } else {
                 upstream
             };
@@ -2231,7 +2235,7 @@ async fn decisions_handler(
 ///
 /// The generative model is asked for JSON; anything it fails to produce as JSON
 /// is reported honestly as an `unparsed` answer rather than being invented.
-fn normalize_generative_decisions(upstream: &Value, expected: usize) -> Value {
+fn normalize_generative_decisions(upstream: &Value, question_ids: &[String]) -> Value {
     let text = upstream
         .get("output")
         .and_then(Value::as_array)
@@ -2263,14 +2267,39 @@ fn normalize_generative_decisions(upstream: &Value, expected: usize) -> Value {
     });
     match parsed {
         Some(Value::Object(map)) if !map.is_empty() => {
-            for (key, value) in map {
-                answers.insert(key, normalize_one_decision(&value));
+            // Keep the CALLER's question ids as the answer keys: a model that
+            // answers under its own keys must not rename the contract.
+            let known: Vec<&String> = question_ids.iter().collect();
+            let mut used = vec![false; known.len()];
+            for (key, value) in &map {
+                let slot = if let Some(index) = known.iter().position(|id| *id == key) {
+                    Some(index)
+                } else {
+                    known.iter().position(|id| !used[known.iter().position(|u| *u == *id).unwrap()])
+                };
+                match slot {
+                    Some(index) if index < known.len() && !used[index] => {
+                        used[index] = true;
+                        answers.insert(known[index].clone(), normalize_one_decision(value));
+                    }
+                    _ => {
+                        answers.insert(key.clone(), normalize_one_decision(value));
+                    }
+                }
+            }
+            for (index, id) in question_ids.iter().enumerate() {
+                if !used.get(index).copied().unwrap_or(false) && !answers.contains_key(id) {
+                    answers.insert(
+                        id.clone(),
+                        serde_json::json!({"type": "unparsed", "raw": text.trim()}),
+                    );
+                }
             }
         }
         _ => {
-            for index in 0..expected.max(1) {
+            for id in question_ids {
                 answers.insert(
-                    format!("q{}", index + 1),
+                    id.clone(),
                     serde_json::json!({"type": "unparsed", "raw": text.trim()}),
                 );
             }

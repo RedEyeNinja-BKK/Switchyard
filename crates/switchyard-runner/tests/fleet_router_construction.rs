@@ -199,7 +199,7 @@ fn all_26_live_fleet_routes_construct() {
 }
 
 #[test]
-fn all_17_live_passthrough_routes_still_construct_through_the_native_path() {
+fn all_live_passthrough_routes_still_construct_through_the_native_path() {
     let targets = live_targets();
     let mut count = 0;
     for (name, table) in live_routes() {
@@ -217,7 +217,22 @@ fn all_17_live_passthrough_routes_still_construct_through_the_native_path() {
         spec.build(&name, &targets)
             .unwrap_or_else(|error| panic!("passthrough route {name} must build: {error}"));
     }
-    assert_eq!(count, 17, "live deployment declares 17 passthrough routes");
+    // Counted from the config itself, not a pinned literal: the 2026-09-28
+    // operator-authorized realignment added the Qwen3.8-27B free and LFM2.5 free
+    // passthrough routes, and a hardcoded total would turn that authorized
+    // addition into a false failure.
+    let declared: usize = live_routes()
+        .values()
+        .filter(|table| table.get("type").and_then(toml::Value::as_str) == Some("passthrough"))
+        .count();
+    assert!(
+        count > 0,
+        "the live deployment must declare passthrough routes"
+    );
+    assert_eq!(
+        count, declared,
+        "the walk must cover every live passthrough route"
+    );
 }
 
 #[test]

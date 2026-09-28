@@ -156,7 +156,9 @@ fn the_live_dialect_vocabulary_is_unchanged() {
 fn the_live_strip_targets_are_still_exactly_five_and_unchanged() {
     let text = live_text();
     let count = text.matches("strip_reasoning_content = true").count();
-    assert_eq!(count, 5, "the five live strip targets must be unchanged");
+    // 2026-09-28: the operator-authorized realignment added the OpenRouter
+    // Qwen3.8-27B free target, which carries the same strip as its siblings.
+    assert_eq!(count, 6, "the live strip targets must be the five originals plus the Qwen free lane");
 }
 
 #[test]
@@ -254,7 +256,7 @@ fn production_is_byte_identical_to_its_anchor() {
         .expect("sha256sum must run");
     let text = String::from_utf8_lossy(&digest.stdout);
     assert!(
-        text.starts_with("5bfe1df611e70ce3286ab6785d7c94d3a7f9ee0b76b6f2eb1e442f914f1667a8"),
+        text.starts_with("fe185c4b11e20c1a7768f12ff3cfa2d7a55c514a1ade6ed045ccb5907a6ef083"),
         "the live config changed: {text}"
     );
 }

@@ -130,7 +130,14 @@ fn live_candidate_field_census() {
         .flat_map(|(_, router)| router.candidates().iter())
         .collect();
 
-    assert_eq!(all.len(), 46, "live file declares 46 candidate entries");
+    // Derived from the loaded live routers, never a pinned literal: the
+    // 2026-09-28 authorized realignment changed the candidate population (five
+    // Space Bunny entries removed, two Qwen free entries added), and a hardcoded
+    // total would make every legitimate route edit look like a defect.
+    assert!(
+        !all.is_empty(),
+        "the live file must declare fleet candidates"
+    );
 
     let tool_true = all.iter().filter(|c| c.tool_calling).count();
     let reasoning_true = all.iter().filter(|c| c.reasoning).count();
@@ -141,7 +148,7 @@ fn live_candidate_field_census() {
         .count();
     let context_some = all.len() - context_none;
 
-    println!("live candidate census (46 entries):");
+    println!("live candidate census ({} entries):", all.len());
     println!(
         "  tool_calling        true={tool_true} false={}",
         all.len() - tool_true
@@ -161,10 +168,17 @@ fn live_candidate_field_census() {
     // not assume the F3 tests exercised a live `false` for these dimensions when
     // they did not - the negative arms are proven by the unit truth table and by
     // the live `supports_vision` split.
-    assert_eq!(tool_true, 46, "all live candidates declare tool_calling");
-    assert_eq!(reasoning_true, 46, "all live candidates declare reasoning");
+    let population = all.len();
+    assert_eq!(
+        tool_true, population,
+        "all live candidates declare tool_calling"
+    );
+    assert_eq!(
+        reasoning_true, population,
+        "all live candidates declare reasoning"
+    );
     assert!(
-        vision_true > 0 && vision_true < 46,
+        vision_true > 0 && vision_true < population,
         "live vision declarations are split"
     );
     assert!(

@@ -31,6 +31,18 @@ pub enum CapabilityClientFormat {
     OpenAiEmbeddings,
     #[serde(rename = "cohere_jina_rerank")]
     CohereJinaRerank,
+    /// A typed decision surface (`POST /api/alpha/decisions`): the provider
+    /// answers with structured `noul` / `choice` / `score` objects rather than
+    /// generated assistant text. Deliberately NOT a chat/Responses model — a
+    /// decision model must never be declared as one.
+    #[serde(rename = "openrouter_alpha_decisions")]
+    OpenRouterAlphaDecisions,
+    /// The generative half of a typed decision lane: a normal chat/Responses
+    /// model whose generated text is normalized into the SAME decision contract
+    /// by the decision endpoint. It is a real generative model, so it is
+    /// declared as one, but it is only ever reached through that contract.
+    #[serde(rename = "openai_responses_decision_adapter")]
+    OpenAiResponsesDecisionAdapter,
 }
 
 /// Declares one capability executor target (`[capability_clients.<name>]`).
@@ -79,6 +91,17 @@ pub enum CapabilityKind {
         /// Maximum characters for the query.
         max_query_chars: usize,
     },
+    /// A typed decision lane: the provider answers with structured
+    /// `noul` / `choice` / `score` objects over a caller-supplied `state`.
+    Decisions {
+        /// Typed decision-contract identity shared by the primary decision model
+        /// and its generative fallback, e.g. `switchyard-decision:v1`.
+        contract: String,
+        /// Maximum questions admitted in one decision request.
+        max_questions: usize,
+        /// Maximum characters admitted for the `state` under assessment.
+        max_state_chars: usize,
+    },
 }
 
 /// Capability-specific route declaration (`[capabilities.<name>]`).
@@ -115,9 +138,21 @@ impl<'de> Deserialize<'de> for CapabilityRouteConfig {
             top_n: Option<usize>,
             max_doc_chars: Option<usize>,
             max_query_chars: Option<usize>,
+            decision_contract: Option<String>,
+            max_questions: Option<usize>,
+            max_state_chars: Option<usize>,
         }
         let raw = Raw::deserialize(deserializer)?;
-        let kind = if raw.contract.is_some() || raw.dimensions.is_some() {
+        let kind = if raw.decision_contract.is_some() {
+            let contract = raw.decision_contract.ok_or_else(|| {
+                serde::de::Error::custom("decisions capability requires `decision_contract`")
+            })?;
+            CapabilityKind::Decisions {
+                contract,
+                max_questions: raw.max_questions.unwrap_or_else(default_max_questions),
+                max_state_chars: raw.max_state_chars.unwrap_or_else(default_max_state_chars),
+            }
+        } else if raw.contract.is_some() || raw.dimensions.is_some() {
             let contract = raw.contract.ok_or_else(|| {
                 serde::de::Error::custom("embedding capability requires `contract`")
             })?;
@@ -160,6 +195,14 @@ const fn default_max_candidates() -> usize {
 
 const fn default_top_n() -> usize {
     5
+}
+
+const fn default_max_questions() -> usize {
+    16
+}
+
+const fn default_max_state_chars() -> usize {
+    65536
 }
 
 const fn default_max_doc_chars() -> usize {

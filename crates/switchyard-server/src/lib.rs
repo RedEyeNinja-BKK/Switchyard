@@ -701,6 +701,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/responses/compact", post(openai_responses_compact))
         .route("/v1/embeddings", post(embeddings_handler))
         .route("/v1/rerank", post(rerank_handler))
+        .route("/v1/decisions", post(decisions_handler))
         .route("/v1/models", get(models))
         .route("/v1/resource/deepseek", get(get_deepseek_resource))
         .route("/v1/stats", get(get_stats))
@@ -2043,6 +2044,135 @@ fn is_physical_batch_overflow(error: &(impl std::fmt::Display + ?Sized)) -> bool
 /// Cohere/Jina-compatible rerank endpoint. Proxies the typed rerank contract
 /// to the capability executor selected by the `model` route id (e.g.
 /// `localclaw/rerank`); bounds (candidates, top_n) are enforced here.
+/// `POST /v1/decisions` - the typed decision lane.
+///
+/// A decision model is NOT a chat model: it answers with structured
+/// `noul` / `choice` / `score` objects over a caller-supplied `state`, so this
+/// endpoint never synthesises assistant text. Both the primary decision model
+/// and a generative fallback may be declared on this contract; the caller sees
+/// one normalized typed-decision response either way.
+async fn decisions_handler(
+    State(state): State<ServerState>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let body = match llm_json_body(body) {
+        Ok(body) => body,
+        Err((status, message)) => {
+            metrics::record_capability_unresolved("decisions", "invalid_body");
+            return invalid_body_error(status, message);
+        }
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let route_id = ModelId::from(model.as_str());
+    let Some(route) = state.capabilities.get(&route_id).cloned() else {
+        metrics::record_capability_unresolved("decisions", "unknown_model");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown decisions model {model}"),
+            "invalid_request_error",
+            "unknown_model",
+        );
+    };
+    let mut call = metrics::CapabilityCall::start("decisions", route_id.as_str());
+    let CapabilityKind::Decisions {
+        contract,
+        max_questions,
+        max_state_chars,
+    } = &route.kind
+    else {
+        call.outcome("wrong_capability");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{model} is not a decisions capability"),
+            "invalid_request_error",
+            "wrong_capability",
+        );
+    };
+    // The state under assessment is required: a decision model has no prompt.
+    let state_text = match body.get("state") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Object(_)) | Some(Value::Array(_)) => body
+            .get("state")
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    if state_text.trim().is_empty() {
+        call.outcome("invalid_state");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "state must be a non-empty string, object or array",
+            "invalid_request_error",
+            "invalid_state",
+        );
+    }
+    if state_text.chars().count() > *max_state_chars {
+        call.outcome("state_too_long");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("state exceeds max_state_chars {max_state_chars}"),
+            "invalid_request_error",
+            "state_too_long",
+        );
+    }
+    let questions = body
+        .get("questions")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if questions.is_empty() {
+        call.outcome("invalid_questions");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "questions must be a non-empty object of typed decision questions",
+            "invalid_request_error",
+            "invalid_questions",
+        );
+    }
+    if questions.len() > *max_questions {
+        call.outcome("too_many_questions");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("questions exceeds max_questions {max_questions}"),
+            "invalid_request_error",
+            "too_many_questions",
+        );
+    }
+    // Upstream payload: the provider owns its own question vocabulary, so the
+    // caller's typed questions are forwarded verbatim and the decision surface
+    // is the executor's, never a chat completion.
+    let mut payload = serde_json::Map::new();
+    payload.insert("state".to_string(), Value::String(state_text));
+    payload.insert("questions".to_string(), Value::Object(questions));
+    match route.client.call(Value::Object(payload)).await {
+        Ok(upstream) => {
+            call.outcome("ok");
+            let mut response = upstream;
+            if let Some(object) = response.as_object_mut() {
+                object.insert(
+                    "contract".to_string(),
+                    Value::String(contract.clone()),
+                );
+                object.insert("served_model".to_string(), Value::String(route_id.to_string()));
+            }
+            Json(response).into_response()
+        }
+        Err(error) => {
+            call.outcome("upstream_error");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+                "server_error",
+                "upstream_error",
+            )
+        }
+    }
+}
+
 async fn rerank_handler(
     State(state): State<ServerState>,
     body: std::result::Result<Json<Value>, JsonRejection>,

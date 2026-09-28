@@ -76,6 +76,22 @@ impl CapabilityClient {
                     config.base_url.as_str().trim_end_matches('/')
                 )
             }
+            // The decision surface is NOT a chat endpoint: the base URL names
+            // the API root and this appends the typed-decisions path.
+            switchyard_runner::CapabilityClientFormat::OpenRouterAlphaDecisions => {
+                format!(
+                    "{}/api/alpha/decisions",
+                    config.base_url.as_str().trim_end_matches('/')
+                )
+            }
+            // The generative fallback leg IS a normal chat endpoint; the
+            // decision endpoint normalizes its text into the same contract.
+            switchyard_runner::CapabilityClientFormat::OpenAiResponsesDecisionAdapter => {
+                format!(
+                    "{}/v1/responses",
+                    config.base_url.as_str().trim_end_matches('/')
+                )
+            }
         };
         Ok(Self {
             model: config.model.clone(),

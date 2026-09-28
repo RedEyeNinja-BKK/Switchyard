@@ -91,7 +91,10 @@ fn every_live_capability_client_parses_through_the_carried_schema() {
                     panic!("live capability client {name} must parse: {error}")
                 });
         match parsed.format {
-            CapabilityClientFormat::OpenAiEmbeddings | CapabilityClientFormat::CohereJinaRerank => {
+            CapabilityClientFormat::OpenAiEmbeddings
+            | CapabilityClientFormat::CohereJinaRerank
+            | CapabilityClientFormat::OpenRouterAlphaDecisions
+            | CapabilityClientFormat::OpenAiResponsesDecisionAdapter => {
             }
         }
         assert!(
@@ -121,28 +124,34 @@ fn every_live_capability_route_parses_and_discriminates_its_kind() {
     );
     let mut embeddings = 0usize;
     let mut reranks = 0usize;
+    let mut decisions = 0usize;
     for (name, table) in &capabilities {
         let parsed: CapabilityRouteConfig = toml::Value::Table(table.clone())
             .try_into()
             .unwrap_or_else(|error| panic!("live capability route {name} must parse: {error}"));
-        // The discriminator is field PRESENCE, not any value.
-        let declares_embedding = table.contains_key("contract") || table.contains_key("dimensions");
-        match (&parsed.kind, declares_embedding) {
-            (CapabilityKind::Embedding { .. }, true) => embeddings += 1,
-            (CapabilityKind::Rerank { .. }, false) => reranks += 1,
-            (kind, expected) => panic!(
-                "live capability route {name} discriminated as {kind:?} but field presence says embedding={expected}"
+        // The discriminator is field PRESENCE, not any value. A decision lane is
+        // selected by `decision_contract`, which is distinct from the embedding
+        // `contract` so the two can never be confused.
+        let declares_decision = table.contains_key("decision_contract");
+        let declares_embedding =
+            table.contains_key("contract") || table.contains_key("dimensions");
+        match (&parsed.kind, declares_embedding, declares_decision) {
+            (CapabilityKind::Embedding { .. }, true, false) => embeddings += 1,
+            (CapabilityKind::Rerank { .. }, false, false) => reranks += 1,
+            (CapabilityKind::Decisions { .. }, false, true) => decisions += 1,
+            (kind, e, d) => panic!(
+                "live capability route {name} discriminated as {kind:?} but field presence says embedding={e} decision={d}"
             ),
         }
     }
     assert_eq!(
-        embeddings + reranks,
+        embeddings + reranks + decisions,
         capabilities.len(),
         "every live capability route must be classified exactly once"
     );
     assert!(
-        embeddings > 0 && reranks > 0,
-        "the live surface exercises BOTH capability kinds, got {embeddings} embedding / {reranks} rerank"
+        embeddings > 0 && reranks > 0 && decisions > 0,
+        "the live surface exercises ALL THREE capability kinds, got {embeddings} embedding / {reranks} rerank / {decisions} decisions"
     );
 }
 

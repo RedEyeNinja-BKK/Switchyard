@@ -397,10 +397,24 @@ fn every_live_capacity_is_positive_and_would_be_admissible_when_absent_from_poli
         }
     }
     assert!(declared > 0, "the live file must declare capacities");
+    // The census must cover EVERY live candidate, derived from the config itself
+    // rather than a hardcoded total: a hardcoded number turns any legitimate
+    // route addition into a false failure and hides a real omission.
+    let live_candidates: usize = routes
+        .values()
+        .filter(|table| table.get("type").and_then(toml::Value::as_str) == Some("fleet_router"))
+        .map(|table| {
+            table
+                .get("candidates")
+                .and_then(toml::Value::as_array)
+                .map(|c| c.len())
+                .unwrap_or(0)
+        })
+        .sum();
     assert_eq!(
         declared + absent,
-        46,
-        "the census must cover every live candidate"
+        live_candidates,
+        "the census must cover every live candidate (derived from routes.toml)"
     );
     assert!(
         absent > 0,

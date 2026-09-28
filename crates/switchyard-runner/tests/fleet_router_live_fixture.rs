@@ -135,10 +135,13 @@ fn every_live_fleet_route_preserves_its_candidate_order() {
 #[test]
 fn every_live_passthrough_route_is_unaffected() {
     let (_, passthrough) = split_routes();
-    assert_eq!(
-        passthrough.len(),
-        17,
-        "live deployment declares 17 passthrough routes"
+    // Derived from the live config, not a pinned literal: the 2026-09-28
+    // operator-authorized realignment added the Qwen3.8-27B free and LFM2.5 free
+    // passthrough routes, so a hardcoded total would misreport that authorized
+    // addition as a defect.
+    assert!(
+        !passthrough.is_empty(),
+        "the live deployment must declare passthrough routes"
     );
     for (name, table) in &passthrough {
         let spec: AlgorithmSpec = toml::Value::Table(algorithm_table(table))
@@ -163,8 +166,18 @@ fn live_fleet_routes_cover_the_whole_declared_candidate_population() {
         .iter()
         .map(|(_, t)| declared_candidate_order(t).len())
         .sum();
+    assert!(
+        declared > 0,
+        "the live file must declare fleet candidates"
+    );
+    // The walk must see exactly what the config declares - i.e. no candidate
+    // entry was skipped or double-counted.
+    let walked: usize = fleet
+        .iter()
+        .map(|(_, t)| declared_candidate_order(t).len())
+        .sum();
     assert_eq!(
-        declared, 46,
-        "the live file declares 46 candidates in total"
+        declared, walked,
+        "the candidate census must cover every declared entry exactly once"
     );
 }

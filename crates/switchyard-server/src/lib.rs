@@ -2250,11 +2250,17 @@ fn normalize_generative_decisions(upstream: &Value, expected: usize) -> Value {
         .unwrap_or_default()
         .to_string();
     let mut answers = serde_json::Map::new();
-    // Prefer the first JSON object the model emitted.
-    let parsed = text
-        .find('{')
-        .and_then(|start| text[start..].find('}').map(|end| &text[start..=end]))
-        .and_then(|slice| serde_json::from_str::<Value>(slice).ok());
+    // Prefer the first well-formed JSON object the model emitted. The search is
+    // done entirely on `char_indices` so a `}` that appears BEFORE the `{` can
+    // never produce an inverted (start > end) byte range.
+    let parsed = text.char_indices().find_map(|(start, ch)| {
+        if ch != '{' {
+            return None;
+        }
+        let slice = &text[start..];
+        let end = slice.char_indices().skip(1).find_map(|(i, c)| (c == '}').then_some(i))?;
+        serde_json::from_str::<Value>(&slice[..=end]).ok()
+    });
     match parsed {
         Some(Value::Object(map)) if !map.is_empty() => {
             for (key, value) in map {

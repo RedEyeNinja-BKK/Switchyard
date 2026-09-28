@@ -2124,6 +2124,7 @@ async fn decisions_handler(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let question_count = questions.len();
     if questions.is_empty() {
         call.outcome("invalid_questions");
         return error_response(
@@ -2142,16 +2143,68 @@ async fn decisions_handler(
             "too_many_questions",
         );
     }
-    // Upstream payload: the provider owns its own question vocabulary, so the
-    // caller's typed questions are forwarded verbatim and the decision surface
-    // is the executor's, never a chat completion.
-    let mut payload = serde_json::Map::new();
-    payload.insert("state".to_string(), Value::String(state_text));
-    payload.insert("questions".to_string(), Value::Object(questions));
-    match route.client.call(Value::Object(payload)).await {
+    // Upstream payload depends on the leg's own protocol. A generative fallback
+    // is a real chat model, so it receives a Responses body and its generated
+    // text is normalized back into the SAME typed decision contract; a decision
+    // model receives the typed-decisions body verbatim and never any text.
+    let generative = matches!(
+        route.client.format(),
+        switchyard_runner::CapabilityClientFormat::OpenAiResponsesDecisionAdapter
+    );
+    let payload = if generative {
+        let mut input = String::new();
+        for (key, question) in &questions {
+            let instructions = question
+                .get("instructions")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let criteria = question
+                .get("criteria")
+                .and_then(Value::as_object)
+                .map(|criteria| {
+                    criteria
+                        .iter()
+                        .map(|(label, text)| {
+                            format!("{label}: {}", text.as_str().unwrap_or_default())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            input.push_str(&format!(
+                "\n[{key}] {instructions}\n{criteria}\n"
+            ));
+            input.push_str(
+                "Reply as JSON: {\"type\": \"noul|choice|score\", \"value\": <number>}\n",
+            );
+        }
+        json!({
+            "model": route.client.model(),
+            "input": format!("{state_text}\n\nAnswer each question below.{input}"),
+            "stream": false,
+        })
+    } else {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "model".to_string(),
+            Value::String(route.client.model().to_string()),
+        );
+        object.insert("state".to_string(), Value::String(state_text));
+        object.insert("questions".to_string(), Value::Object(questions));
+        Value::Object(object)
+    };
+    match route.client.call(payload).await {
         Ok(upstream) => {
             call.outcome("ok");
-            let mut response = upstream;
+            // A generative leg returns text; normalize it into the SAME typed
+            // decision answers the primary leg returns, so the consumer cannot
+            // tell which leg answered.
+            let response = if generative {
+                normalize_generative_decisions(&upstream, question_count)
+            } else {
+                upstream
+            };
+            let mut response = response;
             if let Some(object) = response.as_object_mut() {
                 object.insert(
                     "contract".to_string(),
@@ -2171,6 +2224,87 @@ async fn decisions_handler(
             )
         }
     }
+}
+
+/// Normalizes a generative fallback's Responses body into the typed decision
+/// contract: `answers` is a map of question id -> `{type, noul|choice|score}`.
+///
+/// The generative model is asked for JSON; anything it fails to produce as JSON
+/// is reported honestly as an `unparsed` answer rather than being invented.
+fn normalize_generative_decisions(upstream: &Value, expected: usize) -> Value {
+    let text = upstream
+        .get("output")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|parts| {
+                        parts
+                            .iter()
+                            .find_map(|part| part.get("text").and_then(Value::as_str))
+                    })
+            })
+        })
+        .or_else(|| upstream.get("output_text").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    let mut answers = serde_json::Map::new();
+    // Prefer the first JSON object the model emitted.
+    let parsed = text
+        .find('{')
+        .and_then(|start| text[start..].find('}').map(|end| &text[start..=end]))
+        .and_then(|slice| serde_json::from_str::<Value>(slice).ok());
+    match parsed {
+        Some(Value::Object(map)) if !map.is_empty() => {
+            for (key, value) in map {
+                answers.insert(key, normalize_one_decision(&value));
+            }
+        }
+        _ => {
+            for index in 0..expected.max(1) {
+                answers.insert(
+                    format!("q{}", index + 1),
+                    serde_json::json!({"type": "unparsed", "raw": text.trim()}),
+                );
+            }
+        }
+    }
+    serde_json::json!({
+        "answers": Value::Object(answers),
+        "leg": "generative_fallback",
+        "usage": upstream.get("usage").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Maps one model-emitted decision onto the typed contract, defaulting an
+/// absent numeric answer to a fail-closed 1.0 (worst case) rather than 0.0.
+fn normalize_one_decision(value: &Value) -> Value {
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("noul")
+        .to_string();
+    let number = value
+        .get("value")
+        .and_then(Value::as_f64)
+        .or_else(|| value.as_f64())
+        .unwrap_or(1.0);
+    let mut object = serde_json::Map::new();
+    object.insert("type".to_string(), Value::String(kind.clone()));
+    match kind.as_str() {
+        "choice" => {
+            if let Some(choice) = value.get("choice") {
+                object.insert("choice".to_string(), choice.clone());
+            } else {
+                object.insert("choice".to_string(), value.clone());
+            }
+        }
+        _ => {
+            object.insert("noul".to_string(), serde_json::json!(number));
+        }
+    }
+    Value::Object(object)
 }
 
 async fn rerank_handler(

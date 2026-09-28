@@ -44,6 +44,7 @@ impl Error for CapabilityError {}
 
 /// A typed client bound to one capability executor.
 pub(crate) struct CapabilityClient {
+    pub(crate) format: switchyard_runner::CapabilityClientFormat,
     model: String,
     api_key: Option<String>,
     extra_headers: BTreeMap<String, String>,
@@ -94,6 +95,7 @@ impl CapabilityClient {
             }
         };
         Ok(Self {
+            format: config.format,
             model: config.model.clone(),
             api_key,
             extra_headers: config.extra_headers.clone(),
@@ -105,6 +107,11 @@ impl CapabilityClient {
     /// The executor-side model identity (distinct from the Switchyard route id).
     pub(crate) fn model(&self) -> &str {
         &self.model
+    }
+
+    /// The protocol this executor speaks, so a caller can shape its payload.
+    pub(crate) fn format(&self) -> switchyard_runner::CapabilityClientFormat {
+        self.format
     }
 
     async fn post(&self, body: Value) -> Result<Value, CapabilityError> {

@@ -112,8 +112,21 @@ impl CapabilityClient {
         // begins with a slash but is a NETWORK PATH to any URL joiner, so
         // `base_url + path` would resolve to the OTHER host.
         if let Some(path) = &config.endpoint_path {
+            // A bare, unambiguous path only.
+            //
+            // * `//host/path` begins with a slash but is a NETWORK PATH to any
+            //   URL joiner, so `base_url + path` would resolve to that host.
+            // * A BACKSLASH is refused outright. The real join keeps the
+            //   configured origin and merely normalises the path, so this is
+            //   not an origin change — but no legitimate executor declares a
+            //   backslash, and `\evil.example\x` is a textbook authority
+            //   confusion that a future URL-library change could start
+            //   honouring. Refusing an input nothing needs costs nothing.
+            // * `@`, `?` and `#` can respectively introduce userinfo, a query
+            //   and a fragment; none is part of a path selection.
             if !path.starts_with('/')
                 || path.starts_with("//")
+                || path.contains('\\')
                 || path.contains("://")
                 || path.contains('@')
                 || path.contains('?')
@@ -395,7 +408,9 @@ mod tests {
     #[test]
     fn only_explicit_construction_can_be_eligible() {
         let unclassified = CapabilityError::new("x");
-        assert!(!crate::decision_failure_is_backend_unavailable(&unclassified));
+        assert!(!crate::decision_failure_is_backend_unavailable(
+            &unclassified
+        ));
         let explicit = CapabilityError::with_kind(CapabilityErrorKind::Unreachable, "x");
         assert!(crate::decision_failure_is_backend_unavailable(&explicit));
     }

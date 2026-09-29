@@ -58,6 +58,8 @@ enum Reply {
     Hangup,
     /// Announce a longer body than is sent, then close: a read failure.
     TruncatedBody,
+    /// Replay an exact captured body, for real-backend compatibility proofs.
+    Raw(&'static str),
 }
 
 /// The reason phrase for a programmed status. Any valid token works; the
@@ -116,6 +118,7 @@ async fn spawn_executor_recording(
                         recorder.lock().unwrap().push(path);
                     }
                     let body = match current {
+                        Reply::Raw(raw) => raw.to_string(),
                         Reply::Ok => {
                             let answer = match leg {
                                 // The primary leg answers `noul`; the fallback
@@ -166,8 +169,7 @@ async fn spawn_executor_recording(
                     let (status, reason) = match current {
                         Reply::Http(status) => (status, status_reason(status)),
                         _ => (200u16, "OK"),
-                    };
-                    // A truncated body promises MORE bytes than it sends, so
+                    };                    // A truncated body promises MORE bytes than it sends, so
                     // the client sees a read failure rather than a short read
                     // it could mistake for a complete answer.
                     let declared = if current == Reply::TruncatedBody {
@@ -669,7 +671,9 @@ fn load_error(toml: &str) -> Option<String> {
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("routes.toml");
     std::fs::write(&config, toml).expect("write config");
-    load_server_runtime(&config).err().map(|error| error.to_string())
+    load_server_runtime(&config)
+        .err()
+        .map(|error| error.to_string())
 }
 
 /// Asserts the config is rejected AND that the rejection names `needle`.
@@ -678,8 +682,8 @@ fn load_error(toml: &str) -> Option<String> {
 /// config that fails for an unrelated reason satisfies `is_err()` just as well
 /// as one that fails for the property under test.
 fn assert_rejected_naming(toml: &str, needle: &str) {
-    let error = load_error(toml)
-        .unwrap_or_else(|| panic!("the config must be rejected, naming {needle}"));
+    let error =
+        load_error(toml).unwrap_or_else(|| panic!("the config must be rejected, naming {needle}"));
     assert!(
         error.contains(needle),
         "the rejection must name {needle}, got: {error}"
@@ -914,4 +918,200 @@ async fn an_admission_rejection_names_the_actual_relationship_defect() {
     // contract-mismatch rejections also mention the fallback's name, so
     // asserting only on the name would let an unrelated defect stand in.
     assert_rejected_naming(&toml, "which is not declared");
+}
+
+/// The real HTPC Laya response, captured 2026-09-29 from
+/// `POST http://100.105.20.36:8011/v1/systemone`, replayed VERBATIM.
+///
+/// The question this answers is narrow: can the decision client consume a Laya
+/// body through the new `endpoint_path` support WITHOUT a Laya-specific
+/// adapter? The non-generative decision leg does no response validation - it
+/// proxies the parsed JSON and injects `contract` and `served_model`. So
+/// compatibility is exactly the question of whether this body survives that
+/// path unmodified, which is what this asserts.
+const LAYA_REAL_RESPONSE: &str = r#"{
+  "model": "laya-rl-agent",
+  "answers": {
+    "task_complexity": {
+      "type": "noul",
+      "noul": 0.239,
+      "confidence": 0.839,
+      "answer_confidence": 0.839,
+      "action": {"act_probability": 1.0}
+    }
+  },
+  "usage": {"input_tokens": 436, "output_tokens": 0},
+  "routing": {}
+}"#;
+
+/// A six-question Laya response in the same captured shape: every answer is
+/// `type: noul` with a float in [0,1], keyed by the CALLER's question ids.
+const LAYA_REAL_SIX_QUESTION_RESPONSE: &str = r#"{
+  "model": "laya-rl-agent",
+  "answers": {
+    "task_complexity":       {"type":"noul","noul":0.239,"confidence":0.839,"action":{"act_probability":1.0}},
+    "reasoning_demand":      {"type":"noul","noul":0.118,"confidence":0.702,"action":{"act_probability":0.0}},
+    "tool_dependency":       {"type":"noul","noul":0.861,"confidence":0.914,"action":{"act_probability":1.0}},
+    "agentic_complexity":    {"type":"noul","noul":0.404,"confidence":0.655,"action":{"act_probability":0.0}},
+    "route_sufficiency":     {"type":"noul","noul":0.744,"confidence":0.801,"action":{"act_probability":1.0}},
+    "local_suitability":     {"type":"noul","noul":0.052,"confidence":0.498,"action":{"act_probability":0.0}}
+  },
+  "usage": {"input_tokens": 512, "output_tokens": 0},
+  "routing": {}
+}"#;
+
+/// A harness whose fallback answers with a captured Laya body, reached through
+/// the overridden `endpoint_path`.
+async fn laya_fallback_harness(body: &'static str) -> Harness {
+    let dir = std::env::temp_dir().join(format!(
+        "laya-compat-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let primary_hits = Arc::new(AtomicUsize::new(0));
+    let fallback_hits = Arc::new(AtomicUsize::new(0));
+    // The primary refuses, forcing the fallback leg; the fallback replays the
+    // captured Laya body verbatim.
+    let primary_port = spawn_raw_executor(
+        Arc::new(Mutex::new(Reply::Http(503))),
+        Arc::clone(&primary_hits),
+    )
+    .await;
+    let fallback_port = spawn_raw_executor(
+        Arc::new(Mutex::new(Reply::Raw(body))),
+        Arc::clone(&fallback_hits),
+    )
+    .await;
+    let config = dir.join("routes.toml");
+    std::fs::write(&config, decisions_config(primary_port, fallback_port, ""))
+        .expect("write config");
+    let runtime = load_server_runtime(&config).expect("runtime must load");
+    let app = build_switchyard_router(runtime.state);
+    Harness {
+        app,
+        _dir: dir,
+        primary_hits,
+        fallback_hits,
+    }
+}
+
+/// A loopback executor that can replay an exact captured body.
+async fn spawn_raw_executor(reply: Arc<Mutex<Reply>>, hits: Arc<AtomicUsize>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let current = *reply.lock().unwrap();
+            hits.fetch_add(1, Ordering::SeqCst);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut buffer = vec![0u8; 64 * 1024];
+                let _ = socket.read(&mut buffer).await;
+                let (status, reason, body) = match current {
+                    Reply::Raw(body) => (200u16, "OK", body.to_string()),
+                    Reply::Http(status) => (
+                        status,
+                        status_reason(status),
+                        json!({"error": {"code": status}}).to_string(),
+                    ),
+                    _ => (200u16, "OK", json!({"answers": {}}).to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            })
+            .await;
+        }
+    });
+    port
+}
+
+/// Option B verdict: the captured Laya body passes through the decision client
+/// UNMODIFIED. Only `contract` and `served_model` are injected, and the real
+/// Laya fields survive byte-for-byte. No Laya-specific adapter is needed.
+#[tokio::test]
+async fn a_real_laya_response_passes_through_unmodified() {
+    let h = laya_fallback_harness(LAYA_REAL_RESPONSE).await;
+    let (status, body) = h.decide().await;
+    assert_eq!(
+        status, 200,
+        "the Laya body must be served, not rejected: {body}"
+    );
+
+    // The real Laya answers survive.
+    let answer = &body["answers"]["task_complexity"];
+    assert_eq!(answer["type"], "noul");
+    assert!(
+        (answer["noul"].as_f64().unwrap() - 0.239).abs() < 1e-9,
+        "the Laya score must survive: {body}"
+    );
+    assert!(
+        (answer["confidence"].as_f64().unwrap() - 0.839).abs() < 1e-9,
+        "the Laya confidence must survive: {body}"
+    );
+    assert_eq!(
+        answer["action"]["act_probability"], 1.0,
+        "nested Laya fields must survive"
+    );
+
+    // Usage and routing survive.
+    assert_eq!(body["usage"]["input_tokens"], 436);
+    assert!(
+        body["routing"].is_object(),
+        "the Laya routing object must survive"
+    );
+
+    // Switchyard's own provenance is injected, and the fallback is marked.
+    assert_eq!(body["contract"], "switchyard-decision:v1");
+    assert_eq!(body["served_model"], "decision-primary");
+    assert_eq!(body["fallback_used"], true);
+    assert_eq!(body["fallback_model"], "decision-fallback");
+
+    // The Laya model identity is NOT overwritten: Switchyard injects its own
+    // route identity but must not destroy the backend's self-report.
+    assert_eq!(
+        body["model"], "laya-rl-agent",
+        "the backend's own model field must survive"
+    );
+}
+
+/// All six auxiliary signals, in the real shape, cross intact. `local_suitability`
+/// is expected to be UNAVAILABLE from Laya; this asserts the pass-through
+/// behaviour, not a value.
+#[tokio::test]
+async fn all_six_laya_signals_cross_intact() {
+    let h = laya_fallback_harness(LAYA_REAL_SIX_QUESTION_RESPONSE).await;
+    let (status, body) = h.decide().await;
+    assert_eq!(status, 200, "body: {body}");
+    for signal in [
+        "task_complexity",
+        "reasoning_demand",
+        "tool_dependency",
+        "agentic_complexity",
+        "route_sufficiency",
+        "local_suitability",
+    ] {
+        let answer = &body["answers"][signal];
+        assert_eq!(
+            answer["type"], "noul",
+            "signal {signal} must cross with its real type: {body}"
+        );
+        let value = answer["noul"]
+            .as_f64()
+            .expect(&format!("{signal} must carry a score"));
+        assert!(
+            (0.0..=1.0).contains(&value),
+            "signal {signal} must stay in [0,1], got {value}"
+        );
+    }
+    assert_eq!(body["fallback_used"], true);
 }

@@ -57,6 +57,20 @@ pub struct CapabilityClientConfig {
     pub extra_headers: BTreeMap<String, String>,
     #[serde(default = "default_capability_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// Overrides the path the executor is called on: a single absolute path
+    /// APPENDED to `base_url` (e.g. `/v1/systemone`).
+    ///
+    /// This exists so the decision surface is not welded to one provider's
+    /// path shape: `openrouter_alpha_decisions` otherwise hardcodes
+    /// `/api/alpha/decisions`, so a second decision backend serving the same
+    /// typed contract under its own path could not be declared without a
+    /// provider-specific client. A bare path only — an absolute URL, or one
+    /// carrying a scheme or host, is rejected at load, so an override can
+    /// never silently redirect the capability to a different host.
+    ///
+    /// Honored by the decision formats only. The embedding and rerank paths
+    /// are part of those contracts, not a transport detail.
+    pub endpoint_path: Option<String>,
 }
 
 const fn default_capability_timeout_seconds() -> u64 {
@@ -101,6 +115,17 @@ pub enum CapabilityKind {
         max_questions: usize,
         /// Maximum characters admitted for the `state` under assessment.
         max_state_chars: usize,
+        /// Optional ONE-HOP fallback capability target, used only when the
+        /// primary target fails in a way classified as backend unavailability
+        /// (see `decision_failure_is_backend_unavailable`). `None` preserves
+        /// the pre-fallback behaviour exactly: one target, one invocation,
+        /// error returned.
+        ///
+        /// One hop means one hop: a fallback capability must not itself declare
+        /// a `fallback_target`, and a capability may not name itself. Both are
+        /// rejected at configuration-admission time rather than detected
+        /// recursively at request time.
+        fallback_target: Option<String>,
     },
 }
 
@@ -141,6 +166,7 @@ impl<'de> Deserialize<'de> for CapabilityRouteConfig {
             decision_contract: Option<String>,
             max_questions: Option<usize>,
             max_state_chars: Option<usize>,
+            fallback_target: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
         let kind = if raw.decision_contract.is_some() {
@@ -151,6 +177,7 @@ impl<'de> Deserialize<'de> for CapabilityRouteConfig {
                 contract,
                 max_questions: raw.max_questions.unwrap_or_else(default_max_questions),
                 max_state_chars: raw.max_state_chars.unwrap_or_else(default_max_state_chars),
+                fallback_target: raw.fallback_target,
             }
         } else if raw.contract.is_some() || raw.dimensions.is_some() {
             let contract = raw.contract.ok_or_else(|| {

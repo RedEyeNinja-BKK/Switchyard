@@ -11,7 +11,7 @@ use libsy::{FleetSnapshot, RoutingOutcome, SharedFleetState};
 use serde_json::Value;
 use switchyard_protocol::{ModelId, WireFormat};
 
-use crate::capability::{CapabilityClientConfig, CapabilityRouteConfig};
+use crate::capability::{CapabilityClientConfig, CapabilityKind, CapabilityRouteConfig};
 use crate::config;
 use crate::facts_config::FleetReadinessConfig;
 use crate::{ModelCapabilities, Route, RunnerError};
@@ -147,14 +147,21 @@ impl Runner {
     ///
     /// These describe typed non-LLM utility endpoints. They are served by the
     /// host, not by the named route table, and take no part in model routing.
+    ///
+    /// Decision fallback relationships are validated HERE, at admission, rather
+    /// than discovered at request time: a self-reference, an unresolvable
+    /// target, a target of the wrong capability kind, a contract mismatch, or a
+    /// nested (fallback-of-fallback) relationship are all operator defects that
+    /// must fail the load instead of degrading silently at runtime.
     pub fn with_capabilities(
         mut self,
         capability_clients: BTreeMap<String, CapabilityClientConfig>,
         capabilities: BTreeMap<String, CapabilityRouteConfig>,
-    ) -> Self {
+    ) -> Result<Self, RunnerError> {
+        validate_capability_fallbacks(&capabilities)?;
         self.capability_clients = capability_clients;
         self.capabilities = capabilities;
-        self
+        Ok(self)
     }
 
     /// The parsed `[capability_clients.*]` executor declarations.
@@ -220,4 +227,62 @@ impl Runner {
             fallbacks: model_ids.map(resolve).collect::<Option<Vec<_>>>()?,
         })
     }
+}
+
+/// Validates every declared decision-capability fallback relationship.
+///
+/// One hop means one hop, and each of these is a CONFIGURATION error that must
+/// surface at load time rather than become a runtime degradation:
+///
+/// * a capability naming itself (an infinite loop if honoured),
+/// * a `fallback_target` that is not a declared capability (unresolvable),
+/// * a `fallback_target` that is not a decisions capability (wrong kind),
+/// * a fallback whose decision contract differs from the primary's (the caller
+///   would receive two different contracts under one route id),
+/// * a fallback that itself declares a `fallback_target` (fallback-of-fallback).
+fn validate_capability_fallbacks(
+    capabilities: &BTreeMap<String, CapabilityRouteConfig>,
+) -> Result<(), RunnerError> {
+    for (id, route) in capabilities {
+        let CapabilityKind::Decisions {
+            contract,
+            fallback_target: Some(fallback_id),
+            ..
+        } = &route.kind
+        else {
+            continue;
+        };
+        if fallback_id == id {
+            return Err(RunnerError::configuration(format!(
+                "decision capability {id} declares itself as its own fallback"
+            )));
+        }
+        let Some(fallback) = capabilities.get(fallback_id) else {
+            return Err(RunnerError::configuration(format!(
+                "decision capability {id} names fallback {fallback_id}, which is not declared"
+            )));
+        };
+        let CapabilityKind::Decisions {
+            contract: fallback_contract,
+            fallback_target: nested,
+            ..
+        } = &fallback.kind
+        else {
+            return Err(RunnerError::configuration(format!(
+                "decision capability {id} names fallback {fallback_id}, which is not a decisions capability"
+            )));
+        };
+        if nested.is_some() {
+            return Err(RunnerError::configuration(format!(
+                "decision capability {id} names fallback {fallback_id}, which itself declares a fallback; \
+                 only one hop is supported"
+            )));
+        }
+        if fallback_contract != contract {
+            return Err(RunnerError::configuration(format!(
+                "decision capability {id} serves contract {contract} but its fallback {fallback_id} serves {fallback_contract}"
+            )));
+        }
+    }
+    Ok(())
 }

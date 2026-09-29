@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
 use crate::fleet_readiness::FleetReadinessMonitor;
+use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
 use axum::http::header::CONTENT_TYPE;
@@ -54,7 +54,7 @@ use tracing::{Instrument, Level};
 
 use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
 
-use crate::capability::{CapabilityClient, CapabilityRoute};
+use crate::capability::{CapabilityClient, CapabilityError, CapabilityErrorKind, CapabilityRoute};
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
@@ -2041,11 +2041,114 @@ fn is_physical_batch_overflow(error: &(impl std::fmt::Display + ?Sized)) -> bool
         && text.contains("increase the physical batch size")
 }
 
+/// Whether a decision-capability failure is a BACKEND AVAILABILITY failure that
+/// justifies the single configured fallback invocation.
+///
+/// This deliberately classifies the ORIGIN, not just the status code. The point
+/// is that a healthy fallback must never be used to mask OUR defect:
+///
+/// * [`CapabilityErrorKind::Unreachable`] — the backend could not be reached or
+///   did not answer in time. Availability.
+/// * [`CapabilityErrorKind::ReadFailed`] — the backend started answering and
+///   then stopped mid-body. Availability.
+/// * [`CapabilityErrorKind::Http`] 429 / 502 / 503 / 504 — the provider is
+///   rate-limited, exhausted, or temporarily unable to serve. Availability.
+///
+/// Explicitly NOT eligible, because each of these is a defect on OUR side, a
+/// property of the request, or a caller error that a fallback would silently
+/// hide:
+///
+/// * [`CapabilityErrorKind::Configuration`] — our deployment is broken. This is
+///   also the fail-closed default for any error built without an explicit kind,
+///   so an unclassified failure never degrades.
+/// * [`CapabilityErrorKind::MalformedJson`] — the provider answered but we could
+///   not decode it. Whether the provider is at fault is genuinely ambiguous, so
+///   this fails LOUD rather than quietly rerouting every decision through a
+///   fallback, which would turn a normalizer regression into a silent behaviour
+///   change.
+/// * 400 / 401 / 403 / 404 / 422 — caller error, authentication failure,
+///   authorization failure, unknown route, or schema rejection. A bad Span
+///   credential is an operator defect, not backend unavailability.
+///
+/// 402 is classified explicitly rather than by inference: OpenRouter returns it
+/// for an exhausted account balance, which is an operator billing defect rather
+/// than a transient backend outage, so it is NOT fallback-eligible. Routing it
+/// to a fallback would make a billing problem look like normal degradation.
+pub(crate) fn decision_failure_is_backend_unavailable(error: &CapabilityError) -> bool {
+    match error.kind() {
+        CapabilityErrorKind::Unreachable | CapabilityErrorKind::ReadFailed => true,
+        CapabilityErrorKind::Http(status) => matches!(status, 429 | 502 | 503 | 504),
+        CapabilityErrorKind::MalformedJson | CapabilityErrorKind::Configuration => false,
+    }
+}
+
 /// Cohere/Jina-compatible rerank endpoint. Proxies the typed rerank contract
 /// to the capability executor selected by the `model` route id (e.g.
 /// `localclaw/rerank`); bounds (candidates, top_n) are enforced here.
 /// `POST /v1/decisions` - the typed decision lane.
 ///
+/// Builds the upstream body for ONE decision leg.
+///
+/// The body is a function of the LEG, not of the request: a generative leg
+/// receives a Responses chat body, while a decision leg receives the
+/// typed-decisions body verbatim and never any synthesized text. Building it
+/// per leg is what lets a fallback declare its own format and its own executor
+/// model without inheriting the primary's shape.
+fn decision_leg_payload(
+    client: &CapabilityClient,
+    state_text: &str,
+    questions: &serde_json::Map<String, Value>,
+) -> Value {
+    let generative = matches!(
+        client.format(),
+        switchyard_runner::CapabilityClientFormat::OpenAiResponsesDecisionAdapter
+    );
+    if generative {
+        let mut input = String::new();
+        for (key, question) in questions {
+            let instructions = question
+                .get("instructions")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let criteria = question
+                .get("criteria")
+                .and_then(Value::as_object)
+                .map(|criteria| {
+                    criteria
+                        .iter()
+                        .map(|(label, text)| {
+                            format!("{label}: {}", text.as_str().unwrap_or_default())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            input.push_str(&format!("\n[{key}] {instructions}\n{criteria}\n"));
+            input.push_str(
+                "Reply as JSON: {\"<question id>\": {\"type\": \"noul|choice|score\", \"value\": <number>}}\n",
+            );
+        }
+        json!({
+            "model": client.model(),
+            "input": format!("{state_text}\n\nAnswer each question below.{input}"),
+            "stream": false,
+            // The generative leg reasons by default and will spend the whole
+            // output budget on reasoning tokens, never emitting an answer. Cap
+            // reasoning so the decision text is actually produced.
+            "reasoning": {"effort": "minimal"},
+        })
+    } else {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "model".to_string(),
+            Value::String(client.model().to_string()),
+        );
+        object.insert("state".to_string(), Value::String(state_text.to_string()));
+        object.insert("questions".to_string(), Value::Object(questions.clone()));
+        Value::Object(object)
+    }
+}
+
 /// A decision model is NOT a chat model: it answers with structured
 /// `noul` / `choice` / `score` objects over a caller-supplied `state`, so this
 /// endpoint never synthesises assistant text. Both the primary decision model
@@ -2082,6 +2185,7 @@ async fn decisions_handler(
         contract,
         max_questions,
         max_state_chars,
+        fallback_target,
     } = &route.kind
     else {
         call.outcome("wrong_capability");
@@ -2151,52 +2255,7 @@ async fn decisions_handler(
         route.client.format(),
         switchyard_runner::CapabilityClientFormat::OpenAiResponsesDecisionAdapter
     );
-    let payload = if generative {
-        let mut input = String::new();
-        for (key, question) in &questions {
-            let instructions = question
-                .get("instructions")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let criteria = question
-                .get("criteria")
-                .and_then(Value::as_object)
-                .map(|criteria| {
-                    criteria
-                        .iter()
-                        .map(|(label, text)| {
-                            format!("{label}: {}", text.as_str().unwrap_or_default())
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            input.push_str(&format!(
-                "\n[{key}] {instructions}\n{criteria}\n"
-            ));
-            input.push_str(
-                "Reply as JSON: {\"<question id>\": {\"type\": \"noul|choice|score\", \"value\": <number>}}\n",
-            );
-        }
-        json!({
-            "model": route.client.model(),
-            "input": format!("{state_text}\n\nAnswer each question below.{input}"),
-            "stream": false,
-            // The free fallback reasons by default and will spend the whole
-            // output budget on reasoning tokens, never emitting an answer. Cap
-            // reasoning so the decision text is actually produced.
-            "reasoning": {"effort": "minimal"},
-        })
-    } else {
-        let mut object = serde_json::Map::new();
-        object.insert(
-            "model".to_string(),
-            Value::String(route.client.model().to_string()),
-        );
-        object.insert("state".to_string(), Value::String(state_text));
-        object.insert("questions".to_string(), Value::Object(questions));
-        Value::Object(object)
-    };
+    let payload = decision_leg_payload(&route.client, &state_text, &questions);
     match route.client.call(payload).await {
         Ok(upstream) => {
             call.outcome("ok");
@@ -2210,16 +2269,114 @@ async fn decisions_handler(
             };
             let mut response = response;
             if let Some(object) = response.as_object_mut() {
+                object.insert("contract".to_string(), Value::String(contract.clone()));
                 object.insert(
-                    "contract".to_string(),
-                    Value::String(contract.clone()),
+                    "served_model".to_string(),
+                    Value::String(route_id.to_string()),
                 );
-                object.insert("served_model".to_string(), Value::String(route_id.to_string()));
             }
             Json(response).into_response()
         }
         Err(error) => {
             call.outcome("upstream_error");
+            // ONE-HOP fallback. Only a backend-availability failure of the
+            // PRIMARY may reach the fallback, and the fallback runs at most
+            // once: no fallback-of-fallback, no retry oscillation, no failback
+            // inside this request. A fallback that itself fails returns that
+            // terminal error, and the next request re-selects the primary
+            // (no sticky state, no circuit breaker).
+            if let Some(fallback_id) = fallback_target.as_deref() {
+                if decision_failure_is_backend_unavailable(&error) {
+                    let Some(fallback) = state.capabilities.get(fallback_id).cloned() else {
+                        // Admission rejects an unresolvable fallback_target, so
+                        // this is an operator defect: fail loud, do not degrade.
+                        call.outcome("fallback_unresolved");
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("decision fallback target {fallback_id} is not registered"),
+                            "server_error",
+                            "fallback_unresolved",
+                        );
+                    };
+                    let CapabilityKind::Decisions {
+                        contract: fb_contract,
+                        ..
+                    } = &fallback.kind
+                    else {
+                        call.outcome("fallback_wrong_capability");
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "decision fallback target {fallback_id} is not a decisions capability"
+                            ),
+                            "server_error",
+                            "fallback_wrong_capability",
+                        );
+                    };
+                    if fb_contract != contract {
+                        call.outcome("fallback_contract_mismatch");
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "decision fallback target {fallback_id} serves contract {} but the primary serves {contract}",
+                                fb_contract
+                            ),
+                            "server_error",
+                            "fallback_contract_mismatch",
+                        );
+                    }
+                    call.outcome("fallback_attempt");
+                    // The same validated state and questions are replayed, but
+                    // the body is rebuilt for the FALLBACK's own leg: a fallback
+                    // may be generative where the primary is a decision model,
+                    // and it names its own executor model.
+                    let fallback_payload =
+                        decision_leg_payload(&fallback.client, &state_text, &questions);
+                    match fallback.client.call(fallback_payload).await {
+                        Ok(upstream) => {
+                            call.outcome("fallback_ok");
+                            let mut response = if matches!(
+                                fallback.client.format(),
+                                switchyard_runner::CapabilityClientFormat::OpenAiResponsesDecisionAdapter
+                            ) {
+                                normalize_generative_decisions(&upstream, &question_ids)
+                            } else {
+                                upstream
+                            };
+                            if let Some(object) = response.as_object_mut() {
+                                object.insert(
+                                    "contract".to_string(),
+                                    Value::String(contract.clone()),
+                                );
+                                object.insert(
+                                    "served_model".to_string(),
+                                    Value::String(route_id.to_string()),
+                                );
+                                // Backend provenance so a consumer can tell a
+                                // fallback result from a primary one WITHOUT
+                                // parsing a provider payload.
+                                object.insert("fallback_used".to_string(), Value::Bool(true));
+                                object.insert(
+                                    "fallback_model".to_string(),
+                                    Value::String(fallback_id.to_string()),
+                                );
+                            }
+                            return Json(response).into_response();
+                        }
+                        Err(fallback_error) => {
+                            call.outcome("fallback_failed");
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                format!(
+                                    "{error}; decision fallback {fallback_id} also failed: {fallback_error}"
+                                ),
+                                "server_error",
+                                "upstream_error",
+                            );
+                        }
+                    }
+                }
+            }
             error_response(
                 StatusCode::BAD_GATEWAY,
                 error.to_string(),
@@ -2262,7 +2419,10 @@ fn normalize_generative_decisions(upstream: &Value, question_ids: &[String]) -> 
             return None;
         }
         let slice = &text[start..];
-        let end = slice.char_indices().skip(1).find_map(|(i, c)| (c == '}').then_some(i))?;
+        let end = slice
+            .char_indices()
+            .skip(1)
+            .find_map(|(i, c)| (c == '}').then_some(i))?;
         serde_json::from_str::<Value>(&slice[..=end]).ok()
     });
     match parsed {
@@ -2275,7 +2435,9 @@ fn normalize_generative_decisions(upstream: &Value, question_ids: &[String]) -> 
                 let slot = if let Some(index) = known.iter().position(|id| *id == key) {
                     Some(index)
                 } else {
-                    known.iter().position(|id| !used[known.iter().position(|u| *u == *id).unwrap()])
+                    known
+                        .iter()
+                        .position(|id| !used[known.iter().position(|u| *u == *id).unwrap()])
                 };
                 match slot {
                     Some(index) if index < known.len() && !used[index] => {
@@ -2590,7 +2752,8 @@ async fn get_deepseek_resource(State(state): State<ServerState>) -> (StatusCode,
     )
 }
 
-async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {    Json(state.stats.snapshot())
+async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
+    Json(state.stats.snapshot())
 }
 
 async fn reset_stats(State(state): State<ServerState>) -> Json<Value> {
@@ -3152,5 +3315,76 @@ mod tests {
             18,
             "the escalation threshold boundary is expressed against this exact value"
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_failure_class_tests {
+    use super::decision_failure_is_backend_unavailable;
+    use crate::capability::{CapabilityError, CapabilityErrorKind};
+
+    /// The four eligible statuses and the two transport classes are the ONLY
+    /// eligible classes. Asserted directly so a widening of the classifier is
+    /// caught here rather than only through the handler.
+    #[test]
+    fn the_eligible_failure_classes_are_exactly_the_declared_ones() {
+        for status in [429u16, 502, 503, 504] {
+            let error = CapabilityError::with_kind(CapabilityErrorKind::Http(status), "x");
+            assert!(
+                decision_failure_is_backend_unavailable(&error),
+                "HTTP {status} is declared eligible"
+            );
+        }
+        for status in [400u16, 401, 402, 403, 404, 422, 500, 501, 505] {
+            let error = CapabilityError::with_kind(CapabilityErrorKind::Http(status), "x");
+            assert!(
+                !decision_failure_is_backend_unavailable(&error),
+                "HTTP {status} is NOT declared eligible"
+            );
+        }
+        for kind in [
+            CapabilityErrorKind::Unreachable,
+            CapabilityErrorKind::ReadFailed,
+        ] {
+            assert!(
+                decision_failure_is_backend_unavailable(&CapabilityError::with_kind(kind, "x")),
+                "{kind:?} is declared eligible"
+            );
+        }
+        for kind in [
+            CapabilityErrorKind::MalformedJson,
+            CapabilityErrorKind::Configuration,
+        ] {
+            assert!(
+                !decision_failure_is_backend_unavailable(&CapabilityError::with_kind(kind, "x")),
+                "{kind:?} is NOT declared eligible"
+            );
+        }
+    }
+
+    /// EXHAUSTIVENESS, enforced as a test rather than left to review.
+    ///
+    /// This list must be kept in step with `CapabilityErrorKind`. Adding a
+    /// variant without deciding its eligibility fails to compile here, which
+    /// is the point: a new failure class must make a deliberate eligibility
+    /// decision rather than inheriting one by accident.
+    #[test]
+    fn every_declared_failure_kind_has_a_deliberate_eligibility() {
+        let expected: &[(CapabilityErrorKind, bool)] = &[
+            (CapabilityErrorKind::Unreachable, true),
+            (CapabilityErrorKind::ReadFailed, true),
+            (CapabilityErrorKind::Http(503), true),
+            (CapabilityErrorKind::Http(400), false),
+            (CapabilityErrorKind::MalformedJson, false),
+            (CapabilityErrorKind::Configuration, false),
+        ];
+        for (kind, eligible) in expected {
+            let error = CapabilityError::with_kind(*kind, "x");
+            assert_eq!(
+                decision_failure_is_backend_unavailable(&error),
+                *eligible,
+                "eligibility of {kind:?} is pinned to {eligible}"
+            );
+        }
     }
 }

@@ -568,7 +568,7 @@ impl DeploymentConfig {
             .with_provider_api_keys(provider_api_keys)
             .with_fleet_readiness(self.fleet_readiness)
             .with_fleet_state(fleet_state)
-            .with_capabilities(self.capability_clients, self.capabilities);
+            .with_capabilities(self.capability_clients, self.capabilities)?;
         Ok(runner)
     }
 

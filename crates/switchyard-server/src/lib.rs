@@ -2185,7 +2185,7 @@ async fn decisions_handler(
             // The free fallback reasons by default and will spend the whole
             // output budget on reasoning tokens, never emitting an answer. Cap
             // reasoning so the decision text is actually produced.
-            "reasoning": {"effort": "low", "max_tokens": 256},
+            "reasoning": {"effort": "minimal"},
         })
     } else {
         let mut object = serde_json::Map::new();

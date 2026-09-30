@@ -2051,33 +2051,32 @@ fn is_physical_batch_overflow(error: &(impl std::fmt::Display + ?Sized)) -> bool
 ///   did not answer in time. Availability.
 /// * [`CapabilityErrorKind::ReadFailed`] — the backend started answering and
 ///   then stopped mid-body. Availability.
-/// * [`CapabilityErrorKind::Http`] 429 / 502 / 503 / 504 — the provider is
-///   rate-limited, exhausted, or temporarily unable to serve. Availability.
+/// * [`CapabilityErrorKind::Http`] 429 / 500 / 502 / 503 / 504 — the provider is
+///   rate-limited, temporarily unable to serve, or returned a server error.
+///   Availability.
 ///
-/// Explicitly NOT eligible, because each of these is a defect on OUR side, a
-/// property of the request, or a caller error that a fallback would silently
-/// hide:
+/// 500 is eligible for a structural reason rather than a policy guess:
+/// `CapabilityErrorKind::Http` is constructed at exactly one site, from
+/// `response.status()`, so it can only mean the REMOTE executor answered that
+/// status. A local defect — bad configuration, serialization, or a normalizer
+/// bug — has its own typed class and can never arrive here as a status. Refusing
+/// 500 while accepting its 502/503/504 siblings would be an inconsistency with
+/// no security basis.
 ///
-/// * [`CapabilityErrorKind::Configuration`] — our deployment is broken. This is
-///   also the fail-closed default for any error built without an explicit kind,
-///   so an unclassified failure never degrades.
-/// * [`CapabilityErrorKind::MalformedJson`] — the provider answered but we could
-///   not decode it. Whether the provider is at fault is genuinely ambiguous, so
-///   this fails LOUD rather than quietly rerouting every decision through a
-///   fallback, which would turn a normalizer regression into a silent behaviour
-///   change.
-/// * 400 / 401 / 403 / 404 / 422 — caller error, authentication failure,
-///   authorization failure, unknown route, or schema rejection. A bad Span
-///   credential is an operator defect, not backend unavailability.
-///
-/// 402 is classified explicitly rather than by inference: OpenRouter returns it
-/// for an exhausted account balance, which is an operator billing defect rather
-/// than a transient backend outage, so it is NOT fallback-eligible. Routing it
-/// to a fallback would make a billing problem look like normal degradation.
+/// 402 is a DELIBERATE deferral, not an oversight. The availability argument is
+/// sound in principle: a primary blocked by pricing or account balance is
+/// unavailable for sensing, and a local fallback could preserve service. It is
+/// withheld because no configured primary has ever produced that condition, and
+/// a commercial/account-state condition should not become generic router
+/// behaviour before it has been observed once. Observability is already in place
+/// if it ever happens — the fallback path records `fallback_attempt`,
+/// `fallback_ok` and `fallback_failed` outcomes, and the body carries
+/// `fallback_used` and `fallback_model` — so deferring costs nothing today and
+/// can be revisited from an actual provider response.
 pub(crate) fn decision_failure_is_backend_unavailable(error: &CapabilityError) -> bool {
     match error.kind() {
         CapabilityErrorKind::Unreachable | CapabilityErrorKind::ReadFailed => true,
-        CapabilityErrorKind::Http(status) => matches!(status, 429 | 502 | 503 | 504),
+        CapabilityErrorKind::Http(status) => matches!(status, 429 | 500 | 502 | 503 | 504),
         CapabilityErrorKind::MalformedJson | CapabilityErrorKind::Configuration => false,
     }
 }
@@ -3328,14 +3327,14 @@ mod decision_failure_class_tests {
     /// caught here rather than only through the handler.
     #[test]
     fn the_eligible_failure_classes_are_exactly_the_declared_ones() {
-        for status in [429u16, 502, 503, 504] {
+        for status in [429u16, 500, 502, 503, 504] {
             let error = CapabilityError::with_kind(CapabilityErrorKind::Http(status), "x");
             assert!(
                 decision_failure_is_backend_unavailable(&error),
                 "HTTP {status} is declared eligible"
             );
         }
-        for status in [400u16, 401, 402, 403, 404, 422, 500, 501, 505] {
+        for status in [400u16, 401, 402, 403, 404, 422, 501, 505] {
             let error = CapabilityError::with_kind(CapabilityErrorKind::Http(status), "x");
             assert!(
                 !decision_failure_is_backend_unavailable(&error),
@@ -3362,6 +3361,38 @@ mod decision_failure_class_tests {
         }
     }
 
+    /// No LOCAL defect class may ever degrade.
+    ///
+    /// A local defect is structurally incapable of arriving as an HTTP status:
+    /// bad configuration and malformed decoding each carry their own typed
+    /// kind. Asserted together because the boundary between these and the
+    /// remote faults is the entire reason the origin is typed rather than
+    /// parsed out of a rendered message.
+    #[test]
+    fn no_local_defect_class_ever_degrades() {
+        // A local configuration fault - e.g. an unbuildable HTTP client or a bad
+        // endpoint_path. The same request would fail identically against any
+        // fallback, so degrading would only hide our defect.
+        let configuration = CapabilityError::with_kind(
+            CapabilityErrorKind::Configuration,
+            "failed to build HTTP client",
+        );
+        assert!(!decision_failure_is_backend_unavailable(&configuration));
+
+        // A response we could not decode. Whether the provider or our decoder is
+        // at fault is genuinely ambiguous, so it fails loud rather than being
+        // silently rerouted through a healthy backend.
+        let malformed = CapabilityError::with_kind(
+            CapabilityErrorKind::MalformedJson,
+            "returned malformed JSON",
+        );
+        assert!(!decision_failure_is_backend_unavailable(&malformed));
+
+        // An error whose origin was never recorded at its construction site.
+        let unclassified = CapabilityError::new("some failure with no recorded origin");
+        assert!(!decision_failure_is_backend_unavailable(&unclassified));
+    }
+
     /// EXHAUSTIVENESS, enforced as a test rather than left to review.
     ///
     /// This list must be kept in step with `CapabilityErrorKind`. Adding a
@@ -3374,6 +3405,8 @@ mod decision_failure_class_tests {
             (CapabilityErrorKind::Unreachable, true),
             (CapabilityErrorKind::ReadFailed, true),
             (CapabilityErrorKind::Http(503), true),
+            (CapabilityErrorKind::Http(500), true),
+            (CapabilityErrorKind::Http(402), false),
             (CapabilityErrorKind::Http(400), false),
             (CapabilityErrorKind::MalformedJson, false),
             (CapabilityErrorKind::Configuration, false),

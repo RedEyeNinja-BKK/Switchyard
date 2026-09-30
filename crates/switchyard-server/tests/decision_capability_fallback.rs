@@ -443,7 +443,7 @@ async fn each_leg_is_called_on_its_own_declared_path() {
 /// Each of these is a backend-availability failure and must reach the fallback.
 #[tokio::test]
 async fn availability_failures_reach_the_fallback_exactly_once() {
-    for status in [429u16, 502, 503, 504] {
+    for status in [429u16, 500, 502, 503, 504] {
         let h = Harness::primary_failing(Reply::Http(status)).await;
         let (code, body) = h.decide().await;
         assert_eq!(code, 200, "HTTP {status} must degrade, body: {body}");
@@ -524,14 +524,33 @@ async fn an_exhausted_balance_never_reaches_the_fallback() {
     assert_eq!(h.fallback_hits(), 0);
 }
 
-/// A 500 is an upstream fault, not one of the four declared availability
-/// statuses, so it fails loud rather than degrading.
+/// A remote 500 is an UPSTREAM server error and must degrade exactly like its
+/// 502/503/504 siblings.
+///
+/// `CapabilityErrorKind::Http` is constructed at exactly one site, from
+/// `response.status()`, so `Http(500)` can only mean the remote executor
+/// answered 500 — never a local defect. This test therefore doubles as the proof
+/// that a provider-side server fault is handled consistently rather than by
+/// status-code folklore.
 #[tokio::test]
-async fn an_unlisted_upstream_status_fails_loud() {
+async fn a_remote_500_reaches_the_fallback_exactly_once() {
     let h = Harness::primary_failing(Reply::Http(500)).await;
     let (status, body) = h.decide().await;
-    assert_eq!(status, 502, "HTTP 500 must fail loud, body: {body}");
-    assert_eq!(h.fallback_hits(), 0);
+    assert_eq!(status, 200, "a remote 500 must degrade, body: {body}");
+    assert_eq!(h.primary_hits(), 1);
+    assert_eq!(
+        h.fallback_hits(),
+        1,
+        "a remote 500 must fall back exactly once"
+    );
+    assert_eq!(
+        body.get("fallback_used").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        body.get("fallback_model").and_then(Value::as_str),
+        Some("decision-fallback")
+    );
 }
 
 /// A fallback that also fails is TERMINAL: the caller sees the combined error,

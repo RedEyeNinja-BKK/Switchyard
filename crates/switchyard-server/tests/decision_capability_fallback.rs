@@ -40,6 +40,11 @@ enum Leg {
     /// A typed decision backend: the contract shape the primary serves.
     Decision,
     /// A generative backend: answers as text on a chat endpoint.
+    ///
+    /// Reserved for the generative decision leg. The fallback tests in this
+    /// file drive decision-format legs, so this variant is not constructed
+    /// here; the generative path is covered by the normalization tests.
+    #[allow(dead_code)]
     Generative,
 }
 
@@ -49,6 +54,7 @@ enum Reply {
     /// A well-formed decision answer.
     Ok,
     /// A well-formed generative text answer.
+    #[allow(dead_code)]
     Text,
     /// A non-success HTTP status with this code.
     Http(u16),

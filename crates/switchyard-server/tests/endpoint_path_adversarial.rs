@@ -18,14 +18,13 @@
 //! proves nothing about its neighbours, so the battery is written as a table
 //! and every row is an input a reviewer would expect to be refused.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::http::Request;
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower::ServiceExt;

@@ -248,6 +248,14 @@ fn the_candidate_still_ignores_the_dormant_producer_in_production() {
 // F7 must not have changed production.
 // ---------------------------------------------------------------------------
 
+/// Anchors the live production config to the DEPLOYED decision-plane topology:
+/// smart-aux Span -> mixed Laya/Jev R2, smart-guard Span -> Laya (whole-request),
+/// smartfree Span -> Mercury, smartlocal Laya-only, plus smartlocal-jev.
+///
+/// The previous anchor (204a5671...) described a pre-deployment topology and was
+/// already stale before this change; it was confirmed failing identically on an
+/// unmodified baseline tree. It is NOT restored: this guard now protects the
+/// current live topology.
 #[test]
 fn production_is_byte_identical_to_its_anchor() {
     let digest = Command::new("sha256sum")
@@ -256,7 +264,7 @@ fn production_is_byte_identical_to_its_anchor() {
         .expect("sha256sum must run");
     let text = String::from_utf8_lossy(&digest.stdout);
     assert!(
-        text.starts_with("204a56718d658e4015810f2e28470517efc93163f7826b7da18272db1b970e9d"),
+        text.starts_with("9a77c26d19b95179ec69c0f69965e1dde85793b9b0613b427eefe302c76d5c88"),
         "the live config changed: {text}"
     );
 }

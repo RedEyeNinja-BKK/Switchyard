@@ -126,7 +126,41 @@ pub enum CapabilityKind {
         /// rejected at configuration-admission time rather than detected
         /// recursively at request time.
         fallback_target: Option<String>,
+        /// Optional per-question partition of the ONE-HOP fallback.
+        ///
+        /// Absent (the default) preserves the historical behaviour exactly: the
+        /// fallback leg receives the caller's COMPLETE question object. When
+        /// present, every question is still answered by the fallback, but each is
+        /// routed to one of the declared partition executors instead, so a single
+        /// fallback event may fan out across those executors.
+        ///
+        /// Partitioning is applied ONLY inside the eligible-fallback branch, so the
+        /// healthy primary path is untouched: one primary call, no partition work,
+        /// no additional backend call.
+        ///
+        /// The bounded contract this preserves (see `DecisionPartitionTarget`):
+        /// ROUTING STAGES per request stay at two (primary, then exactly one
+        /// assigned fallback executor per question), while the number of PHYSICAL
+        /// backend calls may exceed two because one stage may fan out across the
+        /// declared partition targets. There is never a third stage, no recursive
+        /// fallback, and no target chaining inside a partition.
+        question_partition: Option<Vec<DecisionPartitionTarget>>,
     },
+}
+
+/// One declared executor group of a decision fallback partition.
+///
+/// `question_ids` is matched on the caller's question KEY (stable identity), never
+/// on prose. A question matching no group falls to the capability's
+/// `fallback_target`, which is therefore the DEFAULT executor: an unmapped or newly
+/// added question keeps historical behaviour rather than being dropped.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionPartitionTarget {
+    /// Fallback capability id that answers the listed questions.
+    pub target: String,
+    /// Caller question keys this executor answers.
+    pub question_ids: Vec<String>,
 }
 
 /// Capability-specific route declaration (`[capabilities.<name>]`).
@@ -167,6 +201,7 @@ impl<'de> Deserialize<'de> for CapabilityRouteConfig {
             max_questions: Option<usize>,
             max_state_chars: Option<usize>,
             fallback_target: Option<String>,
+            question_partition: Option<Vec<DecisionPartitionTarget>>,
         }
         let raw = Raw::deserialize(deserializer)?;
         let kind = if raw.decision_contract.is_some() {
@@ -178,6 +213,7 @@ impl<'de> Deserialize<'de> for CapabilityRouteConfig {
                 max_questions: raw.max_questions.unwrap_or_else(default_max_questions),
                 max_state_chars: raw.max_state_chars.unwrap_or_else(default_max_state_chars),
                 fallback_target: raw.fallback_target,
+                question_partition: raw.question_partition,
             }
         } else if raw.contract.is_some() || raw.dimensions.is_some() {
             let contract = raw.contract.ok_or_else(|| {

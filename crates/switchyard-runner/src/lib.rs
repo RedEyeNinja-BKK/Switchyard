@@ -19,6 +19,7 @@ pub use algorithm::{
 };
 pub use capability::{
     CapabilityClientConfig, CapabilityClientFormat, CapabilityKind, CapabilityRouteConfig,
+    DecisionPartitionTarget,
 };
 pub use facts_config::{
     ComfyFactConfig, ComfyGovernedConfig, FleetReadinessConfig, HtpcFactConfig, ResourceFactConfig,

@@ -247,6 +247,7 @@ fn validate_capability_fallbacks(
         let CapabilityKind::Decisions {
             contract,
             fallback_target: Some(fallback_id),
+            question_partition: partition,
             ..
         } = &route.kind
         else {
@@ -282,6 +283,65 @@ fn validate_capability_fallbacks(
             return Err(RunnerError::configuration(format!(
                 "decision capability {id} serves contract {contract} but its fallback {fallback_id} serves {fallback_contract}"
             )));
+        }
+        // A partition may only name EXISTING fallback capabilities serving the SAME
+        // contract, and every listed question key must be unique across the whole
+        // partition. Both are configuration errors that must surface at load time
+        // rather than silently sending a question to no executor.
+        if let Some(partition) = partition {
+            let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+            for entry in partition {
+                if entry.target == *id {
+                    return Err(RunnerError::configuration(format!(
+                        "decision capability {id} partitions to itself ({})",
+                        entry.target
+                    )));
+                }
+                let Some(target) = capabilities.get(&entry.target) else {
+                    return Err(RunnerError::configuration(format!(
+                        "decision capability {id} partitions to {}, which is not declared",
+                        entry.target
+                    )));
+                };
+                let CapabilityKind::Decisions {
+                    contract: target_contract,
+                    fallback_target: target_nested,
+                    ..
+                } = &target.kind
+                else {
+                    return Err(RunnerError::configuration(format!(
+                        "decision capability {id} partitions to {}, which is not a decisions capability",
+                        entry.target
+                    )));
+                };
+                if target_contract != contract {
+                    return Err(RunnerError::configuration(format!(
+                        "decision capability {id} serves contract {contract} but its partition target {} serves {target_contract}",
+                        entry.target
+                    )));
+                }
+                if target_nested.is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "decision capability {id} partitions to {}, which itself declares a fallback; \
+                         only one hop is supported",
+                        entry.target
+                    )));
+                }
+                if entry.question_ids.is_empty() {
+                    return Err(RunnerError::configuration(format!(
+                        "decision capability {id} partitions to {} with an empty question list",
+                        entry.target
+                    )));
+                }
+                for q in &entry.question_ids {
+                    if let Some(previous) = seen.insert(q.as_str(), entry.target.as_str()) {
+                        return Err(RunnerError::configuration(format!(
+                            "decision capability {id} routes question {q:?} to both {previous} and {}",
+                            entry.target
+                        )));
+                    }
+                }
+            }
         }
     }
     Ok(())

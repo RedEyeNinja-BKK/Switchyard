@@ -240,17 +240,40 @@ impl Runner {
 /// * a fallback whose decision contract differs from the primary's (the caller
 ///   would receive two different contracts under one route id),
 /// * a fallback that itself declares a `fallback_target` (fallback-of-fallback).
+///
+/// A declared `question_partition` is additionally validated even when the
+/// capability has NO `fallback_target`: a partition whose default executor does
+/// not exist can never execute, so it is a load-time error rather than a silent
+/// no-op. The partition rules are: a partition REQUIRES a `fallback_target`;
+/// every entry names a non-empty, declared, non-self, non-chaining decisions
+/// capability on the same contract; every `question_ids` list is non-empty and
+/// holds no empty or whitespace-only id; no question is assigned twice; and the
+/// entry count is bounded by the capability's own `max_questions`.
 fn validate_capability_fallbacks(
     capabilities: &BTreeMap<String, CapabilityRouteConfig>,
 ) -> Result<(), RunnerError> {
     for (id, route) in capabilities {
         let CapabilityKind::Decisions {
             contract,
-            fallback_target: Some(fallback_id),
+            fallback_target,
             question_partition: partition,
+            max_questions,
             ..
         } = &route.kind
         else {
+            continue;
+        };
+        // A partition is only meaningful with a default executor to carry every
+        // question no entry claims.
+        if let Some(partition) = partition {
+            if !partition.is_empty() && fallback_target.is_none() {
+                return Err(RunnerError::configuration(format!(
+                    "decision capability {id} declares a question_partition but no fallback_target; \
+                     the partition has no default executor for unmatched questions"
+                )));
+            }
+        }
+        let Some(fallback_id) = fallback_target.as_deref() else {
             continue;
         };
         if fallback_id == id {
@@ -289,8 +312,22 @@ fn validate_capability_fallbacks(
         // partition. Both are configuration errors that must surface at load time
         // rather than silently sending a question to no executor.
         if let Some(partition) = partition {
+            // A finite bound: one entry per admissible question is already
+            // degenerate, so cap entries at the capability's own admission limit.
+            if partition.len() > *max_questions {
+                return Err(RunnerError::configuration(format!(
+                    "decision capability {id} declares {} partition entries, \
+                     exceeding its max_questions bound of {max_questions}",
+                    partition.len()
+                )));
+            }
             let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
             for entry in partition {
+                if entry.target.trim().is_empty() {
+                    return Err(RunnerError::configuration(format!(
+                        "decision capability {id} declares a partition entry with an empty target"
+                    )));
+                }
                 if entry.target == *id {
                     return Err(RunnerError::configuration(format!(
                         "decision capability {id} partitions to itself ({})",
@@ -334,6 +371,13 @@ fn validate_capability_fallbacks(
                     )));
                 }
                 for q in &entry.question_ids {
+                    if q.trim().is_empty() {
+                        return Err(RunnerError::configuration(format!(
+                            "decision capability {id} routes a blank question id to {}; \
+                             question ids must be non-empty",
+                            entry.target
+                        )));
+                    }
                     if let Some(previous) = seen.insert(q.as_str(), entry.target.as_str()) {
                         return Err(RunnerError::configuration(format!(
                             "decision capability {id} routes question {q:?} to both {previous} and {}",

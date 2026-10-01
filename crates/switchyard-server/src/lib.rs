@@ -2285,6 +2285,12 @@ async fn decisions_handler(
             // inside this request. A fallback that itself fails returns that
             // terminal error, and the next request re-selects the primary
             // (no sticky state, no circuit breaker).
+            //
+            // BOUNDING: this is a bound on ROUTING STAGES and on PER-QUESTION
+            // ATTEMPTS, both <= 2. On a lane with no question_partition that is
+            // also a bound on physical calls. On a partitioned lane the stage may
+            // fan out, so physical calls are <= 1 + the number of non-empty R2
+            // batches actually executed.
             if let Some(fallback_id) = fallback_target.as_deref() {
                 if decision_failure_is_backend_unavailable(&error) {
                     let Some(fallback) = state.capabilities.get(fallback_id).cloned() else {
@@ -2344,7 +2350,7 @@ async fn decisions_handler(
                     )
                     .await
                     {
-                        Ok((mut response, attribution)) => {
+                        Ok((mut response, attribution, answered_by)) => {
                             let partitioned = question_partition
                                 .as_deref()
                                 .is_some_and(|declared| !declared.is_empty());
@@ -2366,10 +2372,22 @@ async fn decisions_handler(
                                 // fallback result from a primary one WITHOUT
                                 // parsing a provider payload.
                                 object.insert("fallback_used".to_string(), Value::Bool(true));
-                                object.insert(
-                                    "fallback_model".to_string(),
-                                    Value::String(fallback_id.to_string()),
-                                );
+                                // TRUTHFUL attribution: name a real responder, or
+                                // omit the key when more than one executor answered
+                                // and no single identity would be true. The
+                                // per-question `fallback_partition` map below is
+                                // the authoritative record in that case.
+                                match answered_by.as_slice() {
+                                    [only] => {
+                                        object.insert(
+                                            "fallback_model".to_string(),
+                                            Value::String(only.clone()),
+                                        );
+                                    }
+                                    _ => {
+                                        object.remove("fallback_model");
+                                    }
+                                }
                                 if partitioned {
                                     // Question-level provenance: which executor
                                     // answered which question. Grouped by
@@ -2447,6 +2465,11 @@ async fn decisions_handler(
 /// `routing` survive as that backend self-reported them. Switchyard's own
 /// provenance keys are injected by the caller.
 ///
+/// The third return value lists, deduplicated and ordered, the executors that
+/// actually produced at least one answer, so the caller can set `fallback_model`
+/// truthfully: a genuinely mixed result has several and must not be collapsed to
+/// one arbitrary identity.
+///
 /// `usage` and `routing` are the DEFAULT executor's report when it answered at
 /// least one question, and otherwise the first assigned executor's. They are
 /// deliberately NOT summed across executors: fabricating an aggregate of
@@ -2463,22 +2486,20 @@ async fn run_partitioned_decision_fallback(
     questions: &serde_json::Map<String, Value>,
     question_ids: &[String],
     partition: Option<&[switchyard_runner::DecisionPartitionTarget]>,
-) -> Result<(Value, Vec<(String, String)>), String> {
+) -> Result<(Value, Vec<(String, String)>, Vec<String>), String> {
     // An absent partition — and a declared-but-EMPTY one, which therefore cannot
     // change behaviour by accident — is the historical single-leg fallback: the
     // fallback executor receives the caller's COMPLETE question object.
     if partition.is_none_or(|declared| declared.is_empty()) {
+        // Historical single-leg fallback. It emits the HISTORICAL metric labels,
+        // never partition_* ones: passing through shared helper code is not a
+        // partition execution and must not create partition metric series.
         let payload = decision_leg_payload(&default_fallback.client, state_text, questions);
-        let mut call = metrics::CapabilityCall::start("decisions", fallback_id);
         let upstream = default_fallback
             .client
             .call(payload)
             .await
-            .map_err(|error| {
-                call.outcome("partition_failed");
-                error.to_string()
-            })?;
-        call.outcome("partition_ok");
+            .map_err(|error| error.to_string())?;
         let response = if matches!(
             default_fallback.client.format(),
             switchyard_runner::CapabilityClientFormat::OpenAiResponsesDecisionAdapter
@@ -2491,7 +2512,7 @@ async fn run_partitioned_decision_fallback(
             .iter()
             .map(|id| (id.clone(), fallback_id.to_string()))
             .collect();
-        return Ok((response, attribution));
+        return Ok((response, attribution, vec![fallback_id.to_string()]));
     }
     let partition = partition.expect("checked empty above");
 
@@ -2534,6 +2555,13 @@ async fn run_partitioned_decision_fallback(
     // that the mixed policy explicitly wants overlapped.
     let mut calls = Vec::new();
     for (target, keys) in &assignments {
+        // A batch claiming ZERO questions is skipped ENTIRELY: not called, not a
+        // failure dependency, no attribution, no latency sample. Otherwise a
+        // configured target the caller never exercised could sink a request it
+        // had no part in.
+        if keys.is_empty() {
+            continue;
+        }
         let Some(route) = state.capabilities.get(target.as_str()).cloned() else {
             return Err(format!(
                 "decision partition target {target} is not registered"
@@ -2635,7 +2663,14 @@ async fn run_partitioned_decision_fallback(
         }
     }
     object.insert("answers".to_string(), Value::Object(ordered));
-    Ok((response, attribution))
+    // The executors that actually produced at least one answer. `fallback_model`
+    // is injected by the caller and must name only a real responder.
+    let answered: std::collections::BTreeSet<String> = attribution
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect();
+    let answered: Vec<String> = answered.into_iter().collect();
+    Ok((response, attribution, answered))
 }
 /// Normalizes a generative fallback's Responses body into the typed decision
 /// contract: `answers` is a map of question id -> `{type, noul|choice|score}`.

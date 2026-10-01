@@ -167,7 +167,12 @@ fn decide_body() -> Value {
     for (name, marker) in SIX_QUESTIONS {
         questions.insert(
             (*name).to_string(),
-            json!({"instructions": format!("assess {marker}"), "criteria": {"low": "no", "high": "yes"}}),
+            json!({
+                "type": "noul",
+                "instructions": format!("assess {marker}"),
+                // A noul question takes criteria keyed true/false.
+                "criteria": {"true": "yes", "false": "no"},
+            }),
         );
     }
     json!({
@@ -355,11 +360,17 @@ impl PartitionHarness {
     }
 
     async fn decide(&self) -> (u16, Value) {
+        self.decide_with_questions(None).await
+    }
+
+    /// `subset` restricts the caller's question set, so a test can prove the
+    /// behaviour of a partition target that claims none of what was asked.
+    async fn decide_with_questions(&self, subset: Option<&[&str]>) -> (u16, Value) {
         let request = Request::builder()
             .method("POST")
             .uri("/v1/decisions")
             .header("content-type", "application/json")
-            .body(Body::from(decide_body().to_string()))
+            .body(Body::from(decide_body_for(subset).to_string()))
             .unwrap();
         let response = self
             .app
@@ -399,6 +410,19 @@ impl PartitionHarness {
         };
         seen.lock().unwrap().questions.len()
     }
+}
+
+/// The caller body, optionally restricted to a subset of the six questions.
+fn decide_body_for(subset: Option<&[&str]>) -> Value {
+    let mut body = decide_body();
+    if let Some(subset) = subset {
+        let questions = body
+            .get_mut("questions")
+            .and_then(Value::as_object_mut)
+            .expect("the body must carry questions");
+        questions.retain(|key, _| subset.contains(&key.as_str()));
+    }
+    body
 }
 
 fn answer_type<'a>(body: &'a Value, question: &str) -> Option<&'a str> {
@@ -559,7 +583,12 @@ async fn answers_are_recombined_in_the_callers_order_with_per_question_attributi
             .collect::<Vec<_>>()
     );
     assert_eq!(body["fallback_used"], true);
-    assert_eq!(body["fallback_model"], "decision-fallback");
+    // Two executors answered, so there is NO truthful single `fallback_model`.
+    // `fallback_partition` is the authoritative per-question record.
+    assert!(
+        body.get("fallback_model").is_none(),
+        "a mixed result must not claim one executor: {body}"
+    );
     assert_eq!(body["served_model"], "decision-primary");
     assert_eq!(body["contract"], "switchyard-decision:v1");
     // The attribution map groups questions by the executor that answered them.
@@ -740,6 +769,115 @@ async fn a_failing_default_executor_also_fails_the_whole_leg() {
     assert_eq!(h.fallback_hits.load(Ordering::SeqCst), 1);
 }
 
+/// FINDING 1, the zero-hit regression. A configured partition target that the
+/// caller gave NO matching question must not be contacted at all -- not called,
+/// not a failure dependency, not attributed, not timed. The target here would
+/// answer 500 if it were ever contacted, so a regression that called it would
+/// fail the whole leg and turn this test red.
+#[tokio::test]
+async fn a_configured_target_with_zero_matching_questions_is_never_contacted() {
+    let h = PartitionHarness::with_all(
+        Reply::Http(503), // primary fails, forcing the R2 stage
+        Reply::Ok,        // default executor healthy
+        Reply::Http(500), // the partition target would FAIL if contacted
+        MIXED_TABLE,
+    )
+    .await;
+    // The caller asks for the FIVE signals that are NOT reasoning_demand, so the
+    // configured Jev-side target claims nothing at all.
+    let (status, body) = h
+        .decide_with_questions(Some(&[
+            "task_complexity",
+            "tool_dependency",
+            "agentic_complexity",
+            "route_sufficiency",
+            "local_suitability",
+        ]))
+        .await;
+    assert_eq!(
+        status, 200,
+        "an unexercised target must not be able to sink the request: {body}"
+    );
+    assert_eq!(
+        h.partition_hits.load(Ordering::SeqCst),
+        0,
+        "a target claiming zero questions must never be dialled"
+    );
+    assert_eq!(
+        h.asked_count("partition"),
+        0,
+        "no request body was built for it"
+    );
+    // The default executor answered every question that WAS asked, truthfully
+    // attributed: one executor answered, so the single-model identity is true.
+    assert_eq!(h.fallback_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(answer_type(&body, "task_complexity"), Some("choice"));
+    assert_eq!(body["fallback_model"], "decision-fallback");
+    assert_eq!(partitioned_questions(&body).len(), 5);
+    // A partition WAS declared and executed here (it simply claimed nothing), so
+    // the attribution key is present and must name ONLY the real responder: the
+    // unexercised target must not appear anywhere in it.
+    let attributed = body["fallback_partition"].as_object().cloned().unwrap_or_default();
+    assert!(
+        !attributed.contains_key("decision-partition"),
+        "an unexercised target must not be attributed: {body}"
+    );
+    assert_eq!(attributed.keys().collect::<Vec<_>>(), vec!["decision-fallback"]);
+}
+
+/// A partition that claims ONLY a question the caller never sends leaves the
+/// whole request on the default executor, and the partition key must not appear.
+#[tokio::test]
+async fn a_partition_entirely_unmatched_degrades_to_the_default_executor() {
+    let h = PartitionHarness::with_all(
+        Reply::Http(503),
+        Reply::Ok,
+        Reply::Http(500),
+        r#"question_partition = [{ target = "decision-partition", question_ids = ["not_asked_by_any_caller"] }]"#,
+    )
+    .await;
+    let (status, body) = h.decide().await;
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(h.partition_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(h.fallback_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(h.asked("fallback").len(), SIX_QUESTIONS.len());
+    // One executor answered, so the historical single-model identity is truthful.
+    assert_eq!(body["fallback_model"], "decision-fallback");
+}
+
+/// FINDING 2: when exactly ONE executor answers a partitioned fallback, the
+/// single `fallback_model` identity IS truthful and must be present.
+#[tokio::test]
+async fn a_single_answering_executor_may_name_itself_in_fallback_model() {
+    // EVERY question is assigned to the partition target, so it alone answers and
+    // the default executor is never dialled.
+    let all_questions: Vec<String> = SIX_QUESTIONS
+        .iter()
+        .map(|(question, _)| format!("\"{question}\""))
+        .collect();
+    let h = PartitionHarness::with_all(
+        Reply::Http(503),
+        Reply::Ok,
+        Reply::Ok,
+        &format!(
+            "question_partition = [{{ target = \"decision-partition\", \
+             question_ids = [{}] }}]",
+            all_questions.join(", ")
+        ),
+    )
+    .await;
+    let (status, body) = h.decide().await;
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(h.partition_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.fallback_hits.load(Ordering::SeqCst),
+        0,
+        "the default claimed nothing"
+    );
+    assert_eq!(body["fallback_model"], "decision-partition");
+    assert_eq!(answer_type(&body, "reasoning_demand"), Some("score"));
+}
+
 // ---------------------------------------------------------------------------
 // Admission: every partition defect must be a LOAD-time rejection.
 // ---------------------------------------------------------------------------
@@ -867,4 +1005,104 @@ async fn a_well_formed_partition_loads() {
     loads_with_partition_table(MIXED_TABLE)
         .await
         .expect("a valid mixed policy must load");
+}
+
+// ---------------------------------------------------------------------------
+// FINDING 4: a partition that can never execute must fail closed at load.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_partition_without_a_fallback_target_is_rejected_at_load() {
+    // Partition declared, but no default executor to carry unmatched questions.
+    let dir = std::env::temp_dir().join(format!(
+        "decision-partition-no-fallback-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("routes.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = 1
+
+[targets.aux-target]
+id = "aux-target"
+llm_client = "probe-chat"
+
+[llm_clients.probe-chat]
+format = "openai_responses"
+base_url = "http://127.0.0.1:9"
+
+[capability_clients.primary-exec]
+format = "openrouter_alpha_decisions"
+base_url = "http://127.0.0.1:9"
+model = "p"
+timeout_seconds = 1
+
+[capabilities.decision-primary]
+id = "decision-primary"
+target = "primary-exec"
+decision_contract = "switchyard-decision:v1"
+question_partition = [{{ target = "decision-partition", question_ids = ["reasoning_demand"] }}]
+
+[capabilities.decision-partition]
+id = "decision-partition"
+target = "primary-exec"
+decision_contract = "switchyard-decision:v1"
+
+[routes.decision-primary]
+id = "decision-primary"
+type = "passthrough"
+target = "aux-target"
+"#
+        ),
+    )
+    .unwrap();
+    let error = load_server_runtime(&config)
+        .err()
+        .map(|e| e.to_string())
+        .expect("a partition with no default executor must be rejected");
+    assert!(error.contains("no fallback_target"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_blank_question_id_is_rejected_at_load() {
+    let error = loads_with_partition_table(
+        r#"question_partition = [{ target = "decision-partition", question_ids = ["   "] }]"#,
+    )
+    .await
+    .expect_err("a whitespace-only question id must be rejected");
+    assert!(error.contains("blank question id"), "{error}");
+}
+
+#[tokio::test]
+async fn an_empty_partition_target_is_rejected_at_load() {
+    let error = loads_with_partition_table(
+        r#"question_partition = [{ target = "  ", question_ids = ["reasoning_demand"] }]"#,
+    )
+    .await
+    .expect_err("an empty partition target must be rejected");
+    assert!(error.contains("empty target"), "{error}");
+}
+
+#[tokio::test]
+async fn too_many_partition_entries_are_rejected_at_load() {
+    // The bound is the capability's own max_questions (8 in this fixture).
+    let many: Vec<String> = (0..9).map(|i| format!("\"q{i}\"")).collect();
+    let entries: Vec<String> = many
+        .iter()
+        .map(|q| {
+            format!("{{ target = \"decision-partition\", question_ids = [{q}] }}")
+        })
+        .collect();
+    let table = format!("question_partition = [{}]", entries.join(", "));
+    let error = loads_with_partition_table(&table)
+        .await
+        .expect_err("an unbounded partition entry count must be rejected");
+    assert!(error.contains("max_questions"), "{error}");
 }

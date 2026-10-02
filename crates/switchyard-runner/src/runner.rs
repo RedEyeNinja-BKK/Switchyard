@@ -20,10 +20,20 @@ pub struct Runner {
     provider_api_keys: Vec<String>,
     /// Specialized capability surfaces, keyed by the public id callers request.
     capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
-    /// The default logical decision lane, shared by every route's decision calls.
-    decision_lane: Option<std::sync::Arc<crate::decision_executor::DecisionResolver>>,
-    /// The configured name of that lane, so a caller can address it explicitly.
-    decision_lane_name: Option<String>,
+    /// Configured logical decision lanes, by name. More than one when candidate order
+    /// differs per question type.
+    decision_lanes: BTreeMap<String, Lane>,
+    /// Name of the lane that serves every question kind, when one is configured.
+    default_decision_lane: Option<String>,
+}
+
+/// One configured lane: its resolver and the kinds it serves.
+#[derive(Clone)]
+pub struct Lane {
+    /// The lane's ordered candidates.
+    pub resolver: std::sync::Arc<crate::decision_executor::DecisionResolver>,
+    /// The question kinds this lane serves. Empty means every kind.
+    pub types: Vec<crate::decision_transport::QuestionKind>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -82,91 +92,11 @@ impl Runner {
             fallback_base_url: None,
             provider_api_keys: Vec::new(),
             capabilities: BTreeMap::new(),
-            decision_lane: None,
-            decision_lane_name: None,
+            decision_lanes: BTreeMap::new(),
+            default_decision_lane: None,
         }
     }
 
-    /// Registers the default logical decision lane, used by the compatibility surface.
-    pub fn with_decision_lane(
-        mut self,
-        name: impl Into<String>,
-        lane: std::sync::Arc<crate::decision_executor::DecisionResolver>,
-    ) -> Self {
-        self.decision_lane_name = Some(name.into());
-        self.decision_lane = Some(lane);
-        self
-    }
-
-    /// The configured name of the default decision lane.
-    pub fn decision_lane_name(&self) -> Option<&str> {
-        self.decision_lane_name.as_deref()
-    }
-
-    /// The default logical decision lane, when the deployment configures one.
-    pub fn decision_lane(&self) -> Option<&std::sync::Arc<crate::decision_executor::DecisionResolver>> {
-        self.decision_lane.as_ref()
-    }
-
-    /// Registers the specialized capability surfaces a deployment exposes.
-    pub fn with_capabilities(
-        mut self,
-        capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
-    ) -> Self {
-        self.capabilities = capabilities;
-        self
-    }
-
-    /// Resolves a caller-requested capability by its public id.
-    pub fn capability(&self, id: &str) -> Option<&crate::capability::ResolvedCapability> {
-        self.capabilities.get(id)
-    }
-
-    /// Every exposed capability, for advertising on `/v1/models`.
-    pub fn capabilities(&self) -> &BTreeMap<String, crate::capability::ResolvedCapability> {
-        &self.capabilities
-    }
-
-    /// Registers deployment-owned API keys for serving-surface output redaction.
-    /// TOML loading registers these automatically; programmatic hosts must supply them.
-    pub fn with_provider_api_keys(mut self, keys: Vec<String>) -> Self {
-        self.provider_api_keys = keys;
-        self
-    }
-
-    /// Returns deployment-owned secrets for serving-surface output redactors.
-    pub fn provider_api_keys(&self) -> &[String] {
-        &self.provider_api_keys
-    }
-
-    pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
-        self.fallback_base_url = fallback_base_url;
-        self
-    }
-
-    /// Returns the route registered for a model.
-    pub fn route(&self, model: &str) -> Option<&Route> {
-        self.routes
-            .iter()
-            .find(|(id, _)| id.as_str() == model)
-            .map(|(_, route)| route)
-    }
-
-    /// Iterates over configured routes in caller-provided order.
-    pub fn models(&self) -> impl Iterator<Item = ModelInfo<'_>> {
-        self.routes.iter().map(|(id, route)| ModelInfo {
-            id,
-            algorithm: route.algorithm_name(),
-            capabilities: route.capabilities(),
-        })
-    }
-
-    /// Returns the validated API root used for unmatched HTTP requests.
-    pub fn fallback_base_url(&self) -> Option<&str> {
-        self.fallback_base_url.as_deref()
-    }
-
-    /// Resolves an outcome to configured target names and non-secret client settings.
     pub fn describe_decision(
         &self,
         model: &ModelId,
@@ -197,4 +127,126 @@ impl Runner {
             fallbacks: model_ids.map(resolve).collect::<Option<Vec<_>>>()?,
         })
     }
+
+    /// Returns the route registered for a model.
+    pub fn route(&self, model: &str) -> Option<&Route> {
+        self.routes
+            .iter()
+            .find(|(id, _)| id.as_str() == model)
+            .map(|(_, route)| route)
+    }
+
+    /// Returns the registered routes, for advertising and capability lookups.
+    pub fn models(&self) -> impl Iterator<Item = ModelInfo<'_>> {
+        self.routes.iter().map(|(id, route)| ModelInfo {
+            id,
+            algorithm: route.algorithm_name(),
+            capabilities: route.capabilities(),
+        })
+    }
+
+    /// The URL unmatched requests may fall through to, when configured.
+    pub fn fallback_base_url(&self) -> Option<&str> {
+        self.fallback_base_url.as_deref()
+    }
+
+    /// Registers the URL unmatched requests may fall through to.
+    pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
+        self.fallback_base_url = fallback_base_url;
+        self
+    }
+
+    /// Registers deployment-owned API keys for serving-surface output redaction.
+    pub fn with_provider_api_keys(mut self, keys: Vec<String>) -> Self {
+        self.provider_api_keys = keys;
+        self
+    }
+
+    /// Returns deployment-owned secrets for serving-surface output redactors.
+    pub fn provider_api_keys(&self) -> &[String] {
+        &self.provider_api_keys
+    }
+
+    /// Registers the specialized capability surfaces a deployment exposes.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Resolves a caller-requested capability by its public id.
+    pub fn capability(&self, id: &str) -> Option<&crate::capability::ResolvedCapability> {
+        self.capabilities.get(id)
+    }
+
+    /// Every exposed capability, for advertising on `/v1/models`.
+    pub fn capabilities(&self) -> &BTreeMap<String, crate::capability::ResolvedCapability> {
+        &self.capabilities
+    }
+
+    /// Registers the default logical decision lane, used by the compatibility surface.
+    pub fn with_decision_lane(
+        mut self,
+        name: impl Into<String>,
+        resolver: std::sync::Arc<crate::decision_executor::DecisionResolver>,
+        types: Vec<crate::decision_transport::QuestionKind>,
+    ) -> Self {
+        let name = name.into();
+        if types.is_empty() {
+            self.default_decision_lane = Some(name.clone());
+        }
+        self.decision_lanes.insert(
+            name,
+            Lane {
+                resolver,
+                types,
+            },
+        );
+        self
+    }
+
+    /// The configured name of the lane that serves every question kind.
+    pub fn decision_lane_name(&self) -> Option<&str> {
+        self.default_decision_lane.as_deref()
+    }
+
+    /// Selects the lane that serves a request, by its question kinds.
+    ///
+    /// A lane scoped to exactly this request's kinds wins over a broader one, so a
+    /// type-specific order is never shadowed by the general lane. A request no lane
+    /// covers is reported as such rather than falling through to whichever lane happens
+    /// to be registered first.
+    pub fn lane_for_request(
+        &self,
+        request: &switchyard_protocol::DecisionRequest,
+    ) -> Option<&Lane> {
+        // Scoped lanes are considered before the unscoped one, so a type-specific order
+        // is never shadowed by the general lane. Registering lanes in a sorted map means
+        // iteration order alone must not decide this.
+        let mut scoped: Option<&Lane> = None;
+        for lane in self.decision_lanes.values() {
+            if lane.types.is_empty() {
+                continue;
+            }
+            if !crate::decision_transport::lane_serves(&lane.types, request) {
+                continue;
+            }
+            let best_fit = scoped.map_or(usize::MAX, |current| current.types.len());
+            if lane.types.len() < best_fit {
+                scoped = Some(lane);
+            } else if lane.types.len() == best_fit {
+                // Two lanes claim the same kinds; that is ambiguous, so neither is used.
+                return None;
+            }
+        }
+        if scoped.is_some() {
+            return scoped;
+        }
+        self.decision_lanes
+            .values()
+            .find(|lane| crate::decision_transport::lane_serves(&lane.types, request))
+    }
 }
+

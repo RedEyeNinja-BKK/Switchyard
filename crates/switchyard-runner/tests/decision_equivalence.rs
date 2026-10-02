@@ -631,9 +631,12 @@ targets = ["z-span", "a-local"]
     );
     unsafe { std::env::set_var("TEST_DECISION_KEY", "test-value") };
     let runner = Runner::from_toml(&config).expect("deployment builds");
-    let lane = runner.decision_lane().expect("a configured lane exists");
+    let request = noul_request(json!("plain"));
+    let lane = runner
+        .lane_for_request(&request)
+        .expect("a configured lane serves a plain noul request");
     assert_eq!(
-        lane.candidates
+        lane.resolver.candidates
             .iter()
             .map(|candidate| candidate.name.as_str())
             .collect::<Vec<_>>(),
@@ -642,6 +645,6 @@ targets = ["z-span", "a-local"]
     );
 
     // And that order decides which backend answers.
-    let outcome = resolve_and_serve(lane, &noul_request(json!("plain"))).await.expect("served");
+    let outcome = resolve_and_serve(&lane.resolver, &request).await.expect("served");
     assert_eq!(outcome.served_by, "z-span");
 }

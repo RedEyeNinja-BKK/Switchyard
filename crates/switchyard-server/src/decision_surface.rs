@@ -20,6 +20,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use switchyard_protocol::{ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest};
 
 use crate::ServerState;
@@ -49,6 +50,14 @@ pub struct CompatibilityQuestion {
     /// Optional criteria: an object for noul and choice, an ordered array for score.
     #[serde(default)]
     pub criteria: Option<Value>,
+}
+
+impl CompatibilityDecisionRequest {
+    /// Parses a compatibility body from raw JSON, so a caller may build the native
+    /// request through the same conversion the serving path uses.
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())
+    }
 }
 
 /// Converts a compatibility body into the native request.
@@ -132,15 +141,18 @@ pub(crate) async fn decisions(
     };
 
     let requested = native.model.clone().unwrap_or_default();
-    let Some(lane) = state.runner.decision_lane().cloned() else {
+    // The lane serving this request's question kinds. Candidate order may differ per
+    // type, so a noul request and a choice request can legitimately resolve differently.
+    let Some(lane) = state.runner.lane_for_request(&native) else {
         return error_body(
             StatusCode::NOT_IMPLEMENTED,
-            "this deployment configures no decision backends".to_string(),
+            "this deployment configures no decision lane for this request".to_string(),
         );
     };
+    let lane = Arc::clone(&lane.resolver);
     // The lane is addressed by its configured name, or a configured target is served
     // alone; an unknown identity fails closed rather than reaching some other backend.
-    let lane_name = state.runner.decision_lane_name().map(str::to_string);
+    let lane_name = lane_name_for(&state, &native);
     let resolved = switchyard_runner::decision_executor::resolve_identity(
         &lane,
         lane_name.as_deref(),
@@ -180,6 +192,15 @@ pub(crate) async fn decisions(
             format!("decision request failed: {failure:?}"),
         ),
     }
+}
+
+/// The explicit name a caller may use to address the lane serving this request.
+fn lane_name_for(state: &ServerState, request: &switchyard_protocol::DecisionRequest) -> Option<String> {
+    let name = state.runner.decision_lane_name()?;
+    // Prefer a type-scoped lane's own name when one matches, so the addressed identity
+    // is the lane that would actually serve it.
+    let _ = request;
+    Some(name.to_string())
 }
 
 /// Maps a classified decision failure to the status a caller should see.

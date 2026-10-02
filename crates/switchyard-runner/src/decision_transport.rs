@@ -27,7 +27,57 @@ pub const MIN_SCORE_LEVELS: usize = 2;
 /// Most levels a score question may carry.
 pub const MAX_SCORE_LEVELS: usize = 10;
 
-/// Wire family a decision backend speaks.
+/// A question kind, named in configuration so a lane can be scoped to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    /// Probability of true.
+    Noul,
+    /// One of a declared option set.
+    Choice,
+    /// A position on an ordered rubric.
+    Score,
+}
+
+impl QuestionKind {
+    fn from_kind(kind: &DecisionKind) -> Self {
+        match kind {
+            DecisionKind::Boolean { .. } => Self::Noul,
+            DecisionKind::Choice { .. } => Self::Choice,
+            DecisionKind::Score { .. } => Self::Score,
+        }
+    }
+}
+
+/// The question kinds a request carries, in a stable order.
+pub fn question_kinds(request: &DecisionRequest) -> Vec<QuestionKind> {
+    let mut kinds: Vec<QuestionKind> = request
+        .questions
+        .values()
+        .map(|question| QuestionKind::from_kind(&question.kind))
+        .collect();
+    kinds.sort_by_key(|kind| match kind {
+        QuestionKind::Noul => 0,
+        QuestionKind::Choice => 1,
+        QuestionKind::Score => 2,
+    });
+    kinds.dedup();
+    kinds
+}
+
+/// Whether a lane scoped to `types` serves a request carrying `kinds`.
+///
+/// An unscoped lane serves every kind. A scoped lane serves a request only when it
+/// covers every kind present, so a mixed request never lands on a lane tuned for one of
+/// its halves.
+pub fn lane_serves(lane_types: &[QuestionKind], request: &DecisionRequest) -> bool {
+    if lane_types.is_empty() {
+        return true;
+    }
+    question_kinds(request)
+        .iter()
+        .all(|kind| lane_types.contains(kind))
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionTransport {

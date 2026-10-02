@@ -5,7 +5,7 @@
 
 mod capabilities;
 mod capability_surfaces;
-mod decision_surface;
+pub mod decision_surface;
 pub mod config;
 mod metrics;
 mod observability;

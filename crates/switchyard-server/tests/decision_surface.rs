@@ -65,6 +65,18 @@ state_forms = {{ plain_string = true, structured = false }}
 
 [decision_lanes.default]
 targets = ["decision-laya", "decision-span"]
+
+[decision_lanes.noul]
+types = ["noul"]
+targets = ["decision-laya", "decision-span"]
+
+[decision_lanes.choice]
+types = ["choice"]
+targets = ["decision-span", "decision-laya"]
+
+[decision_lanes.score]
+types = ["score"]
+targets = ["decision-laya", "decision-span"]
 "#
     )
 }
@@ -509,4 +521,52 @@ decision_api_key_env = "TEST_KEY"
 
     let empty = message(&base("[decision_lanes.default]\ntargets = []"));
     assert!(empty.contains("at least one target"), "{empty}");
+}
+
+/// The bake-off produced different orders per question type, so lane selection must be
+/// per type rather than one ranking applied to every request. A type-scoped lane must win
+/// over the general lane, and a request no lane covers must be refused rather than
+/// falling through to whichever lane is registered first.
+#[tokio::test]
+async fn a_type_scoped_lane_is_selected_for_its_own_kinds() {
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "q": {"type": "choice", "choice": "billing", "probabilities": {"billing": 1.0, "technical": 0.0}}
+            }
+        })))
+        .mount(&backend)
+        .await;
+    let runner = Runner::from_toml(&config(&backend.uri(), &backend.uri())).expect("deployment builds");
+
+    let choice = json!({
+        "model": "switchyard/choice",
+        "state": {"structured": true},
+        "questions": {"q": {"type": "choice", "instructions": "Pick", "criteria": {"billing": null, "technical": null}}}
+    });
+    let request = switchyard_server::decision_surface::CompatibilityDecisionRequest::from_value(&choice).and_then(switchyard_server::decision_surface::to_native).expect("native request");
+    let lane = runner
+        .lane_for_request(&request)
+        .expect("a choice request selects a lane");
+    assert_eq!(
+        lane.resolver.candidates.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        vec!["decision-span", "decision-laya"],
+        "the choice lane's own order is used, not the general lane's"
+    );
+
+    let noul = json!({
+        "model": "switchyard/noul",
+        "state": "plain",
+        "questions": {"q": {"type": "noul", "instructions": "Risky?"}}
+    });
+    let noul_request = switchyard_server::decision_surface::CompatibilityDecisionRequest::from_value(&noul).and_then(switchyard_server::decision_surface::to_native).expect("native request");
+    let noul_lane = runner
+        .lane_for_request(&noul_request)
+        .expect("a noul request selects a lane");
+    assert_eq!(
+        noul_lane.resolver.candidates.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        vec!["decision-laya", "decision-span"]
+    );
 }

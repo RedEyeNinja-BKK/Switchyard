@@ -298,7 +298,11 @@ impl DeploymentConfig {
         }
         let runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
-            .with_provider_api_keys(provider_api_keys);
+            .with_provider_api_keys(provider_api_keys)
+            .with_capabilities(capability::resolve(&capability::CapabilityDeployment {
+                clients: self.capability_clients.clone(),
+                capabilities: self.capabilities.clone(),
+            }));
         Ok(runner)
     }
 

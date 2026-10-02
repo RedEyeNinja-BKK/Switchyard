@@ -18,6 +18,8 @@ pub struct Runner {
     routes: Vec<(ModelId, Route)>,
     fallback_base_url: Option<String>,
     provider_api_keys: Vec<String>,
+    /// Specialized capability surfaces, keyed by the public id callers request.
+    capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -63,7 +65,27 @@ impl Runner {
             routes,
             fallback_base_url: None,
             provider_api_keys: Vec::new(),
+            capabilities: BTreeMap::new(),
         }
+    }
+
+    /// Registers the specialized capability surfaces a deployment exposes.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Resolves a caller-requested capability by its public id.
+    pub fn capability(&self, id: &str) -> Option<&crate::capability::ResolvedCapability> {
+        self.capabilities.get(id)
+    }
+
+    /// Every exposed capability, for advertising on `/v1/models`.
+    pub fn capabilities(&self) -> &BTreeMap<String, crate::capability::ResolvedCapability> {
+        &self.capabilities
     }
 
     /// Registers deployment-owned API keys for serving-surface output redaction.

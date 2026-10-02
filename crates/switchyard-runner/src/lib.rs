@@ -4,7 +4,7 @@
 //! Shared configured routing for Switchyard serving surfaces.
 
 mod algorithm;
-pub(crate) mod capability;
+pub mod capability;
 mod config;
 mod failure;
 mod provider_key_redactor;

@@ -4,6 +4,7 @@
 //! Rust HTTP server for libsy algorithms.
 
 mod capabilities;
+mod capability_surfaces;
 pub mod config;
 mod metrics;
 mod observability;
@@ -166,6 +167,10 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    /// HTTP clients for capability engines, one per declared timeout.
+    capability_http: capability_http::ClientSet,
+    /// Public ids of the capability surfaces this deployment exposes.
+    capability_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -203,6 +208,14 @@ impl SharedRoutingLog {
 }
 
 impl ServerState {
+    /// HTTP client for a capability engine with the declared deadline.
+    fn capability_http(
+        &self,
+        timeout_seconds: Option<u64>,
+    ) -> Result<reqwest::Client, String> {
+        self.capability_http.get(timeout_seconds)
+    }
+
     /// Creates HTTP-server state around an already configured runner.
     pub fn from_runner(runner: Runner) -> ServerResult<Self> {
         let metrics = metrics::registry().map_err(ServerError::new)?;
@@ -215,6 +228,7 @@ impl ServerState {
             runner.models().map(|model| model.algorithm),
         );
         let redactor = redaction::Redactor::new(runner.provider_api_keys());
+        let capability_ids: Vec<String> = runner.capabilities().keys().cloned().collect();
         Ok(Self {
             redactor: Arc::new(redactor),
             runner: Arc::new(runner),
@@ -223,6 +237,8 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            capability_http: capability_http::ClientSet::default(),
+            capability_ids,
         })
     }
 
@@ -496,6 +512,8 @@ pub fn build_llm_router(state: ServerState) -> Router {
 pub fn build_switchyard_router(state: ServerState) -> Router {
     let mut router = primary_llm_routes()
         .route("/v1/decision", post(decision))
+        .route("/v1/embeddings", post(capability_surfaces::embeddings))
+        .route("/v1/rerank", post(capability_surfaces::rerank))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route(
             "/v1/responses/input_tokens",
@@ -688,6 +706,45 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
         "upgrade",
     ] {
         headers.remove(name);
+    }
+}
+
+/// Lazily built HTTP clients for capability engines, keyed by their declared timeout.
+mod capability_http {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Default deadline for a capability call that declares none.
+    const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+
+    #[derive(Clone, Default)]
+    pub(super) struct ClientSet {
+        clients: std::sync::Arc<Mutex<HashMap<u64, reqwest::Client>>>,
+    }
+
+    impl ClientSet {
+        /// Returns a client for the declared timeout, building it once per timeout value.
+        pub(super) fn get(
+            &self,
+            timeout_seconds: Option<u64>,
+        ) -> Result<reqwest::Client, String> {
+            let seconds = timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+            let mut clients = self
+                .clients
+                .lock()
+                .map_err(|_| "capability http client set is poisoned".to_string())?;
+            if let Some(client) = clients.get(&seconds) {
+                return Ok(client.clone());
+            }
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(seconds))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| error.to_string())?;
+            clients.insert(seconds, client.clone());
+            Ok(client)
+        }
     }
 }
 
@@ -1668,6 +1725,8 @@ fn endpoint_listing(has_routing_log: bool) -> String {
         "  POST /v1/messages            Anthropic Messages",
         "  POST /v1/responses           OpenAI Responses",
         "  POST /v1/messages/count_tokens",
+        "  POST /v1/embeddings           capability: embedding spaces",
+        "  POST /v1/rerank               capability: reranking",
         "  POST /v1/responses/input_tokens",
         "  POST /v1/responses/compact",
         "  ANY  unmatched paths          optional fallback client",

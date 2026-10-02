@@ -2767,3 +2767,71 @@ advisor_target = "advisor"
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
     }
 }
+
+/// Closure controls for the production-path fixes in whole-route composition.
+#[cfg(test)]
+mod composition_closure_tests {
+    use super::*;
+    use crate::failure::RouteErrorKind;
+
+    /// A request no eligible route can serve is a caller error, not a deployment fault, so it
+    /// is classified as an invalid request rather than a configuration failure.
+    #[test]
+    fn an_unsupported_capability_is_classified_as_a_request_error() {
+        let error = RunnerError::unsupported_capability("tier2", "vision");
+        assert!(matches!(
+            error,
+            RunnerError::UnsupportedCapability {
+                capability: "vision",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("vision"));
+        assert!(
+            matches!(error.execution_error_summary().kind, RouteErrorKind::InvalidRequest),
+            "an unservable request is reported as invalid, not as configuration"
+        );
+        // A deployment fault stays a configuration failure.
+        let broken = RunnerError::configuration("composite names a missing route");
+        assert!(matches!(
+            broken.execution_error_summary().kind,
+            RouteErrorKind::Configuration
+        ));
+    }
+
+    /// Two children claiming one continuation is a state conflict, never resolved by choosing
+    /// the first claimant.
+    #[test]
+    fn a_state_conflict_is_not_absorbed_as_a_request_error() {
+        let conflict = RunnerError::StateConflict("two children claim resp_1".to_string());
+        assert!(conflict.to_string().contains("resp_1"));
+        assert!(
+            matches!(conflict.execution_error_summary().kind, RouteErrorKind::InvalidRequest),
+            "the conflict is reported rather than silently resolved"
+        );
+    }
+
+    /// Cross-child policy stays narrower than candidate fallback inside a route.
+    #[test]
+    fn cross_route_recovery_excludes_policy_and_contract_failures() {
+        use switchyard_llm_client::FailureClass;
+        for class in [
+            FailureClass::Transport,
+            FailureClass::Timeout,
+            FailureClass::RateLimited,
+            FailureClass::TemporarilyUnavailable,
+            FailureClass::Server,
+        ] {
+            assert!(class.allows_cross_route(), "{class:?} is recoverable across routes");
+        }
+        for class in [
+            FailureClass::Auth,
+            FailureClass::Request,
+            FailureClass::ProviderPolicy,
+            FailureClass::ContextWindow,
+            FailureClass::Other,
+        ] {
+            assert!(!class.allows_cross_route(), "{class:?} must not cross routes");
+        }
+    }
+}

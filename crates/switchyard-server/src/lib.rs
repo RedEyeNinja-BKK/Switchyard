@@ -793,6 +793,14 @@ async fn decision(
         .map(ModelId::from)
         .unwrap_or_default();
 
+    let Some(route) = state.route_for_model(&route) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route registered for model {route}"),
+            "model_not_found",
+            "model_not_found",
+        );
+    };
     let mut outcome = match route.decide(request).await {
         Ok(outcome) => outcome,
         Err(error) => return runner_error(error),
@@ -845,6 +853,15 @@ async fn anthropic_count_tokens(
     ) {
         Ok(resolved) => resolved,
         Err(response) => return anthropic_error_response(response),
+    };
+    // Token counting runs through one concrete target of a leaf route, so it resolves one here.
+    let Some(route) = state.route_for_model(&route) else {
+        return anthropic_error_response(error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route registered for model {route}"),
+            "model_not_found",
+            "model_not_found",
+        ));
     };
     anthropic_error_response(
         match route
@@ -910,6 +927,14 @@ async fn openai_responses_auxiliary(
     ) {
         Ok(resolved) => resolved,
         Err(response) => return render_error_response(response, WireFormat::OpenAiResponses),
+    };
+    let Some(route) = state.route_for_model(&route) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route registered for model {route}"),
+            "model_not_found",
+            "model_not_found",
+        );
     };
     let result = route.call_auxiliary(request, operation).await;
     render_error_response(
@@ -1026,7 +1051,7 @@ fn resolve_route(
     metadata: Metadata,
     mut body: Value,
     wire_format: WireFormat,
-) -> std::result::Result<(&Route, Request), Response> {
+) -> std::result::Result<(String, Request), Response> {
     // Only trusted translation hops may supply exact request preservation state.
     // Strip it before decoding and retaining the raw body for upstream replay.
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -1046,16 +1071,21 @@ fn resolve_route(
                 "invalid_request_error",
             )
         })?;
-    let route = state.route_for_model(&requested_model).ok_or_else(|| {
-        error_response(
+    // A composite is servable exactly like a leaf. Ingress reads the advertised capabilities
+    // (a leaf's own, or a composite's declared guarantee) and then hands execution to the
+    // runner seam, which resolves either kind without this crate choosing between them.
+    let Some(route_capabilities) = state.runner.route_capabilities(&requested_model) else {
+        return Err(error_response(
             StatusCode::NOT_FOUND,
             format!("No route registered for model {requested_model}"),
             "model_not_found",
             "model_not_found",
-        )
-    })?;
-    if let Err(RunnerError::IncompatibleCallerFormat(caller_auth)) =
-        route.check_caller_format(wire_format)
+        ));
+    };
+    if let Some(Err(RunnerError::IncompatibleCallerFormat(caller_auth))) =
+        state
+            .route_for_model(&requested_model)
+            .map(|route| route.check_caller_format(wire_format))
     {
         let (provider, expected_endpoint) = match caller_auth {
             CallerAuthKind::Anthropic => ("Anthropic", "/v1/messages"),
@@ -1071,7 +1101,7 @@ fn resolve_route(
         ));
     }
     if let Some(capability) =
-        request_fit::unsupported_capability(route.capabilities(), &llm_request, &body)
+        request_fit::unsupported_capability(route_capabilities, &llm_request, &body)
     {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -1087,7 +1117,9 @@ fn resolve_route(
         raw_request: Some(body),
         metadata: Some(metadata),
     };
-    Ok((route, request))
+    // The caller keeps the requested name, not a resolved leaf: the runner seam resolves leaf
+    // or composite at execution time.
+    Ok((requested_model, request))
 }
 
 /// Resolves and executes an LLM request, attaching route identity when durable logging is enabled.
@@ -1107,7 +1139,10 @@ async fn handle_llm_request(
     let routing_log_context = routing_log_context.map(|context| {
         context.with_route(
             request.llm_request.model.as_deref().unwrap_or_default(),
-            route.algorithm_name(),
+            state
+                .route_for_model(&route)
+                .map(|route| route.algorithm_name())
+                .unwrap_or("composite"),
         )
     });
     // Only the Codex namespace mapping is needed downstream, not the whole request.
@@ -1121,12 +1156,30 @@ async fn handle_llm_request(
     let route_id = request.llm_request.model.clone().unwrap_or_default();
     // Execution goes through the runner seam, so a composite route is served the same way
     // as a leaf without tier behaviour reaching this crate.
-    let output = match state
+    let execution = match state
         .runner
         .execute_route(&route_id, request, Some(observer))
         .await
     {
-        Ok(output) => output,
+        Ok(execution) => execution,
+        Err(RunnerError::UnsupportedCapability { model, capability }) => {
+            // A valid request that no eligible route can serve is the caller's problem, not a
+            // deployment fault, so it must not be reported as a server failure.
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("no eligible route for model {model:?}: requires {capability}"),
+                "invalid_request_error",
+                "unsupported_capability",
+            );
+        }
+        Err(RunnerError::StateConflict(message)) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                message,
+                "invalid_request_error",
+                "state_conflict",
+            );
+        }
         Err(error) => {
             if let RunnerError::Algorithm(LibsyError::ClientCall {
                 target,
@@ -1140,10 +1193,22 @@ async fn handle_llm_request(
             return runner_error(error);
         }
     };
+    // Composition context is carried alongside the answer for telemetry only. The child's own
+    // routing and observations are untouched, and the serving crate reconstructs nothing.
+    if let Some(composition) = execution.composition.as_ref() {
+        tracing::debug!(
+            parent_route = %composition.parent_route,
+            child_route = %composition.child_route,
+            final_target = %composition.final_target,
+            crossed_child = composition.crossed_child,
+            cross_child_reason = composition.cross_child_reason().as_deref().unwrap_or(""),
+            "whole-route composition",
+        );
+    }
     let RunOutput {
         selected_model,
         response,
-    } = output;
+    } = execution.output;
     // The response carries the candidate that actually served it. Fall back to the routing
     // selection for algorithms that return a response without an offloaded model call.
     let served_model = response.served_model().cloned().or(Some(selected_model));

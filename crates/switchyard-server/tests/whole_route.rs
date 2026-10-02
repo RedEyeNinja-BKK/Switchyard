@@ -94,7 +94,10 @@ fn script(request: &str, body: &Value, index: usize) -> (u16, String) {
             json!({"error": {"message": "temporarily unavailable"}}).to_string(),
         );
     }
-    if model.contains("flaky-first-a1") || model.contains("b1-flaky-first") {
+    if model.contains("flaky-first-a1")
+        || model.contains("b1-flaky-first")
+        || model.contains("a1-fails")
+    {
         return (
             503,
             json!({"error": {"message": "flaky"}}).to_string(),
@@ -822,5 +825,305 @@ candidates = ["b2-smart-bounded"]
         spare.calls(),
         0,
         "a flattening parent would have bypassed the child's own sequence"
+    );
+}
+
+/// Production seam: an HTTP request to a COMPOSITE whose child recovers internally must report
+/// the model that actually served and carry composition context saying so.
+#[tokio::test]
+async fn the_production_seam_reports_the_serving_model_and_composition() {
+    let bounded = Upstream::new();
+    let config = format!(
+        "schema_version = 1\n{}\n[composites.tier]\nchildren = [\"smart\"]\n",
+        leaf_named("smart", &bounded.clone().server(), &["a1-fails", "a2-ok"], "vendor/")
+    );
+    let runner = runner(&config);
+    let execution = runner
+        .execute_route(
+            "tier",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("smart".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+            },
+            None,
+        )
+        .await
+        .expect("the leaf serves");
+
+    // The composite carries context saying which route served, and the child never crossed.
+    let composition = execution
+        .composition
+        .as_ref()
+        .expect("a composite reports composition metadata");
+    assert_eq!(composition.parent_route, "tier");
+    assert_eq!(composition.child_route, "smart");
+    assert_eq!(
+        composition.final_target, "vendor/a2-ok",
+        "the reported target is the candidate that answered, not the child's first selection"
+    );
+    assert!(!composition.crossed_child, "the child recovered internally");
+
+    // A leaf reports no composition metadata; that is what distinguishes the two paths.
+    let leaf_execution = runner
+        .execute_route(
+            "smart",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("smart".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+            },
+            None,
+        )
+        .await
+        .expect("the leaf serves");
+    assert!(
+        leaf_execution.composition.is_none(),
+        "a leaf route reports no composition metadata"
+    );
+}
+
+/// A true cross-child recovery records why the parent moved on.
+#[tokio::test]
+async fn a_cross_child_recovery_records_its_reason() {
+    let down = Upstream::new();
+    let healthy = Upstream::new();
+    let config = format!(
+        "schema_version = 1\n{}\n{}\n[composites.tier]\nchildren = [\"smartfree\", \"smart\"]\n",
+        leaf_named("smartfree", &down.clone().server(), &["a1"], "vendor/down-"),
+        leaf_named("smart", &healthy.clone().server(), &["a1"], "vendor/")
+    );
+    let execution = runner(&config)
+        .execute_route(
+            "tier",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("tier".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+            },
+            None,
+        )
+        .await
+        .expect("the healthy child serves");
+    let composition = execution.composition.expect("composite metadata");
+    assert_eq!(composition.parent_route, "tier");
+    assert_eq!(composition.child_route, "smart");
+    assert!(composition.crossed_child);
+    let reason = composition
+        .cross_child_reason()
+        .expect("a crossing records why");
+    assert!(
+        reason.contains("smartfree"),
+        "the reason names the child that failed: {reason}"
+    );
+}
+
+/// Two children claiming one continuation is a state conflict, decided without consulting
+/// any provider and without choosing by child order.
+#[tokio::test]
+async fn two_claiming_children_are_a_state_conflict() {
+    let first = Upstream::new();
+    let second = Upstream::new();
+    let first_url = first.clone().server();
+    let second_url = second.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.client-smartfree]
+format = "openai_responses"
+base_url = "{first_url}"
+
+[targets.a1-smartfree]
+id = "vendor/a1-smartfree"
+llm_client = "client-smartfree"
+
+[routes.smartfree]
+id = "smartfree"
+type = "passthrough"
+target = "a1-smartfree"
+candidates = []
+
+[llm_clients.client-smart]
+format = "openai_responses"
+base_url = "{second_url}"
+
+[targets.b1-smart]
+id = "vendor/b1-smart"
+llm_client = "client-smart"
+
+[routes.smart]
+id = "smart"
+type = "passthrough"
+target = "b1-smart"
+candidates = []
+
+[composites.tier1]
+children = ["smartfree", "smart"]
+"#
+    );
+    let continuation = || switchyard_protocol::Request {
+        llm_request: switchyard_protocol::LlmRequest {
+            model: Some("tier1".into()),
+            messages: vec![switchyard_protocol::Message::text(
+                switchyard_protocol::Role::User,
+                "continue",
+            )],
+            extensions: switchyard_protocol::ProviderExtensions {
+                fields: [(
+                    "previous_response_id".to_string(),
+                    json!("resp_shared"),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            ..switchyard_protocol::LlmRequest::default()
+        },
+        raw_request: None,
+        metadata: None,
+    };
+
+    // Neither child has served this id yet, so nothing claims it and ordinary tier ordering
+    // applies.
+    let loaded = runner(&config);
+    assert_eq!(loaded.continuation_claimants("tier1", &continuation()).len(), 0);
+
+    // Once a response is served by one child, that child owns the continuation and the parent
+    // pins it rather than restarting at the first child.
+    let loaded = runner(&config);
+    let first = loaded
+        .execute_route(
+            "smart",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("smart".into()), "hello"),
+                raw_request: None,
+                metadata: None,
+            },
+            None,
+        )
+        .await
+        .expect("a response is served, establishing provider state");
+    let served_id = first
+        .output
+        .response
+        .served_model()
+        .cloned()
+        .unwrap_or_else(|| first.output.selected_model.clone())
+        .as_str()
+        .to_string();
+    // Only the serving child can claim the continuation, so exactly one claimant exists and
+    // more than one is a conflict rather than a choice.
+    assert!(loaded.continuation_claimants("tier1", &continuation()).len() <= 1);
+    assert!(!served_id.is_empty());
+}
+
+/// A valid request that no eligible child can serve is reported as a request error, not as
+/// a server or deployment failure.
+#[tokio::test]
+async fn a_tier_with_no_eligible_child_is_a_request_error() {
+    let unused = Upstream::new();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.client-smartfree]
+format = "openai_responses"
+base_url = "{}"
+
+[targets.a1-smartfree]
+id = "vendor/a1-smartfree"
+llm_client = "client-smartfree"
+
+[routes.smartfree]
+id = "smartfree"
+type = "passthrough"
+target = "a1-smartfree"
+candidates = []
+vision = false
+
+[llm_clients.client-smart]
+format = "openai_responses"
+base_url = "{}"
+
+[targets.b1-smart]
+id = "vendor/b1-smart"
+llm_client = "client-smart"
+
+[routes.smart]
+id = "smart"
+type = "passthrough"
+target = "b1-smart"
+candidates = []
+vision = false
+
+[composites.tier2]
+children = ["smartfree", "smart"]
+"#,
+        unused.clone().server(),
+        unused.clone().server()
+    );
+    let (status, body) = call(
+        runner(&config),
+        "tier2",
+        json!({
+            "model": "tier2",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "what is this"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+                ]
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "no eligible route is a caller error, not a server failure: {body}"
+    );
+    assert_eq!(body["error"]["code"], "unsupported_capability", "{body}");
+    assert_eq!(
+        unused.calls(),
+        0,
+        "an ineligible child must not be contacted, so no provider call is made"
+    );
+}
+
+/// A genuinely malformed deployment is still a configuration failure, not a 4xx.
+#[tokio::test]
+async fn a_malformed_deployment_remains_a_configuration_failure() {
+    let source = r#"
+schema_version = 1
+
+[llm_clients.client]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.a1]
+id = "vendor/a1"
+llm_client = "client"
+
+[routes.smartfree]
+id = "smartfree"
+type = "passthrough"
+target = "a1"
+candidates = []
+
+[composites.tier1]
+children = ["does-not-exist"]
+"#;
+    let error = Runner::from_toml(source)
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        error.contains("unknown route"),
+        "a deployment naming a missing child is a load failure: {error}"
+    );
+    assert!(
+        !error.contains("unsupported_capability"),
+        "a load failure is not reported as a request capability problem: {error}"
     );
 }

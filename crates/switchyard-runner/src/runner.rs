@@ -235,6 +235,14 @@ impl Runner {
         self
     }
 
+    /// The capabilities any servable route advertises.
+    ///
+    /// A composite is servable and declares its own guarantee, so ingress resolves it the same
+    /// way it resolves a leaf. Returns `None` only when nothing is registered under the name.
+    pub fn has_route(&self, route_id: &str) -> bool {
+        self.route_capabilities(route_id).is_some()
+    }
+
     /// The capabilities a route advertises: a composite's declared promise, or a leaf's.
     pub fn route_capabilities(&self, route_id: &str) -> Option<ModelCapabilities> {
         if let Some(capabilities) = self.composite_capabilities.get(route_id) {

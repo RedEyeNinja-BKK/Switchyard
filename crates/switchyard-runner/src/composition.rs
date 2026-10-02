@@ -76,6 +76,48 @@ pub struct CompositeOutput {
     pub crossed_child: bool,
 }
 
+/// What one execution did, including composition context when a composite served it.
+///
+/// A leaf carries no composition metadata. A composite carries enough to reconstruct what
+/// happened without asking the server to infer it: which route was invoked, which child
+/// answered, which model actually served, and why each other child was not used.
+/// The served answer is owned rather than cloned, because it holds a live response.
+pub struct ExecutionOutput {
+    /// The served answer.
+    pub output: RunOutput,
+    /// Composition context, when the route was a composite.
+    pub composition: Option<CompositionMetadata>,
+}
+
+/// Composition context for one composite execution.
+#[derive(Clone, Debug)]
+pub struct CompositionMetadata {
+    /// The composite route that was invoked.
+    pub parent_route: String,
+    /// The child that served the request.
+    pub child_route: String,
+    /// The model that actually served, which may differ from the child's first selection.
+    pub final_target: String,
+    /// What happened at each child, in order.
+    pub children: Vec<(String, ChildOutcome)>,
+    /// Whether a serving failure moved the request to a later child.
+    pub crossed_child: bool,
+    /// Why the request crossed children, when it did.
+    pub cross_child_reason: Option<String>,
+}
+
+impl CompositionMetadata {
+    /// The reason a child was skipped or failed, for a single stage.
+    pub fn cross_child_reason(&self) -> Option<String> {
+        self.cross_child_reason.clone().or_else(|| {
+            self.children
+                .iter()
+                .find(|(_, outcome)| outcome.reason() != "served")
+                .map(|(name, outcome)| format!("{name}:{}", outcome.reason()))
+        })
+    }
+}
+
 /// Which route a request resolved to, and whether it was composite.
 pub enum Selection<'a> {
     /// A leaf route with its own native behaviour.
@@ -94,13 +136,26 @@ impl Runner {
         route_id: &str,
         request: Request,
         observer: Option<switchyard_llm_client::RunObserver>,
-    ) -> Result<RunOutput, RunnerError> {
+    ) -> Result<ExecutionOutput, RunnerError> {
         match self.select(route_id)? {
-            Selection::Leaf(route) => route.execute(request, observer).await,
-            Selection::Composite(_) => self
-                .execute_composite(route_id, request, observer)
-                .await
-                .map(|composed| composed.output),
+            Selection::Leaf(route) => Ok(ExecutionOutput {
+                output: route.execute(request, observer).await?,
+                composition: None,
+            }),
+            Selection::Composite(_) => {
+                let composed = self.execute_composite(route_id, request, observer).await?;
+                Ok(ExecutionOutput {
+                    output: composed.output,
+                    composition: Some(CompositionMetadata {
+                        parent_route: composed.parent_route,
+                        child_route: composed.child_route,
+                        final_target: composed.final_target,
+                        children: composed.children,
+                        crossed_child: composed.crossed_child,
+                        cross_child_reason: None,
+                    }),
+                })
+            }
         }
     }
 
@@ -122,7 +177,17 @@ impl Runner {
         // at the first child would either lose the conversation or silently serve it from a
         // provider that cannot reconstruct it, so the owning child is pinned and its own
         // failure surfaces instead of being absorbed elsewhere.
-        let owner = self.continuation_owner(parent_route, &request);
+        let claimants = self.continuation_claimants(parent_route, &request);
+        if claimants.len() > 1 {
+            // Two children claim the same provider state. Choosing by child order would make
+            // the outcome depend on configuration order, so this is reported instead and no
+            // provider is contacted.
+            return Err(RunnerError::StateConflict(format!(
+                "composite route {parent_route} has children claiming the same continuation: {}",
+                claimants.join(", ")
+            )));
+        }
+        let owner = claimants.into_iter().next();
         let order: Vec<&String> = match owner.as_ref() {
             Some(owner) => {
                 let owned: Vec<&String> = spec
@@ -168,23 +233,28 @@ impl Runner {
             let child_request = request.clone();
             match route.execute(child_request, observer.clone()).await {
                 Ok(output) => {
+                    // The response names the candidate that actually served it, which is not
+                    // always the one the child selected: after the child's own fallback a later
+                    // target may have answered. The routing selection is the fallback only when
+                    // the response carries no served model.
+                    let final_target = output
+                        .response
+                        .served_model()
+                        .cloned()
+                        .unwrap_or_else(|| output.selected_model.clone())
+                        .as_str()
+                        .to_string();
                     children.push((
                         child_name.clone(),
                         ChildOutcome::Served {
-                            target: output.selected_model.as_str().to_string(),
+                            target: final_target.clone(),
                         },
                     ));
                     return Ok(CompositeOutput {
                         output,
                         parent_route: parent_route.to_string(),
                         child_route: child_name.clone(),
-                        final_target: children
-                            .last()
-                            .and_then(|(_, outcome)| match outcome {
-                                ChildOutcome::Served { target } => Some(target.clone()),
-                                _ => None,
-                            })
-                            .unwrap_or_default(),
+                        final_target,
                         children,
                         crossed_child: crossed,
                     });
@@ -217,8 +287,17 @@ impl Runner {
             }
         }
 
+        // Nothing answered. If no child was even eligible, the request itself asks for
+        // something no child can serve, which is the caller's problem rather than a
+        // deployment fault.
+        if let Some(capability) = children.iter().find_map(|(_, outcome)| match outcome {
+            ChildOutcome::Skipped { capability } => Some(*capability),
+            _ => None,
+        }) {
+            return Err(RunnerError::unsupported_capability(parent_route, capability));
+        }
         Err(last_error.unwrap_or_else(|| {
-            RunnerError::configuration("composite route has no eligible child".to_string())
+            RunnerError::unsupported_capability(parent_route, "an eligible route")
         }))
     }
 
@@ -230,6 +309,29 @@ impl Runner {
         self.route(route_id)
             .map(Selection::Leaf)
             .ok_or_else(|| RunnerError::UnknownRouteModel(route_id.to_string()))
+    }
+
+    /// Every child that holds provider state for this request.
+    ///
+    /// More than one claimant is a state conflict, not a choice: the parent must not pick by
+    /// child order.
+    pub fn continuation_claimants(
+        &self,
+        parent_route: &str,
+        request: &Request,
+    ) -> Vec<String> {
+        let Ok(Selection::Composite(spec)) = self.select(parent_route) else {
+            return Vec::new();
+        };
+        spec.children
+            .iter()
+            .filter(|child| {
+                self.route(child)
+                    .and_then(|route| route.continuation_owner(request))
+                    .is_some()
+            })
+            .cloned()
+            .collect()
     }
 
     /// The child route that holds provider state for this request, if any.

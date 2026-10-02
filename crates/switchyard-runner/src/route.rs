@@ -76,6 +76,18 @@ pub enum RunnerError {
     },
     #[error("unknown route model {0:?}")]
     UnknownRouteModel(String),
+    /// Two children of one composite claim the same provider state for a request.
+    ///
+    /// Picking by child order would make the outcome depend on configuration order, so the
+    /// conflict is reported and no provider is contacted.
+    #[error("conflicting provider state: {0}")]
+    StateConflict(String),
+    /// A request is valid, but no eligible route can satisfy a capability it requires.
+    ///
+    /// This is the caller's request, not a deployment fault, so it is kept distinct from
+    /// [`Self::Configuration`] and reported as a 4xx rather than a server failure.
+    #[error("no eligible route for model {model:?}: requires {capability}")]
+    UnsupportedCapability { model: String, capability: &'static str },
     #[error("caller format is incompatible with {} credentials", .0.as_str())]
     IncompatibleCallerFormat(CallerAuthKind),
     #[error("route has no compatible target for the auxiliary operation")]
@@ -87,6 +99,13 @@ pub enum RunnerError {
 }
 
 impl RunnerError {
+    pub(crate) fn unsupported_capability(model: impl Into<String>, capability: &'static str) -> Self {
+        Self::UnsupportedCapability {
+            model: model.into(),
+            capability,
+        }
+    }
+
     pub(crate) fn configuration(message: impl Into<String>) -> Self {
         Self::Configuration {
             message: message.into(),

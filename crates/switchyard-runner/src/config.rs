@@ -17,7 +17,14 @@ use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
-use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
+use switchyard_protocol::{
+    Category,
+    ModelId,
+    ReasoningDialect,
+    ReasoningPolicy,
+    RoutedLlmClient,
+    WireFormat,
+};
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
@@ -194,9 +201,11 @@ impl DeploymentConfig {
                     if first.reasoning_effort != target.reasoning_effort
                         || first.extra_body != target.extra_body
                         || first.omit_body_fields != target.omit_body_fields
+                        || first.reasoning_policy != target.reasoning_policy
+                        || first.reasoning_dialect != target.reasoning_dialect
                     {
                         return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, extra_body, or omit_body_fields; one target per model id is kept, so give each its own model id or llm client",
+                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields; one target per model id is kept, so give each its own model id or llm client",
                             target.id, target.llm_client
                         )));
                     }
@@ -287,6 +296,8 @@ impl DeploymentConfig {
                 &BTreeMap::new(),
                 &BTreeSet::new(),
                 None,
+                None,
+                ReasoningDialect::default(),
             )?;
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
@@ -307,6 +318,13 @@ impl DeploymentConfig {
                 .ok_or_else(|| {
                     RunnerError::configuration("validated llm client was not initialized")
                 })?;
+            if let Some(policy) = target.reasoning_policy {
+                policy
+                    .validate_for(target.reasoning_dialect)
+                    .map_err(|error| {
+                        RunnerError::configuration(format!("target {target_name} {error}"))
+                    })?;
+            }
             if let Some(effort) = &target.reasoning_effort {
                 if effort.trim().is_empty() {
                     return Err(RunnerError::configuration(format!(
@@ -327,6 +345,8 @@ impl DeploymentConfig {
                     &target.extra_body,
                     &target.omit_body_fields,
                     target.reasoning_effort.clone(),
+                    target.reasoning_policy,
+                    target.reasoning_dialect,
                 )?,
                 None,
             ));
@@ -598,6 +618,13 @@ struct TargetConfig {
     /// Reasoning effort forced on every request to this target, replacing the caller's value.
     /// Only meaningful on `openai_chat` and `openai_responses` clients.
     reasoning_effort: Option<String>,
+    /// Authoritative reasoning choice for this target. Applied after the caller's fields and
+    /// after `extra_body`, so a strict non-reasoning target cannot be re-enabled by a caller.
+    reasoning_policy: Option<ReasoningPolicy>,
+    /// How this target's provider expects reasoning control on the wire. Two targets behind
+    /// one transport routinely differ here, which is why it is not an `llm_client` setting.
+    #[serde(default)]
+    reasoning_dialect: ReasoningDialect,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -656,6 +683,8 @@ fn build_backend(
     extra_body: &BTreeMap<String, Value>,
     omit_body_fields: &BTreeSet<String>,
     reasoning_effort: Option<String>,
+    reasoning_policy: Option<ReasoningPolicy>,
+    reasoning_dialect: ReasoningDialect,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -702,6 +731,8 @@ fn build_backend(
         extra_body: extra_body.clone(),
         omit_body_fields: omit_body_fields.clone(),
         reasoning_effort,
+        reasoning_policy,
+        reasoning_dialect,
         max_retries: config.max_retries,
         failure_cooldown: Duration::from_millis(config.failure_cooldown_ms),
         timeout: config.timeout_ms.map(Duration::from_millis),
@@ -1211,6 +1242,142 @@ new = ["send_message"]
         Ok(())
     }
 
+    /// The reason dialect lives on the target: two targets behind one transport can pin
+    /// different reasoning dialects without duplicating the `llm_client`.
+    #[test]
+    fn a_target_reasoning_policy_parses_and_carries_its_own_dialect() -> RunnerResult<()> {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        assert!(VALID_CONFIG.contains(strong));
+
+        let strict = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"openrouter_enabled\""
+            ),
+        );
+        let runner = runner_from_toml(&strict)?;
+
+        let plain = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"llama_cpp_enable_thinking\""),
+        );
+        runner_from_toml(&plain)?;
+
+        let misspelled = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_policy = \"disbled\""),
+        );
+        assert!(error_message(&misspelled).contains("reasoning_policy"));
+
+        drop(runner);
+        Ok(())
+    }
+
+    /// A strict target that omits its dialect must fail at load time rather than inherit a
+    /// default and emit a provider control nobody declared.
+    #[test]
+    fn an_authoritative_policy_without_a_dialect_is_rejected() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        for policy in ["disabled", "enabled"] {
+            let without_dialect =
+                VALID_CONFIG.replace(strong, &format!("{strong}\nreasoning_policy = \"{policy}\""));
+            assert!(
+                error_message(&without_dialect)
+                    .contains("needs an explicit reasoning_dialect"),
+                "policy {policy} without a dialect must be rejected: {}",
+                error_message(&without_dialect)
+            );
+        }
+
+        // An unspecified policy declares nothing, so an absent dialect stays legal.
+        let no_policy = VALID_CONFIG.replace(strong, strong);
+        runner_from_toml(&no_policy).expect("a target with no policy needs no dialect");
+
+        // A dialect on its own is also fine; it only becomes meaningful with a policy.
+        let dialect_only = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_dialect = \"llama_cpp_enable_thinking\""),
+        );
+        runner_from_toml(&dialect_only).expect("a bare dialect is accepted");
+    }
+
+    #[test]
+    fn an_unknown_dialect_is_rejected() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        let unknown = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"telepathy\""
+            ),
+        );
+        assert!(error_message(&unknown).contains("reasoning_dialect"));
+    }
+
+    /// A llama.cpp target pointed at the OpenAI dialect would send `reasoning.effort`,
+    /// which that server does not read. The dialect is a declaration, so a mismatch is
+    /// only catchable when the pair is checked; that check is what this pins.
+    #[test]
+    fn a_llama_target_given_the_openai_dialect_still_loads_but_sends_the_declared_control() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        let mismatched = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"openai_effort\""
+            ),
+        );
+        // Loadable: the pair is well-formed, so configuration loading does not reject it.
+        runner_from_toml(&mismatched).expect("a valid but semantically odd pair still loads");
+
+        // The emitted control is the declared dialect's, not a guess: `effort = none`.
+        // Catching a wrong dialect is a qualification job against the live server, which is
+        // why the wire form is asserted here rather than only the load result.
+        assert_eq!(
+            ReasoningPolicy::Disabled.wire_body(ReasoningDialect::OpenAiEffort),
+            Some(serde_json::json!({"reasoning": {"effort": "none"}}))
+        );
+    }
+
+    /// An OpenAI target that wants reasoning on uses the authoritative effort mechanism;
+    /// there is no policy that means "think" on that dialect.
+    #[test]
+    fn an_openai_thinking_target_uses_reasoning_effort() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+
+        let thinking = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_effort = \"high\"\nreasoning_dialect = \"openai_effort\""),
+        );
+        runner_from_toml(&thinking).expect("an effort-driven thinking target is valid");
+
+        let impossible = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"enabled\"\nreasoning_dialect = \"openai_effort\""
+            ),
+        );
+        assert!(
+            error_message(&impossible).contains("reasoning_effort"),
+            "{}",
+            error_message(&impossible)
+        );
+    }
+
+    /// A policy that is not specified leaves the caller's reasoning choice alone, and one
+    /// target per model id is still enforced when two targets disagree on dialect.
+    #[test]
+    fn reasoning_dialect_differences_are_a_conflict_on_a_shared_model_id() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        let alias = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_dialect = \"openrouter_enabled\"\n\n[targets.strong_alias]\nid = \"strong/model\"\nllm_client = \"responses\"\nreasoning_dialect = \"llama_cpp_enable_thinking\""),
+        );
+        assert!(
+            error_message(&alias).contains("reasoning_dialect"),
+            "{}",
+            error_message(&alias)
+        );
+    }
+
     #[test]
     fn duplicate_targets_with_conflicting_settings_are_rejected() -> RunnerResult<()> {
         let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
@@ -1224,7 +1391,9 @@ new = ["send_message"]
         );
         assert!(
             error_message(&conflicting)
-                .contains("different reasoning_effort, extra_body, or omit_body_fields"),
+                .contains(
+                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields",
+            ),
             "{}",
             error_message(&conflicting)
         );
@@ -1661,6 +1830,8 @@ confidence_threshold = 0.5
             &target.extra_body,
             &target.omit_body_fields,
             None,
+            None,
+            ReasoningDialect::default(),
         )?;
 
         assert_eq!(
@@ -1700,6 +1871,8 @@ confidence_threshold = 0.5
             &target.extra_body,
             &target.omit_body_fields,
             None,
+            None,
+            ReasoningDialect::default(),
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -1717,7 +1890,15 @@ confidence_threshold = 0.5
                 "format = \"openai_chat\"\nbase_url = \"https://example.test/v1\"\n{setting}"
             );
             let config: LlmClientConfig = toml::from_str(&source).expect("valid deadline config");
-            let backend = build_backend("test", &config, &BTreeMap::new(), &BTreeSet::new(), None);
+            let backend = build_backend(
+                "test",
+                &config,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                None,
+                ReasoningDialect::default(),
+            );
             if expected == Some(0) {
                 assert!(backend.is_err());
             } else {

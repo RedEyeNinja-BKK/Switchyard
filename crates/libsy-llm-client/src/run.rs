@@ -923,6 +923,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
     use async_trait::async_trait;
     use futures::StreamExt;
     use http::StatusCode;
@@ -1230,6 +1231,8 @@ mod tests {
                         extra_body: BTreeMap::from([("store".to_string(), json!(store))]),
                         omit_body_fields: BTreeSet::new(),
                         reasoning_effort: None,
+                        reasoning_policy: None,
+                        reasoning_dialect: ReasoningDialect::default(),
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
                         timeout: None,
@@ -1377,6 +1380,8 @@ mod tests {
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
                     reasoning_effort: None,
+                    reasoning_policy: None,
+                    reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
                     timeout: None,
@@ -2052,6 +2057,8 @@ mod tests {
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
                     reasoning_effort: None,
+                    reasoning_policy: None,
+                    reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 2,
                     failure_cooldown: cooldown,
                     timeout: None,
@@ -2173,6 +2180,8 @@ mod tests {
                 extra_body: BTreeMap::new(),
                 omit_body_fields: BTreeSet::new(),
                 reasoning_effort: None,
+                reasoning_policy: None,
+                reasoning_dialect: ReasoningDialect::default(),
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
                 timeout: None,

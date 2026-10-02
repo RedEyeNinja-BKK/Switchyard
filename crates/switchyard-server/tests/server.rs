@@ -23,7 +23,7 @@ use switchyard_llm_client::{
     Backend, ClientRouter, HttpBackendConfig, ModelConfig, TranslatingLlmClient,
 };
 use switchyard_protocol::RoutedLlmClient;
-use switchyard_protocol::{Category, ModelId, WireFormat};
+use switchyard_protocol::{Category, ModelId, ReasoningDialect, WireFormat};
 use switchyard_runner::{DecisionTarget, ModelCapabilities, Route, Runner, RuntimeModels};
 use switchyard_server::config::load_server_state;
 use switchyard_server::{
@@ -757,6 +757,8 @@ fn random_state_with_retries(
         extra_body: BTreeMap::new(),
         omit_body_fields: BTreeSet::new(),
         reasoning_effort: None,
+        reasoning_policy: None,
+        reasoning_dialect: ReasoningDialect::default(),
         max_retries,
         failure_cooldown: std::time::Duration::ZERO,
         timeout: None,

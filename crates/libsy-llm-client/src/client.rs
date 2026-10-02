@@ -288,6 +288,10 @@ impl TranslatingLlmClient {
         // After the merge on purpose: the effort override must win over both the caller's
         // value and any `reasoning` default a target set through `extra_body`.
         apply_reasoning_effort(&mut body, backend);
+        // Last, because the policy is the target's authoritative choice. `extra_body` only
+        // fills keys the request omits, so a caller that set `reasoning` or
+        // `chat_template_kwargs` would otherwise re-enable reasoning on a strict target.
+        apply_reasoning_policy(&mut body, backend);
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -1176,6 +1180,46 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
     }
 }
 
+/// Forces the backend's authoritative reasoning policy onto the outbound body.
+///
+/// Unlike `extra_body`, this is an override: a strict non-reasoning target must not be
+/// re-enabled by a caller that sent its own `reasoning` field. Provider-shaped keys are
+/// merged one level deep so unrelated caller fields (`reasoning.summary`, say) survive.
+fn apply_reasoning_policy(body: &mut Value, backend: &Backend) {
+    let Some(policy) = backend.reasoning_policy() else {
+        return;
+    };
+    if !policy.is_specified() {
+        return;
+    }
+    let Some(fragment) = policy.wire_body(backend.reasoning_dialect()) else {
+        return;
+    };
+    let (Value::Object(fragment), Value::Object(object)) = (&fragment, body) else {
+        return;
+    };
+    for (key, value) in fragment {
+        match value {
+            Value::Object(fields) => {
+                let existing = object
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if !existing.is_object() {
+                    *existing = Value::Object(Default::default());
+                }
+                if let Value::Object(existing) = existing {
+                    for (name, field) in fields {
+                        existing.insert(name.clone(), field.clone());
+                    }
+                }
+            }
+            _ => {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 // Applies target defaults without overriding fields supplied by the caller.
 fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     let Value::Object(object) = body else {
@@ -1335,6 +1379,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
     use crate::backend::HttpBackendConfig;
 
     fn config(base_url: &str) -> HttpBackendConfig {
@@ -1346,6 +1391,8 @@ mod tests {
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
+            reasoning_policy: None,
+            reasoning_dialect: ReasoningDialect::default(),
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
@@ -1472,6 +1519,22 @@ mod tests {
     fn responses_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.reasoning_effort = Some(effort.to_string());
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
+    }
+
+    fn responses_map_with_policy(base_url: &str, policy: ReasoningPolicy) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        // An `extra_body` default that the caller will try to override.
+        backend.extra_body = BTreeMap::from([(
+            "reasoning".to_string(),
+            json!({"enabled": true}),
+        )]);
+        backend.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+        backend.reasoning_policy = Some(policy);
         vec![ModelConfig::new(
             "gpt",
             Backend::OpenAiResponses(backend),
@@ -2057,6 +2120,55 @@ mod tests {
                     "model": "client-facing",
                     "input": [{"role": "user", "content": "hi"}],
                     "reasoning": {"effort": "high", "summary": "auto"}
+                }),
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A target reasoning policy is authoritative: it replaces whatever the caller sent
+    /// *and* any conflicting `extra_body` default. `extra_body` alone cannot express this,
+    /// because it only fills keys the request omits (`merge_extra_body`), so a caller that
+    /// sets `reasoning` would silently re-enable reasoning on a strict-NT target.
+    #[tokio::test]
+    async fn reasoning_policy_overrides_caller_and_extra_body()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "gpt",
+                "reasoning": {"enabled": false}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_policy(
+            &format!("{}/v1", server.uri()),
+            ReasoningPolicy::Disabled,
+        ))?;
+        client
+            .call_rewrite_model_raw(
+                json!({
+                    "model": "client-facing",
+                    "input": [{"role": "user", "content": "hi"}],
+                    "reasoning": {"enabled": true, "effort": "high"}
                 }),
                 None,
                 Some(&ModelId::from("gpt")),

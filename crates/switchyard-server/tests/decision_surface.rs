@@ -62,6 +62,9 @@ decision_base_url = "{alpha_url}"
 decision_api_key_env = "TEST_KEY"
 supported_types = {{ noul = true, choice = false, score = false }}
 state_forms = {{ plain_string = true, structured = false }}
+
+[decision_lanes.default]
+targets = ["decision-laya", "decision-span"]
 "#
     )
 }
@@ -107,7 +110,7 @@ async fn a_typed_noul_request_is_served_through_the_lane() {
         router,
         "/v1/decisions",
         json!({
-            "model": "switchyard-decision-default",
+            "model": "default",
             "state": "reviewing a tool output",
             "questions": {
                 "risk": {
@@ -154,7 +157,7 @@ async fn a_choice_request_reaches_the_full_type_backend() {
         router,
         "/v1/decisions",
         json!({
-            "model": "switchyard-decision-default",
+            "model": "default",
             "state": "a ticket needs triage",
             "questions": {
                 "team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": null, "technical": null}}
@@ -198,7 +201,7 @@ async fn a_score_request_keeps_its_estimate_and_distribution() {
         router,
         "/v1/decisions",
         json!({
-            "model": "switchyard-decision-default",
+            "model": "default",
             "state": "a ticket needs triage",
             "questions": {
                 "severity": {"type": "score", "instructions": "Rate it", "criteria": ["low", "medium", "high"]}
@@ -236,7 +239,7 @@ async fn an_out_of_bounds_request_reaches_no_backend() {
         router,
         "/v1/decisions",
         json!({
-            "model": "switchyard-decision-default",
+            "model": "default",
             "state": "state",
             "questions": {
                 "wide": {
@@ -266,7 +269,7 @@ async fn a_malformed_compatibility_body_is_refused() {
         router.clone(),
         "/v1/decisions",
         json!({
-            "model": "switchyard-decision-default",
+            "model": "default",
             "state": "state",
             "questions": {"q": {"type": "vibe", "instructions": "?"}}
         }),
@@ -328,4 +331,182 @@ async fn the_upstream_routing_preview_is_unchanged() {
         body.get("selected").is_some() || body.get("model").is_some(),
         "the preview answers with routing information: {body}"
     );
+}
+/// A provider outage must not be reported to the caller as a malformed request. These
+/// assert the externally visible status, since that is what a consumer reacts to.
+#[tokio::test]
+async fn a_backend_outage_is_service_unavailable_not_bad_request() {
+    // Every configured backend times out at the transport: nothing is reachable.
+    let unreachable = "http://127.0.0.1:1";
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(unreachable, unreachable)).await;
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "default",
+            "state": "a plain state",
+            "questions": {"risk": {"type": "noul", "instructions": "Risky?"}}
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an exhausted lane is unavailable, not a caller error: {body}"
+    );
+}
+
+/// A 503 from the provider is likewise an availability problem.
+#[tokio::test]
+async fn a_provider_503_is_service_unavailable() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "down"})))
+        .mount(&backend)
+        .await;
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "default",
+            "state": "a plain state",
+            "questions": {"risk": {"type": "noul", "instructions": "Risky?"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+/// An unknown identity is a missing model, not an outage and not a bad request body.
+#[tokio::test]
+async fn an_unknown_identity_is_not_found_and_dispatches_nothing() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&backend)
+        .await;
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "decision-does-not-exist",
+            "state": "a plain state",
+            "questions": {"risk": {"type": "noul", "instructions": "Risky?"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("TargetNotFound")),
+        "{body}"
+    );
+}
+
+/// Naming a configured backend directly serves that backend alone.
+#[tokio::test]
+async fn a_concrete_target_is_served_without_touching_the_rest_of_the_lane() {
+    let laya = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.7}}
+        })))
+        .expect(0)
+        .mount(&laya)
+        .await;
+    let span = MockServer::start().await;
+    // SPAN answers noul, so naming it serves SPAN and never consults the rest of the
+    // lane, even though Laya is first in the configured order.
+    Mock::given(method("POST"))
+        .and(path("/api/alpha/decisions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.31}}
+        })))
+        .expect(1)
+        .mount(&span)
+        .await;
+
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(&laya.uri(), &span.uri())).await;
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "decision-span",
+            "state": "a plain state",
+            "questions": {"risk": {"type": "noul", "instructions": "Risky?"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["backend"], "decision-span", "the named backend answered");
+    assert_eq!(body["answers"]["risk"]["noul"], 0.31);
+}
+
+/// A lane listing a target twice, an unknown target, or a non-decision target is a
+/// configuration error, caught at load rather than at the first request.
+#[tokio::test]
+async fn an_invalid_lane_is_rejected_at_load() {
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let base = |lane: &str| {
+        format!(
+            r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[targets.decision-laya]
+id = "laya-rl-agent"
+llm_client = "responses"
+decision_transport = "system_one"
+decision_api_key_env = "TEST_KEY"
+
+{lane}
+"#
+        )
+    };
+    let message = |source: &str| {
+        Runner::from_toml(source)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+    };
+
+    let duplicate = message(&base(
+        "[decision_lanes.default]\ntargets = [\"decision-laya\", \"decision-laya\"]",
+    ));
+    assert!(duplicate.contains("more than once"), "{duplicate}");
+
+    let unknown = message(&base(
+        "[decision_lanes.default]\ntargets = [\"decision-nope\"]",
+    ));
+    assert!(unknown.contains("unknown target"), "{unknown}");
+
+    let not_a_decision = message(&base("[decision_lanes.default]\ntargets = [\"only\"]"));
+    assert!(
+        not_a_decision.contains("not a decision target"),
+        "{not_a_decision}"
+    );
+
+    let empty = message(&base("[decision_lanes.default]\ntargets = []"));
+    assert!(empty.contains("at least one target"), "{empty}");
 }

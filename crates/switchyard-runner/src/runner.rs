@@ -22,6 +22,8 @@ pub struct Runner {
     capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
     /// The default logical decision lane, shared by every route's decision calls.
     decision_lane: Option<std::sync::Arc<crate::decision_executor::DecisionResolver>>,
+    /// The configured name of that lane, so a caller can address it explicitly.
+    decision_lane_name: Option<String>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -81,16 +83,24 @@ impl Runner {
             provider_api_keys: Vec::new(),
             capabilities: BTreeMap::new(),
             decision_lane: None,
+            decision_lane_name: None,
         }
     }
 
     /// Registers the default logical decision lane, used by the compatibility surface.
     pub fn with_decision_lane(
         mut self,
+        name: impl Into<String>,
         lane: std::sync::Arc<crate::decision_executor::DecisionResolver>,
     ) -> Self {
+        self.decision_lane_name = Some(name.into());
         self.decision_lane = Some(lane);
         self
+    }
+
+    /// The configured name of the default decision lane.
+    pub fn decision_lane_name(&self) -> Option<&str> {
+        self.decision_lane_name.as_deref()
     }
 
     /// The default logical decision lane, when the deployment configures one.

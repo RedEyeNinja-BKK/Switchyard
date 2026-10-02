@@ -9,8 +9,10 @@
 
 use serde_json::{Value, json};
 use switchyard_protocol::{ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest, DecisionValue};
+use switchyard_runner::Runner;
 use switchyard_runner::decision_executor::{
-    DecisionCandidate, DecisionFailure, DecisionResolver, DecisionSkip, resolve_and_serve,
+    DecisionCandidate, DecisionFailure, DecisionIdentity, DecisionResolver, DecisionSkip,
+    resolve_and_serve, resolve_identity,
 };
 use switchyard_runner::decision_transport::{
     DecisionTransport, StateForms, SupportedTypes, parse_response,
@@ -526,4 +528,120 @@ async fn an_upstream_error_does_not_expose_the_credential() {
     .expect_err("a 500 with no healthy backend is a failure");
     let rendered = format!("{failure:?}");
     assert!(!rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"), "{rendered}");
+}
+
+/// An unknown identity must fail closed: nothing is dispatched, and the failure is
+/// terminal rather than falling through to whichever backend exists.
+#[tokio::test]
+async fn an_unknown_decision_identity_dispatches_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let resolver = DecisionResolver {
+        candidates: vec![local_backend(server.uri())],
+    };
+    let failure = resolve_identity(&resolver, Some("default"), "decision-does-not-exist")
+        .expect_err("an unknown identity is not a lane");
+    assert_eq!(
+        failure,
+        DecisionFailure::NotEligible(DecisionSkip::TargetNotFound)
+    );
+    assert!(!failure.try_next());
+
+    // The lane is reachable only by its explicit name.
+    assert_eq!(
+        resolve_identity(&resolver, Some("default"), "default"),
+        Ok(DecisionIdentity::Lane)
+    );
+    assert_eq!(
+        resolve_identity(&resolver, Some("default"), "laya"),
+        Ok(DecisionIdentity::Target("laya"))
+    );
+}
+
+/// Explicit lane order must survive parsing and reach the resolver unchanged. A lane
+/// whose order merely happened to match sorted target names would still pass a test
+/// that only checked membership, so the sequence itself is asserted.
+#[tokio::test]
+async fn lane_order_is_explicit_and_preserved() {
+    let local = MockServer::start().await;
+    let remote = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/alpha/decisions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.2}}
+        })))
+        .expect(1)
+        .mount(&remote)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.9}}
+        })))
+        .expect(0)
+        .mount(&local)
+        .await;
+
+    // Declared remote-first, even though "a-local" sorts before "z-span".
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[targets.a-local]
+id = "laya-rl-agent"
+llm_client = "responses"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "{local}"
+decision_api_key_env = "TEST_DECISION_KEY"
+
+[targets.z-span]
+id = "respan/span-01-lite"
+llm_client = "responses"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "{remote}"
+decision_api_key_env = "TEST_DECISION_KEY"
+supported_types = {{ noul = true, choice = false, score = false }}
+state_forms = {{ plain_string = true, structured = false }}
+
+[decision_lanes.default]
+targets = ["z-span", "a-local"]
+"#,
+        local = local.uri(),
+        remote = remote.uri()
+    );
+    unsafe { std::env::set_var("TEST_DECISION_KEY", "test-value") };
+    let runner = Runner::from_toml(&config).expect("deployment builds");
+    let lane = runner.decision_lane().expect("a configured lane exists");
+    assert_eq!(
+        lane.candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["z-span", "a-local"],
+        "declared order is the candidate order, not sorted target names"
+    );
+
+    // And that order decides which backend answers.
+    let outcome = resolve_and_serve(lane, &noul_request(json!("plain"))).await.expect("served");
+    assert_eq!(outcome.served_by, "z-span");
 }

@@ -20,7 +20,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use switchyard_protocol::{ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest, ModelId};
+use switchyard_protocol::{ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest};
 
 use crate::ServerState;
 
@@ -131,14 +131,36 @@ pub(crate) async fn decisions(
         Err(message) => return error_body(StatusCode::BAD_REQUEST, message),
     };
 
+    let requested = native.model.clone().unwrap_or_default();
     let Some(lane) = state.runner.decision_lane().cloned() else {
         return error_body(
             StatusCode::NOT_IMPLEMENTED,
             "this deployment configures no decision backends".to_string(),
         );
     };
-    let requested = native.model.clone().unwrap_or_default();
-    match switchyard_runner::decision_executor::resolve_and_serve(&lane, &native).await {
+    // The lane is addressed by its configured name, or a configured target is served
+    // alone; an unknown identity fails closed rather than reaching some other backend.
+    let lane_name = state.runner.decision_lane_name().map(str::to_string);
+    let resolved = switchyard_runner::decision_executor::resolve_identity(
+        &lane,
+        lane_name.as_deref(),
+        &requested,
+    );
+    let outcome = match resolved {
+        Err(failure) => return error_body(status_for(&failure), format!("{failure:?}")),
+        Ok(switchyard_runner::decision_executor::DecisionIdentity::Target(name)) => {
+            let Some(candidate) = lane.candidates.iter().find(|candidate| {
+                candidate.name == name || candidate.model == name
+            }) else {
+                return error_body(StatusCode::NOT_FOUND, format!("no decision target {name}"));
+            };
+            switchyard_runner::decision_executor::serve_target(candidate, &native).await
+        }
+        Ok(switchyard_runner::decision_executor::DecisionIdentity::Lane) => {
+            switchyard_runner::decision_executor::resolve_and_serve(&lane, &native).await
+        }
+    };
+    match outcome {
         Ok(outcome) => {
             let mut payload = switchyard_runner::decision_executor::compatibility_response(
                 &outcome.response,
@@ -151,14 +173,35 @@ pub(crate) async fn decisions(
             }
             (StatusCode::OK, Json(payload)).into_response()
         }
-        Err(failure) => {
-            let status = if failure.try_next() {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            error_body(status, format!("decision request failed: {failure:?}"))
+        Err(failure) => error_body(
+            // A caller mistake and an exhausted backend are different situations, and a
+            // provider outage must never be reported as a malformed request.
+            status_for(&failure),
+            format!("decision request failed: {failure:?}"),
+        ),
+    }
+}
+
+/// Maps a classified decision failure to the status a caller should see.
+///
+/// A contract or eligibility refusal is the caller's problem and is never retried; an
+/// unknown identity is a missing model; a missing credential is a deployment fault, not
+/// the caller's; and eligible backends exhausted by transient failures are genuinely
+/// unavailable right now.
+fn status_for(
+    failure: &switchyard_runner::decision_executor::DecisionFailure,
+) -> StatusCode {
+    use switchyard_runner::decision_executor::{DecisionFailure, DecisionSkip};
+    match failure {
+        DecisionFailure::NotEligible(DecisionSkip::TargetNotFound) => StatusCode::NOT_FOUND,
+        DecisionFailure::NotEligible(DecisionSkip::Unauthenticated) => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
+        DecisionFailure::NotEligible(_) => StatusCode::BAD_REQUEST,
+        DecisionFailure::Serving { reason, .. } if *reason == "no_eligible_backend" => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        DecisionFailure::Serving { .. } => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 

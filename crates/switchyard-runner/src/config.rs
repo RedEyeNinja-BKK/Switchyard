@@ -94,6 +94,22 @@ pub(crate) struct DeploymentConfig {
     /// Caller-visible capabilities, by configuration name.
     #[serde(default)]
     pub(crate) capabilities: BTreeMap<String, capability::CapabilityConfig>,
+    /// Explicitly ordered decision lanes, by lane name.
+    #[serde(default)]
+    pub(crate) decision_lanes: BTreeMap<String, DecisionLaneConfig>,
+}
+
+/// One explicitly ordered decision lane.
+///
+/// Candidate order is a routing decision, so it is stated rather than inferred. An
+/// ordered list that merely happened to be sorted by name would make a deployment's
+/// behaviour depend on target spelling.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DecisionLaneConfig {
+    /// Decision targets in preference order. Each must be a decision target, appear
+    /// once, and exist.
+    pub(crate) targets: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -260,6 +276,7 @@ impl DeploymentConfig {
         .map_err(RunnerError::configuration)?;
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
+        let lane_identity = self.decision_lanes.keys().next().cloned();
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             // Before the unknown-target sweep below, so a malformed candidate list is
@@ -292,7 +309,7 @@ impl DeploymentConfig {
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             let (route_clients, caller_auth) =
-                self.build_route_clients(route_name, config, &clients)?;
+                self.build_route_clients(route_name, config, &clients, lane_identity.clone())?;
             let anthropic_auxiliary_target =
                 self.build_anthropic_auxiliary_target(config, &clients);
             let responses_auxiliary_target =
@@ -327,15 +344,7 @@ impl DeploymentConfig {
         // backend gets per-request eligibility and ordered fallback instead of having
         // to choose a provider for resilience. Shared by every route and by the
         // compatibility surface, so Decision has one implementation.
-        let lane_names: Vec<&str> = self
-            .targets
-            .iter()
-            .filter(|(_, target)| target.decision_transport.is_some())
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let decision_lane = self
-            .build_decision_resolver(&lane_names)
-            .map(std::sync::Arc::new);
+        let decision_lane = self.decision_lane()?;
 
         let mut runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
@@ -344,8 +353,11 @@ impl DeploymentConfig {
                 clients: self.capability_clients.clone(),
                 capabilities: self.capabilities.clone(),
             }));
-        if let Some(lane) = decision_lane {
-            runner = runner.with_decision_lane(lane);
+        if let (Some(name), Some(lane)) = (
+            self.decision_lanes.keys().next().cloned(),
+            decision_lane,
+        ) {
+            runner = runner.with_decision_lane(name, lane);
         }
         Ok(runner)
     }
@@ -447,6 +459,50 @@ impl DeploymentConfig {
     /// Returns `None` when the route configures no decision backend, leaving the host
     /// to report decision calls as unsupported. Targets are taken in the route's own
     /// configured order, which is the candidate order; there is no scoring here.
+    /// Builds the named default decision lane.
+    ///
+    /// The lane's identity is explicit, and its order comes from configuration. When no
+    /// lane is configured there is no lane: a caller must then name a target, and an
+    /// unknown name fails rather than quietly reaching whatever happens to exist.
+    fn decision_lane(&self) -> RunnerResult<Option<std::sync::Arc<decision_executor::DecisionResolver>>> {
+        let Some((name, lane)) = self
+            .decision_lanes
+            .iter()
+            .next()
+            .map(|(name, lane)| (name.as_str(), lane))
+        else {
+            return Ok(None);
+        };
+        if lane.targets.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "decision lane {name} must list at least one target"
+            )));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for target_name in &lane.targets {
+            if seen.contains(&target_name.as_str()) {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} lists target {target_name} more than once; candidate order is a sequence, so each target may appear once"
+                )));
+            }
+            let Some(target) = self.targets.get(target_name) else {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} references unknown target {target_name}"
+                )));
+            };
+            if target.decision_transport.is_none() {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} lists target {target_name}, which is not a decision target"
+                )));
+            }
+            seen.push(target_name);
+        }
+        let names: Vec<&str> = lane.targets.iter().map(String::as_str).collect();
+        Ok(self
+            .build_decision_resolver(&names)
+            .map(std::sync::Arc::new))
+    }
+
     fn build_decision_resolver(
         &self,
         target_names: &[&str],
@@ -494,6 +550,7 @@ impl DeploymentConfig {
         route_name: &str,
         route: &RouteConfig,
         clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+        lane_identity: Option<String>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let TargetPromptPolicy {
             prompts,
@@ -553,20 +610,45 @@ impl DeploymentConfig {
         if let Some(resolver) = self.build_decision_resolver(&route_targets) {
             let resolver = Arc::new(resolver);
             let handler_resolver = Arc::clone(&resolver);
+            let handler_lane: Arc<Option<String>> = Arc::new(lane_identity.clone());
             let router = router.with_decision_handler(Arc::new(move |request, model| {
                 let resolver = Arc::clone(&handler_resolver);
+                let lane_name = Arc::clone(&handler_lane);
                 Box::pin(async move {
                     // A call that names a concrete model means that backend only: it is
                     // how a caller pins one for diagnostics or comparison. The lane is
                     // reached when the named target is the lane identity itself, or when
                     // no configured candidate matches the name.
-                    let named = resolver.candidates.iter().find(|candidate| {
-                        candidate.name == model.as_str() || candidate.model == model.as_str()
-                    });
-                    let served = match named {
-                        Some(candidate) => decision_executor::serve_target(candidate, &request).await,
-                        None => decision_executor::resolve_and_serve(&resolver, &request).await,
-                    };
+                    // An explicit identity is either a configured target or the named
+                    // lane. An unknown one fails closed instead of reaching whichever
+                    // backend happens to exist.
+                    let requested_model = model.clone();
+                    let served = async move {
+                        match decision_executor::resolve_identity(
+                            &resolver,
+                            lane_name.as_deref(),
+                            requested_model.as_str(),
+                        )? {
+                            decision_executor::DecisionIdentity::Target(name) => {
+                                let candidate = resolver
+                                    .candidates
+                                    .iter()
+                                    .find(|candidate| {
+                                        candidate.name == name || candidate.model == name
+                                    })
+                                    .ok_or_else(|| {
+                                        decision_executor::DecisionFailure::NotEligible(
+                                            decision_executor::DecisionSkip::TargetNotFound,
+                                        )
+                                    })?;
+                                decision_executor::serve_target(candidate, &request).await
+                            }
+                            decision_executor::DecisionIdentity::Lane => {
+                                decision_executor::resolve_and_serve(&resolver, &request).await
+                            }
+                        }
+                    }
+                    .await;
                     served
                         .map(|outcome| outcome.response)
                         .map_err(|failure| {

@@ -32,6 +32,10 @@ use crate::decision_transport::{
 /// Why a decision call could not be served by one candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecisionSkip {
+    /// The caller named an identity this deployment does not configure. Terminal, and
+    /// checked before anything is dispatched, so a typo cannot silently reach whichever
+    /// backend happened to be configured.
+    TargetNotFound,
     /// The backend cannot answer one of the question kinds in the request.
     UnsupportedType,
     /// The backend cannot accept the request's state shape.
@@ -237,6 +241,40 @@ async fn send(
         "http"
     };
     Err(DecisionFailure::Serving { reason, retryable })
+}
+
+/// What a caller asked for, resolved against the deployment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionIdentity<'a> {
+    /// A concrete decision target or its model id: served by that backend alone.
+    Target(&'a str),
+    /// The explicitly configured logical lane.
+    Lane,
+}
+
+/// Resolves the identity a caller named.
+///
+/// An explicit lane identity is the lane; a configured target or model id is that
+/// target; anything else is unknown and terminal. The lane is never inferred from a
+/// failed lookup, because that would turn a typo into a different backend's answer.
+pub fn resolve_identity<'a>(
+    resolver: &DecisionResolver,
+    lane_name: Option<&str>,
+    requested: &'a str,
+) -> Result<DecisionIdentity<'a>, DecisionFailure> {
+    if let Some(name) = lane_name
+        && requested == name
+    {
+        return Ok(DecisionIdentity::Lane);
+    }
+    if resolver
+        .candidates
+        .iter()
+        .any(|candidate| candidate.name == requested || candidate.model == requested)
+    {
+        return Ok(DecisionIdentity::Target(requested));
+    }
+    Err(DecisionFailure::NotEligible(DecisionSkip::TargetNotFound))
 }
 
 /// Serves one named target, and nothing else.

@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"enum":["ReasoningDialect","ReasoningPolicy"]};
+window.SIDEBAR_ITEMS = {"enum":["ReasoningDialect","ReasoningPolicy","ReasoningPolicyError"]};

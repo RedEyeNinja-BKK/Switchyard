@@ -34,6 +34,7 @@ impl RoutedLlmClient for StubClient {
 fn plugin_route(client: Arc<dyn RoutedLlmClient>) -> Route {
     let spec = AlgorithmSpec::Passthrough {
         target: "semantic-target".to_string(),
+        candidates: Vec::new(),
         subagents: None,
     };
     let targets = BTreeMap::from([(

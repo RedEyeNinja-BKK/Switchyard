@@ -224,6 +224,12 @@ impl DeploymentConfig {
         let fallback_base_url = self.fallback_base_url()?;
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
+            // Before the unknown-target sweep below, so a malformed candidate list is
+            // reported as itself rather than as a target that does not exist.
+            config
+                .algorithm
+                .validate_candidates(route_name)
+                .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             for target_name in config.callable_target_names() {
                 self.targets.get(target_name).ok_or_else(|| {
                     RunnerError::configuration(format!(
@@ -237,6 +243,12 @@ impl DeploymentConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
+            // Ordered-candidate validation runs before anything resolves targets, so a malformed
+            // list is reported as itself rather than as an unknown target.
+            config
+                .algorithm
+                .validate_candidates(route_name)
+                .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             let algorithm = config
                 .algorithm
                 .build(route_name, &targets)
@@ -947,6 +959,18 @@ target = "strong"
         }
     }
 
+    /// The parsed `AlgorithmSpec` for one route, so a test can assert what the loader
+    /// hands to the runtime rather than only that the file parses.
+    fn ordered_spec(toml: &str, route_name: &str) -> AlgorithmSpec {
+        let config: DeploymentConfig = toml::from_str(toml).expect("fixture parses");
+        config
+            .routes
+            .get(route_name)
+            .expect("fixture declares the route")
+            .algorithm
+            .clone()
+    }
+
     fn with_subagent_llm_classifier(config: &str, route: &str, extra: &str) -> String {
         let mut configured = config.to_string();
         configured.push_str(&format!("\n[routes.{route}.subagents]\n"));
@@ -1360,6 +1384,64 @@ new = ["send_message"]
             "{}",
             error_message(&impossible)
         );
+    }
+
+    /// A deterministic route must be able to state its candidate order in configuration.
+    /// The order is the contract: the selected target is offered first and the rest follow
+    /// in declared order.
+    #[test]
+    fn a_passthrough_route_declares_its_ordered_candidates() -> RunnerResult<()> {
+        let ordered = VALID_CONFIG.replace(
+            "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"",
+            "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"\ncandidates = [\"weak\", \"classifier\"]",
+        );
+        assert_ne!(ordered, VALID_CONFIG, "the passthrough fixture must exist verbatim");
+        runner_from_toml(&ordered)?;
+
+        // The order must reach the runtime model pool, not merely parse. This is the
+        // property a config-only assertion cannot see: dropping candidates from the pool
+        // still loads, but silently serves only the selected target.
+        let spec = ordered_spec(&ordered, "passthrough");
+        let names = spec
+            .runtime_model_names("passthrough")
+            .expect("declared candidates resolve");
+        assert_eq!(
+            names.parent.get(&Category::Any),
+            Some(&vec![
+                "strong".to_string(),
+                "weak".to_string(),
+                "classifier".to_string()
+            ]),
+            "the selected target must be offered first, then candidates in declared order"
+        );
+        assert_eq!(
+            spec.callable_target_names(),
+            vec!["strong", "weak", "classifier"],
+            "callable targets must carry the same declared order"
+        );
+
+        // The same list naming its own selected target is not an order.
+        let repeated = VALID_CONFIG.replace(
+            "type = \"passthrough\"\ntarget = \"weak\"",
+            "type = \"passthrough\"\ntarget = \"weak\"\ncandidates = [\"weak\"]",
+        );
+        assert!(
+            error_message(&repeated).contains("more than once"),
+            "{}",
+            error_message(&repeated)
+        );
+
+        let blank = VALID_CONFIG.replace(
+            "type = \"passthrough\"\ntarget = \"weak\"",
+            "type = \"passthrough\"\ntarget = \"weak\"\ncandidates = [\" \"]",
+        );
+        assert!(
+            error_message(&blank).contains("empty candidate name"),
+            "{}",
+            error_message(&blank)
+        );
+
+        Ok(())
     }
 
     /// A policy that is not specified leaves the caller's reasoning choice alone, and one

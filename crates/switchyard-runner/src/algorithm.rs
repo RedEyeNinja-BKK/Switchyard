@@ -330,6 +330,18 @@ pub enum AlgorithmSpec {
     Passthrough {
         /// Target that serves the request.
         target: String,
+        /// Further targets tried in order when `target` cannot serve the request.
+        ///
+        /// The native ordered machinery already executes this list: the selected target is
+        /// offered first, the rest follow in declared order, and the client walks it under
+        /// its own retry, cooldown and failure classification. Declaring the list here adds
+        /// no second fallback engine; it only lets configuration state an order the
+        /// machinery already applies.
+        ///
+        /// Execution is keyed by model id, so every target in one route's list must use a
+        /// distinct model id.
+        #[serde(default)]
+        candidates: Vec<String>,
         /// Separate policy for delegated sub-agent work.
         #[serde(default)]
         subagents: Option<SubagentRouteConfig>,
@@ -548,9 +560,16 @@ impl AlgorithmSpec {
             Self::Noop { .. } => Vec::new(),
             Self::Random { targets, .. } => targets.iter().map(String::as_str).collect(),
             Self::Passthrough {
-                target, subagents, ..
+                target,
+                candidates,
+                subagents,
+                ..
             } => {
+                // Selected target first, then the declared fallbacks in order, then any
+                // separate sub-agent policy. `route_to` puts the first entry at the head
+                // and the rest in order behind it.
                 let mut names = vec![target.as_str()];
+                names.extend(candidates.iter().map(String::as_str));
                 if let Some(subagents) = subagents {
                     names.extend(subagents.routing_target_names());
                 }
@@ -671,17 +690,50 @@ impl AlgorithmSpec {
     }
 
     /// Target names grouped as the runtime [`Driver`](libsy::Driver) expects them.
-    pub(crate) fn runtime_model_names(
+    /// Checks that a declared candidate order is a genuine sequence.
+///
+/// Called before targets are resolved so a malformed list is reported as itself rather
+/// than as an unknown target.
+pub(crate) fn validate_candidates(&self, route_name: &str) -> AlgorithmResult<()> {
+    let Self::Passthrough {
+        target, candidates, ..
+    } = self
+    else {
+        return Ok(());
+    };
+    let mut seen: Vec<&str> = vec![target.as_str()];
+    for name in candidates {
+        if name.trim().is_empty() {
+            return Err(AlgorithmConfigError::new(format!(
+                "passthrough route {route_name} lists an empty candidate name"
+            )));
+        }
+        if seen.contains(&name.as_str()) {
+            return Err(AlgorithmConfigError::new(format!(
+                "passthrough route {route_name} lists target {name} more than once; candidates are an ordered fallback list, so each target may appear once"
+            )));
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
+pub(crate) fn runtime_model_names(
         &self,
         route_name: &str,
     ) -> AlgorithmResult<RuntimeModelNames> {
+        self.validate_candidates(route_name)?;
         let parent = match self {
             Self::Noop { .. } => HashMap::new(),
             Self::Random { targets, .. } | Self::PrefillRouter { targets, .. } => {
                 category_models([(Category::Any, targets.clone())])
             }
-            Self::Passthrough { target, .. } => {
-                category_models([(Category::Any, vec![target.clone()])])
+            Self::Passthrough {
+                target, candidates, ..
+            } => {
+                let mut ordered = vec![target.clone()];
+                ordered.extend(candidates.iter().cloned());
+                category_models([(Category::Any, ordered)])
             }
             Self::PlanExecute {
                 capable_target,

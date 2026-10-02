@@ -512,6 +512,19 @@ impl DeploymentConfig {
                 seen.push(target_name);
             }
         }
+        // Two scoped lanes claiming the same kinds would make selection ambiguous, so the
+        // deployment is refused here rather than failing at request time.
+        let mut claimed: BTreeMap<decision_transport::QuestionKind, String> = BTreeMap::new();
+        for (name, lane) in &self.decision_lanes {
+            for kind in &lane.types {
+                if claimed.insert(*kind, name.clone()).is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lanes claim question kind {kind:?} at the same specificity; \
+                         each kind may be scoped by at most one lane"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 

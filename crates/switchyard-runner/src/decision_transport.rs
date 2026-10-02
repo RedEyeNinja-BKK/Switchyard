@@ -28,7 +28,7 @@ pub const MIN_SCORE_LEVELS: usize = 2;
 pub const MAX_SCORE_LEVELS: usize = 10;
 
 /// A question kind, named in configuration so a lane can be scoped to one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionKind {
     /// Probability of true.

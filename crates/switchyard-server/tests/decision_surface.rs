@@ -53,6 +53,14 @@ decision_path = "/v1/systemone"
 decision_base_url = "{systemone_url}"
 decision_api_key_env = "TEST_KEY"
 
+[targets.decision-jev-style]
+id = "jev-style-0.8b-decision-v3"
+llm_client = "responses"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "{systemone_url}"
+decision_api_key_env = "TEST_KEY"
+
 [targets.decision-span]
 id = "respan/span-01-lite"
 llm_client = "responses"
@@ -64,11 +72,11 @@ supported_types = {{ noul = true, choice = false, score = false }}
 state_forms = {{ plain_string = true, structured = false }}
 
 [decision_lanes.default]
-targets = ["decision-laya", "decision-span"]
+targets = ["decision-laya", "decision-jev-style", "decision-span"]
 
 [decision_lanes.noul]
 types = ["noul"]
-targets = ["decision-laya", "decision-span"]
+targets = ["decision-laya", "decision-jev-style", "decision-span"]
 
 [decision_lanes.choice]
 types = ["choice"]
@@ -567,6 +575,69 @@ async fn a_type_scoped_lane_is_selected_for_its_own_kinds() {
         .expect("a noul request selects a lane");
     assert_eq!(
         noul_lane.resolver.candidates.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-        vec!["decision-laya", "decision-span"]
+        vec!["decision-laya", "decision-jev-style", "decision-span"]
     );
+}
+
+/// Two scoped lanes claiming the same kind would make selection ambiguous, so the
+/// deployment is refused at load rather than producing no lane at request time.
+#[tokio::test]
+async fn an_ambiguous_lane_scope_is_rejected_at_load() {
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let source = r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[targets.decision-a]
+id = "backend-a"
+llm_client = "responses"
+decision_transport = "system_one"
+decision_api_key_env = "TEST_KEY"
+
+[targets.decision-b]
+id = "backend-b"
+llm_client = "responses"
+decision_transport = "system_one"
+decision_api_key_env = "TEST_KEY"
+
+[decision_lanes.first]
+types = ["noul"]
+targets = ["decision-a"]
+
+[decision_lanes.second]
+types = ["noul"]
+targets = ["decision-b"]
+"#;
+    let error = Runner::from_toml(source)
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        error.contains("same specificity"),
+        "duplicate scopes must be refused at load: {error}"
+    );
+
+    // Distinct kinds are not ambiguous, and the unscoped lane may coexist with both.
+    let distinct = source
+        .replace(
+            "[decision_lanes.second]\ntypes = [\"noul\"]",
+            "[decision_lanes.second]\ntypes = [\"choice\"]",
+        )
+        .replace(
+            "[decision_lanes.first]",
+            "[decision_lanes.general]\ntargets = [\"decision-a\"]\n\n[decision_lanes.first]",
+        );
+    Runner::from_toml(&distinct).expect("distinct kinds and an unscoped lane are valid");
 }

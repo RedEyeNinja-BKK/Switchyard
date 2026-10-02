@@ -43,6 +43,16 @@ pub struct DecisionTarget {
     pub format: WireFormat,
     pub base_url: String,
     pub extra_body: BTreeMap<String, Value>,
+    /// Wire family this decision backend speaks, when it serves typed decisions.
+    pub decision_transport: Option<crate::decision_transport::DecisionTransport>,
+    /// Which question kinds this backend currently answers.
+    pub supported_types: Option<crate::decision_transport::SupportedTypes>,
+    /// State shapes this backend accepts. A target accepts every shape by default.
+    pub state_forms: crate::decision_transport::StateForms,
+    /// Path appended to `base_url` for a typed decision call.
+    pub decision_path: Option<String>,
+    /// Environment variable holding this backend's credential.
+    pub decision_api_key_env: Option<String>,
 }
 
 impl Runner {

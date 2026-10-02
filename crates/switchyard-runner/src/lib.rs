@@ -5,6 +5,7 @@
 
 mod algorithm;
 pub mod capability;
+pub mod decision_executor;
 pub mod decision_transport;
 mod config;
 mod failure;

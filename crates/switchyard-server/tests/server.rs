@@ -784,6 +784,11 @@ fn random_state_with_retries(
                     format: WireFormat::OpenAiChat,
                     base_url: base_url.to_string(),
                     extra_body: BTreeMap::new(),
+                    decision_transport: None,
+                    supported_types: None,
+                    state_forms: Default::default(),
+                    decision_path: None,
+                    decision_api_key_env: None,
                 })
                 .collect();
             Ok((

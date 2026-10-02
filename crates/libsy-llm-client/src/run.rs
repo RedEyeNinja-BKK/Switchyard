@@ -31,9 +31,9 @@ use switchyard_libsy::{
     RuntimeModels, drive,
 };
 use switchyard_protocol::{
-    AggLlmResponse, LlmClientError, LlmResponse, LlmResponseChunk, LlmResponseStream, Message,
-    ModelId, Request, Response, ResponseAccumulator, RoutedLlmClient, RoutingFallbackReason,
-    WireFormat,
+    AggLlmResponse, DecisionRequest, DecisionResponse, LlmClientError, LlmResponse,
+    LlmResponseChunk, LlmResponseStream, Message, ModelId, Request, Response, ResponseAccumulator,
+    RoutedLlmClient, RoutingFallbackReason, WireFormat,
 };
 use switchyard_translation::prepare_request_for_target;
 
@@ -152,12 +152,23 @@ pub async fn decide(
     Ok(outcome)
 }
 
-async fn unsupported_decision(call: CallDecision) -> Result<()> {
+/// Answers a decision call, or reports that this client serves none.
+async fn serve_decision(clients: &ClientRouter, call: CallDecision) -> Result<()> {
     let model = call.model.clone();
-    call.respond(Err(LibsyError::client_call(
-        model,
-        LlmClientError::General("decision calls are not supported by this client".to_string()),
-    )))
+    let Some(handler) = clients.inner.decision_handler.clone() else {
+        return call.respond(Err(LibsyError::client_call(
+            model,
+            LlmClientError::General("decision calls are not supported by this client".to_string()),
+        )));
+    };
+    let request = call.request.clone();
+    match handler(request, model.clone()).await {
+        Ok(response) => call.respond(Ok(response)),
+        Err(error) => call.respond(Err(LibsyError::client_call(
+            model,
+            LlmClientError::General(error.to_string()),
+        ))),
+    }
 }
 
 /// Emits completed routing calls after the outcome reveals whether one response became the answer.
@@ -191,7 +202,7 @@ async fn serve(
 ) -> Result<()> {
     let call = match call {
         Call::Model(call) => *call,
-        Call::Decision(call) => return unsupported_decision(*call).await,
+        Call::Decision(call) => return serve_decision(&clients, *call).await,
     };
     let observe = |observation| {
         if let Some(observations) = &observations {
@@ -574,7 +585,20 @@ struct ClientRouting {
     state_owners: Mutex<StateOwners>,
     /// Native Responses state only needs a routing pin when answer targets span clients.
     track_provider_state: bool,
+    /// Fulfils a routing-time decision call. Absent, a decision call is reported as
+    /// unsupported, which is what this client did before any host supplied one.
+    decision_handler: Option<DecisionHandler>,
 }
+
+/// Serves one decision call and returns the answer, or a classified failure.
+///
+/// Supplied by the host that owns decision backends, so this crate stays unaware of
+/// how a decision is transported.
+pub type DecisionHandler = Arc<
+    dyn Fn(DecisionRequest, ModelId) -> std::pin::Pin<Box<dyn Future<Output = Result<DecisionResponse>> + Send>>
+        + Send
+        + Sync,
+>;
 
 enum Routing {
     /// One client serves every model.
@@ -584,6 +608,16 @@ enum Routing {
 }
 
 impl ClientRouter {
+    /// Supplies the host that fulfils routing-time decision calls.
+    ///
+    /// Without one, a decision call is answered as unsupported.
+    pub fn with_decision_handler(mut self, handler: DecisionHandler) -> Self {
+        let routing = Arc::get_mut(&mut self.inner)
+            .expect("client router is not yet shared when configured");
+        routing.decision_handler = Some(handler);
+        self
+    }
+
     /// Build a router over `model name -> client`, for targets spread across providers.
     pub fn new(by_model: HashMap<ModelId, Arc<dyn RoutedLlmClient>>) -> Self {
         Self::new_with_target_prompts(by_model, HashMap::new(), None)
@@ -637,6 +671,7 @@ impl ClientRouter {
                 routing_answer_target,
                 state_owners: Mutex::default(),
                 track_provider_state: spans_providers,
+                decision_handler: None,
             }),
         }
     }
@@ -654,6 +689,7 @@ impl ClientRouter {
                 routing_answer_target: None,
                 state_owners: Mutex::default(),
                 track_provider_state: false,
+                decision_handler: None,
             }),
         }
     }

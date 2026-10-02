@@ -17,6 +17,7 @@ use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
+use libsy::LibsyError;
 use switchyard_protocol::{
     Category,
     ModelId,
@@ -28,10 +29,29 @@ use switchyard_protocol::{
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError, capability,
+    Runner, RunnerError, capability, decision_executor, decision_transport,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Carries a classified decision failure out of the host so the reason is not lost.
+#[derive(Debug)]
+struct DecisionCallError {
+    requested: String,
+    failure: decision_executor::DecisionFailure,
+}
+
+impl std::fmt::Display for DecisionCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "decision call to {} failed: {:?}",
+            self.requested, self.failure
+        )
+    }
+}
+
+impl std::error::Error for DecisionCallError {}
 const MAX_CONFIGURED_RETRIES: u32 = 10;
 
 type RunnerResult<T> = Result<T, RunnerError>;
@@ -164,6 +184,11 @@ impl DeploymentConfig {
             format: client.format.wire_format(),
             base_url: client.base_url.as_str().to_string(),
             extra_body: target.extra_body.clone(),
+            decision_transport: target.decision_transport,
+            supported_types: target.supported_types,
+            state_forms: target.state_forms,
+            decision_path: target.decision_path.clone(),
+            decision_api_key_env: target.decision_api_key_env.clone(),
         })
     }
 
@@ -398,6 +423,47 @@ impl DeploymentConfig {
             .collect()
     }
 
+    /// Builds the decision resolver for a route, from its configured targets in order.
+    ///
+    /// Returns `None` when the route configures no decision backend, leaving the host
+    /// to report decision calls as unsupported. Targets are taken in the route's own
+    /// configured order, which is the candidate order; there is no scoring here.
+    fn build_decision_resolver(
+        &self,
+        route: &RouteConfig,
+    ) -> Option<decision_executor::DecisionResolver> {
+        let mut candidates = Vec::new();
+        for name in route.routing_target_names() {
+            let target = self.targets.get(name)?;
+            let client = self.llm_clients.get(&target.llm_client)?;
+            let transport = target.decision_transport?;
+            let credential = target
+                .decision_api_key_env
+                .as_deref()
+                .map(|variable| std::env::var(variable).ok())
+                .unwrap_or(None);
+            let url = format!(
+                "{}{}",
+                client.base_url.as_str().trim_end_matches('/'),
+                target.decision_path.clone().unwrap_or_else(|| {
+                    transport.path().to_string()
+                })
+            );
+            candidates.push(decision_executor::DecisionCandidate {
+                name: name.to_string(),
+                model: target.id.to_string(),
+                transport,
+                url,
+                api_key: credential,
+                supported_types: target
+                    .supported_types
+                    .unwrap_or(decision_transport::SupportedTypes::ALL),
+                state_forms: target.state_forms,
+            });
+        }
+        (!candidates.is_empty()).then_some(decision_executor::DecisionResolver { candidates })
+    }
+
     fn build_route_clients(
         &self,
         route_name: &str,
@@ -455,6 +521,37 @@ impl DeploymentConfig {
             routing_answer_target,
             &completion_targets,
         );
+        // Decision calls need a host. One resolver is built from this route's configured
+        // decision targets, in configured order, and serves both the internal call path
+        // and any public typed surface, so Decision has one implementation.
+        if let Some(resolver) = self.build_decision_resolver(route) {
+            let resolver = Arc::new(resolver);
+            let handler_resolver = Arc::clone(&resolver);
+            let router = router.with_decision_handler(Arc::new(move |request, model| {
+                let resolver = Arc::clone(&handler_resolver);
+                Box::pin(async move {
+                    decision_executor::resolve_and_serve(&resolver, &request)
+                        .await
+                        .map(|outcome| outcome.response)
+                        .map_err(|failure| {
+                            // The host contract carries a LibsyError. The classified
+                            // reason is kept in the message so a caller can tell an
+                            // eligibility or contract refusal from a serving failure.
+                            LibsyError::client_call(
+                                model.clone(),
+                                switchyard_protocol::LlmClientError::General(
+                                    DecisionCallError {
+                                        requested: model.to_string(),
+                                        failure,
+                                    }
+                                    .to_string(),
+                                ),
+                            )
+                        })
+                })
+            }));
+            return Ok((router, caller_auth));
+        }
         Ok((router, caller_auth))
     }
 
@@ -653,6 +750,22 @@ struct TargetConfig {
     /// one transport routinely differ here, which is why it is not an `llm_client` setting.
     #[serde(default)]
     reasoning_dialect: ReasoningDialect,
+    /// Wire family this target speaks when serving a typed decision call.
+    #[serde(default)]
+    decision_transport: Option<decision_transport::DecisionTransport>,
+    /// Question kinds this target currently answers. A request carrying any other kind
+    /// excludes the target before dispatch rather than provoking a provider rejection.
+    #[serde(default)]
+    supported_types: Option<decision_transport::SupportedTypes>,
+    /// State shapes this target accepts. Unset accepts every shape.
+    #[serde(default)]
+    state_forms: decision_transport::StateForms,
+    /// Path for a typed decision call, when the backend does not use its default.
+    #[serde(default)]
+    decision_path: Option<String>,
+    /// Environment variable holding the decision backend's credential.
+    #[serde(default)]
+    decision_api_key_env: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

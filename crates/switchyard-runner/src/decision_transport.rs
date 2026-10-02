@@ -28,7 +28,8 @@ pub const MIN_SCORE_LEVELS: usize = 2;
 pub const MAX_SCORE_LEVELS: usize = 10;
 
 /// Wire family a decision backend speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionTransport {
     /// TypeSafe Jev `/v1/systemone`, served by Laya and JEV-style.
     SystemOne,
@@ -117,11 +118,18 @@ impl DecisionTransport {
 }
 
 /// What a backend can currently answer, independent of what the transport can carry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct SupportedTypes {
+    #[serde(default = "default_true")]
     pub noul: bool,
+    #[serde(default = "default_true")]
     pub choice: bool,
+    #[serde(default = "default_true")]
     pub score: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl SupportedTypes {
@@ -157,6 +165,72 @@ impl SupportedTypes {
         request.questions.values().all(|q| self.accepts(&q.kind))
     }
 
+}
+
+/// State shapes a decision backend accepts.
+///
+/// This is a property of the backend, not of the transport. SPAN is an OpenRouter
+/// alpha backend whose live service currently accepts a string state or an approved
+/// message form and rejects other structured objects; recording that here keeps it a
+/// dated, per-target capability rather than a permanent limitation of the OpenRouter
+/// alpha family, which the provider documents more generally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "StateFormsAcceptance")]
+pub struct StateForms {
+    /// A plain string state.
+    pub plain_string: bool,
+    /// An arbitrary structured object state.
+    pub structured: bool,
+}
+
+/// Absent state-form configuration means no restriction is declared.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+pub struct StateFormsAcceptance {
+    plain_string: Option<bool>,
+    structured: Option<bool>,
+}
+
+impl From<StateFormsAcceptance> for StateForms {
+    fn from(acceptance: StateFormsAcceptance) -> Self {
+        Self {
+            plain_string: acceptance.plain_string.unwrap_or(true),
+            structured: acceptance.structured.unwrap_or(true),
+        }
+    }
+}
+
+impl Default for StateForms {
+    /// No declared restriction means every state shape is accepted.
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+
+
+impl StateForms {
+    /// Every shape: the default for a backend that documents no restriction.
+    pub const ALL: Self = Self {
+        plain_string: true,
+        structured: true,
+    };
+
+
+    /// What SPAN's live service was observed to accept on 2026-10-02.
+    pub const SPAN_OBSERVED: Self = Self {
+        plain_string: true,
+        structured: false,
+    };
+
+    /// Whether this backend accepts the state carried by the request.
+    pub fn accepts(self, context: &Value) -> bool {
+        match context {
+            Value::String(_) => self.plain_string,
+            // An array or a scalar is structured content too; only an object is the
+            // form SPAN was seen rejecting, but the distinction is kept simple here.
+            _ => self.structured,
+        }
+    }
 }
 
 /// Validates a request against the SystemOne wire contract.

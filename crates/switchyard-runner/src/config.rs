@@ -28,7 +28,7 @@ use switchyard_protocol::{
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError,
+    Runner, RunnerError, capability,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -68,6 +68,12 @@ pub(crate) struct DeploymentConfig {
     llm_clients: BTreeMap<String, LlmClientConfig>,
     targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    /// Specialized capability endpoints, by configuration name.
+    #[serde(default)]
+    pub(crate) capability_clients: BTreeMap<String, capability::CapabilityClientConfig>,
+    /// Caller-visible capabilities, by configuration name.
+    #[serde(default)]
+    pub(crate) capabilities: BTreeMap<String, capability::CapabilityConfig>,
 }
 
 #[derive(Debug)]
@@ -220,6 +226,12 @@ impl DeploymentConfig {
 
         let mut provider_api_keys = Vec::new();
         let clients = self.build_clients(&mut provider_api_keys)?;
+        capability::CapabilityDeployment {
+            clients: self.capability_clients.clone(),
+            capabilities: self.capabilities.clone(),
+        }
+        .validate()
+        .map_err(RunnerError::configuration)?;
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
         let mut routes = Vec::with_capacity(self.routes.len());
@@ -1458,6 +1470,81 @@ new = ["send_message"]
             "{}",
             error_message(&alias)
         );
+    }
+
+    /// The capability contracts must survive parsing as runtime values, not just load.
+    /// A config that parses while dropping the contract id or the rerank limits would
+    /// serve vectors callers cannot compare and rerank results callers cannot trust.
+    #[test]
+    fn capability_contracts_are_carried_as_runtime_values() {
+        let source = r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.engine_a]
+format = "openai_embeddings"
+base_url = "https://a.test"
+model = "a"
+
+[capability_clients.engine_b]
+format = "openai_embeddings"
+base_url = "https://b.test"
+model = "b"
+
+[capability_clients.reranker]
+format = "cohere_jina_rerank"
+base_url = "https://r.test"
+model = "r"
+
+[capabilities.space_a]
+id = "space_a"
+target = "engine_a"
+contract = "localclaw-embedding-space:v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+[capabilities.space_b]
+id = "space_b"
+target = "engine_b"
+contract = "localclaw-embedding-space:lfm2.5-350m-v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+[capabilities.rerank]
+id = "rerank"
+target = "reranker"
+max_candidates = 64
+top_n = 5
+max_doc_chars = 1024
+max_query_chars = 512
+"#;
+        let config: DeploymentConfig = toml::from_str(source).expect("fixture parses");
+        let a = &config.capabilities["space_a"];
+        let b = &config.capabilities["space_b"];
+        let r = &config.capabilities["rerank"];
+        assert_eq!(a.contract.as_deref(), Some("localclaw-embedding-space:v1"));
+        assert_eq!(b.contract.as_deref(), Some("localclaw-embedding-space:lfm2.5-350m-v1"));
+        assert_ne!(a.contract, b.contract, "two engines keep two contracts");
+        assert_eq!(a.dimensions, Some(1024));
+        assert_eq!(r.max_candidates, Some(64));
+        assert_eq!(r.top_n, Some(5));
+        assert_eq!(r.max_doc_chars, Some(1024));
+        assert_eq!(r.max_query_chars, Some(512));
+        assert_eq!(config.capability_clients["engine_b"].url("/embeddings"), "https://b.test/embeddings");
     }
 
     #[test]

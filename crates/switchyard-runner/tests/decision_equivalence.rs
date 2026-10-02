@@ -10,7 +10,7 @@
 use serde_json::{Value, json};
 use switchyard_protocol::{ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest, DecisionValue};
 use switchyard_runner::decision_executor::{
-    DecisionCandidate, DecisionResolver, resolve_and_serve,
+    DecisionCandidate, DecisionFailure, DecisionResolver, DecisionSkip, resolve_and_serve,
 };
 use switchyard_runner::decision_transport::{
     DecisionTransport, StateForms, SupportedTypes, parse_response,
@@ -89,7 +89,8 @@ fn local_backend(url: String) -> DecisionCandidate {
         model: "laya-rl-agent".into(),
         transport: DecisionTransport::SystemOne,
         url: format!("{url}/v1/systemone"),
-        api_key: Some("key".into()),
+        api_key: Some("SUPER_SECRET_DECISION_TEST_KEY".into()),
+        api_key_env: Some("TEST_DECISION_KEY".into()),
         supported_types: SupportedTypes::ALL,
         state_forms: StateForms::ALL,
     }
@@ -350,4 +351,179 @@ async fn an_ineligible_state_shape_is_never_sent() {
         .await
         .expect_err("nothing eligible can serve it");
     assert!(!failure.try_next());
+}
+/// A request outside the wire bounds is invalid for every backend on that transport.
+/// The executor must report it without dispatching anything, rather than sending a
+/// malformed request to the next candidate and hoping it behaves differently.
+#[tokio::test]
+async fn an_out_of_bounds_request_dispatches_no_backend() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let backend = |name: &str| DecisionCandidate {
+        name: name.into(),
+        url: format!("{}/v1/systemone", server.uri()),
+        ..local_backend("unused".into())
+    };
+    let resolver = DecisionResolver {
+        candidates: vec![backend("a"), backend("b")],
+    };
+
+    // Asserted on the failure kind itself, not only that it fails: a contract violation
+    // that merely "fails eventually" would still have dispatched the other backend.
+    let too_many_options = wide_choice_request(256);
+    let failure = resolve_and_serve(&resolver, &too_many_options)
+        .await
+        .expect_err("256 options is a contract violation");
+    assert_eq!(
+        failure,
+        DecisionFailure::NotEligible(DecisionSkip::Contract),
+        "256 options is a contract violation, not an availability signal"
+    );
+
+    let too_many_levels = wide_score_request(11);
+    let failure = resolve_and_serve(&resolver, &too_many_levels)
+        .await
+        .expect_err("11 levels is a contract violation");
+    assert_eq!(
+        failure,
+        DecisionFailure::NotEligible(DecisionSkip::Contract)
+    );
+
+    // A request that is merely ineligible for one backend still reaches the next.
+    let answerer = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"team": {"type": "choice", "choice": "billing", "probabilities": {"billing": 1.0, "technical": 0.0}}}
+        })))
+        .mount(&answerer)
+        .await;
+    let eligible = DecisionResolver {
+        candidates: vec![
+            DecisionCandidate {
+                name: "span".into(),
+                supported_types: SupportedTypes::NOUL_ONLY,
+                ..local_backend(server.uri())
+            },
+            local_backend(answerer.uri()),
+        ],
+    };
+    let outcome = resolve_and_serve(&eligible, &choice_request())
+        .await
+        .expect("the full-type backend answers the choice request");
+    assert_eq!(outcome.served_by, "laya");
+    assert_eq!(outcome.attempts.len(), 1, "only the noul-only backend was skipped");
+}
+
+fn wide_choice_request(options: usize) -> DecisionRequest {
+    let mut questions = BTreeMap::new();
+    questions.insert(
+        "wide".to_string(),
+        DecisionQuestion {
+            instructions: json!("Pick one"),
+            kind: DecisionKind::Choice {
+                options: (0..options)
+                    .map(|index| ChoiceOption {
+                        id: format!("o{index}"),
+                        description: None,
+                    })
+                    .collect(),
+            },
+        },
+    );
+    DecisionRequest {
+        model: None,
+        context: json!("a plain state"),
+        questions,
+    }
+}
+
+fn wide_score_request(levels: usize) -> DecisionRequest {
+    let mut questions = BTreeMap::new();
+    questions.insert(
+        "deep".to_string(),
+        DecisionQuestion {
+            instructions: json!("Rate it"),
+            kind: DecisionKind::Score {
+                levels: (0..levels).map(|index| json!(format!("level-{index}"))).collect(),
+            },
+        },
+    );
+    DecisionRequest {
+        model: None,
+        context: json!("a plain state"),
+        questions,
+    }
+}
+
+/// No representation of a candidate may reveal its credential.
+#[test]
+fn a_candidate_never_renders_its_credential() {
+    let backend = local_backend("https://example.test".into());
+    let rendered = format!("{backend:?}");
+    assert!(
+        !rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"),
+        "Debug leaked the credential: {rendered}"
+    );
+    assert!(rendered.contains("credential_present: true"), "{rendered}");
+    assert!(rendered.contains("TEST_DECISION_KEY"), "{rendered}");
+}
+
+/// A missing credential is reported, not hidden behind another backend answering, and
+/// the failure text must not carry the value.
+#[tokio::test]
+async fn a_credential_failure_is_terminal_and_silent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.4}}
+        })))
+        .mount(&server)
+        .await;
+    let healthy = local_backend(server.uri());
+    let nameless = DecisionCandidate {
+        name: "no-credential".into(),
+        api_key: None,
+        ..local_backend("unused".into())
+    };
+    let failure = resolve_and_serve(
+        &DecisionResolver {
+            candidates: vec![nameless, healthy],
+        },
+        &noul_request(json!("state")),
+    )
+    .await
+    .expect_err("a missing credential is a deployment fault, not a reason to move on");
+    assert!(!failure.try_next());
+    let rendered = format!("{failure:?}");
+    assert!(!rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"), "{rendered}");
+}
+
+/// An upstream HTTP error may echo the request; whatever it returns, the rendered
+/// failure must not carry our credential.
+#[tokio::test]
+async fn an_upstream_error_does_not_expose_the_credential() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": "upstream failed"
+        })))
+        .mount(&server)
+        .await;
+    let backend = local_backend(server.uri());
+    let failure = resolve_and_serve(
+        &DecisionResolver {
+            candidates: vec![backend],
+        },
+        &noul_request(json!("state")),
+    )
+    .await
+    .expect_err("a 500 with no healthy backend is a failure");
+    let rendered = format!("{failure:?}");
+    assert!(!rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"), "{rendered}");
 }

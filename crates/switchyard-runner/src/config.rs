@@ -455,6 +455,7 @@ impl DeploymentConfig {
                 transport,
                 url,
                 api_key: credential,
+                api_key_env: target.decision_api_key_env.clone(),
                 supported_types: target
                     .supported_types
                     .unwrap_or(decision_transport::SupportedTypes::ALL),
@@ -530,8 +531,18 @@ impl DeploymentConfig {
             let router = router.with_decision_handler(Arc::new(move |request, model| {
                 let resolver = Arc::clone(&handler_resolver);
                 Box::pin(async move {
-                    decision_executor::resolve_and_serve(&resolver, &request)
-                        .await
+                    // A call that names a concrete model means that backend only: it is
+                    // how a caller pins one for diagnostics or comparison. The lane is
+                    // reached when the named target is the lane identity itself, or when
+                    // no configured candidate matches the name.
+                    let named = resolver.candidates.iter().find(|candidate| {
+                        candidate.name == model.as_str() || candidate.model == model.as_str()
+                    });
+                    let served = match named {
+                        Some(candidate) => decision_executor::serve_target(candidate, &request).await,
+                        None => decision_executor::resolve_and_serve(&resolver, &request).await,
+                    };
+                    served
                         .map(|outcome| outcome.response)
                         .map_err(|failure| {
                             // The host contract carries a LibsyError. The classified

@@ -45,17 +45,21 @@ pub enum DecisionSkip {
 impl DecisionSkip {
     /// Whether another backend could still serve the request.
     ///
-    /// Only eligibility problems are worth trying elsewhere: they are properties of the
-    /// backend, and the next one may well accept what this one refused.
+    /// Only the properties of *this backend* are worth trying elsewhere: an unsupported
+    /// question kind or an unsupported state shape is a fact about the backend, and the
+    /// next one may well accept what this one refused.
+    ///
+    /// A contract violation is different. An out-of-bounds request is invalid for every
+    /// backend on this transport, so trying the next one would send a request already
+    /// known to be malformed. A credential failure is a deployment fault, and moving on
+    /// would hide it. Both are terminal.
     pub fn try_next(self) -> bool {
-        // A credential failure is a deployment problem. Silently moving to the next
-        // backend would hide it, so it is reported instead of absorbed.
-        !matches!(self, Self::Unauthenticated)
+        matches!(self, Self::UnsupportedType | Self::UnsupportedState)
     }
 }
 
 /// A backend refused or failed to serve the request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecisionFailure {
     /// Eligible backend that could not be reached or refused transiently.
     Serving { reason: &'static str, retryable: bool },
@@ -74,7 +78,11 @@ impl DecisionFailure {
 }
 
 /// One configured decision backend, resolved for serving.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is written by hand because the candidate holds a credential: a derived
+/// implementation would print the key into logs, tracing, receipts and test failures.
+/// Only presence and the logical identity are ever shown.
+#[derive(Clone)]
 pub struct DecisionCandidate {
     /// Configuration name of the target.
     pub name: String,
@@ -84,12 +92,30 @@ pub struct DecisionCandidate {
     pub transport: DecisionTransport,
     /// Full request URL.
     pub url: String,
-    /// Credential for this backend.
+    /// Credential for this backend. Never rendered by `Debug`.
     pub api_key: Option<String>,
+    /// Name of the environment variable this credential was read from, for diagnostics.
+    pub api_key_env: Option<String>,
     /// Question kinds this backend currently answers.
     pub supported_types: SupportedTypes,
     /// State shapes this backend accepts.
     pub state_forms: StateForms,
+}
+
+impl std::fmt::Debug for DecisionCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DecisionCandidate")
+            .field("name", &self.name)
+            .field("model", &self.model)
+            .field("transport", &self.transport)
+            .field("url", &self.url)
+            .field("supported_types", &self.supported_types)
+            .field("state_forms", &self.state_forms)
+            .field("credential_present", &self.api_key.is_some())
+            .field("credential_env", &self.api_key_env)
+            .finish()
+    }
 }
 
 impl DecisionCandidate {
@@ -213,6 +239,39 @@ async fn send(
     Err(DecisionFailure::Serving { reason, retryable })
 }
 
+/// Serves one named target, and nothing else.
+///
+/// A concrete decision call names its model, so it means that backend. Eligibility
+/// still applies, but a backend that cannot serve the request produces that result
+/// rather than an answer from a different provider: silently substituting one would
+/// make a pinned diagnostic call report another backend's opinion.
+pub async fn serve_target(
+    candidate: &DecisionCandidate,
+    request: &DecisionRequest,
+) -> Result<DecisionOutcome, DecisionFailure> {
+    if let Err(skip) = candidate.eligibility(request) {
+        return Err(DecisionFailure::NotEligible(skip));
+    }
+    let body = candidate
+        .transport
+        .request_body(&candidate.model, request)
+        .map_err(|_| DecisionFailure::NotEligible(DecisionSkip::Contract))?;
+    match send(candidate, body).await {
+        Ok(payload) => {
+            let response = parse_response(&payload).map_err(|_| DecisionFailure::Serving {
+                reason: "undecodable_response",
+                retryable: false,
+            })?;
+            Ok(DecisionOutcome {
+                response,
+                served_by: candidate.name.clone(),
+                attempts: Vec::new(),
+            })
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
 /// Resolves eligible candidates and serves the request through the first that answers.
 ///
 /// The same resolver and executor back both the internal decision call path and any
@@ -225,6 +284,9 @@ pub async fn resolve_and_serve(
     for candidate in &resolver.candidates {
         if let Err(skip) = candidate.eligibility(request) {
             let failure = DecisionFailure::NotEligible(skip);
+            // Terminal before any request is sent: an out-of-bounds request must never
+            // reach a backend, and a credential fault must not be hidden behind a
+            // different backend answering.
             if !failure.try_next() {
                 return Err(failure);
             }
@@ -288,7 +350,8 @@ mod tests {
             model: "backend-model".to_string(),
             transport,
             url: format!("http://{name}.test{}", transport.path()),
-            api_key: Some("key".to_string()),
+            api_key: Some("SUPER_SECRET_DECISION_TEST_KEY".to_string()),
+            api_key_env: Some("TEST_DECISION_KEY".to_string()),
             supported_types: types,
             state_forms,
         }
@@ -463,12 +526,14 @@ mod tests {
             },
             DecisionFailure::NotEligible(DecisionSkip::UnsupportedType),
             DecisionFailure::NotEligible(DecisionSkip::UnsupportedState),
-            DecisionFailure::NotEligible(DecisionSkip::Contract),
         ] {
             assert!(retryable.try_next(), "{retryable:?} should try the next backend");
         }
 
         for terminal in [
+            // A contract violation is terminal: the request is invalid for every backend
+            // on this transport, so dispatching another would send a malformed request.
+            DecisionFailure::NotEligible(DecisionSkip::Contract),
             DecisionFailure::Serving {
                 reason: "auth",
                 retryable: false,

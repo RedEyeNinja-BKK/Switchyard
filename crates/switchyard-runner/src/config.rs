@@ -188,6 +188,7 @@ impl DeploymentConfig {
             supported_types: target.supported_types,
             state_forms: target.state_forms,
             decision_path: target.decision_path.clone(),
+            decision_base_url: target.decision_base_url.clone(),
             decision_api_key_env: target.decision_api_key_env.clone(),
         })
     }
@@ -321,13 +322,31 @@ impl DeploymentConfig {
             );
             routes.push((config.id.clone(), route));
         }
-        let runner = Runner::new(routes)
+        // The default logical decision lane. Every configured decision target in
+        // configuration order, so a caller asking for a decision without naming a
+        // backend gets per-request eligibility and ordered fallback instead of having
+        // to choose a provider for resilience. Shared by every route and by the
+        // compatibility surface, so Decision has one implementation.
+        let lane_names: Vec<&str> = self
+            .targets
+            .iter()
+            .filter(|(_, target)| target.decision_transport.is_some())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let decision_lane = self
+            .build_decision_resolver(&lane_names)
+            .map(std::sync::Arc::new);
+
+        let mut runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
             .with_provider_api_keys(provider_api_keys)
             .with_capabilities(capability::resolve(&capability::CapabilityDeployment {
                 clients: self.capability_clients.clone(),
                 capabilities: self.capabilities.clone(),
             }));
+        if let Some(lane) = decision_lane {
+            runner = runner.with_decision_lane(lane);
+        }
         Ok(runner)
     }
 
@@ -430,11 +449,11 @@ impl DeploymentConfig {
     /// configured order, which is the candidate order; there is no scoring here.
     fn build_decision_resolver(
         &self,
-        route: &RouteConfig,
+        target_names: &[&str],
     ) -> Option<decision_executor::DecisionResolver> {
         let mut candidates = Vec::new();
-        for name in route.routing_target_names() {
-            let target = self.targets.get(name)?;
+        for name in target_names {
+            let target = self.targets.get(*name)?;
             let client = self.llm_clients.get(&target.llm_client)?;
             let transport = target.decision_transport?;
             let credential = target
@@ -444,13 +463,18 @@ impl DeploymentConfig {
                 .unwrap_or(None);
             let url = format!(
                 "{}{}",
-                client.base_url.as_str().trim_end_matches('/'),
-                target.decision_path.clone().unwrap_or_else(|| {
-                    transport.path().to_string()
-                })
+                target
+                    .decision_base_url
+                    .clone()
+                    .unwrap_or_else(|| client.base_url.as_str().to_string())
+                    .trim_end_matches('/'),
+                target
+                    .decision_path
+                    .clone()
+                    .unwrap_or_else(|| transport.path().to_string())
             );
             candidates.push(decision_executor::DecisionCandidate {
-                name: name.to_string(),
+                name: (*name).to_string(),
                 model: target.id.to_string(),
                 transport,
                 url,
@@ -525,7 +549,8 @@ impl DeploymentConfig {
         // Decision calls need a host. One resolver is built from this route's configured
         // decision targets, in configured order, and serves both the internal call path
         // and any public typed surface, so Decision has one implementation.
-        if let Some(resolver) = self.build_decision_resolver(route) {
+        let route_targets = route.routing_target_names();
+        if let Some(resolver) = self.build_decision_resolver(&route_targets) {
             let resolver = Arc::new(resolver);
             let handler_resolver = Arc::clone(&resolver);
             let router = router.with_decision_handler(Arc::new(move |request, model| {
@@ -774,6 +799,10 @@ struct TargetConfig {
     /// Path for a typed decision call, when the backend does not use its default.
     #[serde(default)]
     decision_path: Option<String>,
+    /// Base URL for a typed decision call, when the decision backend is not the
+    /// completion endpoint this target's client points at.
+    #[serde(default)]
+    decision_base_url: Option<String>,
     /// Environment variable holding the decision backend's credential.
     #[serde(default)]
     decision_api_key_env: Option<String>,

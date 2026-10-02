@@ -20,6 +20,8 @@ pub struct Runner {
     provider_api_keys: Vec<String>,
     /// Specialized capability surfaces, keyed by the public id callers request.
     capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
+    /// The default logical decision lane, shared by every route's decision calls.
+    decision_lane: Option<std::sync::Arc<crate::decision_executor::DecisionResolver>>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -51,6 +53,8 @@ pub struct DecisionTarget {
     pub state_forms: crate::decision_transport::StateForms,
     /// Path appended to `base_url` for a typed decision call.
     pub decision_path: Option<String>,
+    /// Base URL for a typed decision call, when it is not the completion endpoint.
+    pub decision_base_url: Option<String>,
     /// Environment variable holding this backend's credential.
     pub decision_api_key_env: Option<String>,
 }
@@ -76,7 +80,22 @@ impl Runner {
             fallback_base_url: None,
             provider_api_keys: Vec::new(),
             capabilities: BTreeMap::new(),
+            decision_lane: None,
         }
+    }
+
+    /// Registers the default logical decision lane, used by the compatibility surface.
+    pub fn with_decision_lane(
+        mut self,
+        lane: std::sync::Arc<crate::decision_executor::DecisionResolver>,
+    ) -> Self {
+        self.decision_lane = Some(lane);
+        self
+    }
+
+    /// The default logical decision lane, when the deployment configures one.
+    pub fn decision_lane(&self) -> Option<&std::sync::Arc<crate::decision_executor::DecisionResolver>> {
+        self.decision_lane.as_ref()
     }
 
     /// Registers the specialized capability surfaces a deployment exposes.

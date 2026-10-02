@@ -1,0 +1,331 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The retained typed decision compatibility surface, and the routing preview it must not
+//! disturb.
+//!
+//! `/v1/decisions` exists because current consumers call it. `/v1/decision` is upstream's
+//! routing preview and keeps its own contract; the singular and plural spellings are
+//! different endpoints on purpose, and both are exercised here so neither can drift into
+//! the other.
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::{Value, json};
+use switchyard_runner::Runner;
+use tower::ServiceExt;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+async fn serve(config: &str) -> axum::Router {
+    let runner = Runner::from_toml(config).expect("runner builds");
+    switchyard_server::build_switchyard_router(
+        switchyard_server::ServerState::from_runner(runner).expect("state builds"),
+    )
+}
+
+/// A deployment with one completion route and two decision backends: a local
+/// full-type SystemOne backend and a noul-only alpha backend that also accepts only a
+/// plain string state.
+fn config(systemone_url: &str, alpha_url: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[targets.decision-laya]
+id = "laya-rl-agent"
+llm_client = "responses"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "{systemone_url}"
+decision_api_key_env = "TEST_KEY"
+
+[targets.decision-span]
+id = "respan/span-01-lite"
+llm_client = "responses"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "{alpha_url}"
+decision_api_key_env = "TEST_KEY"
+supported_types = {{ noul = true, choice = false, score = false }}
+state_forms = {{ plain_string = true, structured = false }}
+"#
+    )
+}
+
+async fn post(router: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// A Turnstone-shaped noul request reaches the lane and comes back in the shape the
+/// consumer parses: keyed answers, each tagged with its kind.
+#[tokio::test]
+async fn a_typed_noul_request_is_served_through_the_lane() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "laya-rl-agent",
+            "answers": {"risk": {"type": "noul", "noul": 0.82}},
+            "usage": {"input_tokens": 52, "output_tokens": 0, "total_tokens": 52}
+        })))
+        .mount(&backend)
+        .await;
+
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "switchyard-decision-default",
+            "state": "reviewing a tool output",
+            "questions": {
+                "risk": {
+                    "type": "noul",
+                    "instructions": "Flag any error in this output.",
+                    "criteria": {"true": "a problem is present", "false": "the output is clean"}
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answers = body["answers"].as_object().expect("keyed answers");
+    assert_eq!(answers["risk"]["type"], "noul");
+    assert_eq!(answers["risk"]["noul"], 0.82);
+    assert_eq!(body["usage"]["input_tokens"], 52, "provider usage is carried");
+    assert_eq!(body["model"], "laya-rl-agent");
+    assert_eq!(body["backend"], "decision-laya", "the answering backend is named");
+}
+
+#[tokio::test]
+async fn a_choice_request_reaches_the_full_type_backend() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "team": {
+                    "type": "choice",
+                    "choice": "technical",
+                    "confidence": 0.78,
+                    "probabilities": {"billing": 0.22, "technical": 0.78}
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&backend)
+        .await;
+
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "switchyard-decision-default",
+            "state": "a ticket needs triage",
+            "questions": {
+                "team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": null, "technical": null}}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["answers"]["team"]["type"], "choice");
+    assert_eq!(body["answers"]["team"]["choice"], "technical");
+    assert_eq!(body["answers"]["team"]["probabilities"]["technical"], 0.78);
+    assert_eq!(body["answers"]["team"]["confidence"], 0.78);
+    assert_eq!(
+        body["backend"], "decision-laya",
+        "the noul-only backend must be excluded for a choice request"
+    );
+}
+
+#[tokio::test]
+async fn a_score_request_keeps_its_estimate_and_distribution() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "severity": {
+                    "type": "score",
+                    "score": 1.25,
+                    "confidence": 0.6,
+                    "probabilities": {"0": 0.1, "1": 0.5, "2": 0.4}
+                }
+            }
+        })))
+        .mount(&backend)
+        .await;
+
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "switchyard-decision-default",
+            "state": "a ticket needs triage",
+            "questions": {
+                "severity": {"type": "score", "instructions": "Rate it", "criteria": ["low", "medium", "high"]}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["answers"]["severity"]["type"], "score");
+    assert_eq!(body["answers"]["severity"]["score"], 1.25);
+    assert_eq!(
+        body["answers"]["severity"]["probabilities"],
+        json!([0.1, 0.5, 0.4]),
+        "the ordered distribution survives"
+    );
+}
+
+/// An out-of-bounds request is a contract error and must reach no backend at all.
+#[tokio::test]
+async fn an_out_of_bounds_request_reaches_no_backend() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&backend)
+        .await;
+
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+    let criteria: serde_json::Map<String, Value> = (0..256)
+        .map(|index| (format!("o{index}"), Value::Null))
+        .collect();
+    let (status, body) = post(
+        router,
+        "/v1/decisions",
+        json!({
+            "model": "switchyard-decision-default",
+            "state": "state",
+            "questions": {
+                "wide": {
+                    "type": "choice",
+                    "instructions": "Pick",
+                    "criteria": criteria
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().is_some_and(|error| error.contains("Contract")),
+        "the failure must name the contract violation: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_compatibility_body_is_refused() {
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let backend = MockServer::start().await;
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+
+    let (status, body) = post(
+        router.clone(),
+        "/v1/decisions",
+        json!({
+            "model": "switchyard-decision-default",
+            "state": "state",
+            "questions": {"q": {"type": "vibe", "instructions": "?"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("vibe")), "{body}");
+
+    let (status, _) = post(
+        router,
+        "/v1/decisions",
+        json!({"model": "x", "state": "s", "questions": {}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Upstream's routing preview keeps its own contract: it takes `input_format` and
+/// `request`, and answers with routing information rather than typed answers. Adding the
+/// plural surface must not change any of that.
+#[tokio::test]
+async fn the_upstream_routing_preview_is_unchanged() {
+    unsafe { std::env::set_var("TEST_KEY", "test-value") };
+    let backend = MockServer::start().await;
+    let router = serve(&config(&backend.uri(), &backend.uri())).await;
+
+    // Its documented body is rejected if it has been repointed at typed questions.
+    let (status, body) = post(
+        router.clone(),
+        "/v1/decision",
+        json!({"state": "x", "questions": {"risk": {"type": "noul"}}}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "the routing preview must not accept a typed decision body"
+    );
+    assert!(
+        !body.get("answers").is_some(),
+        "the preview must not answer with typed decisions: {body}"
+    );
+
+    // And it still answers a routing request in its own shape.
+    let (status, body) = post(
+        router,
+        "/v1/decision",
+        json!({
+            "input_format": "openai_responses",
+            "request": {
+                "model": "probe/only",
+                "input": [{"role": "user", "content": "hello"}]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("selected").is_some() || body.get("model").is_some(),
+        "the preview answers with routing information: {body}"
+    );
+}

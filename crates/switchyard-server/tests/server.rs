@@ -788,6 +788,7 @@ fn random_state_with_retries(
                     supported_types: None,
                     state_forms: Default::default(),
                     decision_path: None,
+                    decision_base_url: None,
                     decision_api_key_env: None,
                 })
                 .collect();

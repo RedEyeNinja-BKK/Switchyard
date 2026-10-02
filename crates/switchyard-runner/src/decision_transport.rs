@@ -360,11 +360,31 @@ pub fn parse_response(
             },
         );
     }
+    // Provider-reported identity and usage are carried when supplied; a provider that
+    // does not report them leaves them absent rather than invented.
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(switchyard_protocol::ModelId::from);
+    let usage = match body.get("usage") {
+        Some(usage) => switchyard_protocol::Usage {
+            input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+            cache: None,
+            output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+            total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+            reasoning_tokens: None,
+        },
+        None => switchyard_protocol::Usage::default(),
+    };
     Ok(switchyard_protocol::DecisionResponse {
-        id: None,
-        model: None,
+        id,
+        model,
         answers: parsed,
-        usage: Default::default(),
+        usage,
     })
 }
 

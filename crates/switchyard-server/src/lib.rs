@@ -5,6 +5,7 @@
 
 mod capabilities;
 mod capability_surfaces;
+mod decision_surface;
 pub mod config;
 mod metrics;
 mod observability;
@@ -512,6 +513,7 @@ pub fn build_llm_router(state: ServerState) -> Router {
 pub fn build_switchyard_router(state: ServerState) -> Router {
     let mut router = primary_llm_routes()
         .route("/v1/decision", post(decision))
+        .route("/v1/decisions", post(decision_surface::decisions))
         .route("/v1/embeddings", post(capability_surfaces::embeddings))
         .route("/v1/rerank", post(capability_surfaces::rerank))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))

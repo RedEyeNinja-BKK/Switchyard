@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use switchyard_protocol::{DecisionRequest, DecisionResponse};
 
 use crate::decision_transport::{
@@ -330,6 +330,79 @@ pub async fn resolve_and_serve(
         reason: "no_eligible_backend",
         retryable: false,
     })
+}
+
+/// Serializes a native decision response in the retained compatibility shape.
+///
+/// The shape is the canonical one: keyed `answers`, each tagged with its kind and
+/// carrying the provider's own value plus probabilities and confidence where they
+/// were reported. A caller reading either this or a direct provider response sees the
+/// same fields, because they are the same answer.
+pub fn compatibility_response(response: &switchyard_protocol::DecisionResponse) -> Value {
+    let mut answers = serde_json::Map::new();
+    for (id, answer) in &response.answers {
+        let mut entry = serde_json::Map::new();
+        match &answer.value {
+            switchyard_protocol::DecisionValue::Boolean(estimate) => {
+                let probability = match estimate {
+                    switchyard_protocol::BooleanEstimate::ProbabilityTrue(probability) => {
+                        probability.0
+                    }
+                    switchyard_protocol::BooleanEstimate::Value(value) => {
+                        if *value { 1.0 } else { 0.0 }
+                    }
+                };
+                entry.insert("type".to_string(), json!("noul"));
+                entry.insert("noul".to_string(), json!(probability));
+            }
+            switchyard_protocol::DecisionValue::Choice {
+                selected,
+                probabilities,
+            } => {
+                entry.insert("type".to_string(), json!("choice"));
+                entry.insert("choice".to_string(), json!(selected));
+                if let Some(probabilities) = probabilities {
+                    let map: serde_json::Map<String, Value> = probabilities
+                        .iter()
+                        .map(|(name, probability)| (name.clone(), json!(probability.0)))
+                        .collect();
+                    entry.insert("probabilities".to_string(), Value::Object(map));
+                }
+            }
+            switchyard_protocol::DecisionValue::Score {
+                value,
+                probabilities,
+            } => {
+                entry.insert("type".to_string(), json!("score"));
+                entry.insert("score".to_string(), json!(value.0));
+                if let Some(probabilities) = probabilities {
+                    let ordered: Vec<Value> =
+                        probabilities.iter().map(|value| json!(value.0)).collect();
+                    entry.insert("probabilities".to_string(), Value::Array(ordered));
+                }
+            }
+        }
+        if let Some(confidence) = answer.provider_confidence {
+            entry.insert("confidence".to_string(), json!(confidence.0));
+        }
+        answers.insert(id.clone(), Value::Object(entry));
+    }
+    let mut body = json!({ "answers": Value::Object(answers) });
+    if let Some(id) = &response.id {
+        body["id"] = json!(id);
+    }
+    if let Some(model) = &response.model {
+        body["model"] = json!(model.as_str());
+    }
+    let usage = &response.usage;
+    if usage.input_tokens.is_some() || usage.output_tokens.is_some() || usage.total_tokens.is_some() {
+        body["usage"] = json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+        });
+    }
+    body
 }
 
 #[cfg(test)]

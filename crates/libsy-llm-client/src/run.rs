@@ -391,6 +391,88 @@ async fn buffer_routing_stream(
     Ok(stream::iter(events.into_iter().map(Ok)).boxed())
 }
 
+/// Why a provider call failed, in terms a caller can act on.
+///
+/// `fallback_reason` answers one yes/no question for candidate targets inside one route.
+/// A whole-route composite needs the same failure understood more finely: some of these
+/// are worth crossing routes for and some are not, so the classification is exposed rather
+/// than each caller reading HTTP statuses again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The connection could not be made or was lost.
+    Transport,
+    /// A deadline elapsed.
+    Timeout,
+    /// The provider asked us to slow down.
+    RateLimited,
+    /// The provider is temporarily unable to serve and may recover.
+    TemporarilyUnavailable,
+    /// The provider answered with a server-side error.
+    Server,
+    /// The request did not fit the provider's context window.
+    ContextWindow,
+    /// The provider refused on policy grounds. Provider-specific, so another provider
+    /// may legitimately accept it.
+    ProviderPolicy,
+    /// The provider rejected our credential or the caller's.
+    Auth,
+    /// The provider rejected the request itself.
+    Request,
+    /// Anything else, including local failures with no provider involvement.
+    Other,
+}
+
+impl FailureClass {
+    /// Whether a whole-route composite may try its next child after this failure.
+    ///
+    /// Deliberately narrower than candidate fallback inside one route. Crossing to a
+    /// different complete route is a bigger step than trying another target on the same
+    /// one, so only failures that say "this provider is unreachable right now" qualify.
+    ///
+    /// A context-window rejection is excluded on purpose: the next child may hold a
+    /// smaller window still, and crossing would only trade one rejection for another.
+    /// Capability evidence decides child order, not recovery from an oversized request.
+    pub fn allows_cross_route(self) -> bool {
+        matches!(
+            self,
+            Self::Transport
+                | Self::Timeout
+                | Self::RateLimited
+                | Self::TemporarilyUnavailable
+                | Self::Server
+        )
+    }
+}
+
+/// Classifies a provider failure without interpreting it again at each call site.
+pub fn failure_class(error: &LibsyError) -> FailureClass {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return FailureClass::Other;
+    };
+    match source {
+        LlmClientError::ContextWindowExceeded { .. } => FailureClass::ContextWindow,
+        LlmClientError::Transport { .. } => FailureClass::Transport,
+        LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
+        LlmClientError::UpstreamHttp { status, body } => match *status {
+            StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
+            StatusCode::REQUEST_TIMEOUT => FailureClass::Timeout,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => FailureClass::Auth,
+            status if status.is_server_error() => FailureClass::Server,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                if serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+                    value["error"]["code"].as_str() == Some("content_policy_violation")
+                }) {
+                    FailureClass::ProviderPolicy
+                } else {
+                    FailureClass::Request
+                }
+            }
+            _ => FailureClass::Other,
+        },
+        _ => FailureClass::Other,
+    }
+}
+
 /// Whether a failed candidate is worth routing around.
 fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     let LibsyError::ClientCall { source, .. } = error else {
@@ -712,6 +794,15 @@ impl ClientRouter {
                     })
             }
         }
+    }
+
+        /// The model that owns this request's provider state, when one is recorded.
+    ///
+    /// Exposed read-only so a whole-route composite can ask which child owns a
+    /// continuation without copying provider state or reimplementing the lookup. The
+    /// child that owns it keeps its own state; nothing is duplicated here.
+    pub fn continuation_owner(&self, request: &Request) -> Option<ModelId> {
+        self.stored_state_owner(request).map(|owner| owner.model)
     }
 
     /// Return the recorded model for the requested response or conversation ID.

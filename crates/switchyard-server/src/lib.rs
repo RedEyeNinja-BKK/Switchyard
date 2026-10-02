@@ -3,7 +3,6 @@
 
 //! Rust HTTP server for libsy algorithms.
 
-mod capabilities;
 mod capability_surfaces;
 pub mod decision_surface;
 pub mod config;
@@ -45,6 +44,7 @@ use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
+    request_fit,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -1071,7 +1071,7 @@ fn resolve_route(
         ));
     }
     if let Some(capability) =
-        capabilities::unsupported_capability(route.capabilities(), &llm_request, &body)
+        request_fit::unsupported_capability(route.capabilities(), &llm_request, &body)
     {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -1117,7 +1117,15 @@ async fn handle_llm_request(
         state.routing_log.clone().zip(routing_log_context.clone()),
     );
 
-    let output = match route.execute(request, Some(observer)).await {
+    // The routing log borrows the request, so the route id is taken before it is moved.
+    let route_id = request.llm_request.model.clone().unwrap_or_default();
+    // Execution goes through the runner seam, so a composite route is served the same way
+    // as a leaf without tier behaviour reaching this crate.
+    let output = match state
+        .runner
+        .execute_route(&route_id, request, Some(observer))
+        .await
+    {
         Ok(output) => output,
         Err(error) => {
             if let RunnerError::Algorithm(LibsyError::ClientCall {

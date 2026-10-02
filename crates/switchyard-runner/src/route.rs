@@ -190,6 +190,15 @@ impl Route {
     }
 
     /// Executes the configured route without consuming or proxying streamed responses.
+    /// The model this route's client router holds provider state for, when a request
+    /// continues a conversation this route previously served.
+    pub fn continuation_owner(
+        &self,
+        request: &switchyard_protocol::Request,
+    ) -> Option<switchyard_protocol::ModelId> {
+        self.clients.continuation_owner(request)
+    }
+
     pub async fn execute(
         &self,
         request: Request,

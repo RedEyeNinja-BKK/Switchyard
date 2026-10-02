@@ -25,6 +25,11 @@ pub struct Runner {
     decision_lanes: BTreeMap<String, Lane>,
     /// Name of the lane that serves every question kind, when one is configured.
     default_decision_lane: Option<String>,
+    /// Ordered composites over complete child routes.
+    composites: BTreeMap<String, crate::composition::CompositeSpec>,
+    /// Declared capabilities of composite routes, which are policy promises rather than
+    /// derived from any one child.
+    composite_capabilities: BTreeMap<String, ModelCapabilities>,
 }
 
 /// One configured lane: its resolver and the kinds it serves.
@@ -94,6 +99,8 @@ impl Runner {
             capabilities: BTreeMap::new(),
             decision_lanes: BTreeMap::new(),
             default_decision_lane: None,
+            composites: BTreeMap::new(),
+            composite_capabilities: BTreeMap::new(),
         }
     }
 
@@ -205,6 +212,52 @@ impl Runner {
             },
         );
         self
+    }
+
+    /// Registers an ordered composite over complete child routes.
+    pub fn with_composite(
+        mut self,
+        route_id: impl Into<String>,
+        children: Vec<String>,
+    ) -> Self {
+        self.composites
+            .insert(route_id.into(), crate::composition::CompositeSpec { children });
+        self
+    }
+
+    /// Declares the capabilities a composite route guarantees.
+    pub fn with_composite_capabilities(
+        mut self,
+        route_id: impl Into<String>,
+        capabilities: ModelCapabilities,
+    ) -> Self {
+        self.composite_capabilities.insert(route_id.into(), capabilities);
+        self
+    }
+
+    /// The capabilities a route advertises: a composite's declared promise, or a leaf's.
+    pub fn route_capabilities(&self, route_id: &str) -> Option<ModelCapabilities> {
+        if let Some(capabilities) = self.composite_capabilities.get(route_id) {
+            return Some(*capabilities);
+        }
+        self.route(route_id).map(|route| route.capabilities())
+    }
+
+    /// Every route this runner serves, composite or leaf.
+    pub fn route_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.routes.iter().map(|(id, _)| id.to_string()).collect();
+        ids.extend(self.composites.keys().cloned());
+        ids
+    }
+
+    /// The composite spec for a route, when it is one.
+    pub fn composite_spec(&self, route_id: &str) -> Option<&crate::composition::CompositeSpec> {
+        self.composites.get(route_id)
+    }
+
+    /// Every registered composite, for diagnostics and validation.
+    pub fn composites(&self) -> &BTreeMap<String, crate::composition::CompositeSpec> {
+        &self.composites
     }
 
     /// The configured name of the lane that serves every question kind.

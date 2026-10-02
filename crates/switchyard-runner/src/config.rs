@@ -97,6 +97,33 @@ pub(crate) struct DeploymentConfig {
     /// Explicitly ordered decision lanes, by lane name.
     #[serde(default)]
     pub(crate) decision_lanes: BTreeMap<String, DecisionLaneConfig>,
+    /// Ordered composites over complete child routes, by route name.
+    #[serde(default)]
+    pub(crate) composites: BTreeMap<String, CompositeRouteConfig>,
+}
+
+/// A route composed of ordered whole child routes.
+///
+/// Children are route names, not targets. Each child runs as a complete route with its own
+/// algorithm, preparation, reasoning policy and fallback, and the parent adds only
+/// ordered selection between them.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompositeRouteConfig {
+    /// Child route names in preference order.
+    pub(crate) children: Vec<String>,
+    /// Certified context this composite guarantees, as an explicit policy promise.
+    ///
+    /// Stated rather than derived: a composite whose first child accepts a million tokens
+    /// still cannot guarantee that size when a later child does not.
+    #[serde(default)]
+    pub(crate) context_window: Option<u32>,
+    #[serde(default)]
+    pub(crate) tool_calling: Option<bool>,
+    #[serde(default)]
+    pub(crate) reasoning: Option<bool>,
+    #[serde(default)]
+    pub(crate) vision: Option<bool>,
 }
 
 /// One explicitly ordered decision lane.
@@ -281,6 +308,7 @@ impl DeploymentConfig {
         .map_err(RunnerError::configuration)?;
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
+        self.validate_composites()?;
         self.validate_decision_lanes()?;
         // Lane name -> resolver, with the kinds each lane serves. Built before the routes
         // so a route's decision handler can select by the request's question kinds.
@@ -374,6 +402,24 @@ impl DeploymentConfig {
                 capabilities: self.capabilities.clone(),
             }));
         self.validate_decision_lanes()?;
+        // Composites are registered as named routes, so lookup is uniform: a caller
+        // resolving a route cannot tell whether it is a leaf or a composite.
+        for (name, composite) in &self.composites {
+            runner = runner.with_composite(
+                name.clone(),
+                composite.children.clone(),
+            );
+            runner = runner.with_composite_capabilities(
+                name.clone(),
+                crate::ModelCapabilities {
+                    context_window: composite.context_window,
+                    tool_calling: composite.tool_calling,
+                    reasoning: composite.reasoning,
+                    vision: composite.vision,
+                },
+            );
+        }
+
         // The same lanes are registered on the runner, so the public surface and the
         // internal call path resolve a logical identity identically.
         for (name, resolver, types) in lane_index {
@@ -484,6 +530,48 @@ impl DeploymentConfig {
     /// Each lane's identity is explicit and its order comes from configuration. When no
     /// lane is configured there is none: a caller must then name a target, and an unknown
     /// name fails rather than quietly reaching whatever happens to exist.
+    /// Validates every composite: children exist, appear once, are leaves, and cannot
+    /// form a cycle.
+    ///
+    /// Nested composites are refused rather than supported: V6 needs ordered whole-route
+    /// composition, and accepting recursion would mean either a cycle class of bugs or a
+    /// general workflow engine.
+    fn validate_composites(&self) -> RunnerResult<()> {
+        for (parent, composite) in &self.composites {
+            if composite.children.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "composite route {parent} must list at least one child route"
+                )));
+            }
+            let mut seen: Vec<&str> = Vec::new();
+            for child in &composite.children {
+                if child == parent {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} lists itself as a child"
+                    )));
+                }
+                if seen.contains(&child.as_str()) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} lists child {child} more than once"
+                    )));
+                }
+                if self.composites.contains_key(child) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} lists composite {child} as a child; nested \
+                         composites are not supported, so child routes must be leaves"
+                    )));
+                }
+                if !self.routes.contains_key(child) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} references unknown route {child}"
+                    )));
+                }
+                seen.push(child);
+            }
+        }
+        Ok(())
+    }
+
     fn validate_decision_lanes(&self) -> RunnerResult<()> {
         for (name, lane) in &self.decision_lanes {
             if lane.targets.is_empty() {

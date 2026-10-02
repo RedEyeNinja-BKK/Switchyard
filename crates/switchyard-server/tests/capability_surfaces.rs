@@ -292,6 +292,65 @@ async fn declared_limits_are_rejected_before_reaching_an_engine() {
     assert_eq!(engine.received_requests().await.unwrap_or_default().len(), 0);
 }
 
+/// Probes immediately across the contract boundary rather than only obviously invalid
+/// values. `top_n = 99` passing or failing says nothing about whether the declared
+/// `top_n = 5` ceiling is enforced; `top_n = 6` is the discriminating case.
+#[tokio::test]
+async fn rerank_top_n_ceiling_is_enforced_at_the_boundary() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "results": [{"index": 0, "relevance_score": 0.5}],
+        })))
+        .mount(&engine)
+        .await;
+
+    let router = serve(&config(&engine.uri())).await;
+    let documents: Vec<String> = (0..8).map(|index| format!("doc{index}")).collect();
+    let request = |top_n: u32| {
+        json!({
+            "model": "switchyard-rerank-local",
+            "query": "q",
+            "documents": documents,
+            "top_n": top_n,
+        })
+    };
+
+    // At the declared ceiling: accepted.
+    let (status, _headers, _body) = post(
+        router.clone(),
+        "/v1/rerank",
+        request(5),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "top_n 5 is the declared ceiling");
+
+    // One past it: rejected, even though it is far below max_candidates 64.
+    let (status, _headers, body) = post(router.clone(), "/v1/rerank", request(6)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "top_n 6 must not pass a contract declaring top_n 5"
+    );
+    let message = String::from_utf8_lossy(&body).to_string();
+    assert!(message.contains("top_n 6"), "{message}");
+    assert!(
+        message.contains("max_candidates") == false || message.contains("top_n 5"),
+        "the error must name the declared ceiling, not the candidate pool: {message}"
+    );
+
+    // Omitting top_n uses the declared value and is accepted.
+    let (status, _headers, _body) = post(
+        router,
+        "/v1/rerank",
+        json!({"model": "switchyard-rerank-local", "query": "q", "documents": documents}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn an_unknown_or_mistyped_capability_is_refused_rather_than_guessed() {
     let router = serve(&config("https://engine.test")).await;

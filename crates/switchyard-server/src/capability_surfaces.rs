@@ -43,7 +43,7 @@ pub struct RerankRequest {
     query: String,
     /// Documents to rank.
     documents: Vec<String>,
-    /// Results to return. Unset returns the capability's declared `top_n`.
+    /// Results to return. Unset uses the capability's declared `top_n`. May not exceed it.
     top_n: Option<u32>,
 }
 
@@ -157,6 +157,22 @@ pub(crate) async fn rerank(
         );
     }
     let top_n = request.top_n.or(capability.top_n);
+    // Two separate invariants. A caller may not ask for more results than the
+    // capability's declared `top_n`, which is the contract's ceiling; and the declared
+    // `top_n` itself may not exceed `max_candidates`, which config load already checks.
+    // Comparing the caller's value against `max_candidates` would let `top_n = 6`
+    // through a contract capped at 5.
+    if let (Some(requested), Some(declared)) = (request.top_n, capability.top_n)
+        && requested > declared
+    {
+        return contract_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "top_n {requested} exceeds capability {} top_n {declared}",
+                capability.id
+            ),
+        );
+    }
     if let (Some(top_n), Some(max_candidates)) = (top_n, capability.max_candidates)
         && top_n > max_candidates
     {

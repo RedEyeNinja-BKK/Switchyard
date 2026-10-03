@@ -23,6 +23,7 @@
 //! the parent. Retrying elsewhere would hide a contract, policy, credential or
 //! configuration defect behind a different provider's answer.
 
+use serde_json::Value;
 use switchyard_llm_client::FailureClass;
 use switchyard_protocol::Request;
 
@@ -366,6 +367,368 @@ impl Runner {
         match error {
             RunnerError::Algorithm(inner) => switchyard_llm_client::failure_class(inner),
             _ => FailureClass::Other,
+        }
+    }
+}
+
+/// Filters an ordered candidate list by what each target can actually serve.
+///
+/// This is declared order filtered by request eligibility, not scoring or selection: a
+/// target the request cannot use is dropped, and the order of the rest is untouched, so
+/// the native execution, retry, cooldown and fallback machinery still decides among them.
+///
+/// Eligibility is decided with the same predicate that governs route admission and
+/// whole-route child eligibility, so "this request needs vision" means one thing at every
+/// level. A target with no declared facts is left in place: absence of a fact is not a
+/// refusal, and a newly added target is never silently unroutable.
+pub fn eligible_candidates(
+    ordered: &[&str],
+    capabilities: &std::collections::BTreeMap<String, crate::ModelCapabilities>,
+    request: &Request,
+) -> Vec<String> {
+    let raw = request.raw_request.clone().unwrap_or(Value::Null);
+    ordered
+        .iter()
+        .filter(|name| match capabilities.get(**name) {
+            Some(capabilities) => {
+                crate::request_fit::unsupported_capability(
+                    *capabilities,
+                    &request.llm_request,
+                    &raw,
+                )
+                .is_none()
+            }
+            None => true,
+        })
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod target_eligibility_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use switchyard_protocol::{
+        ContentBlock, ImageSource, LlmRequest, Message, Role,
+    };
+    use crate::ModelCapabilities;
+
+    /// A target is a factual property of a backing deployment; a route is a policy promise.
+    /// This is the input the filter uses, and it is deliberately separate from the route's
+    /// advertised capability.
+    #[test]
+    fn a_target_filter_preserves_declared_order_among_eligible_targets() {
+        let capabilities: BTreeMap<String, ModelCapabilities> = [
+            (
+                "text-only".to_string(),
+                ModelCapabilities {
+                    vision: Some(false),
+                    ..ModelCapabilities::default()
+                },
+            ),
+            (
+                "vision-a".to_string(),
+                ModelCapabilities {
+                    vision: Some(true),
+                    ..ModelCapabilities::default()
+                },
+            ),
+            (
+                "vision-b".to_string(),
+                ModelCapabilities {
+                    vision: Some(true),
+                    ..ModelCapabilities::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let ordered = ["text-only", "vision-a", "vision-b"];
+
+        // A text request keeps the declared order untouched.
+        let text = plain_request();
+        assert_eq!(
+            eligible_candidates(&ordered, &capabilities, &text),
+            vec!["text-only", "vision-a", "vision-b"],
+            "a text request is not filtered, and declared order is preserved"
+        );
+
+        // A vision request drops the text-only primary and keeps the order of the rest.
+        let vision = vision_request();
+        assert_eq!(
+            eligible_candidates(&ordered, &capabilities, &vision),
+            vec!["vision-a", "vision-b"],
+            "the ineligible primary is dropped and the declared order of the rest is kept"
+        );
+    }
+
+    /// A target with no declared facts is treated as able to serve, so adding the filter
+    /// cannot silently remove a target that was never characterised.
+    #[test]
+    fn an_uncharacterised_target_is_not_filtered_out() {
+        let capabilities = BTreeMap::new();
+        let ordered = ["unknown"];
+        assert_eq!(
+            eligible_candidates(&ordered, &capabilities, &vision_request()),
+            vec!["unknown"],
+            "an absent fact must not become a refusal"
+        );
+    }
+
+    /// Filtering uses the same predicate as route admission and child eligibility, so
+    /// "requires vision" means one thing at all three levels.
+    #[test]
+    fn the_filter_uses_the_shared_request_fit_predicate() {
+        let capabilities: BTreeMap<String, ModelCapabilities> = [(
+            "text-only".to_string(),
+            ModelCapabilities {
+                vision: Some(false),
+                ..ModelCapabilities::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let request = vision_request();
+        let raw = request.raw_request.clone().unwrap_or(Value::Null);
+        // The shared predicate says this target cannot serve it, and the filter agrees.
+        assert_eq!(
+            crate::request_fit::unsupported_capability(
+                capabilities["text-only"],
+                &request.llm_request,
+                &raw
+            ),
+            Some("vision")
+        );
+        assert!(
+            eligible_candidates(&["text-only"], &capabilities, &request).is_empty(),
+            "the filter must agree with the shared predicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_runtime_filter_keeps_declared_order_for_a_vision_request() {
+        use crate::Runner;
+        let config = r#"
+schema_version = 1
+
+[llm_clients.c]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.text]
+id = "vendor/text"
+llm_client = "c"
+vision = false
+
+[targets.vl_a]
+id = "vendor/vl-a"
+llm_client = "c"
+vision = true
+
+[targets.vl_b]
+id = "vendor/vl-b"
+llm_client = "c"
+vision = true
+
+[routes.r]
+id = "r"
+type = "passthrough"
+target = "text"
+candidates = ["vl_a", "vl_b"]
+vision = true
+"#;
+        let runner = Runner::from_toml(config).expect("builds");
+        let error = match runner.execute_route("r", vision_request(), None).await {
+            Ok(_) => panic!("no provider is reachable in this fixture"),
+            Err(error) => error.to_string(),
+        };
+        // The error names the LAST candidate native execution tried. Both facts matter: the
+        // text-only primary must never appear, and execution must have walked only the
+        // vision-capable candidates in declared order.
+        assert!(
+            !error.contains("vendor/text"),
+            "the ineligible primary must not be dispatched: {error}"
+        );
+        assert!(
+            error.contains("vendor/vl-"),
+            "execution must reach a vision-capable candidate: {error}"
+        );
+    }
+
+    /// With exactly one eligible survivor, the candidate native execution reaches must be that
+    /// one. This distinguishes "filtered" from "not filtered" and "first" from "reordered",
+    /// which an error naming the last-tried candidate cannot.
+    #[tokio::test]
+    async fn exactly_one_eligible_candidate_is_the_one_dispatched() {
+        use crate::Runner;
+        let config = r#"
+schema_version = 1
+
+[llm_clients.c]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.text]
+id = "vendor/text"
+llm_client = "c"
+vision = false
+
+[targets.vl]
+id = "vendor/vl"
+llm_client = "c"
+vision = true
+
+[routes.r]
+id = "r"
+type = "passthrough"
+target = "text"
+candidates = ["vl"]
+vision = true
+"#;
+        let runner = Runner::from_toml(config).expect("builds");
+        let error = match runner.execute_route("r", vision_request(), None).await {
+            Ok(_) => panic!("no provider is reachable in this fixture"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            !error.contains("vendor/text"),
+            "the ineligible primary must be filtered before dispatch: {error}"
+        );
+        assert!(
+            error.contains("vendor/vl"),
+            "the only eligible candidate must be dispatched: {error}"
+        );
+    }
+
+    /// A route whose every target lacks a capability is a request error, not a server fault.
+    #[tokio::test]
+    async fn no_eligible_target_is_a_request_capability_error() {
+        use crate::Runner;
+        let config = r#"
+schema_version = 1
+
+[llm_clients.c]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.text]
+id = "vendor/text"
+llm_client = "c"
+vision = false
+
+[routes.r]
+id = "r"
+type = "passthrough"
+target = "text"
+candidates = []
+"#;
+        let runner = Runner::from_toml(config).expect("builds");
+        let error = match runner.execute_route("r", vision_request(), None).await {
+            Ok(_) => panic!("expected a capability refusal"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, crate::RunnerError::UnsupportedCapability { capability: "vision", .. }),
+            "an image request against a text-only route is a request error: {error}"
+        );
+    }
+
+    /// Two eligible vision candidates: the one native execution reaches FIRST must be the
+    /// first one declared. Reordering the survivors would dispatch the second instead, which
+    /// is the difference between filtering and selecting.
+    #[tokio::test]
+    async fn the_first_eligible_candidate_declared_is_the_first_one_tried() {
+        use crate::Runner;
+        let config = r#"
+schema_version = 1
+
+[llm_clients.c]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.text]
+id = "vendor/text"
+llm_client = "c"
+vision = false
+
+[targets.vl_a]
+id = "vendor/vl-a"
+llm_client = "c"
+vision = true
+
+[targets.vl_b]
+id = "vendor/vl-b"
+llm_client = "c"
+vision = true
+
+[routes.r]
+id = "r"
+type = "passthrough"
+target = "text"
+candidates = ["vl_a", "vl_b"]
+vision = true
+"#;
+        let runner = Runner::from_toml(config).expect("builds");
+        let error = match runner.execute_route("r", vision_request(), None).await {
+            Ok(_) => panic!("no provider is reachable in this fixture"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            !error.contains("vendor/text"),
+            "the ineligible primary must be filtered: {error}"
+        );
+        // Both survivors are unreachable, so the reported failure is the last one tried. That
+        // is only reachable when execution started at the FIRST declared survivor and walked
+        // forward, which is the ordering guarantee.
+        assert!(
+            error.contains("vendor/vl-b"),
+            "execution must walk the eligible candidates in declared order: {error}"
+        );
+    }
+
+    pub(crate) fn plain_request() -> Request {
+        Request {
+            llm_request: LlmRequest {
+                model: Some("route".into()),
+                messages: vec![Message::text(Role::User, "hello")],
+                ..LlmRequest::default()
+            },
+            raw_request: Some(json!({
+                "model": "route",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+            })),
+            metadata: None,
+        }
+    }
+
+    pub(crate) fn vision_request() -> Request {
+        Request {
+            llm_request: LlmRequest {
+                model: Some("route".into()),
+                messages: vec![Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::Text { text: "what is this".into() },
+                        ContentBlock::Image {
+                            source: ImageSource::Url {
+                                url: "https://example.test/a.png".into(),
+                                detail: None,
+                            },
+                        },
+                    ],
+                }],
+                ..LlmRequest::default()
+            },
+            raw_request: Some(json!({
+                "model": "route",
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "what is this"},
+                    {"type": "input_image", "image_url": "https://example.test/a.png"}
+                ]}]
+            })),
+            metadata: None,
         }
     }
 }

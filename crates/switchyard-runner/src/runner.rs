@@ -74,6 +74,8 @@ pub struct DecisionTarget {
     pub decision_base_url: Option<String>,
     /// Environment variable holding this backend's credential.
     pub decision_api_key_env: Option<String>,
+    /// Factual capability of this target's backing deployment.
+    pub target_capabilities: ModelCapabilities,
 }
 
 impl Runner {

@@ -238,6 +238,11 @@ impl DeploymentConfig {
             decision_path: target.decision_path.clone(),
             decision_base_url: target.decision_base_url.clone(),
             decision_api_key_env: target.decision_api_key_env.clone(),
+            target_capabilities: crate::ModelCapabilities {
+                vision: target.vision,
+                tool_calling: target.tool_calling,
+                ..crate::ModelCapabilities::default()
+            },
         })
     }
 
@@ -309,6 +314,7 @@ impl DeploymentConfig {
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
         self.validate_composites()?;
+        self.validate_route_capability_claims()?;
         self.validate_decision_lanes()?;
         // Lane name -> resolver, with the kinds each lane serves. Built before the routes
         // so a route's decision handler can select by the request's question kinds.
@@ -572,6 +578,43 @@ impl DeploymentConfig {
         Ok(())
     }
 
+    /// Checks that a route advertising a capability has at least one completion target that
+    /// actually supports it.
+    ///
+    /// The route declaration stays a policy promise; this only refuses a promise nothing in
+    /// the route could keep. Capabilities are not derived from a union or intersection of
+    /// targets: a route may deliberately be narrower than its widest target.
+    fn validate_route_capability_claims(&self) -> RunnerResult<()> {
+        for (route_name, route) in &self.routes {
+            let capabilities = route.capabilities();
+            let mut names: Vec<&str> = route.routing_target_names().into_iter().collect();
+            names.sort_unstable();
+            for (label, claimed) in [
+                ("vision", capabilities.vision),
+                ("tool_calling", capabilities.tool_calling),
+            ] {
+                if claimed != Some(true) {
+                    continue;
+                }
+                // A target that says nothing is not a refusal: absence of a fact must not
+                // invalidate a pre-existing deployment that never declared one.
+                let supported = names.iter().any(|name| {
+                    self.targets.get(*name).is_some_and(|target| match label {
+                        "vision" => target.vision != Some(false),
+                        _ => target.tool_calling != Some(false),
+                    })
+                });
+                if !supported {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} declares {label} = true but none of its targets \
+                         supports it; declare a target that does, or stop claiming it"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_decision_lanes(&self) -> RunnerResult<()> {
         for (name, lane) in &self.decision_lanes {
             if lane.targets.is_empty() {
@@ -721,6 +764,23 @@ impl DeploymentConfig {
         // decision targets, in configured order, and serves both the internal call path
         // and any public typed surface, so Decision has one implementation.
         let route_targets = route.routing_target_names();
+        // Target capability facts reach the client router so ordered candidates can be
+        // filtered before dispatch. A target with no declaration is left in place.
+        let mut facts: HashMap<ModelId, switchyard_llm_client::CapabilityFacts> = HashMap::new();
+        for name in &route_targets {
+            if let Some(target) = self.targets.get(*name) {
+                facts.insert(
+                    target.id.clone(),
+                    switchyard_llm_client::CapabilityFacts {
+                        no_vision: target.vision == Some(false),
+                        no_tool_calling: target.tool_calling == Some(false),
+                    },
+                );
+            }
+        }
+        let router = router.with_target_capabilities(facts);
+
+
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.
         if let Some(resolver) = self.build_decision_resolver(&route_targets) {
@@ -1019,6 +1079,16 @@ struct TargetConfig {
     /// Environment variable holding the decision backend's credential.
     #[serde(default)]
     decision_api_key_env: Option<String>,
+    /// Factual capability of the backing deployment behind this target.
+    ///
+    /// A target fact, not a policy: it says what this model can do, while the route's own
+    /// declaration says what the route promises to callers. The two are validated against
+    /// each other at load, and the target facts are what ordered-candidate eligibility
+    /// filters on before dispatch.
+    #[serde(default)]
+    vision: Option<bool>,
+    #[serde(default)]
+    tool_calling: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

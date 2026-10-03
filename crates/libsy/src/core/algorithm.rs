@@ -61,6 +61,37 @@ impl RuntimeModels {
         }
     }
 
+    /// Whether every category has been emptied by filtering.
+    pub fn is_empty(&self) -> bool {
+        self.by_category.values().all(|models| models.is_empty())
+    }
+
+    /// Returns this model set with candidates the request cannot use removed.
+    ///
+    /// `keep` decides per candidate whether it survives; the survivors keep their declared
+    /// order. Filtering here rather than inside execution means an ineligible target is never
+    /// called, so it produces no failure, retry or cooldown event.
+    pub fn filtered<F>(&self, keep: &F) -> RuntimeModels
+    where
+        F: Fn(&ModelId) -> bool,
+    {
+        let filter = |groups: &HashMap<Category, Vec<ModelId>>| {
+            groups
+                .iter()
+                .map(|(category, models)| {
+                    (
+                        category.clone(),
+                        models.iter().filter(|model| keep(model)).cloned().collect(),
+                    )
+                })
+                .collect()
+        };
+        RuntimeModels {
+            by_category: filter(&self.by_category),
+            subagent: self.subagent.as_ref().map(|subagent| filter(subagent)),
+        }
+    }
+
     /// Adds the groups used for delegated sub-agent work.
     pub fn with_subagent(mut self, models: HashMap<Category, Vec<ModelId>>) -> Self {
         self.subagent = Some(models);

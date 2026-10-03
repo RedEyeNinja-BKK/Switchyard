@@ -223,11 +223,75 @@ impl Route {
         request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
+        // Ordered candidates are filtered by what each target can actually serve, before any
+        // provider is contacted. Declared order is preserved among the survivors, and the
+        // native execution, retry, cooldown and fallback machinery still decides among them,
+        // so this adds no second fallback engine and issues no request to a target that
+        // cannot answer it.
+        let facts = self.clients.target_capabilities().clone();
+        let raw = request.raw_request.clone().unwrap_or(serde_json::Value::Null);
+        let eligibility = |model: &switchyard_protocol::ModelId| {
+            match facts.get(model) {
+                Some(facts) => {
+                    // An explicit `false` is a refusal; `None` would mean "undeclared",
+                    // which the predicate treats as permitted, so the flag must be carried
+                    // as a concrete boolean.
+                    let capabilities = crate::ModelCapabilities {
+                        vision: Some(!facts.no_vision),
+                        tool_calling: Some(!facts.no_tool_calling),
+                        ..crate::ModelCapabilities::default()
+                    };
+                    crate::request_fit::unsupported_capability(
+                        capabilities,
+                        &request.llm_request,
+                        &raw,
+                    )
+                    .is_none()
+                }
+                None => true,
+            }
+        };
+        let models = self.models.filtered(&eligibility);
+        if models.is_empty() {
+            // Nothing in this route can serve the request, which is the caller's request
+            // rather than a deployment fault. The skipped targets get no provider call.
+            // Name what the request needs, not what the route happens to lack: the route's
+            // own declaration may be silent while a specific target was the blocker.
+            let capability = self
+                .clients
+                .target_capabilities()
+                .iter()
+                .find_map(|(_model, facts)| {
+                    let capabilities = crate::ModelCapabilities {
+                        vision: Some(!facts.no_vision),
+                        tool_calling: Some(!facts.no_tool_calling),
+                        ..crate::ModelCapabilities::default()
+                    };
+                    crate::request_fit::unsupported_capability(
+                        capabilities,
+                        &request.llm_request,
+                        &raw,
+                    )
+                    .or_else(|| None)
+                })
+                .or_else(|| {
+                    crate::request_fit::unsupported_capability(
+                        self.capabilities,
+                        &request.llm_request,
+                        &raw,
+                    )
+                })
+                .unwrap_or("an eligible route");
+            return Err(RunnerError::unsupported_capability(
+                self.algorithm.name(),
+                capability,
+            ));
+        }
         let (selected_model, response) = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
             request,
-            Arc::clone(&self.models),
+            Arc::new(models),
             observer,
         )
         .await?;

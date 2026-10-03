@@ -670,6 +670,21 @@ struct ClientRouting {
     /// Fulfils a routing-time decision call. Absent, a decision call is reported as
     /// unsupported, which is what this client did before any host supplied one.
     decision_handler: Option<DecisionHandler>,
+    /// Factual capability of each target, keyed by model id.
+    ///
+    /// Used to drop candidates a request cannot use before any provider is contacted, so a
+    /// target that cannot see an image is never called for one. A target absent from this
+    /// map is treated as uncharacterised rather than incapable.
+    target_capabilities: HashMap<ModelId, CapabilityFacts>,
+}
+
+/// The request requirements a candidate target is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CapabilityFacts {
+    /// The backing deployment cannot accept image input.
+    pub no_vision: bool,
+    /// The backing deployment cannot accept tool definitions or calls.
+    pub no_tool_calling: bool,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.
@@ -690,6 +705,17 @@ enum Routing {
 }
 
 impl ClientRouter {
+    /// Declares the factual capability of each target, by model id.
+    pub fn with_target_capabilities(
+        mut self,
+        capabilities: HashMap<ModelId, CapabilityFacts>,
+    ) -> Self {
+        let routing = Arc::get_mut(&mut self.inner)
+            .expect("client router is not yet shared when configured");
+        routing.target_capabilities = capabilities;
+        self
+    }
+
     /// Supplies the host that fulfils routing-time decision calls.
     ///
     /// Without one, a decision call is answered as unsupported.
@@ -754,6 +780,7 @@ impl ClientRouter {
                 state_owners: Mutex::default(),
                 track_provider_state: spans_providers,
                 decision_handler: None,
+                target_capabilities: HashMap::new(),
             }),
         }
     }
@@ -772,6 +799,7 @@ impl ClientRouter {
                 state_owners: Mutex::default(),
                 track_provider_state: false,
                 decision_handler: None,
+                target_capabilities: HashMap::new(),
             }),
         }
     }
@@ -1021,6 +1049,11 @@ impl ClientRouter {
     }
 
     /// Prepare a completion candidate with its configured target prompt.
+    /// The declared capability facts of each target, keyed by model id.
+    pub fn target_capabilities(&self) -> &HashMap<ModelId, CapabilityFacts> {
+        &self.inner.target_capabilities
+    }
+
     fn prepare_completion_request(&self, mut request: Request, target: &ModelId) -> Request {
         let prompt = self.inner.target_prompts.get(target).map(String::as_str);
         prepare_request_for_target(&mut request.llm_request, target, prompt);

@@ -156,6 +156,12 @@ struct RouteConfig {
     route_reasoning_policy: Option<RouteReasoningPolicy>,
     /// Estimated input tokens above which this route escalates to a wider-context leg.
     escalation_max_input_tokens: Option<u64>,
+    /// Target this route prefers once it is under context pressure.
+    ///
+    /// Named rather than inferred: a target's context window is not a fact this config
+    /// carries. `context_window` is a route-level promise, and upstream rejects it as an
+    /// unknown field on a target, so which leg is wider has to be stated.
+    escalation_target: Option<String>,
     algorithm: AlgorithmSpec,
 }
 
@@ -195,6 +201,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let vision = take_optional(&mut table, "vision")?;
         let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
+        let escalation_target = take_optional(&mut table, "escalation_target")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -205,6 +212,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             vision,
             route_reasoning_policy,
             escalation_max_input_tokens,
+            escalation_target,
             algorithm,
         })
     }
@@ -375,10 +383,28 @@ impl DeploymentConfig {
                 })?;
             }
             let capabilities = config.capabilities();
+            let mut escalation_model: Option<ModelId> = None;
             if capabilities.context_window == Some(0) {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} context_window must be greater than zero"
                 )));
+            }
+            // An escalation leg that does not exist, or a threshold with no leg to move to,
+            // would both silently serve the request on the primary leg instead. Reject both.
+            if config.escalation_target.is_some() != config.escalation_max_input_tokens.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} must declare escalation_max_input_tokens and \
+                     escalation_target together"
+                )));
+            }
+            if let Some(escalation_target) = &config.escalation_target {
+                let target = self.targets.get(escalation_target).ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "route {route_name} escalation_target references unknown target \
+                         {escalation_target}"
+                    ))
+                })?;
+                escalation_model = Some(target.id.clone());
             }
             // Ordered-candidate validation runs before anything resolves targets, so a malformed
             // list is reported as itself rather than as an unknown target.
@@ -422,6 +448,7 @@ impl DeploymentConfig {
                     crate::config::RouteReasoningPolicy::Inherit,
                 ),
                 config.escalation_max_input_tokens,
+                escalation_model,
             );
             routes.push((config.id.clone(), route));
         }
@@ -1866,6 +1893,69 @@ new = ["send_message"]
             error_message(&impossible).contains("reasoning_effort"),
             "{}",
             error_message(&impossible)
+        );
+    }
+
+    /// The reordering contract must not be declarable in a shape that silently does
+    /// nothing: half a contract would leave every request on the primary leg while the
+    /// config reads as though escalation were configured.
+    #[test]
+    fn an_incomplete_escalation_contract_is_rejected_at_load() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let escalated = format!(
+            "{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = \
+             61440\nescalation_target = \"strong\""
+        );
+
+        // Positive control: the complete contract loads, so each rejection below is caused
+        // by its specific defect rather than by a fixture that never parsed.
+        runner_from_toml(&VALID_CONFIG.replace(passthrough, &escalated))
+            .expect("a complete escalation contract must load");
+
+        for (defect, expected) in [
+            (
+                format!("{passthrough}\nescalation_max_input_tokens = 61440"),
+                "route passthrough must declare escalation_max_input_tokens and escalation_target \
+                 together",
+            ),
+            (
+                format!("{passthrough}\nescalation_target = \"strong\""),
+                "route passthrough must declare escalation_max_input_tokens and escalation_target \
+                 together",
+            ),
+            (
+                format!(
+                    "{passthrough}\nescalation_max_input_tokens = 61440\nescalation_target = \
+                     \"imaginary\""
+                ),
+                "route passthrough escalation_target references unknown target imaginary",
+            ),
+        ] {
+            assert_eq!(
+                error_message(&VALID_CONFIG.replace(passthrough, &defect)),
+                expected,
+                "config: {defect}"
+            );
+        }
+    }
+
+    /// A complete contract resolves to a real target and leaves the declared order alone:
+    /// the promotion is applied at execution time, so loading must not reorder anything.
+    #[test]
+    fn a_declared_escalation_contract_loads_without_changing_the_primary() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let escalated = format!(
+            "{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = \
+             61440\nescalation_target = \"strong\""
+        );
+        let config = VALID_CONFIG.replace(passthrough, &escalated);
+        let names = ordered_spec(&config, "passthrough")
+            .runtime_model_names("passthrough")
+            .expect("declared candidates resolve");
+        assert_eq!(
+            names.parent.get(&Category::Any),
+            Some(&vec!["weak".to_string(), "strong".to_string()]),
+            "declaration order still offers the primary first"
         );
     }
 

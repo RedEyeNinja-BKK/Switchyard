@@ -68,6 +68,34 @@ pub fn unsupported_capability(
         .or_else(|| unsupported_preserved_content(capabilities, body))
 }
 
+/// Estimated input tokens for a request body.
+///
+/// Ported from the retired FleetRouter rather than re-derived, so an escalation decision
+/// this deployment makes is comparable with the decisions the deployment it replaces made.
+/// One estimator: a second, differently-tuned copy would silently move the boundary.
+pub fn estimate_input_tokens(body: &Value) -> u64 {
+    fn walk(value: &Value, acc: &mut u64) {
+        match value {
+            Value::String(text) => {
+                let chars = text.chars().count() as u64;
+                let ascii = text.bytes().filter(|byte| byte.is_ascii()).count() as u64;
+                let non_ascii = chars.saturating_sub(ascii);
+                *acc = acc
+                    .saturating_add(ascii.div_ceil(4))
+                    .saturating_add(non_ascii)
+                    .saturating_add(1);
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, acc)),
+            Value::Object(map) => map.values().for_each(|value| walk(value, acc)),
+            _ => {}
+        }
+    }
+    let mut total = 0u64;
+    walk(body, &mut total);
+    // Fixed structural overhead (model field, message roles, wrapper keys).
+    total.saturating_add(8)
+}
+
 // Some provider fields survive forwarding without becoming decoded content blocks.
 // Inspect protocol content and tool outputs, leaving tool arguments and text untouched.
 fn unsupported_preserved_content(

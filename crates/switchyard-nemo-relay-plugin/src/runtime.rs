@@ -905,6 +905,7 @@ mod tests {
             RuntimeModels::default(),
             switchyard_runner::RouteReasoningPolicy::Inherit,
             None,
+            None,
         );
         SwitchyardRuntime {
             runner: Runner::new(vec![(ModelId::from(model), route)]),

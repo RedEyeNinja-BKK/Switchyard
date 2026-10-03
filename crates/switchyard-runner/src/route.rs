@@ -136,6 +136,9 @@ pub struct Route {
     route_reasoning_policy: crate::config::RouteReasoningPolicy,
     /// Context-pressure threshold for preferring a wider-context leg.
     escalation_max_input_tokens: Option<u64>,
+    /// Target promoted ahead of the declared order under context pressure, resolved
+    /// to its model id at load.
+    escalation_target: Option<ModelId>,
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
     anthropic_auxiliary_target: Option<AuxiliaryTarget>,
@@ -164,12 +167,14 @@ impl Route {
         models: RuntimeModels,
         route_reasoning_policy: crate::config::RouteReasoningPolicy,
         escalation_max_input_tokens: Option<u64>,
+        escalation_target: Option<ModelId>,
     ) -> Self {
         Self {
             algorithm,
             clients,
             route_reasoning_policy,
             escalation_max_input_tokens,
+            escalation_target,
             caller_auth,
             capabilities,
             anthropic_auxiliary_target,
@@ -281,6 +286,19 @@ impl Route {
             }
         };
         let models = self.models.filtered(&eligibility);
+        // Under context pressure the declared escalation leg is offered first, before any
+        // provider is contacted. This reorders one list; it does not add a second
+        // escalation engine, and the native retry, cooldown and fallback machinery still
+        // decides among the survivors.
+        let models = match (
+            self.escalation_target.as_ref(),
+            self.under_context_pressure(crate::request_fit::estimate_input_tokens(&raw)),
+        ) {
+            (Some(escalation_target), true) => models.promoting(std::slice::from_ref(
+                escalation_target,
+            )),
+            _ => models,
+        };
         let request = match self.route_reasoning_policy {
             RouteReasoningPolicy::Inherit => request,
             RouteReasoningPolicy::Medium => request.with_route_reasoning_policy(
@@ -393,6 +411,7 @@ mod context_policy_tests {
             RuntimeModels::default(),
             policy,
             threshold,
+            None,
         )
     }
 

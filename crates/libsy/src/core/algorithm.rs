@@ -92,7 +92,38 @@ impl RuntimeModels {
         }
     }
 
-    /// Adds the groups used for delegated sub-agent work.
+    /// Returns this model set with the named models moved to the front of every category,
+    /// preserving the relative order of everything else.
+    ///
+    /// Used for an under-context-pressure promotion: the named leg is offered first and the
+    /// surviving order is otherwise untouched, so the client still walks one list under its
+    /// own retry, cooldown and failure classification. A name that is not present is a
+    /// no-op rather than a synthetic entry, so a promotion never invents a model id.
+    pub fn promoting(&self, first: &[ModelId]) -> RuntimeModels {
+        if first.is_empty() {
+            return self.clone();
+        }
+        let promote = |groups: &HashMap<Category, Vec<ModelId>>| {
+            groups
+                .iter()
+                .map(|(category, models)| {
+                    let (promoted, rest): (Vec<ModelId>, Vec<ModelId>) = models
+                        .iter()
+                        .cloned()
+                        .partition(|model| first.contains(model));
+                    let mut ordered = promoted;
+                    ordered.extend(rest);
+                    (category.clone(), ordered)
+                })
+                .collect()
+        };
+        RuntimeModels {
+            by_category: promote(&self.by_category),
+            subagent: self.subagent.as_ref().map(|subagent| promote(subagent)),
+        }
+    }
+
+/// Adds the groups used for delegated sub-agent work.
     pub fn with_subagent(mut self, models: HashMap<Category, Vec<ModelId>>) -> Self {
         self.subagent = Some(models);
         self

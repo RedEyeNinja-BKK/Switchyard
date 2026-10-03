@@ -1260,13 +1260,11 @@ async fn handle_llm_request(
             return runner_error(error);
         }
     };
-    // Composition facts outlive the streaming wrapper, so they are kept for the log record.
-    let composition_ref: Option<&'static switchyard_runner::composition::CompositionMetadata> =
-        execution.composition.as_ref().map(|composition| {
-            let owned: &'static switchyard_runner::composition::CompositionMetadata =
-                Box::leak(Box::new(composition.clone()));
-            owned
-        });
+    // Composition facts outlive the streaming wrapper, so they are shared with it rather
+    // than borrowed from a local. An Arc keeps one copy for both readers and is dropped
+    // when the stream ends, so a long-lived router does not grow.
+    let composition_ref: Option<Arc<switchyard_runner::composition::CompositionMetadata>> =
+        execution.composition.clone().map(Arc::new);
 
     // Composition context is carried alongside the answer for telemetry only. The child's own
     // routing and observations are untouched, and the serving crate reconstructs nothing:

@@ -293,11 +293,18 @@ impl Route {
         // provider is contacted. This reorders one list; it does not add a second
         // escalation engine, and the native retry, cooldown and fallback machinery still
         // decides among the survivors.
-        let models = match (
-            self.escalation_target.as_ref(),
-            self.under_context_pressure(estimated_input_tokens),
-        ) {
-            (Some(escalation_target), true) => {
+        //
+        // The promotion is only real if the leg survived capability filtering *and* was
+        // already in the list, so that is what decides whether to reorder and what to
+        // report. Reporting on intent alone would over-count: an ineligible or unlisted leg
+        // leaves the order untouched while the counter still claimed a wider leg was
+        // preferred.
+        let promotion = self.escalation_target.as_ref().filter(|escalation_target| {
+            self.under_context_pressure(estimated_input_tokens)
+                && models.contains(escalation_target)
+        });
+        let models = match promotion {
+            Some(escalation_target) => {
                 if let Some(observer) = observer.as_ref() {
                     observer(RunObservation::ContextPressurePromotion {
                         promoted: escalation_target.clone(),
@@ -306,7 +313,7 @@ impl Route {
                 }
                 models.promoting(std::slice::from_ref(escalation_target))
             }
-            _ => models,
+            None => models,
         };
         let request = match self.route_reasoning_policy {
             RouteReasoningPolicy::Inherit => request,

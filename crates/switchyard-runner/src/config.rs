@@ -404,6 +404,15 @@ impl DeploymentConfig {
                          {escalation_target}"
                     ))
                 })?;
+                // The leg must be one this route can actually serve. `promoting` is a no-op
+                // for an id the route does not offer, so accepting it would leave a route
+                // that reads as escalating, reports promotions, and never reorders.
+                if !config.callable_target_names().contains(&escalation_target.as_str()) {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} escalation_target {escalation_target} is not a \
+                         candidate of this route"
+                    )));
+                }
                 escalation_model = Some(target.id.clone());
             }
             // Ordered-candidate validation runs before anything resolves targets, so a malformed
@@ -1959,7 +1968,37 @@ new = ["send_message"]
         );
     }
 
-    /// A deterministic route must be able to state its candidate order in configuration.
+    /// A route that configures escalation to a target it does not actually offer is
+/// configured-but-dead: `promoting` is a no-op for an absent id, so every over-threshold
+/// request silently keeps the declared order while the config and the dashboard both claim
+/// escalation happens. The leg must therefore be one of this route's own callable targets.
+#[test]
+fn an_escalation_target_outside_the_route_is_rejected_at_load() {
+    let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+    let configured = format!(
+        "{passthrough}\nescalation_max_input_tokens = 61440\nescalation_target = \
+         \"strong\""
+    );
+
+    // Positive control: `strong` IS a candidate here, so this loads. Without it, the
+    // rejection below could be blamed on the fixture rather than on candidate membership.
+    runner_from_toml(
+        &VALID_CONFIG.replace(
+            passthrough,
+            &format!("{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = 61440\nescalation_target = \"strong\""),
+        ),
+    )
+    .expect("an escalation target that is a candidate must load");
+
+    let message = error_message(&VALID_CONFIG.replace(passthrough, &configured));
+    assert_eq!(
+        message,
+        "route passthrough escalation_target strong is not a candidate of this route",
+        "a real target that this route cannot serve must be rejected, not silently accepted"
+    );
+}
+
+/// A deterministic route must be able to state its candidate order in configuration.
     /// The order is the contract: the selected target is offered first and the rest follow
     /// in declared order.
     #[test]

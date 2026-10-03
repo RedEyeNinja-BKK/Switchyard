@@ -184,9 +184,9 @@ impl RoutedLlmClient for EchoClient {
 
 /// A local route whose narrow leg is primary and whose wide leg is the escalation target.
 ///
-/// A third, always-failing leg sits behind the wide one. It is what makes the tail of the
-/// candidate list observable: if promotion dropped or reordered the candidates behind the
-/// promoted target, this leg would be skipped and the fallback would stop short.
+/// The wide leg is declared vision-incapable, matching the real deployment where the
+/// escalation leg is the VL model and the primary is not. Without that fact the capability
+/// filter removes nothing and any test about ineligibility is vacuous.
 fn escalating_route(
     threshold: Option<u64>,
     escalation_target: Option<&str>,
@@ -229,7 +229,14 @@ fn escalating_route(
         ])
         .into_iter()
         .collect(),
-    );
+    )
+    .with_target_capabilities(HashMap::from([(
+        ModelId::from("wide"),
+        switchyard_llm_client::CapabilityFacts {
+            no_vision: true,
+            no_tool_calling: false,
+        },
+    )]));
     Route::new(
         algorithm,
         clients,
@@ -390,6 +397,68 @@ async fn a_promotion_is_observable_by_the_run_observer() {
             );
         }
     }
+}
+
+/// The promotion report must describe a reorder that actually happened. A leg that
+/// capability filtering already removed cannot be promoted, so claiming a promotion would
+/// tell an operator a wider leg was preferred when the narrow one served the request.
+#[tokio::test]
+async fn an_ineligible_escalation_target_is_not_reported_as_promoted() {
+    // The escalation leg is excluded for this request because it cannot see an image, while
+    // the route's primary can. Under pressure the leg must neither be reordered nor reported.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let route = escalating_route(Some(61_440), Some("wide"), &calls);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observer = {
+        let observed = Arc::clone(&observed);
+        Arc::new(move |observation| observed.lock().unwrap().push(observation))
+    };
+    // The image is added after sizing, so the text is sized to leave room for the few tokens
+// the image wrapper adds. The request must END UP over the threshold, otherwise the promotion
+// is never reached and this test would pass for the wrong reason.
+let sized = body_of_estimated_tokens(61_430);
+    // `body_of_estimated_tokens` returns the chat shape, so the text is read from where it
+    // actually put it rather than from the Responses `input` path.
+    let text = sized["messages"][0]["content"].as_str().unwrap_or_default().to_string();
+    let body = serde_json::json!({
+        "model": "smartlocal",
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": "https://example.test/i.png"}
+            ]
+        }]
+    });
+    let estimate = switchyard_runner::request_fit::estimate_input_tokens(&body);
+    assert!(
+        estimate > 61_440,
+        "the fixture must be under context pressure for this test to mean anything, got {estimate}"
+    );
+
+    route
+        .execute(
+            Request {
+                llm_request: text_request(None, "hello"),
+                raw_request: Some(body),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("the request is served by the eligible primary");
+
+    let promotion_count: usize = {
+        let observations = observed.lock().unwrap();
+        observations
+            .iter()
+            .filter(|o| matches!(o, RunObservation::ContextPressurePromotion { .. }))
+            .count()
+    };
+    assert_eq!(
+        promotion_count, 0,
+        "an escalation leg that cannot serve this request must not be reported as promoted"
+    );
 }
 
 /// Promotion reorders; it must not shorten the list. With the promoted leg forced to fail,

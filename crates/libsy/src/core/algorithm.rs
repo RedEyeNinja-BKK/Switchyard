@@ -123,6 +123,22 @@ impl RuntimeModels {
         }
     }
 
+/// Whether this model set contains `model` in any category.
+    ///
+    /// Distinct from "is this the first model": a caller deciding whether an operation will
+    /// actually happen needs presence, not position.
+    pub fn contains(&self, model: &ModelId) -> bool {
+        if self.by_category.values().any(|models| models.contains(model)) {
+            return true;
+        }
+        // Spelled out rather than chained: `contains` would resolve to the `StreamExt`
+        // method that this crate also imports.
+        match &self.subagent {
+            Some(subagent) => subagent.values().any(|models| models.contains(model)),
+            None => false,
+        }
+    }
+
 /// Adds the groups used for delegated sub-agent work.
     pub fn with_subagent(mut self, models: HashMap<Category, Vec<ModelId>>) -> Self {
         self.subagent = Some(models);

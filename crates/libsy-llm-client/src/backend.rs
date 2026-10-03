@@ -12,7 +12,7 @@ use std::{
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use switchyard_protocol::{Metadata, WireFormat};
+use switchyard_protocol::{Metadata, ReasoningDialect, ReasoningPolicy, WireFormat};
 
 use crate::error::{LlmClientError, Result, is_overflow_body};
 
@@ -70,6 +70,13 @@ pub struct HttpBackendConfig {
     /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
     /// Anthropic has no equivalent and rejects the setting at configuration time.
     pub reasoning_effort: Option<String>,
+    /// Authoritative reasoning choice for this backend, applied after the caller's fields
+    /// and after `extra_body`. A provider that names reasoning as a boolean switch rather
+    /// than graded efforts uses this instead of `reasoning_effort`.
+    pub reasoning_policy: Option<ReasoningPolicy>,
+    /// How this provider expects reasoning control on the wire. A property of the provider,
+    /// so two targets behind one transport may use different dialects.
+    pub reasoning_dialect: ReasoningDialect,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
     /// Cooldown after an exhausted transient completion failure. Zero disables it.
@@ -89,6 +96,8 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_body_keys", &self.extra_body.keys())
             .field("omit_body_fields", &self.omit_body_fields)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("reasoning_policy", &self.reasoning_policy)
+            .field("reasoning_dialect", &self.reasoning_dialect)
             .field("max_retries", &self.max_retries)
             .field("failure_cooldown", &self.failure_cooldown)
             .field("timeout", &self.timeout)
@@ -317,6 +326,16 @@ impl Backend {
         self.config().reasoning_effort.as_deref()
     }
 
+    /// The authoritative reasoning choice for this backend, when configured.
+    pub fn reasoning_policy(&self) -> Option<ReasoningPolicy> {
+        self.config().reasoning_policy
+    }
+
+    /// How this provider expects reasoning control on the wire.
+    pub fn reasoning_dialect(&self) -> ReasoningDialect {
+        self.config().reasoning_dialect
+    }
+
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
@@ -438,6 +457,8 @@ mod tests {
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
+            reasoning_policy: None,
+            reasoning_dialect: ReasoningDialect::default(),
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,

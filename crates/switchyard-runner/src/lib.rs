@@ -4,6 +4,11 @@
 //! Shared configured routing for Switchyard serving surfaces.
 
 mod algorithm;
+pub mod capability;
+pub mod composition;
+pub mod decision_executor;
+pub mod request_fit;
+pub mod decision_transport;
 mod config;
 mod failure;
 mod provider_key_redactor;

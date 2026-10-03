@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reject inputs that the selected route explicitly disables.
+//! Request fit: whether a route's declared capabilities can serve a request.
+//!
+//! This lives in the runner rather than the serving crate because two very different
+//! callers need one interpretation of it. HTTP ingress checks it before dispatch, and a
+//! whole-route composite checks it before invoking a child, so "vision", "tools",
+//! "reasoning controls" and preserved provider fields mean exactly the same thing in
+//! both places. A capability mismatch found here is a routing fact, not a failure: the
+//! route simply was not eligible.
 
 use serde_json::Value;
 use switchyard_protocol::{ContentBlock, LlmRequest};
-use switchyard_runner::ModelCapabilities;
+use crate::ModelCapabilities;
 
 /// Return the first explicitly disabled capability used by decoded or preserved input.
 /// Forwarding can retain provider JSON fields that decoding omits.
-pub(crate) fn unsupported_capability(
+pub fn unsupported_capability(
     capabilities: ModelCapabilities,
     request: &LlmRequest,
     body: &Value,

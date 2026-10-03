@@ -3,7 +3,8 @@
 
 //! Rust HTTP server for libsy algorithms.
 
-mod capabilities;
+mod capability_surfaces;
+pub mod decision_surface;
 pub mod config;
 mod metrics;
 mod observability;
@@ -43,6 +44,7 @@ use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
+    request_fit,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -166,6 +168,10 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    /// HTTP clients for capability engines, one per declared timeout.
+    capability_http: capability_http::ClientSet,
+    /// Public ids of the capability surfaces this deployment exposes.
+    capability_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -189,7 +195,33 @@ impl SharedRoutingLog {
         tier: Option<&str>,
         usage: &Usage,
     ) {
-        if let Err(error) = self.writer.lock().append(context, model, tier, usage) {
+        self.append_inner(context, model, tier, usage, None);
+    }
+
+    fn append_composition(
+        &self,
+        context: routing_log::RoutingLogContext,
+        model: &str,
+        tier: Option<&str>,
+        usage: &Usage,
+        composition: &switchyard_runner::composition::CompositionMetadata,
+    ) {
+        self.append_inner(context, model, tier, usage, Some(composition));
+    }
+
+    fn append_inner(
+        &self,
+        context: routing_log::RoutingLogContext,
+        model: &str,
+        tier: Option<&str>,
+        usage: &Usage,
+        composition: Option<&switchyard_runner::composition::CompositionMetadata>,
+    ) {
+        if let Err(error) = self
+            .writer
+            .lock()
+            .append_with(context, model, tier, usage, composition)
+        {
             tracing::warn!(path = %self.path.display(), %error, "routing log append failed");
         }
     }
@@ -203,6 +235,14 @@ impl SharedRoutingLog {
 }
 
 impl ServerState {
+    /// HTTP client for a capability engine with the declared deadline.
+    fn capability_http(
+        &self,
+        timeout_seconds: Option<u64>,
+    ) -> Result<reqwest::Client, String> {
+        self.capability_http.get(timeout_seconds)
+    }
+
     /// Creates HTTP-server state around an already configured runner.
     pub fn from_runner(runner: Runner) -> ServerResult<Self> {
         let metrics = metrics::registry().map_err(ServerError::new)?;
@@ -215,6 +255,7 @@ impl ServerState {
             runner.models().map(|model| model.algorithm),
         );
         let redactor = redaction::Redactor::new(runner.provider_api_keys());
+        let capability_ids: Vec<String> = runner.capabilities().keys().cloned().collect();
         Ok(Self {
             redactor: Arc::new(redactor),
             runner: Arc::new(runner),
@@ -223,6 +264,8 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            capability_http: capability_http::ClientSet::default(),
+            capability_ids,
         })
     }
 
@@ -496,6 +539,9 @@ pub fn build_llm_router(state: ServerState) -> Router {
 pub fn build_switchyard_router(state: ServerState) -> Router {
     let mut router = primary_llm_routes()
         .route("/v1/decision", post(decision))
+        .route("/v1/decisions", post(decision_surface::decisions))
+        .route("/v1/embeddings", post(capability_surfaces::embeddings))
+        .route("/v1/rerank", post(capability_surfaces::rerank))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route(
             "/v1/responses/input_tokens",
@@ -691,6 +737,86 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
+/// Lazily built HTTP clients for capability engines, keyed by their declared timeout.
+mod capability_http {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Default deadline for a capability call that declares none.
+    const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+
+    #[derive(Clone, Default)]
+    pub(super) struct ClientSet {
+        clients: std::sync::Arc<Mutex<HashMap<u64, reqwest::Client>>>,
+    }
+
+    impl ClientSet {
+        /// Returns a client for the declared timeout, building it once per timeout value.
+        pub(super) fn get(
+            &self,
+            timeout_seconds: Option<u64>,
+        ) -> Result<reqwest::Client, String> {
+            let seconds = timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+            let mut clients = self
+                .clients
+                .lock()
+                .map_err(|_| "capability http client set is poisoned".to_string())?;
+            if let Some(client) = clients.get(&seconds) {
+                return Ok(client.clone());
+            }
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(seconds))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| error.to_string())?;
+            clients.insert(seconds, client.clone());
+            Ok(client)
+        }
+    }
+}
+
+/// A bounded label for a failure class, so a cross-child reason stays a fixed vocabulary.
+fn composition_failure_label(class: switchyard_llm_client::FailureClass) -> &'static str {
+    use switchyard_llm_client::FailureClass;
+    match class {
+        FailureClass::Transport => "transport",
+        FailureClass::Timeout => "timeout",
+        FailureClass::RateLimited => "rate_limited",
+        FailureClass::TemporarilyUnavailable => "temporarily_unavailable",
+        FailureClass::Server => "server",
+        FailureClass::ContextWindow => "context_window",
+        FailureClass::ProviderPolicy => "provider_policy",
+        FailureClass::Auth => "auth",
+        FailureClass::Request => "request",
+        FailureClass::Other => "other",
+    }
+}
+
+/// The bounded reason a composite moved off a child, taken from the failure that ended it.
+fn cross_reason(
+    composition: &switchyard_runner::composition::CompositionMetadata,
+    from_child: &str,
+) -> &'static str {
+    composition
+        .children
+        .iter()
+        .find(|(child, outcome)| {
+            child == from_child
+                && matches!(
+                    outcome,
+                    switchyard_runner::composition::ChildOutcome::Failed { .. }
+                )
+        })
+        .and_then(|(_, outcome)| match outcome {
+            switchyard_runner::composition::ChildOutcome::Failed { class, .. } => {
+                Some(composition_failure_label(*class))
+            }
+            _ => None,
+        })
+        .unwrap_or("serving_failure")
+}
+
 /// One provider request submitted for a routing decision without an answer-model call.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -734,6 +860,14 @@ async fn decision(
         .map(ModelId::from)
         .unwrap_or_default();
 
+    let Some(route) = state.route_for_model(&route) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route registered for model {route}"),
+            "model_not_found",
+            "model_not_found",
+        );
+    };
     let mut outcome = match route.decide(request).await {
         Ok(outcome) => outcome,
         Err(error) => return runner_error(error),
@@ -786,6 +920,15 @@ async fn anthropic_count_tokens(
     ) {
         Ok(resolved) => resolved,
         Err(response) => return anthropic_error_response(response),
+    };
+    // Token counting runs through one concrete target of a leaf route, so it resolves one here.
+    let Some(route) = state.route_for_model(&route) else {
+        return anthropic_error_response(error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route registered for model {route}"),
+            "model_not_found",
+            "model_not_found",
+        ));
     };
     anthropic_error_response(
         match route
@@ -851,6 +994,14 @@ async fn openai_responses_auxiliary(
     ) {
         Ok(resolved) => resolved,
         Err(response) => return render_error_response(response, WireFormat::OpenAiResponses),
+    };
+    let Some(route) = state.route_for_model(&route) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("No route registered for model {route}"),
+            "model_not_found",
+            "model_not_found",
+        );
     };
     let result = route.call_auxiliary(request, operation).await;
     render_error_response(
@@ -967,7 +1118,7 @@ fn resolve_route(
     metadata: Metadata,
     mut body: Value,
     wire_format: WireFormat,
-) -> std::result::Result<(&Route, Request), Response> {
+) -> std::result::Result<(String, Request), Response> {
     // Only trusted translation hops may supply exact request preservation state.
     // Strip it before decoding and retaining the raw body for upstream replay.
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -987,16 +1138,21 @@ fn resolve_route(
                 "invalid_request_error",
             )
         })?;
-    let route = state.route_for_model(&requested_model).ok_or_else(|| {
-        error_response(
+    // A composite is servable exactly like a leaf. Ingress reads the advertised capabilities
+    // (a leaf's own, or a composite's declared guarantee) and then hands execution to the
+    // runner seam, which resolves either kind without this crate choosing between them.
+    let Some(route_capabilities) = state.runner.route_capabilities(&requested_model) else {
+        return Err(error_response(
             StatusCode::NOT_FOUND,
             format!("No route registered for model {requested_model}"),
             "model_not_found",
             "model_not_found",
-        )
-    })?;
-    if let Err(RunnerError::IncompatibleCallerFormat(caller_auth)) =
-        route.check_caller_format(wire_format)
+        ));
+    };
+    if let Some(Err(RunnerError::IncompatibleCallerFormat(caller_auth))) =
+        state
+            .route_for_model(&requested_model)
+            .map(|route| route.check_caller_format(wire_format))
     {
         let (provider, expected_endpoint) = match caller_auth {
             CallerAuthKind::Anthropic => ("Anthropic", "/v1/messages"),
@@ -1012,7 +1168,7 @@ fn resolve_route(
         ));
     }
     if let Some(capability) =
-        capabilities::unsupported_capability(route.capabilities(), &llm_request, &body)
+        request_fit::unsupported_capability(route_capabilities, &llm_request, &body)
     {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -1028,7 +1184,9 @@ fn resolve_route(
         raw_request: Some(body),
         metadata: Some(metadata),
     };
-    Ok((route, request))
+    // The caller keeps the requested name, not a resolved leaf: the runner seam resolves leaf
+    // or composite at execution time.
+    Ok((requested_model, request))
 }
 
 /// Resolves and executes an LLM request, attaching route identity when durable logging is enabled.
@@ -1048,7 +1206,10 @@ async fn handle_llm_request(
     let routing_log_context = routing_log_context.map(|context| {
         context.with_route(
             request.llm_request.model.as_deref().unwrap_or_default(),
-            route.algorithm_name(),
+            state
+                .route_for_model(&route)
+                .map(|route| route.algorithm_name())
+                .unwrap_or("composite"),
         )
     });
     // Only the Codex namespace mapping is needed downstream, not the whole request.
@@ -1058,8 +1219,34 @@ async fn handle_llm_request(
         state.routing_log.clone().zip(routing_log_context.clone()),
     );
 
-    let output = match route.execute(request, Some(observer)).await {
-        Ok(output) => output,
+    // The routing log borrows the request, so the route id is taken before it is moved.
+    let route_id = request.llm_request.model.clone().unwrap_or_default();
+    // Execution goes through the runner seam, so a composite route is served the same way
+    // as a leaf without tier behaviour reaching this crate.
+    let execution = match state
+        .runner
+        .execute_route(&route_id, request, Some(observer))
+        .await
+    {
+        Ok(execution) => execution,
+        Err(RunnerError::UnsupportedCapability { model, capability }) => {
+            // A valid request that no eligible route can serve is the caller's problem, not a
+            // deployment fault, so it must not be reported as a server failure.
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("no eligible route for model {model:?}: requires {capability}"),
+                "invalid_request_error",
+                "unsupported_capability",
+            );
+        }
+        Err(RunnerError::StateConflict(message)) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                message,
+                "invalid_request_error",
+                "state_conflict",
+            );
+        }
         Err(error) => {
             if let RunnerError::Algorithm(LibsyError::ClientCall {
                 target,
@@ -1073,10 +1260,68 @@ async fn handle_llm_request(
             return runner_error(error);
         }
     };
+    // Composition facts outlive the streaming wrapper, so they are shared with it rather
+    // than borrowed from a local. An Arc keeps one copy for both readers and is dropped
+    // when the stream ends, so a long-lived router does not grow.
+    let composition_ref: Option<Arc<switchyard_runner::composition::CompositionMetadata>> =
+        execution.composition.clone().map(Arc::new);
+
+    // Composition context is carried alongside the answer for telemetry only. The child's own
+    // routing and observations are untouched, and the serving crate reconstructs nothing:
+    // every value here was already decided by the runner.
+    if let Some(composition) = execution.composition.as_ref() {
+        tracing::debug!(
+            parent_route = %composition.parent_route,
+            child_route = %composition.child_route,
+            final_target = %composition.final_target,
+            crossed_child = composition.crossed_child,
+            cross_child_reason = composition.cross_child_reason().as_deref().unwrap_or(""),
+            "whole-route composition",
+        );
+        // Every child attempt, in order, including one skipped for capability. A skipped
+        // target never reached a provider, which is precisely why this needs its own
+        // signal: it leaves no failure, retry or cooldown trace anywhere else.
+        let mut previous_failed: Option<&str> = None;
+        for (child, outcome) in &composition.children {
+            let (outcome_label, capability) = match outcome {
+                switchyard_runner::composition::ChildOutcome::Skipped { capability } => {
+                    ("skipped_ineligible", *capability)
+                }
+                switchyard_runner::composition::ChildOutcome::Served { .. } => ("selected", "none"),
+                switchyard_runner::composition::ChildOutcome::Failed { class, .. } => {
+                    ("attempt_failed", composition_failure_label(*class))
+                }
+            };
+            metrics::record_composition_attempt(
+                &composition.parent_route,
+                child,
+                match outcome {
+                    switchyard_runner::composition::ChildOutcome::Served { target } => target,
+                    switchyard_runner::composition::ChildOutcome::Skipped { .. } => "",
+                    switchyard_runner::composition::ChildOutcome::Failed { .. } => "",
+                },
+                outcome_label,
+                capability,
+            );
+            if outcome_label == "attempt_failed" {
+                previous_failed = Some(child);
+            } else if let Some(from) = previous_failed
+                && !matches!(outcome, switchyard_runner::composition::ChildOutcome::Skipped { .. })
+            {
+                metrics::record_composition_cross(
+                    &composition.parent_route,
+                    from,
+                    child,
+                    cross_reason(composition, from),
+                );
+                previous_failed = None;
+            }
+        }
+    }
     let RunOutput {
         selected_model,
         response,
-    } = output;
+    } = execution.output;
     // The response carries the candidate that actually served it. Fall back to the routing
     // selection for algorithms that return a response without an offloaded model call.
     let served_model = response.served_model().cloned().or(Some(selected_model));
@@ -1092,6 +1337,7 @@ async fn handle_llm_request(
             state.stats,
             cache_eligible,
             state.routing_log.zip(routing_log_context),
+            composition_ref,
         )
     } else {
         response
@@ -1668,6 +1914,8 @@ fn endpoint_listing(has_routing_log: bool) -> String {
         "  POST /v1/messages            Anthropic Messages",
         "  POST /v1/responses           OpenAI Responses",
         "  POST /v1/messages/count_tokens",
+        "  POST /v1/embeddings           capability: embedding spaces",
+        "  POST /v1/rerank               capability: reranking",
         "  POST /v1/responses/input_tokens",
         "  POST /v1/responses/compact",
         "  ANY  unmatched paths          optional fallback client",

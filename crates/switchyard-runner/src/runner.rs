@@ -18,6 +18,27 @@ pub struct Runner {
     routes: Vec<(ModelId, Route)>,
     fallback_base_url: Option<String>,
     provider_api_keys: Vec<String>,
+    /// Specialized capability surfaces, keyed by the public id callers request.
+    capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
+    /// Configured logical decision lanes, by name. More than one when candidate order
+    /// differs per question type.
+    decision_lanes: BTreeMap<String, Lane>,
+    /// Name of the lane that serves every question kind, when one is configured.
+    default_decision_lane: Option<String>,
+    /// Ordered composites over complete child routes.
+    composites: BTreeMap<String, crate::composition::CompositeSpec>,
+    /// Declared capabilities of composite routes, which are policy promises rather than
+    /// derived from any one child.
+    composite_capabilities: BTreeMap<String, ModelCapabilities>,
+}
+
+/// One configured lane: its resolver and the kinds it serves.
+#[derive(Clone)]
+pub struct Lane {
+    /// The lane's ordered candidates.
+    pub resolver: std::sync::Arc<crate::decision_executor::DecisionResolver>,
+    /// The question kinds this lane serves. Empty means every kind.
+    pub types: Vec<crate::decision_transport::QuestionKind>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -41,6 +62,20 @@ pub struct DecisionTarget {
     pub format: WireFormat,
     pub base_url: String,
     pub extra_body: BTreeMap<String, Value>,
+    /// Wire family this decision backend speaks, when it serves typed decisions.
+    pub decision_transport: Option<crate::decision_transport::DecisionTransport>,
+    /// Which question kinds this backend currently answers.
+    pub supported_types: Option<crate::decision_transport::SupportedTypes>,
+    /// State shapes this backend accepts. A target accepts every shape by default.
+    pub state_forms: crate::decision_transport::StateForms,
+    /// Path appended to `base_url` for a typed decision call.
+    pub decision_path: Option<String>,
+    /// Base URL for a typed decision call, when it is not the completion endpoint.
+    pub decision_base_url: Option<String>,
+    /// Environment variable holding this backend's credential.
+    pub decision_api_key_env: Option<String>,
+    /// Factual capability of this target's backing deployment.
+    pub target_capabilities: ModelCapabilities,
 }
 
 impl Runner {
@@ -63,49 +98,14 @@ impl Runner {
             routes,
             fallback_base_url: None,
             provider_api_keys: Vec::new(),
+            capabilities: BTreeMap::new(),
+            decision_lanes: BTreeMap::new(),
+            default_decision_lane: None,
+            composites: BTreeMap::new(),
+            composite_capabilities: BTreeMap::new(),
         }
     }
 
-    /// Registers deployment-owned API keys for serving-surface output redaction.
-    /// TOML loading registers these automatically; programmatic hosts must supply them.
-    pub fn with_provider_api_keys(mut self, keys: Vec<String>) -> Self {
-        self.provider_api_keys = keys;
-        self
-    }
-
-    /// Returns deployment-owned secrets for serving-surface output redactors.
-    pub fn provider_api_keys(&self) -> &[String] {
-        &self.provider_api_keys
-    }
-
-    pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
-        self.fallback_base_url = fallback_base_url;
-        self
-    }
-
-    /// Returns the route registered for a model.
-    pub fn route(&self, model: &str) -> Option<&Route> {
-        self.routes
-            .iter()
-            .find(|(id, _)| id.as_str() == model)
-            .map(|(_, route)| route)
-    }
-
-    /// Iterates over configured routes in caller-provided order.
-    pub fn models(&self) -> impl Iterator<Item = ModelInfo<'_>> {
-        self.routes.iter().map(|(id, route)| ModelInfo {
-            id,
-            algorithm: route.algorithm_name(),
-            capabilities: route.capabilities(),
-        })
-    }
-
-    /// Returns the validated API root used for unmatched HTTP requests.
-    pub fn fallback_base_url(&self) -> Option<&str> {
-        self.fallback_base_url.as_deref()
-    }
-
-    /// Resolves an outcome to configured target names and non-secret client settings.
     pub fn describe_decision(
         &self,
         model: &ModelId,
@@ -136,4 +136,180 @@ impl Runner {
             fallbacks: model_ids.map(resolve).collect::<Option<Vec<_>>>()?,
         })
     }
+
+    /// Returns the route registered for a model.
+    pub fn route(&self, model: &str) -> Option<&Route> {
+        self.routes
+            .iter()
+            .find(|(id, _)| id.as_str() == model)
+            .map(|(_, route)| route)
+    }
+
+    /// Returns the registered routes, for advertising and capability lookups.
+    pub fn models(&self) -> impl Iterator<Item = ModelInfo<'_>> {
+        self.routes.iter().map(|(id, route)| ModelInfo {
+            id,
+            algorithm: route.algorithm_name(),
+            capabilities: route.capabilities(),
+        })
+    }
+
+    /// The URL unmatched requests may fall through to, when configured.
+    pub fn fallback_base_url(&self) -> Option<&str> {
+        self.fallback_base_url.as_deref()
+    }
+
+    /// Registers the URL unmatched requests may fall through to.
+    pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
+        self.fallback_base_url = fallback_base_url;
+        self
+    }
+
+    /// Registers deployment-owned API keys for serving-surface output redaction.
+    pub fn with_provider_api_keys(mut self, keys: Vec<String>) -> Self {
+        self.provider_api_keys = keys;
+        self
+    }
+
+    /// Returns deployment-owned secrets for serving-surface output redactors.
+    pub fn provider_api_keys(&self) -> &[String] {
+        &self.provider_api_keys
+    }
+
+    /// Registers the specialized capability surfaces a deployment exposes.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: BTreeMap<String, crate::capability::ResolvedCapability>,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Resolves a caller-requested capability by its public id.
+    pub fn capability(&self, id: &str) -> Option<&crate::capability::ResolvedCapability> {
+        self.capabilities.get(id)
+    }
+
+    /// Every exposed capability, for advertising on `/v1/models`.
+    pub fn capabilities(&self) -> &BTreeMap<String, crate::capability::ResolvedCapability> {
+        &self.capabilities
+    }
+
+    /// Registers the default logical decision lane, used by the compatibility surface.
+    pub fn with_decision_lane(
+        mut self,
+        name: impl Into<String>,
+        resolver: std::sync::Arc<crate::decision_executor::DecisionResolver>,
+        types: Vec<crate::decision_transport::QuestionKind>,
+    ) -> Self {
+        let name = name.into();
+        if types.is_empty() {
+            self.default_decision_lane = Some(name.clone());
+        }
+        self.decision_lanes.insert(
+            name,
+            Lane {
+                resolver,
+                types,
+            },
+        );
+        self
+    }
+
+    /// Registers an ordered composite over complete child routes.
+    pub fn with_composite(
+        mut self,
+        route_id: impl Into<String>,
+        children: Vec<String>,
+    ) -> Self {
+        self.composites
+            .insert(route_id.into(), crate::composition::CompositeSpec { children });
+        self
+    }
+
+    /// Declares the capabilities a composite route guarantees.
+    pub fn with_composite_capabilities(
+        mut self,
+        route_id: impl Into<String>,
+        capabilities: ModelCapabilities,
+    ) -> Self {
+        self.composite_capabilities.insert(route_id.into(), capabilities);
+        self
+    }
+
+    /// The capabilities any servable route advertises.
+    ///
+    /// A composite is servable and declares its own guarantee, so ingress resolves it the same
+    /// way it resolves a leaf. Returns `None` only when nothing is registered under the name.
+    pub fn has_route(&self, route_id: &str) -> bool {
+        self.route_capabilities(route_id).is_some()
+    }
+
+    /// The capabilities a route advertises: a composite's declared promise, or a leaf's.
+    pub fn route_capabilities(&self, route_id: &str) -> Option<ModelCapabilities> {
+        if let Some(capabilities) = self.composite_capabilities.get(route_id) {
+            return Some(*capabilities);
+        }
+        self.route(route_id).map(|route| route.capabilities())
+    }
+
+    /// Every route this runner serves, composite or leaf.
+    pub fn route_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.routes.iter().map(|(id, _)| id.to_string()).collect();
+        ids.extend(self.composites.keys().cloned());
+        ids
+    }
+
+    /// The composite spec for a route, when it is one.
+    pub fn composite_spec(&self, route_id: &str) -> Option<&crate::composition::CompositeSpec> {
+        self.composites.get(route_id)
+    }
+
+    /// Every registered composite, for diagnostics and validation.
+    pub fn composites(&self) -> &BTreeMap<String, crate::composition::CompositeSpec> {
+        &self.composites
+    }
+
+    /// The configured name of the lane that serves every question kind.
+    pub fn decision_lane_name(&self) -> Option<&str> {
+        self.default_decision_lane.as_deref()
+    }
+
+    /// Selects the lane that serves a request, by its question kinds.
+    ///
+    /// A lane scoped to exactly this request's kinds wins over a broader one, so a
+    /// type-specific order is never shadowed by the general lane. A request no lane
+    /// covers is reported as such rather than falling through to whichever lane happens
+    /// to be registered first.
+    pub fn lane_for_request(
+        &self,
+        request: &switchyard_protocol::DecisionRequest,
+    ) -> Option<&Lane> {
+        // Scoped lanes are considered before the unscoped one, so a type-specific order
+        // is never shadowed by the general lane. Registering lanes in a sorted map means
+        // iteration order alone must not decide this.
+        let mut scoped: Option<&Lane> = None;
+        for lane in self.decision_lanes.values() {
+            if lane.types.is_empty() {
+                continue;
+            }
+            if !crate::decision_transport::lane_serves(&lane.types, request) {
+                continue;
+            }
+            let best_fit = scoped.map_or(usize::MAX, |current| current.types.len());
+            if lane.types.len() < best_fit {
+                scoped = Some(lane);
+            } else if lane.types.len() == best_fit {
+                // Two lanes claim the same kinds; that is ambiguous, so neither is used.
+                return None;
+            }
+        }
+        if scoped.is_some() {
+            return scoped;
+        }
+        self.decision_lanes
+            .values()
+            .find(|lane| crate::decision_transport::lane_serves(&lane.types, request))
+    }
 }
+

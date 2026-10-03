@@ -31,9 +31,9 @@ use switchyard_libsy::{
     RuntimeModels, drive,
 };
 use switchyard_protocol::{
-    AggLlmResponse, LlmClientError, LlmResponse, LlmResponseChunk, LlmResponseStream, Message,
-    ModelId, Request, Response, ResponseAccumulator, RoutedLlmClient, RoutingFallbackReason,
-    WireFormat,
+    AggLlmResponse, DecisionRequest, DecisionResponse, LlmClientError, LlmResponse,
+    LlmResponseChunk, LlmResponseStream, Message, ModelId, Request, Response, ResponseAccumulator,
+    RoutedLlmClient, RoutingFallbackReason, WireFormat,
 };
 use switchyard_translation::prepare_request_for_target;
 
@@ -152,12 +152,23 @@ pub async fn decide(
     Ok(outcome)
 }
 
-async fn unsupported_decision(call: CallDecision) -> Result<()> {
+/// Answers a decision call, or reports that this client serves none.
+async fn serve_decision(clients: &ClientRouter, call: CallDecision) -> Result<()> {
     let model = call.model.clone();
-    call.respond(Err(LibsyError::client_call(
-        model,
-        LlmClientError::General("decision calls are not supported by this client".to_string()),
-    )))
+    let Some(handler) = clients.inner.decision_handler.clone() else {
+        return call.respond(Err(LibsyError::client_call(
+            model,
+            LlmClientError::General("decision calls are not supported by this client".to_string()),
+        )));
+    };
+    let request = call.request.clone();
+    match handler(request, model.clone()).await {
+        Ok(response) => call.respond(Ok(response)),
+        Err(error) => call.respond(Err(LibsyError::client_call(
+            model,
+            LlmClientError::General(error.to_string()),
+        ))),
+    }
 }
 
 /// Emits completed routing calls after the outcome reveals whether one response became the answer.
@@ -191,7 +202,7 @@ async fn serve(
 ) -> Result<()> {
     let call = match call {
         Call::Model(call) => *call,
-        Call::Decision(call) => return unsupported_decision(*call).await,
+        Call::Decision(call) => return serve_decision(&clients, *call).await,
     };
     let observe = |observation| {
         if let Some(observations) = &observations {
@@ -378,6 +389,88 @@ async fn buffer_routing_stream(
         events.push(event);
     }
     Ok(stream::iter(events.into_iter().map(Ok)).boxed())
+}
+
+/// Why a provider call failed, in terms a caller can act on.
+///
+/// `fallback_reason` answers one yes/no question for candidate targets inside one route.
+/// A whole-route composite needs the same failure understood more finely: some of these
+/// are worth crossing routes for and some are not, so the classification is exposed rather
+/// than each caller reading HTTP statuses again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The connection could not be made or was lost.
+    Transport,
+    /// A deadline elapsed.
+    Timeout,
+    /// The provider asked us to slow down.
+    RateLimited,
+    /// The provider is temporarily unable to serve and may recover.
+    TemporarilyUnavailable,
+    /// The provider answered with a server-side error.
+    Server,
+    /// The request did not fit the provider's context window.
+    ContextWindow,
+    /// The provider refused on policy grounds. Provider-specific, so another provider
+    /// may legitimately accept it.
+    ProviderPolicy,
+    /// The provider rejected our credential or the caller's.
+    Auth,
+    /// The provider rejected the request itself.
+    Request,
+    /// Anything else, including local failures with no provider involvement.
+    Other,
+}
+
+impl FailureClass {
+    /// Whether a whole-route composite may try its next child after this failure.
+    ///
+    /// Deliberately narrower than candidate fallback inside one route. Crossing to a
+    /// different complete route is a bigger step than trying another target on the same
+    /// one, so only failures that say "this provider is unreachable right now" qualify.
+    ///
+    /// A context-window rejection is excluded on purpose: the next child may hold a
+    /// smaller window still, and crossing would only trade one rejection for another.
+    /// Capability evidence decides child order, not recovery from an oversized request.
+    pub fn allows_cross_route(self) -> bool {
+        matches!(
+            self,
+            Self::Transport
+                | Self::Timeout
+                | Self::RateLimited
+                | Self::TemporarilyUnavailable
+                | Self::Server
+        )
+    }
+}
+
+/// Classifies a provider failure without interpreting it again at each call site.
+pub fn failure_class(error: &LibsyError) -> FailureClass {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return FailureClass::Other;
+    };
+    match source {
+        LlmClientError::ContextWindowExceeded { .. } => FailureClass::ContextWindow,
+        LlmClientError::Transport { .. } => FailureClass::Transport,
+        LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
+        LlmClientError::UpstreamHttp { status, body } => match *status {
+            StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
+            StatusCode::REQUEST_TIMEOUT => FailureClass::Timeout,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => FailureClass::Auth,
+            status if status.is_server_error() => FailureClass::Server,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                if serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+                    value["error"]["code"].as_str() == Some("content_policy_violation")
+                }) {
+                    FailureClass::ProviderPolicy
+                } else {
+                    FailureClass::Request
+                }
+            }
+            _ => FailureClass::Other,
+        },
+        _ => FailureClass::Other,
+    }
 }
 
 /// Whether a failed candidate is worth routing around.
@@ -574,7 +667,35 @@ struct ClientRouting {
     state_owners: Mutex<StateOwners>,
     /// Native Responses state only needs a routing pin when answer targets span clients.
     track_provider_state: bool,
+    /// Fulfils a routing-time decision call. Absent, a decision call is reported as
+    /// unsupported, which is what this client did before any host supplied one.
+    decision_handler: Option<DecisionHandler>,
+    /// Factual capability of each target, keyed by model id.
+    ///
+    /// Used to drop candidates a request cannot use before any provider is contacted, so a
+    /// target that cannot see an image is never called for one. A target absent from this
+    /// map is treated as uncharacterised rather than incapable.
+    target_capabilities: HashMap<ModelId, CapabilityFacts>,
 }
+
+/// The request requirements a candidate target is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CapabilityFacts {
+    /// The backing deployment cannot accept image input.
+    pub no_vision: bool,
+    /// The backing deployment cannot accept tool definitions or calls.
+    pub no_tool_calling: bool,
+}
+
+/// Serves one decision call and returns the answer, or a classified failure.
+///
+/// Supplied by the host that owns decision backends, so this crate stays unaware of
+/// how a decision is transported.
+pub type DecisionHandler = Arc<
+    dyn Fn(DecisionRequest, ModelId) -> std::pin::Pin<Box<dyn Future<Output = Result<DecisionResponse>> + Send>>
+        + Send
+        + Sync,
+>;
 
 enum Routing {
     /// One client serves every model.
@@ -584,6 +705,27 @@ enum Routing {
 }
 
 impl ClientRouter {
+    /// Declares the factual capability of each target, by model id.
+    pub fn with_target_capabilities(
+        mut self,
+        capabilities: HashMap<ModelId, CapabilityFacts>,
+    ) -> Self {
+        let routing = Arc::get_mut(&mut self.inner)
+            .expect("client router is not yet shared when configured");
+        routing.target_capabilities = capabilities;
+        self
+    }
+
+    /// Supplies the host that fulfils routing-time decision calls.
+    ///
+    /// Without one, a decision call is answered as unsupported.
+    pub fn with_decision_handler(mut self, handler: DecisionHandler) -> Self {
+        let routing = Arc::get_mut(&mut self.inner)
+            .expect("client router is not yet shared when configured");
+        routing.decision_handler = Some(handler);
+        self
+    }
+
     /// Build a router over `model name -> client`, for targets spread across providers.
     pub fn new(by_model: HashMap<ModelId, Arc<dyn RoutedLlmClient>>) -> Self {
         Self::new_with_target_prompts(by_model, HashMap::new(), None)
@@ -637,6 +779,8 @@ impl ClientRouter {
                 routing_answer_target,
                 state_owners: Mutex::default(),
                 track_provider_state: spans_providers,
+                decision_handler: None,
+                target_capabilities: HashMap::new(),
             }),
         }
     }
@@ -654,6 +798,8 @@ impl ClientRouter {
                 routing_answer_target: None,
                 state_owners: Mutex::default(),
                 track_provider_state: false,
+                decision_handler: None,
+                target_capabilities: HashMap::new(),
             }),
         }
     }
@@ -676,6 +822,15 @@ impl ClientRouter {
                     })
             }
         }
+    }
+
+        /// The model that owns this request's provider state, when one is recorded.
+    ///
+    /// Exposed read-only so a whole-route composite can ask which child owns a
+    /// continuation without copying provider state or reimplementing the lookup. The
+    /// child that owns it keeps its own state; nothing is duplicated here.
+    pub fn continuation_owner(&self, request: &Request) -> Option<ModelId> {
+        self.stored_state_owner(request).map(|owner| owner.model)
     }
 
     /// Return the recorded model for the requested response or conversation ID.
@@ -894,6 +1049,11 @@ impl ClientRouter {
     }
 
     /// Prepare a completion candidate with its configured target prompt.
+    /// The declared capability facts of each target, keyed by model id.
+    pub fn target_capabilities(&self) -> &HashMap<ModelId, CapabilityFacts> {
+        &self.inner.target_capabilities
+    }
+
     fn prepare_completion_request(&self, mut request: Request, target: &ModelId) -> Request {
         let prompt = self.inner.target_prompts.get(target).map(String::as_str);
         prepare_request_for_target(&mut request.llm_request, target, prompt);
@@ -923,6 +1083,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
     use async_trait::async_trait;
     use futures::StreamExt;
     use http::StatusCode;
@@ -1230,6 +1391,8 @@ mod tests {
                         extra_body: BTreeMap::from([("store".to_string(), json!(store))]),
                         omit_body_fields: BTreeSet::new(),
                         reasoning_effort: None,
+                        reasoning_policy: None,
+                        reasoning_dialect: ReasoningDialect::default(),
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
                         timeout: None,
@@ -1377,6 +1540,8 @@ mod tests {
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
                     reasoning_effort: None,
+                    reasoning_policy: None,
+                    reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
                     timeout: None,
@@ -2052,6 +2217,8 @@ mod tests {
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
                     reasoning_effort: None,
+                    reasoning_policy: None,
+                    reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 2,
                     failure_cooldown: cooldown,
                     timeout: None,
@@ -2173,6 +2340,8 @@ mod tests {
                 extra_body: BTreeMap::new(),
                 omit_body_fields: BTreeSet::new(),
                 reasoning_effort: None,
+                reasoning_policy: None,
+                reasoning_dialect: ReasoningDialect::default(),
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
                 timeout: None,

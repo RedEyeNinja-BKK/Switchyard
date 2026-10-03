@@ -119,7 +119,7 @@ impl RuntimeModels {
         };
         RuntimeModels {
             by_category: promote(&self.by_category),
-            subagent: self.subagent.as_ref().map(|subagent| promote(subagent)),
+            subagent: self.subagent.as_ref().map(promote),
         }
     }
 

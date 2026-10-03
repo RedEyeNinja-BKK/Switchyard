@@ -389,6 +389,41 @@ impl DeploymentConfig {
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
+            // A route policy the target cannot carry is a route that reads as authoritative and
+            // is not. Only the graded `reasoning_effort` axis and the target's own dialect
+            // can carry it: a target that declares `reasoning_effort` expresses "medium" on
+            // its own, so requiring a dialect there would reject the shipped manifest. What
+            // must not pass is an intent with neither carrier, or "thinking on" on a dialect
+            // whose only off value is `none`.
+            if let Some(policy) = config.route_reasoning_policy {
+                let requested = match policy {
+                    crate::config::RouteReasoningPolicy::Inherit => None,
+                    crate::config::RouteReasoningPolicy::Medium => {
+                        Some(switchyard_protocol::ReasoningPolicy::Enabled)
+                    }
+                    crate::config::RouteReasoningPolicy::None => {
+                        Some(switchyard_protocol::ReasoningPolicy::Disabled)
+                    }
+                };
+                if let Some(requested) = requested {
+                    for target_name in config.callable_target_names() {
+                        let Some(target) = self.targets.get(target_name) else {
+                            continue;
+                        };
+                        if target.reasoning_effort.is_some() {
+                            continue;
+                        }
+                        requested
+                            .validate_for(target.reasoning_dialect)
+                            .map_err(|error| {
+                                RunnerError::configuration(format!(
+                                    "route {route_name} reasoning policy cannot be applied \
+                                     to target {target_name}: {error}"
+                                ))
+                            })?;
+                    }
+                }
+            }
             // An escalation leg that does not exist, or a threshold with no leg to move to,
             // would both silently serve the request on the primary leg instead. Reject both.
             if config.escalation_target.is_some() != config.escalation_max_input_tokens.is_some() {
@@ -2006,7 +2041,51 @@ fn an_escalation_target_outside_the_route_is_rejected_at_load() {
     );
 }
 
-/// A threshold of zero means "every request", because the estimator floors at the
+/// A route policy is applied last on the wire, so it must be expressible by every target
+    /// the route can reach. A target's own policy is checked against its dialect at load;
+    /// without the same check one layer up, a route asking for thinking on an effort-only
+    /// dialect would apply nothing and still read as authoritative.
+    #[test]
+    fn a_route_policy_a_target_cannot_express_is_rejected_at_load() {
+        // `responses` is declared as an openai_responses client, so give the target the
+        // effort dialect, which grades effort and has no fragment meaning "think".
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        assert!(
+            VALID_CONFIG.contains(strong),
+            "the strong target fixture must exist verbatim"
+        );
+        // The route must point AT that target: a policy is checked against every target the
+        // route can reach, and the fixture's other targets declare no dialect at all.
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let on_effort_target =
+            "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"";
+        let configured = VALID_CONFIG
+            .replace(strong, &format!("{strong}\nreasoning_dialect = \"openai_effort\""))
+            .replace(
+                &passthrough,
+                &format!("{on_effort_target}\nroute_reasoning_policy = \"medium\""),
+            );
+
+        // Positive control: `none` IS expressible on this dialect, so the rejection below
+        // is about the policy value rather than the fixture.
+        runner_from_toml(
+            &VALID_CONFIG
+                .replace(strong, &format!("{strong}\nreasoning_dialect = \"openai_effort\""))
+                .replace(
+                    &passthrough,
+                    &format!("{on_effort_target}\nroute_reasoning_policy = \"none\""),
+                ),
+        )
+        .expect("a non-thinking policy must load on an effort-only dialect");
+
+        let message = error_message(&configured);
+        assert!(
+            message.contains("route passthrough reasoning policy cannot be applied"),
+            "a medium policy on an effort-only dialect must be rejected, got: {message}"
+        );
+    }
+
+    /// A threshold of zero means "every request", because the estimator floors at the
     /// structural overhead and never returns less. Whether that is intended is stated
     /// nowhere, and it silently removes the declared primary from first position, so it is
     /// rejected for the same reason `context_window = 0` is.

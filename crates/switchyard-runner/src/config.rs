@@ -397,6 +397,14 @@ impl DeploymentConfig {
                      escalation_target together"
                 )));
             }
+            // Zero would mean "every request", since the estimator floors at the structural
+            // overhead. That silently removes the declared primary, so it is refused rather
+            // than interpreted.
+            if config.escalation_max_input_tokens == Some(0) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} escalation_max_input_tokens must be greater than zero"
+                )));
+            }
             if let Some(escalation_target) = &config.escalation_target {
                 let target = self.targets.get(escalation_target).ok_or_else(|| {
                     RunnerError::configuration(format!(
@@ -1998,7 +2006,26 @@ fn an_escalation_target_outside_the_route_is_rejected_at_load() {
     );
 }
 
-/// A deterministic route must be able to state its candidate order in configuration.
+/// A threshold of zero means "every request", because the estimator floors at the
+    /// structural overhead and never returns less. Whether that is intended is stated
+    /// nowhere, and it silently removes the declared primary from first position, so it is
+    /// rejected for the same reason `context_window = 0` is.
+    #[test]
+    fn a_zero_escalation_threshold_is_rejected_at_load() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        assert_eq!(
+            error_message(&VALID_CONFIG.replace(
+                passthrough,
+                &format!(
+                    "{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = \
+                     0\nescalation_target = \"strong\""
+                ),
+            )),
+            "route passthrough escalation_max_input_tokens must be greater than zero",
+        );
+    }
+
+    /// A deterministic route must be able to state its candidate order in configuration.
     /// The order is the contract: the selected target is offered first and the rest follow
     /// in declared order.
     #[test]

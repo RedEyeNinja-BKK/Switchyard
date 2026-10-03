@@ -42,12 +42,15 @@ impl RoutingLog {
         Ok(Self(file))
     }
 
-    pub(crate) fn append(
+    /// Composition facts for one request, appended to the same record so the served
+    /// model and the child that produced it are read together rather than joined later.
+    pub(crate) fn append_with(
         &mut self,
         context: RoutingLogContext,
         model: &str,
         tier: Option<&str>,
         usage: &Usage,
+        composition: Option<&switchyard_runner::composition::CompositionMetadata>,
     ) -> std::io::Result<()> {
         let usage = token_usage(usage);
         let record = RoutingRecord {
@@ -66,6 +69,16 @@ impl RoutingLog {
             completion_tokens: usage.completion_tokens,
             reasoning_tokens: usage.reasoning_tokens,
             total_tokens: usage.prompt_tokens.saturating_add(usage.completion_tokens),
+            child_route: composition
+                .map(|composition| composition.child_route.clone().into())
+                .unwrap_or_else(|| "".into()),
+            final_target: composition
+                .map(|composition| composition.final_target.clone().into())
+                .unwrap_or_else(|| "".into()),
+            cross_child_reason: composition
+                .and_then(|composition| composition.cross_child_reason())
+                .unwrap_or_default()
+                .into(),
         };
         let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         line.push(b'\n');
@@ -166,6 +179,12 @@ struct RoutingRecord<'a> {
     cache_creation_tokens: u64,
     completion_tokens: u64,
     reasoning_tokens: u64,
+    /// Child route that served the request, when a composite served it.
+    child_route: Cow<'a, str>,
+    /// The model that actually answered, as recorded by the composition.
+    final_target: Cow<'a, str>,
+    /// Why the composite moved on from an earlier child, empty when it did not.
+    cross_child_reason: Cow<'a, str>,
     total_tokens: u64,
 }
 

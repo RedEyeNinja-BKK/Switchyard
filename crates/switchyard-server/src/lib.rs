@@ -195,7 +195,33 @@ impl SharedRoutingLog {
         tier: Option<&str>,
         usage: &Usage,
     ) {
-        if let Err(error) = self.writer.lock().append(context, model, tier, usage) {
+        self.append_inner(context, model, tier, usage, None);
+    }
+
+    fn append_composition(
+        &self,
+        context: routing_log::RoutingLogContext,
+        model: &str,
+        tier: Option<&str>,
+        usage: &Usage,
+        composition: &switchyard_runner::composition::CompositionMetadata,
+    ) {
+        self.append_inner(context, model, tier, usage, Some(composition));
+    }
+
+    fn append_inner(
+        &self,
+        context: routing_log::RoutingLogContext,
+        model: &str,
+        tier: Option<&str>,
+        usage: &Usage,
+        composition: Option<&switchyard_runner::composition::CompositionMetadata>,
+    ) {
+        if let Err(error) = self
+            .writer
+            .lock()
+            .append_with(context, model, tier, usage, composition)
+        {
             tracing::warn!(path = %self.path.display(), %error, "routing log append failed");
         }
     }
@@ -750,6 +776,47 @@ mod capability_http {
     }
 }
 
+/// A bounded label for a failure class, so a cross-child reason stays a fixed vocabulary.
+fn composition_failure_label(class: switchyard_llm_client::FailureClass) -> &'static str {
+    use switchyard_llm_client::FailureClass;
+    match class {
+        FailureClass::Transport => "transport",
+        FailureClass::Timeout => "timeout",
+        FailureClass::RateLimited => "rate_limited",
+        FailureClass::TemporarilyUnavailable => "temporarily_unavailable",
+        FailureClass::Server => "server",
+        FailureClass::ContextWindow => "context_window",
+        FailureClass::ProviderPolicy => "provider_policy",
+        FailureClass::Auth => "auth",
+        FailureClass::Request => "request",
+        FailureClass::Other => "other",
+    }
+}
+
+/// The bounded reason a composite moved off a child, taken from the failure that ended it.
+fn cross_reason(
+    composition: &switchyard_runner::composition::CompositionMetadata,
+    from_child: &str,
+) -> &'static str {
+    composition
+        .children
+        .iter()
+        .find(|(child, outcome)| {
+            child == from_child
+                && matches!(
+                    outcome,
+                    switchyard_runner::composition::ChildOutcome::Failed { .. }
+                )
+        })
+        .and_then(|(_, outcome)| match outcome {
+            switchyard_runner::composition::ChildOutcome::Failed { class, .. } => {
+                Some(composition_failure_label(*class))
+            }
+            _ => None,
+        })
+        .unwrap_or("serving_failure")
+}
+
 /// One provider request submitted for a routing decision without an answer-model call.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1193,8 +1260,17 @@ async fn handle_llm_request(
             return runner_error(error);
         }
     };
+    // Composition facts outlive the streaming wrapper, so they are kept for the log record.
+    let composition_ref: Option<&'static switchyard_runner::composition::CompositionMetadata> =
+        execution.composition.as_ref().map(|composition| {
+            let owned: &'static switchyard_runner::composition::CompositionMetadata =
+                Box::leak(Box::new(composition.clone()));
+            owned
+        });
+
     // Composition context is carried alongside the answer for telemetry only. The child's own
-    // routing and observations are untouched, and the serving crate reconstructs nothing.
+    // routing and observations are untouched, and the serving crate reconstructs nothing:
+    // every value here was already decided by the runner.
     if let Some(composition) = execution.composition.as_ref() {
         tracing::debug!(
             parent_route = %composition.parent_route,
@@ -1204,6 +1280,45 @@ async fn handle_llm_request(
             cross_child_reason = composition.cross_child_reason().as_deref().unwrap_or(""),
             "whole-route composition",
         );
+        // Every child attempt, in order, including one skipped for capability. A skipped
+        // target never reached a provider, which is precisely why this needs its own
+        // signal: it leaves no failure, retry or cooldown trace anywhere else.
+        let mut previous_failed: Option<&str> = None;
+        for (child, outcome) in &composition.children {
+            let (outcome_label, capability) = match outcome {
+                switchyard_runner::composition::ChildOutcome::Skipped { capability } => {
+                    ("skipped_ineligible", *capability)
+                }
+                switchyard_runner::composition::ChildOutcome::Served { .. } => ("selected", "none"),
+                switchyard_runner::composition::ChildOutcome::Failed { class, .. } => {
+                    ("attempt_failed", composition_failure_label(*class))
+                }
+            };
+            metrics::record_composition_attempt(
+                &composition.parent_route,
+                child,
+                match outcome {
+                    switchyard_runner::composition::ChildOutcome::Served { target } => target,
+                    switchyard_runner::composition::ChildOutcome::Skipped { .. } => "",
+                    switchyard_runner::composition::ChildOutcome::Failed { .. } => "",
+                },
+                outcome_label,
+                capability,
+            );
+            if outcome_label == "attempt_failed" {
+                previous_failed = Some(child);
+            } else if let Some(from) = previous_failed
+                && !matches!(outcome, switchyard_runner::composition::ChildOutcome::Skipped { .. })
+            {
+                metrics::record_composition_cross(
+                    &composition.parent_route,
+                    from,
+                    child,
+                    cross_reason(composition, from),
+                );
+                previous_failed = None;
+            }
+        }
     }
     let RunOutput {
         selected_model,
@@ -1224,6 +1339,7 @@ async fn handle_llm_request(
             state.stats,
             cache_eligible,
             state.routing_log.zip(routing_log_context),
+            composition_ref,
         )
     } else {
         response

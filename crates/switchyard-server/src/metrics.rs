@@ -144,6 +144,56 @@ fn seed_outcome_metrics() {
 
 /// Records a request whose downstream client disconnected before a response was
 /// written. The run and its upstream calls were cancelled, so no status exists.
+/// Records one child attempt made by a whole-route composite.
+///
+/// Labels are bounded: a parent route, a child route, a declared target, an outcome from a
+/// fixed set, and the capability a skip was driven by. Nothing user-controlled reaches a
+/// label, so the series cannot explode from request text.
+pub(crate) fn record_composition_attempt(
+    parent_route: &str,
+    child_route: &str,
+    target: &str,
+    outcome: &str,
+    capability: &str,
+) {
+    let meter = global::meter("switchyard");
+    meter
+        .u64_counter("switchyard.composition_attempt")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("parent_route", parent_route.to_string()),
+                KeyValue::new("child_route", child_route.to_string()),
+                KeyValue::new("target", target.to_string()),
+                KeyValue::new("outcome", outcome.to_string()),
+                KeyValue::new("capability", capability.to_string()),
+            ],
+        );
+}
+
+/// Records a move from one child route to another, with the reason for the move.
+pub(crate) fn record_composition_cross(
+    parent_route: &str,
+    from_child: &str,
+    to_child: &str,
+    reason: &str,
+) {
+    let meter = global::meter("switchyard");
+    meter
+        .u64_counter("switchyard.composition_cross")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("parent_route", parent_route.to_string()),
+                KeyValue::new("from_child", from_child.to_string()),
+                KeyValue::new("to_child", to_child.to_string()),
+                KeyValue::new("reason", reason.to_string()),
+            ],
+        );
+}
+
 pub(crate) fn record_client_disconnect() {
     global::meter("switchyard")
         .u64_counter("switchyard.client_responses")

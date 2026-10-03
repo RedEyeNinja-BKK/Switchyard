@@ -21,6 +21,8 @@ pub(crate) fn observe(
     stats: StatsAccumulator,
     cache_eligible: f64,
     routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
+    // Composition facts for this request, appended to the same record as the served model.
+    composition: Option<&'static switchyard_runner::composition::CompositionMetadata>,
 ) -> Response {
     let Response {
         llm_response,
@@ -89,7 +91,10 @@ pub(crate) fn observe(
                     let usage = latest_usage.unwrap_or_default();
                     record_terminal(&stats, &usage, &model, started, cache_eligible);
                     if let Some((log, context)) = routing_log {
-                        log.append(context, &model, None, &usage);
+                        match composition {
+                            Some(composition) => log.append_composition(context, &model, None, &usage, composition),
+                            None => log.append(context, &model, None, &usage),
+                        }
                     }
                 }
             };
@@ -221,6 +226,7 @@ mod tests {
             stats.clone(),
             0.0,
             Some((log.clone(), context)),
+            None,
         );
 
         let LlmResponse::Stream(mut observed) = observed.llm_response else {

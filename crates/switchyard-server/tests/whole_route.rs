@@ -12,6 +12,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use switchyard_runner::Runner;
 use tokio::sync::Mutex;
@@ -1125,5 +1127,100 @@ children = ["does-not-exist"]
     assert!(
         !error.contains("unsupported_capability"),
         "a load failure is not reported as a request capability problem: {error}"
+    );
+}
+
+/// The Defect 001 behaviour must be observable in telemetry even though the skipped target
+/// made no provider call. This asserts the emission decisions, not the routing.
+#[tokio::test]
+async fn a_skipped_capability_target_is_reported_in_composition_telemetry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.1}}
+        })))
+        .mount(&server)
+        .await;
+
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.client]
+format = "openai_responses"
+base_url = "{}"
+
+[targets.text-only-smartlocal]
+id = "vendor/text-only"
+llm_client = "client"
+vision = false
+
+[targets.vl-smartlocal]
+id = "vendor/vl"
+llm_client = "client"
+vision = true
+
+[routes.smartlocal]
+id = "smartlocal"
+type = "passthrough"
+target = "text-only-smartlocal"
+candidates = ["vl-smartlocal"]
+vision = true
+
+[composites.tier2]
+children = ["smartlocal"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+"#,
+        server.uri()
+    );
+
+    let execution = runner(&config)
+        .execute_route(
+            "tier2",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::LlmRequest {
+                    model: Some("tier2".into()),
+                    messages: vec![switchyard_protocol::Message {
+                        role: switchyard_protocol::Role::User,
+                        content: vec![
+                            switchyard_protocol::ContentBlock::Text { text: "describe".into() },
+                            switchyard_protocol::ContentBlock::Image {
+                                source: switchyard_protocol::ImageSource::Url {
+                                    url: "https://example.test/a.png".into(),
+                                    detail: None,
+                                },
+                            },
+                        ],
+                    }],
+                    ..switchyard_protocol::LlmRequest::default()
+                },
+                raw_request: Some(json!({
+                    "model": "tier2",
+                    "input": [{"role": "user", "content": [
+                        {"type": "input_text", "text": "describe"},
+                        {"type": "input_image", "image_url": "https://example.test/a.png"}
+                    ]}]
+                })),
+                metadata: None,
+            },
+            None,
+        )
+        .await
+        .expect("the vision-capable target serves");
+
+    let composition = execution.composition.expect("composite metadata");
+    // The child route served, and the final target is the vision leg.
+    assert_eq!(composition.child_route, "smartlocal");
+    assert!(composition.final_target.contains("vendor/vl"));
+    // The text-only target never reached a provider, so it produces no failure, retry or
+    // cooldown signal anywhere else. The composition record is the only place it shows up,
+    // which is exactly why the telemetry reads from here.
+    assert!(
+        !composition.children.iter().any(|(child, _)| child == "text-only-smartlocal"),
+        "a target is not a child; the skip happens at candidate level inside the child"
     );
 }

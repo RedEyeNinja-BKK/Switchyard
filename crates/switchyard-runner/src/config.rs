@@ -1170,6 +1170,13 @@ struct LlmClientConfig {
     failure_cooldown_ms: u64,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
+    /// This upstream requires the Responses `input` to be a JSON array.
+    ///
+    /// The Codex backend rejects the compact bare-string form with `Input must be a list`.
+    /// Declaring it keeps chat ingress working on that lane instead of narrowing the
+    /// advertised inbound formats. Ignored by the Chat and Anthropic formats.
+    #[serde(default)]
+    requires_list_input: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1335,6 +1342,7 @@ fn build_backend(
         max_retries: config.max_retries,
         failure_cooldown: Duration::from_millis(config.failure_cooldown_ms),
         timeout: config.timeout_ms.map(Duration::from_millis),
+        requires_list_input: config.requires_list_input,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),

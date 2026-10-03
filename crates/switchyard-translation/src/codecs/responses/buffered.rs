@@ -1271,7 +1271,11 @@ fn encode_responses_input(
     // custom outputs. A tool result is typed by the call it answers, and Responses history
     // always lists the call before its output, so recording ids as calls are encoded is enough
     // to type the outputs that follow.
-    if messages.len() == 1
+    // A lone user text message encodes in the compact string form, which every Responses
+    // upstream accepts. An upstream declaring `requires_list_input` is the exception: it
+    // rejects a bare string, so that case falls through to the list encoder below.
+    if policy.target_capabilities.requires_list_input != Some(true)
+        && messages.len() == 1
         && matches!(messages[0].role, Role::User)
         && messages[0].content.len() == 1
         && matches!(messages[0].content[0], ContentBlock::Text { .. })

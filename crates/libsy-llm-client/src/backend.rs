@@ -84,6 +84,12 @@ pub struct HttpBackendConfig {
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
+    /// This upstream requires the Responses `input` to be a JSON array.
+    ///
+    /// The Codex backend does: it rejects the compact bare-string form with
+    /// `Input must be a list`. Only meaningful for a Responses backend; other formats ignore
+    /// it. Defaults to false so every existing provider keeps the compact encoding.
+    pub requires_list_input: bool,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -120,6 +126,14 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Whether this backend's upstream requires a list-shaped Responses `input`.
+    ///
+    /// True only for a Responses backend that declares it, which today is the Codex lane.
+    /// The other formats carry their own input shape and ignore the flag.
+    pub fn requires_list_input(&self) -> bool {
+        matches!(self, Backend::OpenAiResponses(config) if config.requires_list_input)
+    }
+
     // Matches reqwest's header conversions before the client can send a request.
     pub(crate) fn validate_configured_headers(&self, model_name: &str) -> Result<()> {
         for (name, value) in &self.config().extra_headers {
@@ -462,6 +476,7 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            requires_list_input: false,
         }
     }
 

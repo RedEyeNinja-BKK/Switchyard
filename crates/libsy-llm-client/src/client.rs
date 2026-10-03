@@ -20,8 +20,9 @@ use switchyard_protocol::{
     ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
-    TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
+    TargetCapabilities, TranslationError, TranslationPolicy, WireFormat, decode_aggregated_response,
+    decode_request, decode_stream, encode_aggregated_response_with_extensions,
+    encode_request_with_policy, encode_stream_with_extensions,
 };
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -272,7 +273,16 @@ impl TranslatingLlmClient {
             return Err(LlmClientError::TemporarilyUnavailable);
         }
 
-        let mut body = encode_request(&llm_request, wire_format)
+        // A Responses upstream may declare that it requires a list-shaped `input`; the
+        // default policy carries no target capabilities, so it is supplied here.
+        let policy = TranslationPolicy {
+            target_capabilities: TargetCapabilities {
+                requires_list_input: Some(backend.requires_list_input()),
+                ..TargetCapabilities::default()
+            },
+            ..TranslationPolicy::default()
+        };
+        let mut body = encode_request_with_policy(&llm_request, wire_format, &policy)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`; force the resolved model so
@@ -1460,6 +1470,7 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            requires_list_input: false,
         }
     }
 

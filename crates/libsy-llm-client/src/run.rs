@@ -1398,6 +1398,7 @@ mod tests {
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
                         timeout: None,
+                        requires_list_input: false,
                     };
                     let backend = if responses {
                         Backend::OpenAiResponses(config)
@@ -1547,6 +1548,7 @@ mod tests {
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
                     timeout: None,
+                    requires_list_input: false,
                 }),
                 None,
             )])
@@ -2230,6 +2232,7 @@ mod tests {
                     max_retries: 2,
                     failure_cooldown: cooldown,
                     timeout: None,
+                    requires_list_input: false,
                 })
             };
             TranslatingLlmClient::new(&[
@@ -2353,6 +2356,7 @@ mod tests {
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
                 timeout: None,
+                requires_list_input: false,
             })
         };
         let client = Arc::new(

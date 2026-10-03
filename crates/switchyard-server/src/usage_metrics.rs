@@ -35,7 +35,12 @@ pub(crate) fn observe(
         LlmResponse::Agg(agg) => {
             record_terminal(&stats, &agg.usage, &model, started, cache_eligible);
             if let Some((log, context)) = routing_log {
-                log.append(context, &model, None, &agg.usage);
+                match composition {
+                    Some(composition) => {
+                        log.append_composition(context, &model, None, &agg.usage, composition);
+                    }
+                    None => log.append(context, &model, None, &agg.usage),
+                }
             }
             LlmResponse::Agg(agg)
         }

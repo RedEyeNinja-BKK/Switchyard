@@ -175,6 +175,7 @@ where
             },
             raw_request: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: request.metadata.clone(),
         }
     }
@@ -471,6 +472,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 

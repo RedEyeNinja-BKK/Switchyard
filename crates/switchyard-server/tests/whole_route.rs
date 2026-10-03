@@ -271,6 +271,7 @@ async fn child_internal_fallback_finishes_before_the_parent_crosses() {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -338,6 +339,7 @@ async fn an_exhausted_child_lets_the_parent_cross_and_says_why() {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -379,6 +381,7 @@ async fn a_terminal_child_failure_does_not_cross_to_another_child() {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -444,6 +447,7 @@ children = ["smartfree", "smartlocal"]
             "tier2",
             switchyard_protocol::Request {
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
                 llm_request: switchyard_protocol::LlmRequest {
                     model: Some("tier2".into()),
                     messages: vec![switchyard_protocol::Message {
@@ -547,6 +551,7 @@ children = ["smartfree", "smart"]
                 raw_request: Some(json!({"model": "tier1", "input": "hi"})),
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -583,6 +588,7 @@ async fn composition_records_parent_child_and_final_target() {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -799,6 +805,7 @@ candidates = ["b2-smart-bounded"]
                 })),
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -855,6 +862,7 @@ async fn the_production_seam_reports_the_serving_model_and_composition() {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -883,6 +891,7 @@ async fn the_production_seam_reports_the_serving_model_and_composition() {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -912,6 +921,7 @@ async fn a_cross_child_recovery_records_its_reason() {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -994,6 +1004,7 @@ children = ["smartfree", "smart"]
         raw_request: None,
         metadata: None,
         route_reasoning_policy: None,
+        route_reasoning_effort: None,
     };
 
     // Neither child has served this id yet, so nothing claims it and ordinary tier ordering
@@ -1012,6 +1023,7 @@ children = ["smartfree", "smart"]
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             None,
         )
@@ -1195,6 +1207,7 @@ vision = true
             "tier2",
             switchyard_protocol::Request {
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
                 llm_request: switchyard_protocol::LlmRequest {
                     model: Some("tier2".into()),
                     messages: vec![switchyard_protocol::Message {

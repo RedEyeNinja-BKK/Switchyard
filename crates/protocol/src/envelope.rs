@@ -24,12 +24,24 @@ pub struct Request {
     /// reasoning behaviour, so this is a property of the route and travels with the
     /// request rather than being fixed on the target at load time.
     pub route_reasoning_policy: Option<crate::ReasoningPolicy>,
+    /// Reasoning effort the serving ROUTE imposes, for dialects that only grade effort.
+    ///
+    /// A dialect such as `openai_effort` has no fragment meaning "think", so a route policy
+    /// of "on" cannot reach the wire there. The level travels beside the policy so the client
+    /// can write it, instead of the request silently keeping the target's weaker default.
+    pub route_reasoning_effort: Option<String>,
 }
 
 impl Request {
     /// Returns this request carrying the given route reasoning policy.
     pub fn with_route_reasoning_policy(mut self, policy: crate::ReasoningPolicy) -> Self {
         self.route_reasoning_policy = Some(policy);
+        self
+    }
+
+    /// Returns this request carrying the given route reasoning effort.
+    pub fn with_route_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.route_reasoning_effort = Some(effort.into());
         self
     }
 

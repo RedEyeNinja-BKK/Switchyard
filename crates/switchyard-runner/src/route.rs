@@ -168,7 +168,7 @@ impl Route {
         decision_targets: Vec<DecisionTarget>,
         models: RuntimeModels,
         route_reasoning_policy: crate::config::RouteReasoningPolicy,
-        escalation_max_input_tokens: Option<u64>,
+            escalation_max_input_tokens: Option<u64>,
         escalation_target: Option<ModelId>,
     ) -> Self {
         Self {
@@ -320,6 +320,15 @@ impl Route {
             RouteReasoningPolicy::Medium => request.with_route_reasoning_policy(
                 switchyard_protocol::ReasoningPolicy::Enabled,
             ),
+            // `High` needs the graded level as well as the on/off intent: on a dialect that
+            // only grades effort the policy alone has no wire form, so the request also
+            // carries the effort for the client to write.
+            RouteReasoningPolicy::High => request
+                .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Enabled)
+                .with_route_reasoning_effort(
+                    crate::config::route_policy_effort(RouteReasoningPolicy::High)
+                        .unwrap_or_default(),
+                ),
             RouteReasoningPolicy::None => {
                 request.with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Disabled)
             }

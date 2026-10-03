@@ -1011,6 +1011,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 
@@ -1490,6 +1491,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         Ok(judge
             .build_request(&State::default(), &request)
@@ -1728,6 +1730,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
 
         let built = TaskInput {
@@ -1768,6 +1771,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
 
         let built = judge.build_request(&State::default(), &request);
@@ -1810,6 +1814,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let judge_request = judge.build_request(&State::default(), &request);
 

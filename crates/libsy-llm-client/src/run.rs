@@ -1231,6 +1231,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 
@@ -1571,6 +1572,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1610,6 +1612,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1643,6 +1646,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let history = clients
             .stored_state_owner(&third)
@@ -2366,6 +2370,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let result = run(
             algorithm,

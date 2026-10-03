@@ -132,6 +132,7 @@ impl SwitchyardRuntime {
             llm_request,
             raw_request: Some(request.content),
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: Some(metadata),
         })
     }

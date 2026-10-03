@@ -208,6 +208,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let (classification, _) = RecordingClassifier
             .score(&mut state, &mut request, &empty_driver())
@@ -251,6 +252,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
 
         RewritingClassifier

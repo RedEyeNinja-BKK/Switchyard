@@ -67,6 +67,7 @@ fn delegated_prompt_request(request: &Request) -> Option<Request> {
         },
         raw_request: None,
         route_reasoning_policy: None,
+            route_reasoning_effort: None,
         metadata: request.metadata.clone(),
     })
 }
@@ -164,6 +165,7 @@ mod tests {
             llm_request: text_request(Some(ModelId::from("auto").to_string()), "hi"),
             raw_request: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata,
         }
     }

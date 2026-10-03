@@ -91,6 +91,7 @@ pub(crate) fn turn_request(failed: bool) -> Request {
     };
     Request {
         route_reasoning_policy: None,
+        route_reasoning_effort: None,
         llm_request: LlmRequest {
             model: Some("auto".to_string()),
             messages: vec![

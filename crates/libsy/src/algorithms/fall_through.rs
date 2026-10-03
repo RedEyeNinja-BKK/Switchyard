@@ -379,6 +379,7 @@ mod tests {
             },
             raw_request: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: Some(Metadata {
                 session_id: Some("session-1".to_string()),
                 ..Metadata::default()
@@ -457,6 +458,7 @@ mod tests {
                 raw_request: None,
                 metadata: None,
                 route_reasoning_policy: None,
+                route_reasoning_effort: None,
             },
             category_models(Category::Any, &["capable", "efficient"]),
             capturing(Arc::clone(&captured)),

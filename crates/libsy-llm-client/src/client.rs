@@ -223,6 +223,7 @@ impl TranslatingLlmClient {
                 model,
                 UpstreamEndpoint::Auxiliary(operation),
                 None,
+                None,
             )
             .await?;
         let EncodedResponse::Buffered { body, .. } = http_response else {
@@ -255,6 +256,7 @@ impl TranslatingLlmClient {
         model: &ModelId,
         endpoint: UpstreamEndpoint,
         route_reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
+        route_reasoning_effort: Option<&str>,
     ) -> Result<EncodedResponse> {
         let cooldown = backend.failure_cooldown();
         let unavailable_until =
@@ -294,6 +296,34 @@ impl TranslatingLlmClient {
         // fills keys the request omits, so a caller that set `reasoning` or
         // `chat_template_kwargs` would otherwise re-enable reasoning on a strict target.
         apply_reasoning_policy(&mut body, backend);
+        // A route's graded level outranks the target's effort, so it is written after
+        // `apply_reasoning_effort` and before the on/off policy fragment. Only the single key
+        // the transport uses for effort is touched, so an unrelated `reasoning` field the
+        // caller set survives.
+        if let Some(effort) = route_reasoning_effort
+            && let Value::Object(object) = &mut body
+        {
+            match backend {
+                Backend::OpenAiResponses(_) => {
+                    let reasoning = object
+                        .entry("reasoning".to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if !reasoning.is_object() {
+                        *reasoning = Value::Object(serde_json::Map::new());
+                    }
+                    if let Value::Object(reasoning) = reasoning {
+                        reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+                    }
+                }
+                Backend::OpenAiChat(_) => {
+                    object.insert(
+                        "reasoning_effort".to_string(),
+                        Value::String(effort.to_string()),
+                    );
+                }
+                Backend::Anthropic(_) => {}
+            }
+        }
         // A route's explicit policy outranks the target's default and the caller's effort.
         // Applied last so the route is genuinely authoritative.
         if let Some(policy) = route_reasoning_policy {
@@ -579,6 +609,7 @@ impl TranslatingLlmClient {
             mut llm_request,
             metadata,
             route_reasoning_policy,
+            route_reasoning_effort,
             ..
         } = request;
 
@@ -614,6 +645,7 @@ impl TranslatingLlmClient {
                 &model_id,
                 UpstreamEndpoint::Completion,
                 route_reasoning_policy,
+                route_reasoning_effort.as_deref(),
             )
             .await?;
 
@@ -697,6 +729,7 @@ impl TranslatingLlmClient {
             llm_request,
             raw_request: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: Some(Metadata {
                 session_id: None,
                 agent_id: None,
@@ -1668,6 +1701,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 
@@ -2099,7 +2133,53 @@ mod tests {
     ///
     /// This is the guarantee that lets one physical model serve a thinking route and a
     /// strict-NT route at the same time: the target declares thinking enabled, the caller
-    /// asks for high effort, and the route still wins.
+    /// A route that asks for `High` must reach the wire as a graded effort, not as the
+    /// target's weaker default. `openai_effort` has no fragment meaning "think", so the
+    /// policy alone would be inert and the request would silently keep the target's level.
+    #[tokio::test]
+    async fn a_route_effort_overrides_the_target_default_on_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "reasoning": {"effort": "high"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        // The target defaults to medium; the route must still win with high.
+        let client = TranslatingLlmClient::new(&responses_map_with_effort(
+            &format!("{}/v1", server.uri()),
+            "medium",
+        ))
+        .expect("client");
+
+        let request = Request {
+            llm_request: switchyard_protocol::text_request(Some("gpt".into()), "hi"),
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: Some(switchyard_protocol::ReasoningPolicy::Enabled),
+            route_reasoning_effort: Some("high".to_string()),
+        };
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .expect("call completes");
+    }
+
+    /// A route's explicit reasoning policy outranks the target default AND the caller's
+    /// effort, on the real request path rather than a synthetic body.
     #[tokio::test]
     async fn a_route_policy_overrides_both_the_target_default_and_the_caller() {
         let server = MockServer::start().await;
@@ -2135,6 +2215,7 @@ mod tests {
             raw_request: None,
             metadata: None,
             route_reasoning_policy: Some(switchyard_protocol::ReasoningPolicy::Disabled),
+            route_reasoning_effort: None,
         };
         client
             .call_rewrite_model(request, Some(&ModelId::from("gpt")))

@@ -179,8 +179,28 @@ pub enum RouteReasoningPolicy {
     /// Thinking on. Where the provider exposes no graded effort axis this means thinking
     /// enabled, not a fabricated intermediate level.
     Medium,
+    /// The strongest level the provider genuinely supports.
+    ///
+    /// Distinct from `Medium` because a route policy is applied last and therefore wins over
+    /// the target default. An unbounded primitive that must reach a stronger level than a
+    /// direct address of the same physical model needs to say so; inheriting would hand it
+    /// the target's level, which is the point of the two being separate decisions.
+    High,
     /// Thinking off.
     None,
+}
+
+/// A route policy's effect on the wire, which is not always expressible as on/off.
+///
+/// A dialect that only grades effort (`openai_effort`) has no fragment meaning "think", so an
+/// on/off policy is inert there and the level has to arrive as an effort string instead. This
+/// records the effort a route asks for when its own policy would otherwise be unrepresentable,
+/// so the client can write it rather than silently sending the target's weaker default.
+pub(crate) fn route_policy_effort(policy: RouteReasoningPolicy) -> Option<&'static str> {
+    match policy {
+        RouteReasoningPolicy::High => Some("high"),
+        _ => None,
+    }
 }
 
 struct TargetPromptPolicy {
@@ -399,6 +419,11 @@ impl DeploymentConfig {
                 let requested = match policy {
                     crate::config::RouteReasoningPolicy::Inherit => None,
                     crate::config::RouteReasoningPolicy::Medium => {
+                        Some(switchyard_protocol::ReasoningPolicy::Enabled)
+                    }
+                    // `High` also carries a graded effort, so it is expressible on every
+                    // dialect rather than only the boolean ones.
+                    crate::config::RouteReasoningPolicy::High => {
                         Some(switchyard_protocol::ReasoningPolicy::Enabled)
                     }
                     crate::config::RouteReasoningPolicy::None => {

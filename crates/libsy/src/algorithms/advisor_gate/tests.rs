@@ -58,6 +58,7 @@ fn request(messages: Vec<Message>) -> Request {
         raw_request: None,
         metadata: None,
         route_reasoning_policy: None,
+        route_reasoning_effort: None,
     }
 }
 

@@ -690,6 +690,7 @@ vision = true
 
     pub(crate) fn plain_request() -> Request {
         Request {
+            route_reasoning_policy: None,
             llm_request: LlmRequest {
                 model: Some("route".into()),
                 messages: vec![Message::text(Role::User, "hello")],
@@ -705,6 +706,7 @@ vision = true
 
     pub(crate) fn vision_request() -> Request {
         Request {
+            route_reasoning_policy: None,
             llm_request: LlmRequest {
                 model: Some("route".into()),
                 messages: vec![Message {

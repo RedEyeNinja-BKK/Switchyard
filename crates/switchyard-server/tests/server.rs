@@ -810,6 +810,8 @@ fn random_state_with_retries(
                         )]
                         .into(),
                     ),
+                    switchyard_runner::RouteReasoningPolicy::Inherit,
+                    None,
                 ),
             ))
         })

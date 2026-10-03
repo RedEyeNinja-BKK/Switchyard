@@ -222,6 +222,7 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 model,
                 UpstreamEndpoint::Auxiliary(operation),
+                None,
             )
             .await?;
         let EncodedResponse::Buffered { body, .. } = http_response else {
@@ -253,6 +254,7 @@ impl TranslatingLlmClient {
         metadata: Option<&Metadata>,
         model: &ModelId,
         endpoint: UpstreamEndpoint,
+        route_reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
     ) -> Result<EncodedResponse> {
         let cooldown = backend.failure_cooldown();
         let unavailable_until =
@@ -292,6 +294,32 @@ impl TranslatingLlmClient {
         // fills keys the request omits, so a caller that set `reasoning` or
         // `chat_template_kwargs` would otherwise re-enable reasoning on a strict target.
         apply_reasoning_policy(&mut body, backend);
+        // A route's explicit policy outranks the target's default and the caller's effort.
+        // Applied last so the route is genuinely authoritative.
+        if let Some(policy) = route_reasoning_policy {
+            if let Some(fragment) = policy.wire_body(backend.reasoning_dialect())
+                && let (Value::Object(fragment), Value::Object(object)) = (&fragment, &mut body)
+            {
+                for (key, value) in fragment {
+                    match value {
+                        Value::Object(fields) => {
+                            let entry = object
+                                .entry(key.clone())
+                                .or_insert_with(|| Value::Object(Default::default()));
+                            if !entry.is_object() {
+                                *entry = Value::Object(Default::default());
+                            }
+                            if let Value::Object(entry) = entry {
+                                entry.extend(fields.clone());
+                            }
+                        }
+                        _ => {
+                            object.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+        }
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -550,6 +578,7 @@ impl TranslatingLlmClient {
         let Request {
             mut llm_request,
             metadata,
+            route_reasoning_policy,
             ..
         } = request;
 
@@ -584,6 +613,7 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 &model_id,
                 UpstreamEndpoint::Completion,
+                route_reasoning_policy,
             )
             .await?;
 
@@ -666,6 +696,7 @@ impl TranslatingLlmClient {
         let request = Request {
             llm_request,
             raw_request: None,
+            route_reasoning_policy: None,
             metadata: Some(Metadata {
                 session_id: None,
                 agent_id: None,
@@ -1526,6 +1557,22 @@ mod tests {
         )]
     }
 
+    /// A Responses target on the llama.cpp dialect, which gates reasoning through
+    /// `chat_template_kwargs.enable_thinking` rather than an effort axis.
+    fn responses_map_with_local_policy(
+        base_url: &str,
+        policy: ReasoningPolicy,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.reasoning_dialect = ReasoningDialect::LlamaCppEnableThinking;
+        backend.reasoning_policy = Some(policy);
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
+    }
+
     fn responses_map_with_policy(base_url: &str, policy: ReasoningPolicy) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         // An `extra_body` default that the caller will try to override.
@@ -1620,6 +1667,7 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
         }
     }
 
@@ -2044,6 +2092,54 @@ mod tests {
             .await?;
         // The body_partial_json matcher asserts the upstream saw model "gpt".
         Ok(())
+    }
+
+    /// A route's explicit reasoning policy outranks the target default AND the caller's
+    /// effort, on the real request path rather than a synthetic body.
+    ///
+    /// This is the guarantee that lets one physical model serve a thinking route and a
+    /// strict-NT route at the same time: the target declares thinking enabled, the caller
+    /// asks for high effort, and the route still wins.
+    #[tokio::test]
+    async fn a_route_policy_overrides_both_the_target_default_and_the_caller() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "chat_template_kwargs": {"enable_thinking": false}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_local_policy(
+            &format!("{}/v1", server.uri()),
+            switchyard_protocol::ReasoningPolicy::Enabled,
+        ))
+        .expect("client");
+
+        // Built through the typed Request so the route policy is carried the way the
+        // runner carries it, not by a hand-written body field.
+        let request = Request {
+            llm_request: switchyard_protocol::text_request(Some("gpt".into()), "hi"),
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: Some(switchyard_protocol::ReasoningPolicy::Disabled),
+        };
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .expect("call completes");
     }
 
     /// A configured reasoning effort replaces the caller's value on both OpenAI wire formats,

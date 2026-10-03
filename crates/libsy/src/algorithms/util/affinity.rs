@@ -319,6 +319,7 @@ mod tests {
         Request {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
+            route_reasoning_policy: None,
             metadata: Some(metadata),
         }
     }
@@ -343,6 +344,7 @@ mod tests {
                 ..LlmRequest::default()
             },
             raw_request: None,
+            route_reasoning_policy: None,
             metadata,
         }
     }
@@ -586,6 +588,7 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
         };
         let text_only = request(Message::text(Role::User, "Implement the parser."));
         let text_with_reasoning = request(Message {

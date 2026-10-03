@@ -15,6 +15,7 @@ mod provider_key_redactor;
 mod route;
 mod runner;
 
+pub use config::RouteReasoningPolicy;
 pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, CategoryModelConfig, ClassifierMode,
     ClassifierPolicyConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,

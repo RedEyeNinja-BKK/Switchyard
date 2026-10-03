@@ -116,6 +116,7 @@ async fn reflected_response(format: WireFormat, streaming: bool, fail: bool) {
     let request = Request {
         llm_request,
         raw_request: None,
+        route_reasoning_policy: None,
         metadata: Some(Metadata {
             session_id: Some(KEY.into()),
             ..Default::default()

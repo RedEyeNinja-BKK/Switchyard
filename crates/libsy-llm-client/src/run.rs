@@ -1230,6 +1230,7 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hello".to_string()),
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
         }
     }
 
@@ -1569,6 +1570,7 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding seed request", error))?,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1607,6 +1609,7 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding continuation request", error))?,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1639,6 +1642,7 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding chained request", error))?,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
         };
         let history = clients
             .stored_state_owner(&third)
@@ -2361,6 +2365,7 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
         };
         let result = run(
             algorithm,

@@ -13,6 +13,7 @@ use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat
 use thiserror::Error;
 
 use crate::DecisionTarget;
+use crate::config::RouteReasoningPolicy;
 
 /// Capabilities declared for one route.
 ///
@@ -131,6 +132,10 @@ pub struct Route {
     // selected. A route is a synthetic model with no upstream of its own, so this is a
     // per-target lookup, never one client serving the whole route.
     clients: ClientRouter,
+    /// Reasoning policy imposed by the route, overriding the target's factual policy.
+    route_reasoning_policy: crate::config::RouteReasoningPolicy,
+    /// Context-pressure threshold for preferring a wider-context leg.
+    escalation_max_input_tokens: Option<u64>,
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
     anthropic_auxiliary_target: Option<AuxiliaryTarget>,
@@ -157,10 +162,14 @@ impl Route {
         responses_auxiliary_target: Option<AuxiliaryTarget>,
         decision_targets: Vec<DecisionTarget>,
         models: RuntimeModels,
+        route_reasoning_policy: crate::config::RouteReasoningPolicy,
+        escalation_max_input_tokens: Option<u64>,
     ) -> Self {
         Self {
             algorithm,
             clients,
+            route_reasoning_policy,
+            escalation_max_input_tokens,
             caller_auth,
             capabilities,
             anthropic_auxiliary_target,
@@ -173,6 +182,26 @@ impl Route {
     /// Returns the configured libsy algorithm name.
     pub fn algorithm_name(&self) -> &str {
         self.algorithm.name()
+    }
+
+    /// The reasoning policy this route imposes, overriding the target's factual policy.
+    pub fn route_reasoning_policy(&self) -> crate::config::RouteReasoningPolicy {
+        self.route_reasoning_policy
+    }
+
+    /// Estimated input tokens above which this route should prefer a wider-context leg.
+    pub fn escalation_max_input_tokens(&self) -> Option<u64> {
+        self.escalation_max_input_tokens
+    }
+
+    /// Whether this request is at or below the configured context-pressure threshold.
+    ///
+    /// The comparator is strictly greater-than, reproducing the historical
+    /// `escalation_max_input_tokens` behaviour rather than approximating it. A request
+    /// exactly at the threshold stays on the primary leg.
+    pub fn under_context_pressure(&self, estimated_input_tokens: u64) -> bool {
+        self.escalation_max_input_tokens
+            .is_some_and(|threshold| estimated_input_tokens > threshold)
     }
 
     /// Returns model-list capability metadata.
@@ -252,6 +281,15 @@ impl Route {
             }
         };
         let models = self.models.filtered(&eligibility);
+        let request = match self.route_reasoning_policy {
+            RouteReasoningPolicy::Inherit => request,
+            RouteReasoningPolicy::Medium => request.with_route_reasoning_policy(
+                switchyard_protocol::ReasoningPolicy::Enabled,
+            ),
+            RouteReasoningPolicy::None => {
+                request.with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Disabled)
+            }
+        };
         if models.is_empty() {
             // Nothing in this route can serve the request, which is the caller's request
             // rather than a deployment fault. The skipped targets get no provider call.
@@ -332,5 +370,64 @@ impl Route {
             .call_auxiliary(&target.model, request, operation)
             .await
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod context_policy_tests {
+    use super::*;
+    use crate::RouteReasoningPolicy;
+
+    /// Only the boundary predicate and the stored policy are under test here; both are
+    /// plain value logic, so this builds a route with the cheapest algorithm the runner
+    /// already uses in its own tests.
+    fn build(threshold: Option<u64>, policy: RouteReasoningPolicy) -> Route {
+        Route::new(
+            Arc::new(libsy::Passthrough),
+            ClientRouter::new(std::collections::HashMap::new()),
+            None,
+            ModelCapabilities::default(),
+            None,
+            None,
+            Vec::new(),
+            RuntimeModels::default(),
+            policy,
+            threshold,
+        )
+    }
+
+    /// The recovered historical comparator was strictly greater-than: a request exactly
+    /// at the threshold stays on the primary leg and only 61,441 escalates.
+    #[test]
+    fn the_context_boundary_is_strictly_greater_than() {
+        let route = build(Some(61_440), RouteReasoningPolicy::Inherit);
+        assert!(
+            !route.under_context_pressure(61_440),
+            "exactly at the threshold stays on the primary leg"
+        );
+        assert!(
+            route.under_context_pressure(61_441),
+            "one token over the threshold escalates"
+        );
+        assert!(
+            !build(None, RouteReasoningPolicy::Inherit).under_context_pressure(1_000_000),
+            "a route without a threshold never escalates on context pressure"
+        );
+    }
+
+    /// The route's policy is what it imposes on a shared physical target.
+    #[test]
+    fn the_route_policy_is_what_the_route_imposes() {
+        for policy in [
+            RouteReasoningPolicy::Inherit,
+            RouteReasoningPolicy::Medium,
+            RouteReasoningPolicy::None,
+        ] {
+            assert_eq!(
+                build(Some(61_440), policy).route_reasoning_policy(),
+                policy,
+                "the route keeps the policy it was configured with"
+            );
+        }
     }
 }

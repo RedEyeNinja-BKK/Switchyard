@@ -131,6 +131,7 @@ impl SwitchyardRuntime {
         Ok(Request {
             llm_request,
             raw_request: Some(request.content),
+            route_reasoning_policy: None,
             metadata: Some(metadata),
         })
     }
@@ -902,6 +903,8 @@ mod tests {
             None,
             Vec::new(),
             RuntimeModels::default(),
+            switchyard_runner::RouteReasoningPolicy::Inherit,
+            None,
         );
         SwitchyardRuntime {
             runner: Runner::new(vec![(ModelId::from(model), route)]),

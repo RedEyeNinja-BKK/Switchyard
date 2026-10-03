@@ -1182,6 +1182,7 @@ fn resolve_route(
     let request = Request {
         llm_request,
         raw_request: Some(body),
+        route_reasoning_policy: None,
         metadata: Some(metadata),
     };
     // The caller keeps the requested name, not a resolved leaf: the runner seam resolves leaf

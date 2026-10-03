@@ -535,6 +535,7 @@ impl AdvisorGate {
             },
             raw_request: None,
             metadata: base.metadata.clone(),
+            route_reasoning_policy: base.route_reasoning_policy,
         }
     }
 }

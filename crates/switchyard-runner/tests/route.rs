@@ -58,6 +58,8 @@ fn plugin_route(client: Arc<dyn RoutedLlmClient>) -> Route {
         None,
         Vec::new(),
         RuntimeModels::new([(Category::Any, vec![ModelId::from("semantic-target")])].into()),
+        switchyard_runner::RouteReasoningPolicy::Inherit,
+        None,
     )
 }
 

@@ -34,6 +34,7 @@ use crate::{
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
+
 /// Carries a classified decision failure out of the host so the reason is not lost.
 #[derive(Debug)]
 struct DecisionCallError {
@@ -151,7 +152,29 @@ struct RouteConfig {
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
     vision: Option<bool>,
+    /// Reasoning policy for this route. Applies on top of the target's factual policy.
+    route_reasoning_policy: Option<RouteReasoningPolicy>,
+    /// Estimated input tokens above which this route escalates to a wider-context leg.
+    escalation_max_input_tokens: Option<u64>,
     algorithm: AlgorithmSpec,
+}
+
+/// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
+/// target is capable of.
+///
+/// Two routes may deliberately share one physical model while one forbids reasoning, so
+/// this cannot live on the target. Target reasoning stays the factual capability; this is
+/// the policy applied on top of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteReasoningPolicy {
+    /// Use the target's own declared policy.
+    Inherit,
+    /// Thinking on. Where the provider exposes no graded effort axis this means thinking
+    /// enabled, not a fabricated intermediate level.
+    Medium,
+    /// Thinking off.
+    None,
 }
 
 struct TargetPromptPolicy {
@@ -170,6 +193,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
+        let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
+        let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -178,6 +203,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
             tool_calling,
             reasoning,
             vision,
+            route_reasoning_policy,
+            escalation_max_input_tokens,
             algorithm,
         })
     }
@@ -391,6 +418,10 @@ impl DeploymentConfig {
                 responses_auxiliary_target,
                 decision_targets,
                 models,
+                config.route_reasoning_policy.unwrap_or(
+                    crate::config::RouteReasoningPolicy::Inherit,
+                ),
+                config.escalation_max_input_tokens,
             );
             routes.push((config.id.clone(), route));
         }

@@ -378,6 +378,7 @@ mod tests {
                 ..LlmRequest::default()
             },
             raw_request: None,
+            route_reasoning_policy: None,
             metadata: Some(Metadata {
                 session_id: Some("session-1".to_string()),
                 ..Metadata::default()
@@ -455,6 +456,7 @@ mod tests {
                 llm_request: text_request(Some("auto".to_string()), "fix the build"),
                 raw_request: None,
                 metadata: None,
+                route_reasoning_policy: None,
             },
             category_models(Category::Any, &["capable", "efficient"]),
             capturing(Arc::clone(&captured)),

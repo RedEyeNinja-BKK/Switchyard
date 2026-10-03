@@ -194,6 +194,40 @@ pub(crate) fn record_composition_cross(
         );
 }
 
+/// Records a pre-dispatch promotion of a route's candidates under context pressure.
+///
+/// Distinct from [`record_composition_cross`]: nothing was skipped and no whole route was
+/// entered or left. The order of one route's own candidates simply changed, and conflating
+/// that with a composition crossing would make the two indistinguishable in a dashboard.
+pub(crate) fn record_context_pressure_promotion(
+    route: &str,
+    promoted_target: &str,
+    estimated_input_tokens: u64,
+) {
+    global::meter("switchyard")
+        .u64_counter("switchyard.context_pressure_promotion")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("route", route.to_string()),
+                KeyValue::new("promoted_target", promoted_target.to_string()),
+                // A bucket, not the raw figure: an unbounded label would mint a new time
+                // series per request size. The exact count belongs in the routing log.
+                KeyValue::new(
+                    "estimate_bucket",
+                    context_bucket(estimated_input_tokens).to_string(),
+                ),
+            ],
+        );
+}
+
+/// Buckets an estimated input size so it can be used as a bounded metric label.
+fn context_bucket(tokens: u64) -> u64 {
+    const STEP: u64 = 16_384;
+    tokens / STEP * STEP
+}
+
 pub(crate) fn record_client_disconnect() {
     global::meter("switchyard")
         .u64_counter("switchyard.client_responses")

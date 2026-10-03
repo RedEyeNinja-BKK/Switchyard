@@ -367,6 +367,20 @@ impl SwitchyardRuntime {
                     }));
                     events.extend(token_usage_metrics("answer", &call, metadata));
                 }
+                RunObservation::ContextPressurePromotion {
+                    promoted,
+                    estimated_input_tokens,
+                } => {
+                    events.push(RoutingEvent::Mark(RoutingMark {
+                        name: "switchyard.routing.context_pressure".into(),
+                        data: json!({
+                            "promoted_target": promoted.as_str(),
+                            "estimated_input_tokens": estimated_input_tokens,
+                        }),
+                        metadata: metadata.clone(),
+                        severity: Some(LogSeverity::Debug),
+                    }));
+                }
             }
         }
         outcome_fields

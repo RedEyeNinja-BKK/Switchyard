@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use libsy::{Algorithm, LibsyError, RoutingOutcome, RuntimeModels};
 use serde_json::Value;
-use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObserver, TranslatingLlmClient};
+use switchyard_llm_client::{
+    AuxiliaryOperation, ClientRouter, RunObservation, RunObserver, TranslatingLlmClient,
+};
 use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat};
 use thiserror::Error;
 
@@ -264,6 +266,7 @@ impl Route {
         // cannot answer it.
         let facts = self.clients.target_capabilities().clone();
         let raw = request.raw_request.clone().unwrap_or(serde_json::Value::Null);
+        let estimated_input_tokens = crate::request_fit::estimate_input_tokens(&raw);
         let eligibility = |model: &switchyard_protocol::ModelId| {
             match facts.get(model) {
                 Some(facts) => {
@@ -292,11 +295,17 @@ impl Route {
         // decides among the survivors.
         let models = match (
             self.escalation_target.as_ref(),
-            self.under_context_pressure(crate::request_fit::estimate_input_tokens(&raw)),
+            self.under_context_pressure(estimated_input_tokens),
         ) {
-            (Some(escalation_target), true) => models.promoting(std::slice::from_ref(
-                escalation_target,
-            )),
+            (Some(escalation_target), true) => {
+                if let Some(observer) = observer.as_ref() {
+                    observer(RunObservation::ContextPressurePromotion {
+                        promoted: escalation_target.clone(),
+                        estimated_input_tokens,
+                    });
+                }
+                models.promoting(std::slice::from_ref(escalation_target))
+            }
             _ => models,
         };
         let request = match self.route_reasoning_policy {

@@ -477,9 +477,20 @@ const CLASSIFIER_TIER: &str = "classifier";
 fn stats_observer(
     stats: StatsAccumulator,
     classifier_log: Option<(SharedRoutingLog, routing_log::RoutingLogContext)>,
+    route_id: String,
 ) -> RunObserver {
     Arc::new(move |observation| match observation {
         RunObservation::Outcome(_) => {}
+        RunObservation::ContextPressurePromotion {
+            promoted,
+            estimated_input_tokens,
+        } => {
+            metrics::record_context_pressure_promotion(
+                &route_id,
+                promoted.as_str(),
+                estimated_input_tokens,
+            );
+        }
         RunObservation::AnswerCall(call) => {
             let latency_ms = call.duration.as_secs_f64() * 1_000.0;
             if call.is_success {
@@ -1218,6 +1229,7 @@ async fn handle_llm_request(
     let observer = stats_observer(
         state.stats.clone(),
         state.routing_log.clone().zip(routing_log_context.clone()),
+        request.llm_request.model.clone().unwrap_or_default(),
     );
 
     // The routing log borrows the request, so the route id is taken before it is moved.
@@ -1952,7 +1964,11 @@ mod tests {
         headers.insert("proxy_x_session_id", "session-1".parse().expect("header"));
         let metadata = metadata_from_headers(headers);
         let context = routing_log::RoutingLogContext::from_metadata(&metadata);
-        let observer = stats_observer(StatsAccumulator::default(), Some((log.clone(), context)));
+        let observer = stats_observer(
+            StatsAccumulator::default(),
+            Some((log.clone(), context)),
+            "route-under-test".to_string(),
+        );
 
         let call = |model: &str, answer: bool| {
             let observation = LlmCallObservation {

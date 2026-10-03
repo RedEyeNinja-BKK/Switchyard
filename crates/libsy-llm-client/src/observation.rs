@@ -33,6 +33,16 @@ pub enum RunObservation {
     AnswerCall(LlmCallObservation),
     /// Routing time recorded by the `switchyard.routing_overhead_ms` metric.
     RoutingOverhead(Duration),
+    /// This run reordered its candidates before dispatch, naming the target it promoted
+    /// and the estimated input tokens that triggered it.
+    ///
+    /// A separate variant rather than a metric recorded beside the dispatch: the
+    /// promotion happens inside the route, below any composite, so an observer is the
+    /// only place that can see it.
+    ContextPressurePromotion {
+        promoted: ModelId,
+        estimated_input_tokens: u64,
+    },
 }
 
 /// Request-scoped callback for algorithm-run observations.

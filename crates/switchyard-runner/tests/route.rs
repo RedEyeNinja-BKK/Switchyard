@@ -341,6 +341,57 @@ async fn no_escalation_contract_leaves_the_declared_order_intact() {
     }
 }
 
+/// The promotion must be observable from outside the route, or the behaviour is invisible
+/// in production: nothing else distinguishes it from an ordinary failure fallback.
+#[tokio::test]
+async fn a_promotion_is_observable_by_the_run_observer() {
+    for (tokens, expect_promoted) in [(61_440, false), (61_441, true)] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let route = escalating_route(Some(61_440), Some("wide"), &calls);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observed = Arc::clone(&observed);
+            Arc::new(move |observation| observed.lock().unwrap().push(observation))
+        };
+        route
+            .execute(
+                Request {
+                    llm_request: text_request(None, "hello"),
+                    raw_request: Some(body_of_estimated_tokens(tokens)),
+                    ..Request::default()
+                },
+                Some(observer),
+            )
+            .await
+            .expect("request is served");
+
+        let promotions: Vec<_> = observed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|observation| match observation {
+                RunObservation::ContextPressurePromotion {
+                    promoted,
+                    estimated_input_tokens,
+                } => Some((promoted.clone(), *estimated_input_tokens)),
+                _ => None,
+            })
+            .collect();
+        if expect_promoted {
+            assert_eq!(
+                promotions,
+                vec![(ModelId::from("wide"), tokens)],
+                "a request above the threshold must report the leg it promoted"
+            );
+        } else {
+            assert!(
+                promotions.is_empty(),
+                "a request at the threshold must not report a promotion, got {promotions:?}"
+            );
+        }
+    }
+}
+
 /// Promotion reorders; it must not shorten the list. With the promoted leg forced to fail,
 /// the candidates behind it are still reached in their declared relative order.
 #[tokio::test]

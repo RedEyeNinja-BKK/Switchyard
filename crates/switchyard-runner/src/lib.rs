@@ -6,12 +6,12 @@
 mod algorithm;
 pub mod capability;
 pub mod composition;
-pub mod decision_executor;
-pub mod request_fit;
-pub mod decision_transport;
 mod config;
+pub mod decision_executor;
+pub mod decision_transport;
 mod failure;
 mod provider_key_redactor;
+pub mod request_fit;
 mod route;
 mod runner;
 

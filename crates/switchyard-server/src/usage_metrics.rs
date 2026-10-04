@@ -273,67 +273,69 @@ mod tests {
         assert_eq!(process.models["model/worker"].completion_tokens, 3);
     }
 
-/// A Responses stream that commits on its terminal event must carry the same composition
-/// facts as every other append path.
-///
-/// This is the shape that regressed: the early-commit branch wrote a record without
-/// composition, so a streamed request disagreed with the counters while an aggregate
-/// request was correct. The test supplies real composition metadata, so it fails if any
-/// append path drops it.
-#[tokio::test]
-async fn an_early_committed_stream_records_composition() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let log = SharedRoutingLog::new(dir.path().join("routing.jsonl")).expect("routing log");
-    let context = RoutingLogContext::from_metadata(&Metadata {
-        session_id: Some("composition-session".to_string()),
-        ..Metadata::default()
-    });
-    let composition = Arc::new(switchyard_runner::composition::CompositionMetadata {
+    /// A Responses stream that commits on its terminal event must carry the same composition
+    /// facts as every other append path.
+    ///
+    /// This is the shape that regressed: the early-commit branch wrote a record without
+    /// composition, so a streamed request disagreed with the counters while an aggregate
+    /// request was correct. The test supplies real composition metadata, so it fails if any
+    /// append path drops it.
+    #[tokio::test]
+    async fn an_early_committed_stream_records_composition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = SharedRoutingLog::new(dir.path().join("routing.jsonl")).expect("routing log");
+        let context = RoutingLogContext::from_metadata(&Metadata {
+            session_id: Some("composition-session".to_string()),
+            ..Metadata::default()
+        });
+        let composition = Arc::new(switchyard_runner::composition::CompositionMetadata {
             parent_route: "tier2".to_string(),
             child_route: "smartlocal".to_string(),
             final_target: "vendor/vl".to_string(),
             children: vec![(
                 "smartfree".to_string(),
-                switchyard_runner::composition::ChildOutcome::Skipped { capability: "vision" },
+                switchyard_runner::composition::ChildOutcome::Skipped {
+                    capability: "vision",
+                },
             )],
-        crossed_child: false,
-        cross_child_reason: None,
-    });
-    let usage = Usage {
-        input_tokens: Some(7),
-        output_tokens: Some(2),
-        ..Usage::default()
-    };
-    let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
-        LlmResponseChunk::Usage(usage),
-        LlmResponseChunk::MessageStop { reason: None },
-    ]))]);
-    let response = Response {
-        llm_response: LlmResponse::Stream(Box::pin(source)),
-        metadata: None,
-        upstream_headers: http::HeaderMap::new(),
-    };
-    let stats = StatsAccumulator::default();
-    let observed = observe(
-        response,
-        "model/worker",
-        Instant::now(),
-        stats.clone(),
-        0.0,
-        Some((log.clone(), context)),
-        Some(composition),
-    );
-    let LlmResponse::Stream(mut observed) = observed.llm_response else {
-        panic!("expected stream");
-    };
-    assert!(observed.next().await.is_some());
-    drop(observed);
+            crossed_child: false,
+            cross_child_reason: None,
+        });
+        let usage = Usage {
+            input_tokens: Some(7),
+            output_tokens: Some(2),
+            ..Usage::default()
+        };
+        let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::Usage(usage),
+            LlmResponseChunk::MessageStop { reason: None },
+        ]))]);
+        let response = Response {
+            llm_response: LlmResponse::Stream(Box::pin(source)),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        };
+        let stats = StatsAccumulator::default();
+        let observed = observe(
+            response,
+            "model/worker",
+            Instant::now(),
+            stats.clone(),
+            0.0,
+            Some((log.clone(), context)),
+            Some(composition),
+        );
+        let LlmResponse::Stream(mut observed) = observed.llm_response else {
+            panic!("expected stream");
+        };
+        assert!(observed.next().await.is_some());
+        drop(observed);
 
-    // The record the operator reads must name the child and the target that served.
-    let written = std::fs::read_to_string(dir.path().join("routing.jsonl")).expect("read log");
-    let record: Value = serde_json::from_str(written.lines().next().expect("one record"))
-        .expect("record is JSON");
-    assert_eq!(record["child_route"], "smartlocal", "{record}");
-    assert_eq!(record["final_target"], "vendor/vl", "{record}");
-}
+        // The record the operator reads must name the child and the target that served.
+        let written = std::fs::read_to_string(dir.path().join("routing.jsonl")).expect("read log");
+        let record: Value = serde_json::from_str(written.lines().next().expect("one record"))
+            .expect("record is JSON");
+        assert_eq!(record["child_route"], "smartlocal", "{record}");
+        assert_eq!(record["final_target"], "vendor/vl", "{record}");
+    }
 }

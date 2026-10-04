@@ -111,18 +111,11 @@ impl DecisionTransport {
     /// keyed by question id, and names the kind `type`. Both SystemOne and OpenRouter
     /// alpha-decisions use this shape, so the difference between them is endpoint,
     /// authentication and response handling rather than a second semantic encoding.
-    pub fn request_body(
-        self,
-        model: &str,
-        request: &DecisionRequest,
-    ) -> Result<Value, String> {
+    pub fn request_body(self, model: &str, request: &DecisionRequest) -> Result<Value, String> {
         let mut questions = serde_json::Map::new();
         for (id, question) in &request.questions {
             let mut entry = serde_json::Map::new();
-            entry.insert(
-                "type".to_string(),
-                json!(Self::kind_name(&question.kind)),
-            );
+            entry.insert("type".to_string(), json!(Self::kind_name(&question.kind)));
             entry.insert("instructions".to_string(), question.instructions.clone());
             match &question.kind {
                 DecisionKind::Boolean {
@@ -214,7 +207,6 @@ impl SupportedTypes {
     pub fn accepts_request(self, request: &DecisionRequest) -> bool {
         request.questions.values().all(|q| self.accepts(&q.kind))
     }
-
 }
 
 /// State shapes a decision backend accepts.
@@ -256,15 +248,12 @@ impl Default for StateForms {
     }
 }
 
-
-
 impl StateForms {
     /// Every shape: the default for a backend that documents no restriction.
     pub const ALL: Self = Self {
         plain_string: true,
         structured: true,
     };
-
 
     /// What SPAN's live service was observed to accept on 2026-10-02.
     pub const SPAN_OBSERVED: Self = Self {
@@ -327,9 +316,7 @@ pub fn validate_systemone(request: &DecisionRequest) -> Result<(), String> {
 /// made, so a provider's score legend is not duplicated into the response, and a
 /// backend's own routing or action metadata is not added here: it is diagnostic, and no
 /// portable caller field is manufactured to carry it.
-pub fn parse_response(
-    body: &Value,
-) -> Result<switchyard_protocol::DecisionResponse, String> {
+pub fn parse_response(body: &Value) -> Result<switchyard_protocol::DecisionResponse, String> {
     let answers = body
         .get("answers")
         .and_then(Value::as_object)
@@ -351,9 +338,9 @@ pub fn parse_response(
                 .map(|map| {
                     map.iter()
                         .filter_map(|(name, value)| {
-                            value
-                                .as_f64()
-                                .map(|value| (name.clone(), switchyard_protocol::Probability(value)))
+                            value.as_f64().map(|value| {
+                                (name.clone(), switchyard_protocol::Probability(value))
+                            })
                         })
                         .collect()
                 })
@@ -412,10 +399,7 @@ pub fn parse_response(
     }
     // Provider-reported identity and usage are carried when supplied; a provider that
     // does not report them leaves them absent rather than invented.
-    let id = body
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let id = body.get("id").and_then(Value::as_str).map(str::to_string);
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -472,7 +456,11 @@ mod tests {
                 kind: DecisionKind::Choice {
                     options: (0..options)
                         .map(|index| ChoiceOption {
-                            id: if index == 0 { "billing".into() } else { format!("o{index}") },
+                            id: if index == 0 {
+                                "billing".into()
+                            } else {
+                                format!("o{index}")
+                            },
                             description: None,
                         })
                         .collect(),
@@ -570,12 +558,20 @@ mod tests {
             .request_body("jev-style-0.8b-decision-v3", &boolean_request())
             .expect("body builds");
         assert!(body.get("state").is_some(), "context is named state");
-        assert!(body.get("context").is_none(), "context is not the field name");
-        let questions = body["questions"].as_object().expect("questions is an object");
+        assert!(
+            body.get("context").is_none(),
+            "context is not the field name"
+        );
+        let questions = body["questions"]
+            .as_object()
+            .expect("questions is an object");
         assert_eq!(questions.len(), 1);
         let risk = &questions["risk"];
         assert_eq!(risk["type"], "noul");
-        assert!(risk.get("kind").is_none(), "the discriminator is type, not kind");
+        assert!(
+            risk.get("kind").is_none(),
+            "the discriminator is type, not kind"
+        );
         assert!(risk.get("question_id").is_none(), "the id is the map key");
         assert!(risk.get("instructions").is_some());
         assert_eq!(risk["criteria"]["true"], "needs reasoning");
@@ -650,9 +646,7 @@ mod tests {
         assert!(
             matches!(
                 risk.value,
-                DecisionValue::Boolean(
-                    switchyard_protocol::BooleanEstimate::ProbabilityTrue(_)
-                )
+                DecisionValue::Boolean(switchyard_protocol::BooleanEstimate::ProbabilityTrue(_))
             ),
             "noul becomes a probability of true, not a threshold"
         );

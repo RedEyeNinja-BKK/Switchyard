@@ -20,6 +20,8 @@
 //! evidence about this request or this configuration, not evidence that another
 //! backend should serve it, so it stops immediately.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -66,7 +68,10 @@ impl DecisionSkip {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecisionFailure {
     /// Eligible backend that could not be reached or refused transiently.
-    Serving { reason: &'static str, retryable: bool },
+    Serving {
+        reason: &'static str,
+        retryable: bool,
+    },
     /// The request or configuration is at fault; another backend would not help.
     NotEligible(DecisionSkip),
 }
@@ -172,16 +177,21 @@ pub struct DecisionOutcome {
     pub served_by: String,
     /// Candidates that were tried and failed, with the reason.
     pub attempts: Vec<(String, DecisionFailure)>,
+    /// The child POLICY lane that served the request, when the caller addressed a
+    /// composed lane. A tier must not reduce to "some backend answered": which family
+    /// policy produced the answer is the operationally meaningful part.
+    pub served_by_lane: Option<String>,
 }
 
 /// Default deadline for one decision call.
 const DEFAULT_DECISION_TIMEOUT_SECONDS: u64 = 30;
 
-async fn send(
-    candidate: &DecisionCandidate,
-    body: Value,
-) -> Result<Value, DecisionFailure> {
-    let Some(api_key) = candidate.api_key.as_deref().filter(|key| !key.trim().is_empty()) else {
+async fn send(candidate: &DecisionCandidate, body: Value) -> Result<Value, DecisionFailure> {
+    let Some(api_key) = candidate
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    else {
         return Err(DecisionFailure::NotEligible(DecisionSkip::Unauthenticated));
     };
     let client = reqwest::Client::builder()
@@ -304,6 +314,7 @@ pub async fn serve_target(
                 response,
                 served_by: candidate.name.clone(),
                 attempts: Vec::new(),
+                served_by_lane: None,
             })
         }
         Err(failure) => Err(failure),
@@ -354,6 +365,7 @@ pub async fn resolve_and_serve(
                     response,
                     served_by: candidate.name.clone(),
                     attempts,
+                    served_by_lane: None,
                 });
             }
             Err(failure) => {
@@ -368,6 +380,132 @@ pub async fn resolve_and_serve(
         reason: "no_eligible_backend",
         retryable: false,
     })
+}
+
+/// One child lane's contribution to a composed request.
+#[derive(Clone)]
+pub struct LaneChild {
+    lane: String,
+    resolver: std::sync::Arc<DecisionResolver>,
+}
+
+impl LaneChild {
+    /// The child lane's public name.
+    pub fn lane(&self) -> &str {
+        &self.lane
+    }
+}
+
+/// Serves a request addressed to a lane that composes child POLICY lanes.
+///
+/// Children are invoked whole and in order, in process, through the same
+/// `resolve_and_serve` used by a leaf lane. A tier therefore inherits each child's
+/// candidate order, question-kind eligibility, terminal-vs-retry failure policy and
+/// telemetry, and a change to a child is inherited rather than copied.
+///
+/// Three outcomes stay distinct, mirroring the route composition precedent:
+///
+/// * a child whose own candidates are all ineligible is skipped without a provider
+///   call, and the next child is tried (routing, not failure);
+/// * a child that fails transiently after exhausting its own candidates may yield, so
+///   one child's outage does not decide the tier;
+/// * a child that fails for a reason no other lane can fix (contract, credential,
+///   undecodable response) stops the tier rather than hiding the defect behind a
+///   different family's answer.
+///
+/// `stack` carries the current recursion path so a cycle fails closed instead of
+/// recursing. Cycles are also rejected at configuration load, so this is a backstop.
+pub async fn serve_composed(
+    children: &[LaneChild],
+    request: &DecisionRequest,
+    stack: &mut Vec<String>,
+) -> Result<DecisionOutcome, DecisionFailure> {
+    let mut attempts = Vec::new();
+    let mut yielded = false;
+    for child in children {
+        if stack.contains(&child.lane) {
+            return Err(DecisionFailure::Serving {
+                reason: "decision_lane_cycle",
+                retryable: false,
+            });
+        }
+        stack.push(child.lane.clone());
+        let outcome = resolve_and_serve(&child.resolver, request).await;
+        stack.pop();
+        match outcome {
+            Ok(mut served) => {
+                served.served_by_lane = Some(child.lane.clone());
+                for (candidate, failure) in served.attempts.drain(..) {
+                    attempts.push((format!("{}/{}", child.lane, candidate), failure));
+                }
+                served.attempts = attempts;
+                return Ok(served);
+            }
+            Err(failure) => {
+                if !failure.try_next() {
+                    return Err(failure);
+                }
+                attempts.push((child.lane.clone(), failure));
+                yielded = true;
+            }
+        }
+    }
+    Err(DecisionFailure::Serving {
+        reason: if yielded {
+            "all_child_lanes_exhausted"
+        } else {
+            "no_eligible_backend"
+        },
+        retryable: false,
+    })
+}
+
+/// Resolves the child policy lanes of a composed lane, in configured order.
+pub fn lane_children(
+    composition: &BTreeMap<String, Vec<String>>,
+    lanes: &BTreeMap<String, LaneResolverHandle>,
+    lane: &str,
+) -> Option<Vec<LaneChild>> {
+    let names = composition.get(lane)?;
+    let mut children = Vec::with_capacity(names.len());
+    for name in names {
+        let handle = lanes.get(name)?;
+        children.push(LaneChild {
+            lane: name.clone(),
+            resolver: handle.resolver.clone(),
+        });
+    }
+    Some(children)
+}
+
+/// A lane's resolver, without its question-kind scoping, for composition lookup.
+#[derive(Clone)]
+pub struct LaneResolverHandle {
+    /// The lane's ordered candidates.
+    pub resolver: std::sync::Arc<DecisionResolver>,
+}
+
+/// Builds the ordered child lanes of a composed lane, from the runner's own index.
+///
+/// Resolution is in process and uses each child's own resolver, so a child keeps its
+/// candidate order, eligibility and failure policy. Returns `None` when the composed
+/// lane cannot be built, which the caller reports rather than silently degrading to a
+/// flat list of physical targets.
+pub fn resolve_composed(
+    runner: &crate::Runner,
+    lane: &str,
+    _request: &switchyard_protocol::DecisionRequest,
+) -> Option<Vec<LaneChild>> {
+    let children = runner.decision_lane_children(lane)?;
+    let mut resolved = Vec::with_capacity(children.len());
+    for name in children {
+        let handle = runner.named_decision_lane(name)?;
+        resolved.push(LaneChild {
+            lane: name.to_string(),
+            resolver: Arc::clone(&handle.resolver),
+        });
+    }
+    Some(resolved)
 }
 
 /// Serializes a native decision response in the retained compatibility shape.
@@ -387,7 +525,11 @@ pub fn compatibility_response(response: &switchyard_protocol::DecisionResponse) 
                         probability.0
                     }
                     switchyard_protocol::BooleanEstimate::Value(value) => {
-                        if *value { 1.0 } else { 0.0 }
+                        if *value {
+                            1.0
+                        } else {
+                            0.0
+                        }
                     }
                 };
                 entry.insert("type".to_string(), json!("noul"));
@@ -433,7 +575,8 @@ pub fn compatibility_response(response: &switchyard_protocol::DecisionResponse) 
         body["model"] = json!(model.as_str());
     }
     let usage = &response.usage;
-    if usage.input_tokens.is_some() || usage.output_tokens.is_some() || usage.total_tokens.is_some() {
+    if usage.input_tokens.is_some() || usage.output_tokens.is_some() || usage.total_tokens.is_some()
+    {
         body["usage"] = json!({
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
@@ -447,8 +590,8 @@ pub fn compatibility_response(response: &switchyard_protocol::DecisionResponse) 
 mod tests {
     use super::*;
     use serde_json::json;
-    use switchyard_protocol::{DecisionKind, DecisionQuestion};
     use std::collections::BTreeMap;
+    use switchyard_protocol::{DecisionKind, DecisionQuestion};
 
     pub(crate) fn candidate(
         name: &str,
@@ -523,7 +666,11 @@ mod tests {
     fn a_local_backend_is_eligible_for_every_supported_shape() {
         let backend = local();
         assert!(backend.eligibility(&noul_request(json!("plain"))).is_ok());
-        assert!(backend.eligibility(&noul_request(json!({"task": "x"}))).is_ok());
+        assert!(
+            backend
+                .eligibility(&noul_request(json!({"task": "x"})))
+                .is_ok()
+        );
         assert!(backend.eligibility(&choice_request()).is_ok());
     }
 
@@ -638,7 +785,10 @@ mod tests {
             DecisionFailure::NotEligible(DecisionSkip::UnsupportedType),
             DecisionFailure::NotEligible(DecisionSkip::UnsupportedState),
         ] {
-            assert!(retryable.try_next(), "{retryable:?} should try the next backend");
+            assert!(
+                retryable.try_next(),
+                "{retryable:?} should try the next backend"
+            );
         }
 
         for terminal in [

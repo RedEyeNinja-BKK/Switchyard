@@ -1453,8 +1453,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
     use crate::backend::HttpBackendConfig;
+    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
@@ -1620,10 +1620,7 @@ mod tests {
     fn responses_map_with_policy(base_url: &str, policy: ReasoningPolicy) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         // An `extra_body` default that the caller will try to override.
-        backend.extra_body = BTreeMap::from([(
-            "reasoning".to_string(),
-            json!({"enabled": true}),
-        )]);
+        backend.extra_body = BTreeMap::from([("reasoning".to_string(), json!({"enabled": true}))]);
         backend.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
         backend.reasoning_policy = Some(policy);
         vec![ModelConfig::new(

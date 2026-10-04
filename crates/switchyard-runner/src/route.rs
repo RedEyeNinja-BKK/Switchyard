@@ -90,7 +90,10 @@ pub enum RunnerError {
     /// This is the caller's request, not a deployment fault, so it is kept distinct from
     /// [`Self::Configuration`] and reported as a 4xx rather than a server failure.
     #[error("no eligible route for model {model:?}: requires {capability}")]
-    UnsupportedCapability { model: String, capability: &'static str },
+    UnsupportedCapability {
+        model: String,
+        capability: &'static str,
+    },
     #[error("caller format is incompatible with {} credentials", .0.as_str())]
     IncompatibleCallerFormat(CallerAuthKind),
     #[error("route has no compatible target for the auxiliary operation")]
@@ -102,7 +105,10 @@ pub enum RunnerError {
 }
 
 impl RunnerError {
-    pub(crate) fn unsupported_capability(model: impl Into<String>, capability: &'static str) -> Self {
+    pub(crate) fn unsupported_capability(
+        model: impl Into<String>,
+        capability: &'static str,
+    ) -> Self {
         Self::UnsupportedCapability {
             model: model.into(),
             capability,

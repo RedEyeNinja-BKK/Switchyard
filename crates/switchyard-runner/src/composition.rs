@@ -219,12 +219,12 @@ impl Runner {
             if let Some(capability) = request_fit::unsupported_capability(
                 route.capabilities(),
                 &request.llm_request,
-                request.raw_request.as_ref().unwrap_or(&serde_json::Value::Null),
+                request
+                    .raw_request
+                    .as_ref()
+                    .unwrap_or(&serde_json::Value::Null),
             ) {
-                children.push((
-                    child_name.clone(),
-                    ChildOutcome::Skipped { capability },
-                ));
+                children.push((child_name.clone(), ChildOutcome::Skipped { capability }));
                 continue;
             }
 
@@ -295,7 +295,10 @@ impl Runner {
             ChildOutcome::Skipped { capability } => Some(*capability),
             _ => None,
         }) {
-            return Err(RunnerError::unsupported_capability(parent_route, capability));
+            return Err(RunnerError::unsupported_capability(
+                parent_route,
+                capability,
+            ));
         }
         Err(last_error.unwrap_or_else(|| {
             RunnerError::unsupported_capability(parent_route, "an eligible route")
@@ -316,11 +319,7 @@ impl Runner {
     ///
     /// More than one claimant is a state conflict, not a choice: the parent must not pick by
     /// child order.
-    pub fn continuation_claimants(
-        &self,
-        parent_route: &str,
-        request: &Request,
-    ) -> Vec<String> {
+    pub fn continuation_claimants(&self, parent_route: &str, request: &Request) -> Vec<String> {
         let Ok(Selection::Composite(spec)) = self.select(parent_route) else {
             return Vec::new();
         };
@@ -339,11 +338,7 @@ impl Runner {
     ///
     /// Read-only: the owning child keeps its own state, and nothing is copied or
     /// reconstructed here.
-    pub fn continuation_owner(
-        &self,
-        parent_route: &str,
-        request: &Request,
-    ) -> Option<String> {
+    pub fn continuation_owner(&self, parent_route: &str, request: &Request) -> Option<String> {
         let Selection::Composite(spec) = self.select(parent_route).ok()? else {
             return None;
         };
@@ -390,14 +385,12 @@ pub fn eligible_candidates(
     ordered
         .iter()
         .filter(|name| match capabilities.get(**name) {
-            Some(capabilities) => {
-                crate::request_fit::unsupported_capability(
-                    *capabilities,
-                    &request.llm_request,
-                    &raw,
-                )
-                .is_none()
-            }
+            Some(capabilities) => crate::request_fit::unsupported_capability(
+                *capabilities,
+                &request.llm_request,
+                &raw,
+            )
+            .is_none(),
             None => true,
         })
         .map(|name| (*name).to_string())
@@ -407,12 +400,10 @@ pub fn eligible_candidates(
 #[cfg(test)]
 mod target_eligibility_tests {
     use super::*;
+    use crate::ModelCapabilities;
     use serde_json::json;
     use std::collections::BTreeMap;
-    use switchyard_protocol::{
-        ContentBlock, ImageSource, LlmRequest, Message, Role,
-    };
-    use crate::ModelCapabilities;
+    use switchyard_protocol::{ContentBlock, ImageSource, LlmRequest, Message, Role};
 
     /// A target is a factual property of a backing deployment; a route is a policy promise.
     /// This is the input the filter uses, and it is deliberately separate from the route's
@@ -630,7 +621,13 @@ candidates = []
             Err(error) => error,
         };
         assert!(
-            matches!(error, crate::RunnerError::UnsupportedCapability { capability: "vision", .. }),
+            matches!(
+                error,
+                crate::RunnerError::UnsupportedCapability {
+                    capability: "vision",
+                    ..
+                }
+            ),
             "an image request against a text-only route is a request error: {error}"
         );
     }
@@ -714,7 +711,9 @@ vision = true
                 messages: vec![Message {
                     role: Role::User,
                     content: vec![
-                        ContentBlock::Text { text: "what is this".into() },
+                        ContentBlock::Text {
+                            text: "what is this".into(),
+                        },
                         ContentBlock::Image {
                             source: ImageSource::Url {
                                 url: "https://example.test/a.png".into(),

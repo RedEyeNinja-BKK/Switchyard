@@ -1,0 +1,396 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Named decision-lane resolution and route-to-route decision composition.
+//!
+//! The defect these cover: a caller could not address a policy lane by its own name.
+//! The public identity came from `default_decision_lane`, which the last unscoped lane
+//! overwrote, and `resolve_identity` searched only the selected lane's candidates, so
+//! adding real sibling lanes made them shadow and steal the request from one another.
+//!
+//! The fix makes an explicitly requested name authoritative and lets a tier compose
+//! child POLICY lanes in process. These tests pin that mechanism generically: no test
+//! names a particular production lane.
+
+use std::collections::BTreeMap;
+
+use serde_json::json;
+use switchyard_protocol::{DecisionKind, DecisionQuestion, DecisionRequest, ModelId};
+use switchyard_runner::{Runner, RunnerError};
+
+fn decision_config(lanes: &str, composition: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+default_decision_lane = "free-family"
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+api_key_env = "PRIMARY_KEY"
+
+[targets.span]
+id = "span/model"
+llm_client = "primary"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "https://alpha.test"
+decision_api_key_env = "SPAN_KEY"
+supported_types = {{ noul = true, choice = false, score = false }}
+
+[targets.mercury]
+id = "mercury/model"
+llm_client = "primary"
+decision_transport = "system_one"
+decision_base_url = "https://systemone.test"
+decision_api_key_env = "MERCURY_KEY"
+
+[targets.jev]
+id = "jev/model"
+llm_client = "primary"
+decision_transport = "system_one"
+decision_base_url = "https://systemone.test"
+decision_api_key_env = "JEV_KEY"
+
+[targets.laya]
+id = "laya/model"
+llm_client = "primary"
+decision_transport = "system_one"
+decision_base_url = "https://systemone.test"
+decision_api_key_env = "LAYA_KEY"
+
+[routes.noop]
+id = "switchyard/noop"
+type = "noop"
+
+[decision_lanes.free-family]
+targets = ["span", "mercury"]
+
+[decision_lanes.local-family]
+targets = ["jev", "laya"]
+
+[lane_placeholder]
+{lanes}
+{composition}
+"#
+    )
+}
+
+/// A standalone lane config with only the supplied lane blocks.
+fn build(lanes: &str, composition: &str) -> Result<Runner, RunnerError> {
+    // The placeholder keeps the template readable; strip it before parsing.
+    let toml = decision_config(lanes, composition).replace("[lane_placeholder]\n", "");
+    Runner::from_toml(&toml)
+}
+
+/// The refusal message for a configuration that must not load.
+fn refusal(lanes: &str, composition: &str) -> String {
+    match build(lanes, composition) {
+        Ok(_) => panic!("deployment should have been refused"),
+        Err(error) => error.to_string(),
+    }
+}
+
+fn with_env<F: FnOnce()>(f: F) {
+    // SAFETY: single-threaded per test; each sets only its own keys.
+    unsafe {
+        std::env::set_var("PRIMARY_KEY", "primary-dummy");
+        std::env::set_var("SPAN_KEY", "span-dummy");
+        std::env::set_var("MERCURY_KEY", "mercury-dummy");
+        std::env::set_var("JEV_KEY", "jev-dummy");
+        std::env::set_var("LAYA_KEY", "laya-dummy");
+    }
+    f();
+}
+
+#[test]
+fn an_explicitly_named_lane_resolves_to_itself_not_the_default() {
+    with_env(|| {
+        let runner = build(
+            "",
+            r#"
+[decision_lane_composition.default-lane-composite]
+children = ["free-family", "local-family"]
+"#,
+        )
+        .expect("deployment should load");
+
+        // Both siblings are independently addressable.
+        assert!(runner.named_decision_lane("free-family").is_some());
+        assert!(runner.named_decision_lane("local-family").is_some());
+
+        // The free family holds its own two candidates, in its own order.
+        let free = runner
+            .named_decision_lane("free-family")
+            .expect("free family lane");
+        assert_eq!(
+            free.resolver
+                .candidates
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["span", "mercury"]
+        );
+
+        // The local family is a DIFFERENT lane and neither shadows the other.
+        let local = runner
+            .named_decision_lane("local-family")
+            .expect("local family lane");
+        assert_eq!(
+            local
+                .resolver
+                .candidates
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["jev", "laya"]
+        );
+    });
+}
+
+#[test]
+fn an_unscoped_lane_is_not_promoted_to_a_default_implicitly() {
+    with_env(|| {
+        // A second unscoped lane sorts BEFORE the declared default.
+        let runner = build(
+            r#"
+[decision_lanes.aaa-extra-unscoped]
+targets = ["mercury"]
+"#,
+            "",
+        )
+        .expect("deployment should load");
+
+        // The declared default is used, not whichever unscoped lane came first.
+        assert_eq!(runner.decision_lane_name(), Some("free-family"));
+        // The extra lane is still addressable by name, which is the whole point.
+        assert!(runner.named_decision_lane("aaa-extra-unscoped").is_some());
+    });
+}
+
+#[test]
+fn a_declared_default_naming_no_lane_is_refused() {
+    with_env(|| {
+        // A default that names no configured lane must fail at load, not silently
+        // leave every unaddressed request to fail later at request time.
+        let bad = decision_config("", "")
+            .replace("[lane_placeholder]\n", "")
+            .replace(
+                "default_decision_lane = \"free-family\"",
+                "default_decision_lane = \"no-such-lane\"",
+            );
+        match Runner::from_toml(&bad) {
+            Ok(_) => panic!("a default naming no lane must be refused"),
+            Err(error) => assert!(
+                error.to_string().contains("not a configured decision lane"),
+                "{error}"
+            ),
+        }
+    });
+}
+
+#[test]
+fn composition_is_referenced_not_flattened() {
+    with_env(|| {
+        let runner = build(
+            "",
+            r#"
+[decision_lane_composition.tier]
+children = ["free-family", "local-family"]
+"#,
+        )
+        .expect("deployment should load");
+
+        assert_eq!(
+            runner.decision_lane_children("tier"),
+            Some(["free-family".to_string(), "local-family".to_string()].as_slice())
+        );
+        assert!(runner.decision_lane_is_composite("tier"));
+        // A composed lane holds child LANES; its children are not copied into it.
+        assert!(runner.named_decision_lane("tier").is_none());
+        // Both children remain independently addressable while the tier exists.
+        assert!(runner.named_decision_lane("free-family").is_some());
+        assert!(runner.named_decision_lane("local-family").is_some());
+    });
+}
+
+#[test]
+fn a_composition_cycle_is_refused_at_load() {
+    with_env(|| {
+        let error = refusal(
+            "",
+            r#"
+[decision_lane_composition.tier]
+children = ["free-family", "tier-two"]
+
+[decision_lane_composition.tier-two]
+children = ["local-family", "tier"]
+"#,
+        );
+
+        assert!(error.contains("cycle"), "{error}");
+    });
+}
+
+#[test]
+fn a_self_referential_composition_is_refused() {
+    with_env(|| {
+        let error = refusal(
+            "",
+            r#"
+[decision_lane_composition.tier]
+children = ["tier"]
+"#,
+        );
+
+        assert!(error.to_string().contains("itself"), "{error}");
+    });
+}
+
+#[test]
+fn an_unknown_child_lane_is_refused() {
+    with_env(|| {
+        let error = refusal(
+            "",
+            r#"
+[decision_lane_composition.tier]
+children = ["free-family", "no-such-lane"]
+"#,
+        );
+
+        assert!(error.to_string().contains("unknown child lane"), "{error}");
+    });
+}
+
+#[test]
+fn an_empty_composition_is_refused() {
+    with_env(|| {
+        let error = refusal(
+            "",
+            r#"
+[decision_lane_composition.tier]
+children = []
+"#,
+        );
+
+        assert!(error.to_string().contains("at least one child"), "{error}");
+    });
+}
+
+#[test]
+fn a_name_cannot_be_both_a_target_lane_and_a_composed_lane() {
+    with_env(|| {
+        let error = refusal(
+            "",
+            r#"
+[decision_lane_composition.free-family]
+children = ["local-family"]
+"#,
+        );
+
+        assert!(
+            error.to_string().contains("both as a target lane"),
+            "{error}"
+        );
+    });
+}
+
+#[test]
+fn resolution_does_not_depend_on_btree_lexical_order() {
+    with_env(|| {
+        // Same sibling lanes, but the default lane is named so it sorts LAST.
+        let toml = r#"
+schema_version = 1
+default_decision_lane = "zzz-family"
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+api_key_env = "PRIMARY_KEY"
+
+[targets.a_span]
+id = "span/model"
+llm_client = "primary"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "https://alpha.test"
+decision_api_key_env = "SPAN_KEY"
+
+[targets.b_mercury]
+id = "mercury/model"
+llm_client = "primary"
+decision_transport = "system_one"
+decision_base_url = "https://systemone.test"
+decision_api_key_env = "MERCURY_KEY"
+
+[routes.noop]
+id = "switchyard/noop"
+type = "noop"
+
+[decision_lanes.zzz-family]
+targets = ["a_span", "b_mercury"]
+"#;
+        let runner = Runner::from_toml(toml).expect("deployment should load");
+        // Despite sorting last, it is the only unscoped lane and is addressable by
+        // name; public identity does not depend on which name happens to come first.
+        assert_eq!(runner.decision_lane_name(), Some("zzz-family"));
+        assert!(runner.named_decision_lane("zzz-family").is_some());
+    });
+}
+
+#[test]
+fn an_unsupported_question_type_reaches_no_candidate() {
+    with_env(|| {
+        let runner = build("", "").expect("deployment should load");
+        let free = runner
+            .named_decision_lane("free-family")
+            .expect("free family");
+
+        // Span declares choice = false. A choice question must be refused by span
+        // pre-dispatch, and mercury (which supports it) is the one that may serve.
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "risk".to_string(),
+            DecisionQuestion {
+                instructions: json!("assess"),
+                kind: DecisionKind::Choice {
+                    options: vec![
+                        switchyard_protocol::ChoiceOption {
+                            id: "yes".to_string(),
+                            description: None,
+                        },
+                        switchyard_protocol::ChoiceOption {
+                            id: "no".to_string(),
+                            description: None,
+                        },
+                    ],
+                },
+            },
+        );
+        let choice = DecisionRequest {
+            model: None,
+            context: json!("clean"),
+            questions,
+        };
+        let span = free
+            .resolver
+            .candidates
+            .iter()
+            .find(|c| c.name == "span")
+            .expect("span candidate");
+        assert!(
+            span.eligibility(&choice).is_err(),
+            "a declared-ineligible backend must not be eligible for the request"
+        );
+        let mercury = free
+            .resolver
+            .candidates
+            .iter()
+            .find(|c| c.name == "mercury")
+            .expect("mercury candidate");
+        assert!(
+            mercury.eligibility(&choice).is_ok(),
+            "an all-types backend must remain eligible"
+        );
+    });
+}

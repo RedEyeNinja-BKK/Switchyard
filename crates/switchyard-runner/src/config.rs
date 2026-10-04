@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use libsy::LibsyError;
 use libsy::RuntimeModels;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
@@ -17,14 +18,8 @@ use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
-use libsy::LibsyError;
 use switchyard_protocol::{
-    Category,
-    ModelId,
-    ReasoningDialect,
-    ReasoningPolicy,
-    RoutedLlmClient,
-    WireFormat,
+    Category, ModelId, ReasoningDialect, ReasoningPolicy, RoutedLlmClient, WireFormat,
 };
 
 use crate::{
@@ -98,6 +93,16 @@ pub(crate) struct DeploymentConfig {
     /// Explicitly ordered decision lanes, by lane name.
     #[serde(default)]
     pub(crate) decision_lanes: BTreeMap<String, DecisionLaneConfig>,
+    /// The lane that serves a request naming no lane. Declared explicitly: promoting
+    /// whichever unscoped lane happened to be registered first would make a
+    /// deployment's public identity depend on map ordering.
+    #[serde(default)]
+    pub(crate) default_decision_lane: Option<String>,
+    /// Decision lanes that compose child POLICY lanes rather than physical targets.
+    /// A tier over families references its families, so each keeps its own identity,
+    /// stays independently addressable, and its policy change is inherited.
+    #[serde(default)]
+    pub(crate) decision_lane_composition: BTreeMap<String, DecisionLaneCompositionConfig>,
     /// Ordered composites over complete child routes, by route name.
     #[serde(default)]
     pub(crate) composites: BTreeMap<String, CompositeRouteConfig>,
@@ -143,6 +148,19 @@ pub(crate) struct DecisionLaneConfig {
     /// ranking applied to everything.
     #[serde(default)]
     pub(crate) types: Vec<decision_transport::QuestionKind>,
+}
+
+/// A decision lane composed of ordered child POLICY lanes.
+///
+/// Children are lane names, not targets. Each child runs its own candidate order,
+/// question-kind eligibility and failure policy in process, and the parent adds only
+/// ordered selection between them. Keeping the reference rather than flattening it is
+/// what lets a family stay independently addressable and its policy stay single-sourced.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DecisionLaneCompositionConfig {
+    /// Child decision lane names in preference order.
+    pub(crate) children: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -371,22 +389,30 @@ impl DeploymentConfig {
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
         self.validate_decision_lanes()?;
+        self.validate_default_decision_lane()?;
+        self.validate_decision_lane_composition()?;
         // Lane name -> resolver, with the kinds each lane serves. Built before the routes
         // so a route's decision handler can select by the request's question kinds.
-        let mut lane_index: Vec<(String, Arc<decision_executor::DecisionResolver>, Vec<decision_transport::QuestionKind>)> =
-            Vec::new();
+        let mut lane_index: Vec<(
+            String,
+            Arc<decision_executor::DecisionResolver>,
+            Vec<decision_transport::QuestionKind>,
+        )> = Vec::new();
+        let mut lane_handles: BTreeMap<String, decision_executor::LaneResolverHandle> =
+            BTreeMap::new();
         for (name, lane_config) in &self.decision_lanes {
             let names: Vec<&str> = lane_config.targets.iter().map(String::as_str).collect();
             let Some(resolver) = self.build_decision_resolver(&names) else {
                 continue;
             };
-            lane_index.push((name.clone(), Arc::new(resolver), lane_config.types.clone()));
+            let handle = decision_executor::LaneResolverHandle {
+                resolver: Arc::new(resolver),
+            };
+            lane_handles.insert(name.clone(), handle.clone());
+            lane_index.push((name.clone(), handle.resolver, lane_config.types.clone()));
         }
-        let lane_identity = self
-            .decision_lanes
-            .iter()
-            .find(|(_, lane)| lane.types.is_empty())
-            .map(|(name, _)| name.clone());
+        let lane_composition = self.resolve_decision_lane_composition(&lane_handles)?;
+        let lane_identity = self.default_decision_lane.clone();
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             // Before the unknown-target sweep below, so a malformed candidate list is
@@ -493,8 +519,13 @@ impl DeploymentConfig {
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
-            let (route_clients, caller_auth) =
-                self.build_route_clients(route_name, config, &clients, lane_identity.clone(), &lane_index)?;
+            let (route_clients, caller_auth) = self.build_route_clients(
+                route_name,
+                config,
+                &clients,
+                lane_identity.clone(),
+                &lane_index,
+            )?;
             let anthropic_auxiliary_target =
                 self.build_anthropic_auxiliary_target(config, &clients);
             let responses_auxiliary_target =
@@ -546,10 +577,7 @@ impl DeploymentConfig {
         // Composites are registered as named routes, so lookup is uniform: a caller
         // resolving a route cannot tell whether it is a leaf or a composite.
         for (name, composite) in &self.composites {
-            runner = runner.with_composite(
-                name.clone(),
-                composite.children.clone(),
-            );
+            runner = runner.with_composite(name.clone(), composite.children.clone());
             runner = runner.with_composite_capabilities(
                 name.clone(),
                 crate::ModelCapabilities {
@@ -565,6 +593,12 @@ impl DeploymentConfig {
         // internal call path resolve a logical identity identically.
         for (name, resolver, types) in lane_index {
             runner = runner.with_decision_lane(name, resolver, types);
+        }
+        if let Some(name) = &self.default_decision_lane {
+            runner = runner.with_default_decision_lane(name.clone());
+        }
+        for (name, children) in lane_composition {
+            runner = runner.with_decision_lane_composition(name, children);
         }
         Ok(runner)
     }
@@ -794,6 +828,145 @@ impl DeploymentConfig {
         Ok(())
     }
 
+    /// Validates the declared default decision lane, which must name a lane this
+    /// deployment actually configures. A default that names nothing would make every
+    /// unaddressed request fail late, at request time, instead of at load.
+    fn validate_default_decision_lane(&self) -> RunnerResult<()> {
+        let Some(name) = self.default_decision_lane.as_deref() else {
+            return Ok(());
+        };
+        if name.is_empty() {
+            return Err(RunnerError::configuration(
+                "default_decision_lane must not be empty; omit it instead",
+            ));
+        }
+        if !self.decision_lanes.contains_key(name) {
+            return Err(RunnerError::configuration(format!(
+                "default_decision_lane names {name}, which is not a configured decision lane"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A decision lane that composes child POLICY lanes in order.
+    ///
+    /// Distinct from `DecisionLaneConfig`, which holds physical targets: a composed
+    /// lane holds child LANE names, so a tier references its families and inherits
+    /// their policy instead of copying their target lists.
+    fn validate_decision_lane_composition(&self) -> RunnerResult<()> {
+        for (name, composition) in &self.decision_lane_composition {
+            let children = &composition.children;
+            if children.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} must list at least one child lane"
+                )));
+            }
+            // A name may not be both a physical lane and a composed lane: the two are
+            // different mechanisms, and silently preferring one would make the other's
+            // policy unreachable.
+            if self.decision_lanes.contains_key(name) {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} is declared both as a target lane and as a composed lane"
+                )));
+            }
+            let mut seen: Vec<&str> = Vec::new();
+            for child in children {
+                if child == name {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} lists itself as a child"
+                    )));
+                }
+                if seen.contains(&child.as_str()) {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} lists child lane {child} more than once"
+                    )));
+                }
+                if !self.decision_lanes.contains_key(child.as_str())
+                    && !self.decision_lane_composition.contains_key(child.as_str())
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} references unknown child lane {child}"
+                    )));
+                }
+                seen.push(child.as_str());
+            }
+        }
+        self.validate_decision_lane_acyclic()
+    }
+
+    /// Rejects a composition cycle, so a configuration that would recurse at request
+    /// time is refused at load instead.
+    fn validate_decision_lane_acyclic(&self) -> RunnerResult<()> {
+        /// Depth-first walk with the current path on the stack.
+        fn walk(
+            composition: &BTreeMap<String, DecisionLaneCompositionConfig>,
+            lane: &str,
+            path: &mut Vec<String>,
+        ) -> Result<(), String> {
+            if let Some(start) = path.iter().position(|entry| entry == lane) {
+                let mut cycle: Vec<&str> = path[start..].iter().map(String::as_str).collect();
+                cycle.push(lane);
+                return Err(cycle.join(" -> "));
+            }
+            let Some(entry) = composition.get(lane) else {
+                return Ok(());
+            };
+            path.push(lane.to_string());
+            for child in &entry.children {
+                if composition.contains_key(child.as_str()) {
+                    walk(composition, child.as_str(), path)?;
+                }
+            }
+            path.pop();
+            Ok(())
+        }
+
+        let mut lanes: Vec<&String> = self.decision_lane_composition.keys().collect();
+        lanes.sort();
+        for lane in lanes {
+            let mut path = Vec::new();
+            if let Err(cycle) = walk(&self.decision_lane_composition, lane.as_str(), &mut path) {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane composition contains a cycle: {cycle}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Flattens each composed lane into its ordered children once, at load, so a
+    /// request walks a precomputed list and a child that could not be built is a load
+    /// error rather than a silent skip at request time.
+    fn resolve_decision_lane_composition(
+        &self,
+        lanes: &BTreeMap<String, decision_executor::LaneResolverHandle>,
+    ) -> RunnerResult<Vec<(String, Vec<String>)>> {
+        let mut resolved = Vec::with_capacity(self.decision_lane_composition.len());
+        for (name, composition) in &self.decision_lane_composition {
+            let children = &composition.children;
+            let mut ordered = Vec::with_capacity(children.len());
+            for child in children {
+                // A composed child is legal and is resolved recursively at request
+                // time; requiring it to hold targets here would forbid a tier of
+                // tiers. It is accepted only if it is itself a composition, and
+                // cycles were already rejected above.
+                let is_leaf = lanes.contains_key(child.as_str());
+                let is_composite = self.decision_lane_composition.contains_key(child.as_str());
+                if !is_leaf {
+                    if !is_composite {
+                        return Err(RunnerError::configuration(format!(
+                            "decision lane {name} composes child lane {child}, which resolved to no \
+                             decision targets"
+                        )));
+                    }
+                }
+                ordered.push(child.clone());
+            }
+            resolved.push((name.clone(), ordered));
+        }
+        Ok(resolved)
+    }
+
     fn build_decision_resolver(
         &self,
         target_names: &[&str],
@@ -842,7 +1015,11 @@ impl DeploymentConfig {
         route: &RouteConfig,
         clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
         lane_identity: Option<String>,
-        lanes: &[(String, Arc<decision_executor::DecisionResolver>, Vec<decision_transport::QuestionKind>)],
+        lanes: &[(
+            String,
+            Arc<decision_executor::DecisionResolver>,
+            Vec<decision_transport::QuestionKind>,
+        )],
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let TargetPromptPolicy {
             prompts,
@@ -915,7 +1092,6 @@ impl DeploymentConfig {
         }
         let router = router.with_target_capabilities(facts);
 
-
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.
         if let Some(resolver) = self.build_decision_resolver(&route_targets) {
@@ -975,23 +1151,21 @@ impl DeploymentConfig {
                         }
                     }
                     .await;
-                    served
-                        .map(|outcome| outcome.response)
-                        .map_err(|failure| {
-                            // The host contract carries a LibsyError. The classified
-                            // reason is kept in the message so a caller can tell an
-                            // eligibility or contract refusal from a serving failure.
-                            LibsyError::client_call(
-                                model.clone(),
-                                switchyard_protocol::LlmClientError::General(
-                                    DecisionCallError {
-                                        requested: model.to_string(),
-                                        failure,
-                                    }
-                                    .to_string(),
-                                ),
-                            )
-                        })
+                    served.map(|outcome| outcome.response).map_err(|failure| {
+                        // The host contract carries a LibsyError. The classified
+                        // reason is kept in the message so a caller can tell an
+                        // eligibility or contract refusal from a serving failure.
+                        LibsyError::client_call(
+                            model.clone(),
+                            switchyard_protocol::LlmClientError::General(
+                                DecisionCallError {
+                                    requested: model.to_string(),
+                                    failure,
+                                }
+                                .to_string(),
+                            ),
+                        )
+                    })
                 })
             }));
             return Ok((router, caller_auth));
@@ -1882,10 +2056,8 @@ new = ["send_message"]
         );
         runner_from_toml(&plain)?;
 
-        let misspelled = VALID_CONFIG.replace(
-            strong,
-            &format!("{strong}\nreasoning_policy = \"disbled\""),
-        );
+        let misspelled =
+            VALID_CONFIG.replace(strong, &format!("{strong}\nreasoning_policy = \"disbled\""));
         assert!(error_message(&misspelled).contains("reasoning_policy"));
 
         drop(runner);
@@ -1898,11 +2070,12 @@ new = ["send_message"]
     fn an_authoritative_policy_without_a_dialect_is_rejected() {
         let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
         for policy in ["disabled", "enabled"] {
-            let without_dialect =
-                VALID_CONFIG.replace(strong, &format!("{strong}\nreasoning_policy = \"{policy}\""));
+            let without_dialect = VALID_CONFIG.replace(
+                strong,
+                &format!("{strong}\nreasoning_policy = \"{policy}\""),
+            );
             assert!(
-                error_message(&without_dialect)
-                    .contains("needs an explicit reasoning_dialect"),
+                error_message(&without_dialect).contains("needs an explicit reasoning_dialect"),
                 "policy {policy} without a dialect must be rejected: {}",
                 error_message(&without_dialect)
             );
@@ -1964,7 +2137,9 @@ new = ["send_message"]
 
         let thinking = VALID_CONFIG.replace(
             strong,
-            &format!("{strong}\nreasoning_effort = \"high\"\nreasoning_dialect = \"openai_effort\""),
+            &format!(
+                "{strong}\nreasoning_effort = \"high\"\nreasoning_dialect = \"openai_effort\""
+            ),
         );
         runner_from_toml(&thinking).expect("an effort-driven thinking target is valid");
 
@@ -2146,7 +2321,10 @@ fn an_escalation_target_outside_the_route_is_rejected_at_load() {
             "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"",
             "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"\ncandidates = [\"weak\", \"classifier\"]",
         );
-        assert_ne!(ordered, VALID_CONFIG, "the passthrough fixture must exist verbatim");
+        assert_ne!(
+            ordered, VALID_CONFIG,
+            "the passthrough fixture must exist verbatim"
+        );
         runner_from_toml(&ordered)?;
 
         // The order must reach the runtime model pool, not merely parse. This is the
@@ -2276,14 +2454,20 @@ max_query_chars = 512
         let b = &config.capabilities["space_b"];
         let r = &config.capabilities["rerank"];
         assert_eq!(a.contract.as_deref(), Some("localclaw-embedding-space:v1"));
-        assert_eq!(b.contract.as_deref(), Some("localclaw-embedding-space:lfm2.5-350m-v1"));
+        assert_eq!(
+            b.contract.as_deref(),
+            Some("localclaw-embedding-space:lfm2.5-350m-v1")
+        );
         assert_ne!(a.contract, b.contract, "two engines keep two contracts");
         assert_eq!(a.dimensions, Some(1024));
         assert_eq!(r.max_candidates, Some(64));
         assert_eq!(r.top_n, Some(5));
         assert_eq!(r.max_doc_chars, Some(1024));
         assert_eq!(r.max_query_chars, Some(512));
-        assert_eq!(config.capability_clients["engine_b"].url("/embeddings"), "https://b.test/embeddings");
+        assert_eq!(
+            config.capability_clients["engine_b"].url("/embeddings"),
+            "https://b.test/embeddings"
+        );
     }
 
     #[test]
@@ -3157,7 +3341,10 @@ mod composition_closure_tests {
         ));
         assert!(error.to_string().contains("vision"));
         assert!(
-            matches!(error.execution_error_summary().kind, RouteErrorKind::InvalidRequest),
+            matches!(
+                error.execution_error_summary().kind,
+                RouteErrorKind::InvalidRequest
+            ),
             "an unservable request is reported as invalid, not as configuration"
         );
         // A deployment fault stays a configuration failure.
@@ -3175,7 +3362,10 @@ mod composition_closure_tests {
         let conflict = RunnerError::StateConflict("two children claim resp_1".to_string());
         assert!(conflict.to_string().contains("resp_1"));
         assert!(
-            matches!(conflict.execution_error_summary().kind, RouteErrorKind::InvalidRequest),
+            matches!(
+                conflict.execution_error_summary().kind,
+                RouteErrorKind::InvalidRequest
+            ),
             "the conflict is reported rather than silently resolved"
         );
     }
@@ -3191,7 +3381,10 @@ mod composition_closure_tests {
             FailureClass::TemporarilyUnavailable,
             FailureClass::Server,
         ] {
-            assert!(class.allows_cross_route(), "{class:?} is recoverable across routes");
+            assert!(
+                class.allows_cross_route(),
+                "{class:?} is recoverable across routes"
+            );
         }
         for class in [
             FailureClass::Auth,
@@ -3200,7 +3393,10 @@ mod composition_closure_tests {
             FailureClass::ContextWindow,
             FailureClass::Other,
         ] {
-            assert!(!class.allows_cross_route(), "{class:?} must not cross routes");
+            assert!(
+                !class.allows_cross_route(),
+                "{class:?} must not cross routes"
+            );
         }
     }
 }

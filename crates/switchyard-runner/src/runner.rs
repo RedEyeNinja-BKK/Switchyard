@@ -25,6 +25,10 @@ pub struct Runner {
     decision_lanes: BTreeMap<String, Lane>,
     /// Name of the lane that serves every question kind, when one is configured.
     default_decision_lane: Option<String>,
+    /// Decision lanes that compose child POLICY lanes rather than physical targets.
+    /// A tier over families is preserved as a reference, so the child policies stay
+    /// independently addressable and a child change is inherited rather than copied.
+    decision_lane_composition: BTreeMap<String, Vec<String>>,
     /// Ordered composites over complete child routes.
     composites: BTreeMap<String, crate::composition::CompositeSpec>,
     /// Declared capabilities of composite routes, which are policy promises rather than
@@ -101,6 +105,7 @@ impl Runner {
             capabilities: BTreeMap::new(),
             decision_lanes: BTreeMap::new(),
             default_decision_lane: None,
+            decision_lane_composition: BTreeMap::new(),
             composites: BTreeMap::new(),
             composite_capabilities: BTreeMap::new(),
         }
@@ -195,7 +200,15 @@ impl Runner {
         &self.capabilities
     }
 
-    /// Registers the default logical decision lane, used by the compatibility surface.
+    /// Registers a decision lane.
+    ///
+    /// A lane's public identity is its NAME, resolved by
+    /// [`Runner::named_decision_lane`]. An unscoped lane is NOT promoted to a default
+    /// implicitly: which lane happened to be registered first must never decide a
+    /// deployment's public identity, and promotion-by-registration is exactly that.
+    /// A default is declared explicitly with
+    /// [`Runner::with_default_decision_lane`] and is only the fallback for a request
+    /// that names no lane at all.
     pub fn with_decision_lane(
         mut self,
         name: impl Into<String>,
@@ -203,27 +216,39 @@ impl Runner {
         types: Vec<crate::decision_transport::QuestionKind>,
     ) -> Self {
         let name = name.into();
-        if types.is_empty() {
-            self.default_decision_lane = Some(name.clone());
-        }
-        self.decision_lanes.insert(
-            name,
-            Lane {
-                resolver,
-                types,
-            },
-        );
+        self.decision_lanes.insert(name, Lane { resolver, types });
+        self
+    }
+
+    /// Declares the lane that serves a request which names no lane.
+    ///
+    /// This is a fallback identity, not a routing rule, so it cannot override an
+    /// explicitly requested lane. Declaring it is deliberate rather than inferred.
+    pub fn with_default_decision_lane(mut self, name: impl Into<String>) -> Self {
+        self.default_decision_lane = Some(name.into());
+        self
+    }
+
+    /// Registers a decision lane that composes child POLICY lanes in order.
+    ///
+    /// The child lanes are resolved in process through the same named-lane mechanism,
+    /// so a tier inherits each child's candidate order, question-kind eligibility,
+    /// failure policy and telemetry instead of a copied list of physical targets.
+    pub fn with_decision_lane_composition(
+        mut self,
+        name: impl Into<String>,
+        children: Vec<String>,
+    ) -> Self {
+        self.decision_lane_composition.insert(name.into(), children);
         self
     }
 
     /// Registers an ordered composite over complete child routes.
-    pub fn with_composite(
-        mut self,
-        route_id: impl Into<String>,
-        children: Vec<String>,
-    ) -> Self {
-        self.composites
-            .insert(route_id.into(), crate::composition::CompositeSpec { children });
+    pub fn with_composite(mut self, route_id: impl Into<String>, children: Vec<String>) -> Self {
+        self.composites.insert(
+            route_id.into(),
+            crate::composition::CompositeSpec { children },
+        );
         self
     }
 
@@ -233,7 +258,8 @@ impl Runner {
         route_id: impl Into<String>,
         capabilities: ModelCapabilities,
     ) -> Self {
-        self.composite_capabilities.insert(route_id.into(), capabilities);
+        self.composite_capabilities
+            .insert(route_id.into(), capabilities);
         self
     }
 
@@ -275,6 +301,40 @@ impl Runner {
         self.default_decision_lane.as_deref()
     }
 
+    /// Resolves the lane a caller named EXPLICITLY, by its own name.
+    ///
+    /// An explicit identity is authoritative and is never overridden by the default
+    /// lane or by any question-kind selection. A request that names a configured lane
+    /// therefore executes that lane's own policy, which is what makes independent
+    /// policy lanes (a free family, a local family, and a tier that composes them)
+    /// addressable at the same time instead of contending for one implicit slot.
+    ///
+    /// The name must be non-empty; an absent or empty `requested` is not an explicit
+    /// identity and is answered by [`Runner::lane_for_request`] instead.
+    pub fn named_decision_lane(&self, requested: &str) -> Option<&Lane> {
+        if requested.is_empty() {
+            return None;
+        }
+        self.decision_lanes.get(requested)
+    }
+
+    /// A lane's child policy lanes, when it composes other lanes instead of targets.
+    pub fn decision_lane_children(&self, lane: &str) -> Option<&[String]> {
+        self.decision_lane_composition
+            .get(lane)
+            .map(|children| children.as_slice())
+    }
+
+    /// Whether the named lane composes child lanes rather than holding physical targets.
+    pub fn decision_lane_is_composite(&self, lane: &str) -> bool {
+        self.decision_lane_composition.contains_key(lane)
+    }
+
+    /// Every decision lane that composes child lanes, for diagnostics and validation.
+    pub fn decision_lane_compositions(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.decision_lane_composition
+    }
+
     /// Selects the lane that serves a request, by its question kinds.
     ///
     /// A lane scoped to exactly this request's kinds wins over a broader one, so a
@@ -312,4 +372,3 @@ impl Runner {
             .find(|lane| crate::decision_transport::lane_serves(&lane.types, request))
     }
 }
-

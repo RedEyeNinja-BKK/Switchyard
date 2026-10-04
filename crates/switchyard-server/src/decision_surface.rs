@@ -13,10 +13,10 @@
 //! fallback, transport and decoding all live in that one executor, so this is a
 //! translation and nothing more.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -89,7 +89,11 @@ pub fn to_native(request: CompatibilityDecisionRequest) -> Result<DecisionReques
                         .into_iter()
                         .map(|(option, description)| ChoiceOption {
                             id: option,
-                            description: if description.is_null() { None } else { Some(description) },
+                            description: if description.is_null() {
+                                None
+                            } else {
+                                Some(description)
+                            },
                         })
                         .collect(),
                 }
@@ -128,7 +132,10 @@ pub fn to_native(request: CompatibilityDecisionRequest) -> Result<DecisionReques
 
 pub(crate) async fn decisions(
     State(state): State<ServerState>,
-    body: std::result::Result<Json<CompatibilityDecisionRequest>, axum::extract::rejection::JsonRejection>,
+    body: std::result::Result<
+        Json<CompatibilityDecisionRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> Response {
     let Json(request) = match body {
         Ok(parsed) => parsed,
@@ -141,9 +148,43 @@ pub(crate) async fn decisions(
     };
 
     let requested = native.model.clone().unwrap_or_default();
+
+    // An EXPLICIT lane name is authoritative and is resolved before any question-kind
+    // selection. Requesting a family or a tier runs exactly that lane's policy; kind
+    // eligibility is then applied WITHIN it, so two policy lanes that both support a
+    // kind can never silently take the request from one another.
+    let explicit_lane = state.runner.named_decision_lane(&requested);
+
+    // A composed lane holds child policy lanes and is served in process, not by
+    // flattening its children into a copied target list.
+    if let Some(children) = state.runner.decision_lane_children(&requested) {
+        let resolved = switchyard_runner::decision_executor::resolve_composed(
+            &state.runner,
+            &requested,
+            &native,
+        );
+        if let Some(child_list) = resolved {
+            let mut stack: Vec<String> = vec![requested.to_string()];
+            return finish(
+                switchyard_runner::decision_executor::serve_composed(
+                    &child_list,
+                    &native,
+                    &mut stack,
+                )
+                .await,
+                &requested,
+            );
+        }
+        let _ = children;
+        return error_body(
+            StatusCode::NOT_IMPLEMENTED,
+            format!("decision lane {requested} resolves to no decision targets"),
+        );
+    }
+
     // The lane serving this request's question kinds. Candidate order may differ per
     // type, so a noul request and a choice request can legitimately resolve differently.
-    let Some(lane) = state.runner.lane_for_request(&native) else {
+    let Some(lane) = explicit_lane.or_else(|| state.runner.lane_for_request(&native)) else {
         return error_body(
             StatusCode::NOT_IMPLEMENTED,
             "this deployment configures no decision lane for this request".to_string(),
@@ -152,7 +193,7 @@ pub(crate) async fn decisions(
     let lane = Arc::clone(&lane.resolver);
     // The lane is addressed by its configured name, or a configured target is served
     // alone; an unknown identity fails closed rather than reaching some other backend.
-    let lane_name = lane_name_for(&state, &native);
+    let lane_name = lane_name_for(&state, &native, explicit_lane.is_some());
     let resolved = switchyard_runner::decision_executor::resolve_identity(
         &lane,
         lane_name.as_deref(),
@@ -161,9 +202,11 @@ pub(crate) async fn decisions(
     let outcome = match resolved {
         Err(failure) => return error_body(status_for(&failure), format!("{failure:?}")),
         Ok(switchyard_runner::decision_executor::DecisionIdentity::Target(name)) => {
-            let Some(candidate) = lane.candidates.iter().find(|candidate| {
-                candidate.name == name || candidate.model == name
-            }) else {
+            let Some(candidate) = lane
+                .candidates
+                .iter()
+                .find(|candidate| candidate.name == name || candidate.model == name)
+            else {
                 return error_body(StatusCode::NOT_FOUND, format!("no decision target {name}"));
             };
             switchyard_runner::decision_executor::serve_target(candidate, &native).await
@@ -172,14 +215,28 @@ pub(crate) async fn decisions(
             switchyard_runner::decision_executor::resolve_and_serve(&lane, &native).await
         }
     };
+    finish(outcome, &requested)
+}
+
+/// Renders a decision outcome, naming both the lane that was asked for and the child
+/// policy lane that served it, so a tier trace is not reduced to one backend name.
+fn finish(
+    outcome: Result<
+        switchyard_runner::decision_executor::DecisionOutcome,
+        switchyard_runner::decision_executor::DecisionFailure,
+    >,
+    requested: &str,
+) -> Response {
     match outcome {
         Ok(outcome) => {
-            let mut payload = switchyard_runner::decision_executor::compatibility_response(
-                &outcome.response,
-            );
+            let mut payload =
+                switchyard_runner::decision_executor::compatibility_response(&outcome.response);
             // Name the backend that answered, so a caller can see which lane position
             // served it without inspecting logs.
             payload["backend"] = json!(outcome.served_by);
+            if let Some(child) = outcome.served_by_lane {
+                payload["child_lane"] = json!(child);
+            }
             if !requested.is_empty() {
                 payload["requested"] = json!(requested);
             }
@@ -195,12 +252,19 @@ pub(crate) async fn decisions(
 }
 
 /// The explicit name a caller may use to address the lane serving this request.
-fn lane_name_for(state: &ServerState, request: &switchyard_protocol::DecisionRequest) -> Option<String> {
-    let name = state.runner.decision_lane_name()?;
-    // Prefer a type-scoped lane's own name when one matches, so the addressed identity
-    // is the lane that would actually serve it.
-    let _ = request;
-    Some(name.to_string())
+///
+/// When the caller named a lane explicitly, that name IS the addressed identity and no
+/// default lane is substituted for it. Otherwise the deployment's default lane name is
+/// offered, so an unaddressed request still resolves.
+fn lane_name_for(
+    state: &ServerState,
+    request: &switchyard_protocol::DecisionRequest,
+    explicit: bool,
+) -> Option<String> {
+    if explicit {
+        return request.model.as_ref().map(|model| model.to_string());
+    }
+    state.runner.decision_lane_name().map(str::to_string)
 }
 
 /// Maps a classified decision failure to the status a caller should see.
@@ -209,9 +273,7 @@ fn lane_name_for(state: &ServerState, request: &switchyard_protocol::DecisionReq
 /// unknown identity is a missing model; a missing credential is a deployment fault, not
 /// the caller's; and eligible backends exhausted by transient failures are genuinely
 /// unavailable right now.
-fn status_for(
-    failure: &switchyard_runner::decision_executor::DecisionFailure,
-) -> StatusCode {
+fn status_for(failure: &switchyard_runner::decision_executor::DecisionFailure) -> StatusCode {
     use switchyard_runner::decision_executor::{DecisionFailure, DecisionSkip};
     match failure {
         DecisionFailure::NotEligible(DecisionSkip::TargetNotFound) => StatusCode::NOT_FOUND,

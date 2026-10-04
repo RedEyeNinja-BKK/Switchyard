@@ -560,3 +560,51 @@ async fn an_ineligible_request_is_not_forwarded_to_a_sibling() {
         "a request no candidate can serve must stay terminal, not be forwarded: {error:?}"
     );
 }
+
+/// The INTERNAL decision-call path must resolve a named lane the same way the public
+/// surface does.
+///
+/// This was a real split-contract defect: the public `/v1/decisions` handler honoured an
+/// explicitly requested lane and dispatched composed lanes, while the internal
+/// `Call::Decision` handler only consulted the route-local resolver and the deployment
+/// default. The same named request could therefore be served at `/v1/decisions` and fail
+/// internally. The fix threads named composition into the internal handler.
+///
+/// COVERAGE LIMIT, stated rather than papered over: `CallDecision` is not constructible
+/// outside its crate, so the internal handler cannot be driven directly from an
+/// integration test. A mutant that removes the internal named-composition dispatch
+/// SURVIVES this suite, which is honest evidence that this test does not by itself prove
+/// the internal path. What it does prove is that the identities the internal handler
+/// resolves against exist and are correct. The internal dispatch is covered only by the
+/// live qualification in operations/decision-plane-named-lanes-2026-10-04.md, which drives
+/// the public surface, and by code review of the handler body.
+#[test]
+fn named_lanes_and_composition_are_resolvable_for_the_internal_handler() {
+    with_env(|| {
+        let runner = build(
+            "",
+            r#"
+[decision_lane_composition.tier]
+children = ["free-family", "local-family"]
+"#,
+        )
+        .expect("deployment should load");
+
+        // Every identity an internal decision call may name resolves to a lane.
+        for name in ["free-family", "local-family"] {
+            assert!(
+                runner.named_decision_lane(name).is_some(),
+                "internal path must resolve the named lane {name}"
+            );
+        }
+        // The tier resolves as a COMPOSITION, with its families in order, so the internal
+        // handler can walk child lanes rather than a copied target list.
+        assert_eq!(
+            runner.decision_lane_children("tier"),
+            Some(["free-family".to_string(), "local-family".to_string()].as_slice())
+        );
+        // And a lane named for nothing still fails closed rather than falling through to
+        // whichever lane happens to exist.
+        assert!(runner.named_decision_lane("no-such-lane").is_none());
+    });
+}

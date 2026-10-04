@@ -521,12 +521,18 @@ impl DeploymentConfig {
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+            let lane_composition: BTreeMap<String, Vec<String>> =
+                self.decision_lane_composition
+                    .iter()
+                    .map(|(name, composition)| (name.clone(), composition.children.clone()))
+                    .collect();
             let (route_clients, caller_auth) = self.build_route_clients(
                 route_name,
                 config,
                 &clients,
                 lane_identity.clone(),
                 &lane_index,
+                &lane_composition,
             )?;
             let anthropic_auxiliary_target =
                 self.build_anthropic_auxiliary_target(config, &clients);
@@ -1022,6 +1028,11 @@ impl DeploymentConfig {
             Arc<decision_executor::DecisionResolver>,
             Vec<decision_transport::QuestionKind>,
         )],
+        // Named composition, threaded to the internal decision handler so an internal
+        // `Call::Decision` resolves a named lane by the SAME mechanism as the public
+        // surface. Without it, the same request could be served at `/v1/decisions`
+        // and fail internally, which is a split contract rather than one mechanism.
+        composition: &BTreeMap<String, Vec<String>>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let TargetPromptPolicy {
             prompts,
@@ -1101,10 +1112,21 @@ impl DeploymentConfig {
             let handler_resolver = Arc::clone(&resolver);
             let handler_lane: Arc<Option<String>> = Arc::new(lane_identity.clone());
             let handler_lanes = Arc::new(lanes.to_vec());
+            let handler_composition = Arc::new(composition.clone());
+            let handler_lane_resolvers: Arc<
+                BTreeMap<String, Arc<decision_executor::DecisionResolver>>,
+            > = Arc::new(
+                lanes
+                    .iter()
+                    .map(|(name, resolver, _)| (name.clone(), Arc::clone(resolver)))
+                    .collect(),
+            );
             let router = router.with_decision_handler(Arc::new(move |request, model| {
                 let resolver = Arc::clone(&handler_resolver);
                 let lane_name = Arc::clone(&handler_lane);
                 let lanes = Arc::clone(&handler_lanes);
+                let composition = Arc::clone(&handler_composition);
+                let lane_resolvers = Arc::clone(&handler_lane_resolvers);
                 Box::pin(async move {
                     // A call that names a concrete model means that backend only: it is
                     // how a caller pins one for diagnostics or comparison. The lane is
@@ -1113,8 +1135,58 @@ impl DeploymentConfig {
                     // An explicit identity is either a configured target or the named
                     // lane. An unknown one fails closed instead of reaching whichever
                     // backend happens to exist.
+                    // An EXPLICIT lane name is authoritative and is resolved BEFORE
+                    // the route-local resolver and before any question-kind selection, so
+                    // a named family or tier runs its own policy internally exactly as it
+                    // does on the public surface. Without this the same request could be
+                    // served at `/v1/decisions` and fail here, which would be a split
+                    // contract rather than one mechanism.
+                    let requested_name = model.to_string();
+                    let named_lane = lane_resolvers.get(requested_name.as_str()).cloned();
+                    let named_children = composition.get(requested_name.as_str()).cloned();
                     let requested_model = model.clone();
                     let served = async move {
+                        if let Some(children) = named_children {
+                            let mut ordered: Vec<decision_executor::LaneChild> =
+                                Vec::with_capacity(children.len());
+                            for child in &children {
+                                let Some(handle) = lane_resolvers.get(child.as_str()) else {
+                                    return Err(decision_executor::DecisionFailure::NotEligible(
+                                        decision_executor::DecisionSkip::TargetNotFound,
+                                    ));
+                                };
+                                ordered.push(decision_executor::LaneChild::new(
+                                    child.clone(),
+                                    Arc::clone(handle),
+                                ));
+                            }
+                            // The named lane is served by ITS OWN policy; a sibling lane
+                            // may not answer for it.
+                            let mut stack = vec![requested_name.clone()];
+                            return decision_executor::serve_composed(&ordered, &request, &mut stack)
+                                .await;
+                        }
+                        if let Some(lane) = named_lane {
+                            return match decision_executor::resolve_identity(
+                                &lane,
+                                Some(requested_name.as_str()),
+                                requested_name.as_str(),
+                            )? {
+                                decision_executor::DecisionIdentity::Target(target) => {
+                                    let Some(candidate) = lane.candidates.iter().find(|candidate| {
+                                        candidate.name == target || candidate.model == target
+                                    }) else {
+                                        return Err(decision_executor::DecisionFailure::NotEligible(
+                                            decision_executor::DecisionSkip::TargetNotFound,
+                                        ));
+                                    };
+                                    decision_executor::serve_target(candidate, &request).await
+                                }
+                                decision_executor::DecisionIdentity::Lane => {
+                                    decision_executor::resolve_and_serve(&lane, &request).await
+                                }
+                            };
+                        }
                         match decision_executor::resolve_identity(
                             &resolver,
                             lane_name.as_deref(),

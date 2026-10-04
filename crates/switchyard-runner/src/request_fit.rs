@@ -10,9 +10,9 @@
 //! both places. A capability mismatch found here is a routing fact, not a failure: the
 //! route simply was not eligible.
 
-use crate::ModelCapabilities;
 use serde_json::Value;
 use switchyard_protocol::{ContentBlock, LlmRequest};
+use crate::ModelCapabilities;
 
 /// Return the first explicitly disabled capability used by decoded or preserved input.
 /// Forwarding can retain provider JSON fields that decoding omits.

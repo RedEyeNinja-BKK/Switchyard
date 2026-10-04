@@ -201,29 +201,23 @@ model = "a"
         let missing_contract = deployment(&format!(
             "{CLIENTS}\n[capabilities.space]\nid = \"space\"\ntarget = \"engine_a\"\ndimensions = 1024\n"
         ));
-        assert!(
-            missing_contract
-                .validate()
-                .expect_err("a contract is required")
-                .contains("must declare contract")
-        );
+        assert!(missing_contract
+            .validate()
+            .expect_err("a contract is required")
+            .contains("must declare contract"));
 
         let missing_dimensions = deployment(&format!(
             "{CLIENTS}\n[capabilities.space]\nid = \"space\"\ntarget = \"engine_a\"\ncontract = \"space:v1\"\n"
         ));
-        assert!(
-            missing_dimensions
-                .validate()
-                .expect_err("dimensions are required")
-                .contains("must declare dimensions")
-        );
+        assert!(missing_dimensions
+            .validate()
+            .expect_err("dimensions are required")
+            .contains("must declare dimensions"));
 
         let complete = deployment(&format!(
             "{CLIENTS}\n[capabilities.space]\nid = \"space\"\ntarget = \"engine_a\"\ncontract = \"space:v1\"\ndimensions = 1024\n"
         ));
-        complete
-            .validate()
-            .expect("a complete embedding capability is valid");
+        complete.validate().expect("a complete embedding capability is valid");
     }
 
     #[test]
@@ -235,9 +229,7 @@ model = "a"
              \n[capabilities.space_a]\nid = \"space_a\"\ntarget = \"engine_a\"\ncontract = \"space:a:v1\"\ndimensions = 1024\n\
              \n[capabilities.space_b]\nid = \"space_b\"\ntarget = \"engine_b\"\ncontract = \"space:b:v1\"\ndimensions = 1024\n"
         );
-        deployment(&source)
-            .validate()
-            .expect("distinct contracts are valid");
+        deployment(&source).validate().expect("distinct contracts are valid");
 
         let shared = format!(
             "{CLIENTS}\n[clients.engine_b]\nformat = \"openai_embeddings\"\nbase_url = \"https://engine-b.test\"\nmodel = \"b\"\n\
@@ -269,9 +261,7 @@ max_doc_chars = 1024
 max_query_chars = 512
 "#;
         let loaded = deployment(source);
-        loaded
-            .validate()
-            .expect("a complete rerank capability is valid");
+        loaded.validate().expect("a complete rerank capability is valid");
         let rerank = &loaded.capabilities["rerank"];
         assert_eq!(rerank.max_candidates, Some(64));
         assert_eq!(rerank.top_n, Some(5));
@@ -474,14 +464,8 @@ max_query_chars = 512
         let free = &resolved["switchyard-embedding-free"];
         assert_eq!(local.dimensions, free.dimensions);
         assert_ne!(local.contract, free.contract);
-        assert_eq!(
-            local.contract.as_deref(),
-            Some("localclaw-embedding-space:v1")
-        );
-        assert_eq!(
-            free.contract.as_deref(),
-            Some("localclaw-embedding-space:lfm2.5-350m-v1")
-        );
+        assert_eq!(local.contract.as_deref(), Some("localclaw-embedding-space:v1"));
+        assert_eq!(free.contract.as_deref(), Some("localclaw-embedding-space:lfm2.5-350m-v1"));
         assert_ne!(local.url, free.url, "each space reaches its own engine");
     }
 
@@ -520,10 +504,7 @@ contract = "other:v1"
 dimensions = 8
 "#;
         let deployment: CapabilityDeployment = toml::from_str(source).expect("parses");
-        assert!(
-            deployment.validate().is_err(),
-            "load-time validation must catch it"
-        );
+        assert!(deployment.validate().is_err(), "load-time validation must catch it");
         let resolved = resolve(&deployment);
         assert!(resolved.contains_key("space"));
         assert!(!resolved.contains_key("dangling"));

@@ -8,10 +8,7 @@
 //! rather than two copies of one function's output.
 
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-use switchyard_protocol::{
-    ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest, DecisionValue,
-};
+use switchyard_protocol::{ChoiceOption, DecisionKind, DecisionQuestion, DecisionRequest, DecisionValue};
 use switchyard_runner::Runner;
 use switchyard_runner::decision_executor::{
     DecisionCandidate, DecisionFailure, DecisionIdentity, DecisionResolver, DecisionSkip,
@@ -20,6 +17,7 @@ use switchyard_runner::decision_executor::{
 use switchyard_runner::decision_transport::{
     DecisionTransport, StateForms, SupportedTypes, parse_response,
 };
+use std::collections::BTreeMap;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -174,26 +172,17 @@ async fn the_decoded_choice_equals_the_provider_answer() {
         panic!("choice decodes as a choice");
     };
     let direct_choice = match &direct.answers["team"].value {
-        DecisionValue::Choice {
-            selected,
-            probabilities,
-        } => (selected, probabilities),
+        DecisionValue::Choice { selected, probabilities } => (selected, probabilities),
         other => panic!("direct decode disagrees: {other:?}"),
     };
-    assert_eq!(
-        selected.as_str(),
-        direct_choice.0.as_str(),
-        "same selected option"
-    );
+    assert_eq!(selected.as_str(), direct_choice.0.as_str(), "same selected option");
     assert_eq!(
         probabilities.as_ref().map(|p| p["technical"].0),
         direct_choice.1.as_ref().map(|p| p["technical"].0),
         "same probabilities"
     );
     assert_eq!(
-        outcome.response.answers["team"]
-            .provider_confidence
-            .map(|c| c.0),
+        outcome.response.answers["team"].provider_confidence.map(|c| c.0),
         direct.answers["team"].provider_confidence.map(|c| c.0),
         "same provider confidence"
     );
@@ -297,11 +286,7 @@ async fn a_transport_failure_falls_through_but_a_rejection_does_not() {
     .await
     .expect("the healthy backend answers");
     assert_eq!(outcome.served_by, "laya");
-    assert_eq!(
-        outcome.attempts.len(),
-        1,
-        "the unreachable backend was tried first"
-    );
+    assert_eq!(outcome.attempts.len(), 1, "the unreachable backend was tried first");
     assert!(
         outcome.attempts[0].1.try_next(),
         "an unreachable backend is a reason to try the next one"
@@ -434,11 +419,7 @@ async fn an_out_of_bounds_request_dispatches_no_backend() {
         .await
         .expect("the full-type backend answers the choice request");
     assert_eq!(outcome.served_by, "laya");
-    assert_eq!(
-        outcome.attempts.len(),
-        1,
-        "only the noul-only backend was skipped"
-    );
+    assert_eq!(outcome.attempts.len(), 1, "only the noul-only backend was skipped");
 }
 
 fn wide_choice_request(options: usize) -> DecisionRequest {
@@ -471,9 +452,7 @@ fn wide_score_request(levels: usize) -> DecisionRequest {
         DecisionQuestion {
             instructions: json!("Rate it"),
             kind: DecisionKind::Score {
-                levels: (0..levels)
-                    .map(|index| json!(format!("level-{index}")))
-                    .collect(),
+                levels: (0..levels).map(|index| json!(format!("level-{index}"))).collect(),
             },
         },
     );
@@ -524,10 +503,7 @@ async fn a_credential_failure_is_terminal_and_silent() {
     .expect_err("a missing credential is a deployment fault, not a reason to move on");
     assert!(!failure.try_next());
     let rendered = format!("{failure:?}");
-    assert!(
-        !rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"),
-        "{rendered}"
-    );
+    assert!(!rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"), "{rendered}");
 }
 
 /// An upstream HTTP error may echo the request; whatever it returns, the rendered
@@ -551,10 +527,7 @@ async fn an_upstream_error_does_not_expose_the_credential() {
     .await
     .expect_err("a 500 with no healthy backend is a failure");
     let rendered = format!("{failure:?}");
-    assert!(
-        !rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"),
-        "{rendered}"
-    );
+    assert!(!rendered.contains("SUPER_SECRET_DECISION_TEST_KEY"), "{rendered}");
 }
 
 /// An unknown identity must fail closed: nothing is dispatched, and the failure is
@@ -663,8 +636,7 @@ targets = ["z-span", "a-local"]
         .lane_for_request(&request)
         .expect("a configured lane serves a plain noul request");
     assert_eq!(
-        lane.resolver
-            .candidates
+        lane.resolver.candidates
             .iter()
             .map(|candidate| candidate.name.as_str())
             .collect::<Vec<_>>(),
@@ -673,8 +645,6 @@ targets = ["z-span", "a-local"]
     );
 
     // And that order decides which backend answers.
-    let outcome = resolve_and_serve(&lane.resolver, &request)
-        .await
-        .expect("served");
+    let outcome = resolve_and_serve(&lane.resolver, &request).await.expect("served");
     assert_eq!(outcome.served_by, "z-span");
 }

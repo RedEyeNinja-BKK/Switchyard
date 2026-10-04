@@ -88,11 +88,7 @@ max_query_chars = 512
     )
 }
 
-async fn post(
-    router: axum::Router,
-    uri: &str,
-    body: Value,
-) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+async fn post(router: axum::Router, uri: &str, body: Value) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
     let response = router
         .oneshot(
             Request::builder()
@@ -171,12 +167,7 @@ async fn two_embedding_spaces_reach_their_own_engines_and_keep_separate_contract
             .await;
     }
 
-    let router = serve(&config_with(
-        &engine_a.uri(),
-        &engine_b.uri(),
-        &engine_a.uri(),
-    ))
-    .await;
+    let router = serve(&config_with(&engine_a.uri(), &engine_b.uri(), &engine_a.uri())).await;
 
     let (_status, local_headers, _) = post(
         router.clone(),
@@ -199,20 +190,14 @@ async fn two_embedding_spaces_reach_their_own_engines_and_keep_separate_contract
             .to_string()
     };
     assert_eq!(contract(&local_headers), "localclaw-embedding-space:v1");
-    assert_eq!(
-        contract(&free_headers),
-        "localclaw-embedding-space:lfm2.5-350m-v1"
-    );
+    assert_eq!(contract(&free_headers), "localclaw-embedding-space:lfm2.5-350m-v1");
     assert_ne!(
         contract(&local_headers),
         contract(&free_headers),
         "equal width must not collapse two spaces into one identity"
     );
     // engine_b must have received exactly one call, so `free` was not served by engine_a.
-    assert_eq!(
-        engine_b.received_requests().await.unwrap_or_default().len(),
-        1
-    );
+    assert_eq!(engine_b.received_requests().await.unwrap_or_default().len(), 1);
 }
 
 #[tokio::test]
@@ -220,9 +205,7 @@ async fn rerank_returns_engine_scores_and_honours_top_n() {
     let engine = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/rerank"))
-        .and(body_partial_json(
-            json!({"model": "qwen3-reranker", "top_n": 2}),
-        ))
+        .and(body_partial_json(json!({"model": "qwen3-reranker", "top_n": 2})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "object": "list",
             "model": "qwen3-reranker",
@@ -306,10 +289,7 @@ async fn declared_limits_are_rejected_before_reaching_an_engine() {
     assert!(String::from_utf8_lossy(&body).contains("exceeds"));
 
     // Nothing above should have reached an engine.
-    assert_eq!(
-        engine.received_requests().await.unwrap_or_default().len(),
-        0
-    );
+    assert_eq!(engine.received_requests().await.unwrap_or_default().len(), 0);
 }
 
 /// Probes immediately across the contract boundary rather than only obviously invalid
@@ -339,7 +319,12 @@ async fn rerank_top_n_ceiling_is_enforced_at_the_boundary() {
     };
 
     // At the declared ceiling: accepted.
-    let (status, _headers, _body) = post(router.clone(), "/v1/rerank", request(5)).await;
+    let (status, _headers, _body) = post(
+        router.clone(),
+        "/v1/rerank",
+        request(5),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "top_n 5 is the declared ceiling");
 
     // One past it: rejected, even though it is far below max_candidates 64.

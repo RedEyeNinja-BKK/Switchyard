@@ -691,34 +691,34 @@ impl AlgorithmSpec {
 
     /// Target names grouped as the runtime [`Driver`](libsy::Driver) expects them.
     /// Checks that a declared candidate order is a genuine sequence.
-    ///
-    /// Called before targets are resolved so a malformed list is reported as itself rather
-    /// than as an unknown target.
-    pub(crate) fn validate_candidates(&self, route_name: &str) -> AlgorithmResult<()> {
-        let Self::Passthrough {
-            target, candidates, ..
-        } = self
-        else {
-            return Ok(());
-        };
-        let mut seen: Vec<&str> = vec![target.as_str()];
-        for name in candidates {
-            if name.trim().is_empty() {
-                return Err(AlgorithmConfigError::new(format!(
-                    "passthrough route {route_name} lists an empty candidate name"
-                )));
-            }
-            if seen.contains(&name.as_str()) {
-                return Err(AlgorithmConfigError::new(format!(
-                    "passthrough route {route_name} lists target {name} more than once; candidates are an ordered fallback list, so each target may appear once"
-                )));
-            }
-            seen.push(name);
+///
+/// Called before targets are resolved so a malformed list is reported as itself rather
+/// than as an unknown target.
+pub(crate) fn validate_candidates(&self, route_name: &str) -> AlgorithmResult<()> {
+    let Self::Passthrough {
+        target, candidates, ..
+    } = self
+    else {
+        return Ok(());
+    };
+    let mut seen: Vec<&str> = vec![target.as_str()];
+    for name in candidates {
+        if name.trim().is_empty() {
+            return Err(AlgorithmConfigError::new(format!(
+                "passthrough route {route_name} lists an empty candidate name"
+            )));
         }
-        Ok(())
+        if seen.contains(&name.as_str()) {
+            return Err(AlgorithmConfigError::new(format!(
+                "passthrough route {route_name} lists target {name} more than once; candidates are an ordered fallback list, so each target may appear once"
+            )));
+        }
+        seen.push(name);
     }
+    Ok(())
+}
 
-    pub(crate) fn runtime_model_names(
+pub(crate) fn runtime_model_names(
         &self,
         route_name: &str,
     ) -> AlgorithmResult<RuntimeModelNames> {

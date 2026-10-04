@@ -4,8 +4,8 @@
 //! Rust HTTP server for libsy algorithms.
 
 mod capability_surfaces;
-pub mod config;
 pub mod decision_surface;
+pub mod config;
 mod metrics;
 mod observability;
 mod redaction;
@@ -236,7 +236,10 @@ impl SharedRoutingLog {
 
 impl ServerState {
     /// HTTP client for a capability engine with the declared deadline.
-    fn capability_http(&self, timeout_seconds: Option<u64>) -> Result<reqwest::Client, String> {
+    fn capability_http(
+        &self,
+        timeout_seconds: Option<u64>,
+    ) -> Result<reqwest::Client, String> {
         self.capability_http.get(timeout_seconds)
     }
 
@@ -761,7 +764,10 @@ mod capability_http {
 
     impl ClientSet {
         /// Returns a client for the declared timeout, building it once per timeout value.
-        pub(super) fn get(&self, timeout_seconds: Option<u64>) -> Result<reqwest::Client, String> {
+        pub(super) fn get(
+            &self,
+            timeout_seconds: Option<u64>,
+        ) -> Result<reqwest::Client, String> {
             let seconds = timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
             let mut clients = self
                 .clients
@@ -1154,9 +1160,10 @@ fn resolve_route(
             "model_not_found",
         ));
     };
-    if let Some(Err(RunnerError::IncompatibleCallerFormat(caller_auth))) = state
-        .route_for_model(&requested_model)
-        .map(|route| route.check_caller_format(wire_format))
+    if let Some(Err(RunnerError::IncompatibleCallerFormat(caller_auth))) =
+        state
+            .route_for_model(&requested_model)
+            .map(|route| route.check_caller_format(wire_format))
     {
         let (provider, expected_endpoint) = match caller_auth {
             CallerAuthKind::Anthropic => ("Anthropic", "/v1/messages"),
@@ -1187,7 +1194,7 @@ fn resolve_route(
         llm_request,
         raw_request: Some(body),
         route_reasoning_policy: None,
-        route_reasoning_effort: None,
+            route_reasoning_effort: None,
         metadata: Some(metadata),
     };
     // The caller keeps the requested name, not a resolved leaf: the runner seam resolves leaf
@@ -1313,10 +1320,7 @@ async fn handle_llm_request(
             if outcome_label == "attempt_failed" {
                 previous_failed = Some(child);
             } else if let Some(from) = previous_failed
-                && !matches!(
-                    outcome,
-                    switchyard_runner::composition::ChildOutcome::Skipped { .. }
-                )
+                && !matches!(outcome, switchyard_runner::composition::ChildOutcome::Skipped { .. })
             {
                 metrics::record_composition_cross(
                     &composition.parent_route,

@@ -20,10 +20,9 @@ use switchyard_protocol::{
     ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
-    TargetCapabilities, TranslationError, TranslationPolicy, WireFormat,
-    decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request_with_policy,
-    encode_stream_with_extensions,
+    TargetCapabilities, TranslationError, TranslationPolicy, WireFormat, decode_aggregated_response,
+    decode_request, decode_stream, encode_aggregated_response_with_extensions,
+    encode_request_with_policy, encode_stream_with_extensions,
 };
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -1454,8 +1453,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::backend::HttpBackendConfig;
     use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
+    use crate::backend::HttpBackendConfig;
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
@@ -1621,7 +1620,10 @@ mod tests {
     fn responses_map_with_policy(base_url: &str, policy: ReasoningPolicy) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         // An `extra_body` default that the caller will try to override.
-        backend.extra_body = BTreeMap::from([("reasoning".to_string(), json!({"enabled": true}))]);
+        backend.extra_body = BTreeMap::from([(
+            "reasoning".to_string(),
+            json!({"enabled": true}),
+        )]);
         backend.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
         backend.reasoning_policy = Some(policy);
         vec![ModelConfig::new(

@@ -12,12 +12,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use switchyard_runner::Runner;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// One provider backend whose behaviour each test scripts.
 #[derive(Clone)]
@@ -53,21 +53,18 @@ impl Upstream {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let Ok(buffer) = read_http(&mut stream) else {
-                    continue;
-                };
+                let Ok(buffer) = read_http(&mut stream) else { continue };
                 let body_start = buffer
                     .windows(4)
                     .position(|window| window == b"\r\n\r\n")
                     .map(|index| index + 4)
                     .unwrap_or(buffer.len());
-                let raw =
-                    String::from_utf8_lossy(&buffer[body_start.min(buffer.len())..]).to_string();
+                let raw = String::from_utf8_lossy(&buffer[body_start.min(buffer.len())..]).to_string();
                 let parsed: Value = serde_json::from_str(raw.trim()).unwrap_or(Value::Null);
                 runtime.block_on(async { seen.lock().await.push(parsed.clone()) });
                 let index = calls.fetch_add(1, Ordering::SeqCst);
-                let header =
-                    String::from_utf8_lossy(&buffer[..body_start.min(buffer.len())]).to_string();
+                let header = String::from_utf8_lossy(&buffer[..body_start.min(buffer.len())])
+                    .to_string();
                 let parsed: Value = serde_json::from_str(raw.trim()).unwrap_or(Value::Null);
                 let (status, payload) = script(&header, &parsed, index);
                 let response = format!(
@@ -85,10 +82,7 @@ impl Upstream {
 /// Chooses the scripted response from the request body, so distinct targets on one
 /// upstream are still told apart by the model they name.
 fn script(request: &str, body: &Value, index: usize) -> (u16, String) {
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let model = body.get("model").and_then(Value::as_str).unwrap_or_default();
     let _ = request;
     if model.contains("always-400") {
         return (
@@ -106,7 +100,10 @@ fn script(request: &str, body: &Value, index: usize) -> (u16, String) {
         || model.contains("b1-flaky-first")
         || model.contains("a1-fails")
     {
-        return (503, json!({"error": {"message": "flaky"}}).to_string());
+        return (
+            503,
+            json!({"error": {"message": "flaky"}}).to_string(),
+        );
     }
     if true {
         {
@@ -196,10 +193,7 @@ async fn call(runner: Runner, model: &str, body: Value) -> (StatusCode, Value) {
         .await
         .expect("body reads");
     let _ = model;
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
 /// A leaf route whose target is one scripted upstream.
@@ -284,10 +278,7 @@ async fn child_internal_fallback_finishes_before_the_parent_crosses() {
         .await
         .expect("child A serves the request");
 
-    assert_eq!(
-        outcome.child_route, "smart",
-        "child A must recover internally"
-    );
+    assert_eq!(outcome.child_route, "smart", "child A must recover internally");
     // `selected_model` is the route's recommended model, not necessarily the one that
     // served: native `run` returns the first candidate even when a later one answered.
     // Which model actually served is read from the response, which is what callers need.
@@ -305,7 +296,10 @@ async fn child_internal_fallback_finishes_before_the_parent_crosses() {
         Some("vendor/flaky-first-a2"),
         "the model that served is child A's second candidate"
     );
-    assert!(!outcome.crossed_child, "the parent stayed inside child A");
+    assert!(
+        !outcome.crossed_child,
+        "the parent stayed inside child A"
+    );
     let seen = flaky.bodies().await;
     let models = seen_models(&flaky).await;
     assert!(
@@ -609,11 +603,7 @@ async fn composition_records_parent_child_and_final_target() {
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
-    assert_eq!(
-        names,
-        vec!["smartfree", "smart"],
-        "every attempt is recorded in order"
-    );
+    assert_eq!(names, vec!["smartfree", "smart"], "every attempt is recorded in order");
 }
 
 /// Configuration errors are refused at load rather than producing a broken tier later.
@@ -674,6 +664,7 @@ candidates = []
     );
 }
 
+
 /// A composite's advertised envelope is what it guarantees, not its largest child.
 #[test]
 fn a_composite_advertises_its_declared_guarantee() {
@@ -729,7 +720,12 @@ async fn an_unknown_route_is_not_found() {
         "schema_version = 1\n{}",
         leaf("smartfree", "https://example.test/v1", &["a1"])
     ));
-    let (status, body) = call(runner, "nope", json!({"model": "nope", "input": "hi"})).await;
+    let (status, body) = call(
+        runner,
+        "nope",
+        json!({"model": "nope", "input": "hi"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 /// The flattening control.
@@ -855,12 +851,7 @@ async fn the_production_seam_reports_the_serving_model_and_composition() {
     let bounded = Upstream::new();
     let config = format!(
         "schema_version = 1\n{}\n[composites.tier]\nchildren = [\"smart\"]\n",
-        leaf_named(
-            "smart",
-            &bounded.clone().server(),
-            &["a1-fails", "a2-ok"],
-            "vendor/"
-        )
+        leaf_named("smart", &bounded.clone().server(), &["a1-fails", "a2-ok"], "vendor/")
     );
     let runner = runner(&config);
     let execution = runner
@@ -1001,9 +992,12 @@ children = ["smartfree", "smart"]
                 "continue",
             )],
             extensions: switchyard_protocol::ProviderExtensions {
-                fields: [("previous_response_id".to_string(), json!("resp_shared"))]
-                    .into_iter()
-                    .collect(),
+                fields: [(
+                    "previous_response_id".to_string(),
+                    json!("resp_shared"),
+                )]
+                .into_iter()
+                .collect(),
             },
             ..switchyard_protocol::LlmRequest::default()
         },
@@ -1016,12 +1010,7 @@ children = ["smartfree", "smart"]
     // Neither child has served this id yet, so nothing claims it and ordinary tier ordering
     // applies.
     let loaded = runner(&config);
-    assert_eq!(
-        loaded
-            .continuation_claimants("tier1", &continuation())
-            .len(),
-        0
-    );
+    assert_eq!(loaded.continuation_claimants("tier1", &continuation()).len(), 0);
 
     // Once a response is served by one child, that child owns the continuation and the parent
     // pins it rather than restarting at the first child.
@@ -1050,12 +1039,7 @@ children = ["smartfree", "smart"]
         .to_string();
     // Only the serving child can claim the continuation, so exactly one claimant exists and
     // more than one is a conflict rather than a choice.
-    assert!(
-        loaded
-            .continuation_claimants("tier1", &continuation())
-            .len()
-            <= 1
-    );
+    assert!(loaded.continuation_claimants("tier1", &continuation()).len() <= 1);
     assert!(!served_id.is_empty());
 }
 
@@ -1229,9 +1213,7 @@ vision = true
                     messages: vec![switchyard_protocol::Message {
                         role: switchyard_protocol::Role::User,
                         content: vec![
-                            switchyard_protocol::ContentBlock::Text {
-                                text: "describe".into(),
-                            },
+                            switchyard_protocol::ContentBlock::Text { text: "describe".into() },
                             switchyard_protocol::ContentBlock::Image {
                                 source: switchyard_protocol::ImageSource::Url {
                                     url: "https://example.test/a.png".into(),
@@ -1264,10 +1246,7 @@ vision = true
     // cooldown signal anywhere else. The composition record is the only place it shows up,
     // which is exactly why the telemetry reads from here.
     assert!(
-        !composition
-            .children
-            .iter()
-            .any(|(child, _)| child == "text-only-smartlocal"),
+        !composition.children.iter().any(|(child, _)| child == "text-only-smartlocal"),
         "a target is not a child; the skip happens at candidate level inside the child"
     );
 }

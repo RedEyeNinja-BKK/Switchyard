@@ -147,15 +147,9 @@ async fn a_typed_noul_request_is_served_through_the_lane() {
     let answers = body["answers"].as_object().expect("keyed answers");
     assert_eq!(answers["risk"]["type"], "noul");
     assert_eq!(answers["risk"]["noul"], 0.82);
-    assert_eq!(
-        body["usage"]["input_tokens"], 52,
-        "provider usage is carried"
-    );
+    assert_eq!(body["usage"]["input_tokens"], 52, "provider usage is carried");
     assert_eq!(body["model"], "laya-rl-agent");
-    assert_eq!(
-        body["backend"], "decision-laya",
-        "the answering backend is named"
-    );
+    assert_eq!(body["backend"], "decision-laya", "the answering backend is named");
 }
 
 #[tokio::test]
@@ -280,9 +274,7 @@ async fn an_out_of_bounds_request_reaches_no_backend() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("Contract")),
+        body["error"].as_str().is_some_and(|error| error.contains("Contract")),
         "the failure must name the contract violation: {body}"
     );
 }
@@ -304,10 +296,7 @@ async fn a_malformed_compatibility_body_is_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(
-        body["error"].as_str().is_some_and(|e| e.contains("vibe")),
-        "{body}"
-    );
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("vibe")), "{body}");
 
     let (status, _) = post(
         router,
@@ -478,10 +467,7 @@ async fn a_concrete_target_is_served_without_touching_the_rest_of_the_lane() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["backend"], "decision-span",
-        "the named backend answered"
-    );
+    assert_eq!(body["backend"], "decision-span", "the named backend answered");
     assert_eq!(body["answers"]["risk"]["noul"], 0.31);
 }
 
@@ -561,27 +547,19 @@ async fn a_type_scoped_lane_is_selected_for_its_own_kinds() {
         })))
         .mount(&backend)
         .await;
-    let runner =
-        Runner::from_toml(&config(&backend.uri(), &backend.uri())).expect("deployment builds");
+    let runner = Runner::from_toml(&config(&backend.uri(), &backend.uri())).expect("deployment builds");
 
     let choice = json!({
         "model": "switchyard/choice",
         "state": {"structured": true},
         "questions": {"q": {"type": "choice", "instructions": "Pick", "criteria": {"billing": null, "technical": null}}}
     });
-    let request =
-        switchyard_server::decision_surface::CompatibilityDecisionRequest::from_value(&choice)
-            .and_then(switchyard_server::decision_surface::to_native)
-            .expect("native request");
+    let request = switchyard_server::decision_surface::CompatibilityDecisionRequest::from_value(&choice).and_then(switchyard_server::decision_surface::to_native).expect("native request");
     let lane = runner
         .lane_for_request(&request)
         .expect("a choice request selects a lane");
     assert_eq!(
-        lane.resolver
-            .candidates
-            .iter()
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>(),
+        lane.resolver.candidates.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
         vec!["decision-span", "decision-laya"],
         "the choice lane's own order is used, not the general lane's"
     );
@@ -591,20 +569,12 @@ async fn a_type_scoped_lane_is_selected_for_its_own_kinds() {
         "state": "plain",
         "questions": {"q": {"type": "noul", "instructions": "Risky?"}}
     });
-    let noul_request =
-        switchyard_server::decision_surface::CompatibilityDecisionRequest::from_value(&noul)
-            .and_then(switchyard_server::decision_surface::to_native)
-            .expect("native request");
+    let noul_request = switchyard_server::decision_surface::CompatibilityDecisionRequest::from_value(&noul).and_then(switchyard_server::decision_surface::to_native).expect("native request");
     let noul_lane = runner
         .lane_for_request(&noul_request)
         .expect("a noul request selects a lane");
     assert_eq!(
-        noul_lane
-            .resolver
-            .candidates
-            .iter()
-            .map(|c| c.name.clone())
-            .collect::<Vec<_>>(),
+        noul_lane.resolver.candidates.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
         vec!["decision-laya", "decision-jev-style", "decision-span"]
     );
 }

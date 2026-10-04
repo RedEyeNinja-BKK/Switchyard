@@ -376,9 +376,25 @@ pub async fn resolve_and_serve(
             }
         }
     }
+    // Every candidate was tried and every one yielded. The lane itself is exhausted
+    // rather than broken, so the outcome stays recoverable: a composed parent is
+    // entitled to try its NEXT child lane after this one runs out of candidates.
+    //
+    // "Yielded" means a candidate was actually SENT to. A candidate skipped
+    // pre-dispatch was never tried, so a lane where every candidate was skipped
+    // attempted nothing and keeps the terminal no_eligible_backend: forwarding a
+    // request that no candidate here can serve would just spread a request that is
+    // unserviceable by contract.
+    let exhausted = attempts
+        .iter()
+        .any(|(_, failure)| matches!(failure, DecisionFailure::Serving { .. }));
     Err(DecisionFailure::Serving {
-        reason: "no_eligible_backend",
-        retryable: false,
+        reason: if exhausted {
+            "all_candidates_exhausted"
+        } else {
+            "no_eligible_backend"
+        },
+        retryable: exhausted,
     })
 }
 
@@ -393,6 +409,14 @@ impl LaneChild {
     /// The child lane's public name.
     pub fn lane(&self) -> &str {
         &self.lane
+    }
+
+    /// Builds one child of a composed lane from its name and resolver.
+    pub fn new(lane: impl Into<String>, resolver: std::sync::Arc<DecisionResolver>) -> Self {
+        Self {
+            lane: lane.into(),
+            resolver,
+        }
     }
 }
 
@@ -445,18 +469,25 @@ pub async fn serve_composed(
                 if !failure.try_next() {
                     return Err(failure);
                 }
-                attempts.push((child.lane.clone(), failure));
-                yielded = true;
+                attempts.push((child.lane.clone(), failure.clone()));
+                // Only a child that was actually SENT TO has yielded; a child that
+                // skipped every candidate pre-dispatch was never tried.
+                if matches!(failure, DecisionFailure::Serving { .. }) {
+                    yielded = true;
+                }
             }
         }
     }
+    // Every child yielded after exhausting its own candidates. The composed lane is
+    // itself exhausted, so this stays recoverable: an outer tier may still try its
+    // own next child rather than treating a sibling's exhaustion as terminal.
     Err(DecisionFailure::Serving {
         reason: if yielded {
             "all_child_lanes_exhausted"
         } else {
             "no_eligible_backend"
         },
-        retryable: false,
+        retryable: yielded,
     })
 }
 
@@ -500,10 +531,10 @@ pub fn resolve_composed(
     let mut resolved = Vec::with_capacity(children.len());
     for name in children {
         let handle = runner.named_decision_lane(name)?;
-        resolved.push(LaneChild {
-            lane: name.to_string(),
-            resolver: Arc::clone(&handle.resolver),
-        });
+        resolved.push(LaneChild::new(
+            name.to_string(),
+            Arc::clone(&handle.resolver),
+        ));
     }
     Some(resolved)
 }

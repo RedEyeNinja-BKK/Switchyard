@@ -1187,7 +1187,7 @@ fn resolve_route(
         llm_request,
         raw_request: Some(body),
         route_reasoning_policy: None,
-            route_reasoning_effort: None,
+        route_reasoning_effort: None,
         metadata: Some(metadata),
     };
     // The caller keeps the requested name, not a resolved leaf: the runner seam resolves leaf

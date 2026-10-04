@@ -394,3 +394,169 @@ fn an_unsupported_question_type_reaches_no_candidate() {
         );
     });
 }
+
+/// Exhausting a lane's candidates must let a COMPOSED parent try its next child.
+///
+/// This is the distinction the composition mechanism depends on: a lane that ran out
+/// of healthy backends is exhausted, not broken, so a tier must still be able to
+/// enter its next family. A lane where every candidate was skipped pre-dispatch is a
+/// different fact and stays terminal.
+#[tokio::test]
+async fn an_exhausted_child_lane_yields_to_the_next_child() {
+    use std::sync::Arc;
+
+    use switchyard_runner::decision_executor::{
+        DecisionCandidate, DecisionFailure, DecisionResolver, LaneChild, resolve_and_serve,
+        serve_composed,
+    };
+    use switchyard_runner::decision_transport::{DecisionTransport, StateForms, SupportedTypes};
+
+    fn candidate(name: &str, url: &str) -> DecisionCandidate {
+        DecisionCandidate {
+            name: name.to_string(),
+            model: name.to_string(),
+            transport: DecisionTransport::SystemOne,
+            url: url.to_string(),
+            api_key: Some("dummy".to_string()),
+            api_key_env: Some("DUMMY".to_string()),
+            supported_types: SupportedTypes::ALL,
+            state_forms: StateForms::ALL,
+        }
+    }
+
+    fn request() -> DecisionRequest {
+        let mut questions = BTreeMap::new();
+        questions.insert(
+            "risk".to_string(),
+            DecisionQuestion {
+                instructions: json!("assess"),
+                kind: DecisionKind::Boolean {
+                    true_description: None,
+                    false_description: None,
+                },
+            },
+        );
+        DecisionRequest {
+            model: None,
+            context: json!("state"),
+            questions,
+        }
+    }
+
+    // First child: a candidate that was actually SENT to and refused the connection.
+    let dead = DecisionResolver {
+        candidates: vec![candidate("dead", "http://127.0.0.1:9/unreachable")],
+    };
+    // A candidate with no credential is terminal (a deployment fault), so it must NOT
+    // be used to simulate an exhausted child here.
+    let outcome = resolve_and_serve(&dead, &request()).await;
+    assert!(
+        matches!(
+            &outcome,
+            Err(DecisionFailure::Serving {
+                retryable: true,
+                ..
+            })
+        ),
+        "a sent-and-failed candidate must be retryable so a parent can continue: {outcome:?}"
+    );
+
+    // Second child: also unreachable, which is fine: what matters is that the parent
+    // ATTEMPTED it, proving it was not short-circuited by the first child's exhaustion.
+    let children = vec![
+        LaneChild::new("free-family".to_string(), Arc::new(dead)),
+        LaneChild::new(
+            "local-family".to_string(),
+            Arc::new(DecisionResolver {
+                candidates: vec![candidate("also-dead", "http://127.0.0.1:9/unreachable")],
+            }),
+        ),
+    ];
+    let mut stack = vec!["tier".to_string()];
+    let composed = serve_composed(&children, &request(), &mut stack).await;
+    let error = composed.expect_err("both children are unreachable");
+    assert!(
+        matches!(&error, DecisionFailure::Serving { reason, retryable: true }
+            if *reason == "all_child_lanes_exhausted"),
+        "the tier must report exhaustion of its children, not an untried-lane error: {error:?}"
+    );
+}
+
+/// A child that could not ELIGIBLY serve is never dispatched and stays terminal, so an
+/// ineligible request is not forwarded to a sibling that would only refuse it too.
+#[tokio::test]
+async fn an_ineligible_request_is_not_forwarded_to_a_sibling() {
+    use std::sync::Arc;
+
+    use switchyard_runner::decision_executor::{
+        DecisionCandidate, DecisionFailure, DecisionResolver, LaneChild, serve_composed,
+    };
+    use switchyard_runner::decision_transport::{DecisionTransport, StateForms, SupportedTypes};
+
+    let noul_only = DecisionCandidate {
+        name: "noul-only".to_string(),
+        model: "noul-only".to_string(),
+        transport: DecisionTransport::SystemOne,
+        // Nothing may be sent here: the test would fail on a real request.
+        url: "http://127.0.0.1:9/unreachable".to_string(),
+        api_key: Some("dummy".to_string()),
+        api_key_env: Some("DUMMY".to_string()),
+        supported_types: SupportedTypes::NOUL_ONLY,
+        state_forms: StateForms::SPAN_OBSERVED,
+    };
+    let children = vec![
+        LaneChild::new(
+            "free-family".to_string(),
+            Arc::new(DecisionResolver {
+                candidates: vec![noul_only],
+            }),
+        ),
+        LaneChild::new(
+            "local-family".to_string(),
+            Arc::new(DecisionResolver {
+                candidates: vec![DecisionCandidate {
+                    name: "sibling".to_string(),
+                    model: "sibling".to_string(),
+                    transport: DecisionTransport::SystemOne,
+                    url: "http://127.0.0.1:9/unreachable".to_string(),
+                    api_key: Some("dummy".to_string()),
+                    api_key_env: Some("DUMMY".to_string()),
+                    supported_types: SupportedTypes::ALL,
+                    state_forms: StateForms::ALL,
+                }],
+            }),
+        ),
+    ];
+    let mut questions = BTreeMap::new();
+    questions.insert(
+        "risk".to_string(),
+        DecisionQuestion {
+            instructions: json!("assess"),
+            kind: DecisionKind::Choice {
+                options: vec![
+                    switchyard_protocol::ChoiceOption {
+                        id: "yes".into(),
+                        description: None,
+                    },
+                    switchyard_protocol::ChoiceOption {
+                        id: "no".into(),
+                        description: None,
+                    },
+                ],
+            },
+        },
+    );
+    let request = DecisionRequest {
+        model: None,
+        context: json!("state"),
+        questions,
+    };
+    let mut stack = vec!["tier".to_string()];
+    let error = serve_composed(&children, &request, &mut stack)
+        .await
+        .expect_err("no child is eligible for a choice question");
+    assert!(
+        !error.try_next(),
+        "a request no candidate can serve must stay terminal, not be forwarded: {error:?}"
+    );
+}

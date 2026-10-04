@@ -174,7 +174,7 @@ impl Route {
         decision_targets: Vec<DecisionTarget>,
         models: RuntimeModels,
         route_reasoning_policy: crate::config::RouteReasoningPolicy,
-            escalation_max_input_tokens: Option<u64>,
+        escalation_max_input_tokens: Option<u64>,
         escalation_target: Option<ModelId>,
     ) -> Self {
         Self {
@@ -271,7 +271,10 @@ impl Route {
         // so this adds no second fallback engine and issues no request to a target that
         // cannot answer it.
         let facts = self.clients.target_capabilities().clone();
-        let raw = request.raw_request.clone().unwrap_or(serde_json::Value::Null);
+        let raw = request
+            .raw_request
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
         let estimated_input_tokens = crate::request_fit::estimate_input_tokens(&raw);
         let eligibility = |model: &switchyard_protocol::ModelId| {
             match facts.get(model) {
@@ -321,24 +324,23 @@ impl Route {
             }
             None => models,
         };
-        let request = match self.route_reasoning_policy {
-            RouteReasoningPolicy::Inherit => request,
-            RouteReasoningPolicy::Medium => request.with_route_reasoning_policy(
-                switchyard_protocol::ReasoningPolicy::Enabled,
-            ),
-            // `High` needs the graded level as well as the on/off intent: on a dialect that
-            // only grades effort the policy alone has no wire form, so the request also
-            // carries the effort for the client to write.
-            RouteReasoningPolicy::High => request
-                .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Enabled)
-                .with_route_reasoning_effort(
-                    crate::config::route_policy_effort(RouteReasoningPolicy::High)
-                        .unwrap_or_default(),
-                ),
-            RouteReasoningPolicy::None => {
-                request.with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Disabled)
-            }
-        };
+        let request =
+            match self.route_reasoning_policy {
+                RouteReasoningPolicy::Inherit => request,
+                RouteReasoningPolicy::Medium => request
+                    .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Enabled),
+                // `High` needs the graded level as well as the on/off intent: on a dialect that
+                // only grades effort the policy alone has no wire form, so the request also
+                // carries the effort for the client to write.
+                RouteReasoningPolicy::High => request
+                    .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Enabled)
+                    .with_route_reasoning_effort(
+                        crate::config::route_policy_effort(RouteReasoningPolicy::High)
+                            .unwrap_or_default(),
+                    ),
+                RouteReasoningPolicy::None => request
+                    .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Disabled),
+            };
         if models.is_empty() {
             // Nothing in this route can serve the request, which is the caller's request
             // rather than a deployment fault. The skipped targets get no provider call.

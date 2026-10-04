@@ -29,7 +29,6 @@ use crate::{
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
-
 /// Carries a classified decision failure out of the host so the reason is not lost.
 #[derive(Debug)]
 struct DecisionCallError {
@@ -501,7 +500,10 @@ impl DeploymentConfig {
                 // The leg must be one this route can actually serve. `promoting` is a no-op
                 // for an id the route does not offer, so accepting it would leave a route
                 // that reads as escalating, reports promotions, and never reorders.
-                if !config.callable_target_names().contains(&escalation_target.as_str()) {
+                if !config
+                    .callable_target_names()
+                    .contains(&escalation_target.as_str())
+                {
                     return Err(RunnerError::configuration(format!(
                         "route {route_name} escalation_target {escalation_target} is not a \
                          candidate of this route"
@@ -552,9 +554,9 @@ impl DeploymentConfig {
                 responses_auxiliary_target,
                 decision_targets,
                 models,
-                config.route_reasoning_policy.unwrap_or(
-                    crate::config::RouteReasoningPolicy::Inherit,
-                ),
+                config
+                    .route_reasoning_policy
+                    .unwrap_or(crate::config::RouteReasoningPolicy::Inherit),
                 config.escalation_max_input_tokens,
                 escalation_model,
             );
@@ -2220,20 +2222,20 @@ new = ["send_message"]
     }
 
     /// A route that configures escalation to a target it does not actually offer is
-/// configured-but-dead: `promoting` is a no-op for an absent id, so every over-threshold
-/// request silently keeps the declared order while the config and the dashboard both claim
-/// escalation happens. The leg must therefore be one of this route's own callable targets.
-#[test]
-fn an_escalation_target_outside_the_route_is_rejected_at_load() {
-    let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
-    let configured = format!(
-        "{passthrough}\nescalation_max_input_tokens = 61440\nescalation_target = \
+    /// configured-but-dead: `promoting` is a no-op for an absent id, so every over-threshold
+    /// request silently keeps the declared order while the config and the dashboard both claim
+    /// escalation happens. The leg must therefore be one of this route's own callable targets.
+    #[test]
+    fn an_escalation_target_outside_the_route_is_rejected_at_load() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let configured = format!(
+            "{passthrough}\nescalation_max_input_tokens = 61440\nescalation_target = \
          \"strong\""
-    );
+        );
 
-    // Positive control: `strong` IS a candidate here, so this loads. Without it, the
-    // rejection below could be blamed on the fixture rather than on candidate membership.
-    runner_from_toml(
+        // Positive control: `strong` IS a candidate here, so this loads. Without it, the
+        // rejection below could be blamed on the fixture rather than on candidate membership.
+        runner_from_toml(
         &VALID_CONFIG.replace(
             passthrough,
             &format!("{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = 61440\nescalation_target = \"strong\""),
@@ -2241,15 +2243,14 @@ fn an_escalation_target_outside_the_route_is_rejected_at_load() {
     )
     .expect("an escalation target that is a candidate must load");
 
-    let message = error_message(&VALID_CONFIG.replace(passthrough, &configured));
-    assert_eq!(
-        message,
-        "route passthrough escalation_target strong is not a candidate of this route",
-        "a real target that this route cannot serve must be rejected, not silently accepted"
-    );
-}
+        let message = error_message(&VALID_CONFIG.replace(passthrough, &configured));
+        assert_eq!(
+            message, "route passthrough escalation_target strong is not a candidate of this route",
+            "a real target that this route cannot serve must be rejected, not silently accepted"
+        );
+    }
 
-/// A route policy is applied last on the wire, so it must be expressible by every target
+    /// A route policy is applied last on the wire, so it must be expressible by every target
     /// the route can reach. A target's own policy is checked against its dialect at load;
     /// without the same check one layer up, a route asking for thinking on an effort-only
     /// dialect would apply nothing and still read as authoritative.
@@ -2265,10 +2266,12 @@ fn an_escalation_target_outside_the_route_is_rejected_at_load() {
         // The route must point AT that target: a policy is checked against every target the
         // route can reach, and the fixture's other targets declare no dialect at all.
         let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
-        let on_effort_target =
-            "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"";
+        let on_effort_target = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"";
         let configured = VALID_CONFIG
-            .replace(strong, &format!("{strong}\nreasoning_dialect = \"openai_effort\""))
+            .replace(
+                strong,
+                &format!("{strong}\nreasoning_dialect = \"openai_effort\""),
+            )
             .replace(
                 &passthrough,
                 &format!("{on_effort_target}\nroute_reasoning_policy = \"medium\""),
@@ -2278,7 +2281,10 @@ fn an_escalation_target_outside_the_route_is_rejected_at_load() {
         // is about the policy value rather than the fixture.
         runner_from_toml(
             &VALID_CONFIG
-                .replace(strong, &format!("{strong}\nreasoning_dialect = \"openai_effort\""))
+                .replace(
+                    strong,
+                    &format!("{strong}\nreasoning_dialect = \"openai_effort\""),
+                )
                 .replace(
                     &passthrough,
                     &format!("{on_effort_target}\nroute_reasoning_policy = \"none\""),

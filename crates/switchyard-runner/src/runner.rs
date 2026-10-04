@@ -325,6 +325,26 @@ impl Runner {
             .map(|children| children.as_slice())
     }
 
+    /// Every lane's resolver, for a caller resolving a named identity.
+    pub fn decision_lane_handles(&self) -> BTreeMap<String, crate::decision_executor::LaneResolverHandle> {
+        self.decision_lanes
+            .iter()
+            .map(|(name, lane)| {
+                (
+                    name.clone(),
+                    crate::decision_executor::LaneResolverHandle {
+                        resolver: std::sync::Arc::clone(&lane.resolver),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The named composition, so a caller can serve a composed lane by its own name.
+    pub fn decision_lane_composition_map(&self) -> BTreeMap<String, Vec<String>> {
+        self.decision_lane_composition.clone()
+    }
+
     /// Whether the named lane composes child lanes rather than holding physical targets.
     pub fn decision_lane_is_composite(&self, lane: &str) -> bool {
         self.decision_lane_composition.contains_key(lane)

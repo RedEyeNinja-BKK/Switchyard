@@ -491,6 +491,113 @@ pub async fn serve_composed(
     })
 }
 
+/// What an explicitly named identity resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedDispatch {
+    /// The name is a COMPOSED lane: it owns child policy lanes.
+    Composed,
+    /// The name is a leaf lane: it owns ordered physical candidates.
+    Leaf,
+    /// The name is not a configured decision lane, so the caller falls through to the
+    /// route-local resolver. It is never silently served by some other lane.
+    Unknown,
+}
+
+/// Classifies an explicitly requested decision identity against the deployment's lanes.
+///
+/// This is the single decision point the public surface and the internal
+/// `Call::Decision` handler both use, so the two cannot disagree about what a caller
+/// named. An explicit name is authoritative and is classified BEFORE any question-kind
+/// selection, which is what keeps two policy lanes that both support a kind from
+/// stealing each other's requests.
+pub fn classify_named(
+    composition: &BTreeMap<String, Vec<String>>,
+    lanes: &BTreeMap<String, LaneResolverHandle>,
+    requested: &str,
+) -> NamedDispatch {
+    if requested.is_empty() {
+        return NamedDispatch::Unknown;
+    }
+    if composition.contains_key(requested) {
+        return NamedDispatch::Composed;
+    }
+    if lanes.contains_key(requested) {
+        return NamedDispatch::Leaf;
+    }
+    NamedDispatch::Unknown
+}
+
+/// Serves a request whose caller named a decision lane, or reports that it did not.
+///
+/// Returns `Ok(None)` when the name is not a configured decision lane, which tells the
+/// caller to fall through to its own route-local resolution. Returns `Err` when the name
+/// IS a configured lane and serving it failed - an explicitly named lane that cannot
+/// serve must never be answered by a different lane.
+///
+/// This is the whole internal/public decision point in one testable function: the
+/// previous split, where the public surface honoured a named lane and the internal
+/// handler bypassed it, was possible precisely because this logic was inlined in two
+/// places.
+pub async fn serve_named(
+    composition: &BTreeMap<String, Vec<String>>,
+    lanes: &BTreeMap<String, LaneResolverHandle>,
+    requested: &str,
+    request: &DecisionRequest,
+) -> Result<Option<DecisionOutcome>, DecisionFailure> {
+    match classify_named(composition, lanes, requested) {
+        NamedDispatch::Unknown => Ok(None),
+        NamedDispatch::Composed => {
+            let children = composition
+                .get(requested)
+                .cloned()
+                .unwrap_or_default();
+            // An unknown child fails closed rather than silently shrinking the policy.
+            let ordered = composed_children(lanes, &children)?;
+            let mut stack = vec![requested.to_string()];
+            serve_composed(&ordered, request, &mut stack)
+                .await
+                .map(Some)
+        }
+        NamedDispatch::Leaf => {
+            let lane = lanes
+                .get(requested)
+                .map(|handle| Arc::clone(&handle.resolver))
+                .ok_or(DecisionFailure::NotEligible(DecisionSkip::TargetNotFound))?;
+            // The named lane is served by ITS OWN candidates only; a sibling lane may not
+            // answer for it.
+            match resolve_identity(&lane, Some(requested), requested)? {
+                DecisionIdentity::Target(target) => {
+                    let candidate = lane
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.name == target || candidate.model == target)
+                        .ok_or(DecisionFailure::NotEligible(DecisionSkip::TargetNotFound))?;
+                    serve_target(candidate, request).await.map(Some)
+                }
+                DecisionIdentity::Lane => resolve_and_serve(&lane, request).await.map(Some),
+            }
+        }
+    }
+}
+
+/// Builds the ordered child lanes for a composed lane, in configured order.
+///
+/// An unknown child is reported rather than skipped: a composed lane that silently lost
+/// a child would quietly change policy instead of failing closed.
+pub fn composed_children(
+    lanes: &BTreeMap<String, LaneResolverHandle>,
+    children: &[String],
+) -> Result<Vec<LaneChild>, DecisionFailure> {
+    let mut ordered = Vec::with_capacity(children.len());
+    for child in children {
+        let handle = lanes.get(child.as_str()).ok_or(DecisionFailure::NotEligible(
+            DecisionSkip::TargetNotFound,
+        ))?;
+        ordered.push(LaneChild::new(child.clone(), Arc::clone(&handle.resolver)));
+    }
+    Ok(ordered)
+}
+
 /// Resolves the child policy lanes of a composed lane, in configured order.
 pub fn lane_children(
     composition: &BTreeMap<String, Vec<String>>,

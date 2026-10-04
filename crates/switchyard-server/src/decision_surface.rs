@@ -155,31 +155,26 @@ pub(crate) async fn decisions(
     // kind can never silently take the request from one another.
     let explicit_lane = state.runner.named_decision_lane(&requested);
 
-    // A composed lane holds child policy lanes and is served in process, not by
-    // flattening its children into a copied target list.
-    if let Some(children) = state.runner.decision_lane_children(&requested) {
-        let resolved = switchyard_runner::decision_executor::resolve_composed(
-            &state.runner,
-            &requested,
-            &native,
-        );
-        if let Some(child_list) = resolved {
-            let mut stack: Vec<String> = vec![requested.to_string()];
-            return finish(
-                switchyard_runner::decision_executor::serve_composed(
-                    &child_list,
-                    &native,
-                    &mut stack,
-                )
-                .await,
-                &requested,
-            );
-        }
-        let _ = children;
-        return error_body(
-            StatusCode::NOT_IMPLEMENTED,
-            format!("decision lane {requested} resolves to no decision targets"),
-        );
+    // An EXPLICIT lane name is served by `serve_named`, the same function the internal
+    // `Call::Decision` handler uses. One mechanism, so the public surface and the
+    // internal path cannot disagree about what a caller named.
+    let handles: BTreeMap<String, switchyard_runner::decision_executor::LaneResolverHandle> = state
+        .runner
+        .decision_lane_handles()
+        .into_iter()
+        .collect();
+    let composition = state.runner.decision_lane_composition_map().clone();
+    match switchyard_runner::decision_executor::serve_named(
+        &composition,
+        &handles,
+        &requested,
+        &native,
+    )
+    .await
+    {
+        Ok(Some(outcome)) => return finish(Ok(outcome), &requested),
+        Ok(None) => {}
+        Err(failure) => return error_body(status_for(&failure), format!("{failure:?}")),
     }
 
     // The lane serving this request's question kinds. Candidate order may differ per

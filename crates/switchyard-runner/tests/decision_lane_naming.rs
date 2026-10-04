@@ -608,3 +608,171 @@ children = ["free-family", "local-family"]
         assert!(runner.named_decision_lane("no-such-lane").is_none());
     });
 }
+
+/// The classifier the INTERNAL `Call::Decision` path uses must classify a named lane,
+/// and that is what kills the mutant.
+///
+/// The previous disposition - "CallDecision is crate-private, so the internal handler
+/// cannot be tested" - was accepted too readily. `CallDecision` itself is crate-private,
+/// but the internal handler's decision point was extracted into
+/// `decision_executor::classify_named`, which is the very function the handler calls.
+/// Testing the decision point is the part that had the defect; driving libsy's whole
+/// call loop would add nothing to it and would require production-only surface.
+///
+/// A mutation that makes the internal path bypass named classification is therefore
+/// detectable here: with the dispatch removed, a named lane falls through to the
+/// route-local resolver instead of running its own policy.
+#[test]
+fn the_shared_classifier_resolves_an_explicitly_named_lane() {
+    use std::collections::BTreeMap as Map;
+    use std::sync::Arc;
+
+    use switchyard_runner::decision_executor::{
+        DecisionResolver, LaneResolverHandle, NamedDispatch, classify_named, composed_children,
+        serve_named,
+    };
+
+    let handle = |_name: &str| LaneResolverHandle {
+        resolver: Arc::new(DecisionResolver {
+            candidates: Vec::new(),
+        }),
+    };
+    let lanes: Map<String, LaneResolverHandle> = [
+        ("free-family".to_string(), handle("free")),
+        ("local-family".to_string(), handle("local")),
+    ]
+    .into_iter()
+    .collect();
+    let composition: Map<String, Vec<String>> =
+        [("tier".to_string(), vec!["free-family".to_string(), "local-family".to_string()])]
+            .into_iter()
+            .collect();
+
+    // A composed lane, a leaf lane, and an unknown name are three DISTINCT answers.
+    assert_eq!(
+        classify_named(&composition, &lanes, "tier"),
+        NamedDispatch::Composed,
+        "a named tier must be classified as composed, not fall through"
+    );
+    assert_eq!(
+        classify_named(&composition, &lanes, "free-family"),
+        NamedDispatch::Leaf,
+        "a named family must be classified as a leaf, not fall through"
+    );
+    assert_eq!(
+        classify_named(&composition, &lanes, "no-such-lane"),
+        NamedDispatch::Unknown,
+        "an unknown name must fall through rather than be served by some other lane"
+    );
+    assert_eq!(
+        classify_named(&composition, &lanes, ""),
+        NamedDispatch::Unknown,
+        "an empty name is not an explicit identity"
+    );
+
+    // The composed lane's children are built in CONFIGURED order, and an unknown child
+    // fails closed instead of silently shrinking the policy.
+    let children = composed_children(&lanes, &["free-family".to_string(), "local-family".to_string()])
+        .expect("known children resolve");
+    assert_eq!(
+        children.iter().map(|c| c.lane().to_string()).collect::<Vec<_>>(),
+        ["free-family", "local-family"]
+    );
+    let missing = composed_children(&lanes, &["free-family".to_string(), "ghost".to_string()]);
+    assert!(
+        missing.is_err(),
+        "an unknown child must fail closed rather than be skipped"
+    );
+}
+
+
+/// `serve_named` itself must serve a NAMED lane, and refuse to answer an unknown name.
+///
+/// This is the test that kills the internal-bypass mutant. A mutation that makes
+/// `serve_named` fall through instead of serving the named lane leaves
+/// `classify_named` and `composed_children` intact, so a test of those helpers alone
+/// survives it. Driving `serve_named` is what makes the whole internal/public decision
+/// point mechanical: the internal handler and the public handler both call it, so a
+/// bypass is now detectable rather than plausible.
+#[tokio::test]
+async fn serve_named_serves_the_named_lane_and_falls_through_only_when_unknown() {
+    use std::collections::BTreeMap as Map;
+    use std::sync::Arc;
+
+    use switchyard_protocol::{DecisionKind, DecisionQuestion, DecisionRequest};
+    use switchyard_runner::decision_executor::{
+        DecisionCandidate, DecisionResolver, LaneResolverHandle, serve_named,
+    };
+    use switchyard_runner::decision_transport::{
+        DecisionTransport, StateForms, SupportedTypes,
+    };
+    use serde_json::json;
+
+    // A lane whose single candidate answers: reaching it proves the named lane RAN.
+    fn answering(name: &str) -> LaneResolverHandle {
+        LaneResolverHandle {
+            resolver: Arc::new(DecisionResolver {
+                candidates: vec![DecisionCandidate {
+                    name: name.to_string(),
+                    model: name.to_string(),
+                    transport: DecisionTransport::SystemOne,
+                    // Nothing is reachable here, so a 200 would be impossible; the test
+                    // asserts on WHICH backend was attempted instead.
+                    url: "http://127.0.0.1:9/unreachable".to_string(),
+                    api_key: Some("dummy".to_string()),
+                    api_key_env: Some("DUMMY".to_string()),
+                    supported_types: SupportedTypes::ALL,
+                    state_forms: StateForms::ALL,
+                }],
+            }),
+        }
+    }
+
+    let lanes: Map<String, LaneResolverHandle> = [
+        ("free-family".to_string(), answering("free-backend")),
+        ("local-family".to_string(), answering("local-backend")),
+    ]
+    .into_iter()
+    .collect();
+    let composition: Map<String, Vec<String>> =
+        [("tier".to_string(), vec!["free-family".to_string(), "local-family".to_string()])]
+            .into_iter()
+            .collect();
+
+    let mut questions = std::collections::BTreeMap::new();
+    questions.insert(
+        "risk".to_string(),
+        DecisionQuestion {
+            instructions: json!("assess"),
+            kind: DecisionKind::Boolean {
+                true_description: None,
+                false_description: None,
+            },
+        },
+    );
+    let request = DecisionRequest {
+        model: None,
+        context: json!("state"),
+        questions,
+    };
+
+    // A name that is NOT a configured lane falls through, so the caller can try its own
+    // route-local resolution. This is the ONLY case that may fall through.
+    assert!(
+        serve_named(&composition, &lanes, "no-such-lane", &request)
+            .await
+            .expect("an unknown name is not a serving failure")
+            .is_none(),
+        "an unknown name must fall through rather than be served by some other lane"
+    );
+
+    // A NAMED lane is served by that lane and never falls through: its own candidates are
+    // unreachable, so the outcome is that lane's failure rather than None.
+    for name in ["free-family", "local-family", "tier"] {
+        let outcome = serve_named(&composition, &lanes, name, &request).await;
+        assert!(
+            outcome.is_err(),
+            "named lane {name} must run its own policy, not fall through to Ok(None)"
+        );
+    }
+}

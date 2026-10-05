@@ -179,7 +179,26 @@ pub(crate) async fn decisions(
 
     // The lane serving this request's question kinds. Candidate order may differ per
     // type, so a noul request and a choice request can legitimately resolve differently.
-    let Some(lane) = explicit_lane.or_else(|| state.runner.lane_for_request(&native)) else {
+    //
+    // An UNADDRESSED request is served by the DECLARED default lane when it serves this
+    // request's kinds. Selecting by question kind alone would instead pick whichever
+    // unscoped lane came first in map order, so the declared default would be honoured
+    // only by accident of spelling.
+    let declared_default = if explicit_lane.is_none() {
+        state
+            .runner
+            .decision_lane_name()
+            .and_then(|name| state.runner.named_decision_lane(name))
+            .filter(|lane| {
+                switchyard_runner::decision_transport::lane_serves(&lane.types, &native)
+            })
+    } else {
+        None
+    };
+    let Some(lane) = explicit_lane
+        .or(declared_default)
+        .or_else(|| state.runner.lane_for_request(&native))
+    else {
         return error_body(
             StatusCode::NOT_IMPLEMENTED,
             "this deployment configures no decision lane for this request".to_string(),
@@ -188,11 +207,17 @@ pub(crate) async fn decisions(
     let lane = Arc::clone(&lane.resolver);
     // The lane is addressed by its configured name, or a configured target is served
     // alone; an unknown identity fails closed rather than reaching some other backend.
-    let lane_name = lane_name_for(&state, &native, explicit_lane.is_some());
+    // An UNADDRESSED request is served by the DECLARED default lane. `lane_name_for`
+    // supplies that name as the identity being resolved, so it must be resolved against
+    // the lane it names rather than against the caller's (absent) name; otherwise an
+    // unaddressed request could never match its own default and would fail closed.
+    let explicit = explicit_lane.is_some();
+    let lane_name = lane_name_for(&state, &native, explicit);
+    let identity_to_resolve = lane_name.clone().unwrap_or_else(|| requested.to_string());
     let resolved = switchyard_runner::decision_executor::resolve_identity(
         &lane,
         lane_name.as_deref(),
-        &requested,
+        &identity_to_resolve,
     );
     let outcome = match resolved {
         Err(failure) => return error_body(status_for(&failure), format!("{failure:?}")),

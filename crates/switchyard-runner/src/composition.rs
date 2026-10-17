@@ -380,7 +380,8 @@ impl Runner {
 /// Eligibility is decided with the same predicate that governs route admission and
 /// whole-route child eligibility, so "this request needs vision" means one thing at every
 /// level. A target with no declared facts is left in place: absence of a fact is not a
-/// refusal, and a newly added target is never silently unroutable.
+/// refusal, and a newly added target is never silently unroutable. Video is the one
+/// exception, because no target may receive it without stating that it can read it.
 pub fn eligible_candidates(
     ordered: &[&str],
     capabilities: &std::collections::BTreeMap<String, crate::ModelCapabilities>,

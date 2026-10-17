@@ -1181,11 +1181,19 @@ fn resolve_route(
     if let Some(capability) =
         request_fit::unsupported_capability(route_capabilities, &llm_request, &body)
     {
+        // `vision` is a declaration about images. Video and audio have no declaration at
+        // all, so saying they "declare ... = false" would name a field the config lacks.
+        let detail = if matches!(capability, "video" | "audio") {
+            format!(
+                "route {requested_model} cannot accept {capability} input: this deployment \
+                 declares no {capability}-capable target"
+            )
+        } else {
+            format!("route {requested_model} declares {capability} = false")
+        };
         return Err(error_response(
             StatusCode::BAD_REQUEST,
-            format!(
-                "route {requested_model} declares {capability} = false; remove the unsupported input or select another route"
-            ),
+            format!("{detail}; remove the unsupported input or select another route"),
             "invalid_request_error",
             "unsupported_capability",
         ));

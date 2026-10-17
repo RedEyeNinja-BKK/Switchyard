@@ -51,6 +51,12 @@ pub fn unsupported_capability(
     {
         return Some("tool_calling");
     }
+    // Video and audio first, and unconditionally: `vision` describes image input only, and
+    // the deployment cannot declare support for either. Doing this before the image and tool
+    // scan also means a request carrying both reports the medium nobody can serve.
+    if let Some(capability) = unsupported_media(request, body) {
+        return Some(capability);
+    }
     if capabilities.tool_calling != Some(false) && capabilities.vision != Some(false) {
         return None;
     }
@@ -66,6 +72,129 @@ pub fn unsupported_capability(
         )
         .find_map(|content| unsupported_content(capabilities, content))
         .or_else(|| unsupported_preserved_content(capabilities, body))
+}
+
+/// Video and audio, refused regardless of any declared capability.
+///
+/// `vision` is a declaration about images. There is no configuration surface for video or
+/// audio, so inferring either from `vision` would hand media to a target that cannot read
+/// it. Both are therefore refused outright until the configuration can state support for
+/// them explicitly.
+fn unsupported_media(request: &LlmRequest, body: &Value) -> Option<&'static str> {
+    request
+        .instructions
+        .iter()
+        .map(|instruction| instruction.content.as_slice())
+        .chain(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_slice()),
+        )
+        .find_map(media_block)
+        .or_else(|| preserved_media(body))
+}
+
+fn media_block(content: &[ContentBlock]) -> Option<&'static str> {
+    content.iter().find_map(|block| match block {
+        ContentBlock::Video { .. } => Some("video"),
+        ContentBlock::Audio { .. } => Some("audio"),
+        ContentBlock::ToolResult(result) => media_block(&result.content),
+        _ => None,
+    })
+}
+
+/// Look for media in fields that survive forwarding without becoming decoded content.
+///
+/// Two walks, because the evidence differs in strength. An explicit `type` discriminator is
+/// unambiguous wherever it appears, so it may be followed into tool output. A bare key such
+/// as `video` is only meaningful in caller-authored request shape: inside tool output it is
+/// ordinary data, and refusing it would reject a text request that merely returned a field
+/// named `video`. Neither walk enters tool *definitions*.
+fn preserved_media(body: &Value) -> Option<&'static str> {
+    const VIDEO: [&str; 3] = ["input_video", "video_url", "video"];
+    const AUDIO: [&str; 2] = ["input_audio", "audio"];
+
+    fn discriminant(value: &Value) -> &str {
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+
+    fn roots(body: &Value) -> Vec<&Value> {
+        ["messages", "input", "system"]
+            .iter()
+            .filter_map(|key| body.get(*key))
+            .collect()
+    }
+
+    // Explicit discriminators. Tool output is followed only from a `*_call_output` part,
+    // exactly as the image check does, so an unrelated nested object is never inspected.
+    let mut pending = roots(body);
+    while let Some(value) = pending.pop() {
+        if let Some(items) = value.as_array() {
+            pending.extend(items);
+            continue;
+        }
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let kind = discriminant(value);
+        if VIDEO.contains(&kind) {
+            return Some("video");
+        }
+        if AUDIO.contains(&kind) {
+            return Some("audio");
+        }
+        pending.extend(object.get("content"));
+        if kind.ends_with("_call_output") {
+            pending.extend(object.get("output"));
+        }
+    }
+
+    // Bare keys, on message and content-part objects only. Tracking the two kinds
+    // separately is what keeps a media-named field in deeper data from being read as a
+    // request shape: only elements of a messages/input/system array, and elements of a
+    // `content` array, are inspected.
+    let mut messages = roots(body);
+    let mut parts: Vec<&Value> = Vec::new();
+    loop {
+        let object = match messages.pop() {
+            Some(value) => match value.as_array() {
+                Some(items) => {
+                    messages.extend(items);
+                    continue;
+                }
+                None => match value.as_object() {
+                    Some(object) => object,
+                    None => continue,
+                },
+            },
+            None => match parts.pop() {
+                Some(value) => match value.as_object() {
+                    Some(object) => object,
+                    None => continue,
+                },
+                None => break,
+            },
+        };
+        if has_media_key(object, &VIDEO) {
+            return Some("video");
+        }
+        if has_media_key(object, &AUDIO) {
+            return Some("audio");
+        }
+        if let Some(content) = object.get("content").and_then(Value::as_array) {
+            parts.extend(content);
+        }
+    }
+    None
+}
+
+fn has_media_key(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
 }
 
 /// Estimated input tokens for a request body.
@@ -305,6 +434,167 @@ mod tests {
             },
             "vision",
         )?;
+        Ok(())
+    }
+
+    /// `vision` is a declaration about images. Enabling it, or leaving every capability
+    /// undeclared, must not admit video or audio — the deployment cannot state support for
+    /// either, so both are refused before any target sees them.
+    #[test]
+    fn video_and_audio_are_refused_even_when_vision_is_enabled() -> TestResult {
+        let cases = [
+            (
+                OpenAiChat,
+                "video",
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4"}}
+                ]}]}),
+            ),
+            (
+                OpenAiChat,
+                "audio",
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]}]}),
+            ),
+            (
+                OpenAiResponses,
+                "video",
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+                ]}]}),
+            ),
+            (
+                OpenAiResponses,
+                "audio",
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]}]}),
+            ),
+            (
+                AnthropicMessages,
+                "video",
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "video", "source": {"type": "url", "url": "https://example.test/clip.mp4"}}
+                ]}]}),
+            ),
+            (
+                AnthropicMessages,
+                "audio",
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "audio", "source": {"type": "base64", "media_type": "audio/wav", "data": "AAAA"}}
+                ]}]}),
+            ),
+        ];
+        let permissive = ModelCapabilities {
+            tool_calling: Some(true),
+            reasoning: Some(true),
+            vision: Some(true),
+            ..Default::default()
+        };
+        for (format, capability, body) in cases {
+            let request = decode_request(format, &body)?;
+            for capabilities in [ModelCapabilities::default(), permissive] {
+                assert_eq!(
+                    unsupported_capability(capabilities, &request, &body),
+                    Some(capability),
+                    "{capability} must be refused regardless of `vision`: {body}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Plain text is unaffected by the media rule.
+    #[test]
+    fn text_is_admitted_after_the_media_rule() -> TestResult {
+        let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let request = decode_request(OpenAiChat, &body)?;
+        assert_eq!(
+            unsupported_capability(ModelCapabilities::default(), &request, &body),
+            None
+        );
+        Ok(())
+    }
+
+    /// Media can survive forwarding as a key beside `content`, with no `type` to match.
+    #[test]
+    fn media_preserved_as_a_bare_key_is_refused() -> TestResult {
+        let video = json!({"messages": [{"role": "user", "content": "hello",
+            "video": {"url": "https://example.test/clip.mp4"}}]});
+        let audio = json!({"input": [{"role": "user", "content": "hello",
+            "audio": {"data": "AAAA", "format": "wav"}}]});
+        for (format, body, capability) in [
+            (OpenAiChat, video, "video"),
+            (OpenAiResponses, audio, "audio"),
+        ] {
+            let request = decode_request(format, &body)?;
+            assert_eq!(
+                unsupported_capability(ModelCapabilities::default(), &request, &body),
+                Some(capability),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A tool schema may legitimately declare a property named `video`. Refusing that would
+    /// reject an ordinary text request, so tool definitions are deliberately not walked.
+    #[test]
+    fn a_tool_schema_naming_video_is_not_treated_as_media() -> TestResult {        let body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {
+                "name": "probe",
+                "parameters": {"type": "object", "properties": {
+                    "video": {"type": "string"},
+                    "audio": {"type": "string"}
+                }}
+            }}]
+        });
+        let request = decode_request(OpenAiChat, &body)?;
+        assert_eq!(
+            unsupported_capability(ModelCapabilities::default(), &request, &body),
+            None,
+            "a tool parameter named video must not reject a text request"
+        );
+        Ok(())
+    }
+
+    /// A field named `video` inside tool output is data the tool chose to return, not the
+    /// caller sending media. Refusing it would break an ordinary text request.
+    #[test]
+    fn media_named_fields_inside_tool_output_are_not_request_media() -> TestResult {
+        let body = json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": {"video": "clip.mp4", "audio": "note.wav"}
+            }]
+        });
+        let request = decode_request(OpenAiResponses, &body)?;
+        assert_eq!(
+            unsupported_capability(ModelCapabilities::default(), &request, &body),
+            None,
+            "tool output data must not be read as caller-supplied media"
+        );
+        Ok(())
+    }
+
+    /// Media-named data on an object that is not a message, a content part, or a
+    /// `*_call_output` must not be read as request media either.
+    #[test]
+    fn media_named_data_in_unrelated_nesting_is_not_request_media() -> TestResult {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"output": {"type": "audio"}}
+        });
+        let request = decode_request(OpenAiChat, &body)?;
+        assert_eq!(
+            unsupported_capability(ModelCapabilities::default(), &request, &body),
+            None,
+            "only request shape and *_call_output output may be inspected"
+        );
         Ok(())
     }
 }

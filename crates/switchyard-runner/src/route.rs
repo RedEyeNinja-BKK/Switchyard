@@ -19,10 +19,13 @@ use crate::config::RouteReasoningPolicy;
 
 /// Capabilities declared for one route.
 ///
-/// `GET /v1/models` includes `context_window`, `tool_calling`, and `vision` in each
-/// standard `data` entry, using `null` for unset values. It omits `reasoning`.
-/// The server rejects tool inputs, reasoning controls, or images when the
+/// `GET /v1/models` includes `context_window`, `tool_calling`, `vision` and `video` in
+/// each standard `data` entry, using `null` for unset values. It omits `reasoning`.
+/// The server rejects tool inputs, reasoning controls, images or video when the
 /// corresponding declaration is explicitly `false` for the selected route.
+///
+/// `video` is the exception to "absent means permitted": video is admitted only when a
+/// route declares it, because no deployment carried video before the field existed.
 #[derive(Clone, Copy, Default)]
 pub struct ModelCapabilities {
     pub context_window: Option<u32>,
@@ -31,6 +34,12 @@ pub struct ModelCapabilities {
     pub reasoning: Option<bool>,
     /// Whether the routed model accepts image input, as declared in config.
     pub vision: Option<bool>,
+    /// Whether the routed model accepts video input, as declared in config.
+    ///
+    /// Deliberately separate from `vision`: an image-capable target need not be
+    /// video-capable, and the providers that serve the two are not the same. Absent means
+    /// "cannot accept video".
+    pub video: Option<bool>,
 }
 
 /// Caller credential family required by a forwarded-auth route.
@@ -276,6 +285,9 @@ impl Route {
                     let capabilities = crate::ModelCapabilities {
                         vision: Some(!facts.no_vision),
                         tool_calling: Some(!facts.no_tool_calling),
+                        // Carried as a concrete boolean like the other facts, so an
+                        // undeclared target is treated as video-incapable here.
+                        video: Some(!facts.no_video),
                         ..crate::ModelCapabilities::default()
                     };
                     crate::request_fit::unsupported_capability(
@@ -285,7 +297,9 @@ impl Route {
                     )
                     .is_none()
                 }
-                None => true,
+                // Uncharacterised rather than incapable: permitted, except for video,
+                // which no target may receive without stating that it can read it.
+                None => !crate::request_fit::requires_video(&request.llm_request, &raw),
             }
         };
         let models = self.models.filtered(&eligibility);
@@ -346,6 +360,7 @@ impl Route {
                     let capabilities = crate::ModelCapabilities {
                         vision: Some(!facts.no_vision),
                         tool_calling: Some(!facts.no_tool_calling),
+                        video: Some(!facts.no_video),
                         ..crate::ModelCapabilities::default()
                     };
                     crate::request_fit::unsupported_capability(

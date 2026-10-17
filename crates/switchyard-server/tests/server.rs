@@ -3606,6 +3606,91 @@ async fn disabled_route_capabilities_reject_requests_before_calling_upstream() -
     Ok(())
 }
 
+// Video and audio must be refused locally even on a route that declares `vision = true`,
+// and the incompatible upstream must receive nothing at all.
+#[tokio::test]
+async fn video_and_audio_never_reach_the_upstream() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let app = capability_app(&upstream.base_url, "openai_chat")?;
+    let cases = [
+        (
+            "/v1/chat/completions",
+            "video",
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "watch"},
+                {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4"}}
+            ]}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            "audio",
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+            ]}]}),
+        ),
+        (
+            "/v1/responses",
+            "video",
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+            ]}]}),
+        ),
+        (
+            "/v1/responses",
+            "audio",
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+            ]}]}),
+        ),
+        (
+            "/v1/messages",
+            "video",
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "video", "source": {"type": "url", "url": "https://example.test/clip.mp4"}}
+            ]}]}),
+        ),
+        (
+            "/v1/messages",
+            "audio",
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "audio", "source": {"type": "base64", "media_type": "audio/wav", "data": "AAAA"}}
+            ]}]}),
+        ),
+    ];
+    for (endpoint, capability, mut body) in cases {
+        // `enabled` declares vision, reasoning and tool calling: the most permissive route.
+        body["model"] = json!("enabled");
+        let response = send(&app, "POST", endpoint, Some(body)).await?;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{endpoint} must refuse {capability} locally"
+        );
+        let error = response.json()?;
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        if endpoint == "/v1/messages" {
+            assert_eq!(error["type"], "error");
+        } else {
+            assert_eq!(error["error"]["code"], "unsupported_capability");
+        }
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(capability),
+            "{endpoint}: message must name {capability}: {message}"
+        );
+        assert!(
+            !message.contains("= false"),
+            "{endpoint}: {capability} has no declaration, so must not be reported as one: {message}"
+        );
+    }
+    // The whole point: nothing was transmitted.
+    assert!(
+        upstream.calls.lock().await.is_empty(),
+        "no video or audio request may reach an incompatible upstream"
+    );
+    Ok(())
+}
+
 // Approval replies can resume tool use without a tools field or a decoded tool call.
 #[tokio::test]
 async fn tool_approval_replies_follow_route_capabilities() -> TestResult {

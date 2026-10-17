@@ -380,7 +380,8 @@ impl Runner {
 /// Eligibility is decided with the same predicate that governs route admission and
 /// whole-route child eligibility, so "this request needs vision" means one thing at every
 /// level. A target with no declared facts is left in place: absence of a fact is not a
-/// refusal, and a newly added target is never silently unroutable.
+/// refusal, and a newly added target is never silently unroutable. Video is the one
+/// exception, because no target may receive it without stating that it can read it.
 pub fn eligible_candidates(
     ordered: &[&str],
     capabilities: &std::collections::BTreeMap<String, crate::ModelCapabilities>,
@@ -398,7 +399,9 @@ pub fn eligible_candidates(
                 )
                 .is_none()
             }
-            None => true,
+            // Uncharacterised rather than incapable: permitted, except for video, which
+            // no target may receive without stating that it can read it.
+            None => !crate::request_fit::requires_video(&request.llm_request, &raw),
         })
         .map(|name| (*name).to_string())
         .collect()
@@ -410,7 +413,7 @@ mod target_eligibility_tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use switchyard_protocol::{
-        ContentBlock, ImageSource, LlmRequest, Message, Role,
+        ContentBlock, ImageSource, LlmRequest, MediaSource, Message, Role,
     };
     use crate::ModelCapabilities;
 
@@ -474,6 +477,17 @@ mod target_eligibility_tests {
             eligible_candidates(&ordered, &capabilities, &vision_request()),
             vec!["unknown"],
             "an absent fact must not become a refusal"
+        );
+    }
+
+    /// Video is the exception to that rule: no target may receive it without saying so.
+    #[test]
+    fn an_uncharacterised_target_is_filtered_out_for_video() {
+        let capabilities = BTreeMap::new();
+        let ordered = ["unknown"];
+        assert!(
+            eligible_candidates(&ordered, &capabilities, &video_request()).is_empty(),
+            "an uncharacterised target must not receive video"
         );
     }
 
@@ -700,6 +714,37 @@ vision = true
             raw_request: Some(json!({
                 "model": "route",
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+            })),
+            metadata: None,
+        }
+    }
+
+    pub(crate) fn video_request() -> Request {
+        Request {
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
+            llm_request: LlmRequest {
+                model: Some("route".into()),
+                messages: vec![Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::Text { text: "describe".into() },
+                        ContentBlock::Video {
+                            source: MediaSource::Url {
+                                url: "https://example.test/a.mp4".into(),
+                                media_type: None,
+                            },
+                        },
+                    ],
+                }],
+                ..LlmRequest::default()
+            },
+            raw_request: Some(json!({
+                "model": "route",
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_video", "video_url": "https://example.test/a.mp4"}
+                ]}]
             })),
             metadata: None,
         }

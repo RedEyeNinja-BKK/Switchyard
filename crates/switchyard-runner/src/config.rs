@@ -129,6 +129,9 @@ pub(crate) struct CompositeRouteConfig {
     pub(crate) reasoning: Option<bool>,
     #[serde(default)]
     pub(crate) vision: Option<bool>,
+    /// Whether any child can accept video input. Stated, never inferred from `vision`.
+    #[serde(default)]
+    pub(crate) video: Option<bool>,
 }
 
 /// One explicitly ordered decision lane.
@@ -169,6 +172,7 @@ struct RouteConfig {
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
     vision: Option<bool>,
+    video: Option<bool>,
     /// Reasoning policy for this route. Applies on top of the target's factual policy.
     route_reasoning_policy: Option<RouteReasoningPolicy>,
     /// Estimated input tokens above which this route escalates to a wider-context leg.
@@ -236,6 +240,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
+        let video = take_optional(&mut table, "video")?;
         let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
@@ -247,6 +252,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             tool_calling,
             reasoning,
             vision,
+            video,
             route_reasoning_policy,
             escalation_max_input_tokens,
             escalation_target,
@@ -282,6 +288,7 @@ impl RouteConfig {
             tool_calling: self.tool_calling,
             reasoning: self.reasoning,
             vision: self.vision,
+            video: self.video,
         }
     }
 
@@ -387,6 +394,7 @@ impl DeploymentConfig {
         let fallback_base_url = self.fallback_base_url()?;
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
+        self.validate_video_transport()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
         self.validate_decision_lane_composition()?;
@@ -593,6 +601,7 @@ impl DeploymentConfig {
                     tool_calling: composite.tool_calling,
                     reasoning: composite.reasoning,
                     vision: composite.vision,
+                    video: composite.video,
                 },
             );
         }
@@ -768,6 +777,7 @@ impl DeploymentConfig {
             names.sort_unstable();
             for (label, claimed) in [
                 ("vision", capabilities.vision),
+                ("video", capabilities.video),
                 ("tool_calling", capabilities.tool_calling),
             ] {
                 if claimed != Some(true) {
@@ -778,6 +788,9 @@ impl DeploymentConfig {
                 let supported = names.iter().any(|name| {
                     self.targets.get(*name).is_some_and(|target| match label {
                         "vision" => target.vision != Some(false),
+                        // Video differs from the others: a target that says nothing is
+                        // not a video target, it is one that has not claimed video.
+                        "video" => target.video == Some(true),
                         _ => target.tool_calling != Some(false),
                     })
                 });
@@ -787,6 +800,39 @@ impl DeploymentConfig {
                          supports it; declare a target that does, or stop claiming it"
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that a target claiming video sits on a transport that can carry it.
+    ///
+    /// Video has one faithful wire representation, the Responses `input_video` part. The
+    /// OpenAI Chat codec has no stable video mapping and encodes the block as text, so a
+    /// video declaration there would admit a request and then deliver a paragraph instead
+    /// of the video. Refusing at load makes that a configuration error rather than a
+    /// silent conversion at request time.
+    fn validate_video_transport(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if target.video != Some(true) {
+                continue;
+            }
+            let client = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} references unknown llm client {}",
+                    target.llm_client
+                ))
+            })?;
+            if !matches!(client.format, ClientFormat::OpenAiResponses) {
+                let format = match client.format {
+                    ClientFormat::OpenAiChat => "openai_chat",
+                    ClientFormat::AnthropicMessages => "anthropic_messages",
+                    ClientFormat::OpenAiResponses => "openai_responses",
+                };
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares video = true but its client uses {format}; \
+                     video requires an openai_responses client"
+                )));
             }
         }
         Ok(())
@@ -1098,6 +1144,9 @@ impl DeploymentConfig {
                     target.id.clone(),
                     switchyard_llm_client::CapabilityFacts {
                         no_vision: target.vision == Some(false),
+                        // Video is never inferred: a target that does not state support is
+                        // treated as unable to receive it.
+                        no_video: target.video != Some(true),
                         no_tool_calling: target.tool_calling == Some(false),
                     },
                 );
@@ -1465,6 +1514,12 @@ struct TargetConfig {
     /// filters on before dispatch.
     #[serde(default)]
     vision: Option<bool>,
+    /// Whether this deployment accepts video input.
+    ///
+    /// Separate from `vision` on purpose: an endpoint that accepts images need not accept
+    /// video, and on this deployment it does not. Omitted means "cannot".
+    #[serde(default)]
+    video: Option<bool>,
     #[serde(default)]
     tool_calling: Option<bool>,
 }
@@ -2961,6 +3016,68 @@ confidence_threshold = 0.5
             "base_threshold = 0.25\nthreshold_step = 0.1\nclassify_trigger = \"new_session\"\nmessage_hash_fallback = true",
         );
         runner_from_toml(&configured)?;
+        Ok(())
+    }
+
+    /// Video has one faithful transport. Declaring it anywhere else would admit the request
+    /// and then deliver its content as text, so the load fails instead.
+    #[test]
+    fn video_declaration_requires_a_responses_client() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"classifier/model\"",
+            "id = \"classifier/model\"\nvideo = true",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("chat client claimed video")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("video = true") && message.contains("openai_chat"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A route may not promise a capability no target of that route can keep.
+    #[test]
+    fn route_claiming_video_needs_a_video_target() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "targets = [\"strong\", \"weak\"]",
+            "targets = [\"strong\", \"weak\"]\nvideo = true",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("route claimed video")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("video = true") && message.contains("none of its targets"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A responses target that states video support satisfies the route claim.
+    #[test]
+    fn video_on_a_responses_target_is_accepted() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true",
+                1,
+            );
+        let runner = runner_from_toml(&configured)?;
+        let route = runner
+            .route("switchyard/random")
+            .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
+        let capabilities = route.capabilities();
+        assert_eq!(capabilities.video, Some(true));
         Ok(())
     }
 

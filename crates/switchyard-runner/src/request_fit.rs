@@ -51,10 +51,11 @@ pub fn unsupported_capability(
     {
         return Some("tool_calling");
     }
-    // Video and audio first, and unconditionally: `vision` describes image input only, and
-    // the deployment cannot declare support for either. Doing this before the image and tool
-    // scan also means a request carrying both reports the medium nobody can serve.
-    if let Some(capability) = unsupported_media(request, body) {
+    // Audio first: it has no declaration at all and is refused wherever it appears. Video
+    // follows, and is admitted only where the route states it can read video. Doing this
+    // before the image and tool scan also means a request carrying both reports the medium
+    // nothing can serve.
+    if let Some(capability) = unsupported_media(capabilities, request, body) {
         return Some(capability);
     }
     if capabilities.tool_calling != Some(false) && capabilities.vision != Some(false) {
@@ -74,13 +75,39 @@ pub fn unsupported_capability(
         .or_else(|| unsupported_preserved_content(capabilities, body))
 }
 
-/// Video and audio, refused regardless of any declared capability.
+/// Video and audio, refused unless the route states it can read the medium.
 ///
-/// `vision` is a declaration about images. There is no configuration surface for video or
-/// audio, so inferring either from `vision` would hand media to a target that cannot read
-/// it. Both are therefore refused outright until the configuration can state support for
-/// them explicitly.
-fn unsupported_media(request: &LlmRequest, body: &Value) -> Option<&'static str> {
+/// `vision` is a declaration about images and says nothing about video: a target that
+/// accepts images need not accept video, and the providers behind the two differ. Audio
+/// has no declaration at all, so no route can admit it.
+fn unsupported_media(
+    capabilities: ModelCapabilities,
+    request: &LlmRequest,
+    body: &Value,
+) -> Option<&'static str> {
+    if request_media(request, body, &|medium| medium == "audio").is_some() {
+        return Some("audio");
+    }
+    if capabilities.video == Some(true) {
+        return None;
+    }
+    request_media(request, body, &|medium| medium == "video")
+}
+
+/// Whether the request carries video.
+///
+/// Used where a target is uncharacterised. Vision is permitted by default there, because
+/// absence of a fact must not invalidate a pre-existing deployment; video is not, because
+/// no deployment carried video before video could be declared.
+pub fn requires_video(request: &LlmRequest, body: &Value) -> bool {
+    request_media(request, body, &|medium| medium == "video").is_some()
+}
+
+fn request_media(
+    request: &LlmRequest,
+    body: &Value,
+    want: &dyn Fn(&str) -> bool,
+) -> Option<&'static str> {
     request
         .instructions
         .iter()
@@ -91,15 +118,15 @@ fn unsupported_media(request: &LlmRequest, body: &Value) -> Option<&'static str>
                 .iter()
                 .map(|message| message.content.as_slice()),
         )
-        .find_map(media_block)
-        .or_else(|| preserved_media(body))
+        .find_map(|content| media_block(content, want))
+        .or_else(|| preserved_media(body, want))
 }
 
-fn media_block(content: &[ContentBlock]) -> Option<&'static str> {
+fn media_block(content: &[ContentBlock], want: &dyn Fn(&str) -> bool) -> Option<&'static str> {
     content.iter().find_map(|block| match block {
-        ContentBlock::Video { .. } => Some("video"),
-        ContentBlock::Audio { .. } => Some("audio"),
-        ContentBlock::ToolResult(result) => media_block(&result.content),
+        ContentBlock::Video { .. } if want("video") => Some("video"),
+        ContentBlock::Audio { .. } if want("audio") => Some("audio"),
+        ContentBlock::ToolResult(result) => media_block(&result.content, want),
         _ => None,
     })
 }
@@ -111,7 +138,7 @@ fn media_block(content: &[ContentBlock]) -> Option<&'static str> {
 /// as `video` is only meaningful in caller-authored request shape: inside tool output it is
 /// ordinary data, and refusing it would reject a text request that merely returned a field
 /// named `video`. Neither walk enters tool *definitions*.
-fn preserved_media(body: &Value) -> Option<&'static str> {
+fn preserved_media(body: &Value, want: &dyn Fn(&str) -> bool) -> Option<&'static str> {
     const VIDEO: [&str; 3] = ["input_video", "video_url", "video"];
     const AUDIO: [&str; 2] = ["input_audio", "audio"];
 
@@ -141,10 +168,10 @@ fn preserved_media(body: &Value) -> Option<&'static str> {
             continue;
         };
         let kind = discriminant(value);
-        if VIDEO.contains(&kind) {
+        if VIDEO.contains(&kind) && want("video") {
             return Some("video");
         }
-        if AUDIO.contains(&kind) {
+        if AUDIO.contains(&kind) && want("audio") {
             return Some("audio");
         }
         pending.extend(object.get("content"));
@@ -179,10 +206,10 @@ fn preserved_media(body: &Value) -> Option<&'static str> {
                 None => break,
             },
         };
-        if has_media_key(object, &VIDEO) {
+        if has_media_key(object, &VIDEO) && want("video") {
             return Some("video");
         }
-        if has_media_key(object, &AUDIO) {
+        if has_media_key(object, &AUDIO) && want("audio") {
             return Some("audio");
         }
         if let Some(content) = object.get("content").and_then(Value::as_array) {
@@ -438,10 +465,10 @@ mod tests {
     }
 
     /// `vision` is a declaration about images. Enabling it, or leaving every capability
-    /// undeclared, must not admit video or audio — the deployment cannot state support for
-    /// either, so both are refused before any target sees them.
+    /// undeclared, must not admit video or audio: video needs its own declaration and audio
+    /// has none, so both are refused before any target sees them.
     #[test]
-    fn video_and_audio_are_refused_even_when_vision_is_enabled() -> TestResult {
+    fn media_is_refused_without_a_video_declaration() -> TestResult {
         let cases = [
             (
                 OpenAiChat,
@@ -542,7 +569,8 @@ mod tests {
     /// A tool schema may legitimately declare a property named `video`. Refusing that would
     /// reject an ordinary text request, so tool definitions are deliberately not walked.
     #[test]
-    fn a_tool_schema_naming_video_is_not_treated_as_media() -> TestResult {        let body = json!({
+    fn a_tool_schema_naming_video_is_not_treated_as_media() -> TestResult {
+        let body = json!({
             "messages": [{"role": "user", "content": "hello"}],
             "tools": [{"type": "function", "function": {
                 "name": "probe",
@@ -595,6 +623,113 @@ mod tests {
             None,
             "only request shape and *_call_output output may be inspected"
         );
+        Ok(())
+    }
+
+    /// Video is admitted only where the route states it can read video. `vision` describes
+    /// images and is not evidence of video support.
+    #[test]
+    fn video_is_admitted_only_by_an_explicit_declaration() -> TestResult {
+        let bodies = [
+            (
+                OpenAiChat,
+                json!({"messages": [{"role": "user", "content": [
+                    {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4"}}
+                ]}]}),
+            ),
+            (
+                OpenAiResponses,
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+                ]}]}),
+            ),
+            // Survives forwarding as a bare key, with no `type` to match.
+            (
+                OpenAiChat,
+                json!({"messages": [{"role": "user", "content": "look",
+                    "video": {"url": "https://example.test/clip.mp4"}}]}),
+            ),
+        ];
+        for (format, body) in bodies {
+            let request = decode_request(format, &body)?;
+            let vision_only = ModelCapabilities {
+                vision: Some(true),
+                ..Default::default()
+            };
+            assert_eq!(
+                unsupported_capability(vision_only, &request, &body),
+                Some("video"),
+                "vision must not imply video support: {body}"
+            );
+            let declared = ModelCapabilities {
+                vision: Some(false),
+                video: Some(true),
+                ..Default::default()
+            };
+            assert_eq!(
+                unsupported_capability(declared, &request, &body),
+                None,
+                "an explicit video declaration admits it even without image support: {body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Audio has no declaration at all, so a route declaring video must not widen into it.
+    #[test]
+    fn audio_is_refused_even_when_video_is_declared() -> TestResult {
+        let body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "https://example.test/clip.mp4"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+        ]}]});
+        let request = decode_request(OpenAiResponses, &body)?;
+        assert_eq!(
+            unsupported_capability(
+                ModelCapabilities {
+                    video: Some(true),
+                    ..Default::default()
+                },
+                &request,
+                &body
+            ),
+            Some("audio"),
+            "a video declaration must not admit audio"
+        );
+        Ok(())
+    }
+
+    /// The uncharacterised-target guard uses the same reading of the request.
+    #[test]
+    fn requires_video_matches_the_admission_rule() -> TestResult {
+        let video = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+        ]}]});
+        let audio = json!({"input": [{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+        ]}]});
+        let text = json!({"input": "hello"});
+        for (body, expected) in [(video, true), (audio, false), (text, false)] {
+            let request = decode_request(OpenAiResponses, &body)?;
+            assert_eq!(requires_video(&request, &body), expected, "{body}");
+        }
+        Ok(())
+    }
+
+    /// Video survives the decode/encode round trip into the provider spelling.
+    #[test]
+    fn video_round_trips_to_the_responses_part() -> TestResult {
+        let body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "https://example.test/clip.mp4"},
+            {"type": "input_text", "text": "describe"}
+        ]}]});
+        let request = decode_request(OpenAiResponses, &body)?;
+        let encoded = encode_request(&request, OpenAiResponses)?;
+        let parts = encoded
+            .pointer("/input/0/content")
+            .and_then(Value::as_array)
+            .ok_or("missing content")?;
+        assert_eq!(parts[0]["type"], "input_video");
+        assert_eq!(parts[0]["video_url"], "https://example.test/clip.mp4");
         Ok(())
     }
 }

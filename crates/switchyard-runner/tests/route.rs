@@ -234,6 +234,7 @@ fn escalating_route(
         ModelId::from("wide"),
         switchyard_llm_client::CapabilityFacts {
             no_vision: true,
+            no_video: true,
             no_tool_calling: false,
         },
     )]));

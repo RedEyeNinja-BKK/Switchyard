@@ -1846,6 +1846,7 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
             "vision": capabilities.vision,
+            "video": capabilities.video,
             "supported_inbound_formats": [
                 "openai-chat-completions",
                 "openai-responses",

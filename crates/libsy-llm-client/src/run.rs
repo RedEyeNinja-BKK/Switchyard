@@ -683,6 +683,11 @@ struct ClientRouting {
 pub struct CapabilityFacts {
     /// The backing deployment cannot accept image input.
     pub no_vision: bool,
+    /// The backing deployment cannot accept video input.
+    ///
+    /// Unlike `no_vision`, this is set for a target that says nothing: video is never
+    /// inferred from image support, so "undeclared" and "cannot" are the same fact here.
+    pub no_video: bool,
     /// The backing deployment cannot accept tool definitions or calls.
     pub no_tool_calling: bool,
 }

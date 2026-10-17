@@ -394,6 +394,7 @@ impl DeploymentConfig {
         let fallback_base_url = self.fallback_base_url()?;
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
+        self.validate_composite_video_claims()?;
         self.validate_video_transport()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
@@ -800,6 +801,31 @@ impl DeploymentConfig {
                          supports it; declare a target that does, or stop claiming it"
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that a composite claiming video has a child that can serve it.
+    ///
+    /// A composite is registered with its own declared capabilities and is resolved
+    /// before its children, so a claim nothing below it can keep would advertise video to
+    /// callers and then skip every child at request time.
+    fn validate_composite_video_claims(&self) -> RunnerResult<()> {
+        for (name, composite) in &self.composites {
+            if composite.video != Some(true) {
+                continue;
+            }
+            let supported = composite.children.iter().any(|child| {
+                self.routes
+                    .get(child)
+                    .is_some_and(|route| route.capabilities().video == Some(true))
+            });
+            if !supported {
+                return Err(RunnerError::configuration(format!(
+                    "composite route {name} declares video = true but none of its children \
+                     does; declare a child that does, or stop claiming it"
+                )));
             }
         }
         Ok(())
@@ -3078,6 +3104,45 @@ confidence_threshold = 0.5
             .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
         let capabilities = route.capabilities();
         assert_eq!(capabilities.video, Some(true));
+        Ok(())
+    }
+
+    /// A composite is resolved before its children, so its claim must be backed by one of
+    /// them. Otherwise it advertises video and then skips every child.
+    #[test]
+    fn composite_claiming_video_needs_a_video_child() -> RunnerResult<()> {
+        let configured = format!(
+            "{VALID_CONFIG}\n[composites.tier]\nchildren = [\"random\"]\nvideo = true\n"
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("composite claimed video")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("composite route tier") && message.contains("none of its children"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// The same composite is accepted once a child can serve video.
+    #[test]
+    fn composite_with_a_video_child_is_accepted() -> RunnerResult<()> {
+        let configured = format!(
+            "{}\n[composites.tier]\nchildren = [\"random\"]\nvideo = true\n",
+            VALID_CONFIG
+                .replacen(
+                    "id = \"strong/model\"",
+                    "id = \"strong/model\"\nvideo = true",
+                    1
+                )
+                .replacen(
+                    "targets = [\"strong\", \"weak\"]",
+                    "targets = [\"strong\", \"weak\"]\nvideo = true",
+                    1
+                )
+        );
+        runner_from_toml(&configured)?;
         Ok(())
     }
 

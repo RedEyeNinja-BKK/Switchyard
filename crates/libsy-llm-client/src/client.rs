@@ -5,7 +5,7 @@
 //! request, call the configured backend over HTTP, decode the neutral response.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::ready;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -984,23 +984,53 @@ async fn prepare_response_stream(
             .map_err(convert_reqwest_error)
     });
     let mut chunks = decode_stream(bytes, backend.wire_format())?;
-    match chunks.next().await {
-        None => Ok(stream::empty().boxed()),
-        // Nothing has reached the caller, so transport failures can still be retried.
-        Some(Err(error @ (LlmClientError::Transport { .. } | LlmClientError::Timeout { .. }))) => {
-            Err(error)
-        }
-        Some(first) => {
-            // An in-band context overflow skips retries and advances to another candidate.
-            if let Some(message) = first_event_overflow(&first, backend) {
-                return Err(LlmClientError::ContextWindowExceeded {
-                    model: model.clone(),
-                    message,
-                });
+    // Hold non-output events until something usable arrives. A provider announces
+    // the response (`response.created`, a role-only delta) and may then stall; if
+    // the attempt returned at that announcement, the attempt bound would stop
+    // applying with no output delivered and no bound left but the overall one.
+    // Staying inside this future keeps the wait covered by the attempt deadline,
+    // which also keeps the failure pre-commit and therefore routable.
+    let mut held: Vec<LlmResponseStreamEvent> = Vec::new();
+    loop {
+        match chunks.next().await {
+            None => break,
+            Some(Err(error)) => {
+                // Nothing usable was produced, so a transport failure here can
+                // still be retried and another candidate may serve the request.
+                return Err(error);
             }
-            Ok(stream::once(ready(first)).chain(chunks).boxed())
+            Some(Ok(event)) => {
+                // An in-band context overflow skips retries and advances to another candidate.
+                if let Some(message) = first_event_overflow(&Ok(event.clone()), backend) {
+                    return Err(LlmClientError::ContextWindowExceeded {
+                        model: model.clone(),
+                        message,
+                    });
+                }
+                let usable = event.normalized().iter().any(is_usable_output);
+                held.push(event);
+                if usable {
+                    break;
+                }
+            }
         }
     }
+    Ok(stream::iter(held.into_iter().map(Ok)).chain(chunks).boxed())
+}
+
+// Output a caller can act on. Identity and framing events (MessageStart, empty
+// normalized frames) are deliberately not usable: they say a response exists,
+// not that it produced anything.
+fn is_usable_output(chunk: &LlmResponseChunk) -> bool {
+    matches!(
+        chunk,
+        LlmResponseChunk::TextDelta { .. }
+            | LlmResponseChunk::ReasoningDelta { .. }
+            | LlmResponseChunk::ReasoningDetailsDelta { .. }
+            | LlmResponseChunk::ToolCallDelta { .. }
+            | LlmResponseChunk::MessageStop { .. }
+            | LlmResponseChunk::Usage(_)
+    )
 }
 
 // The overflow message when a stream's first event is an in-band provider rejection
@@ -3091,6 +3121,69 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(connections.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    fn chat_role_only() -> String {
+        // Announces the response without producing anything the caller can use.
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_string()
+    }
+
+    #[tokio::test]
+    async fn a_non_output_event_does_not_end_the_attempt_boundary()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The provider announces the response (role-only delta) and then stalls.
+        // If the attempt returned at the announcement, the bound would stop
+        // applying with zero output delivered and nothing left but the overall
+        // deadline, which is unset on this lane.
+        let (base_url, _handle, connections) =
+            paced_stream_server(vec![(0, chat_role_only()), (600, chat_delta("late"))])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("a non-output event must not satisfy the attempt bound".into()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, LlmClientError::AttemptTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_output_event_followed_by_output_still_streams_normally()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The control for the test above: holding the announcement must not cost
+        // anything when output does follow.
+        let (base_url, _handle, _connections) = paced_stream_server(vec![
+            (0, chat_role_only()),
+            (10, chat_delta("Hello")),
+            (10, "data: [DONE]\n\n".to_string()),
+        ])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert_eq!(completion_text(&agg), "Hello");
         Ok(())
     }
 

@@ -1179,6 +1179,7 @@ mod tests {
         Unauthorized,
         AttemptTimeout,
         TerminalTimeout,
+        ServerError,
         StreamSuccess,
         MidStreamError,
     }
@@ -1215,6 +1216,10 @@ mod tests {
                             "attempt produced no usable output",
                         )
                         .into(),
+                    }),
+                    FirstOutcome::ServerError => Err(LlmClientError::UpstreamHttp {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: "upstream unavailable".to_string(),
                     }),
                     FirstOutcome::TerminalTimeout => Err(LlmClientError::Timeout {
                         source: std::io::Error::new(
@@ -1292,22 +1297,35 @@ mod tests {
     async fn run_candidates(
         first: FirstOutcome,
     ) -> (Arc<CandidateClient>, Result<(ModelId, Response)>) {
+        run_candidates_for(first, request()).await
+    }
+
+    async fn run_candidates_for(
+        first: FirstOutcome,
+        request: Request,
+    ) -> (Arc<CandidateClient>, Result<(ModelId, Response)>) {
         let client = Arc::new(CandidateClient {
             calls: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             first,
         });
-        let algorithm = Arc::new(CandidateAlgorithm {});
-        let models = to_category_map(&["weak", "strong"]);
-        let result = run(
-            algorithm,
-            ClientRouter::single(client.clone()),
-            request(),
-            models,
+        let clients = ClientRouter::single(client.clone());
+        let result = run_candidates_with(clients, request).await;
+        (client, result)
+    }
+
+    async fn run_candidates_with(
+        clients: ClientRouter,
+        request: Request,
+    ) -> Result<(ModelId, Response)> {
+        run(
+            Arc::new(CandidateAlgorithm {}),
+            clients,
+            request,
+            to_category_map(&["weak", "strong"]),
             None,
         )
-        .await;
-        (client, result)
+        .await
     }
 
     fn to_category_map(names: &[&str]) -> Arc<RuntimeModels> {
@@ -2243,6 +2261,89 @@ mod tests {
             })
         ));
         assert_eq!(&*client.calls.lock(), &[ModelId::from("weak")]);
+        Ok(())
+    }
+
+    fn continuation_request(response_id: &str) -> Request {
+        let mut request = request();
+        request
+            .llm_request
+            .extensions
+            .fields
+            .insert(
+                "previous_response_id".to_string(),
+                serde_json::json!(response_id),
+            );
+        request
+    }
+
+    #[tokio::test]
+    async fn a_continuation_is_pinned_to_its_owner_and_never_falls_back() -> Result<()> {
+        // `run()` already pins a continuation before the algorithm executes
+        // (`continue_on`), so the algorithm never offers a fallback list. This
+        // test covers the layer that owns the guarantee for every OTHER caller:
+        // anything that hands `call_first_available` an ordered candidate list
+        // must still not move a request whose state another model holds.
+        let build = || {
+            let client = Arc::new(CandidateClient {
+                calls: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                first: FirstOutcome::ServerError,
+            });
+            (Arc::clone(&client), ClientRouter::single(client))
+        };
+        let models = vec![ModelId::from("weak"), ModelId::from("strong")];
+        let observe = |_observation| {};
+
+        // Control: no recorded owner, so the ordered list is honoured.
+        let (client, clients) = build();
+        let _ = call_first_available(
+            &clients,
+            "candidate_test",
+            &continuation_request("resp_owned"),
+            &models,
+            &observe,
+        )
+        .await;
+        assert_eq!(
+            client.calls.lock().clone(),
+            vec![ModelId::from("weak"), ModelId::from("strong")],
+            "without stored state the fallback list applies"
+        );
+
+        // The same call, once "weak" is recorded as the owner.
+        let (client, clients) = build();
+        clients.inner.state_owners.lock().by_id.insert(
+            "resp_owned".to_string(),
+            StoredState {
+                model: ModelId::from("weak"),
+                history: None,
+            },
+        );
+        let result = call_first_available(
+            &clients,
+            "candidate_test",
+            &continuation_request("resp_owned"),
+            &models,
+            &observe,
+        )
+        .await;
+        assert_eq!(
+            client.calls.lock().clone(),
+            vec![ModelId::from("weak")],
+            "an owned continuation must not reach another candidate"
+        );
+        match result {
+            Err(LibsyError::ClientCall { source, .. }) => assert!(matches!(
+                source,
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ..
+                }
+            )),
+            Ok(_) => panic!("expected the owner's own error, got a success"),
+            Err(other) => panic!("expected a client-call error, got {other}"),
+        }
         Ok(())
     }
 

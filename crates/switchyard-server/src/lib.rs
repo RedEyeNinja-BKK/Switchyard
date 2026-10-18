@@ -1596,12 +1596,19 @@ fn client_error(error: &LlmClientError) -> Response {
             "upstream_error",
             "upstream_error",
         ),
-        LlmClientError::Timeout { source } => error_response(
-            StatusCode::GATEWAY_TIMEOUT,
-            source.to_string(),
-            "upstream_error",
-            "upstream_timeout",
-        ),
+        // Both bounds are upstream time, not a request the caller got wrong: an
+        // elapsed overall deadline and a per-attempt expiry that produced no
+        // output are equally unservable from the caller's side. They stay
+        // distinguishable in metrics (`timeout` / `attempt_timeout`) but share
+        // one wire contract.
+        LlmClientError::Timeout { source } | LlmClientError::AttemptTimeout { source } => {
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                source.to_string(),
+                "upstream_error",
+                "upstream_timeout",
+            )
+        }
         LlmClientError::RequestEncoding(message) => server_error(message),
         _ => server_error(error.to_string()),
     }
@@ -2277,6 +2284,36 @@ mod tests {
                 .map(|error| error.0.as_str()),
             Some("invalid request")
         );
+    }
+
+    // A pre-commit attempt expiry is a gateway timeout, not an internal error:
+    // the upstream took too long and produced nothing. It shares the caller-facing
+    // contract with the overall deadline; only the metric label separates them.
+    #[test]
+    fn an_attempt_timeout_renders_as_a_gateway_timeout() {
+        let timeout = || LlmClientError::AttemptTimeout {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "attempt produced no usable output within 1000 ms",
+            )),
+        };
+        let overall = LlmClientError::Timeout {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request exceeded 2000 ms",
+            )),
+        };
+        for error in [timeout(), overall] {
+            let response = client_error(&error);
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let api_error = response
+                .extensions()
+                .get::<ApiError>()
+                .expect("ApiError extension");
+            assert_eq!(api_error.status, StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(api_error.error_type, "upstream_error");
+            assert_eq!(api_error.code, "upstream_timeout");
+        }
     }
 
     // The provider's message can quote request content, so the request log

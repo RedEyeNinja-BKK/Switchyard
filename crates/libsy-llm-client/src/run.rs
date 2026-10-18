@@ -237,6 +237,10 @@ async fn call_first_available(
     models: &[ModelId],
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
 ) -> Result<Response> {
+    // Provider state can only be continued by the model that owns it. Any other
+    // candidate would lose or reconstruct the conversation, so a recorded owner
+    // pins the route even when another candidate is configured.
+    let pinned_owner = clients.continuation_owner(request);
     for (index, target) in models.iter().enumerate() {
         let request = clients.prepare_completion_request(request.clone(), target);
         match call_one(
@@ -253,6 +257,14 @@ async fn call_first_available(
         {
             Ok(response) => return Ok(response),
             Err(error) if index + 1 == models.len() => return Err(error),
+            Err(error) if pinned_owner.is_some() => {
+                tracing::info!(
+                    from = %target,
+                    owner = %pinned_owner.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "continuation owner failed; not falling back"
+                );
+                return Err(error);
+            }
             Err(error) => match fallback_reason(&error) {
                 Some(reason) => tracing::info!(
                     from = %target,
@@ -452,6 +464,9 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
     match source {
         LlmClientError::ContextWindowExceeded { .. } => FailureClass::ContextWindow,
         LlmClientError::Transport { .. } => FailureClass::Transport,
+        // A per-attempt expiry is a deadline that elapsed, so a whole-route
+        // composite treats it exactly like an upstream 408.
+        LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
         LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
         LlmClientError::UpstreamHttp { status, body } => match *status {
             StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
@@ -480,6 +495,11 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     };
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
+        // Pre-commit expiry: this attempt returned no response at all, so another
+        // candidate loses nothing. `Timeout` is deliberately absent: it means the
+        // overall lifetime elapsed or a delivered stream stopped, and routing
+        // around either would splice two models' output or overrun the budget.
+        LlmClientError::AttemptTimeout { .. } => Some(RoutingFallbackReason::Unavailable),
         LlmClientError::Transport { .. } | LlmClientError::TemporarilyUnavailable => {
             Some(RoutingFallbackReason::Unavailable)
         }
@@ -1157,6 +1177,8 @@ mod tests {
         ContextWindow,
         ContentPolicy,
         Unauthorized,
+        AttemptTimeout,
+        TerminalTimeout,
         StreamSuccess,
         MidStreamError,
     }
@@ -1186,6 +1208,20 @@ mod tests {
                     FirstOutcome::Unauthorized => Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::UNAUTHORIZED,
                         body: "unauthorized".to_string(),
+                    }),
+                    FirstOutcome::AttemptTimeout => Err(LlmClientError::AttemptTimeout {
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "attempt produced no usable output",
+                        )
+                        .into(),
+                    }),
+                    FirstOutcome::TerminalTimeout => Err(LlmClientError::Timeout {
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "response did not finish within the overall budget",
+                        )
+                        .into(),
                     }),
                     FirstOutcome::StreamSuccess => Ok(stream_response(vec![
                         LlmResponseChunk::TextDelta {
@@ -1403,6 +1439,8 @@ mod tests {
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
                         timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
                         requires_list_input: false,
                     };
                     let backend = if responses {
@@ -1553,6 +1591,8 @@ mod tests {
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
                     timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
                     requires_list_input: false,
                 }),
                 None,
@@ -2084,6 +2124,22 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_commit_attempt_timeout_crosses_routes_but_a_terminal_timeout_does_not() {
+        let error = |source| LibsyError::client_call("target", source);
+        let attempt = error(LlmClientError::AttemptTimeout {
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "no output").into(),
+        });
+        assert_eq!(failure_class(&attempt), FailureClass::Timeout);
+        assert!(FailureClass::Timeout.allows_cross_route());
+
+        let terminal = error(LlmClientError::Timeout {
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "overall").into(),
+        });
+        assert_eq!(failure_class(&terminal), FailureClass::Other);
+        assert!(!FailureClass::Other.allows_cross_route());
+    }
+
+    #[test]
     fn fallback_only_accepts_context_policy_and_unavailable_failures() {
         let error = |source| LibsyError::client_call("target", source);
         assert_eq!(
@@ -2191,6 +2247,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pre_commit_attempt_timeout_falls_back_but_a_committed_timeout_does_not() -> Result<()>
+    {
+        // Nothing reached the caller, so another candidate may serve the request.
+        let (client, result) = run_candidates(FirstOutcome::AttemptTimeout).await;
+        let (_, response) = result.expect("a pre-commit timeout must be routable");
+        assert_eq!(
+            &*client.calls.lock(),
+            &[ModelId::from("weak"), "strong".into()]
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
+
+        // A terminal timeout may follow output the caller already holds, or an
+        // exhausted overall budget. Routing around it would splice two models or
+        // overrun the deadline, so the second candidate must stay untouched.
+        let (client, result) = run_candidates(FirstOutcome::TerminalTimeout).await;
+        assert!(matches!(
+            result,
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::Timeout { .. },
+                ..
+            })
+        ));
+        assert_eq!(&*client.calls.lock(), &[ModelId::from("weak")]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn retry_exhaustion_falls_back_and_optional_cooldown_skips_failed_backend() -> Result<()>
     {
         let server = MockServer::start().await;
@@ -2237,6 +2320,8 @@ mod tests {
                     max_retries: 2,
                     failure_cooldown: cooldown,
                     timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
                     requires_list_input: false,
                 })
             };
@@ -2361,6 +2446,8 @@ mod tests {
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
                 timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
                 requires_list_input: false,
             })
         };

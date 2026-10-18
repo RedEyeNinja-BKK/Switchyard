@@ -151,7 +151,9 @@ fn client_error_summary(
             (RouteErrorKind::ContextWindowExceeded, None)
         }
         LlmClientError::TemporarilyUnavailable => (RouteErrorKind::TemporarilyUnavailable, None),
-        LlmClientError::Timeout { .. } => (RouteErrorKind::Timeout, None),
+        LlmClientError::Timeout { .. } | LlmClientError::AttemptTimeout { .. } => {
+            (RouteErrorKind::Timeout, None)
+        }
         LlmClientError::Transport { .. } => (RouteErrorKind::Transport, None),
         LlmClientError::InvalidResponse { .. } => (RouteErrorKind::InvalidResponse, None),
         LlmClientError::RequestTranslation(_) => (RouteErrorKind::RequestTranslation, None),

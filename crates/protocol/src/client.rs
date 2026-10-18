@@ -76,8 +76,24 @@ pub enum LlmClientError {
     },
 
     /// The upstream request exceeded its timeout.
+    ///
+    /// Surfaced once the response is committed (a stream the caller already holds
+    /// stopped producing) or when the request's overall lifetime elapsed. A caller
+    /// must not route around this: output may already have been delivered.
     #[error("upstream request timed out: {source}")]
     Timeout {
+        /// Client-specific timeout failure.
+        #[source]
+        source: BoxError,
+    },
+
+    /// One attempt elapsed its own bound before producing any usable output.
+    ///
+    /// Pre-commit by construction: the attempt never returned a response to the
+    /// caller, so no output can be lost by trying another candidate. Distinct from
+    /// [`LlmClientError::Timeout`], which never permits fallback.
+    #[error("upstream attempt timed out before producing output: {source}")]
+    AttemptTimeout {
         /// Client-specific timeout failure.
         #[source]
         source: BoxError,

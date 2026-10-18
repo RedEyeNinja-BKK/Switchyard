@@ -435,6 +435,27 @@ impl TranslatingLlmClient {
                 retry_delay_ms = tracing::field::Empty,
             );
             let mut attempt_started = false;
+            // Per-attempt bound: send, response headers and the first decoded event.
+            // It stops applying once this attempt returns, so it can never cut a
+            // healthy stream short. Expiry here happens before anything reaches the
+            // caller, which is what makes it safe to try another candidate.
+            let attempt_deadline = backend.attempt_timeout().map(|bound| {
+                let at = tokio::time::Instant::now() + bound;
+                match expires_at {
+                    Some((overall, _)) => (at.min(overall), bound),
+                    None => (at, bound),
+                }
+            });
+            let attempt_expired = async {
+                match attempt_deadline {
+                    Some((at, bound)) => {
+                        tokio::time::sleep_until(at).await;
+                        bound
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(attempt_expired);
             let result = tokio::select! {
                 biased;
                 timeout = &mut deadline => {
@@ -444,6 +465,18 @@ impl TranslatingLlmClient {
                     span.record("outcome", "error");
                     span.record("will_retry", false);
                     return Err(deadline_error(timeout));
+                }
+                bound = &mut attempt_expired => {
+                    if attempt_started {
+                        metrics::record_upstream_attempt(None);
+                    }
+                    span.record("outcome", "error");
+                    span.record("will_retry", false);
+                    Err(AttemptFailure {
+                        error: attempt_timeout_error(bound),
+                        status: None,
+                        retry_after: None,
+                    })
                 }
                 result = async {
                     attempt_started = true;
@@ -466,7 +499,12 @@ impl TranslatingLlmClient {
                             upstream_headers,
                         } => EncodedResponse::Streaming {
                             status,
-                            chunks: stream_with_deadline(chunks, expires_at),
+                            // Post-commit bounds: the caller holds this stream, so an
+                            // expiry is terminal rather than a fallback opportunity.
+                            chunks: stream_with_idle_deadline(
+                                stream_with_deadline(chunks, expires_at),
+                                backend.stream_idle_timeout(),
+                            ),
                             upstream_headers,
                         },
                         buffered => buffered,
@@ -845,6 +883,35 @@ fn deadline_error(timeout: Duration) -> LlmClientError {
     }
 }
 
+// Pre-commit expiry: no response was returned for this attempt, so routing may
+// still choose another candidate. Kept distinct from `deadline_error` so the
+// fallback decision never has to guess which deadline fired.
+fn attempt_timeout_error(bound: Duration) -> LlmClientError {
+    LlmClientError::AttemptTimeout {
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "attempt produced no usable output within {} ms",
+                duration_millis(bound)
+            ),
+        )),
+    }
+}
+
+// Post-commit inactivity: the caller holds the stream and already received at
+// least one event, so this is a terminal `Timeout`, never a fallback trigger.
+fn idle_timeout_error(idle: Duration) -> LlmClientError {
+    LlmClientError::Timeout {
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "stream produced no event within {} ms",
+                duration_millis(idle)
+            ),
+        )),
+    }
+}
+
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
         is_transient_failure(&self.error)
@@ -853,7 +920,9 @@ impl AttemptFailure {
 
 fn is_transient_failure(error: &LlmClientError) -> bool {
     match error {
-        LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
+        LlmClientError::Transport { .. }
+        | LlmClientError::Timeout { .. }
+        | LlmClientError::AttemptTimeout { .. } => true,
         LlmClientError::UpstreamHttp { status, .. } => {
             metrics::is_retryable_http_status(status.as_u16())
         }
@@ -873,6 +942,29 @@ fn stream_with_deadline(
         let chunk = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(at) => return Some((Err(deadline_error(timeout)), None)),
+            chunk = chunks.next() => chunk?,
+        };
+        let next = chunk.is_ok().then_some(chunks);
+        Some((chunk, next))
+    })
+    .boxed()
+}
+
+// Bounds the gap between events on a stream the caller already holds. This is a
+// post-commit bound: a slow but progressing stream is left alone, and an expiry
+// surfaces as an in-band error rather than a new candidate.
+fn stream_with_idle_deadline(
+    chunks: LlmResponseStream,
+    idle: Option<Duration>,
+) -> LlmResponseStream {
+    let Some(idle) = idle else {
+        return chunks;
+    };
+    stream::unfold(Some(chunks), move |chunks| async move {
+        let mut chunks = chunks?;
+        let chunk = tokio::select! {
+            biased;
+            _ = tokio::time::sleep(idle) => return Some((Err(idle_timeout_error(idle)), None)),
             chunk = chunks.next() => chunk?,
         };
         let next = chunk.is_ok().then_some(chunks);
@@ -1470,6 +1562,8 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
             requires_list_input: false,
         }
     }
@@ -2898,6 +2992,207 @@ mod tests {
             "recovered"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    // Serves a scripted SSE response, writing each event after its own delay.
+    // Used for the cases wiremock cannot express: headers now, body later, and a
+    // stream that starts promptly then stops producing.
+    fn paced_stream_server(
+        events: Vec<(u64, String)>,
+    ) -> std::io::Result<(String, JoinHandle<std::io::Result<()>>, Arc<AtomicUsize>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&connections);
+        let handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept()?;
+                observed.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                if stream.read(&mut request)? == 0 {
+                    continue;
+                }
+                stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )?;
+                for (delay_ms, payload) in &events {
+                    std::thread::sleep(Duration::from_millis(*delay_ms));
+                    write!(stream, "{:X}\r\n{payload}\r\n", payload.len())?;
+                    stream.flush()?;
+                }
+                stream.write_all(b"0\r\n\r\n")?;
+            }
+            Ok(())
+        });
+        Ok((format!("http://{address}/v1"), handle, connections))
+    }
+
+    fn chat_delta(text: &str) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
+    }
+
+    #[tokio::test]
+    async fn attempt_timeout_before_headers_is_pre_commit()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(600)))
+            .mount(&server)
+            .await;
+
+        let mut backend = config_with_retries(&format!("{}/v1", server.uri()), 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("attempt bound must fire before the response".into()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, LlmClientError::AttemptTimeout { .. }),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attempt_timeout_after_headers_before_first_event_is_pre_commit()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // Headers arrive immediately; the first event does not. Without an attempt
+        // bound this looked like a success until the overall deadline fired.
+        let (base_url, _handle, connections) =
+            paced_stream_server(vec![(600, chat_delta("late"))])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("the first event must not arrive".into()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, LlmClientError::AttemptTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_overall_deadline_stays_terminal_and_is_not_an_attempt_timeout()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(600)))
+            .mount(&server)
+            .await;
+
+        let mut backend = config_with_retries(&format!("{}/v1", server.uri()), 0);
+        backend.timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("overall deadline must fire".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LlmClientError::Timeout { .. }), "{error:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_slow_but_progressing_stream_is_not_cut_by_the_attempt_bound()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // Two events, 150 ms apart: the whole response outlives a 100 ms attempt
+        // bound, but the first event arrives inside it. The attempt bound must stop
+        // applying once the attempt returns, or valid streams get truncated.
+        let (base_url, _handle, _connections) = paced_stream_server(vec![
+            (10, chat_delta("Hello")),
+            (150, chat_delta(" world")),
+            (10, "data: [DONE]\n\n".to_string()),
+        ])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert_eq!(completion_text(&agg), "Hello world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_after_first_event_is_terminal_and_never_reaches_a_second_attempt()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The first event is delivered, then silence. This is post-commit: the
+        // caller holds output, so the only correct outcome is a timeout on that
+        // same stream, with no new upstream call behind its back.
+        let (base_url, _handle, connections) =
+            paced_stream_server(vec![(10, chat_delta("partial")), (600, chat_delta("never"))])?;
+        let mut backend = config_with_retries(&base_url, 2);
+        backend.stream_idle_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let LlmResponse::Stream(mut chunks) = response.llm_response else {
+            return Err("expected a stream".into());
+        };
+        let mut saw_partial = false;
+        let mut timeout = None;
+        while let Some(item) = chunks.next().await {
+            match item {
+                Ok(event) => {
+                    saw_partial |= event
+                        .normalized()
+                        .iter()
+                        .any(|chunk| matches!(chunk, LlmResponseChunk::TextDelta { .. }));
+                }
+                Err(error) => {
+                    timeout = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(saw_partial, "the first event must reach the caller");
+        assert!(
+            matches!(timeout, Some(LlmClientError::Timeout { .. })),
+            "{timeout:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

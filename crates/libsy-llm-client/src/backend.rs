@@ -84,6 +84,18 @@ pub struct HttpBackendConfig {
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
+    /// Deadline for a single attempt, measured from send to the first decoded event.
+    ///
+    /// This is the "no usable output yet" bound: it covers connection, response headers
+    /// and the first event, then stops applying. An expiry here is pre-commit — nothing
+    /// has been handed to the caller — so the request may advance to another candidate
+    /// while the overall `timeout` still has room. `None` confines an attempt to `timeout`.
+    pub attempt_timeout: Option<Duration>,
+    /// Maximum gap between two events once a stream has started.
+    ///
+    /// A stream that is slow but progressing is not a failure; a stream that stops
+    /// producing is. `None` confines the gap to `timeout`.
+    pub stream_idle_timeout: Option<Duration>,
     /// This upstream requires the Responses `input` to be a JSON array.
     ///
     /// The Codex backend does: it rejects the compact bare-string form with
@@ -107,6 +119,8 @@ impl fmt::Debug for HttpBackendConfig {
             .field("max_retries", &self.max_retries)
             .field("failure_cooldown", &self.failure_cooldown)
             .field("timeout", &self.timeout)
+            .field("attempt_timeout", &self.attempt_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish()
     }
 }
@@ -365,6 +379,16 @@ impl Backend {
         self.config().timeout
     }
 
+    /// Deadline for one attempt up to its first decoded event; `None` inherits `timeout`.
+    pub fn attempt_timeout(&self) -> Option<Duration> {
+        self.config().attempt_timeout
+    }
+
+    /// Maximum gap between events once a stream has started; `None` inherits `timeout`.
+    pub fn stream_idle_timeout(&self) -> Option<Duration> {
+        self.config().stream_idle_timeout
+    }
+
     /// Whether this backend speaks the Anthropic Messages wire format — the only
     /// one with a `count_tokens` endpoint.
     pub fn is_anthropic(&self) -> bool {
@@ -476,6 +500,8 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
             requires_list_input: false,
         }
     }

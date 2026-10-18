@@ -1481,6 +1481,20 @@ struct LlmClientConfig {
     failure_cooldown_ms: u64,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
+    /// Deadline in milliseconds for one attempt, from send to the first decoded event.
+    ///
+    /// Bounds "this candidate is producing nothing": connect, response headers and the
+    /// first event. It stops applying once the attempt returns, so it never truncates a
+    /// stream that is already delivering. An expiry here is pre-commit and may advance
+    /// to another candidate; unset means an attempt is bounded only by `timeout_ms`.
+    #[serde(default)]
+    attempt_timeout_ms: Option<u64>,
+    /// Maximum gap in milliseconds between events once a stream has started.
+    ///
+    /// A slow but progressing stream is unaffected; a stream that stops producing ends
+    /// with an in-band timeout. Unset means the gap is bounded only by `timeout_ms`.
+    #[serde(default)]
+    stream_idle_timeout_ms: Option<u64>,
     /// This upstream requires the Responses `input` to be a JSON array.
     ///
     /// The Codex backend rejects the compact bare-string form with `Input must be a list`.
@@ -1619,6 +1633,28 @@ fn build_backend(
             "llm client {client_name} timeout_ms must be at least 1"
         )));
     }
+    for (label, value) in [
+        ("attempt_timeout_ms", config.attempt_timeout_ms),
+        ("stream_idle_timeout_ms", config.stream_idle_timeout_ms),
+    ] {
+        if value == Some(0) {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} {label} must be at least 1"
+            )));
+        }
+    }
+    // Naming both makes the relationship explicit here rather than at the call site:
+    // an attempt bound wider than the overall bound can never take effect.
+    if let (Some(attempt), Some(overall)) = (config.attempt_timeout_ms, config.timeout_ms)
+        && attempt > overall
+    {
+        tracing::warn!(
+            llm_client = client_name,
+            attempt_timeout_ms = attempt,
+            timeout_ms = overall,
+            "attempt_timeout_ms exceeds timeout_ms; the overall deadline wins"
+        );
+    }
     if config.forward_auth && config.api_key_env.is_some() {
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} cannot set both forward_auth and api_key_env"
@@ -1659,6 +1695,8 @@ fn build_backend(
         max_retries: config.max_retries,
         failure_cooldown: Duration::from_millis(config.failure_cooldown_ms),
         timeout: config.timeout_ms.map(Duration::from_millis),
+        attempt_timeout: config.attempt_timeout_ms.map(Duration::from_millis),
+        stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
         requires_list_input: config.requires_list_input,
     };
     let backend = match config.format {

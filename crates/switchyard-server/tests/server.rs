@@ -762,6 +762,8 @@ fn random_state_with_retries(
         max_retries,
         failure_cooldown: std::time::Duration::ZERO,
         timeout: None,
+        attempt_timeout: None,
+        stream_idle_timeout: None,
         requires_list_input: false,
     });
     let target_models = routes

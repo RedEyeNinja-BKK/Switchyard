@@ -352,7 +352,7 @@ async fn rerank_top_n_ceiling_is_enforced_at_the_boundary() {
     let message = String::from_utf8_lossy(&body).to_string();
     assert!(message.contains("top_n 6"), "{message}");
     assert!(
-        message.contains("max_candidates") == false || message.contains("top_n 5"),
+        !message.contains("max_candidates") || message.contains("top_n 5"),
         "the error must name the declared ceiling, not the candidate pool: {message}"
     );
 

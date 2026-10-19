@@ -88,7 +88,7 @@ impl RuntimeModels {
         };
         RuntimeModels {
             by_category: filter(&self.by_category),
-            subagent: self.subagent.as_ref().map(|subagent| filter(subagent)),
+            subagent: self.subagent.as_ref().map(filter),
         }
     }
 

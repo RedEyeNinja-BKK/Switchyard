@@ -105,13 +105,13 @@ pub(super) fn video_source(block: &Map<String, Value>) -> Option<MediaSource> {
                 media_type: text(block, "media_type"),
             });
         }
-        if let Some(nested) = value.as_object() {
-            if let Some(url) = nested.get("url").and_then(Value::as_str) {
-                return Some(MediaSource::Url {
-                    url: url.to_string(),
-                    media_type: text(nested, "media_type"),
-                });
-            }
+        if let Some(nested) = value.as_object()
+            && let Some(url) = nested.get("url").and_then(Value::as_str)
+        {
+            return Some(MediaSource::Url {
+                url: url.to_string(),
+                media_type: text(nested, "media_type"),
+            });
         }
     }
     if let Some(video) = block.get("video").and_then(Value::as_object) {

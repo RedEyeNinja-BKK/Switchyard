@@ -65,11 +65,11 @@ impl Upstream {
                     String::from_utf8_lossy(&buffer[body_start.min(buffer.len())..]).to_string();
                 let parsed: Value = serde_json::from_str(raw.trim()).unwrap_or(Value::Null);
                 runtime.block_on(async { seen.lock().await.push(parsed.clone()) });
-                let index = calls.fetch_add(1, Ordering::SeqCst);
+                calls.fetch_add(1, Ordering::SeqCst);
                 let header =
                     String::from_utf8_lossy(&buffer[..body_start.min(buffer.len())]).to_string();
                 let parsed: Value = serde_json::from_str(raw.trim()).unwrap_or(Value::Null);
-                let (status, payload) = script(&header, &parsed, index);
+                let (status, payload) = script(&header, &parsed);
                 let response = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
                     payload.len()
@@ -84,7 +84,7 @@ impl Upstream {
 
 /// Chooses the scripted response from the request body, so distinct targets on one
 /// upstream are still told apart by the model they name.
-fn script(request: &str, body: &Value, index: usize) -> (u16, String) {
+fn script(request: &str, body: &Value) -> (u16, String) {
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -107,26 +107,6 @@ fn script(request: &str, body: &Value, index: usize) -> (u16, String) {
         || model.contains("a1-fails")
     {
         return (503, json!({"error": {"message": "flaky"}}).to_string());
-    }
-    if true {
-        {
-            (
-                200,
-                json!({
-                    "id": "resp_ok",
-                    "object": "response",
-                    "model": model,
-                    "status": "completed",
-                    "output": [{
-                        "type": "message", "id": "m1", "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": "ok"}]
-                    }],
-                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-                })
-                .to_string(),
-            )
-        };
     }
     (
         200,
@@ -306,7 +286,6 @@ async fn child_internal_fallback_finishes_before_the_parent_crosses() {
         "the model that served is child A's second candidate"
     );
     assert!(!outcome.crossed_child, "the parent stayed inside child A");
-    let seen = flaky.bodies().await;
     let models = seen_models(&flaky).await;
     assert!(
         models.iter().filter(|model| model.ends_with("a1")).count() >= 1
@@ -755,10 +734,8 @@ async fn a_flattening_parent_cannot_satisfy_child_route_semantics() {
     let spare_url = spare.clone().server();
 
     let config = format!(
-        "schema_version = 1\n{}{}\n[composites.tier1]\nchildren = [\"smart-bounded\", \"spare\"]\n",
         // The child's first candidate fails; its second is strict non-reasoning.
-        format!(
-            r#"
+        r#"schema_version = 1
 [llm_clients.client-smart-bounded]
 format = "openai_responses"
 base_url = "{bounded_url}"
@@ -778,11 +755,12 @@ id = "smart-bounded"
 type = "passthrough"
 target = "a1-smart-bounded"
 candidates = ["b2-smart-bounded"]
+{spare_leaf}[composites.tier1]
+children = ["smart-bounded", "spare"]
 "#,
-        ),
         // The other child's targets use distinct names so they cannot collide with the
         // strict child's above.
-        leaf_named("spare", &spare_url, &["b1"], "vendor/spare-"),
+        spare_leaf = leaf_named("spare", &spare_url, &["b1"], "vendor/spare-"),
     );
 
     // The caller actively tries to turn reasoning back on.

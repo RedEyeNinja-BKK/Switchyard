@@ -1032,13 +1032,11 @@ impl DeploymentConfig {
                 // cycles were already rejected above.
                 let is_leaf = lanes.contains_key(child.as_str());
                 let is_composite = self.decision_lane_composition.contains_key(child.as_str());
-                if !is_leaf {
-                    if !is_composite {
-                        return Err(RunnerError::configuration(format!(
-                            "decision lane {name} composes child lane {child}, which resolved to no \
-                             decision targets"
-                        )));
-                    }
+                if !is_leaf && !is_composite {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} composes child lane {child}, which resolved to no \
+                         decision targets"
+                    )));
                 }
                 ordered.push(child.clone());
             }
@@ -1259,11 +1257,9 @@ impl DeploymentConfig {
                                     .find(|candidate| {
                                         candidate.name == name || candidate.model == name
                                     })
-                                    .ok_or_else(|| {
-                                        decision_executor::DecisionFailure::NotEligible(
-                                            decision_executor::DecisionSkip::TargetNotFound,
-                                        )
-                                    })?;
+                                    .ok_or(decision_executor::DecisionFailure::NotEligible(
+                                        decision_executor::DecisionSkip::TargetNotFound,
+                                    ))?;
                                 decision_executor::serve_target(candidate, &request).await
                             }
                             decision_executor::DecisionIdentity::Lane => {
@@ -2260,7 +2256,7 @@ new = ["send_message"]
         }
 
         // An unspecified policy declares nothing, so an absent dialect stays legal.
-        let no_policy = VALID_CONFIG.replace(strong, strong);
+        let no_policy = VALID_CONFIG.to_string();
         runner_from_toml(&no_policy).expect("a target with no policy needs no dialect");
 
         // A dialect on its own is also fine; it only becomes meaningful with a policy.
@@ -2449,7 +2445,7 @@ new = ["send_message"]
                 &format!("{strong}\nreasoning_dialect = \"openai_effort\""),
             )
             .replace(
-                &passthrough,
+                passthrough,
                 &format!("{on_effort_target}\nroute_reasoning_policy = \"medium\""),
             );
 
@@ -2462,7 +2458,7 @@ new = ["send_message"]
                     &format!("{strong}\nreasoning_dialect = \"openai_effort\""),
                 )
                 .replace(
-                    &passthrough,
+                    passthrough,
                     &format!("{on_effort_target}\nroute_reasoning_policy = \"none\""),
                 ),
         )

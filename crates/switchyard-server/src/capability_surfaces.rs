@@ -226,10 +226,10 @@ async fn forward(state: &ServerState, capability: &ResolvedCapability, payload: 
                         .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
                 );
             }
-            if let Some(dimensions) = capability.dimensions {
-                if let Ok(value) = dimensions.to_string().parse() {
-                    headers.insert("x-switchyard-embedding-dimensions", value);
-                }
+            if let Some(dimensions) = capability.dimensions
+                && let Ok(value) = dimensions.to_string().parse()
+            {
+                headers.insert("x-switchyard-embedding-dimensions", value);
             }
             (status, headers, body).into_response()
         }

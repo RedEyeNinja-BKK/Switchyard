@@ -97,7 +97,7 @@ pub(crate) fn observe(
                                         &model,
                                         None,
                                         usage,
-                                        &composition,
+                                        composition,
                                     );
                                 }
                                 None => log.append(context.clone(), &model, None, usage),

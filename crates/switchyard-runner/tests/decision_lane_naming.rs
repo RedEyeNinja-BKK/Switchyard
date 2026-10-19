@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::json;
-use switchyard_protocol::{DecisionKind, DecisionQuestion, DecisionRequest, ModelId};
+use switchyard_protocol::{DecisionKind, DecisionQuestion, DecisionRequest};
 use switchyard_runner::{Runner, RunnerError};
 
 fn decision_config(lanes: &str, composition: &str) -> String {
@@ -489,7 +489,7 @@ async fn an_ineligible_request_is_not_forwarded_to_a_sibling() {
     use std::sync::Arc;
 
     use switchyard_runner::decision_executor::{
-        DecisionCandidate, DecisionFailure, DecisionResolver, LaneChild, serve_composed,
+        DecisionCandidate, DecisionResolver, LaneChild, serve_composed,
     };
     use switchyard_runner::decision_transport::{DecisionTransport, StateForms, SupportedTypes};
 
@@ -629,7 +629,6 @@ fn the_shared_classifier_resolves_an_explicitly_named_lane() {
 
     use switchyard_runner::decision_executor::{
         DecisionResolver, LaneResolverHandle, NamedDispatch, classify_named, composed_children,
-        serve_named,
     };
 
     let handle = |_name: &str| LaneResolverHandle {

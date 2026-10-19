@@ -1115,11 +1115,11 @@ mod tests {
     use futures::StreamExt;
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
+    use switchyard_protocol::ReasoningDialect;
     use switchyard_protocol::{
         ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Message, Role,
         ToolResult, completion_text, text_request, text_response,
     };
-    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

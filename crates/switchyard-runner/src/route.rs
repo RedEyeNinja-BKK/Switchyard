@@ -376,7 +376,6 @@ impl Route {
                         &request.llm_request,
                         &raw,
                     )
-                    .or_else(|| None)
                 })
                 .or_else(|| {
                     crate::request_fit::unsupported_capability(

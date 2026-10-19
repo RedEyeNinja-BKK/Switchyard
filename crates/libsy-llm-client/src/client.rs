@@ -249,6 +249,7 @@ impl TranslatingLlmClient {
     /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
     /// backend's completion URL and decodes a response) and
     /// the model-bearing auxiliary operations, which return raw JSON.
+    #[allow(clippy::too_many_arguments)]
     async fn send_encoded(
         &self,
         backend: &Backend,
@@ -337,26 +338,25 @@ impl TranslatingLlmClient {
         }
         // A route's explicit policy outranks the target's default and the caller's effort.
         // Applied last so the route is genuinely authoritative.
-        if let Some(policy) = route_reasoning_policy {
-            if let Some(fragment) = policy.wire_body(backend.reasoning_dialect())
-                && let (Value::Object(fragment), Value::Object(object)) = (&fragment, &mut body)
-            {
-                for (key, value) in fragment {
-                    match value {
-                        Value::Object(fields) => {
-                            let entry = object
-                                .entry(key.clone())
-                                .or_insert_with(|| Value::Object(Default::default()));
-                            if !entry.is_object() {
-                                *entry = Value::Object(Default::default());
-                            }
-                            if let Value::Object(entry) = entry {
-                                entry.extend(fields.clone());
-                            }
+        if let Some(policy) = route_reasoning_policy
+            && let Some(fragment) = policy.wire_body(backend.reasoning_dialect())
+            && let (Value::Object(fragment), Value::Object(object)) = (&fragment, &mut body)
+        {
+            for (key, value) in fragment {
+                match value {
+                    Value::Object(fields) => {
+                        let entry = object
+                            .entry(key.clone())
+                            .or_insert_with(|| Value::Object(Default::default()));
+                        if !entry.is_object() {
+                            *entry = Value::Object(Default::default());
                         }
-                        _ => {
-                            object.insert(key.clone(), value.clone());
+                        if let Value::Object(entry) = entry {
+                            entry.extend(fields.clone());
                         }
+                    }
+                    _ => {
+                        object.insert(key.clone(), value.clone());
                     }
                 }
             }

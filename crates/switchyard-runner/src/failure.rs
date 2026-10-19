@@ -100,9 +100,13 @@ impl RunnerError {
                 None,
                 None,
             ),
+            // A capability no eligible route can satisfy, and a conflicting provider state
+            // claim, are both decided against the request rather than the deployment.
             Self::UnknownRouteModel(_)
             | Self::IncompatibleCallerFormat(_)
-            | Self::AuxiliaryUnsupported => summary(
+            | Self::AuxiliaryUnsupported
+            | Self::UnsupportedCapability { .. }
+            | Self::StateConflict(_) => summary(
                 RouteErrorKind::InvalidRequest,
                 RouteErrorPhase::BeforeResponse,
                 None,
@@ -147,7 +151,9 @@ fn client_error_summary(
             (RouteErrorKind::ContextWindowExceeded, None)
         }
         LlmClientError::TemporarilyUnavailable => (RouteErrorKind::TemporarilyUnavailable, None),
-        LlmClientError::Timeout { .. } => (RouteErrorKind::Timeout, None),
+        LlmClientError::Timeout { .. } | LlmClientError::AttemptTimeout { .. } => {
+            (RouteErrorKind::Timeout, None)
+        }
         LlmClientError::Transport { .. } => (RouteErrorKind::Transport, None),
         LlmClientError::InvalidResponse { .. } => (RouteErrorKind::InvalidResponse, None),
         LlmClientError::RequestTranslation(_) => (RouteErrorKind::RequestTranslation, None),

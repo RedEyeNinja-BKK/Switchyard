@@ -42,6 +42,20 @@ pub fn encode_request(request: &LlmRequest, wire_format: WireFormat) -> Result<V
         .body)
 }
 
+/// Encodes a normalized request under an explicit policy.
+///
+/// Used when the target declares a capability the default policy does not carry, such as
+/// an upstream that requires a list-shaped Responses `input`.
+pub fn encode_request_with_policy(
+    request: &LlmRequest,
+    wire_format: WireFormat,
+    policy: &TranslationPolicy,
+) -> Result<Value> {
+    Ok(DEFAULT_TRANSLATION_ENGINE
+        .encode_request(wire_format, request, policy)?
+        .body)
+}
+
 /// Decodes a buffered `wire_format` response body into the neutral aggregate.
 pub fn decode_aggregated_response(body: &Value, wire_format: WireFormat) -> Result<AggLlmResponse> {
     Ok(DEFAULT_TRANSLATION_ENGINE

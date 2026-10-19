@@ -944,6 +944,14 @@ fn decode_responses_content(value: &Value) -> Vec<ContentBlock> {
                     Some("input_audio") => out.push(ContentBlock::Audio {
                         source: MediaSource::Raw(Value::Object(block.clone())),
                     }),
+                    Some("input_video") => {
+                        // Unrecognized spellings stay video rather than becoming opaque
+                        // data: the medium is known from the discriminator even when its
+                        // shape is not, and admission has to see it.
+                        let source = crate::codecs::openai_media::video_source(block)
+                            .unwrap_or(MediaSource::Raw(Value::Object(block.clone())));
+                        out.push(ContentBlock::Video { source });
+                    }
                     Some("input_file") => out.push(ContentBlock::File {
                         source: decode_file_source(block),
                     }),
@@ -1271,7 +1279,11 @@ fn encode_responses_input(
     // custom outputs. A tool result is typed by the call it answers, and Responses history
     // always lists the call before its output, so recording ids as calls are encoded is enough
     // to type the outputs that follow.
-    if messages.len() == 1
+    // A lone user text message encodes in the compact string form, which every Responses
+    // upstream accepts. An upstream declaring `requires_list_input` is the exception: it
+    // rejects a bare string, so that case falls through to the list encoder below.
+    if policy.target_capabilities.requires_list_input != Some(true)
+        && messages.len() == 1
         && matches!(messages[0].role, Role::User)
         && messages[0].content.len() == 1
         && matches!(messages[0].content[0], ContentBlock::Text { .. })
@@ -1608,17 +1620,31 @@ fn encode_responses_content(
             ContentBlock::Audio { source } => {
                 blocks.push(crate::codecs::openai_media::audio_part(source)?);
             }
+            ContentBlock::Video {
+                source: MediaSource::Raw(raw),
+            } if raw.get("type").and_then(Value::as_str) == Some("input_video") => {
+                // Already the target spelling: forwarding it beats re-deriving it and
+                // dropping provider fields such as `processing`.
+                blocks.push(raw.clone());
+            }
             ContentBlock::Video { source } => blocks.push(match source {
                 MediaSource::Raw(raw) => json!({"type": "input_text", "text": json_string(raw)}),
-                MediaSource::Url { url, media_type } => json!({
-                    "type": "input_video",
-                    "video_url": url,
-                    "media_type": media_type,
-                }),
-                MediaSource::Base64 { media_type, data } => json!({
-                    "type": "input_video",
-                    "video": {"media_type": media_type, "data": data},
-                }),
+                MediaSource::Url { url, media_type } => {
+                    let mut part = json!({"type": "input_video", "video_url": url});
+                    // A null media type is not the same as an omitted one to a strict
+                    // provider, so the field is written only when it is known.
+                    if let Some(media_type) = media_type {
+                        part["media_type"] = Value::String(media_type.clone());
+                    }
+                    part
+                }
+                MediaSource::Base64 { media_type, data } => {
+                    let mut video = json!({"data": data});
+                    if let Some(media_type) = media_type {
+                        video["media_type"] = Value::String(media_type.clone());
+                    }
+                    json!({"type": "input_video", "video": video})
+                }
             }),
             ContentBlock::File { source } => match responses_file_part(source) {
                 Some(part) => blocks.push(part),

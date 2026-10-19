@@ -179,6 +179,8 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 

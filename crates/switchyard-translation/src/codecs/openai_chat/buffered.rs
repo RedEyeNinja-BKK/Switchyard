@@ -569,6 +569,14 @@ pub(crate) fn decode_openai_content(
                     Some("input_audio") => content.push(ContentBlock::Audio {
                         source: MediaSource::Raw(Value::Object(block.clone())),
                     }),
+                    Some("video_url") | Some("input_video") => {
+                        // Unrecognized spellings stay video rather than becoming opaque
+                        // data: the medium is known from the discriminator even when its
+                        // shape is not, and admission has to see it.
+                        let source = crate::codecs::openai_media::video_source(block)
+                            .unwrap_or(MediaSource::Raw(Value::Object(block.clone())));
+                        content.push(ContentBlock::Video { source });
+                    }
                     Some("file") | Some("input_file") => {
                         content.push(ContentBlock::File {
                             source: decode_file_source(block),

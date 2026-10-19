@@ -57,6 +57,13 @@ pub struct TargetCapabilities {
     pub supports_code_execution: Option<bool>,
     pub supports_safety_settings: Option<bool>,
     pub openai_compatible: Option<bool>,
+    /// The upstream requires `input` to be a JSON array and rejects the bare-string form.
+    ///
+    /// The Codex backend does: it answers a lone text prompt encoded as a string with
+    /// `Input must be a list`. When set, a single user message is encoded in list form.
+    /// Absent or false the compact string form is kept, which is what every other Responses
+    /// upstream expects.
+    pub requires_list_input: Option<bool>,
 }
 
 /// Provider-level profile that can be used to configure target capabilities.

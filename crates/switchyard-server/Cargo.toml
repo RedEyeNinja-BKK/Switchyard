@@ -54,3 +54,5 @@ http-body-util = "0.1"
 tempfile = "3"
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
+

@@ -29,7 +29,10 @@ thiserror.workspace = true
 toml = "1.1"
 tracing.workspace = true
 
+switchyard-translation.workspace = true
+
 [dev-dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
+wiremock = "0.6"

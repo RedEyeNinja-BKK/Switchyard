@@ -2432,10 +2432,12 @@ dependencies = [
  "switchyard-libsy",
  "switchyard-llm-client",
  "switchyard-protocol",
+ "switchyard-translation",
  "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2472,6 +2474,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

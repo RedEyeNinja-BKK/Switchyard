@@ -13,6 +13,8 @@ pub mod format;
 pub mod llm;
 pub mod metadata;
 pub mod model_id;
+/// Authoritative per-target reasoning control: the policy and the provider's wire dialect.
+pub mod reasoning_policy;
 pub mod stream;
 
 pub use category::*;
@@ -23,6 +25,7 @@ pub use format::*;
 pub use llm::*;
 pub use metadata::*;
 pub use model_id::*;
+pub use reasoning_policy::*;
 pub use stream::*;
 
 /// Builds a single-turn request: one user message carrying `prompt`, for `model`.

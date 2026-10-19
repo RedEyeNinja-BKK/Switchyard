@@ -84,6 +84,53 @@ pub(super) fn image_source_text(source: &ImageSource) -> String {
     }
 }
 
+/// Decodes a video content part into a normalized source.
+///
+/// Two provider spellings reach this: the Responses form, where `video_url` is a string,
+/// and the Chat form, where it is an object with a `url`. Inline bytes arrive under
+/// `video` with `data` and an optional `media_type`. Anything else stays unrecognized and
+/// is preserved as an opaque block rather than guessed at.
+pub(super) fn video_source(block: &Map<String, Value>) -> Option<MediaSource> {
+    fn text(object: &Map<String, Value>, key: &str) -> Option<String> {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    }
+
+    if let Some(value) = block.get("video_url") {
+        if let Some(url) = value.as_str() {
+            return Some(MediaSource::Url {
+                url: url.to_string(),
+                media_type: text(block, "media_type"),
+            });
+        }
+        if let Some(nested) = value.as_object()
+            && let Some(url) = nested.get("url").and_then(Value::as_str)
+        {
+            return Some(MediaSource::Url {
+                url: url.to_string(),
+                media_type: text(nested, "media_type"),
+            });
+        }
+    }
+    if let Some(video) = block.get("video").and_then(Value::as_object) {
+        if let Some(data) = video.get("data").and_then(Value::as_str) {
+            return Some(MediaSource::Base64 {
+                media_type: text(video, "media_type"),
+                data: data.to_string(),
+            });
+        }
+        if let Some(url) = video.get("url").and_then(Value::as_str) {
+            return Some(MediaSource::Url {
+                url: url.to_string(),
+                media_type: text(video, "media_type"),
+            });
+        }
+    }
+    None
+}
+
 pub(super) fn file_payload(source: &FileSource) -> Option<Map<String, Value>> {
     match source {
         FileSource::FileId(file_id) => {

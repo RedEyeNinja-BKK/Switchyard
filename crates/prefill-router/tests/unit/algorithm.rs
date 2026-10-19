@@ -107,6 +107,8 @@ fn request(messages: Vec<Message>) -> Request {
         },
         raw_request: None,
         metadata: None,
+        route_reasoning_policy: None,
+        route_reasoning_effort: None,
     }
 }
 
@@ -165,6 +167,8 @@ async fn routes_on_latest_user_text_and_reuses_decision_for_tool_steps() -> libs
             llm_request: text_request(Some("auto".to_string()), ""),
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         },
     )
     .await?;

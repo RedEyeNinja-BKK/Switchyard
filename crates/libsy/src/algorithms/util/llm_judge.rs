@@ -174,6 +174,8 @@ where
                 ..LlmRequest::default()
             },
             raw_request: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: request.metadata.clone(),
         }
     }
@@ -469,6 +471,8 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "judge this"),
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 

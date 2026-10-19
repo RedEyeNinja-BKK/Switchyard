@@ -131,6 +131,8 @@ impl SwitchyardRuntime {
         Ok(Request {
             llm_request,
             raw_request: Some(request.content),
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: Some(metadata),
         })
     }
@@ -365,6 +367,20 @@ impl SwitchyardRuntime {
                         severity: Some(LogSeverity::Debug),
                     }));
                     events.extend(token_usage_metrics("answer", &call, metadata));
+                }
+                RunObservation::ContextPressurePromotion {
+                    promoted,
+                    estimated_input_tokens,
+                } => {
+                    events.push(RoutingEvent::Mark(RoutingMark {
+                        name: "switchyard.routing.context_pressure".into(),
+                        data: json!({
+                            "promoted_target": promoted.as_str(),
+                            "estimated_input_tokens": estimated_input_tokens,
+                        }),
+                        metadata: metadata.clone(),
+                        severity: Some(LogSeverity::Debug),
+                    }));
                 }
             }
         }
@@ -902,6 +918,9 @@ mod tests {
             None,
             Vec::new(),
             RuntimeModels::default(),
+            switchyard_runner::RouteReasoningPolicy::Inherit,
+            None,
+            None,
         );
         SwitchyardRuntime {
             runner: Runner::new(vec![(ModelId::from(model), route)]),

@@ -61,6 +61,88 @@ impl RuntimeModels {
         }
     }
 
+    /// Whether every category has been emptied by filtering.
+    pub fn is_empty(&self) -> bool {
+        self.by_category.values().all(|models| models.is_empty())
+    }
+
+    /// Returns this model set with candidates the request cannot use removed.
+    ///
+    /// `keep` decides per candidate whether it survives; the survivors keep their declared
+    /// order. Filtering here rather than inside execution means an ineligible target is never
+    /// called, so it produces no failure, retry or cooldown event.
+    pub fn filtered<F>(&self, keep: &F) -> RuntimeModels
+    where
+        F: Fn(&ModelId) -> bool,
+    {
+        let filter = |groups: &HashMap<Category, Vec<ModelId>>| {
+            groups
+                .iter()
+                .map(|(category, models)| {
+                    (
+                        category.clone(),
+                        models.iter().filter(|model| keep(model)).cloned().collect(),
+                    )
+                })
+                .collect()
+        };
+        RuntimeModels {
+            by_category: filter(&self.by_category),
+            subagent: self.subagent.as_ref().map(filter),
+        }
+    }
+
+    /// Returns this model set with the named models moved to the front of every category,
+    /// preserving the relative order of everything else.
+    ///
+    /// Used for an under-context-pressure promotion: the named leg is offered first and the
+    /// surviving order is otherwise untouched, so the client still walks one list under its
+    /// own retry, cooldown and failure classification. A name that is not present is a
+    /// no-op rather than a synthetic entry, so a promotion never invents a model id.
+    pub fn promoting(&self, first: &[ModelId]) -> RuntimeModels {
+        if first.is_empty() {
+            return self.clone();
+        }
+        let promote = |groups: &HashMap<Category, Vec<ModelId>>| {
+            groups
+                .iter()
+                .map(|(category, models)| {
+                    let (promoted, rest): (Vec<ModelId>, Vec<ModelId>) = models
+                        .iter()
+                        .cloned()
+                        .partition(|model| first.contains(model));
+                    let mut ordered = promoted;
+                    ordered.extend(rest);
+                    (category.clone(), ordered)
+                })
+                .collect()
+        };
+        RuntimeModels {
+            by_category: promote(&self.by_category),
+            subagent: self.subagent.as_ref().map(promote),
+        }
+    }
+
+    /// Whether this model set contains `model` in any category.
+    ///
+    /// Distinct from "is this the first model": a caller deciding whether an operation will
+    /// actually happen needs presence, not position.
+    pub fn contains(&self, model: &ModelId) -> bool {
+        if self
+            .by_category
+            .values()
+            .any(|models| models.contains(model))
+        {
+            return true;
+        }
+        // Spelled out rather than chained: `contains` would resolve to the `StreamExt`
+        // method that this crate also imports.
+        match &self.subagent {
+            Some(subagent) => subagent.values().any(|models| models.contains(model)),
+            None => false,
+        }
+    }
+
     /// Adds the groups used for delegated sub-agent work.
     pub fn with_subagent(mut self, models: HashMap<Category, Vec<ModelId>>) -> Self {
         self.subagent = Some(models);
@@ -724,6 +806,8 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi".to_string()),
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 

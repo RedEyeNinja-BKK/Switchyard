@@ -83,6 +83,8 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 
@@ -151,6 +153,8 @@ mod tests {
             },
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
 
         append_note(&mut request, NOTE);

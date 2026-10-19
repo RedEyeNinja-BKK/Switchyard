@@ -746,6 +746,8 @@ impl PyAlgorithm {
         let request = Request {
             llm_request: from_python(request)?,
             raw_request: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: headers.map(|headers| Metadata::from_headers(&headers)),
         };
         let mut runtime_models = RuntimeModels::new(category_models_from_python(models)?);

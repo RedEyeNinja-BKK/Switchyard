@@ -12,7 +12,7 @@ use std::{
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use switchyard_protocol::{Metadata, WireFormat};
+use switchyard_protocol::{Metadata, ReasoningDialect, ReasoningPolicy, WireFormat};
 
 use crate::error::{LlmClientError, Result, is_overflow_body};
 
@@ -70,6 +70,13 @@ pub struct HttpBackendConfig {
     /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
     /// Anthropic has no equivalent and rejects the setting at configuration time.
     pub reasoning_effort: Option<String>,
+    /// Authoritative reasoning choice for this backend, applied after the caller's fields
+    /// and after `extra_body`. A provider that names reasoning as a boolean switch rather
+    /// than graded efforts uses this instead of `reasoning_effort`.
+    pub reasoning_policy: Option<ReasoningPolicy>,
+    /// How this provider expects reasoning control on the wire. A property of the provider,
+    /// so two targets behind one transport may use different dialects.
+    pub reasoning_dialect: ReasoningDialect,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
     /// Cooldown after an exhausted transient completion failure. Zero disables it.
@@ -77,6 +84,24 @@ pub struct HttpBackendConfig {
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
+    /// Deadline for a single attempt, measured from send to the first decoded event.
+    ///
+    /// This is the "no usable output yet" bound: it covers connection, response headers
+    /// and the first event, then stops applying. An expiry here is pre-commit — nothing
+    /// has been handed to the caller — so the request may advance to another candidate
+    /// while the overall `timeout` still has room. `None` confines an attempt to `timeout`.
+    pub attempt_timeout: Option<Duration>,
+    /// Maximum gap between two events once a stream has started.
+    ///
+    /// A stream that is slow but progressing is not a failure; a stream that stops
+    /// producing is. `None` confines the gap to `timeout`.
+    pub stream_idle_timeout: Option<Duration>,
+    /// This upstream requires the Responses `input` to be a JSON array.
+    ///
+    /// The Codex backend does: it rejects the compact bare-string form with
+    /// `Input must be a list`. Only meaningful for a Responses backend; other formats ignore
+    /// it. Defaults to false so every existing provider keeps the compact encoding.
+    pub requires_list_input: bool,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -89,9 +114,13 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_body_keys", &self.extra_body.keys())
             .field("omit_body_fields", &self.omit_body_fields)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("reasoning_policy", &self.reasoning_policy)
+            .field("reasoning_dialect", &self.reasoning_dialect)
             .field("max_retries", &self.max_retries)
             .field("failure_cooldown", &self.failure_cooldown)
             .field("timeout", &self.timeout)
+            .field("attempt_timeout", &self.attempt_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish()
     }
 }
@@ -111,6 +140,14 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Whether this backend's upstream requires a list-shaped Responses `input`.
+    ///
+    /// True only for a Responses backend that declares it, which today is the Codex lane.
+    /// The other formats carry their own input shape and ignore the flag.
+    pub fn requires_list_input(&self) -> bool {
+        matches!(self, Backend::OpenAiResponses(config) if config.requires_list_input)
+    }
+
     // Matches reqwest's header conversions before the client can send a request.
     pub(crate) fn validate_configured_headers(&self, model_name: &str) -> Result<()> {
         for (name, value) in &self.config().extra_headers {
@@ -317,6 +354,16 @@ impl Backend {
         self.config().reasoning_effort.as_deref()
     }
 
+    /// The authoritative reasoning choice for this backend, when configured.
+    pub fn reasoning_policy(&self) -> Option<ReasoningPolicy> {
+        self.config().reasoning_policy
+    }
+
+    /// How this provider expects reasoning control on the wire.
+    pub fn reasoning_dialect(&self) -> ReasoningDialect {
+        self.config().reasoning_dialect
+    }
+
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
@@ -330,6 +377,16 @@ impl Backend {
     /// Deadline for all attempts and the complete response; `None` leaves the wait unbounded.
     pub fn timeout(&self) -> Option<Duration> {
         self.config().timeout
+    }
+
+    /// Deadline for one attempt up to its first decoded event; `None` inherits `timeout`.
+    pub fn attempt_timeout(&self) -> Option<Duration> {
+        self.config().attempt_timeout
+    }
+
+    /// Maximum gap between events once a stream has started; `None` inherits `timeout`.
+    pub fn stream_idle_timeout(&self) -> Option<Duration> {
+        self.config().stream_idle_timeout
     }
 
     /// Whether this backend speaks the Anthropic Messages wire format — the only
@@ -438,9 +495,14 @@ mod tests {
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
+            reasoning_policy: None,
+            reasoning_dialect: ReasoningDialect::default(),
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
+            requires_list_input: false,
         }
     }
 

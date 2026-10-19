@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use libsy::LibsyError;
 use libsy::RuntimeModels;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
@@ -17,14 +18,35 @@ use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
-use switchyard_protocol::{Category, ModelId, RoutedLlmClient, WireFormat};
+use switchyard_protocol::{
+    Category, ModelId, ReasoningDialect, ReasoningPolicy, RoutedLlmClient, WireFormat,
+};
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError,
+    Runner, RunnerError, capability, decision_executor, decision_transport,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Carries a classified decision failure out of the host so the reason is not lost.
+#[derive(Debug)]
+struct DecisionCallError {
+    requested: String,
+    failure: decision_executor::DecisionFailure,
+}
+
+impl std::fmt::Display for DecisionCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "decision call to {} failed: {:?}",
+            self.requested, self.failure
+        )
+    }
+}
+
+impl std::error::Error for DecisionCallError {}
 const MAX_CONFIGURED_RETRIES: u32 = 10;
 
 type RunnerResult<T> = Result<T, RunnerError>;
@@ -61,6 +83,86 @@ pub(crate) struct DeploymentConfig {
     llm_clients: BTreeMap<String, LlmClientConfig>,
     targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    /// Specialized capability endpoints, by configuration name.
+    #[serde(default)]
+    pub(crate) capability_clients: BTreeMap<String, capability::CapabilityClientConfig>,
+    /// Caller-visible capabilities, by configuration name.
+    #[serde(default)]
+    pub(crate) capabilities: BTreeMap<String, capability::CapabilityConfig>,
+    /// Explicitly ordered decision lanes, by lane name.
+    #[serde(default)]
+    pub(crate) decision_lanes: BTreeMap<String, DecisionLaneConfig>,
+    /// The lane that serves a request naming no lane. Declared explicitly: promoting
+    /// whichever unscoped lane happened to be registered first would make a
+    /// deployment's public identity depend on map ordering.
+    #[serde(default)]
+    pub(crate) default_decision_lane: Option<String>,
+    /// Decision lanes that compose child POLICY lanes rather than physical targets.
+    /// A tier over families references its families, so each keeps its own identity,
+    /// stays independently addressable, and its policy change is inherited.
+    #[serde(default)]
+    pub(crate) decision_lane_composition: BTreeMap<String, DecisionLaneCompositionConfig>,
+    /// Ordered composites over complete child routes, by route name.
+    #[serde(default)]
+    pub(crate) composites: BTreeMap<String, CompositeRouteConfig>,
+}
+
+/// A route composed of ordered whole child routes.
+///
+/// Children are route names, not targets. Each child runs as a complete route with its own
+/// algorithm, preparation, reasoning policy and fallback, and the parent adds only
+/// ordered selection between them.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompositeRouteConfig {
+    /// Child route names in preference order.
+    pub(crate) children: Vec<String>,
+    /// Certified context this composite guarantees, as an explicit policy promise.
+    ///
+    /// Stated rather than derived: a composite whose first child accepts a million tokens
+    /// still cannot guarantee that size when a later child does not.
+    #[serde(default)]
+    pub(crate) context_window: Option<u32>,
+    #[serde(default)]
+    pub(crate) tool_calling: Option<bool>,
+    #[serde(default)]
+    pub(crate) reasoning: Option<bool>,
+    #[serde(default)]
+    pub(crate) vision: Option<bool>,
+    /// Whether any child can accept video input. Stated, never inferred from `vision`.
+    #[serde(default)]
+    pub(crate) video: Option<bool>,
+}
+
+/// One explicitly ordered decision lane.
+///
+/// Candidate order is a routing decision, so it is stated rather than inferred. An
+/// ordered list that merely happened to be sorted by name would make a deployment's
+/// behaviour depend on target spelling.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DecisionLaneConfig {
+    /// Decision targets in preference order. Each must be a decision target, appear
+    /// once, and exist.
+    pub(crate) targets: Vec<String>,
+    /// When set, this lane serves only requests of these question kinds. Different kinds
+    /// can genuinely have different best orders, so the split is per type rather than one
+    /// ranking applied to everything.
+    #[serde(default)]
+    pub(crate) types: Vec<decision_transport::QuestionKind>,
+}
+
+/// A decision lane composed of ordered child POLICY lanes.
+///
+/// Children are lane names, not targets. Each child runs its own candidate order,
+/// question-kind eligibility and failure policy in process, and the parent adds only
+/// ordered selection between them. Keeping the reference rather than flattening it is
+/// what lets a family stay independently addressable and its policy stay single-sourced.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DecisionLaneCompositionConfig {
+    /// Child decision lane names in preference order.
+    pub(crate) children: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -70,7 +172,56 @@ struct RouteConfig {
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
     vision: Option<bool>,
+    video: Option<bool>,
+    /// Reasoning policy for this route. Applies on top of the target's factual policy.
+    route_reasoning_policy: Option<RouteReasoningPolicy>,
+    /// Estimated input tokens above which this route escalates to a wider-context leg.
+    escalation_max_input_tokens: Option<u64>,
+    /// Target this route prefers once it is under context pressure.
+    ///
+    /// Named rather than inferred: a target's context window is not a fact this config
+    /// carries. `context_window` is a route-level promise, and upstream rejects it as an
+    /// unknown field on a target, so which leg is wider has to be stated.
+    escalation_target: Option<String>,
     algorithm: AlgorithmSpec,
+}
+
+/// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
+/// target is capable of.
+///
+/// Two routes may deliberately share one physical model while one forbids reasoning, so
+/// this cannot live on the target. Target reasoning stays the factual capability; this is
+/// the policy applied on top of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteReasoningPolicy {
+    /// Use the target's own declared policy.
+    Inherit,
+    /// Thinking on. Where the provider exposes no graded effort axis this means thinking
+    /// enabled, not a fabricated intermediate level.
+    Medium,
+    /// The strongest level the provider genuinely supports.
+    ///
+    /// Distinct from `Medium` because a route policy is applied last and therefore wins over
+    /// the target default. An unbounded primitive that must reach a stronger level than a
+    /// direct address of the same physical model needs to say so; inheriting would hand it
+    /// the target's level, which is the point of the two being separate decisions.
+    High,
+    /// Thinking off.
+    None,
+}
+
+/// A route policy's effect on the wire, which is not always expressible as on/off.
+///
+/// A dialect that only grades effort (`openai_effort`) has no fragment meaning "think", so an
+/// on/off policy is inert there and the level has to arrive as an effort string instead. This
+/// records the effort a route asks for when its own policy would otherwise be unrepresentable,
+/// so the client can write it rather than silently sending the target's weaker default.
+pub(crate) fn route_policy_effort(policy: RouteReasoningPolicy) -> Option<&'static str> {
+    match policy {
+        RouteReasoningPolicy::High => Some("high"),
+        _ => None,
+    }
 }
 
 struct TargetPromptPolicy {
@@ -89,6 +240,10 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
+        let video = take_optional(&mut table, "video")?;
+        let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
+        let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
+        let escalation_target = take_optional(&mut table, "escalation_target")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -97,6 +252,10 @@ impl<'de> Deserialize<'de> for RouteConfig {
             tool_calling,
             reasoning,
             vision,
+            video,
+            route_reasoning_policy,
+            escalation_max_input_tokens,
+            escalation_target,
             algorithm,
         })
     }
@@ -129,6 +288,7 @@ impl RouteConfig {
             tool_calling: self.tool_calling,
             reasoning: self.reasoning,
             vision: self.vision,
+            video: self.video,
         }
     }
 
@@ -151,6 +311,17 @@ impl DeploymentConfig {
             format: client.format.wire_format(),
             base_url: client.base_url.as_str().to_string(),
             extra_body: target.extra_body.clone(),
+            decision_transport: target.decision_transport,
+            supported_types: target.supported_types,
+            state_forms: target.state_forms,
+            decision_path: target.decision_path.clone(),
+            decision_base_url: target.decision_base_url.clone(),
+            decision_api_key_env: target.decision_api_key_env.clone(),
+            target_capabilities: crate::ModelCapabilities {
+                vision: target.vision,
+                tool_calling: target.tool_calling,
+                ..crate::ModelCapabilities::default()
+            },
         })
     }
 
@@ -194,9 +365,11 @@ impl DeploymentConfig {
                     if first.reasoning_effort != target.reasoning_effort
                         || first.extra_body != target.extra_body
                         || first.omit_body_fields != target.omit_body_fields
+                        || first.reasoning_policy != target.reasoning_policy
+                        || first.reasoning_dialect != target.reasoning_dialect
                     {
                         return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, extra_body, or omit_body_fields; one target per model id is kept, so give each its own model id or llm client",
+                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields; one target per model id is kept, so give each its own model id or llm client",
                             target.id, target.llm_client
                         )));
                     }
@@ -211,10 +384,51 @@ impl DeploymentConfig {
 
         let mut provider_api_keys = Vec::new();
         let clients = self.build_clients(&mut provider_api_keys)?;
+        capability::CapabilityDeployment {
+            clients: self.capability_clients.clone(),
+            capabilities: self.capabilities.clone(),
+        }
+        .validate()
+        .map_err(RunnerError::configuration)?;
         let targets = self.build_targets();
         let fallback_base_url = self.fallback_base_url()?;
+        self.validate_composites()?;
+        self.validate_route_capability_claims()?;
+        self.validate_composite_video_claims()?;
+        self.validate_video_transport()?;
+        self.validate_decision_lanes()?;
+        self.validate_default_decision_lane()?;
+        self.validate_decision_lane_composition()?;
+        // Lane name -> resolver, with the kinds each lane serves. Built before the routes
+        // so a route's decision handler can select by the request's question kinds.
+        let mut lane_index: Vec<(
+            String,
+            Arc<decision_executor::DecisionResolver>,
+            Vec<decision_transport::QuestionKind>,
+        )> = Vec::new();
+        let mut lane_handles: BTreeMap<String, decision_executor::LaneResolverHandle> =
+            BTreeMap::new();
+        for (name, lane_config) in &self.decision_lanes {
+            let names: Vec<&str> = lane_config.targets.iter().map(String::as_str).collect();
+            let Some(resolver) = self.build_decision_resolver(&names) else {
+                continue;
+            };
+            let handle = decision_executor::LaneResolverHandle {
+                resolver: Arc::new(resolver),
+            };
+            lane_handles.insert(name.clone(), handle.clone());
+            lane_index.push((name.clone(), handle.resolver, lane_config.types.clone()));
+        }
+        let lane_composition = self.resolve_decision_lane_composition(&lane_handles)?;
+        let lane_identity = self.default_decision_lane.clone();
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
+            // Before the unknown-target sweep below, so a malformed candidate list is
+            // reported as itself rather than as a target that does not exist.
+            config
+                .algorithm
+                .validate_candidates(route_name)
+                .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             for target_name in config.callable_target_names() {
                 self.targets.get(target_name).ok_or_else(|| {
                     RunnerError::configuration(format!(
@@ -223,17 +437,112 @@ impl DeploymentConfig {
                 })?;
             }
             let capabilities = config.capabilities();
+            let mut escalation_model: Option<ModelId> = None;
             if capabilities.context_window == Some(0) {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} context_window must be greater than zero"
                 )));
             }
+            // A route policy the target cannot carry is a route that reads as authoritative and
+            // is not. Only the graded `reasoning_effort` axis and the target's own dialect
+            // can carry it: a target that declares `reasoning_effort` expresses "medium" on
+            // its own, so requiring a dialect there would reject the shipped manifest. What
+            // must not pass is an intent with neither carrier, or "thinking on" on a dialect
+            // whose only off value is `none`.
+            if let Some(policy) = config.route_reasoning_policy {
+                let requested = match policy {
+                    crate::config::RouteReasoningPolicy::Inherit => None,
+                    crate::config::RouteReasoningPolicy::Medium => {
+                        Some(switchyard_protocol::ReasoningPolicy::Enabled)
+                    }
+                    // `High` also carries a graded effort, so it is expressible on every
+                    // dialect rather than only the boolean ones.
+                    crate::config::RouteReasoningPolicy::High => {
+                        Some(switchyard_protocol::ReasoningPolicy::Enabled)
+                    }
+                    crate::config::RouteReasoningPolicy::None => {
+                        Some(switchyard_protocol::ReasoningPolicy::Disabled)
+                    }
+                };
+                if let Some(requested) = requested {
+                    for target_name in config.callable_target_names() {
+                        let Some(target) = self.targets.get(target_name) else {
+                            continue;
+                        };
+                        if target.reasoning_effort.is_some() {
+                            continue;
+                        }
+                        requested
+                            .validate_for(target.reasoning_dialect)
+                            .map_err(|error| {
+                                RunnerError::configuration(format!(
+                                    "route {route_name} reasoning policy cannot be applied \
+                                     to target {target_name}: {error}"
+                                ))
+                            })?;
+                    }
+                }
+            }
+            // An escalation leg that does not exist, or a threshold with no leg to move to,
+            // would both silently serve the request on the primary leg instead. Reject both.
+            if config.escalation_target.is_some() != config.escalation_max_input_tokens.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} must declare escalation_max_input_tokens and \
+                     escalation_target together"
+                )));
+            }
+            // Zero would mean "every request", since the estimator floors at the structural
+            // overhead. That silently removes the declared primary, so it is refused rather
+            // than interpreted.
+            if config.escalation_max_input_tokens == Some(0) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} escalation_max_input_tokens must be greater than zero"
+                )));
+            }
+            if let Some(escalation_target) = &config.escalation_target {
+                let target = self.targets.get(escalation_target).ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "route {route_name} escalation_target references unknown target \
+                         {escalation_target}"
+                    ))
+                })?;
+                // The leg must be one this route can actually serve. `promoting` is a no-op
+                // for an id the route does not offer, so accepting it would leave a route
+                // that reads as escalating, reports promotions, and never reorders.
+                if !config
+                    .callable_target_names()
+                    .contains(&escalation_target.as_str())
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} escalation_target {escalation_target} is not a \
+                         candidate of this route"
+                    )));
+                }
+                escalation_model = Some(target.id.clone());
+            }
+            // Ordered-candidate validation runs before anything resolves targets, so a malformed
+            // list is reported as itself rather than as an unknown target.
+            config
+                .algorithm
+                .validate_candidates(route_name)
+                .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
             let algorithm = config
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
-            let (route_clients, caller_auth) =
-                self.build_route_clients(route_name, config, &clients)?;
+            let lane_composition: BTreeMap<String, Vec<String>> = self
+                .decision_lane_composition
+                .iter()
+                .map(|(name, composition)| (name.clone(), composition.children.clone()))
+                .collect();
+            let (route_clients, caller_auth) = self.build_route_clients(
+                route_name,
+                config,
+                &clients,
+                lane_identity.clone(),
+                &lane_index,
+                &lane_composition,
+            )?;
             let anthropic_auxiliary_target =
                 self.build_anthropic_auxiliary_target(config, &clients);
             let responses_auxiliary_target =
@@ -260,12 +569,55 @@ impl DeploymentConfig {
                 responses_auxiliary_target,
                 decision_targets,
                 models,
+                config
+                    .route_reasoning_policy
+                    .unwrap_or(crate::config::RouteReasoningPolicy::Inherit),
+                config.escalation_max_input_tokens,
+                escalation_model,
             );
             routes.push((config.id.clone(), route));
         }
-        let runner = Runner::new(routes)
+        // The default logical decision lane. Every configured decision target in
+        // configuration order, so a caller asking for a decision without naming a
+        // backend gets per-request eligibility and ordered fallback instead of having
+        // to choose a provider for resilience. Shared by every route and by the
+        // compatibility surface, so Decision has one implementation.
+
+        let mut runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
-            .with_provider_api_keys(provider_api_keys);
+            .with_provider_api_keys(provider_api_keys)
+            .with_capabilities(capability::resolve(&capability::CapabilityDeployment {
+                clients: self.capability_clients.clone(),
+                capabilities: self.capabilities.clone(),
+            }));
+        self.validate_decision_lanes()?;
+        // Composites are registered as named routes, so lookup is uniform: a caller
+        // resolving a route cannot tell whether it is a leaf or a composite.
+        for (name, composite) in &self.composites {
+            runner = runner.with_composite(name.clone(), composite.children.clone());
+            runner = runner.with_composite_capabilities(
+                name.clone(),
+                crate::ModelCapabilities {
+                    context_window: composite.context_window,
+                    tool_calling: composite.tool_calling,
+                    reasoning: composite.reasoning,
+                    vision: composite.vision,
+                    video: composite.video,
+                },
+            );
+        }
+
+        // The same lanes are registered on the runner, so the public surface and the
+        // internal call path resolve a logical identity identically.
+        for (name, resolver, types) in lane_index {
+            runner = runner.with_decision_lane(name, resolver, types);
+        }
+        if let Some(name) = &self.default_decision_lane {
+            runner = runner.with_default_decision_lane(name.clone());
+        }
+        for (name, children) in lane_composition {
+            runner = runner.with_decision_lane_composition(name, children);
+        }
         Ok(runner)
     }
 
@@ -287,6 +639,8 @@ impl DeploymentConfig {
                 &BTreeMap::new(),
                 &BTreeSet::new(),
                 None,
+                None,
+                ReasoningDialect::default(),
             )?;
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
@@ -307,6 +661,13 @@ impl DeploymentConfig {
                 .ok_or_else(|| {
                     RunnerError::configuration("validated llm client was not initialized")
                 })?;
+            if let Some(policy) = target.reasoning_policy {
+                policy
+                    .validate_for(target.reasoning_dialect)
+                    .map_err(|error| {
+                        RunnerError::configuration(format!("target {target_name} {error}"))
+                    })?;
+            }
             if let Some(effort) = &target.reasoning_effort {
                 if effort.trim().is_empty() {
                     return Err(RunnerError::configuration(format!(
@@ -327,6 +688,8 @@ impl DeploymentConfig {
                     &target.extra_body,
                     &target.omit_body_fields,
                     target.reasoning_effort.clone(),
+                    target.reasoning_policy,
+                    target.reasoning_dialect,
                 )?,
                 None,
             ));
@@ -350,11 +713,396 @@ impl DeploymentConfig {
             .collect()
     }
 
+    /// Builds the decision resolver for a route, from its configured targets in order.
+    ///
+    /// Returns `None` when the route configures no decision backend, leaving the host
+    /// to report decision calls as unsupported. Targets are taken in the route's own
+    /// configured order, which is the candidate order; there is no scoring here.
+    /// Validates every configured lane.
+    ///
+    /// Each lane's identity is explicit and its order comes from configuration. When no
+    /// lane is configured there is none: a caller must then name a target, and an unknown
+    /// name fails rather than quietly reaching whatever happens to exist.
+    /// Validates every composite: children exist, appear once, are leaves, and cannot
+    /// form a cycle.
+    ///
+    /// Nested composites are refused rather than supported: V6 needs ordered whole-route
+    /// composition, and accepting recursion would mean either a cycle class of bugs or a
+    /// general workflow engine.
+    fn validate_composites(&self) -> RunnerResult<()> {
+        for (parent, composite) in &self.composites {
+            if composite.children.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "composite route {parent} must list at least one child route"
+                )));
+            }
+            let mut seen: Vec<&str> = Vec::new();
+            for child in &composite.children {
+                if child == parent {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} lists itself as a child"
+                    )));
+                }
+                if seen.contains(&child.as_str()) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} lists child {child} more than once"
+                    )));
+                }
+                if self.composites.contains_key(child) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} lists composite {child} as a child; nested \
+                         composites are not supported, so child routes must be leaves"
+                    )));
+                }
+                if !self.routes.contains_key(child) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {parent} references unknown route {child}"
+                    )));
+                }
+                seen.push(child);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that a route advertising a capability has at least one completion target that
+    /// actually supports it.
+    ///
+    /// The route declaration stays a policy promise; this only refuses a promise nothing in
+    /// the route could keep. Capabilities are not derived from a union or intersection of
+    /// targets: a route may deliberately be narrower than its widest target.
+    fn validate_route_capability_claims(&self) -> RunnerResult<()> {
+        for (route_name, route) in &self.routes {
+            let capabilities = route.capabilities();
+            let mut names: Vec<&str> = route.routing_target_names().into_iter().collect();
+            names.sort_unstable();
+            for (label, claimed) in [
+                ("vision", capabilities.vision),
+                ("video", capabilities.video),
+                ("tool_calling", capabilities.tool_calling),
+            ] {
+                if claimed != Some(true) {
+                    continue;
+                }
+                // A target that says nothing is not a refusal: absence of a fact must not
+                // invalidate a pre-existing deployment that never declared one.
+                let supported = names.iter().any(|name| {
+                    self.targets.get(*name).is_some_and(|target| match label {
+                        "vision" => target.vision != Some(false),
+                        // Video differs from the others: a target that says nothing is
+                        // not a video target, it is one that has not claimed video.
+                        "video" => target.video == Some(true),
+                        _ => target.tool_calling != Some(false),
+                    })
+                });
+                if !supported {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} declares {label} = true but none of its targets \
+                         supports it; declare a target that does, or stop claiming it"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that a composite claiming video has a child that can serve it.
+    ///
+    /// A composite is registered with its own declared capabilities and is resolved
+    /// before its children, so a claim nothing below it can keep would advertise video to
+    /// callers and then skip every child at request time.
+    fn validate_composite_video_claims(&self) -> RunnerResult<()> {
+        for (name, composite) in &self.composites {
+            if composite.video != Some(true) {
+                continue;
+            }
+            let supported = composite.children.iter().any(|child| {
+                self.routes
+                    .get(child)
+                    .is_some_and(|route| route.capabilities().video == Some(true))
+            });
+            if !supported {
+                return Err(RunnerError::configuration(format!(
+                    "composite route {name} declares video = true but none of its children \
+                     does; declare a child that does, or stop claiming it"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that a target claiming video sits on a transport that can carry it.
+    ///
+    /// Video has one faithful wire representation, the Responses `input_video` part. The
+    /// OpenAI Chat codec has no stable video mapping and encodes the block as text, so a
+    /// video declaration there would admit a request and then deliver a paragraph instead
+    /// of the video. Refusing at load makes that a configuration error rather than a
+    /// silent conversion at request time.
+    fn validate_video_transport(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if target.video != Some(true) {
+                continue;
+            }
+            let client = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} references unknown llm client {}",
+                    target.llm_client
+                ))
+            })?;
+            if !matches!(client.format, ClientFormat::OpenAiResponses) {
+                let format = match client.format {
+                    ClientFormat::OpenAiChat => "openai_chat",
+                    ClientFormat::AnthropicMessages => "anthropic_messages",
+                    ClientFormat::OpenAiResponses => "openai_responses",
+                };
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares video = true but its client uses {format}; \
+                     video requires an openai_responses client"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_decision_lanes(&self) -> RunnerResult<()> {
+        for (name, lane) in &self.decision_lanes {
+            if lane.targets.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} must list at least one target"
+                )));
+            }
+            let mut seen: Vec<&str> = Vec::new();
+            for target_name in &lane.targets {
+                if seen.contains(&target_name.as_str()) {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} lists target {target_name} more than once; \
+                         candidate order is a sequence, so each target may appear once"
+                    )));
+                }
+                let Some(target) = self.targets.get(target_name) else {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} references unknown target {target_name}"
+                    )));
+                };
+                if target.decision_transport.is_none() {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} lists target {target_name}, which is not a decision target"
+                    )));
+                }
+                seen.push(target_name);
+            }
+        }
+        // Two scoped lanes claiming the same kinds would make selection ambiguous, so the
+        // deployment is refused here rather than failing at request time.
+        let mut claimed: BTreeMap<decision_transport::QuestionKind, String> = BTreeMap::new();
+        for (name, lane) in &self.decision_lanes {
+            for kind in &lane.types {
+                if claimed.insert(*kind, name.clone()).is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lanes claim question kind {kind:?} at the same specificity; \
+                         each kind may be scoped by at most one lane"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the declared default decision lane, which must name a lane this
+    /// deployment actually configures. A default that names nothing would make every
+    /// unaddressed request fail late, at request time, instead of at load.
+    fn validate_default_decision_lane(&self) -> RunnerResult<()> {
+        let Some(name) = self.default_decision_lane.as_deref() else {
+            return Ok(());
+        };
+        if name.is_empty() {
+            return Err(RunnerError::configuration(
+                "default_decision_lane must not be empty; omit it instead",
+            ));
+        }
+        if !self.decision_lanes.contains_key(name) {
+            return Err(RunnerError::configuration(format!(
+                "default_decision_lane names {name}, which is not a configured decision lane"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A decision lane that composes child POLICY lanes in order.
+    ///
+    /// Distinct from `DecisionLaneConfig`, which holds physical targets: a composed
+    /// lane holds child LANE names, so a tier references its families and inherits
+    /// their policy instead of copying their target lists.
+    fn validate_decision_lane_composition(&self) -> RunnerResult<()> {
+        for (name, composition) in &self.decision_lane_composition {
+            let children = &composition.children;
+            if children.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} must list at least one child lane"
+                )));
+            }
+            // A name may not be both a physical lane and a composed lane: the two are
+            // different mechanisms, and silently preferring one would make the other's
+            // policy unreachable.
+            if self.decision_lanes.contains_key(name) {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane {name} is declared both as a target lane and as a composed lane"
+                )));
+            }
+            let mut seen: Vec<&str> = Vec::new();
+            for child in children {
+                if child == name {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} lists itself as a child"
+                    )));
+                }
+                if seen.contains(&child.as_str()) {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} lists child lane {child} more than once"
+                    )));
+                }
+                if !self.decision_lanes.contains_key(child.as_str())
+                    && !self.decision_lane_composition.contains_key(child.as_str())
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} references unknown child lane {child}"
+                    )));
+                }
+                seen.push(child.as_str());
+            }
+        }
+        self.validate_decision_lane_acyclic()
+    }
+
+    /// Rejects a composition cycle, so a configuration that would recurse at request
+    /// time is refused at load instead.
+    fn validate_decision_lane_acyclic(&self) -> RunnerResult<()> {
+        /// Depth-first walk with the current path on the stack.
+        fn walk(
+            composition: &BTreeMap<String, DecisionLaneCompositionConfig>,
+            lane: &str,
+            path: &mut Vec<String>,
+        ) -> Result<(), String> {
+            if let Some(start) = path.iter().position(|entry| entry == lane) {
+                let mut cycle: Vec<&str> = path[start..].iter().map(String::as_str).collect();
+                cycle.push(lane);
+                return Err(cycle.join(" -> "));
+            }
+            let Some(entry) = composition.get(lane) else {
+                return Ok(());
+            };
+            path.push(lane.to_string());
+            for child in &entry.children {
+                if composition.contains_key(child.as_str()) {
+                    walk(composition, child.as_str(), path)?;
+                }
+            }
+            path.pop();
+            Ok(())
+        }
+
+        let mut lanes: Vec<&String> = self.decision_lane_composition.keys().collect();
+        lanes.sort();
+        for lane in lanes {
+            let mut path = Vec::new();
+            if let Err(cycle) = walk(&self.decision_lane_composition, lane.as_str(), &mut path) {
+                return Err(RunnerError::configuration(format!(
+                    "decision lane composition contains a cycle: {cycle}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Flattens each composed lane into its ordered children once, at load, so a
+    /// request walks a precomputed list and a child that could not be built is a load
+    /// error rather than a silent skip at request time.
+    fn resolve_decision_lane_composition(
+        &self,
+        lanes: &BTreeMap<String, decision_executor::LaneResolverHandle>,
+    ) -> RunnerResult<Vec<(String, Vec<String>)>> {
+        let mut resolved = Vec::with_capacity(self.decision_lane_composition.len());
+        for (name, composition) in &self.decision_lane_composition {
+            let children = &composition.children;
+            let mut ordered = Vec::with_capacity(children.len());
+            for child in children {
+                // A composed child is legal and is resolved recursively at request
+                // time; requiring it to hold targets here would forbid a tier of
+                // tiers. It is accepted only if it is itself a composition, and
+                // cycles were already rejected above.
+                let is_leaf = lanes.contains_key(child.as_str());
+                let is_composite = self.decision_lane_composition.contains_key(child.as_str());
+                if !is_leaf && !is_composite {
+                    return Err(RunnerError::configuration(format!(
+                        "decision lane {name} composes child lane {child}, which resolved to no \
+                         decision targets"
+                    )));
+                }
+                ordered.push(child.clone());
+            }
+            resolved.push((name.clone(), ordered));
+        }
+        Ok(resolved)
+    }
+
+    fn build_decision_resolver(
+        &self,
+        target_names: &[&str],
+    ) -> Option<decision_executor::DecisionResolver> {
+        let mut candidates = Vec::new();
+        for name in target_names {
+            let target = self.targets.get(*name)?;
+            let client = self.llm_clients.get(&target.llm_client)?;
+            let transport = target.decision_transport?;
+            let credential = target
+                .decision_api_key_env
+                .as_deref()
+                .map(|variable| std::env::var(variable).ok())
+                .unwrap_or(None);
+            let url = format!(
+                "{}{}",
+                target
+                    .decision_base_url
+                    .clone()
+                    .unwrap_or_else(|| client.base_url.as_str().to_string())
+                    .trim_end_matches('/'),
+                target
+                    .decision_path
+                    .clone()
+                    .unwrap_or_else(|| transport.path().to_string())
+            );
+            candidates.push(decision_executor::DecisionCandidate {
+                name: (*name).to_string(),
+                model: target.id.to_string(),
+                transport,
+                url,
+                api_key: credential,
+                api_key_env: target.decision_api_key_env.clone(),
+                supported_types: target
+                    .supported_types
+                    .unwrap_or(decision_transport::SupportedTypes::ALL),
+                state_forms: target.state_forms,
+            });
+        }
+        (!candidates.is_empty()).then_some(decision_executor::DecisionResolver { candidates })
+    }
+
     fn build_route_clients(
         &self,
         route_name: &str,
         route: &RouteConfig,
         clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
+        lane_identity: Option<String>,
+        lanes: &[(
+            String,
+            Arc<decision_executor::DecisionResolver>,
+            Vec<decision_transport::QuestionKind>,
+        )],
+        // Named composition, threaded to the internal decision handler so an internal
+        // `Call::Decision` resolves a named lane by the SAME mechanism as the public
+        // surface. Without it, the same request could be served at `/v1/decisions`
+        // and fail internally, which is a split contract rather than one mechanism.
+        composition: &BTreeMap<String, Vec<String>>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let TargetPromptPolicy {
             prompts,
@@ -407,6 +1155,151 @@ impl DeploymentConfig {
             routing_answer_target,
             &completion_targets,
         );
+        // Decision calls need a host. One resolver is built from this route's configured
+        // decision targets, in configured order, and serves both the internal call path
+        // and any public typed surface, so Decision has one implementation.
+        let route_targets = route.routing_target_names();
+        // Target capability facts reach the client router so ordered candidates can be
+        // filtered before dispatch. A target with no declaration is left in place.
+        let mut facts: HashMap<ModelId, switchyard_llm_client::CapabilityFacts> = HashMap::new();
+        for name in &route_targets {
+            if let Some(target) = self.targets.get(*name) {
+                facts.insert(
+                    target.id.clone(),
+                    switchyard_llm_client::CapabilityFacts {
+                        no_vision: target.vision == Some(false),
+                        // Video is never inferred: a target that does not state support is
+                        // treated as unable to receive it.
+                        no_video: target.video != Some(true),
+                        no_tool_calling: target.tool_calling == Some(false),
+                    },
+                );
+            }
+        }
+        let router = router.with_target_capabilities(facts);
+
+        // A route-level resolver serves a concrete target; the configured lanes serve a
+        // logical identity and may order candidates differently per question type.
+        if let Some(resolver) = self.build_decision_resolver(&route_targets) {
+            let resolver = Arc::new(resolver);
+            let handler_resolver = Arc::clone(&resolver);
+            let handler_lane: Arc<Option<String>> = Arc::new(lane_identity.clone());
+            let handler_lanes = Arc::new(lanes.to_vec());
+            let handler_composition = Arc::new(composition.clone());
+            let handler_lane_resolvers: Arc<
+                BTreeMap<String, Arc<decision_executor::DecisionResolver>>,
+            > = Arc::new(
+                lanes
+                    .iter()
+                    .map(|(name, resolver, _)| (name.clone(), Arc::clone(resolver)))
+                    .collect(),
+            );
+            let router = router.with_decision_handler(Arc::new(move |request, model| {
+                let resolver = Arc::clone(&handler_resolver);
+                let lane_name = Arc::clone(&handler_lane);
+                let lanes = Arc::clone(&handler_lanes);
+                let composition = Arc::clone(&handler_composition);
+                let lane_resolvers = Arc::clone(&handler_lane_resolvers);
+                Box::pin(async move {
+                    // A call that names a concrete model means that backend only: it is
+                    // how a caller pins one for diagnostics or comparison. The lane is
+                    // reached when the named target is the lane identity itself, or when
+                    // no configured candidate matches the name.
+                    // An explicit identity is either a configured target or the named
+                    // lane. An unknown one fails closed instead of reaching whichever
+                    // backend happens to exist.
+                    // An EXPLICIT lane name is authoritative and is resolved BEFORE
+                    // the route-local resolver and before any question-kind selection, so
+                    // a named family or tier runs its own policy internally exactly as it
+                    // does on the public surface. Without this the same request could be
+                    // served at `/v1/decisions` and fail here, which would be a split
+                    // contract rather than one mechanism.
+                    let handles: BTreeMap<String, decision_executor::LaneResolverHandle> =
+                        lane_resolvers
+                            .iter()
+                            .map(|(name, resolver)| {
+                                (
+                                    name.clone(),
+                                    decision_executor::LaneResolverHandle {
+                                        resolver: Arc::clone(resolver),
+                                    },
+                                )
+                            })
+                            .collect();
+                    let composition = Arc::clone(&composition);
+                    let requested_model = model.clone();
+                    // An EXPLICIT lane name is authoritative and is resolved BEFORE the
+                    // route-local resolver and before any question-kind selection, so a
+                    // named family or tier runs its own policy internally exactly as it
+                    // does on the public surface. Without this the same request could be
+                    // served at `/v1/decisions` and fail here, which would be a split
+                    // contract rather than one mechanism.
+                    let served = async move {
+                        if let Some(outcome) = decision_executor::serve_named(
+                            &composition,
+                            &handles,
+                            requested_model.as_str(),
+                            &request,
+                        )
+                        .await?
+                        {
+                            return Ok(outcome);
+                        }
+                        match decision_executor::resolve_identity(
+                            &resolver,
+                            lane_name.as_deref(),
+                            requested_model.as_str(),
+                        )? {
+                            decision_executor::DecisionIdentity::Target(name) => {
+                                let candidate = resolver
+                                    .candidates
+                                    .iter()
+                                    .find(|candidate| {
+                                        candidate.name == name || candidate.model == name
+                                    })
+                                    .ok_or(decision_executor::DecisionFailure::NotEligible(
+                                        decision_executor::DecisionSkip::TargetNotFound,
+                                    ))?;
+                                decision_executor::serve_target(candidate, &request).await
+                            }
+                            decision_executor::DecisionIdentity::Lane => {
+                                let selected = lanes
+                                    .iter()
+                                    .find(|(_, _, types)| {
+                                        decision_transport::lane_serves(types, &request)
+                                    })
+                                    .map(|(_, resolver, _)| Arc::clone(resolver));
+                                match selected {
+                                    Some(lane) => {
+                                        decision_executor::resolve_and_serve(&lane, &request).await
+                                    }
+                                    None => Err(decision_executor::DecisionFailure::NotEligible(
+                                        decision_executor::DecisionSkip::TargetNotFound,
+                                    )),
+                                }
+                            }
+                        }
+                    }
+                    .await;
+                    served.map(|outcome| outcome.response).map_err(|failure| {
+                        // The host contract carries a LibsyError. The classified
+                        // reason is kept in the message so a caller can tell an
+                        // eligibility or contract refusal from a serving failure.
+                        LibsyError::client_call(
+                            model.clone(),
+                            switchyard_protocol::LlmClientError::General(
+                                DecisionCallError {
+                                    requested: model.to_string(),
+                                    failure,
+                                }
+                                .to_string(),
+                            ),
+                        )
+                    })
+                })
+            }));
+            return Ok((router, caller_auth));
+        }
         Ok((router, caller_auth))
     }
 
@@ -581,6 +1474,27 @@ struct LlmClientConfig {
     failure_cooldown_ms: u64,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
+    /// Deadline in milliseconds for one attempt, from send to the first decoded event.
+    ///
+    /// Bounds "this candidate is producing nothing": connect, response headers and the
+    /// first event. It stops applying once the attempt returns, so it never truncates a
+    /// stream that is already delivering. An expiry here is pre-commit and may advance
+    /// to another candidate; unset means an attempt is bounded only by `timeout_ms`.
+    #[serde(default)]
+    attempt_timeout_ms: Option<u64>,
+    /// Maximum gap in milliseconds between events once a stream has started.
+    ///
+    /// A slow but progressing stream is unaffected; a stream that stops producing ends
+    /// with an in-band timeout. Unset means the gap is bounded only by `timeout_ms`.
+    #[serde(default)]
+    stream_idle_timeout_ms: Option<u64>,
+    /// This upstream requires the Responses `input` to be a JSON array.
+    ///
+    /// The Codex backend rejects the compact bare-string form with `Input must be a list`.
+    /// Declaring it keeps chat ingress working on that lane instead of narrowing the
+    /// advertised inbound formats. Ignored by the Chat and Anthropic formats.
+    #[serde(default)]
+    requires_list_input: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,6 +1512,49 @@ struct TargetConfig {
     /// Reasoning effort forced on every request to this target, replacing the caller's value.
     /// Only meaningful on `openai_chat` and `openai_responses` clients.
     reasoning_effort: Option<String>,
+    /// Authoritative reasoning choice for this target. Applied after the caller's fields and
+    /// after `extra_body`, so a strict non-reasoning target cannot be re-enabled by a caller.
+    reasoning_policy: Option<ReasoningPolicy>,
+    /// How this target's provider expects reasoning control on the wire. Two targets behind
+    /// one transport routinely differ here, which is why it is not an `llm_client` setting.
+    #[serde(default)]
+    reasoning_dialect: ReasoningDialect,
+    /// Wire family this target speaks when serving a typed decision call.
+    #[serde(default)]
+    decision_transport: Option<decision_transport::DecisionTransport>,
+    /// Question kinds this target currently answers. A request carrying any other kind
+    /// excludes the target before dispatch rather than provoking a provider rejection.
+    #[serde(default)]
+    supported_types: Option<decision_transport::SupportedTypes>,
+    /// State shapes this target accepts. Unset accepts every shape.
+    #[serde(default)]
+    state_forms: decision_transport::StateForms,
+    /// Path for a typed decision call, when the backend does not use its default.
+    #[serde(default)]
+    decision_path: Option<String>,
+    /// Base URL for a typed decision call, when the decision backend is not the
+    /// completion endpoint this target's client points at.
+    #[serde(default)]
+    decision_base_url: Option<String>,
+    /// Environment variable holding the decision backend's credential.
+    #[serde(default)]
+    decision_api_key_env: Option<String>,
+    /// Factual capability of the backing deployment behind this target.
+    ///
+    /// A target fact, not a policy: it says what this model can do, while the route's own
+    /// declaration says what the route promises to callers. The two are validated against
+    /// each other at load, and the target facts are what ordered-candidate eligibility
+    /// filters on before dispatch.
+    #[serde(default)]
+    vision: Option<bool>,
+    /// Whether this deployment accepts video input.
+    ///
+    /// Separate from `vision` on purpose: an endpoint that accepts images need not accept
+    /// video, and on this deployment it does not. Omitted means "cannot".
+    #[serde(default)]
+    video: Option<bool>,
+    #[serde(default)]
+    tool_calling: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -656,6 +1613,8 @@ fn build_backend(
     extra_body: &BTreeMap<String, Value>,
     omit_body_fields: &BTreeSet<String>,
     reasoning_effort: Option<String>,
+    reasoning_policy: Option<ReasoningPolicy>,
+    reasoning_dialect: ReasoningDialect,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -666,6 +1625,28 @@ fn build_backend(
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} timeout_ms must be at least 1"
         )));
+    }
+    for (label, value) in [
+        ("attempt_timeout_ms", config.attempt_timeout_ms),
+        ("stream_idle_timeout_ms", config.stream_idle_timeout_ms),
+    ] {
+        if value == Some(0) {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} {label} must be at least 1"
+            )));
+        }
+    }
+    // Naming both makes the relationship explicit here rather than at the call site:
+    // an attempt bound wider than the overall bound can never take effect.
+    if let (Some(attempt), Some(overall)) = (config.attempt_timeout_ms, config.timeout_ms)
+        && attempt > overall
+    {
+        tracing::warn!(
+            llm_client = client_name,
+            attempt_timeout_ms = attempt,
+            timeout_ms = overall,
+            "attempt_timeout_ms exceeds timeout_ms; the overall deadline wins"
+        );
     }
     if config.forward_auth && config.api_key_env.is_some() {
         return Err(RunnerError::configuration(format!(
@@ -702,9 +1683,14 @@ fn build_backend(
         extra_body: extra_body.clone(),
         omit_body_fields: omit_body_fields.clone(),
         reasoning_effort,
+        reasoning_policy,
+        reasoning_dialect,
         max_retries: config.max_retries,
         failure_cooldown: Duration::from_millis(config.failure_cooldown_ms),
         timeout: config.timeout_ms.map(Duration::from_millis),
+        attempt_timeout: config.attempt_timeout_ms.map(Duration::from_millis),
+        stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
+        requires_list_input: config.requires_list_input,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -914,6 +1900,18 @@ target = "strong"
             Ok(_) => "configuration unexpectedly succeeded".to_string(),
             Err(error) => error.to_string(),
         }
+    }
+
+    /// The parsed `AlgorithmSpec` for one route, so a test can assert what the loader
+    /// hands to the runtime rather than only that the file parses.
+    fn ordered_spec(toml: &str, route_name: &str) -> AlgorithmSpec {
+        let config: DeploymentConfig = toml::from_str(toml).expect("fixture parses");
+        config
+            .routes
+            .get(route_name)
+            .expect("fixture declares the route")
+            .algorithm
+            .clone()
     }
 
     fn with_subagent_llm_classifier(config: &str, route: &str, extra: &str) -> String {
@@ -1211,6 +2209,445 @@ new = ["send_message"]
         Ok(())
     }
 
+    /// The reason dialect lives on the target: two targets behind one transport can pin
+    /// different reasoning dialects without duplicating the `llm_client`.
+    #[test]
+    fn a_target_reasoning_policy_parses_and_carries_its_own_dialect() -> RunnerResult<()> {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        assert!(VALID_CONFIG.contains(strong));
+
+        let strict = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"openrouter_enabled\""
+            ),
+        );
+        let runner = runner_from_toml(&strict)?;
+
+        let plain = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"llama_cpp_enable_thinking\""),
+        );
+        runner_from_toml(&plain)?;
+
+        let misspelled =
+            VALID_CONFIG.replace(strong, &format!("{strong}\nreasoning_policy = \"disbled\""));
+        assert!(error_message(&misspelled).contains("reasoning_policy"));
+
+        drop(runner);
+        Ok(())
+    }
+
+    /// A strict target that omits its dialect must fail at load time rather than inherit a
+    /// default and emit a provider control nobody declared.
+    #[test]
+    fn an_authoritative_policy_without_a_dialect_is_rejected() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        for policy in ["disabled", "enabled"] {
+            let without_dialect = VALID_CONFIG.replace(
+                strong,
+                &format!("{strong}\nreasoning_policy = \"{policy}\""),
+            );
+            assert!(
+                error_message(&without_dialect).contains("needs an explicit reasoning_dialect"),
+                "policy {policy} without a dialect must be rejected: {}",
+                error_message(&without_dialect)
+            );
+        }
+
+        // An unspecified policy declares nothing, so an absent dialect stays legal.
+        let no_policy = VALID_CONFIG.to_string();
+        runner_from_toml(&no_policy).expect("a target with no policy needs no dialect");
+
+        // A dialect on its own is also fine; it only becomes meaningful with a policy.
+        let dialect_only = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_dialect = \"llama_cpp_enable_thinking\""),
+        );
+        runner_from_toml(&dialect_only).expect("a bare dialect is accepted");
+    }
+
+    #[test]
+    fn an_unknown_dialect_is_rejected() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        let unknown = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"telepathy\""
+            ),
+        );
+        assert!(error_message(&unknown).contains("reasoning_dialect"));
+    }
+
+    /// A llama.cpp target pointed at the OpenAI dialect would send `reasoning.effort`,
+    /// which that server does not read. The dialect is a declaration, so a mismatch is
+    /// only catchable when the pair is checked; that check is what this pins.
+    #[test]
+    fn a_llama_target_given_the_openai_dialect_still_loads_but_sends_the_declared_control() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        let mismatched = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"disabled\"\nreasoning_dialect = \"openai_effort\""
+            ),
+        );
+        // Loadable: the pair is well-formed, so configuration loading does not reject it.
+        runner_from_toml(&mismatched).expect("a valid but semantically odd pair still loads");
+
+        // The emitted control is the declared dialect's, not a guess: `effort = none`.
+        // Catching a wrong dialect is a qualification job against the live server, which is
+        // why the wire form is asserted here rather than only the load result.
+        assert_eq!(
+            ReasoningPolicy::Disabled.wire_body(ReasoningDialect::OpenAiEffort),
+            Some(serde_json::json!({"reasoning": {"effort": "none"}}))
+        );
+    }
+
+    /// An OpenAI target that wants reasoning on uses the authoritative effort mechanism;
+    /// there is no policy that means "think" on that dialect.
+    #[test]
+    fn an_openai_thinking_target_uses_reasoning_effort() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+
+        let thinking = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_effort = \"high\"\nreasoning_dialect = \"openai_effort\""
+            ),
+        );
+        runner_from_toml(&thinking).expect("an effort-driven thinking target is valid");
+
+        let impossible = VALID_CONFIG.replace(
+            strong,
+            &format!(
+                "{strong}\nreasoning_policy = \"enabled\"\nreasoning_dialect = \"openai_effort\""
+            ),
+        );
+        assert!(
+            error_message(&impossible).contains("reasoning_effort"),
+            "{}",
+            error_message(&impossible)
+        );
+    }
+
+    /// The reordering contract must not be declarable in a shape that silently does
+    /// nothing: half a contract would leave every request on the primary leg while the
+    /// config reads as though escalation were configured.
+    #[test]
+    fn an_incomplete_escalation_contract_is_rejected_at_load() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let escalated = format!(
+            "{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = \
+             61440\nescalation_target = \"strong\""
+        );
+
+        // Positive control: the complete contract loads, so each rejection below is caused
+        // by its specific defect rather than by a fixture that never parsed.
+        runner_from_toml(&VALID_CONFIG.replace(passthrough, &escalated))
+            .expect("a complete escalation contract must load");
+
+        for (defect, expected) in [
+            (
+                format!("{passthrough}\nescalation_max_input_tokens = 61440"),
+                "route passthrough must declare escalation_max_input_tokens and escalation_target \
+                 together",
+            ),
+            (
+                format!("{passthrough}\nescalation_target = \"strong\""),
+                "route passthrough must declare escalation_max_input_tokens and escalation_target \
+                 together",
+            ),
+            (
+                format!(
+                    "{passthrough}\nescalation_max_input_tokens = 61440\nescalation_target = \
+                     \"imaginary\""
+                ),
+                "route passthrough escalation_target references unknown target imaginary",
+            ),
+        ] {
+            assert_eq!(
+                error_message(&VALID_CONFIG.replace(passthrough, &defect)),
+                expected,
+                "config: {defect}"
+            );
+        }
+    }
+
+    /// A complete contract resolves to a real target and leaves the declared order alone:
+    /// the promotion is applied at execution time, so loading must not reorder anything.
+    #[test]
+    fn a_declared_escalation_contract_loads_without_changing_the_primary() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let escalated = format!(
+            "{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = \
+             61440\nescalation_target = \"strong\""
+        );
+        let config = VALID_CONFIG.replace(passthrough, &escalated);
+        let names = ordered_spec(&config, "passthrough")
+            .runtime_model_names("passthrough")
+            .expect("declared candidates resolve");
+        assert_eq!(
+            names.parent.get(&Category::Any),
+            Some(&vec!["weak".to_string(), "strong".to_string()]),
+            "declaration order still offers the primary first"
+        );
+    }
+
+    /// A route that configures escalation to a target it does not actually offer is
+    /// configured-but-dead: `promoting` is a no-op for an absent id, so every over-threshold
+    /// request silently keeps the declared order while the config and the dashboard both claim
+    /// escalation happens. The leg must therefore be one of this route's own callable targets.
+    #[test]
+    fn an_escalation_target_outside_the_route_is_rejected_at_load() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let configured = format!(
+            "{passthrough}\nescalation_max_input_tokens = 61440\nescalation_target = \
+         \"strong\""
+        );
+
+        // Positive control: `strong` IS a candidate here, so this loads. Without it, the
+        // rejection below could be blamed on the fixture rather than on candidate membership.
+        runner_from_toml(
+        &VALID_CONFIG.replace(
+            passthrough,
+            &format!("{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = 61440\nescalation_target = \"strong\""),
+        ),
+    )
+    .expect("an escalation target that is a candidate must load");
+
+        let message = error_message(&VALID_CONFIG.replace(passthrough, &configured));
+        assert_eq!(
+            message, "route passthrough escalation_target strong is not a candidate of this route",
+            "a real target that this route cannot serve must be rejected, not silently accepted"
+        );
+    }
+
+    /// A route policy is applied last on the wire, so it must be expressible by every target
+    /// the route can reach. A target's own policy is checked against its dialect at load;
+    /// without the same check one layer up, a route asking for thinking on an effort-only
+    /// dialect would apply nothing and still read as authoritative.
+    #[test]
+    fn a_route_policy_a_target_cannot_express_is_rejected_at_load() {
+        // `responses` is declared as an openai_responses client, so give the target the
+        // effort dialect, which grades effort and has no fragment meaning "think".
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        assert!(
+            VALID_CONFIG.contains(strong),
+            "the strong target fixture must exist verbatim"
+        );
+        // The route must point AT that target: a policy is checked against every target the
+        // route can reach, and the fixture's other targets declare no dialect at all.
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let on_effort_target = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"";
+        let configured = VALID_CONFIG
+            .replace(
+                strong,
+                &format!("{strong}\nreasoning_dialect = \"openai_effort\""),
+            )
+            .replace(
+                passthrough,
+                &format!("{on_effort_target}\nroute_reasoning_policy = \"medium\""),
+            );
+
+        // Positive control: `none` IS expressible on this dialect, so the rejection below
+        // is about the policy value rather than the fixture.
+        runner_from_toml(
+            &VALID_CONFIG
+                .replace(
+                    strong,
+                    &format!("{strong}\nreasoning_dialect = \"openai_effort\""),
+                )
+                .replace(
+                    passthrough,
+                    &format!("{on_effort_target}\nroute_reasoning_policy = \"none\""),
+                ),
+        )
+        .expect("a non-thinking policy must load on an effort-only dialect");
+
+        let message = error_message(&configured);
+        assert!(
+            message.contains("route passthrough reasoning policy cannot be applied"),
+            "a medium policy on an effort-only dialect must be rejected, got: {message}"
+        );
+    }
+
+    /// A threshold of zero means "every request", because the estimator floors at the
+    /// structural overhead and never returns less. Whether that is intended is stated
+    /// nowhere, and it silently removes the declared primary from first position, so it is
+    /// rejected for the same reason `context_window = 0` is.
+    #[test]
+    fn a_zero_escalation_threshold_is_rejected_at_load() {
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        assert_eq!(
+            error_message(&VALID_CONFIG.replace(
+                passthrough,
+                &format!(
+                    "{passthrough}\ncandidates = [\"strong\"]\nescalation_max_input_tokens = \
+                     0\nescalation_target = \"strong\""
+                ),
+            )),
+            "route passthrough escalation_max_input_tokens must be greater than zero",
+        );
+    }
+
+    /// A deterministic route must be able to state its candidate order in configuration.
+    /// The order is the contract: the selected target is offered first and the rest follow
+    /// in declared order.
+    #[test]
+    fn a_passthrough_route_declares_its_ordered_candidates() -> RunnerResult<()> {
+        let ordered = VALID_CONFIG.replace(
+            "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"",
+            "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"\ncandidates = [\"weak\", \"classifier\"]",
+        );
+        assert_ne!(
+            ordered, VALID_CONFIG,
+            "the passthrough fixture must exist verbatim"
+        );
+        runner_from_toml(&ordered)?;
+
+        // The order must reach the runtime model pool, not merely parse. This is the
+        // property a config-only assertion cannot see: dropping candidates from the pool
+        // still loads, but silently serves only the selected target.
+        let spec = ordered_spec(&ordered, "passthrough");
+        let names = spec
+            .runtime_model_names("passthrough")
+            .expect("declared candidates resolve");
+        assert_eq!(
+            names.parent.get(&Category::Any),
+            Some(&vec![
+                "strong".to_string(),
+                "weak".to_string(),
+                "classifier".to_string()
+            ]),
+            "the selected target must be offered first, then candidates in declared order"
+        );
+        assert_eq!(
+            spec.callable_target_names(),
+            vec!["strong", "weak", "classifier"],
+            "callable targets must carry the same declared order"
+        );
+
+        // The same list naming its own selected target is not an order.
+        let repeated = VALID_CONFIG.replace(
+            "type = \"passthrough\"\ntarget = \"weak\"",
+            "type = \"passthrough\"\ntarget = \"weak\"\ncandidates = [\"weak\"]",
+        );
+        assert!(
+            error_message(&repeated).contains("more than once"),
+            "{}",
+            error_message(&repeated)
+        );
+
+        let blank = VALID_CONFIG.replace(
+            "type = \"passthrough\"\ntarget = \"weak\"",
+            "type = \"passthrough\"\ntarget = \"weak\"\ncandidates = [\" \"]",
+        );
+        assert!(
+            error_message(&blank).contains("empty candidate name"),
+            "{}",
+            error_message(&blank)
+        );
+
+        Ok(())
+    }
+
+    /// A policy that is not specified leaves the caller's reasoning choice alone, and one
+    /// target per model id is still enforced when two targets disagree on dialect.
+    #[test]
+    fn reasoning_dialect_differences_are_a_conflict_on_a_shared_model_id() {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        let alias = VALID_CONFIG.replace(
+            strong,
+            &format!("{strong}\nreasoning_dialect = \"openrouter_enabled\"\n\n[targets.strong_alias]\nid = \"strong/model\"\nllm_client = \"responses\"\nreasoning_dialect = \"llama_cpp_enable_thinking\""),
+        );
+        assert!(
+            error_message(&alias).contains("reasoning_dialect"),
+            "{}",
+            error_message(&alias)
+        );
+    }
+
+    /// The capability contracts must survive parsing as runtime values, not just load.
+    /// A config that parses while dropping the contract id or the rerank limits would
+    /// serve vectors callers cannot compare and rerank results callers cannot trust.
+    #[test]
+    fn capability_contracts_are_carried_as_runtime_values() {
+        let source = r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.engine_a]
+format = "openai_embeddings"
+base_url = "https://a.test"
+model = "a"
+
+[capability_clients.engine_b]
+format = "openai_embeddings"
+base_url = "https://b.test"
+model = "b"
+
+[capability_clients.reranker]
+format = "cohere_jina_rerank"
+base_url = "https://r.test"
+model = "r"
+
+[capabilities.space_a]
+id = "space_a"
+target = "engine_a"
+contract = "localclaw-embedding-space:v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+[capabilities.space_b]
+id = "space_b"
+target = "engine_b"
+contract = "localclaw-embedding-space:lfm2.5-350m-v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+[capabilities.rerank]
+id = "rerank"
+target = "reranker"
+max_candidates = 64
+top_n = 5
+max_doc_chars = 1024
+max_query_chars = 512
+"#;
+        let config: DeploymentConfig = toml::from_str(source).expect("fixture parses");
+        let a = &config.capabilities["space_a"];
+        let b = &config.capabilities["space_b"];
+        let r = &config.capabilities["rerank"];
+        assert_eq!(a.contract.as_deref(), Some("localclaw-embedding-space:v1"));
+        assert_eq!(
+            b.contract.as_deref(),
+            Some("localclaw-embedding-space:lfm2.5-350m-v1")
+        );
+        assert_ne!(a.contract, b.contract, "two engines keep two contracts");
+        assert_eq!(a.dimensions, Some(1024));
+        assert_eq!(r.max_candidates, Some(64));
+        assert_eq!(r.top_n, Some(5));
+        assert_eq!(r.max_doc_chars, Some(1024));
+        assert_eq!(r.max_query_chars, Some(512));
+        assert_eq!(
+            config.capability_clients["engine_b"].url("/embeddings"),
+            "https://b.test/embeddings"
+        );
+    }
+
     #[test]
     fn duplicate_targets_with_conflicting_settings_are_rejected() -> RunnerResult<()> {
         let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
@@ -1224,7 +2661,9 @@ new = ["send_message"]
         );
         assert!(
             error_message(&conflicting)
-                .contains("different reasoning_effort, extra_body, or omit_body_fields"),
+                .contains(
+                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields",
+            ),
             "{}",
             error_message(&conflicting)
         );
@@ -1637,6 +3076,106 @@ confidence_threshold = 0.5
         Ok(())
     }
 
+    /// Video has one faithful transport. Declaring it anywhere else would admit the request
+    /// and then deliver its content as text, so the load fails instead.
+    #[test]
+    fn video_declaration_requires_a_responses_client() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"classifier/model\"",
+            "id = \"classifier/model\"\nvideo = true",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("chat client claimed video")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("video = true") && message.contains("openai_chat"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A route may not promise a capability no target of that route can keep.
+    #[test]
+    fn route_claiming_video_needs_a_video_target() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "targets = [\"strong\", \"weak\"]",
+            "targets = [\"strong\", \"weak\"]\nvideo = true",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("route claimed video")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("video = true") && message.contains("none of its targets"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A responses target that states video support satisfies the route claim.
+    #[test]
+    fn video_on_a_responses_target_is_accepted() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true",
+                1,
+            );
+        let runner = runner_from_toml(&configured)?;
+        let route = runner
+            .route("switchyard/random")
+            .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
+        let capabilities = route.capabilities();
+        assert_eq!(capabilities.video, Some(true));
+        Ok(())
+    }
+
+    /// A composite is resolved before its children, so its claim must be backed by one of
+    /// them. Otherwise it advertises video and then skips every child.
+    #[test]
+    fn composite_claiming_video_needs_a_video_child() -> RunnerResult<()> {
+        let configured =
+            format!("{VALID_CONFIG}\n[composites.tier]\nchildren = [\"random\"]\nvideo = true\n");
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("composite claimed video")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("composite route tier") && message.contains("none of its children"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// The same composite is accepted once a child can serve video.
+    #[test]
+    fn composite_with_a_video_child_is_accepted() -> RunnerResult<()> {
+        let configured = format!(
+            "{}\n[composites.tier]\nchildren = [\"random\"]\nvideo = true\n",
+            VALID_CONFIG
+                .replacen(
+                    "id = \"strong/model\"",
+                    "id = \"strong/model\"\nvideo = true",
+                    1
+                )
+                .replacen(
+                    "targets = [\"strong\", \"weak\"]",
+                    "targets = [\"strong\", \"weak\"]\nvideo = true",
+                    1
+                )
+        );
+        runner_from_toml(&configured)?;
+        Ok(())
+    }
+
     #[test]
     fn target_extra_body_is_parsed_and_applied_to_its_backend() -> RunnerResult<()> {
         let configured = VALID_CONFIG.replacen(
@@ -1661,6 +3200,8 @@ confidence_threshold = 0.5
             &target.extra_body,
             &target.omit_body_fields,
             None,
+            None,
+            ReasoningDialect::default(),
         )?;
 
         assert_eq!(
@@ -1700,6 +3241,8 @@ confidence_threshold = 0.5
             &target.extra_body,
             &target.omit_body_fields,
             None,
+            None,
+            ReasoningDialect::default(),
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -1717,7 +3260,15 @@ confidence_threshold = 0.5
                 "format = \"openai_chat\"\nbase_url = \"https://example.test/v1\"\n{setting}"
             );
             let config: LlmClientConfig = toml::from_str(&source).expect("valid deadline config");
-            let backend = build_backend("test", &config, &BTreeMap::new(), &BTreeSet::new(), None);
+            let backend = build_backend(
+                "test",
+                &config,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                None,
+                ReasoningDialect::default(),
+            );
             if expected == Some(0) {
                 assert!(backend.is_err());
             } else {
@@ -2045,5 +3596,85 @@ advisor_target = "advisor"
             "advisor_target = \"advisor\"\nmax_reviews = 0",
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
+    }
+}
+
+/// Closure controls for the production-path fixes in whole-route composition.
+#[cfg(test)]
+mod composition_closure_tests {
+    use super::*;
+    use crate::failure::RouteErrorKind;
+
+    /// A request no eligible route can serve is a caller error, not a deployment fault, so it
+    /// is classified as an invalid request rather than a configuration failure.
+    #[test]
+    fn an_unsupported_capability_is_classified_as_a_request_error() {
+        let error = RunnerError::unsupported_capability("tier2", "vision");
+        assert!(matches!(
+            error,
+            RunnerError::UnsupportedCapability {
+                capability: "vision",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("vision"));
+        assert!(
+            matches!(
+                error.execution_error_summary().kind,
+                RouteErrorKind::InvalidRequest
+            ),
+            "an unservable request is reported as invalid, not as configuration"
+        );
+        // A deployment fault stays a configuration failure.
+        let broken = RunnerError::configuration("composite names a missing route");
+        assert!(matches!(
+            broken.execution_error_summary().kind,
+            RouteErrorKind::Configuration
+        ));
+    }
+
+    /// Two children claiming one continuation is a state conflict, never resolved by choosing
+    /// the first claimant.
+    #[test]
+    fn a_state_conflict_is_not_absorbed_as_a_request_error() {
+        let conflict = RunnerError::StateConflict("two children claim resp_1".to_string());
+        assert!(conflict.to_string().contains("resp_1"));
+        assert!(
+            matches!(
+                conflict.execution_error_summary().kind,
+                RouteErrorKind::InvalidRequest
+            ),
+            "the conflict is reported rather than silently resolved"
+        );
+    }
+
+    /// Cross-child policy stays narrower than candidate fallback inside a route.
+    #[test]
+    fn cross_route_recovery_excludes_policy_and_contract_failures() {
+        use switchyard_llm_client::FailureClass;
+        for class in [
+            FailureClass::Transport,
+            FailureClass::Timeout,
+            FailureClass::RateLimited,
+            FailureClass::TemporarilyUnavailable,
+            FailureClass::Server,
+        ] {
+            assert!(
+                class.allows_cross_route(),
+                "{class:?} is recoverable across routes"
+            );
+        }
+        for class in [
+            FailureClass::Auth,
+            FailureClass::Request,
+            FailureClass::ProviderPolicy,
+            FailureClass::ContextWindow,
+            FailureClass::Other,
+        ] {
+            assert!(
+                !class.allows_cross_route(),
+                "{class:?} must not cross routes"
+            );
+        }
     }
 }

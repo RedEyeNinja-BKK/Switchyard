@@ -1,0 +1,662 @@
+# An example deployment file. It shows the shape of a fleet that serves
+# several providers at once: direct routes per model, small groups that
+# fall back through a list of candidates, whole-route tiers over those
+# groups, decision lanes, and the embedding and reranking capabilities.
+#
+# Every base_url below points at a placeholder host. Point them at your own
+# servers and export the api_key_env variables before starting the server.
+#
+#   switchyard-server --config routes.example.toml --dry-run
+#
+# The api_key_env values are read from the environment. The file itself
+# carries no secret.
+schema_version = 1
+
+[llm_clients.deepseek]
+format = "openai_responses"
+base_url = "https://api.deepseek.com"
+api_key_env = "SWITCHYARD_DEEPSEEK_API_KEY"
+max_retries = 2
+
+[llm_clients.htpc]
+format = "openai_responses"
+base_url = "http://localhost:8889/v1"
+api_key_env = "SWITCHYARD_HTPC_API_KEY"
+max_retries = 2
+
+[llm_clients.thaillm]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+api_key_env = "SWITCHYARD_THAILLM_API_KEY"
+max_retries = 2
+
+[llm_clients.openai]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+requires_list_input = true
+max_retries = 2
+
+[llm_clients.openai_nt]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+requires_list_input = true
+max_retries = 2
+
+[llm_clients.openrouter]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+max_retries = 2
+
+[llm_clients.comfyninja]
+format = "openai_responses"
+base_url = "http://localhost:8446/v1"
+api_key_env = "SWITCHYARD_COMFYNINJA_API_KEY"
+max_retries = 2
+
+# ---- completion targets ----
+[targets.comfyninja-qwen3_8-27b-q3]
+id = "comfyninja/qwen3.8-27b-q3"
+llm_client = "comfyninja"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.comfyninja-qwen3_8-27b-q3-mtp]
+id = "comfyninja/qwen3.8-27b-q3-mtp"
+llm_client = "comfyninja"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.comfyninja-qwen3_8-27b-q3-mtp-vl]
+id = "comfyninja/qwen3.8-27b-q3-mtp-vl"
+llm_client = "comfyninja"
+vision = true
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.comfyninja-qwen3_8-27b-q4]
+id = "comfyninja/qwen3.8-27b-q4"
+llm_client = "comfyninja"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.comfyninja-qwen3_8-27b-q4-mtp]
+id = "comfyninja/qwen3.8-27b-q4-mtp"
+llm_client = "comfyninja"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.comfyninja-qwen3_8-27b-q4-mtp-vl]
+id = "comfyninja/qwen3.8-27b-q4-mtp-vl"
+llm_client = "comfyninja"
+vision = true
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.deepseek-deepseek-flash]
+id = "deepseek-flash"
+llm_client = "deepseek"
+vision = true
+reasoning_effort = "high"
+
+[targets.htpc-qwen3_5-9b]
+id = "Qwen3.5-9B-Q4_0"
+llm_client = "htpc"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.htpc-qwen3_5-9b-mtp]
+id = "Qwen3.5-9B-MTP"
+llm_client = "htpc"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.openai-gpt-6-luna]
+id = "gpt-6-luna"
+llm_client = "openai"
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_effort = "high"
+
+[targets.openai-gpt-6-luna-nt]
+id = "gpt-6-luna"
+llm_client = "openai_nt"
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[targets.openai-gpt-6-sol]
+id = "gpt-6-sol"
+llm_client = "openai"
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_effort = "high"
+
+[targets.openrouter-glm-5_3-flash]
+id = "z-ai/glm-5.3-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "high"
+
+[targets.openrouter-liquid-lfm-2_5-2_6b-free]
+id = "liquid/lfm-2.5-2.6b:free"
+llm_client = "openrouter"
+vision = false
+reasoning_effort = "high"
+
+[targets.openrouter-minimax-m3-1-flash-free]
+id = "minimax/minimax-m3.1-flash:free"
+llm_client = "openrouter"
+vision = true
+video = true
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.openrouter-qwen3_7-flash]
+id = "qwen/qwen3.7-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+[targets.openrouter-qwen3_8-flash]
+id = "qwen/qwen3.8-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+[targets.openrouter-nemotron-3_5-super-vl-free]
+id = "nvidia/nemotron-3.5-super-vl:free"
+llm_client = "openrouter"
+vision = true
+video = true
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.openrouter-xing4_0-29b-a4b-free]
+id = "xingchen-agi/xing4.0-29b-a4b:free"
+llm_client = "openrouter"
+vision = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.thaillm-openthaigpt]
+id = "openthaigpt-thaillm-8b-instruct-v7.2"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-qwen3_5-9b]
+id = "qwen3.5-9b"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-qwen3_6-35b-a3b]
+id = "qwen3.6-35b-a3b"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-thalle]
+id = "thalle-0.2-thaillm-8b-fa"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-typhoon]
+id = "typhoon-s-thaillm-8b-instruct"
+llm_client = "thaillm"
+vision = false
+
+# ---- one direct route per model ----
+[routes.direct-comfyninja-qwen3_8-27b-q3]
+id = "direct-comfyninja-qwen3_8-27b-q3"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q3"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-comfyninja-qwen3_8-27b-q3-mtp]
+id = "direct-comfyninja-qwen3_8-27b-q3-mtp"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q3-mtp"
+candidates = []
+context_window = 249856
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-comfyninja-qwen3_8-27b-q3-mtp-vl]
+id = "direct-comfyninja-qwen3_8-27b-q3-mtp-vl"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q3-mtp-vl"
+candidates = []
+context_window = 225280
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-comfyninja-qwen3_8-27b-q4]
+id = "direct-comfyninja-qwen3_8-27b-q4"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q4"
+candidates = []
+context_window = 200704
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-comfyninja-qwen3_8-27b-q4-mtp]
+id = "direct-comfyninja-qwen3_8-27b-q4-mtp"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q4-mtp"
+candidates = []
+context_window = 188416
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-comfyninja-qwen3_8-27b-q4-mtp-vl]
+id = "direct-comfyninja-qwen3_8-27b-q4-mtp-vl"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q4-mtp-vl"
+candidates = []
+context_window = 163840
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-deepseek-deepseek-flash]
+id = "direct-deepseek-deepseek-flash"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-htpc-qwen3_5-9b]
+id = "direct-htpc-qwen3_5-9b"
+type = "passthrough"
+target = "htpc-qwen3_5-9b"
+candidates = []
+context_window = 81920
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-htpc-qwen3_5-9b-mtp]
+id = "direct-htpc-qwen3_5-9b-mtp"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+candidates = []
+context_window = 81920
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-openai-gpt-6-luna]
+id = "direct-openai-gpt-6-luna"
+type = "passthrough"
+target = "openai-gpt-6-luna"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openai-gpt-6-luna-nt]
+id = "direct-openai-gpt-6-luna-nt"
+type = "passthrough"
+target = "openai-gpt-6-luna-nt"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openai-gpt-6-sol]
+id = "direct-openai-gpt-6-sol"
+type = "passthrough"
+target = "openai-gpt-6-sol"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-glm-5_3-flash]
+id = "direct-openrouter-glm-5_3-flash"
+type = "passthrough"
+target = "openrouter-glm-5_3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-liquid-lfm-2_5-2_6b-free]
+id = "direct-openrouter-liquid-lfm-2_5-2_6b-free"
+type = "passthrough"
+target = "openrouter-liquid-lfm-2_5-2_6b-free"
+candidates = []
+context_window = 67584
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-openrouter-minimax-m3-1-flash-free]
+id = "direct-openrouter-minimax-m3-1-flash-free"
+type = "passthrough"
+target = "openrouter-minimax-m3-1-flash-free"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+[routes.direct-openrouter-qwen3_7-flash]
+id = "direct-openrouter-qwen3_7-flash"
+type = "passthrough"
+target = "openrouter-qwen3_7-flash"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-qwen3_8-flash]
+id = "direct-openrouter-qwen3_8-flash"
+type = "passthrough"
+target = "openrouter-qwen3_8-flash"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-nemotron-3_5-super-vl-free]
+id = "direct-openrouter-nemotron-3_5-super-vl-free"
+type = "passthrough"
+target = "openrouter-nemotron-3_5-super-vl-free"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+[routes.direct-openrouter-xing4_0-29b-a4b-free]
+id = "direct-openrouter-xing4_0-29b-a4b-free"
+type = "passthrough"
+target = "openrouter-xing4_0-29b-a4b-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-openthaigpt]
+id = "direct-thaillm-openthaigpt"
+type = "passthrough"
+target = "thaillm-openthaigpt"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-qwen3_5-9b]
+id = "direct-thaillm-qwen3_5-9b"
+type = "passthrough"
+target = "thaillm-qwen3_5-9b"
+candidates = []
+context_window = 32768
+tool_calling = false
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-qwen3_6-35b-a3b]
+id = "direct-thaillm-qwen3_6-35b-a3b"
+type = "passthrough"
+target = "thaillm-qwen3_6-35b-a3b"
+candidates = []
+context_window = 32768
+tool_calling = false
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-thalle]
+id = "direct-thaillm-thalle"
+type = "passthrough"
+target = "thaillm-thalle"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-typhoon]
+id = "direct-thaillm-typhoon"
+type = "passthrough"
+target = "thaillm-typhoon"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+# ---- routes that fall back through a list of candidates ----
+[routes.smart]
+id = "smart"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = ["openrouter-glm-5_3-flash", "openrouter-qwen3_8-flash"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "inherit"
+
+[routes.smart-bounded]
+id = "smart-bounded"
+type = "passthrough"
+target = "openai-gpt-6-luna-nt"
+candidates = ["openrouter-qwen3_7-flash"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+
+[routes.smartlocal]
+id = "smartlocal"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+candidates = ["comfyninja-qwen3_8-27b-q3-mtp-vl"]
+context_window = 225280
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "medium"
+escalation_max_input_tokens = 61440
+escalation_target = "comfyninja-qwen3_8-27b-q3-mtp-vl"
+
+[routes.smartlocal-bounded]
+id = "smartlocal-bounded"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+candidates = ["comfyninja-qwen3_8-27b-q3-mtp-vl"]
+context_window = 225280
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+escalation_max_input_tokens = 61440
+escalation_target = "comfyninja-qwen3_8-27b-q3-mtp-vl"
+
+[routes.smartfree]
+id = "smartfree"
+type = "passthrough"
+target = "openrouter-minimax-m3-1-flash-free"
+candidates = ["openrouter-nemotron-3_5-super-vl-free", "openrouter-xing4_0-29b-a4b-free"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+route_reasoning_policy = "inherit"
+
+[routes.smartfree-bounded]
+id = "smartfree-bounded"
+type = "passthrough"
+target = "openrouter-minimax-m3-1-flash-free"
+candidates = ["openrouter-nemotron-3_5-super-vl-free", "openrouter-xing4_0-29b-a4b-free"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+route_reasoning_policy = "inherit"
+
+# ---- tiers that order whole routes ----
+[composites.tier1]
+children = ["smartfree", "smart"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+[composites.tier1-bounded]
+children = ["smartfree-bounded", "smart-bounded"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+[composites.tier2]
+children = ["smartfree", "smartlocal"]
+context_window = 225280
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+[composites.tier2-bounded]
+children = ["smartfree-bounded", "smartlocal-bounded"]
+context_window = 225280
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+# ---- decision targets and lanes ----
+[targets.direct-htpc-laya]
+id = "laya-rl-agent"
+llm_client = "htpc"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "http://localhost:8011"
+decision_api_key_env = "SWITCHYARD_LAYA_API_KEY"
+
+[targets.direct-htpc-jev-style]
+id = "jev-style-0.8b-decision-v3"
+llm_client = "htpc"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "http://localhost:8765"
+decision_api_key_env = "SWITCHYARD_JEV_STYLE_API_KEY"
+
+[targets.direct-openrouter-span-01-lite]
+id = "respan/span-01-lite"
+llm_client = "openrouter"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "https://openrouter.ai"
+decision_api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+supported_types = { noul = true, choice = false, score = false }
+state_forms = { plain_string = true, structured = false }
+
+[targets."direct-openrouter-mercury-decide-free"]
+id = "inception/mercury-decide:free"
+llm_client = "openrouter"
+decision_transport = "system_one"
+decision_base_url = "https://openrouter.ai/api"
+decision_api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+
+[targets."direct-openrouter-mercury-decide-free".supported_types]
+noul = true
+choice = true
+score = true
+
+[decision_lanes.smartfree-decision]
+targets = ["direct-openrouter-span-01-lite", "direct-openrouter-mercury-decide-free"]
+
+[decision_lanes.smartlocal-decision]
+targets = ["direct-htpc-jev-style", "direct-htpc-laya"]
+
+# tier1-decision COMPOSES the two policy lanes above. It does not copy
+# their targets, so each family stays independently addressable and a
+# family change is inherited rather than duplicated.
+[decision_lane_composition.tier1-decision]
+children = ["smartfree-decision", "smartlocal-decision"]
+
+# ---- embeddings and reranking ----
+[capability_clients.embedding-local]
+format = "openai_embeddings"
+base_url = "http://localhost:8448"
+model = "Qwen3-Embedding-0.6B"
+
+[capability_clients.embedding-free]
+format = "openai_embeddings"
+base_url = "https://openrouter.ai/api"
+model = "liquid/lfm-2.5-embedding-350m:free"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capability_clients.reranker-local]
+format = "cohere_jina_rerank"
+base_url = "http://localhost:8449"
+model = "qwen3-reranker-0.6b-q8_0"
+timeout_seconds = 120
+
+[capabilities.switchyard-embedding-local]
+id = "switchyard-embedding-local"
+target = "embedding-local"
+contract = "localclaw-embedding-space:v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+[capabilities.switchyard-embedding-free]
+id = "switchyard-embedding-free"
+target = "embedding-free"
+contract = "localclaw-embedding-space:lfm2.5-350m-v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+[capabilities.switchyard-rerank-local]
+id = "switchyard-rerank-local"
+target = "reranker-local"
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512

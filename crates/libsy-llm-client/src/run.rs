@@ -31,9 +31,9 @@ use switchyard_libsy::{
     RuntimeModels, drive,
 };
 use switchyard_protocol::{
-    AggLlmResponse, LlmClientError, LlmResponse, LlmResponseChunk, LlmResponseStream, Message,
-    ModelId, Request, Response, ResponseAccumulator, RoutedLlmClient, RoutingFallbackReason,
-    WireFormat,
+    AggLlmResponse, DecisionRequest, DecisionResponse, LlmClientError, LlmResponse,
+    LlmResponseChunk, LlmResponseStream, Message, ModelId, Request, Response, ResponseAccumulator,
+    RoutedLlmClient, RoutingFallbackReason, WireFormat,
 };
 use switchyard_translation::prepare_request_for_target;
 
@@ -152,12 +152,23 @@ pub async fn decide(
     Ok(outcome)
 }
 
-async fn unsupported_decision(call: CallDecision) -> Result<()> {
+/// Answers a decision call, or reports that this client serves none.
+async fn serve_decision(clients: &ClientRouter, call: CallDecision) -> Result<()> {
     let model = call.model.clone();
-    call.respond(Err(LibsyError::client_call(
-        model,
-        LlmClientError::General("decision calls are not supported by this client".to_string()),
-    )))
+    let Some(handler) = clients.inner.decision_handler.clone() else {
+        return call.respond(Err(LibsyError::client_call(
+            model,
+            LlmClientError::General("decision calls are not supported by this client".to_string()),
+        )));
+    };
+    let request = call.request.clone();
+    match handler(request, model.clone()).await {
+        Ok(response) => call.respond(Ok(response)),
+        Err(error) => call.respond(Err(LibsyError::client_call(
+            model,
+            LlmClientError::General(error.to_string()),
+        ))),
+    }
 }
 
 /// Emits completed routing calls after the outcome reveals whether one response became the answer.
@@ -191,7 +202,7 @@ async fn serve(
 ) -> Result<()> {
     let call = match call {
         Call::Model(call) => *call,
-        Call::Decision(call) => return unsupported_decision(*call).await,
+        Call::Decision(call) => return serve_decision(&clients, *call).await,
     };
     let observe = |observation| {
         if let Some(observations) = &observations {
@@ -226,6 +237,10 @@ async fn call_first_available(
     models: &[ModelId],
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
 ) -> Result<Response> {
+    // Provider state can only be continued by the model that owns it. Any other
+    // candidate would lose or reconstruct the conversation, so a recorded owner
+    // pins the route even when another candidate is configured.
+    let pinned_owner = clients.continuation_owner(request);
     for (index, target) in models.iter().enumerate() {
         let request = clients.prepare_completion_request(request.clone(), target);
         match call_one(
@@ -242,6 +257,14 @@ async fn call_first_available(
         {
             Ok(response) => return Ok(response),
             Err(error) if index + 1 == models.len() => return Err(error),
+            Err(error) if pinned_owner.is_some() => {
+                tracing::info!(
+                    from = %target,
+                    owner = %pinned_owner.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "continuation owner failed; not falling back"
+                );
+                return Err(error);
+            }
             Err(error) => match fallback_reason(&error) {
                 Some(reason) => tracing::info!(
                     from = %target,
@@ -380,6 +403,91 @@ async fn buffer_routing_stream(
     Ok(stream::iter(events.into_iter().map(Ok)).boxed())
 }
 
+/// Why a provider call failed, in terms a caller can act on.
+///
+/// `fallback_reason` answers one yes/no question for candidate targets inside one route.
+/// A whole-route composite needs the same failure understood more finely: some of these
+/// are worth crossing routes for and some are not, so the classification is exposed rather
+/// than each caller reading HTTP statuses again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The connection could not be made or was lost.
+    Transport,
+    /// A deadline elapsed.
+    Timeout,
+    /// The provider asked us to slow down.
+    RateLimited,
+    /// The provider is temporarily unable to serve and may recover.
+    TemporarilyUnavailable,
+    /// The provider answered with a server-side error.
+    Server,
+    /// The request did not fit the provider's context window.
+    ContextWindow,
+    /// The provider refused on policy grounds. Provider-specific, so another provider
+    /// may legitimately accept it.
+    ProviderPolicy,
+    /// The provider rejected our credential or the caller's.
+    Auth,
+    /// The provider rejected the request itself.
+    Request,
+    /// Anything else, including local failures with no provider involvement.
+    Other,
+}
+
+impl FailureClass {
+    /// Whether a whole-route composite may try its next child after this failure.
+    ///
+    /// Deliberately narrower than candidate fallback inside one route. Crossing to a
+    /// different complete route is a bigger step than trying another target on the same
+    /// one, so only failures that say "this provider is unreachable right now" qualify.
+    ///
+    /// A context-window rejection is excluded on purpose: the next child may hold a
+    /// smaller window still, and crossing would only trade one rejection for another.
+    /// Capability evidence decides child order, not recovery from an oversized request.
+    pub fn allows_cross_route(self) -> bool {
+        matches!(
+            self,
+            Self::Transport
+                | Self::Timeout
+                | Self::RateLimited
+                | Self::TemporarilyUnavailable
+                | Self::Server
+        )
+    }
+}
+
+/// Classifies a provider failure without interpreting it again at each call site.
+pub fn failure_class(error: &LibsyError) -> FailureClass {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return FailureClass::Other;
+    };
+    match source {
+        LlmClientError::ContextWindowExceeded { .. } => FailureClass::ContextWindow,
+        LlmClientError::Transport { .. } => FailureClass::Transport,
+        // A per-attempt expiry is a deadline that elapsed, so a whole-route
+        // composite treats it exactly like an upstream 408.
+        LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
+        LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
+        LlmClientError::UpstreamHttp { status, body } => match *status {
+            StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
+            StatusCode::REQUEST_TIMEOUT => FailureClass::Timeout,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => FailureClass::Auth,
+            status if status.is_server_error() => FailureClass::Server,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                if serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+                    value["error"]["code"].as_str() == Some("content_policy_violation")
+                }) {
+                    FailureClass::ProviderPolicy
+                } else {
+                    FailureClass::Request
+                }
+            }
+            _ => FailureClass::Other,
+        },
+        _ => FailureClass::Other,
+    }
+}
+
 /// Whether a failed candidate is worth routing around.
 fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     let LibsyError::ClientCall { source, .. } = error else {
@@ -387,6 +495,11 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     };
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
+        // Pre-commit expiry: this attempt returned no response at all, so another
+        // candidate loses nothing. `Timeout` is deliberately absent: it means the
+        // overall lifetime elapsed or a delivered stream stopped, and routing
+        // around either would splice two models' output or overrun the budget.
+        LlmClientError::AttemptTimeout { .. } => Some(RoutingFallbackReason::Unavailable),
         LlmClientError::Transport { .. } | LlmClientError::TemporarilyUnavailable => {
             Some(RoutingFallbackReason::Unavailable)
         }
@@ -574,7 +687,43 @@ struct ClientRouting {
     state_owners: Mutex<StateOwners>,
     /// Native Responses state only needs a routing pin when answer targets span clients.
     track_provider_state: bool,
+    /// Fulfils a routing-time decision call. Absent, a decision call is reported as
+    /// unsupported, which is what this client did before any host supplied one.
+    decision_handler: Option<DecisionHandler>,
+    /// Factual capability of each target, keyed by model id.
+    ///
+    /// Used to drop candidates a request cannot use before any provider is contacted, so a
+    /// target that cannot see an image is never called for one. A target absent from this
+    /// map is treated as uncharacterised rather than incapable.
+    target_capabilities: HashMap<ModelId, CapabilityFacts>,
 }
+
+/// The request requirements a candidate target is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CapabilityFacts {
+    /// The backing deployment cannot accept image input.
+    pub no_vision: bool,
+    /// The backing deployment cannot accept video input.
+    ///
+    /// Unlike `no_vision`, this is set for a target that says nothing: video is never
+    /// inferred from image support, so "undeclared" and "cannot" are the same fact here.
+    pub no_video: bool,
+    /// The backing deployment cannot accept tool definitions or calls.
+    pub no_tool_calling: bool,
+}
+
+/// Serves one decision call and returns the answer, or a classified failure.
+///
+/// Supplied by the host that owns decision backends, so this crate stays unaware of
+/// how a decision is transported.
+pub type DecisionHandler = Arc<
+    dyn Fn(
+            DecisionRequest,
+            ModelId,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<DecisionResponse>> + Send>>
+        + Send
+        + Sync,
+>;
 
 enum Routing {
     /// One client serves every model.
@@ -584,6 +733,27 @@ enum Routing {
 }
 
 impl ClientRouter {
+    /// Declares the factual capability of each target, by model id.
+    pub fn with_target_capabilities(
+        mut self,
+        capabilities: HashMap<ModelId, CapabilityFacts>,
+    ) -> Self {
+        let routing =
+            Arc::get_mut(&mut self.inner).expect("client router is not yet shared when configured");
+        routing.target_capabilities = capabilities;
+        self
+    }
+
+    /// Supplies the host that fulfils routing-time decision calls.
+    ///
+    /// Without one, a decision call is answered as unsupported.
+    pub fn with_decision_handler(mut self, handler: DecisionHandler) -> Self {
+        let routing =
+            Arc::get_mut(&mut self.inner).expect("client router is not yet shared when configured");
+        routing.decision_handler = Some(handler);
+        self
+    }
+
     /// Build a router over `model name -> client`, for targets spread across providers.
     pub fn new(by_model: HashMap<ModelId, Arc<dyn RoutedLlmClient>>) -> Self {
         Self::new_with_target_prompts(by_model, HashMap::new(), None)
@@ -637,6 +807,8 @@ impl ClientRouter {
                 routing_answer_target,
                 state_owners: Mutex::default(),
                 track_provider_state: spans_providers,
+                decision_handler: None,
+                target_capabilities: HashMap::new(),
             }),
         }
     }
@@ -654,6 +826,8 @@ impl ClientRouter {
                 routing_answer_target: None,
                 state_owners: Mutex::default(),
                 track_provider_state: false,
+                decision_handler: None,
+                target_capabilities: HashMap::new(),
             }),
         }
     }
@@ -676,6 +850,15 @@ impl ClientRouter {
                     })
             }
         }
+    }
+
+    /// The model that owns this request's provider state, when one is recorded.
+    ///
+    /// Exposed read-only so a whole-route composite can ask which child owns a
+    /// continuation without copying provider state or reimplementing the lookup. The
+    /// child that owns it keeps its own state; nothing is duplicated here.
+    pub fn continuation_owner(&self, request: &Request) -> Option<ModelId> {
+        self.stored_state_owner(request).map(|owner| owner.model)
     }
 
     /// Return the recorded model for the requested response or conversation ID.
@@ -894,6 +1077,11 @@ impl ClientRouter {
     }
 
     /// Prepare a completion candidate with its configured target prompt.
+    /// The declared capability facts of each target, keyed by model id.
+    pub fn target_capabilities(&self) -> &HashMap<ModelId, CapabilityFacts> {
+        &self.inner.target_capabilities
+    }
+
     fn prepare_completion_request(&self, mut request: Request, target: &ModelId) -> Request {
         let prompt = self.inner.target_prompts.get(target).map(String::as_str);
         prepare_request_for_target(&mut request.llm_request, target, prompt);
@@ -927,6 +1115,7 @@ mod tests {
     use futures::StreamExt;
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
+    use switchyard_protocol::ReasoningDialect;
     use switchyard_protocol::{
         ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Message, Role,
         ToolResult, completion_text, text_request, text_response,
@@ -991,6 +1180,9 @@ mod tests {
         ContextWindow,
         ContentPolicy,
         Unauthorized,
+        AttemptTimeout,
+        TerminalTimeout,
+        ServerError,
         StreamSuccess,
         MidStreamError,
     }
@@ -1020,6 +1212,24 @@ mod tests {
                     FirstOutcome::Unauthorized => Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::UNAUTHORIZED,
                         body: "unauthorized".to_string(),
+                    }),
+                    FirstOutcome::AttemptTimeout => Err(LlmClientError::AttemptTimeout {
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "attempt produced no usable output",
+                        )
+                        .into(),
+                    }),
+                    FirstOutcome::ServerError => Err(LlmClientError::UpstreamHttp {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body: "upstream unavailable".to_string(),
+                    }),
+                    FirstOutcome::TerminalTimeout => Err(LlmClientError::Timeout {
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "response did not finish within the overall budget",
+                        )
+                        .into(),
                     }),
                     FirstOutcome::StreamSuccess => Ok(stream_response(vec![
                         LlmResponseChunk::TextDelta {
@@ -1069,6 +1279,8 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hello".to_string()),
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 
@@ -1088,22 +1300,35 @@ mod tests {
     async fn run_candidates(
         first: FirstOutcome,
     ) -> (Arc<CandidateClient>, Result<(ModelId, Response)>) {
+        run_candidates_for(first, request()).await
+    }
+
+    async fn run_candidates_for(
+        first: FirstOutcome,
+        request: Request,
+    ) -> (Arc<CandidateClient>, Result<(ModelId, Response)>) {
         let client = Arc::new(CandidateClient {
             calls: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             first,
         });
-        let algorithm = Arc::new(CandidateAlgorithm {});
-        let models = to_category_map(&["weak", "strong"]);
-        let result = run(
-            algorithm,
-            ClientRouter::single(client.clone()),
-            request(),
-            models,
+        let clients = ClientRouter::single(client.clone());
+        let result = run_candidates_with(clients, request).await;
+        (client, result)
+    }
+
+    async fn run_candidates_with(
+        clients: ClientRouter,
+        request: Request,
+    ) -> Result<(ModelId, Response)> {
+        run(
+            Arc::new(CandidateAlgorithm {}),
+            clients,
+            request,
+            to_category_map(&["weak", "strong"]),
             None,
         )
-        .await;
-        (client, result)
+        .await
     }
 
     fn to_category_map(names: &[&str]) -> Arc<RuntimeModels> {
@@ -1230,9 +1455,14 @@ mod tests {
                         extra_body: BTreeMap::from([("store".to_string(), json!(store))]),
                         omit_body_fields: BTreeSet::new(),
                         reasoning_effort: None,
+                        reasoning_policy: None,
+                        reasoning_dialect: ReasoningDialect::default(),
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
                         timeout: None,
+                        attempt_timeout: None,
+                        stream_idle_timeout: None,
+                        requires_list_input: false,
                     };
                     let backend = if responses {
                         Backend::OpenAiResponses(config)
@@ -1377,9 +1607,14 @@ mod tests {
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
                     reasoning_effort: None,
+                    reasoning_policy: None,
+                    reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
                     timeout: None,
+                    attempt_timeout: None,
+                    stream_idle_timeout: None,
+                    requires_list_input: false,
                 }),
                 None,
             )])
@@ -1404,6 +1639,8 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding seed request", error))?,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1442,6 +1679,8 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding continuation request", error))?,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let (_, response) = run(
             Arc::new(switchyard_libsy::Passthrough),
@@ -1474,6 +1713,8 @@ mod tests {
             .map_err(|error| LibsyError::external("decoding chained request", error))?,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let history = clients
             .stored_state_owner(&third)
@@ -1904,6 +2145,22 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_commit_attempt_timeout_crosses_routes_but_a_terminal_timeout_does_not() {
+        let error = |source| LibsyError::client_call("target", source);
+        let attempt = error(LlmClientError::AttemptTimeout {
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "no output").into(),
+        });
+        assert_eq!(failure_class(&attempt), FailureClass::Timeout);
+        assert!(FailureClass::Timeout.allows_cross_route());
+
+        let terminal = error(LlmClientError::Timeout {
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "overall").into(),
+        });
+        assert_eq!(failure_class(&terminal), FailureClass::Other);
+        assert!(!FailureClass::Other.allows_cross_route());
+    }
+
+    #[test]
     fn fallback_only_accepts_context_policy_and_unavailable_failures() {
         let error = |source| LibsyError::client_call("target", source);
         assert_eq!(
@@ -2010,6 +2267,112 @@ mod tests {
         Ok(())
     }
 
+    fn continuation_request(response_id: &str) -> Request {
+        let mut request = request();
+        request.llm_request.extensions.fields.insert(
+            "previous_response_id".to_string(),
+            serde_json::json!(response_id),
+        );
+        request
+    }
+
+    #[tokio::test]
+    async fn a_continuation_is_pinned_to_its_owner_and_never_falls_back() -> Result<()> {
+        // `run()` already pins a continuation before the algorithm executes
+        // (`continue_on`), so the algorithm never offers a fallback list. This
+        // test covers the layer that owns the guarantee for every OTHER caller:
+        // anything that hands `call_first_available` an ordered candidate list
+        // must still not move a request whose state another model holds.
+        let build = || {
+            let client = Arc::new(CandidateClient {
+                calls: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                first: FirstOutcome::ServerError,
+            });
+            (Arc::clone(&client), ClientRouter::single(client))
+        };
+        let models = vec![ModelId::from("weak"), ModelId::from("strong")];
+        let observe = |_observation| {};
+
+        // Control: no recorded owner, so the ordered list is honoured.
+        let (client, clients) = build();
+        let _ = call_first_available(
+            &clients,
+            "candidate_test",
+            &continuation_request("resp_owned"),
+            &models,
+            &observe,
+        )
+        .await;
+        assert_eq!(
+            client.calls.lock().clone(),
+            vec![ModelId::from("weak"), ModelId::from("strong")],
+            "without stored state the fallback list applies"
+        );
+
+        // The same call, once "weak" is recorded as the owner.
+        let (client, clients) = build();
+        clients.inner.state_owners.lock().by_id.insert(
+            "resp_owned".to_string(),
+            StoredState {
+                model: ModelId::from("weak"),
+                history: None,
+            },
+        );
+        let result = call_first_available(
+            &clients,
+            "candidate_test",
+            &continuation_request("resp_owned"),
+            &models,
+            &observe,
+        )
+        .await;
+        assert_eq!(
+            client.calls.lock().clone(),
+            vec![ModelId::from("weak")],
+            "an owned continuation must not reach another candidate"
+        );
+        match result {
+            Err(LibsyError::ClientCall { source, .. }) => assert!(matches!(
+                source,
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ..
+                }
+            )),
+            Ok(_) => panic!("expected the owner's own error, got a success"),
+            Err(other) => panic!("expected a client-call error, got {other}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pre_commit_attempt_timeout_falls_back_but_a_committed_timeout_does_not() -> Result<()>
+    {
+        // Nothing reached the caller, so another candidate may serve the request.
+        let (client, result) = run_candidates(FirstOutcome::AttemptTimeout).await;
+        let (_, response) = result.expect("a pre-commit timeout must be routable");
+        assert_eq!(
+            &*client.calls.lock(),
+            &[ModelId::from("weak"), "strong".into()]
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
+
+        // A terminal timeout may follow output the caller already holds, or an
+        // exhausted overall budget. Routing around it would splice two models or
+        // overrun the deadline, so the second candidate must stay untouched.
+        let (client, result) = run_candidates(FirstOutcome::TerminalTimeout).await;
+        assert!(matches!(
+            result,
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::Timeout { .. },
+                ..
+            })
+        ));
+        assert_eq!(&*client.calls.lock(), &[ModelId::from("weak")]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn retry_exhaustion_falls_back_and_optional_cooldown_skips_failed_backend() -> Result<()>
     {
@@ -2052,9 +2415,14 @@ mod tests {
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
                     reasoning_effort: None,
+                    reasoning_policy: None,
+                    reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 2,
                     failure_cooldown: cooldown,
                     timeout: None,
+                    attempt_timeout: None,
+                    stream_idle_timeout: None,
+                    requires_list_input: false,
                 })
             };
             TranslatingLlmClient::new(&[
@@ -2173,9 +2541,14 @@ mod tests {
                 extra_body: BTreeMap::new(),
                 omit_body_fields: BTreeSet::new(),
                 reasoning_effort: None,
+                reasoning_policy: None,
+                reasoning_dialect: ReasoningDialect::default(),
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
                 timeout: None,
+                attempt_timeout: None,
+                stream_idle_timeout: None,
+                requires_list_input: false,
             })
         };
         let client = Arc::new(
@@ -2192,6 +2565,8 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         };
         let result = run(
             algorithm,

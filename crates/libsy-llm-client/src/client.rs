@@ -5,7 +5,7 @@
 //! request, call the configured backend over HTTP, decode the neutral response.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::ready;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -20,8 +20,10 @@ use switchyard_protocol::{
     ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
-    TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
+    TargetCapabilities, TranslationError, TranslationPolicy, WireFormat,
+    decode_aggregated_response, decode_request, decode_stream,
+    encode_aggregated_response_with_extensions, encode_request_with_policy,
+    encode_stream_with_extensions,
 };
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -222,6 +224,8 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 model,
                 UpstreamEndpoint::Auxiliary(operation),
+                None,
+                None,
             )
             .await?;
         let EncodedResponse::Buffered { body, .. } = http_response else {
@@ -245,6 +249,7 @@ impl TranslatingLlmClient {
     /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
     /// backend's completion URL and decodes a response) and
     /// the model-bearing auxiliary operations, which return raw JSON.
+    #[allow(clippy::too_many_arguments)]
     async fn send_encoded(
         &self,
         backend: &Backend,
@@ -253,6 +258,8 @@ impl TranslatingLlmClient {
         metadata: Option<&Metadata>,
         model: &ModelId,
         endpoint: UpstreamEndpoint,
+        route_reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
+        route_reasoning_effort: Option<&str>,
     ) -> Result<EncodedResponse> {
         let cooldown = backend.failure_cooldown();
         let unavailable_until =
@@ -268,7 +275,16 @@ impl TranslatingLlmClient {
             return Err(LlmClientError::TemporarilyUnavailable);
         }
 
-        let mut body = encode_request(&llm_request, wire_format)
+        // A Responses upstream may declare that it requires a list-shaped `input`; the
+        // default policy carries no target capabilities, so it is supplied here.
+        let policy = TranslationPolicy {
+            target_capabilities: TargetCapabilities {
+                requires_list_input: Some(backend.requires_list_input()),
+                ..TargetCapabilities::default()
+            },
+            ..TranslationPolicy::default()
+        };
+        let mut body = encode_request_with_policy(&llm_request, wire_format, &policy)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`; force the resolved model so
@@ -288,6 +304,63 @@ impl TranslatingLlmClient {
         // After the merge on purpose: the effort override must win over both the caller's
         // value and any `reasoning` default a target set through `extra_body`.
         apply_reasoning_effort(&mut body, backend);
+        // Last, because the policy is the target's authoritative choice. `extra_body` only
+        // fills keys the request omits, so a caller that set `reasoning` or
+        // `chat_template_kwargs` would otherwise re-enable reasoning on a strict target.
+        apply_reasoning_policy(&mut body, backend);
+        // A route's graded level outranks the target's effort, so it is written after
+        // `apply_reasoning_effort` and before the on/off policy fragment. Only the single key
+        // the transport uses for effort is touched, so an unrelated `reasoning` field the
+        // caller set survives.
+        if let Some(effort) = route_reasoning_effort
+            && let Value::Object(object) = &mut body
+        {
+            match backend {
+                Backend::OpenAiResponses(_) => {
+                    let reasoning = object
+                        .entry("reasoning".to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if !reasoning.is_object() {
+                        *reasoning = Value::Object(serde_json::Map::new());
+                    }
+                    if let Value::Object(reasoning) = reasoning {
+                        reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+                    }
+                }
+                Backend::OpenAiChat(_) => {
+                    object.insert(
+                        "reasoning_effort".to_string(),
+                        Value::String(effort.to_string()),
+                    );
+                }
+                Backend::Anthropic(_) => {}
+            }
+        }
+        // A route's explicit policy outranks the target's default and the caller's effort.
+        // Applied last so the route is genuinely authoritative.
+        if let Some(policy) = route_reasoning_policy
+            && let Some(fragment) = policy.wire_body(backend.reasoning_dialect())
+            && let (Value::Object(fragment), Value::Object(object)) = (&fragment, &mut body)
+        {
+            for (key, value) in fragment {
+                match value {
+                    Value::Object(fields) => {
+                        let entry = object
+                            .entry(key.clone())
+                            .or_insert_with(|| Value::Object(Default::default()));
+                        if !entry.is_object() {
+                            *entry = Value::Object(Default::default());
+                        }
+                        if let Value::Object(entry) = entry {
+                            entry.extend(fields.clone());
+                        }
+                    }
+                    _ => {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -363,6 +436,27 @@ impl TranslatingLlmClient {
                 retry_delay_ms = tracing::field::Empty,
             );
             let mut attempt_started = false;
+            // Per-attempt bound: send, response headers and the first decoded event.
+            // It stops applying once this attempt returns, so it can never cut a
+            // healthy stream short. Expiry here happens before anything reaches the
+            // caller, which is what makes it safe to try another candidate.
+            let attempt_deadline = backend.attempt_timeout().map(|bound| {
+                let at = tokio::time::Instant::now() + bound;
+                match expires_at {
+                    Some((overall, _)) => (at.min(overall), bound),
+                    None => (at, bound),
+                }
+            });
+            let attempt_expired = async {
+                match attempt_deadline {
+                    Some((at, bound)) => {
+                        tokio::time::sleep_until(at).await;
+                        bound
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(attempt_expired);
             let result = tokio::select! {
                 biased;
                 timeout = &mut deadline => {
@@ -372,6 +466,18 @@ impl TranslatingLlmClient {
                     span.record("outcome", "error");
                     span.record("will_retry", false);
                     return Err(deadline_error(timeout));
+                }
+                bound = &mut attempt_expired => {
+                    if attempt_started {
+                        metrics::record_upstream_attempt(None);
+                    }
+                    span.record("outcome", "error");
+                    span.record("will_retry", false);
+                    Err(AttemptFailure {
+                        error: attempt_timeout_error(bound),
+                        status: None,
+                        retry_after: None,
+                    })
                 }
                 result = async {
                     attempt_started = true;
@@ -394,7 +500,12 @@ impl TranslatingLlmClient {
                             upstream_headers,
                         } => EncodedResponse::Streaming {
                             status,
-                            chunks: stream_with_deadline(chunks, expires_at),
+                            // Post-commit bounds: the caller holds this stream, so an
+                            // expiry is terminal rather than a fallback opportunity.
+                            chunks: stream_with_idle_deadline(
+                                stream_with_deadline(chunks, expires_at),
+                                backend.stream_idle_timeout(),
+                            ),
                             upstream_headers,
                         },
                         buffered => buffered,
@@ -546,6 +657,8 @@ impl TranslatingLlmClient {
         let Request {
             mut llm_request,
             metadata,
+            route_reasoning_policy,
+            route_reasoning_effort,
             ..
         } = request;
 
@@ -580,6 +693,8 @@ impl TranslatingLlmClient {
                 metadata.as_ref(),
                 &model_id,
                 UpstreamEndpoint::Completion,
+                route_reasoning_policy,
+                route_reasoning_effort.as_deref(),
             )
             .await?;
 
@@ -662,6 +777,8 @@ impl TranslatingLlmClient {
         let request = Request {
             llm_request,
             raw_request: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
             metadata: Some(Metadata {
                 session_id: None,
                 agent_id: None,
@@ -767,6 +884,35 @@ fn deadline_error(timeout: Duration) -> LlmClientError {
     }
 }
 
+// Pre-commit expiry: no response was returned for this attempt, so routing may
+// still choose another candidate. Kept distinct from `deadline_error` so the
+// fallback decision never has to guess which deadline fired.
+fn attempt_timeout_error(bound: Duration) -> LlmClientError {
+    LlmClientError::AttemptTimeout {
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "attempt produced no usable output within {} ms",
+                duration_millis(bound)
+            ),
+        )),
+    }
+}
+
+// Post-commit inactivity: the caller holds the stream and already received at
+// least one event, so this is a terminal `Timeout`, never a fallback trigger.
+fn idle_timeout_error(idle: Duration) -> LlmClientError {
+    LlmClientError::Timeout {
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "stream produced no event within {} ms",
+                duration_millis(idle)
+            ),
+        )),
+    }
+}
+
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
         is_transient_failure(&self.error)
@@ -775,7 +921,9 @@ impl AttemptFailure {
 
 fn is_transient_failure(error: &LlmClientError) -> bool {
     match error {
-        LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
+        LlmClientError::Transport { .. }
+        | LlmClientError::Timeout { .. }
+        | LlmClientError::AttemptTimeout { .. } => true,
         LlmClientError::UpstreamHttp { status, .. } => {
             metrics::is_retryable_http_status(status.as_u16())
         }
@@ -803,6 +951,29 @@ fn stream_with_deadline(
     .boxed()
 }
 
+// Bounds the gap between events on a stream the caller already holds. This is a
+// post-commit bound: a slow but progressing stream is left alone, and an expiry
+// surfaces as an in-band error rather than a new candidate.
+fn stream_with_idle_deadline(
+    chunks: LlmResponseStream,
+    idle: Option<Duration>,
+) -> LlmResponseStream {
+    let Some(idle) = idle else {
+        return chunks;
+    };
+    stream::unfold(Some(chunks), move |chunks| async move {
+        let mut chunks = chunks?;
+        let chunk = tokio::select! {
+            biased;
+            _ = tokio::time::sleep(idle) => return Some((Err(idle_timeout_error(idle)), None)),
+            chunk = chunks.next() => chunk?,
+        };
+        let next = chunk.is_ok().then_some(chunks);
+        Some((chunk, next))
+    })
+    .boxed()
+}
+
 async fn prepare_response_stream(
     response: reqwest::Response,
     backend: &Backend,
@@ -814,23 +985,53 @@ async fn prepare_response_stream(
             .map_err(convert_reqwest_error)
     });
     let mut chunks = decode_stream(bytes, backend.wire_format())?;
-    match chunks.next().await {
-        None => Ok(stream::empty().boxed()),
-        // Nothing has reached the caller, so transport failures can still be retried.
-        Some(Err(error @ (LlmClientError::Transport { .. } | LlmClientError::Timeout { .. }))) => {
-            Err(error)
-        }
-        Some(first) => {
-            // An in-band context overflow skips retries and advances to another candidate.
-            if let Some(message) = first_event_overflow(&first, backend) {
-                return Err(LlmClientError::ContextWindowExceeded {
-                    model: model.clone(),
-                    message,
-                });
+    // Hold non-output events until something usable arrives. A provider announces
+    // the response (`response.created`, a role-only delta) and may then stall; if
+    // the attempt returned at that announcement, the attempt bound would stop
+    // applying with no output delivered and no bound left but the overall one.
+    // Staying inside this future keeps the wait covered by the attempt deadline,
+    // which also keeps the failure pre-commit and therefore routable.
+    let mut held: Vec<LlmResponseStreamEvent> = Vec::new();
+    loop {
+        match chunks.next().await {
+            None => break,
+            Some(Err(error)) => {
+                // Nothing usable was produced, so a transport failure here can
+                // still be retried and another candidate may serve the request.
+                return Err(error);
             }
-            Ok(stream::once(ready(first)).chain(chunks).boxed())
+            Some(Ok(event)) => {
+                // An in-band context overflow skips retries and advances to another candidate.
+                if let Some(message) = first_event_overflow(&Ok(event.clone()), backend) {
+                    return Err(LlmClientError::ContextWindowExceeded {
+                        model: model.clone(),
+                        message,
+                    });
+                }
+                let usable = event.normalized().iter().any(is_usable_output);
+                held.push(event);
+                if usable {
+                    break;
+                }
+            }
         }
     }
+    Ok(stream::iter(held.into_iter().map(Ok)).chain(chunks).boxed())
+}
+
+// Output a caller can act on. Identity and framing events (MessageStart, empty
+// normalized frames) are deliberately not usable: they say a response exists,
+// not that it produced anything.
+fn is_usable_output(chunk: &LlmResponseChunk) -> bool {
+    matches!(
+        chunk,
+        LlmResponseChunk::TextDelta { .. }
+            | LlmResponseChunk::ReasoningDelta { .. }
+            | LlmResponseChunk::ReasoningDetailsDelta { .. }
+            | LlmResponseChunk::ToolCallDelta { .. }
+            | LlmResponseChunk::MessageStop { .. }
+            | LlmResponseChunk::Usage(_)
+    )
 }
 
 // The overflow message when a stream's first event is an in-band provider rejection
@@ -1176,6 +1377,46 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
     }
 }
 
+/// Forces the backend's authoritative reasoning policy onto the outbound body.
+///
+/// Unlike `extra_body`, this is an override: a strict non-reasoning target must not be
+/// re-enabled by a caller that sent its own `reasoning` field. Provider-shaped keys are
+/// merged one level deep so unrelated caller fields (`reasoning.summary`, say) survive.
+fn apply_reasoning_policy(body: &mut Value, backend: &Backend) {
+    let Some(policy) = backend.reasoning_policy() else {
+        return;
+    };
+    if !policy.is_specified() {
+        return;
+    }
+    let Some(fragment) = policy.wire_body(backend.reasoning_dialect()) else {
+        return;
+    };
+    let (Value::Object(fragment), Value::Object(object)) = (&fragment, body) else {
+        return;
+    };
+    for (key, value) in fragment {
+        match value {
+            Value::Object(fields) => {
+                let existing = object
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if !existing.is_object() {
+                    *existing = Value::Object(Default::default());
+                }
+                if let Value::Object(existing) = existing {
+                    for (name, field) in fields {
+                        existing.insert(name.clone(), field.clone());
+                    }
+                }
+            }
+            _ => {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 // Applies target defaults without overriding fields supplied by the caller.
 fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     let Value::Object(object) = body else {
@@ -1336,6 +1577,7 @@ mod tests {
 
     use super::*;
     use crate::backend::HttpBackendConfig;
+    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
@@ -1346,9 +1588,14 @@ mod tests {
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
+            reasoning_policy: None,
+            reasoning_dialect: ReasoningDialect::default(),
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
+            requires_list_input: false,
         }
     }
 
@@ -1479,6 +1726,35 @@ mod tests {
         )]
     }
 
+    /// A Responses target on the llama.cpp dialect, which gates reasoning through
+    /// `chat_template_kwargs.enable_thinking` rather than an effort axis.
+    fn responses_map_with_local_policy(
+        base_url: &str,
+        policy: ReasoningPolicy,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.reasoning_dialect = ReasoningDialect::LlamaCppEnableThinking;
+        backend.reasoning_policy = Some(policy);
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
+    }
+
+    fn responses_map_with_policy(base_url: &str, policy: ReasoningPolicy) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        // An `extra_body` default that the caller will try to override.
+        backend.extra_body = BTreeMap::from([("reasoning".to_string(), json!({"enabled": true}))]);
+        backend.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+        backend.reasoning_policy = Some(policy);
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
+    }
+
     fn anthropic_map(base_url: &str) -> Vec<ModelConfig> {
         vec![ModelConfig::new(
             "claude",
@@ -1557,6 +1833,8 @@ mod tests {
             llm_request,
             raw_request: None,
             metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
         }
     }
 
@@ -1983,6 +2261,101 @@ mod tests {
         Ok(())
     }
 
+    /// A route's explicit reasoning policy outranks the target default AND the caller's
+    /// effort, on the real request path rather than a synthetic body.
+    ///
+    /// This is the guarantee that lets one physical model serve a thinking route and a
+    /// strict-NT route at the same time: the target declares thinking enabled, the caller
+    /// A route that asks for `High` must reach the wire as a graded effort, not as the
+    /// target's weaker default. `openai_effort` has no fragment meaning "think", so the
+    /// policy alone would be inert and the request would silently keep the target's level.
+    #[tokio::test]
+    async fn a_route_effort_overrides_the_target_default_on_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "reasoning": {"effort": "high"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        // The target defaults to medium; the route must still win with high.
+        let client = TranslatingLlmClient::new(&responses_map_with_effort(
+            &format!("{}/v1", server.uri()),
+            "medium",
+        ))
+        .expect("client");
+
+        let request = Request {
+            llm_request: switchyard_protocol::text_request(Some("gpt".into()), "hi"),
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: Some(switchyard_protocol::ReasoningPolicy::Enabled),
+            route_reasoning_effort: Some("high".to_string()),
+        };
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .expect("call completes");
+    }
+
+    /// A route's explicit reasoning policy outranks the target default AND the caller's
+    /// effort, on the real request path rather than a synthetic body.
+    #[tokio::test]
+    async fn a_route_policy_overrides_both_the_target_default_and_the_caller() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "chat_template_kwargs": {"enable_thinking": false}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_local_policy(
+            &format!("{}/v1", server.uri()),
+            switchyard_protocol::ReasoningPolicy::Enabled,
+        ))
+        .expect("client");
+
+        // Built through the typed Request so the route policy is carried the way the
+        // runner carries it, not by a hand-written body field.
+        let request = Request {
+            llm_request: switchyard_protocol::text_request(Some("gpt".into()), "hi"),
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: Some(switchyard_protocol::ReasoningPolicy::Disabled),
+            route_reasoning_effort: None,
+        };
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .expect("call completes");
+    }
+
     /// A configured reasoning effort replaces the caller's value on both OpenAI wire formats,
     /// which `extra_body` (defaults only) cannot do.
     #[tokio::test]
@@ -2057,6 +2430,55 @@ mod tests {
                     "model": "client-facing",
                     "input": [{"role": "user", "content": "hi"}],
                     "reasoning": {"effort": "high", "summary": "auto"}
+                }),
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A target reasoning policy is authoritative: it replaces whatever the caller sent
+    /// *and* any conflicting `extra_body` default. `extra_body` alone cannot express this,
+    /// because it only fills keys the request omits (`merge_extra_body`), so a caller that
+    /// sets `reasoning` would silently re-enable reasoning on a strict-NT target.
+    #[tokio::test]
+    async fn reasoning_policy_overrides_caller_and_extra_body()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "gpt",
+                "reasoning": {"enabled": false}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_policy(
+            &format!("{}/v1", server.uri()),
+            ReasoningPolicy::Disabled,
+        ))?;
+        client
+            .call_rewrite_model_raw(
+                json!({
+                    "model": "client-facing",
+                    "input": [{"role": "user", "content": "hi"}],
+                    "reasoning": {"enabled": true, "effort": "high"}
                 }),
                 None,
                 Some(&ModelId::from("gpt")),
@@ -2598,6 +3020,272 @@ mod tests {
             "recovered"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    // Serves a scripted SSE response, writing each event after its own delay.
+    // Used for the cases wiremock cannot express: headers now, body later, and a
+    // stream that starts promptly then stops producing.
+    fn paced_stream_server(
+        events: Vec<(u64, String)>,
+    ) -> std::io::Result<(String, JoinHandle<std::io::Result<()>>, Arc<AtomicUsize>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&connections);
+        let handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept()?;
+                observed.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                if stream.read(&mut request)? == 0 {
+                    continue;
+                }
+                stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )?;
+                for (delay_ms, payload) in &events {
+                    std::thread::sleep(Duration::from_millis(*delay_ms));
+                    write!(stream, "{:X}\r\n{payload}\r\n", payload.len())?;
+                    stream.flush()?;
+                }
+                stream.write_all(b"0\r\n\r\n")?;
+            }
+            Ok(())
+        });
+        Ok((format!("http://{address}/v1"), handle, connections))
+    }
+
+    fn chat_delta(text: &str) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
+    }
+
+    #[tokio::test]
+    async fn attempt_timeout_before_headers_is_pre_commit()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(600)))
+            .mount(&server)
+            .await;
+
+        let mut backend = config_with_retries(&format!("{}/v1", server.uri()), 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("attempt bound must fire before the response".into()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, LlmClientError::AttemptTimeout { .. }),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attempt_timeout_after_headers_before_first_event_is_pre_commit()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // Headers arrive immediately; the first event does not. Without an attempt
+        // bound this looked like a success until the overall deadline fired.
+        let (base_url, _handle, connections) =
+            paced_stream_server(vec![(600, chat_delta("late"))])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("the first event must not arrive".into()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, LlmClientError::AttemptTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    fn chat_role_only() -> String {
+        // Announces the response without producing anything the caller can use.
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_string()
+    }
+
+    #[tokio::test]
+    async fn a_non_output_event_does_not_end_the_attempt_boundary()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The provider announces the response (role-only delta) and then stalls.
+        // If the attempt returned at the announcement, the bound would stop
+        // applying with zero output delivered and nothing left but the overall
+        // deadline, which is unset on this lane.
+        let (base_url, _handle, connections) =
+            paced_stream_server(vec![(0, chat_role_only()), (600, chat_delta("late"))])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("a non-output event must not satisfy the attempt bound".into()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, LlmClientError::AttemptTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_output_event_followed_by_output_still_streams_normally()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The control for the test above: holding the announcement must not cost
+        // anything when output does follow.
+        let (base_url, _handle, _connections) = paced_stream_server(vec![
+            (0, chat_role_only()),
+            (10, chat_delta("Hello")),
+            (10, "data: [DONE]\n\n".to_string()),
+        ])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert_eq!(completion_text(&agg), "Hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_overall_deadline_stays_terminal_and_is_not_an_attempt_timeout()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(600)))
+            .mount(&server)
+            .await;
+
+        let mut backend = config_with_retries(&format!("{}/v1", server.uri()), 0);
+        backend.timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let error = match client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        {
+            Ok(_) => return Err("overall deadline must fire".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LlmClientError::Timeout { .. }), "{error:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_slow_but_progressing_stream_is_not_cut_by_the_attempt_bound()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // Two events, 150 ms apart: the whole response outlives a 100 ms attempt
+        // bound, but the first event arrives inside it. The attempt bound must stop
+        // applying once the attempt returns, or valid streams get truncated.
+        let (base_url, _handle, _connections) = paced_stream_server(vec![
+            (10, chat_delta("Hello")),
+            (150, chat_delta(" world")),
+            (10, "data: [DONE]\n\n".to_string()),
+        ])?;
+        let mut backend = config_with_retries(&base_url, 0);
+        backend.attempt_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert_eq!(completion_text(&agg), "Hello world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_after_first_event_is_terminal_and_never_reaches_a_second_attempt()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The first event is delivered, then silence. This is post-commit: the
+        // caller holds output, so the only correct outcome is a timeout on that
+        // same stream, with no new upstream call behind its back.
+        let (base_url, _handle, connections) = paced_stream_server(vec![
+            (10, chat_delta("partial")),
+            (600, chat_delta("never")),
+        ])?;
+        let mut backend = config_with_retries(&base_url, 2);
+        backend.stream_idle_timeout = Some(Duration::from_millis(100));
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend),
+            None,
+        )])?;
+
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let LlmResponse::Stream(mut chunks) = response.llm_response else {
+            return Err("expected a stream".into());
+        };
+        let mut saw_partial = false;
+        let mut timeout = None;
+        while let Some(item) = chunks.next().await {
+            match item {
+                Ok(event) => {
+                    saw_partial |= event
+                        .normalized()
+                        .iter()
+                        .any(|chunk| matches!(chunk, LlmResponseChunk::TextDelta { .. }));
+                }
+                Err(error) => {
+                    timeout = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(saw_partial, "the first event must reach the caller");
+        assert!(
+            matches!(timeout, Some(LlmClientError::Timeout { .. })),
+            "{timeout:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

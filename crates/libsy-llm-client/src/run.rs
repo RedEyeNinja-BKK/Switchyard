@@ -717,7 +717,10 @@ pub struct CapabilityFacts {
 /// Supplied by the host that owns decision backends, so this crate stays unaware of
 /// how a decision is transported.
 pub type DecisionHandler = Arc<
-    dyn Fn(DecisionRequest, ModelId) -> std::pin::Pin<Box<dyn Future<Output = Result<DecisionResponse>> + Send>>
+    dyn Fn(
+            DecisionRequest,
+            ModelId,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<DecisionResponse>> + Send>>
         + Send
         + Sync,
 >;
@@ -735,8 +738,8 @@ impl ClientRouter {
         mut self,
         capabilities: HashMap<ModelId, CapabilityFacts>,
     ) -> Self {
-        let routing = Arc::get_mut(&mut self.inner)
-            .expect("client router is not yet shared when configured");
+        let routing =
+            Arc::get_mut(&mut self.inner).expect("client router is not yet shared when configured");
         routing.target_capabilities = capabilities;
         self
     }
@@ -745,8 +748,8 @@ impl ClientRouter {
     ///
     /// Without one, a decision call is answered as unsupported.
     pub fn with_decision_handler(mut self, handler: DecisionHandler) -> Self {
-        let routing = Arc::get_mut(&mut self.inner)
-            .expect("client router is not yet shared when configured");
+        let routing =
+            Arc::get_mut(&mut self.inner).expect("client router is not yet shared when configured");
         routing.decision_handler = Some(handler);
         self
     }
@@ -849,7 +852,7 @@ impl ClientRouter {
         }
     }
 
-        /// The model that owns this request's provider state, when one is recorded.
+    /// The model that owns this request's provider state, when one is recorded.
     ///
     /// Exposed read-only so a whole-route composite can ask which child owns a
     /// continuation without copying provider state or reimplementing the lookup. The
@@ -1108,7 +1111,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
-    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
     use async_trait::async_trait;
     use futures::StreamExt;
     use http::StatusCode;
@@ -1117,6 +1119,7 @@ mod tests {
         ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Message, Role,
         ToolResult, completion_text, text_request, text_response,
     };
+    use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1457,8 +1460,8 @@ mod tests {
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
                         timeout: None,
-            attempt_timeout: None,
-            stream_idle_timeout: None,
+                        attempt_timeout: None,
+                        stream_idle_timeout: None,
                         requires_list_input: false,
                     };
                     let backend = if responses {
@@ -1609,8 +1612,8 @@ mod tests {
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
                     timeout: None,
-            attempt_timeout: None,
-            stream_idle_timeout: None,
+                    attempt_timeout: None,
+                    stream_idle_timeout: None,
                     requires_list_input: false,
                 }),
                 None,
@@ -2266,14 +2269,10 @@ mod tests {
 
     fn continuation_request(response_id: &str) -> Request {
         let mut request = request();
-        request
-            .llm_request
-            .extensions
-            .fields
-            .insert(
-                "previous_response_id".to_string(),
-                serde_json::json!(response_id),
-            );
+        request.llm_request.extensions.fields.insert(
+            "previous_response_id".to_string(),
+            serde_json::json!(response_id),
+        );
         request
     }
 
@@ -2421,8 +2420,8 @@ mod tests {
                     max_retries: 2,
                     failure_cooldown: cooldown,
                     timeout: None,
-            attempt_timeout: None,
-            stream_idle_timeout: None,
+                    attempt_timeout: None,
+                    stream_idle_timeout: None,
                     requires_list_input: false,
                 })
             };
@@ -2547,8 +2546,8 @@ mod tests {
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
                 timeout: None,
-            attempt_timeout: None,
-            stream_idle_timeout: None,
+                attempt_timeout: None,
+                stream_idle_timeout: None,
                 requires_list_input: false,
             })
         };

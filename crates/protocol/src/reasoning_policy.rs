@@ -47,9 +47,7 @@ impl ReasoningPolicy {
             },
             ReasoningDialect::LlamaCppEnableThinking => match self {
                 Self::Unspecified => None,
-                Self::Disabled => {
-                    Some(json!({"chat_template_kwargs": {"enable_thinking": false}}))
-                }
+                Self::Disabled => Some(json!({"chat_template_kwargs": {"enable_thinking": false}})),
                 Self::Enabled => Some(json!({"chat_template_kwargs": {"enable_thinking": true}})),
             },
         }
@@ -60,10 +58,7 @@ impl ReasoningPolicy {
     /// An authoritative policy with no dialect would otherwise acquire a default dialect
     /// and emit a provider control nobody declared, which is the failure mode this
     /// rejects: a strict target silently sending the wrong knob.
-    pub fn validate_for(
-        self,
-        dialect: ReasoningDialect,
-    ) -> Result<(), ReasoningPolicyError> {
+    pub fn validate_for(self, dialect: ReasoningDialect) -> Result<(), ReasoningPolicyError> {
         if !self.is_specified() {
             // An unspecified policy changes nothing, so any dialect is acceptable and an
             // absent one is the normal case.
@@ -246,12 +241,16 @@ mod tests {
             ReasoningDialect::OpenRouterEnabled,
             ReasoningDialect::LlamaCppEnableThinking,
         ] {
-            assert!(ReasoningPolicy::Disabled
-                .wire_body(dialect)
-                .is_some_and(|body| body.to_string().contains("false")));
-            assert!(ReasoningPolicy::Enabled
-                .wire_body(dialect)
-                .is_some_and(|body| body.to_string().contains("true")));
+            assert!(
+                ReasoningPolicy::Disabled
+                    .wire_body(dialect)
+                    .is_some_and(|body| body.to_string().contains("false"))
+            );
+            assert!(
+                ReasoningPolicy::Enabled
+                    .wire_body(dialect)
+                    .is_some_and(|body| body.to_string().contains("true"))
+            );
         }
     }
 

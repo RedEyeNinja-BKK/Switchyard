@@ -1620,9 +1620,9 @@ fn encode_responses_content(
             ContentBlock::Audio { source } => {
                 blocks.push(crate::codecs::openai_media::audio_part(source)?);
             }
-            ContentBlock::Video { source: MediaSource::Raw(raw) }
-                if raw.get("type").and_then(Value::as_str) == Some("input_video") =>
-            {
+            ContentBlock::Video {
+                source: MediaSource::Raw(raw),
+            } if raw.get("type").and_then(Value::as_str) == Some("input_video") => {
                 // Already the target spelling: forwarding it beats re-deriving it and
                 // dropping provider fields such as `processing`.
                 blocks.push(raw.clone());

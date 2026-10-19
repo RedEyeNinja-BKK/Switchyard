@@ -643,10 +643,12 @@ fn the_shared_classifier_resolves_an_explicitly_named_lane() {
     ]
     .into_iter()
     .collect();
-    let composition: Map<String, Vec<String>> =
-        [("tier".to_string(), vec!["free-family".to_string(), "local-family".to_string()])]
-            .into_iter()
-            .collect();
+    let composition: Map<String, Vec<String>> = [(
+        "tier".to_string(),
+        vec!["free-family".to_string(), "local-family".to_string()],
+    )]
+    .into_iter()
+    .collect();
 
     // A composed lane, a leaf lane, and an unknown name are three DISTINCT answers.
     assert_eq!(
@@ -672,10 +674,16 @@ fn the_shared_classifier_resolves_an_explicitly_named_lane() {
 
     // The composed lane's children are built in CONFIGURED order, and an unknown child
     // fails closed instead of silently shrinking the policy.
-    let children = composed_children(&lanes, &["free-family".to_string(), "local-family".to_string()])
-        .expect("known children resolve");
+    let children = composed_children(
+        &lanes,
+        &["free-family".to_string(), "local-family".to_string()],
+    )
+    .expect("known children resolve");
     assert_eq!(
-        children.iter().map(|c| c.lane().to_string()).collect::<Vec<_>>(),
+        children
+            .iter()
+            .map(|c| c.lane().to_string())
+            .collect::<Vec<_>>(),
         ["free-family", "local-family"]
     );
     let missing = composed_children(&lanes, &["free-family".to_string(), "ghost".to_string()]);
@@ -684,7 +692,6 @@ fn the_shared_classifier_resolves_an_explicitly_named_lane() {
         "an unknown child must fail closed rather than be skipped"
     );
 }
-
 
 /// `serve_named` itself must serve a NAMED lane, and refuse to answer an unknown name.
 ///
@@ -699,14 +706,12 @@ async fn serve_named_serves_the_named_lane_and_falls_through_only_when_unknown()
     use std::collections::BTreeMap as Map;
     use std::sync::Arc;
 
+    use serde_json::json;
     use switchyard_protocol::{DecisionKind, DecisionQuestion, DecisionRequest};
     use switchyard_runner::decision_executor::{
         DecisionCandidate, DecisionResolver, LaneResolverHandle, serve_named,
     };
-    use switchyard_runner::decision_transport::{
-        DecisionTransport, StateForms, SupportedTypes,
-    };
-    use serde_json::json;
+    use switchyard_runner::decision_transport::{DecisionTransport, StateForms, SupportedTypes};
 
     // A lane whose single candidate answers: reaching it proves the named lane RAN.
     fn answering(name: &str) -> LaneResolverHandle {
@@ -734,10 +739,12 @@ async fn serve_named_serves_the_named_lane_and_falls_through_only_when_unknown()
     ]
     .into_iter()
     .collect();
-    let composition: Map<String, Vec<String>> =
-        [("tier".to_string(), vec!["free-family".to_string(), "local-family".to_string()])]
-            .into_iter()
-            .collect();
+    let composition: Map<String, Vec<String>> = [(
+        "tier".to_string(),
+        vec!["free-family".to_string(), "local-family".to_string()],
+    )]
+    .into_iter()
+    .collect();
 
     let mut questions = std::collections::BTreeMap::new();
     questions.insert(

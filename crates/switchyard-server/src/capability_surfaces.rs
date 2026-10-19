@@ -12,10 +12,10 @@
 //! Declared limits are enforced here rather than at the engine, so a caller learns the
 //! contract from a 400 naming the limit instead of from a truncated result.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -61,10 +61,7 @@ pub(crate) async fn embeddings(
     if capability.format != CapabilityFormat::OpenaiEmbeddings {
         return contract_error(
             StatusCode::BAD_REQUEST,
-            format!(
-                "capability {} does not serve embeddings",
-                capability.id
-            ),
+            format!("capability {} does not serve embeddings", capability.id),
         );
     }
     if request.input.is_empty() {
@@ -201,11 +198,7 @@ pub(crate) async fn rerank(
 /// The response is passed through rather than reshaped: embedding vectors and rerank
 /// scores are the engine's contract, and re-encoding them here would risk changing
 /// ordering or numeric representation.
-async fn forward(
-    state: &ServerState,
-    capability: &ResolvedCapability,
-    payload: Value,
-) -> Response {
+async fn forward(state: &ServerState, capability: &ResolvedCapability, payload: Value) -> Response {
     let client = match state.capability_http(capability.timeout_seconds) {
         Ok(client) => client,
         Err(message) => return contract_error(StatusCode::BAD_GATEWAY, message),
@@ -219,8 +212,8 @@ async fn forward(
     }
     match builder.send().await {
         Ok(response) => {
-            let status = StatusCode::from_u16(response.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = response.bytes().await.unwrap_or_default();
             // The contract travels back so a caller holding vectors knows which space
             // produced them, rather than inferring it from the capability id.
@@ -228,9 +221,9 @@ async fn forward(
             if let Some(contract) = &capability.contract {
                 headers.insert(
                     "x-switchyard-embedding-contract",
-                    contract.parse().unwrap_or_else(|_| {
-                        axum::http::HeaderValue::from_static("unknown")
-                    }),
+                    contract
+                        .parse()
+                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
                 );
             }
             if let Some(dimensions) = capability.dimensions {

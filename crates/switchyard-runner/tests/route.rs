@@ -14,8 +14,7 @@ use switchyard_protocol::{
     text_request, text_response,
 };
 use switchyard_runner::{
-    AlgorithmSpec, ModelCapabilities, Route,
-    request_fit::estimate_input_tokens,
+    AlgorithmSpec, ModelCapabilities, Route, request_fit::estimate_input_tokens,
 };
 
 struct StubClient;
@@ -172,10 +171,7 @@ impl RoutedLlmClient for EchoClient {
             return Err(LlmClientError::TemporarilyUnavailable);
         }
         Ok(Response {
-            llm_response: LlmResponse::Agg(text_response(
-                request.llm_request.model.clone(),
-                "ok",
-            )),
+            llm_response: LlmResponse::Agg(text_response(request.llm_request.model.clone(), "ok")),
             metadata: None,
             upstream_headers: Default::default(),
         })
@@ -202,7 +198,9 @@ fn escalating_route(
         ("wide".to_string(), ModelId::from("wide")),
         ("refused".to_string(), ModelId::from("refused")),
     ]);
-    let algorithm = spec.build("switchyard", &targets).expect("algorithm builds");
+    let algorithm = spec
+        .build("switchyard", &targets)
+        .expect("algorithm builds");
     let clients = ClientRouter::new(
         BTreeMap::from([
             (
@@ -325,8 +323,7 @@ async fn context_pressure_reorders_the_escalation_target_before_dispatch() {
 /// declared order. This is the property that stops the reorder leaking into other routes.
 #[tokio::test]
 async fn no_escalation_contract_leaves_the_declared_order_intact() {
-    for (threshold, escalation_target) in
-        [(None, Some("wide")), (Some(61_440), None), (None, None)]
+    for (threshold, escalation_target) in [(None, Some("wide")), (Some(61_440), None), (None, None)]
     {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let route = escalating_route(threshold, escalation_target, &calls);
@@ -415,12 +412,15 @@ async fn an_ineligible_escalation_target_is_not_reported_as_promoted() {
         Arc::new(move |observation| observed.lock().unwrap().push(observation))
     };
     // The image is added after sizing, so the text is sized to leave room for the few tokens
-// the image wrapper adds. The request must END UP over the threshold, otherwise the promotion
-// is never reached and this test would pass for the wrong reason.
-let sized = body_of_estimated_tokens(61_430);
+    // the image wrapper adds. The request must END UP over the threshold, otherwise the promotion
+    // is never reached and this test would pass for the wrong reason.
+    let sized = body_of_estimated_tokens(61_430);
     // `body_of_estimated_tokens` returns the chat shape, so the text is read from where it
     // actually put it rather than from the Responses `input` path.
-    let text = sized["messages"][0]["content"].as_str().unwrap_or_default().to_string();
+    let text = sized["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let body = serde_json::json!({
         "model": "smartlocal",
         "input": [{

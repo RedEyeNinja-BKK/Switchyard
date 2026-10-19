@@ -530,11 +530,11 @@ impl DeploymentConfig {
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
-            let lane_composition: BTreeMap<String, Vec<String>> =
-                self.decision_lane_composition
-                    .iter()
-                    .map(|(name, composition)| (name.clone(), composition.children.clone()))
-                    .collect();
+            let lane_composition: BTreeMap<String, Vec<String>> = self
+                .decision_lane_composition
+                .iter()
+                .map(|(name, composition)| (name.clone(), composition.children.clone()))
+                .collect();
             let (route_clients, caller_auth) = self.build_route_clients(
                 route_name,
                 config,
@@ -1216,20 +1216,18 @@ impl DeploymentConfig {
                     // does on the public surface. Without this the same request could be
                     // served at `/v1/decisions` and fail here, which would be a split
                     // contract rather than one mechanism.
-                    let handles: BTreeMap<
-                        String,
-                        decision_executor::LaneResolverHandle,
-                    > = lane_resolvers
-                        .iter()
-                        .map(|(name, resolver)| {
-                            (
-                                name.clone(),
-                                decision_executor::LaneResolverHandle {
-                                    resolver: Arc::clone(resolver),
-                                },
-                            )
-                        })
-                        .collect();
+                    let handles: BTreeMap<String, decision_executor::LaneResolverHandle> =
+                        lane_resolvers
+                            .iter()
+                            .map(|(name, resolver)| {
+                                (
+                                    name.clone(),
+                                    decision_executor::LaneResolverHandle {
+                                        resolver: Arc::clone(resolver),
+                                    },
+                                )
+                            })
+                            .collect();
                     let composition = Arc::clone(&composition);
                     let requested_model = model.clone();
                     // An EXPLICIT lane name is authoritative and is resolved BEFORE the
@@ -1239,14 +1237,13 @@ impl DeploymentConfig {
                     // served at `/v1/decisions` and fail here, which would be a split
                     // contract rather than one mechanism.
                     let served = async move {
-                        if let Some(outcome) =
-                            decision_executor::serve_named(
-                                &composition,
-                                &handles,
-                                requested_model.as_str(),
-                                &request,
-                            )
-                            .await?
+                        if let Some(outcome) = decision_executor::serve_named(
+                            &composition,
+                            &handles,
+                            requested_model.as_str(),
+                            &request,
+                        )
+                        .await?
                         {
                             return Ok(outcome);
                         }
@@ -3149,9 +3146,8 @@ confidence_threshold = 0.5
     /// them. Otherwise it advertises video and then skips every child.
     #[test]
     fn composite_claiming_video_needs_a_video_child() -> RunnerResult<()> {
-        let configured = format!(
-            "{VALID_CONFIG}\n[composites.tier]\nchildren = [\"random\"]\nvideo = true\n"
-        );
+        let configured =
+            format!("{VALID_CONFIG}\n[composites.tier]\nchildren = [\"random\"]\nvideo = true\n");
         let message = match runner_from_toml(&configured) {
             Ok(_) => return Err(RunnerError::configuration("composite claimed video")),
             Err(error) => error.to_string(),

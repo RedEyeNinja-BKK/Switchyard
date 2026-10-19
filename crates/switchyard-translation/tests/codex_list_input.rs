@@ -46,12 +46,8 @@ fn chat_single_user_text_is_a_list_when_the_upstream_requires_one() {
 #[test]
 fn chat_single_user_text_stays_a_string_without_the_capability() {
     let request = decode_request(WireFormat::OpenAiChat, &chat_body()).expect("decodes");
-    let encoded = encode_request_with_policy(
-        &request,
-        WireFormat::OpenAiResponses,
-        &policy(false),
-    )
-    .expect("encodes");
+    let encoded = encode_request_with_policy(&request, WireFormat::OpenAiResponses, &policy(false))
+        .expect("encodes");
     assert_eq!(
         encoded["input"],
         serde_json::json!("Reply OK"),

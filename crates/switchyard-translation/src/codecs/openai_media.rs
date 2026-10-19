@@ -70,7 +70,8 @@ fn raw_image_payload(raw: &Value) -> Option<ImagePayload> {
     })
 }
 
-pub(super) fn image_source_text(source: &ImageSource) -> String {    match source {
+pub(super) fn image_source_text(source: &ImageSource) -> String {
+    match source {
         ImageSource::Url { url, detail } => json_string(&json!({
             "url": url,
             "detail": detail,
@@ -91,7 +92,10 @@ pub(super) fn image_source_text(source: &ImageSource) -> String {    match sourc
 /// is preserved as an opaque block rather than guessed at.
 pub(super) fn video_source(block: &Map<String, Value>) -> Option<MediaSource> {
     fn text(object: &Map<String, Value>, key: &str) -> Option<String> {
-        object.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
     }
 
     if let Some(value) = block.get("video_url") {

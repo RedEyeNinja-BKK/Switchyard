@@ -547,10 +547,7 @@ pub async fn serve_named(
     match classify_named(composition, lanes, requested) {
         NamedDispatch::Unknown => Ok(None),
         NamedDispatch::Composed => {
-            let children = composition
-                .get(requested)
-                .cloned()
-                .unwrap_or_default();
+            let children = composition.get(requested).cloned().unwrap_or_default();
             // An unknown child fails closed rather than silently shrinking the policy.
             let ordered = composed_children(lanes, &children)?;
             let mut stack = vec![requested.to_string()];
@@ -590,9 +587,9 @@ pub fn composed_children(
 ) -> Result<Vec<LaneChild>, DecisionFailure> {
     let mut ordered = Vec::with_capacity(children.len());
     for child in children {
-        let handle = lanes.get(child.as_str()).ok_or(DecisionFailure::NotEligible(
-            DecisionSkip::TargetNotFound,
-        ))?;
+        let handle = lanes
+            .get(child.as_str())
+            .ok_or(DecisionFailure::NotEligible(DecisionSkip::TargetNotFound))?;
         ordered.push(LaneChild::new(child.clone(), Arc::clone(&handle.resolver)));
     }
     Ok(ordered)

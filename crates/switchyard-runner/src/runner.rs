@@ -326,7 +326,9 @@ impl Runner {
     }
 
     /// Every lane's resolver, for a caller resolving a named identity.
-    pub fn decision_lane_handles(&self) -> BTreeMap<String, crate::decision_executor::LaneResolverHandle> {
+    pub fn decision_lane_handles(
+        &self,
+    ) -> BTreeMap<String, crate::decision_executor::LaneResolverHandle> {
         self.decision_lanes
             .iter()
             .map(|(name, lane)| {

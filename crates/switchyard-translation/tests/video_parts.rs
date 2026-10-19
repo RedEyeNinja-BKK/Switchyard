@@ -8,7 +8,9 @@
 //! preserved as an opaque block rather than silently converted to text.
 
 use serde_json::{Value, json};
-use switchyard_translation::{PreservationPolicy, TranslationEngine, TranslationPolicy, WireFormat};
+use switchyard_translation::{
+    PreservationPolicy, TranslationEngine, TranslationPolicy, WireFormat,
+};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

@@ -158,11 +158,8 @@ pub(crate) async fn decisions(
     // An EXPLICIT lane name is served by `serve_named`, the same function the internal
     // `Call::Decision` handler uses. One mechanism, so the public surface and the
     // internal path cannot disagree about what a caller named.
-    let handles: BTreeMap<String, switchyard_runner::decision_executor::LaneResolverHandle> = state
-        .runner
-        .decision_lane_handles()
-        .into_iter()
-        .collect();
+    let handles: BTreeMap<String, switchyard_runner::decision_executor::LaneResolverHandle> =
+        state.runner.decision_lane_handles().into_iter().collect();
     let composition = state.runner.decision_lane_composition_map().clone();
     match switchyard_runner::decision_executor::serve_named(
         &composition,
@@ -189,9 +186,7 @@ pub(crate) async fn decisions(
             .runner
             .decision_lane_name()
             .and_then(|name| state.runner.named_decision_lane(name))
-            .filter(|lane| {
-                switchyard_runner::decision_transport::lane_serves(&lane.types, &native)
-            })
+            .filter(|lane| switchyard_runner::decision_transport::lane_serves(&lane.types, &native))
     } else {
         None
     };

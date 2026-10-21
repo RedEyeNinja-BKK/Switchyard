@@ -6,6 +6,7 @@
 mod capability_surfaces;
 pub mod config;
 pub mod decision_surface;
+pub mod economics;
 mod metrics;
 mod observability;
 mod redaction;
@@ -172,6 +173,15 @@ pub struct ServerState {
     capability_http: capability_http::ClientSet,
     /// Public ids of the capability surfaces this deployment exposes.
     capability_ids: Vec<String>,
+    /// The provider, route and cost classification derived from the deployment
+    /// configuration, used to attribute usage in the economics metrics.
+    classification: economics::DeploymentClassification,
+    /// The Bangkok calendar-day counters.
+    ///
+    /// A rolling 24-hour window and a calendar day are different questions, so the
+    /// calendar day is counted here rather than derived in PromQL, which cannot
+    /// express a computed `@` timestamp.
+    calendar: Arc<economics::CalendarWindow>,
 }
 
 #[derive(Clone)]
@@ -253,6 +263,7 @@ impl ServerState {
         );
         let redactor = redaction::Redactor::new(runner.provider_api_keys());
         let capability_ids: Vec<String> = runner.capabilities().keys().cloned().collect();
+        let classification = economics::DeploymentClassification::from_runner(&runner);
         Ok(Self {
             redactor: Arc::new(redactor),
             runner: Arc::new(runner),
@@ -263,6 +274,8 @@ impl ServerState {
             track_cache_eligibility: tracking_enabled_from_env(),
             capability_http: capability_http::ClientSet::default(),
             capability_ids,
+            classification,
+            calendar: Arc::new(economics::CalendarWindow::new()),
         })
     }
 
@@ -354,12 +367,32 @@ pub async fn run_server(state: ServerState, options: ServerRunOptions) -> Server
     server.serve(shutdown::signal()).await
 }
 
+/// Starts the background economics collection for a deployment.
+///
+/// The provider credentials are read from the process environment with the variable
+/// names the deployment itself declares, so a credential never passes through the
+/// configuration, a log line or a metric label. A variable that is unset or empty
+/// yields no credential, and that provider contributes no account reader.
+fn start_economics(state: &ServerState) -> std::thread::JoinHandle<()> {
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    economics::runtime::start(
+        state.runner.deployment_facts(),
+        Arc::clone(&state.calendar),
+        &env,
+    )
+}
+
 /// A configured server with its listening socket already bound.
 pub struct BoundServer {
     listener: TcpListener,
     router: Router,
     options: ServerRunOptions,
     state: ServerState,
+    /// The background economics collection, alive for the life of the server.
+    ///
+    /// Held here so the threads are owned by the server rather than by a detached
+    /// handle, and so exactly one collector starts per server.
+    _economics: std::thread::JoinHandle<()>,
 }
 
 impl BoundServer {
@@ -367,11 +400,13 @@ impl BoundServer {
     pub fn bind(state: ServerState, options: ServerRunOptions) -> ServerResult<Self> {
         let listener = bind_tcp_listener(options.addr, options.backlog)?;
         let addr = listener.local_addr().map_err(server_io_error)?;
+        let economics = start_economics(&state);
         Ok(Self {
             listener,
             router: build_switchyard_router(state.clone()),
             options: ServerRunOptions { addr, ..options },
             state,
+            _economics: economics,
         })
     }
 
@@ -1349,14 +1384,30 @@ async fn handle_llm_request(
             .as_ref()
             .map(|probe| state.stats.prefix_eligibility(served_model, probe))
             .unwrap_or(0.0);
+        // The economics attribution: the provider that served the request and the
+        // route the caller addressed. For a composed route the parent is the route
+        // the caller asked for and the child is the one that served it, so both are
+        // recorded rather than collapsing to the leaf.
+        let attribution = economics::metrics::UsageAttribution::resolve(
+            &state.classification,
+            &route_id,
+            composition_ref
+                .as_ref()
+                .map(|composition| composition.child_route.as_str()),
+            served_model.as_str(),
+        );
         usage_metrics::observe(
             response,
-            served_model.as_str(),
-            started.0,
             state.stats,
-            cache_eligible,
-            state.routing_log.zip(routing_log_context),
-            composition_ref,
+            usage_metrics::ObservationContext {
+                model: served_model.as_str().to_string(),
+                started: started.0,
+                cache_eligible,
+                routing_log: state.routing_log.zip(routing_log_context),
+                composition: composition_ref,
+                attribution,
+                calendar: Arc::clone(&state.calendar),
+            },
         )
     } else {
         response

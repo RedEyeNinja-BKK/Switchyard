@@ -1244,6 +1244,9 @@ fn decode_anthropic_usage(value: Option<&Value>) -> Usage {
                 .and_then(Value::as_u64)
                 .or_else(|| details.get("reasoning_tokens").and_then(Value::as_u64))
         }),
+        // Anthropic reports no per-request cost on the Messages API.
+        cost: None,
+        cost_currency: None,
     }
 }
 

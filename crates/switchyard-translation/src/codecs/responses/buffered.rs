@@ -2129,6 +2129,10 @@ fn decode_responses_usage(value: Option<&Value>) -> Usage {
                     .and_then(|details| details.get("reasoning_tokens"))
             })
             .and_then(Value::as_u64),
+        // The provider's own figure for what it charged. OpenRouter reports this on
+        // the Responses shape as well as the Chat shape.
+        cost: value.get("cost").and_then(Value::as_f64),
+        cost_currency: None,
     }
 }
 

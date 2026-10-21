@@ -325,6 +325,59 @@ impl DeploymentConfig {
         })
     }
 
+    /// Extracts the deployment facts an economics surface needs.
+    ///
+    /// These are facts, not inferences: a client's base URL, a target's model id and
+    /// client binding, and a route's primary target and candidate list. The economics
+    /// layer derives the provider, route family and cost class from them, so a
+    /// dashboard's attribution can be traced back to the configuration.
+    fn deployment_facts(&self) -> crate::facts::DeploymentFacts {
+        let mut facts = crate::facts::DeploymentFacts::default();
+        for (name, client) in &self.llm_clients {
+            facts.clients.insert(
+                name.clone(),
+                crate::facts::ClientFacts {
+                    name: name.clone(),
+                    base_url: client.base_url.as_str().to_string(),
+                    api_key_env: client.api_key_env.clone(),
+                    billing: client.billing,
+                },
+            );
+        }
+        for (name, target) in &self.targets {
+            facts.targets.insert(
+                name.clone(),
+                crate::facts::TargetFacts {
+                    name: name.clone(),
+                    model: target.id.as_str().to_string(),
+                    llm_client: target.llm_client.clone(),
+                },
+            );
+        }
+        for (name, config) in &self.routes {
+            let (target, has_candidates) = match &config.algorithm {
+                AlgorithmSpec::Passthrough {
+                    target, candidates, ..
+                } => (Some(target.clone()), !candidates.is_empty()),
+                _ => (None, false),
+            };
+            facts.routes.insert(
+                name.clone(),
+                crate::facts::RouteFacts {
+                    id: config.id.as_str().to_string(),
+                    target,
+                    has_candidates,
+                },
+            );
+        }
+        for (name, composite) in &self.composites {
+            facts
+                .composites
+                .insert(name.clone(), composite.children.clone());
+        }
+        facts
+    }
+
     fn build(self) -> RunnerResult<Runner> {
         if self.schema_version != SUPPORTED_SCHEMA_VERSION {
             return Err(RunnerError::configuration(format!(
@@ -332,6 +385,8 @@ impl DeploymentConfig {
                 self.schema_version
             )));
         }
+
+        let facts = self.deployment_facts();
 
         let mut route_names_by_id = HashMap::new();
         for (route_name, config) in &self.routes {
@@ -586,6 +641,7 @@ impl DeploymentConfig {
         let mut runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
             .with_provider_api_keys(provider_api_keys)
+            .with_deployment_facts(facts)
             .with_capabilities(capability::resolve(&capability::CapabilityDeployment {
                 clients: self.capability_clients.clone(),
                 capabilities: self.capabilities.clone(),
@@ -1497,6 +1553,27 @@ struct LlmClientConfig {
     /// advertised inbound formats. Ignored by the Chat and Anthropic formats.
     #[serde(default)]
     requires_list_input: bool,
+    /// How this client's usage is billed.
+    ///
+    /// Stated rather than inferred, because the difference decides whether a per-token
+    /// price may be attached to the lane at all. An allowance-backed client is not
+    /// billed per token, so pricing it as if it were would manufacture a charge the
+    /// provider never made.
+    #[serde(default)]
+    billing: Option<BillingKind>,
+}
+
+/// How a client's usage is billed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingKind {
+    /// A metered API key on a paid provider: billed per token.
+    Metered,
+    /// An allowance-bearing credential: the provider charges a subscription or a
+    /// credit allowance, not a per-token amount.
+    Subscription,
+    /// A deployment the operator hosts: no external provider charge at all.
+    Local,
 }
 
 #[derive(Debug, Deserialize)]

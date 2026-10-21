@@ -56,6 +56,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
 | `failure_cooldown_ms` | No | `5000` (5 seconds) | Skip a backend for this many milliseconds after an exhausted transient completion failure. Zero disables it. |
 | `timeout_ms` | No | unset | Deadline in milliseconds for all attempts, retry delays, and the complete response, including stream reads. Must be at least `1`. Unset leaves the wait unbounded. |
+| `billing` | No | inferred | How this client's usage is billed: `metered`, `subscription`, or `local`. Stated rather than inferred, because the difference decides whether a per-token price may be attached to the lane at all. An allowance-bearing credential is not billed per token, so pricing it as if it were would manufacture a charge the provider never made. When unset, the client is treated as `metered` unless its base URL names a deployment the operator hosts, in which case it is `local`. |
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.

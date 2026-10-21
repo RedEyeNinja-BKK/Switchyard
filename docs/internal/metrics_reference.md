@@ -146,6 +146,99 @@ sum      (rate(switchyard_upstream_attempts_total{code!="200"}[5m]))
 The ready-to-deploy alert rules implementing these expressions live in
 [`examples/prometheus/switchyard.rules.yaml`](../../examples/prometheus/switchyard.rules.yaml).
 
+## Economics and token accounting
+
+These series attribute usage to the provider, route and cost class the deployment
+declares, and report the provider account state Switchyard reads with its own
+credentials. Every value comes from the deployment configuration, never from a
+model-name guess.
+
+### Token components
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_tokens_total{component,model,provider,route,route_family,cost_class,outcome}` | counter | Tokens consumed, split by component. `component` is one of `prompt`, `cached`, `cache_creation`, `completion`, `reasoning`. |
+| `switchyard_economics_requests_total{component="request",...}` | counter | Requests served, with the same attribution labels. |
+| `switchyard_economics_provider_cost_total{component="provider_reported",...}` | counter | The cost the **provider itself** reported for the request. |
+| `switchyard_economics_estimated_cost_total{component="estimated",...}` | counter | A Switchyard-derived cost estimate. **Reserved and currently unpublished**: Switchyard has no validated rate card, so nothing writes this family and a query against it returns no series. It is published beside the provider-reported cost, never instead of it. |
+
+The provider-reported cost and the Switchyard-derived estimate are deliberately
+separate metric families, so a dashboard can never present one as the other.
+
+> **Note:** `cached` and `cache_creation` are *components of* `prompt`, not
+> additions to it. `prompt` is the provider's own input total
+> (`input + cached + cache_creation`). Adding the components to the prompt total
+> double counts the cache. There is deliberately no "all tokens" series.
+
+`reasoning` is a *component of* `completion` in the same way, not an addition to
+it. `completion` is the provider's own output total, and on every provider that
+reports reasoning separately that reasoning count sits inside the completion count.
+Measured 2026-10-21 against the live OpenRouter API: a response reported
+`completion_tokens: 650` with `completion_tokens_details.reasoning_tokens: 521` and
+`total_tokens: 680`, where `prompt + completion == total_tokens` and
+`prompt + completion + reasoning` did not. A total token figure, were one published,
+would therefore be `prompt + completion` and nothing else.
+
+`reasoning` is published only when the provider reported it. A provider that does
+not report reasoning yields no such series, which reads as absent rather than as a
+measured zero.
+
+### Attribution labels
+
+| Label | Values | Meaning |
+|---|---|---|
+| `provider` | One per configured `llm_client`. | The client the serving target is bound to. |
+| `route` | One per configured route. | The route the **caller** addressed. On a composed route this is the parent. |
+| `child_route` | One per configured child route; absent on a direct route. | The child that served the request. |
+| `route_family` | `direct`, `primitive`, `tier`. | A route's role, derived from its configuration: bound to one target, declares an ordered candidate list, or composes other routes. |
+| `cost_class` | `local`, `free`, `subscription`, `metered`. | How the provider bills the lane. |
+
+`cost_class` is a deployment fact. `local` is a deployment the operator hosts,
+`free` is a model the provider prices at zero, `subscription` is an
+allowance-bearing credential, and `metered` is a metered API key on a paid
+provider. A `free` or `subscription` lane must never be given a per-token price.
+
+### Account state
+
+Switchyard reads these provider account surfaces with the credential it already
+uses to serve inference, and publishes the result. Nothing downstream of
+Switchyard contacts a provider.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_account_fetch_total{provider,outcome}` | counter | One per account read. `outcome` is `ok`, `unauthorized` or `failed`. |
+| `switchyard_economics_account_auth_failures_total{provider}` | counter | Reads rejected with 401 or 403. |
+| `switchyard_economics_account_freshness_seconds{provider}` | gauge | Age of the last successful read. |
+| `switchyard_economics_account_fetch_duration_seconds{provider}` | gauge | How long the last read took. |
+| `switchyard_economics_provider_balance{provider,currency}` | gauge | The balance the provider reported. |
+| `switchyard_economics_provider_credit{provider,currency}` | gauge | The purchased credit the provider reported. |
+| `switchyard_economics_provider_usage{provider,currency}` | gauge | The cumulative usage the provider reported. |
+| `switchyard_economics_allowance_remaining_percent{provider,pool}` | gauge | Remaining allowance of a provider-reported window. |
+| `switchyard_economics_allowance_reset_seconds{provider,pool}` | gauge | Time until that window resets. |
+
+A provider that exposes no account surface produces no account series at all. It
+is not recorded as a zero balance: a provider that exposes nothing has not
+reported a balance of zero.
+
+### Bangkok calendar day
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_calendar_tokens{component,...}` | gauge | The same token components, for the current Bangkok day. |
+| `switchyard_economics_calendar_requests{...}` | gauge | The same request count, for the current Bangkok day. |
+| `switchyard_economics_calendar_day_start` | gauge | Unix timestamp of the current Bangkok midnight. |
+| `switchyard_economics_calendar_day_end` | gauge | Unix timestamp of the next Bangkok midnight. |
+| `switchyard_economics_calendar_day_elapsed_seconds` | gauge | Seconds since the current Bangkok midnight. |
+
+The day boundary is midnight in `UTC+07:00`, not midnight in UTC and not a
+rolling twenty-four hours. Prometheus cannot express this: the `@` modifier
+needs a literal timestamp, and a computed one is rejected by the API. Switchyard
+therefore publishes the calendar-day totals itself.
+
+> **Note:** these are **gauges**, not counters. The calendar is republished every
+> thirty seconds; as counters the published total would grow by the day's total on
+> every publish.
+
 ## Cardinality
 
 All labels are bounded enums. No per-request or per-user values escape

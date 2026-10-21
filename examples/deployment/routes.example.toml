@@ -17,18 +17,24 @@ format = "openai_responses"
 base_url = "https://api.deepseek.com"
 api_key_env = "SWITCHYARD_DEEPSEEK_API_KEY"
 max_retries = 2
+# A metered API key on a paid provider: billed per token.
+billing = "metered"
 
 [llm_clients.htpc]
 format = "openai_responses"
 base_url = "http://localhost:8889/v1"
 api_key_env = "SWITCHYARD_HTPC_API_KEY"
 max_retries = 2
+# A deployment the operator hosts: no external provider charge.
+billing = "local"
 
 [llm_clients.thaillm]
 format = "openai_responses"
 base_url = "https://thaillm.or.th/api/v1"
 api_key_env = "SWITCHYARD_THAILLM_API_KEY"
 max_retries = 2
+# A metered API key on a paid provider: billed per token.
+billing = "metered"
 
 [llm_clients.openai]
 format = "openai_responses"
@@ -36,6 +42,8 @@ base_url = "https://chatgpt.com/backend-api/codex"
 api_key_env = "SY_OPENAI_OAUTH_TOKEN"
 requires_list_input = true
 max_retries = 2
+# An allowance-bearing credential: charged against an allowance, not per token.
+billing = "subscription"
 
 [llm_clients.openai_nt]
 format = "openai_responses"
@@ -43,18 +51,25 @@ base_url = "https://chatgpt.com/backend-api/codex"
 api_key_env = "SY_OPENAI_OAUTH_TOKEN"
 requires_list_input = true
 max_retries = 2
+# An allowance-bearing credential: charged against an allowance, not per token.
+billing = "subscription"
 
 [llm_clients.openrouter]
 format = "openai_responses"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
 max_retries = 2
+# A metered API key on a paid provider. The free models this client also serves are
+# priced at zero by the provider; the client itself is metered.
+billing = "metered"
 
 [llm_clients.comfyninja]
 format = "openai_responses"
 base_url = "http://localhost:8446/v1"
 api_key_env = "SWITCHYARD_COMFYNINJA_API_KEY"
 max_retries = 2
+# A deployment the operator hosts: no external provider charge.
+billing = "local"
 
 # ---- completion targets ----
 [targets.comfyninja-qwen3_8-27b-q3]

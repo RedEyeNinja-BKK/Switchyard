@@ -12,31 +12,70 @@ use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
 use crate::SharedRoutingLog;
 use std::sync::Arc;
 
+use crate::economics;
 use crate::routing_log::RoutingLogContext;
 use crate::stats::{StatsAccumulator, TokenUsage};
+
+/// The observations a routed response produces.
+///
+/// Grouped into one value because the observation path carries several pieces of
+/// request-scoped context, and a long positional list makes it easy to pass the
+/// wrong one to the wrong field.
+pub(crate) struct ObservationContext {
+    /// The model that served the request.
+    pub model: String,
+    /// The instant the request arrived.
+    pub started: Instant,
+    /// The share of the prompt that was cache-eligible.
+    pub cache_eligible: f64,
+    /// The durable routing record, when the deployment records one.
+    pub routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
+    /// The composition facts for this request, appended to the same record as the
+    /// served model. Owned so the streaming wrapper keeps them for its lifetime
+    /// without a leak.
+    pub composition: Option<Arc<switchyard_runner::composition::CompositionMetadata>>,
+    /// The economics attribution of this request: the provider that served it, the
+    /// route the caller addressed, and how it is billed. Resolved by the caller from
+    /// the deployment configuration, so the attribution is a configuration fact
+    /// rather than a guess made here.
+    pub attribution: Option<economics::metrics::UsageAttribution>,
+    /// The Bangkok calendar-day window, in which the same usage is counted so the
+    /// day view and the rolling counters cannot disagree.
+    pub calendar: Arc<economics::CalendarWindow>,
+}
 
 /// Observes a routed response without changing its aggregate or streaming contents.
 pub(crate) fn observe(
     response: Response,
-    model: &str,
-    started: Instant,
     stats: StatsAccumulator,
-    cache_eligible: f64,
-    routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
-    // Composition facts for this request, appended to the same record as the served
-    // model. Owned so the streaming wrapper keeps them for its lifetime without a leak.
-    composition: Option<Arc<switchyard_runner::composition::CompositionMetadata>>,
+    context: ObservationContext,
 ) -> Response {
+    let ObservationContext {
+        model,
+        started,
+        cache_eligible,
+        routing_log,
+        composition,
+        attribution,
+        calendar,
+    } = context;
     let Response {
         llm_response,
         metadata,
         upstream_headers,
     } = response;
-    let model = model.to_string();
 
     let llm_response = match llm_response {
         LlmResponse::Agg(agg) => {
-            record_terminal(&stats, &agg.usage, &model, started, cache_eligible);
+            record_terminal(
+                &stats,
+                &agg.usage,
+                &model,
+                started,
+                cache_eligible,
+                attribution.as_ref(),
+                &calendar,
+            );
             if let Some((log, context)) = routing_log {
                 match composition {
                     Some(composition) => {
@@ -84,7 +123,15 @@ pub(crate) fn observe(
                     if !failed && !recorded && terminal_seen
                         && let Some(usage) = latest_usage.as_ref()
                     {
-                        record_terminal(&stats, usage, &model, started, cache_eligible);
+                        record_terminal(
+                            &stats,
+                            usage,
+                            &model,
+                            started,
+                            cache_eligible,
+                            attribution.as_ref(),
+                            &calendar,
+                        );
                         // This early-commit path is the normal shape for a Responses
                         // stream whose terminal event already carries usage. It must carry
                         // the same composition facts as every other append, or a streamed
@@ -112,7 +159,15 @@ pub(crate) fn observe(
                 }
                 if !recorded {
                     let usage = latest_usage.unwrap_or_default();
-                    record_terminal(&stats, &usage, &model, started, cache_eligible);
+                    record_terminal(
+                        &stats,
+                        &usage,
+                        &model,
+                        started,
+                        cache_eligible,
+                        attribution.as_ref(),
+                        &calendar,
+                    );
                     if let Some((log, context)) = routing_log {
                         match composition {
                             Some(composition) => log.append_composition(context, &model, None, &usage, &composition),
@@ -161,10 +216,51 @@ fn record_terminal(
     model: &str,
     started: Instant,
     cache_eligible: f64,
+    attribution: Option<&economics::metrics::UsageAttribution>,
+    calendar: &economics::CalendarWindow,
 ) {
     let total_latency = started.elapsed();
     record_usage(usage, model);
     record_latency(model, total_latency);
+    // The economics series carry the same usage, attributed to the provider, route and
+    // cost class the deployment declares. They are published alongside the native
+    // counters rather than instead of them, so nothing that already reads the native
+    // surface changes.
+    if let Some(attribution) = attribution {
+        economics::metrics::record_usage(
+            attribution,
+            model,
+            usage,
+            economics::metrics::UsageOutcome::Served,
+        );
+        economics::metrics::record_request(
+            attribution,
+            model,
+            economics::metrics::UsageOutcome::Served,
+        );
+        // The provider's own figure for what it charged, when the provider reports
+        // one. It is published as its own metric family, so a dashboard can show it
+        // beside a Switchyard-derived estimate without ever confusing the two.
+        if let Some(cost) = usage.cost {
+            economics::metrics::record_provider_cost(attribution, model, cost);
+        }
+        // The same usage is counted into the Bangkok calendar-day window, with the
+        // same components and the same accounting rules, so the day view and the
+        // rolling counters cannot disagree about what was consumed.
+        economics::metrics::record_usage_in_calendar(
+            calendar,
+            attribution,
+            model,
+            usage,
+            economics::metrics::UsageOutcome::Served,
+        );
+        economics::metrics::record_request_in_calendar(
+            calendar,
+            attribution,
+            model,
+            economics::metrics::UsageOutcome::Served,
+        );
+    }
     let mut token_usage = token_usage(usage);
     token_usage.cacheable_prompt_tokens =
         (token_usage.prompt_tokens as f64 * cache_eligible).round() as u64;
@@ -245,12 +341,16 @@ mod tests {
         let stats = StatsAccumulator::default();
         let observed = observe(
             response,
-            "model/worker",
-            Instant::now(),
             stats.clone(),
-            0.0,
-            Some((log.clone(), context)),
-            None,
+            ObservationContext {
+                model: "model/worker".to_string(),
+                started: Instant::now(),
+                cache_eligible: 0.0,
+                routing_log: Some((log.clone(), context)),
+                composition: None,
+                attribution: None,
+                calendar: Arc::new(economics::CalendarWindow::new()),
+            },
         );
 
         let LlmResponse::Stream(mut observed) = observed.llm_response else {
@@ -318,12 +418,16 @@ mod tests {
         let stats = StatsAccumulator::default();
         let observed = observe(
             response,
-            "model/worker",
-            Instant::now(),
             stats.clone(),
-            0.0,
-            Some((log.clone(), context)),
-            Some(composition),
+            ObservationContext {
+                model: "model/worker".to_string(),
+                started: Instant::now(),
+                cache_eligible: 0.0,
+                routing_log: Some((log.clone(), context)),
+                composition: Some(composition),
+                attribution: None,
+                calendar: Arc::new(economics::CalendarWindow::new()),
+            },
         );
         let LlmResponse::Stream(mut observed) = observed.llm_response else {
             panic!("expected stream");

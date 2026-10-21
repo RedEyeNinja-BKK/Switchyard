@@ -411,6 +411,8 @@ pub fn parse_response(body: &Value) -> Result<switchyard_protocol::DecisionRespo
             output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
             total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
             reasoning_tokens: None,
+            cost: None,
+            cost_currency: None,
         },
         None => switchyard_protocol::Usage::default(),
     };

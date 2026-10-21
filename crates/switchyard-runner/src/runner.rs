@@ -34,6 +34,8 @@ pub struct Runner {
     /// Declared capabilities of composite routes, which are policy promises rather than
     /// derived from any one child.
     composite_capabilities: BTreeMap<String, ModelCapabilities>,
+    /// The configuration facts an economics surface needs, extracted at load.
+    deployment_facts: crate::facts::DeploymentFacts,
 }
 
 /// One configured lane: its resolver and the kinds it serves.
@@ -108,6 +110,7 @@ impl Runner {
             decision_lane_composition: BTreeMap::new(),
             composites: BTreeMap::new(),
             composite_capabilities: BTreeMap::new(),
+            deployment_facts: crate::facts::DeploymentFacts::default(),
         }
     }
 
@@ -157,6 +160,17 @@ impl Runner {
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
         })
+    }
+
+    /// Registers the configuration facts an economics surface needs.
+    pub(crate) fn with_deployment_facts(mut self, facts: crate::facts::DeploymentFacts) -> Self {
+        self.deployment_facts = facts;
+        self
+    }
+
+    /// Returns the configuration facts an economics surface needs.
+    pub fn deployment_facts(&self) -> &crate::facts::DeploymentFacts {
+        &self.deployment_facts
     }
 
     /// The URL unmatched requests may fall through to, when configured.

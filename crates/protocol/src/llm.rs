@@ -346,7 +346,16 @@ pub struct Usage {
     /// Cache-read and cache-creation token detail, when reported.
     #[serde(flatten)]
     pub cache: Option<Box<InputCacheUsage>>,
-    /// Generated output tokens, excluding reasoning detail when the provider reports it separately.
+    /// Generated output tokens.
+    ///
+    /// This is the provider's own output total, and it *includes* the reasoning
+    /// tokens when the provider reports reasoning inside that total. Measured
+    /// 2026-10-21 against the live OpenRouter API: a response reported
+    /// `completion_tokens: 650` with `completion_tokens_details.reasoning_tokens: 521`
+    /// and `total_tokens: 680`, where `prompt + completion == total` and
+    /// `prompt + completion + reasoning` did not. The reasoning count is therefore a
+    /// component of the output total, not an addition to it — the same shape as the
+    /// cached and cache-creation counts being components of the prompt total.
     pub output_tokens: Option<u64>,
     /// Provider-reported or codec-computed total token count.
     ///
@@ -354,7 +363,21 @@ pub struct Usage {
     /// this may equal non-cached input plus cache detail plus output.
     pub total_tokens: Option<u64>,
     /// Reasoning output tokens, when reported separately.
+    ///
+    /// A component of the output total, not an addition to it: see
+    /// [`Usage::output_tokens`].
     pub reasoning_tokens: Option<u64>,
+    /// The cost the provider itself reported for the request, in the provider's own
+    /// currency.
+    ///
+    /// Distinct from any Switchyard-derived estimate: this is the provider's own
+    /// figure for what it charged. It is absent when the provider reports no cost,
+    /// which is the case for every provider that does not bill per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// The currency the reported cost is denominated in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_currency: Option<String>,
 }
 
 /// Optional cache-token detail kept out of the common, cache-free usage allocation.

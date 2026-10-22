@@ -18,7 +18,9 @@ use switchyard_server::economics::account_apis::{
     CodexAllowanceAccount, DeepSeekAccount, OpenRouterAccount,
 };
 use switchyard_server::economics::collector::AccountCollector;
-use switchyard_server::economics::providers::{AccountApi, AccountObservation, FetchOutcome};
+use switchyard_server::economics::providers::{
+    AccountAmount, AccountApi, AccountObservation, AccountScope, FetchOutcome, ReportingPeriod,
+};
 use switchyard_server::economics::runtime::build_account_apis;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -140,9 +142,167 @@ async fn the_openrouter_reader_reports_the_credit_and_the_usage() {
     let FetchOutcome::Ok(observation) = outcome else {
         panic!("expected a successful reading, got {outcome:?}");
     };
-    assert_eq!(observation.credits.get("USD"), Some(&125.0));
-    assert_eq!(observation.usage.get("USD_account"), Some(&124.232404098));
-    assert_eq!(observation.usage.get("USD"), Some(&12.5));
+    assert_eq!(observation.credits.len(), 1);
+    let credit = &observation.credits[0];
+    assert_eq!(credit.currency, "USD");
+    assert_eq!(credit.scope, AccountScope::Account);
+    assert_eq!(credit.period, ReportingPeriod::Total);
+    assert_eq!(credit.value, 125.0);
+
+    assert_eq!(observation.usage.len(), 3);
+    let account_usage = observation
+        .usage
+        .iter()
+        .find(|amount| amount.scope == AccountScope::Account)
+        .expect("an account-wide usage figure");
+    assert_eq!(account_usage.value, 124.232404098);
+    assert_eq!(account_usage.period, ReportingPeriod::Total);
+
+    let key_total = observation
+        .usage
+        .iter()
+        .find(|amount| amount.scope == AccountScope::Key && amount.period == ReportingPeriod::Total)
+        .expect("a key usage figure for the whole life of the key");
+    assert_eq!(key_total.value, 12.5);
+
+    let key_monthly = observation
+        .usage
+        .iter()
+        .find(|amount| {
+            amount.scope == AccountScope::Key && amount.period == ReportingPeriod::Monthly
+        })
+        .expect("a key usage figure for the current month");
+    assert_eq!(key_monthly.value, 40.0);
+}
+
+/// The currency, the accounting scope and the reporting period are separate facts.
+///
+/// The key endpoint and the credits endpoint both report usage in US dollars, but one
+/// covers the key and the other the whole account, so they are different amounts.
+/// A single label that carried the currency together with the scope or the period
+/// would make the two indistinguishable without parsing the label value, and a
+/// reader could sum series that were never meant to be summed.
+#[tokio::test]
+async fn the_currency_the_scope_and_the_period_are_separate_labels() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "usage": 1.0,
+                "usage_daily": 2.0,
+                "usage_weekly": 3.0,
+                "usage_monthly": 4.0
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/credits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"total_credits": 10.0, "total_usage": 6.0}
+        })))
+        .mount(&server)
+        .await;
+
+    let reader = OpenRouterAccount::new("test-key").with_base_url(server.uri());
+    let outcome = reader.fetch().await;
+    let FetchOutcome::Ok(observation) = outcome else {
+        panic!("expected a successful reading, got {outcome:?}");
+    };
+
+    // Every figure carries the same currency, and differs in exactly one of scope
+    // and period.
+    assert!(
+        observation
+            .usage
+            .iter()
+            .all(|amount| amount.currency == "USD")
+    );
+
+    let key_figures: Vec<(&str, f64)> = observation
+        .usage
+        .iter()
+        .filter(|amount| amount.scope == AccountScope::Key)
+        .map(|amount| (amount.period.as_str(), amount.value))
+        .collect();
+    assert_eq!(
+        key_figures,
+        vec![
+            ("total", 1.0),
+            ("daily", 2.0),
+            ("weekly", 3.0),
+            ("monthly", 4.0),
+        ],
+        "each reporting window is its own figure"
+    );
+
+    let account_figures: Vec<(&str, f64)> = observation
+        .usage
+        .iter()
+        .filter(|amount| amount.scope == AccountScope::Account)
+        .map(|amount| (amount.period.as_str(), amount.value))
+        .collect();
+    assert_eq!(
+        account_figures,
+        vec![("total", 6.0)],
+        "the account-wide usage is a different amount from the key's usage"
+    );
+}
+
+/// Total credits, consumed credits and remaining balance are three different facts.
+///
+/// The provider reports the credit it sold and the usage drawn against it. What is
+/// left is the difference. Publishing all three under their own labels means an
+/// operator reads the remaining balance directly instead of subtracting one series
+/// from another, and a reader cannot mistake the purchased credit for the money that
+/// is left.
+#[tokio::test]
+async fn the_credit_the_consumed_credit_and_the_remaining_balance_are_separate() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"usage": 1.0}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/credits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"total_credits": 125.0, "total_usage": 124.232622134}
+        })))
+        .mount(&server)
+        .await;
+
+    let reader = OpenRouterAccount::new("test-key").with_base_url(server.uri());
+    let FetchOutcome::Ok(observation) = reader.fetch().await else {
+        panic!("expected a successful reading");
+    };
+
+    assert_eq!(observation.credits.len(), 1, "one purchased credit figure");
+    assert_eq!(observation.credits[0].value, 125.0);
+
+    let consumed = observation
+        .usage
+        .iter()
+        .find(|amount| amount.scope == AccountScope::Account)
+        .expect("the consumed credit");
+    assert_eq!(consumed.value, 124.232622134);
+
+    assert_eq!(
+        observation.balances.len(),
+        1,
+        "one remaining balance figure"
+    );
+    let remaining = &observation.balances[0];
+    assert_eq!(remaining.scope, AccountScope::Account);
+    assert_eq!(remaining.period, ReportingPeriod::Total);
+    assert!(
+        (remaining.value - (125.0 - 124.232622134)).abs() < 1e-9,
+        "the remaining balance is the purchased credit less the consumed credit, got {}",
+        remaining.value
+    );
 }
 
 /// A provider that rejects the credential is reported as unauthorized, not as a
@@ -215,7 +375,12 @@ async fn the_deepseek_reader_reports_the_balance() {
     let FetchOutcome::Ok(observation) = outcome else {
         panic!("expected a successful reading, got {outcome:?}");
     };
-    assert_eq!(observation.balances.get("CNY"), Some(&12.34));
+    assert_eq!(observation.balances.len(), 1);
+    let balance = &observation.balances[0];
+    assert_eq!(balance.currency, "CNY");
+    assert_eq!(balance.scope, AccountScope::Account);
+    assert_eq!(balance.period, ReportingPeriod::Total);
+    assert_eq!(balance.value, 12.34);
 }
 
 /// A provider may report an amount as a decimal string rather than as a JSON
@@ -242,10 +407,19 @@ async fn a_balance_reported_as_a_string_is_read_as_an_amount() {
     let FetchOutcome::Ok(observation) = outcome else {
         panic!("expected a successful reading, got {outcome:?}");
     };
-    assert_eq!(observation.balances.get("USD"), Some(&7.5));
+    let usd = observation
+        .balances
+        .iter()
+        .find(|amount| amount.currency == "USD")
+        .expect("a US dollar balance");
+    assert_eq!(usd.value, 7.5);
+    let cny = observation
+        .balances
+        .iter()
+        .find(|amount| amount.currency == "CNY")
+        .expect("a renminbi balance");
     assert_eq!(
-        observation.balances.get("CNY"),
-        Some(&-0.0),
+        cny.value, -0.0,
         "a negative zero balance is still a balance the provider reported"
     );
 }
@@ -351,7 +525,12 @@ async fn the_collection_counts_only_the_providers_that_answered() {
         std::sync::Arc::new(Stub {
             provider: "ok",
             outcome: FetchOutcome::Ok(AccountObservation {
-                balances: [("USD".to_string(), 1.0)].into_iter().collect(),
+                balances: vec![AccountAmount::new(
+                    "USD",
+                    AccountScope::Account,
+                    ReportingPeriod::Total,
+                    1.0,
+                )],
                 ..AccountObservation::default()
             }),
         }),

@@ -14,7 +14,7 @@
 //!
 //! * It is read-only. No account, key or balance is ever written.
 //! * It is bounded. Each provider contributes a fixed number of series, and every
-//!   label value is a provider name, a currency or a pool name.
+//!   label value comes from a fixed set.
 //! * It is asynchronous. A provider that is slow, down or unauthorized must not
 //!   delay an inference request, so the poller runs on its own task and records a
 //!   failure rather than propagating one.
@@ -26,15 +26,101 @@ use std::time::{Duration, Instant};
 
 use opentelemetry::{KeyValue, global};
 
+/// The accounting scope a provider figure covers.
+///
+/// A provider reports some figures for the whole account and some for the single key
+/// Switchyard holds. The two are different amounts of money, so they are published
+/// under different scopes rather than added together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AccountScope {
+    /// The whole provider account.
+    Account,
+    /// The single API key Switchyard holds.
+    Key,
+}
+
+impl AccountScope {
+    /// The label value for this scope.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Key => "key",
+        }
+    }
+}
+
+/// The reporting period a provider figure covers.
+///
+/// A provider reports usage over several windows at once. Each window is a different
+/// amount, so each is published under its own period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReportingPeriod {
+    /// The whole life of the account or key.
+    Total,
+    /// The current day.
+    Daily,
+    /// The current week.
+    Weekly,
+    /// The current month.
+    Monthly,
+}
+
+impl ReportingPeriod {
+    /// The label value for this period.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Total => "total",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+        }
+    }
+}
+
+/// One amount a provider reported, with the three facts that describe it kept apart.
+///
+/// The currency, the accounting scope and the reporting period are separate facts.
+/// A provider that reports a monthly figure and an account-wide figure must produce
+/// two series that differ in one label each, so a query can select one of them and
+/// so a reader can tell which figure is which.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountAmount {
+    /// The currency the amount is denominated in.
+    pub currency: String,
+    /// Whether the amount covers the account or the key.
+    pub scope: AccountScope,
+    /// The window the amount covers.
+    pub period: ReportingPeriod,
+    /// The amount itself.
+    pub value: f64,
+}
+
+impl AccountAmount {
+    /// Builds one reported amount.
+    pub fn new(
+        currency: impl Into<String>,
+        scope: AccountScope,
+        period: ReportingPeriod,
+        value: f64,
+    ) -> Self {
+        Self {
+            currency: currency.into(),
+            scope,
+            period,
+            value,
+        }
+    }
+}
+
 /// What a provider reported about its account.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AccountObservation {
-    /// The provider's reported balance, by currency.
-    pub balances: BTreeMap<String, f64>,
-    /// The provider's reported purchased credit, by currency.
-    pub credits: BTreeMap<String, f64>,
-    /// The provider's reported cumulative usage, by currency.
-    pub usage: BTreeMap<String, f64>,
+    /// The balance the provider reported.
+    pub balances: Vec<AccountAmount>,
+    /// The purchased credit the provider reported.
+    pub credits: Vec<AccountAmount>,
+    /// The usage the provider reported.
+    pub usage: Vec<AccountAmount>,
     /// The remaining allowance of a provider-reported window, by pool name, as a
     /// percentage.
     pub allowance_remaining_percent: BTreeMap<String, f64>,
@@ -175,42 +261,24 @@ impl AccountPublisher {
                 &[KeyValue::new("provider", provider.to_string())],
             );
 
-        for (currency, value) in &observation.balances {
-            meter
-                .f64_gauge("switchyard.economics_provider_balance")
-                .build()
-                .record(
-                    *value,
-                    &[
-                        KeyValue::new("provider", provider.to_string()),
-                        KeyValue::new("currency", currency.clone()),
-                    ],
-                );
-        }
-        for (currency, value) in &observation.credits {
-            meter
-                .f64_gauge("switchyard.economics_provider_credit")
-                .build()
-                .record(
-                    *value,
-                    &[
-                        KeyValue::new("provider", provider.to_string()),
-                        KeyValue::new("currency", currency.clone()),
-                    ],
-                );
-        }
-        for (currency, value) in &observation.usage {
-            meter
-                .f64_gauge("switchyard.economics_provider_usage")
-                .build()
-                .record(
-                    *value,
-                    &[
-                        KeyValue::new("provider", provider.to_string()),
-                        KeyValue::new("currency", currency.clone()),
-                    ],
-                );
-        }
+        publish_amounts(
+            &meter,
+            "switchyard.economics_provider_balance",
+            &observation.balances,
+            provider,
+        );
+        publish_amounts(
+            &meter,
+            "switchyard.economics_provider_credit",
+            &observation.credits,
+            provider,
+        );
+        publish_amounts(
+            &meter,
+            "switchyard.economics_provider_usage",
+            &observation.usage,
+            provider,
+        );
         for (pool, value) in &observation.allowance_remaining_percent {
             meter
                 .f64_gauge("switchyard.economics_allowance_remaining_percent")
@@ -268,5 +336,28 @@ impl AccountPublisher {
                     KeyValue::new("provider", provider.to_string()),
                 ],
             );
+    }
+}
+
+/// Publishes a set of reported amounts under one metric family.
+///
+/// Each amount carries its own currency, scope and period, so the three facts stay
+/// separable in the metric namespace and a query can select one of them.
+fn publish_amounts(
+    meter: &opentelemetry::metrics::Meter,
+    name: &'static str,
+    amounts: &[AccountAmount],
+    provider: &str,
+) {
+    for amount in amounts {
+        meter.f64_gauge(name).build().record(
+            amount.value,
+            &[
+                KeyValue::new("provider", provider.to_string()),
+                KeyValue::new("currency", amount.currency.clone()),
+                KeyValue::new("scope", amount.scope.as_str()),
+                KeyValue::new("period", amount.period.as_str()),
+            ],
+        );
     }
 }

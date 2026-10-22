@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::providers::{AccountApi, AccountObservation, FetchOutcome};
+use super::providers::{
+    AccountAmount, AccountApi, AccountObservation, AccountScope, FetchOutcome, ReportingPeriod,
+};
 
 /// The HTTP client the account readers use.
 ///
@@ -92,11 +94,24 @@ impl OpenRouterAccount {
         match self.get_json("/key").await {
             Ok(body) => {
                 if let Some(data) = body.get("data") {
-                    if let Some(usage) = data.get("usage").and_then(Value::as_f64) {
-                        observation.usage.insert("USD".to_string(), usage);
-                    }
-                    if let Some(usage) = data.get("usage_monthly").and_then(Value::as_f64) {
-                        observation.usage.insert("USD_monthly".to_string(), usage);
+                    // The key endpoint reports the usage of this key over several
+                    // windows. Each window is a different amount, so each is
+                    // published under its own period rather than folded into one
+                    // series.
+                    for (field, period) in [
+                        ("usage", ReportingPeriod::Total),
+                        ("usage_daily", ReportingPeriod::Daily),
+                        ("usage_weekly", ReportingPeriod::Weekly),
+                        ("usage_monthly", ReportingPeriod::Monthly),
+                    ] {
+                        if let Some(usage) = data.get(field).and_then(Value::as_f64) {
+                            observation.usage.push(AccountAmount::new(
+                                "USD",
+                                AccountScope::Key,
+                                period,
+                                usage,
+                            ));
+                        }
                     }
                 }
             }
@@ -107,14 +122,42 @@ impl OpenRouterAccount {
         // drawn against it. It is a separate request because a provider may authorize
         // one and refuse the other, so a failure here does not discard the reading
         // already taken.
+        //
+        // The purchased credit and the consumed credit are different facts. The
+        // remaining balance is the difference between them, and is published as its
+        // own figure so no reader has to subtract one series from another to know
+        // what is left.
         if let Ok(body) = self.get_json("/credits").await
             && let Some(data) = body.get("data")
         {
-            if let Some(credits) = data.get("total_credits").and_then(Value::as_f64) {
-                observation.credits.insert("USD".to_string(), credits);
+            let credits = data.get("total_credits").and_then(Value::as_f64);
+            let consumed = data.get("total_usage").and_then(Value::as_f64);
+            if let Some(credits) = credits {
+                observation.credits.push(AccountAmount::new(
+                    "USD",
+                    AccountScope::Account,
+                    ReportingPeriod::Total,
+                    credits,
+                ));
             }
-            if let Some(usage) = data.get("total_usage").and_then(Value::as_f64) {
-                observation.usage.insert("USD_account".to_string(), usage);
+            if let Some(consumed) = consumed {
+                observation.usage.push(AccountAmount::new(
+                    "USD",
+                    AccountScope::Account,
+                    ReportingPeriod::Total,
+                    consumed,
+                ));
+            }
+            if let Some(remaining) = credits
+                .zip(consumed)
+                .map(|(credits, consumed)| credits - consumed)
+            {
+                observation.balances.push(AccountAmount::new(
+                    "USD",
+                    AccountScope::Account,
+                    ReportingPeriod::Total,
+                    remaining,
+                ));
             }
         }
 
@@ -189,8 +232,14 @@ impl AccountApi for DeepSeekAccount {
                 let Some(currency) = balance.get("currency").and_then(Value::as_str) else {
                     continue;
                 };
+                // The balance endpoint reports the account's balance, not the key's.
                 if let Some(total) = balance.get("total_balance").and_then(decode_amount) {
-                    observation.balances.insert(currency.to_string(), total);
+                    observation.balances.push(AccountAmount::new(
+                        currency,
+                        AccountScope::Account,
+                        ReportingPeriod::Total,
+                        total,
+                    ));
                 }
             }
         }

@@ -210,15 +210,41 @@ Switchyard contacts a provider.
 | `switchyard_economics_account_auth_failures_total{provider}` | counter | Reads rejected with 401 or 403. |
 | `switchyard_economics_account_freshness_seconds{provider}` | gauge | Age of the last successful read. |
 | `switchyard_economics_account_fetch_duration_seconds{provider}` | gauge | How long the last read took. |
-| `switchyard_economics_provider_balance{provider,currency}` | gauge | The balance the provider reported. |
-| `switchyard_economics_provider_credit{provider,currency}` | gauge | The purchased credit the provider reported. |
-| `switchyard_economics_provider_usage{provider,currency}` | gauge | The cumulative usage the provider reported. |
+| `switchyard_economics_provider_balance{provider,currency,scope,period}` | gauge | The remaining balance the provider reported. |
+| `switchyard_economics_provider_credit{provider,currency,scope,period}` | gauge | The purchased credit the provider reported. |
+| `switchyard_economics_provider_usage{provider,currency,scope,period}` | gauge | The usage the provider reported. |
 | `switchyard_economics_allowance_remaining_percent{provider,pool}` | gauge | Remaining allowance of a provider-reported window. |
 | `switchyard_economics_allowance_reset_seconds{provider,pool}` | gauge | Time until that window resets. |
 
 A provider that exposes no account surface produces no account series at all. It
 is not recorded as a zero balance: a provider that exposes nothing has not
 reported a balance of zero.
+
+The three amount families carry three separate labels, because a provider figure
+has three separate facts attached to it:
+
+| Label | Values | Meaning |
+|---|---|---|
+| `currency` | `USD`, `CNY`, ... | The currency the amount is denominated in. |
+| `scope` | `account`, `key` | Whether the amount covers the whole provider account or the single API key Switchyard holds. |
+| `period` | `total`, `daily`, `weekly`, `monthly` | The reporting window the amount covers. |
+
+These are not combined into one label. A currency label that also carried the
+scope or the period would make two different amounts indistinguishable without
+parsing the label value, and would invite a query to sum series that were never
+meant to be summed. A reader selects on `currency`, `scope` and `period`
+independently.
+
+The three amount families are three different facts and are not interchanged:
+
+* `provider_credit` is the credit the provider sold.
+* `provider_usage` with `scope="account"` is the credit that has been consumed.
+* `provider_balance` is the credit that is left, which is the difference between
+  the two.
+
+A provider that reports a purchased credit but no consumed credit publishes no
+balance, because the remaining amount is not known. A provider that reports a
+balance directly, such as DeepSeek, publishes the balance and no credit.
 
 ### Bangkok calendar day
 

@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The economics dashboard's identity and the deployment it reads.
+#
+# `job` is the Prometheus job label of the Switchyard deployment the dashboard
+# reads. Every panel selects on it, so changing this points the whole dashboard
+# at a different deployment.
+#
+# `uid` is the Grafana dashboard uid. The publishing tool creates a dashboard
+# with this uid, and the V7.11 back-link points at it.
+#
+# `message` is the revision note recorded with the dashboard when it is
+# published.
+
+job = "switchyard-v7"
+uid = "turnstone-switchyard-economics-v8"
+title = "SWITCHYARD ECONOMICS & TOKEN ACCOUNTING V8.0"
+
+# The Grafana datasource the panels query. This is a deployment fact, not a
+# property of the dashboard's content, so it lives here rather than in the
+# generator.
+datasource_uid = "df7wrp11a9hq8c"
+datasource_type = "prometheus"
+
+# The routing dashboard this one links back to. The reverse link is added by
+# prepare_v7_backlink.py.
+routing_uid = "turnstone-switchyard-v7"
+
+message = """
+Switchyard economics V8.0: provider/route/family/cost-class attribution with
+separate token components (reasoning is inside completion, not additive) and
+provider account state read with Switchyard's own credentials.
+"""

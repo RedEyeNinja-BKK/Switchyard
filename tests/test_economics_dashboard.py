@@ -288,3 +288,50 @@ def test_the_coverage_table_explains_the_openai_naming_split() -> None:
     description = table[0]["description"]
     assert "openai_nt" in description
     assert "one credential" in description
+
+
+def test_the_deepseek_row_shows_every_figure_the_previous_dashboard_showed() -> None:
+    # The row the operator reads must not lose information in the move to
+    # Switchyard telemetry. Switchyard publishes the balance and its movement,
+    # but not the top-up ledger, lifetime spend, or request-derived actual cost -
+    # those live only in the older localclaw exporter. They are still current,
+    # so the row carries them rather than presenting a thinner row.
+    document = _request()["dashboard"]
+    titles = {panel.get("title", "") for panel in document["panels"]}
+    required = {
+        "DeepSeek Status",
+        "DeepSeek Balance (CNY)",
+        "DeepSeek 24h Balance Movement",
+        "DeepSeek Top-Ups (total, CNY)",
+        "DeepSeek Lifetime Spend (CNY)",
+        "Cumulative Actual Spend (CNY)",
+        "DeepSeek balance trend (CNY)",
+        "DeepSeek lifetime spend (CNY)",
+    }
+    assert required <= titles, f"missing from the DeepSeek row: {sorted(required - titles)}"
+
+
+def test_every_legacy_deepseek_figure_is_attributed_to_its_source() -> None:
+    # Three figures cannot be derived from Switchyard's balance readings. The
+    # dashboard must say where they actually come from, or an operator reading
+    # them as Switchyard output will trust provenance that does not exist.
+    config = _config()
+    document = _request()["dashboard"]
+    legacy_job = config.get("legacy_job")
+    assert legacy_job, "the configuration must name the exporter that publishes these figures"
+    legacy_panels = [
+        panel
+        for panel in document["panels"]
+        if any(legacy_job in target.get("expr", "") for target in panel.get("targets", []))
+    ]
+    assert legacy_panels, "the legacy-sourced panels must exist"
+
+    coverage = [
+        panel["options"]["content"]
+        for panel in document["panels"]
+        if panel.get("type") == "text" and "DEEPSEEK COVERAGE" in panel.get("title", "")
+    ]
+    assert coverage, "the DeepSeek coverage note must exist"
+    text = "\n".join(coverage)
+    assert "localclaw" in text, "the coverage note must name the exporter it relies on"
+    assert "Read from Switchyard" in text, "the note must separate the two sources"

@@ -69,6 +69,15 @@ CAL_DAY_START = "switchyard_economics_calendar_day_start"
 CAL_DAY_END = "switchyard_economics_calendar_day_end"
 CAL_DAY_ELAPSED = "switchyard_economics_calendar_day_elapsed_seconds"
 
+# Figures the older localclaw economics exporter publishes and Switchyard does
+# not. Switchyard reads DeepSeek's balance endpoint, which returns a level and
+# not a ledger, so a top-up and a day of usage are indistinguishable from two
+# readings. These series are still current, so the DeepSeek row keeps them
+# rather than dropping information the operator can act on.
+LEGACY_SPEND_DELTA = "localclaw_deepseek_spend_balance_delta_total_cny"
+LEGACY_TOP_UP = "localclaw_deepseek_top_up_total_cny"
+LEGACY_ACTUAL_COST = "localclaw_econ_actual_cost_total"
+
 _uid = 1000
 
 
@@ -281,6 +290,7 @@ def text(title, content, x, y, w=24, h=4):
 def build_dashboard(config):
     """Builds the dashboard document from a configuration mapping."""
     job = config["job"]
+    legacy_job = config["legacy_job"]
     uid = config["uid"]
     title = config["title"]
     routing_uid = config["routing_uid"]
@@ -808,6 +818,50 @@ def build_dashboard(config):
     y += 5
 
     panels.append(
+        stat(
+            "DeepSeek Top-Ups (total, CNY)",
+            f'last_over_time({LEGACY_TOP_UP}{{job="{legacy_job}"}}[3h])',
+            "Every top-up ever credited to the DeepSeek account, in CNY, as recorded by the "
+            "older localclaw economics exporter. Switchyard does not publish a top-up ledger, "
+            "so this figure comes from that exporter and not from Switchyard's account reads.",
+            0,
+            y,
+            w=8,
+            unit="CNY",
+            decimals=2,
+        )
+    )
+    panels.append(
+        stat(
+            "DeepSeek Lifetime Spend (CNY)",
+            f'sum({LEGACY_SPEND_DELTA}{{job="{legacy_job}"}})',
+            "Cumulative spend inferred from balance deltas by the older localclaw economics "
+            "exporter. Switchyard reads the balance endpoint only, which reports a level rather "
+            "than a ledger, so it cannot reproduce this sum on its own.",
+            8,
+            y,
+            w=8,
+            unit="CNY",
+            decimals=2,
+        )
+    )
+    panels.append(
+        stat(
+            "Cumulative Actual Spend (CNY)",
+            f'sum({LEGACY_ACTUAL_COST}{{job="{legacy_job}",currency="CNY",provider="deepseek"}})',
+            "Request-derived spend for the DeepSeek lane, priced from the served model and token "
+            "counts by the older localclaw exporter. This is a computed cost, not a figure "
+            "DeepSeek billed, so it will not reconcile exactly against the balance movement.",
+            16,
+            y,
+            w=8,
+            unit="CNY",
+            decimals=2,
+        )
+    )
+    y += 5
+
+    panels.append(
         timeseries(
             "DeepSeek balance trend (CNY)",
             [
@@ -827,19 +881,49 @@ def build_dashboard(config):
         )
     )
     panels.append(
-        text(
-            "DEEPSEEK COVERAGE - WHAT IS AND IS NOT AVAILABLE",
-            "**Available from Switchyard:** the live balance in both currencies, and the age of "
-            "the last successful account read.\n\n"
-            "**NOT available, and deliberately not guessed:** DeepSeek lifetime spend, the "
-            "top-up ledger, and a true metered-spend figure. The historical dashboard derived "
-            "those from a balance-delta ledger maintained by a separate exporter. Switchyard "
-            "reads the balance endpoint only, which reports a level rather than a ledger, so a "
-            "top-up and a day of usage are indistinguishable from two readings alone. Those "
-            "panels are absent here rather than approximated.",
+        timeseries(
+            "DeepSeek lifetime spend (CNY)",
+            [
+                target(
+                    f'sum({LEGACY_SPEND_DELTA}{{job="{legacy_job}"}})',
+                    legend="lifetime spend ¥",
+                ),
+                target(
+                    f'sum({LEGACY_ACTUAL_COST}{{job="{legacy_job}",currency="CNY",provider="deepseek"}})',
+                    legend="actual spend ¥",
+                    ref="B",
+                ),
+            ],
+            "The exporter's running totals over time. Lifetime spend steps up in whole "
+            "reconciliation units, while actual spend moves with every priced request, so the "
+            "two lines answer different questions and are not expected to overlap.",
             12,
             y,
             w=12,
+            h=8,
+            unit="CNY",
+        )
+    )
+    y += 8
+
+    panels.append(
+        text(
+            "DEEPSEEK COVERAGE - WHERE EACH NUMBER COMES FROM",
+            "**Read from Switchyard:** the live balance in both currencies, the 24-hour balance "
+            "movement, and the age of the last successful account read. These come from "
+            "Switchyard's own credentialed read of DeepSeek's balance endpoint.\n\n"
+            "**Read from the older localclaw economics exporter:** the top-up ledger, lifetime "
+            "spend, and request-derived actual spend. Switchyard reads a balance level rather "
+            "than a ledger, so a top-up and a day of usage are indistinguishable from two "
+            "readings alone and it cannot reconstruct these three on its own. They are shown "
+            "because that exporter still publishes them and they are current, not because "
+            "Switchyard derives them.\n\n"
+            "**Not shown at all:** a true metered-spend figure. No available source separates "
+            "metered spend from top-ups, so a panel claiming to would be an approximation "
+            "dressed as a measurement.",
+            0,
+            y,
+            w=24,
             h=8,
         )
     )

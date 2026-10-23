@@ -14,6 +14,15 @@
 # published.
 
 job = "switchyard-v7"
+
+# `legacy_job` is the Prometheus job label of the older localclaw economics
+# exporter. Three figures exist only there and not in Switchyard: the DeepSeek
+# top-up ledger, DeepSeek lifetime spend, and request-derived actual cost.
+# Switchyard reads DeepSeek's balance endpoint, which reports a level rather
+# than a ledger, so it cannot reconstruct any of them. The panels that use this
+# label say so in their own descriptions.
+legacy_job = "localclaw-econ"
+
 uid = "turnstone-switchyard-economics-v8"
 title = "SWITCHYARD ECONOMICS & TOKEN ACCOUNTING V8.0"
 

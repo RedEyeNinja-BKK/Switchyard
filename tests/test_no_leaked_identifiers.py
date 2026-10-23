@@ -98,7 +98,11 @@ def test_the_scanner_detects_a_key_it_is_shown() -> None:
 
 
 def test_the_scanner_detects_a_private_hostname_it_is_shown() -> None:
-    sample = 'url = "http://some-host.realtailnet1234.ts.net:8446/v1"'
+    # The sample hostname is assembled at runtime rather than written out. A
+    # literal here would be a private-network-shaped hostname in a tracked file,
+    # which is the very thing this scanner reports - it would fail on itself.
+    fake_tailnet = "realtail" + "net1234"
+    sample = 'url = "http://some-host.' + fake_tailnet + '.ts.net:8446/v1"'
     matches = [m.group(0) for m in TAILNET.finditer(sample)]
     assert matches, "the tailnet pattern must match a real-shaped hostname"
     assert not matches[0].lower().endswith(TAILNET_PLACEHOLDER)

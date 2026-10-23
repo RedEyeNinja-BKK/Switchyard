@@ -8,10 +8,16 @@ SPDX-License-Identifier: Apache-2.0
 The Switchyard economics dashboard, its generator and the tool that prepares it
 for publication.
 
-Everything here reads from Switchyard itself. The provider account figures are
-collected by Switchyard, with the credentials Switchyard already holds to serve
-inference, and published through Switchyard's own metric surface. No external
-exporter or agent-based accounting path is involved.
+Almost everything here reads from Switchyard itself. The provider account
+figures are collected by Switchyard, with the credentials Switchyard already
+holds to serve inference, and published through Switchyard's own metric surface.
+
+There is one exception. Four DeepSeek panels read the older localclaw economics
+exporter, because Switchyard reads a balance level rather than a ledger and
+cannot derive a cumulative top-up or lifetime-spend figure. Those panels name
+their source in their own descriptions, and `PROVENANCE.md` records the
+exception, what is native, and what Switchyard would need to replace it. Do not
+describe this dashboard as wholly Switchyard-native while it stands.
 
 ## The files
 
@@ -20,6 +26,7 @@ exporter or agent-based accounting path is involved.
 | `economics_dashboard.toml` | The dashboard's identity and the deployment it reads: the Prometheus job, the Grafana datasource, the dashboard uid and title, and the routing dashboard it links to. |
 | `build_economics_dashboard.py` | Builds the dashboard document from that configuration. Writes a file; publishes nothing. |
 | `prepare_v7_backlink.py` | Reads the live routing dashboard, adds one link to this dashboard, and writes the update request and a rollback copy. Writes a file; publishes nothing. |
+| `PROVENANCE.md` | Where every published figure comes from, the DeepSeek legacy exception and its replacement requirements, the `openrouter_stephen` account gap, and the limits of rolling-period accounting. Read it before changing a panel. |
 
 The values in the configuration are deployment facts. The generator hardcodes
 none of them, so pointing this at a different deployment is a configuration

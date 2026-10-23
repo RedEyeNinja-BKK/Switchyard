@@ -794,6 +794,7 @@ fn composition_failure_label(class: switchyard_llm_client::FailureClass) -> &'st
         FailureClass::ProviderPolicy => "provider_policy",
         FailureClass::Auth => "auth",
         FailureClass::Request => "request",
+        FailureClass::AccountQuota => "account_quota",
         FailureClass::Other => "other",
     }
 }

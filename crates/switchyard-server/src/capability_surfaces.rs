@@ -89,7 +89,7 @@ pub(crate) async fn embeddings(
         "model": capability.model,
         "input": request.input,
     });
-    forward(&state, capability, payload).await
+    forward(&state, capability, payload, Some(request.input.len())).await
 }
 
 pub(crate) async fn rerank(
@@ -190,7 +190,7 @@ pub(crate) async fn rerank(
     if let Some(top_n) = top_n {
         payload["top_n"] = json!(top_n);
     }
-    forward(&state, capability, payload).await
+    forward(&state, capability, payload, None).await
 }
 
 /// Forwards a capability request to its engine and returns the engine's own response.
@@ -198,16 +198,24 @@ pub(crate) async fn rerank(
 /// The response is passed through rather than reshaped: embedding vectors and rerank
 /// scores are the engine's contract, and re-encoding them here would risk changing
 /// ordering or numeric representation.
-async fn forward(state: &ServerState, capability: &ResolvedCapability, payload: Value) -> Response {
+async fn forward(
+    state: &ServerState,
+    capability: &ResolvedCapability,
+    payload: Value,
+    embedding_count: Option<usize>,
+) -> Response {
     let client = match state.capability_http(capability.timeout_seconds) {
         Ok(client) => client,
         Err(message) => return contract_error(StatusCode::BAD_GATEWAY, message),
     };
     let mut builder = client.post(&capability.url).json(&payload);
-    if let Some(variable) = &capability.api_key_env
-        && let Ok(value) = std::env::var(variable)
-        && !value.trim().is_empty()
-    {
+    if let Some(variable) = &capability.api_key_env {
+        let Ok(value) = std::env::var(variable) else {
+            return upstream_contract_error(capability, "credential unavailable");
+        };
+        if value.trim().is_empty() {
+            return upstream_contract_error(capability, "credential unavailable");
+        }
         builder = builder.bearer_auth(value);
     }
     match builder.send().await {
@@ -215,21 +223,42 @@ async fn forward(state: &ServerState, capability: &ResolvedCapability, payload: 
             let status =
                 StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = response.bytes().await.unwrap_or_default();
-            // The contract travels back so a caller holding vectors knows which space
-            // produced them, rather than inferring it from the capability id.
-            let mut headers = axum::http::HeaderMap::new();
-            if let Some(contract) = &capability.contract {
-                headers.insert(
-                    "x-switchyard-embedding-contract",
-                    contract
-                        .parse()
-                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
-                );
+            // Only Stephen's as-yet-unverified OpenRouter capabilities need the
+            // strict upstream check. Existing embedding spaces and rerank engines
+            // keep their established passthrough contract unchanged.
+            if matches!(capability.id.as_str(), "ST_Embed" | "ST_Rerank") && status.is_success() {
+                let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+                    return upstream_contract_error(
+                        capability,
+                        "upstream returned non-JSON success",
+                    );
+                };
+                let result = if capability.id == "ST_Embed" {
+                    validate_stephen_embedding(capability, &value, embedding_count.unwrap_or(0))
+                } else {
+                    validate_stephen_rerank(capability, &value, &payload)
+                };
+                if let Err(reason) = result {
+                    return upstream_contract_error(capability, reason);
+                }
             }
-            if let Some(dimensions) = capability.dimensions
-                && let Ok(value) = dimensions.to_string().parse()
-            {
-                headers.insert("x-switchyard-embedding-dimensions", value);
+            // The contract travels back only with verified successful vectors;
+            // on an upstream error it must never attest to an absent embedding.
+            let mut headers = axum::http::HeaderMap::new();
+            if status.is_success() {
+                if let Some(contract) = &capability.contract {
+                    headers.insert(
+                        "x-switchyard-embedding-contract",
+                        contract
+                            .parse()
+                            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
+                    );
+                }
+                if let Some(dimensions) = capability.dimensions
+                    && let Ok(value) = dimensions.to_string().parse()
+                {
+                    headers.insert("x-switchyard-embedding-dimensions", value);
+                }
             }
             (status, headers, body).into_response()
         }
@@ -238,6 +267,124 @@ async fn forward(state: &ServerState, capability: &ResolvedCapability, payload: 
             format!("capability {} is unreachable: {}", capability.id, error),
         ),
     }
+}
+
+fn upstream_contract_error(capability: &ResolvedCapability, reason: &str) -> Response {
+    error_body(
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "capability {} upstream contract mismatch: {reason}",
+            capability.id
+        ),
+        "upstream_contract_error",
+    )
+}
+
+/// The model's own name, reduced to letters and digits.
+///
+/// Providers reformat the identifier they echo back. Measured against OpenRouter:
+/// requesting `liquid/lfm-2.5-embedding-350m:free` returns
+/// `openrouter:LiquidAI/LFM2.5-Embedding-350M:free` -- different vendor prefix,
+/// different punctuation, different case. Exact string equality would reject a
+/// perfectly good vector.
+///
+/// Comparing the last path segment (the model, not the vendor) with punctuation
+/// and case folded still distinguishes the case that matters: `...embed-8b` vs
+/// `...embed-1b` reduce to different strings.
+fn model_name_key(identifier: &str) -> String {
+    let without_prefix = identifier.strip_prefix("openrouter:").unwrap_or(identifier);
+    let model = without_prefix.rsplit('/').next().unwrap_or(without_prefix);
+    let model = model.split(':').next().unwrap_or(model);
+    model
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether the engine's answer came from the model we asked for.
+///
+/// A provider may report the canonical slug without the `:free` suffix, or under
+/// its own vendor namespace, for the very same weights. Accepting that is not
+/// leniency about identity: a substituted sibling (`...-embed-1b`) still fails,
+/// which is the case that matters.
+fn engine_identity_matches(requested: &str, returned: Option<&str>) -> bool {
+    let Some(returned) = returned else {
+        return false;
+    };
+    let wanted = model_name_key(requested);
+    !wanted.is_empty() && wanted == model_name_key(returned)
+}
+
+fn validate_stephen_embedding(
+    capability: &ResolvedCapability,
+    value: &Value,
+    expected_count: usize,
+) -> Result<(), &'static str> {
+    // OpenRouter may silently serve Embed 1B for an Embed 8B request. A
+    // mismatched or absent identity is NOT evidence of the agreed vector space.
+    if !engine_identity_matches(&capability.model, value["model"].as_str()) {
+        return Err("model identity missing or substituted");
+    }
+    let dimensions = capability.dimensions.ok_or("dimensions undeclared")? as usize;
+    let data = value["data"].as_array().ok_or("embedding data missing")?;
+    if data.len() != expected_count {
+        return Err("embedding batch length mismatch");
+    }
+    let mut seen = vec![false; expected_count];
+    for item in data {
+        let index = item["index"].as_u64().ok_or("embedding index missing")? as usize;
+        if index >= expected_count || seen[index] {
+            return Err("embedding index invalid or repeated");
+        }
+        seen[index] = true;
+        let vector = item["embedding"]
+            .as_array()
+            .ok_or("embedding vector missing")?;
+        if vector.len() != dimensions
+            || vector
+                .iter()
+                .any(|number| number.as_f64().is_none_or(|n| !n.is_finite()))
+        {
+            return Err("embedding dimension or value mismatch");
+        }
+    }
+    Ok(())
+}
+
+fn validate_stephen_rerank(
+    capability: &ResolvedCapability,
+    value: &Value,
+    payload: &Value,
+) -> Result<(), &'static str> {
+    if !engine_identity_matches(&capability.model, value["model"].as_str()) {
+        return Err("model identity missing or substituted");
+    }
+    let results = value["results"]
+        .as_array()
+        .ok_or("rerank results missing")?;
+    let docs = payload["documents"]
+        .as_array()
+        .ok_or("rerank documents missing")?;
+    let top_n = payload["top_n"].as_u64().unwrap_or(docs.len() as u64) as usize;
+    if results.len() > top_n || results.len() > docs.len() {
+        return Err("rerank result count exceeds request");
+    }
+    let mut seen = vec![false; docs.len()];
+    for result in results {
+        let index = result["index"].as_u64().ok_or("rerank index missing")? as usize;
+        if index >= docs.len() || seen[index] {
+            return Err("rerank index invalid or repeated");
+        }
+        seen[index] = true;
+        if result["relevance_score"]
+            .as_f64()
+            .is_none_or(|score| !score.is_finite())
+        {
+            return Err("rerank score missing or invalid");
+        }
+    }
+    Ok(())
 }
 
 /// A capability id this deployment does not expose. The message names what it does
@@ -267,4 +414,35 @@ fn error_body(status: StatusCode, message: String, kind: &str) -> Response {
         Json(json!({"error": {"message": message, "type": kind}})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::model_name_key;
+
+    /// The reformatting OpenRouter actually returned, measured 2026-10-22.
+    #[test]
+    fn provider_reformatting_of_the_same_model_is_accepted() {
+        assert_eq!(
+            model_name_key("liquid/lfm-2.5-embedding-350m:free"),
+            model_name_key("openrouter:LiquidAI/LFM2.5-Embedding-350M:free"),
+        );
+        assert_eq!(
+            model_name_key("nvidia/nemotron-3.5-embed-8b:free"),
+            model_name_key("nvidia/nemotron-3.5-embed-8b"),
+        );
+    }
+
+    /// The substitution the check exists to catch must still differ.
+    #[test]
+    fn a_sibling_variant_never_collapses_into_the_same_key() {
+        assert_ne!(
+            model_name_key("nvidia/nemotron-3.5-embed-8b:free"),
+            model_name_key("nvidia/nemotron-3.5-embed-1b:free"),
+        );
+        assert_ne!(
+            model_name_key("nvidia/nemotron-3.5-rerank-8b:free"),
+            model_name_key("nvidia/nemotron-3.5-embed-8b:free"),
+        );
+    }
 }

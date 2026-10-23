@@ -919,7 +919,35 @@ impl AttemptFailure {
     }
 }
 
+/// Whether a failure says the credential's account-wide allowance is exhausted.
+///
+/// OpenRouter reports this on a 429 as `error.metadata.limit_source =
+/// "openrouter_free_tier_daily"`, an allowance shared by every free model on the
+/// credential. Two decisions need this answer and must agree on it:
+///
+/// - the retry loop, because retrying a daily cap immediately cannot succeed and each
+///   attempt is another request against an allowance already at zero;
+/// - the route's candidate fallback, because every candidate draws on the same allowance.
+///
+/// One definition, so the two layers cannot drift apart.
+pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
+    let LlmClientError::UpstreamHttp { status, body } = source else {
+        return false;
+    };
+    if *status != StatusCode::TOO_MANY_REQUESTS {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+        value["error"]["metadata"]["limit_source"].as_str() == Some("openrouter_free_tier_daily")
+    })
+}
+
 fn is_transient_failure(error: &LlmClientError) -> bool {
+    // Checked before the status table: 429 is retryable in general, but a daily
+    // account cap is not a throttle that clears in a moment.
+    if is_account_wide_quota(error) {
+        return false;
+    }
     match error {
         LlmClientError::Transport { .. }
         | LlmClientError::Timeout { .. }
@@ -3354,6 +3382,58 @@ mod tests {
             retry_after: None,
         };
         assert!(!context_window.is_retryable());
+    }
+
+    /// A daily account cap is not a throttle: retrying it immediately cannot succeed.
+    ///
+    /// The control matters as much as the rule. A 429 from a provider's shared pool
+    /// clears in seconds and must keep its retries, and so must a 429 carrying no
+    /// marker at all, or this test would pass while quietly removing recovery that
+    /// works today.
+    #[test]
+    fn an_account_wide_quota_429_is_not_retried_but_pool_429s_are() {
+        let failure = |body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: body.to_string(),
+            },
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            retry_after: None,
+        };
+
+        let account = failure(
+            r#"{"error":{"code":429,"metadata":{"limit_source":"openrouter_free_tier_daily","remaining":0}}}"#,
+        );
+        assert!(
+            !account.is_retryable(),
+            "a daily account cap cannot clear on retry"
+        );
+        assert!(is_account_wide_quota(&account.error));
+
+        // A provider-pool 429 is model-scoped and short-lived.
+        let pool = failure(
+            r#"{"error":{"code":429,"metadata":{"limit_source":"upstream_provider_shared_pool"}}}"#,
+        );
+        assert!(pool.is_retryable(), "a provider pool 429 keeps its retries");
+        assert!(!is_account_wide_quota(&pool.error));
+
+        // An unmarked 429 keeps today's behaviour.
+        assert!(failure("{}").is_retryable());
+
+        // The marker only counts on a 429.
+        let mislabelled = AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: r#"{"error":{"metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#
+                    .to_string(),
+            },
+            status: Some(StatusCode::SERVICE_UNAVAILABLE),
+            retry_after: None,
+        };
+        assert!(
+            mislabelled.is_retryable(),
+            "a 503 is transient whatever its body says"
+        );
     }
 
     #[test]

@@ -430,6 +430,13 @@ pub enum FailureClass {
     Auth,
     /// The provider rejected the request itself.
     Request,
+    /// An account-wide quota shared by every model on one credential is exhausted.
+    ///
+    /// Distinct from [`Self::RateLimited`], which is a per-model or per-provider
+    /// throttle where another candidate may legitimately succeed. This one says the
+    /// whole account is out, so trying the next candidate cannot help: it would spend
+    /// a request from an allowance already known to be empty.
+    AccountQuota,
     /// Anything else, including local failures with no provider involvement.
     Other,
 }
@@ -454,10 +461,69 @@ impl FailureClass {
                 | Self::Server
         )
     }
+
+    /// Whether the failure says the whole account is out of quota.
+    ///
+    /// A composite must not cross on this: every child shares one credential, so the
+    /// next child would spend a request from an allowance already known to be empty.
+    pub fn is_account_quota(self) -> bool {
+        matches!(self, Self::AccountQuota)
+    }
+}
+
+/// Only the documented OpenRouter retirement notice for this exact free model
+/// changes a 404 into an unavailable candidate. Other 404s (including invalid
+/// requests and modality mismatches) remain terminal.
+fn is_retired_minimax_free(error: &LibsyError) -> bool {
+    let LibsyError::ClientCall {
+        target,
+        source: LlmClientError::UpstreamHttp { status, body },
+    } = error
+    else {
+        return false;
+    };
+    if target.as_str() != "minimax/minimax-m3.1-flash:free" || *status != StatusCode::NOT_FOUND {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value["error"]["message"].as_str().is_some_and(|message| {
+        message.starts_with("The free launch period for MiniMax M3.1 Flash ended on Oct 22, 2026.")
+            && message.contains("The `:free` variant has been retired;")
+            && message.contains("use `minimax/minimax-m3.1-flash`")
+    })
+}
+
+/// Whether a 429 says an ACCOUNT-WIDE allowance is exhausted, rather than one model
+/// or one provider being busy.
+///
+/// OpenRouter reports this as `limit_source: openrouter_free_tier_daily`, which is
+/// shared by every free model on the credential. The distinction matters: a
+/// provider-pool 429 (`upstream_provider_shared_pool`) is model-scoped and another
+/// candidate may well succeed, whereas an exhausted account-wide allowance makes
+/// every remaining candidate fail the same way while still consuming an attempt.
+///
+/// Only a 429 with that explicit marker qualifies. A 429 without it stays a plain
+/// rate limit, so provider throttling keeps its existing fallthrough.
+///
+/// The status/body predicate lives in [`crate::client::is_account_wide_quota`] because the
+/// retry loop must reach the same verdict; this wrapper only unwraps the routing error.
+fn is_account_wide_quota_exhausted(error: &LibsyError) -> bool {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return false;
+    };
+    crate::client::is_account_wide_quota(source)
 }
 
 /// Classifies a provider failure without interpreting it again at each call site.
 pub fn failure_class(error: &LibsyError) -> FailureClass {
+    if is_retired_minimax_free(error) {
+        return FailureClass::TemporarilyUnavailable;
+    }
+    if is_account_wide_quota_exhausted(error) {
+        return FailureClass::AccountQuota;
+    }
     let LibsyError::ClientCall { source, .. } = error else {
         return FailureClass::Other;
     };
@@ -490,6 +556,15 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
 
 /// Whether a failed candidate is worth routing around.
 fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
+    if is_retired_minimax_free(error) {
+        return Some(RoutingFallbackReason::Unavailable);
+    }
+    // An exhausted account-wide allowance is not a reason to try another candidate:
+    // they all draw on the same allowance, so the next attempt cannot succeed and
+    // only spends another request against a cap already known to be at zero.
+    if is_account_wide_quota_exhausted(error) {
+        return None;
+    }
     let LibsyError::ClientCall { source, .. } = error else {
         return None;
     };
@@ -2161,6 +2236,53 @@ mod tests {
     }
 
     #[test]
+    fn only_the_verified_minimax_retirement_notice_is_a_fallback() {
+        let retired = LibsyError::client_call(
+            "minimax/minimax-m3.1-flash:free",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::NOT_FOUND,
+                body: r#"{"error":{"message":"The free launch period for MiniMax M3.1 Flash ended on Oct 22, 2026. The `:free` variant has been retired; use `minimax/minimax-m3.1-flash` (list price) instead.","type":"upstream_error"}}"#.to_string(),
+            },
+        );
+        assert_eq!(
+            fallback_reason(&retired),
+            Some(RoutingFallbackReason::Unavailable)
+        );
+        assert!(failure_class(&retired).allows_cross_route());
+        for (target, message) in [
+            (
+                "some/other-model:free",
+                "The free launch period for MiniMax M3.1 Flash ended on Oct 22, 2026. The `:free` variant has been retired",
+            ),
+            (
+                "minimax/minimax-m3.1-flash:free",
+                "No endpoints found that support video URLs",
+            ),
+            (
+                "minimax/minimax-m3.1-flash:free",
+                "minimax/minimax-m3.1-flash:free is not a valid model ID",
+            ),
+            (
+                "minimax/minimax-m3.1-flash:free",
+                "The free launch period for MiniMax M3.1 Flash ended on Oct 22, 2026. The `:free` variant has been retired",
+            ),
+        ] {
+            let error = LibsyError::client_call(
+                target,
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::NOT_FOUND,
+                    body: json!({"error": {"message": message}}).to_string(),
+                },
+            );
+            assert_eq!(fallback_reason(&error), None, "{target}: {message}");
+            assert!(
+                !failure_class(&error).allows_cross_route(),
+                "{target}: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn fallback_only_accepts_context_policy_and_unavailable_failures() {
         let error = |source| LibsyError::client_call("target", source);
         assert_eq!(
@@ -2640,5 +2762,111 @@ mod tests {
             .map_err(|source| LibsyError::client_call("weak", source))?;
         assert_eq!(completion_text(&aggregate), "");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod account_quota_tests {
+    use super::{FailureClass, failure_class, fallback_reason};
+    use http::StatusCode;
+    use switchyard_libsy::LibsyError;
+    use switchyard_protocol::LlmClientError;
+
+    fn rate_limited(target: &str, limit_source: Option<&str>) -> LibsyError {
+        let mut metadata = serde_json::Map::new();
+        if let Some(source) = limit_source {
+            metadata.insert("limit_source".into(), serde_json::json!(source));
+        }
+        let body = serde_json::json!({
+            "error": {
+                "message": "Rate limit exceeded",
+                "code": 429,
+                "metadata": serde_json::Value::Object(metadata),
+            }
+        });
+        LibsyError::client_call(
+            target,
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: body.to_string(),
+            },
+        )
+    }
+
+    /// The acceptance criterion: an unambiguous account-wide daily-cap response must
+    /// not buy a second attempt. `None` here is what stops the candidate loop.
+    #[test]
+    fn an_account_wide_daily_cap_permits_no_further_candidate() {
+        let error = rate_limited(
+            "dots-studio/dots-3-note-preview:free",
+            Some("openrouter_free_tier_daily"),
+        );
+        assert_eq!(
+            fallback_reason(&error),
+            None,
+            "must not try another candidate"
+        );
+        assert_eq!(failure_class(&error), FailureClass::AccountQuota);
+    }
+
+    /// An account-wide cap must not let a composite cross into another child route,
+    /// because every child shares the same credential and the same allowance.
+    #[test]
+    fn an_account_wide_daily_cap_does_not_cross_a_composite() {
+        let error = rate_limited(
+            "dots-studio/dots-3-note-preview:free",
+            Some("openrouter_free_tier_daily"),
+        );
+        assert!(!failure_class(&error).allows_cross_route());
+        assert!(failure_class(&error).is_account_quota());
+    }
+
+    /// Provider- and model-scoped throttling must keep its existing fallthrough: the
+    /// next candidate may genuinely be served by a different pool.
+    #[test]
+    fn provider_pool_throttling_still_falls_through() {
+        let error = rate_limited(
+            "google/gemma-4-26b-a4b-it:free",
+            Some("upstream_provider_shared_pool"),
+        );
+        assert!(
+            fallback_reason(&error).is_some(),
+            "a provider-pool 429 must still permit the next candidate"
+        );
+        assert_eq!(failure_class(&error), FailureClass::RateLimited);
+        assert!(failure_class(&error).allows_cross_route());
+    }
+
+    /// A bare 429 carries no account-wide evidence, so it must not be promoted to
+    /// one merely because the status matches.
+    #[test]
+    fn a_429_without_the_account_marker_stays_a_rate_limit() {
+        for source in [None, Some("something_else")] {
+            let error = rate_limited("some/model:free", source);
+            assert_eq!(
+                failure_class(&error),
+                FailureClass::RateLimited,
+                "{source:?}"
+            );
+            assert!(fallback_reason(&error).is_some(), "{source:?}");
+        }
+    }
+
+    /// The marker only counts on a 429. A 500 that happens to mention it is not a
+    /// quota signal.
+    #[test]
+    fn the_account_marker_only_counts_on_429() {
+        let body = serde_json::json!({
+            "error": {"code": 500, "metadata": {"limit_source": "openrouter_free_tier_daily"}}
+        });
+        let error = LibsyError::client_call(
+            "some/model:free",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: body.to_string(),
+            },
+        );
+        assert_eq!(failure_class(&error), FailureClass::Server);
+        assert!(fallback_reason(&error).is_some());
     }
 }

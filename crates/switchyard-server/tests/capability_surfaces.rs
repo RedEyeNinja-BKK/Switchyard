@@ -413,6 +413,122 @@ async fn an_unknown_or_mistyped_capability_is_refused_rather_than_guessed() {
 }
 
 #[tokio::test]
+async fn stephen_embedding_rejects_wrong_engine_and_dimension_without_claiming_a_contract() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list", "model": "nvidia/nemotron-3.5-embed-1b:free",
+            "data": [{"index": 0, "embedding": vec![0.1; 2048]}],
+        })))
+        .mount(&engine)
+        .await;
+    let cfg = config(&engine.uri())
+        .replace("Qwen3-Embedding-0.6B", "nvidia/nemotron-3.5-embed-8b:free")
+        .replace("switchyard-embedding-local", "ST_Embed")
+        .replace("dimensions = 1024", "dimensions = 4096");
+    let (status, headers, body) = post(
+        serve(&cfg).await,
+        "/v1/embeddings",
+        json!({"model": "ST_Embed", "input": ["hello"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(headers.get("x-switchyard-embedding-contract").is_none());
+    assert!(String::from_utf8_lossy(&body).contains("ST_Embed"));
+}
+
+#[tokio::test]
+async fn stephen_embedding_valid_batch_passes_with_declared_identity_and_width() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .and(body_partial_json(json!({
+            "model": "nvidia/nemotron-3.5-embed-8b:free", "input": ["one", "two"],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list", "model": "nvidia/nemotron-3.5-embed-8b:free",
+            "data": [
+                {"index": 0, "embedding": vec![0.1; 4096]},
+                {"index": 1, "embedding": vec![0.2; 4096]},
+            ],
+        })))
+        .expect(1)
+        .mount(&engine)
+        .await;
+    let cfg = config(&engine.uri())
+        .replace("Qwen3-Embedding-0.6B", "nvidia/nemotron-3.5-embed-8b:free")
+        .replace("switchyard-embedding-local", "ST_Embed")
+        .replace("dimensions = 1024", "dimensions = 4096");
+    let (status, headers, body) = post(
+        serve(&cfg).await,
+        "/v1/embeddings",
+        json!({"model": "ST_Embed", "input": ["one", "two"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["x-switchyard-embedding-dimensions"], "4096");
+    assert_eq!(
+        headers["x-switchyard-embedding-contract"],
+        "localclaw-embedding-space:v1"
+    );
+}
+
+#[tokio::test]
+async fn stephen_rerank_rejects_chat_completion_instead_of_results() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "chat.completion", "model": "nvidia/nemotron-3.5-super-vl:free",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}}],
+        })))
+        .mount(&engine)
+        .await;
+    let cfg = config(&engine.uri())
+        .replace("switchyard-rerank-local", "ST_Rerank")
+        .replace("qwen3-reranker", "nvidia/nemotron-3.5-rerank-8b:free");
+    let (status, _, body) = post(
+        serve(&cfg).await,
+        "/v1/rerank",
+        json!({"model": "ST_Rerank", "query": "capital of France", "documents": ["Paris", "a cat"], "top_n": 2}),
+    ).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(String::from_utf8_lossy(&body).contains("ST_Rerank"));
+}
+
+#[tokio::test]
+async fn stephen_rerank_valid_results_pass_with_top_n_and_ranked_scores() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .and(body_partial_json(json!({
+            "model": "nvidia/nemotron-3.5-rerank-8b:free", "top_n": 2,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "nvidia/nemotron-3.5-rerank-8b:free",
+            "results": [
+                {"index": 0, "relevance_score": 0.98},
+                {"index": 1, "relevance_score": 0.03},
+            ],
+        })))
+        .expect(1)
+        .mount(&engine)
+        .await;
+    let cfg = config(&engine.uri())
+        .replace("switchyard-rerank-local", "ST_Rerank")
+        .replace("qwen3-reranker", "nvidia/nemotron-3.5-rerank-8b:free");
+    let (status, _, body) = post(
+        serve(&cfg).await, "/v1/rerank",
+        json!({"model": "ST_Rerank", "query": "capital of France", "documents": ["Paris is the capital of France", "A cat sleeps"], "top_n": 2}),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let parsed: Value = serde_json::from_slice(&body).expect("rerank JSON");
+    assert_eq!(parsed["results"][0]["index"], 0);
+    assert_eq!(parsed["results"][0]["relevance_score"], 0.98);
+}
+
+#[tokio::test]
 async fn an_unreachable_engine_fails_rather_than_returning_an_empty_result() {
     let router = serve(&config("http://127.0.0.1:1")).await;
     let (status, _headers, _body) = post(
@@ -425,5 +541,100 @@ async fn an_unreachable_engine_fails_rather_than_returning_an_empty_result() {
         status,
         StatusCode::BAD_GATEWAY,
         "an unreachable engine must be reported, not silently empty"
+    );
+}
+
+/// The substitution that matters: Embed 1B answering at the requested width. Width
+/// alone cannot detect it, so identity is checked independently of dimension.
+#[tokio::test]
+async fn stephen_embed_rejects_a_substituted_sibling_even_at_the_right_width() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list", "model": "nvidia/nemotron-3.5-embed-1b:free",
+            "data": [{"index": 0, "embedding": vec![0.1; 4096]}],
+        })))
+        .mount(&engine)
+        .await;
+    let cfg = config(&engine.uri())
+        .replace("Qwen3-Embedding-0.6B", "nvidia/nemotron-3.5-embed-8b:free")
+        .replace("switchyard-embedding-local", "ST_Embed")
+        .replace("dimensions = 1024", "dimensions = 4096");
+    let (status, headers, body) = post(
+        serve(&cfg).await,
+        "/v1/embeddings",
+        json!({"model": "ST_Embed", "input": ["hello"]}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        headers.get("x-switchyard-embedding-contract").is_none(),
+        "a substituted engine must not be attested under the agreed contract"
+    );
+}
+
+/// A provider may name the same weights by their canonical slug. That is the same
+/// model, so it must be accepted rather than failing every real call.
+#[tokio::test]
+async fn stephen_embed_accepts_the_canonical_slug_for_the_same_weights() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list", "model": "nvidia/nemotron-3.5-embed-8b",
+            "data": [{"index": 0, "embedding": vec![0.25; 4096]}],
+        })))
+        .mount(&engine)
+        .await;
+    let cfg = config(&engine.uri())
+        .replace("Qwen3-Embedding-0.6B", "nvidia/nemotron-3.5-embed-8b:free")
+        .replace("switchyard-embedding-local", "ST_Embed")
+        .replace("dimensions = 1024", "dimensions = 4096");
+    let (status, headers, body) = post(
+        serve(&cfg).await,
+        "/v1/embeddings",
+        json!({"model": "ST_Embed", "input": ["hello"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["x-switchyard-embedding-dimensions"], "4096");
+}
+
+/// A capability whose credential is absent must fail closed. Previously the request
+/// was sent unauthenticated and the provider's 401 was relayed, which reads like a
+/// credential problem at the engine rather than a missing deployment value.
+#[tokio::test]
+async fn a_missing_capability_credential_fails_closed_without_an_upstream_call() {
+    let engine = MockServer::start().await;
+    let cfg = config(&engine.uri()).replace(
+        "model = \"Qwen3-Embedding-0.6B\"",
+        "model = \"Qwen3-Embedding-0.6B\"\napi_key_env = \"SWITCHYARD_TEST_UNSET_CAPABILITY_KEY\"",
+    );
+    assert!(
+        std::env::var("SWITCHYARD_TEST_UNSET_CAPABILITY_KEY").is_err(),
+        "the fixture assumes the variable is unset in this process"
+    );
+    let (status, _headers, body) = post(
+        serve(&cfg).await,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-local", "input": ["x"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        String::from_utf8_lossy(&body).contains("credential unavailable"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "an unauthenticated call must not be attempted"
     );
 }

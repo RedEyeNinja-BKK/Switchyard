@@ -102,6 +102,58 @@ fn script(request: &str, body: &Value) -> (u16, String) {
             json!({"error": {"message": "temporarily unavailable"}}).to_string(),
         );
     }
+    // The account-wide free-tier cap OpenRouter shares across every free model on one
+    // credential. Nothing about the next model can change this answer.
+    if model.contains("account-quota") {
+        return (
+            429,
+            json!({"error": {
+                "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+                "code": 429,
+                "metadata": {
+                    "limit_source": "openrouter_free_tier_daily",
+                    "limit": 1000,
+                    "remaining": 0
+                }
+            }})
+            .to_string(),
+        );
+    }
+    // A 429 scoped to one upstream provider's pool: another provider may still serve it.
+    if model.contains("pool-429") {
+        return (
+            429,
+            json!({"error": {
+                "message": "Provider returned error",
+                "code": 429,
+                "metadata": {
+                    "limit_source": "upstream_provider_shared_pool",
+                    "provider_name": "Google AI Studio"
+                }
+            }})
+            .to_string(),
+        );
+    }
+    // The exact notice OpenRouter returned for the retired MiniMax free slug. Only this
+    // model id and this wording may turn a 404 into an eligible-again candidate.
+    if model == "minimax/minimax-m3.1-flash:free" {
+        return (
+            404,
+            json!({"error": {
+                "message": "The free launch period for MiniMax M3.1 Flash ended on Oct 22, 2026. The `:free` variant has been retired; use `minimax/minimax-m3.1-flash` (list price: $0.15/M input tokens) instead.",
+                "type": "upstream_error"
+            }})
+            .to_string(),
+        );
+    }
+    // A 404 that is NOT a retirement notice stays terminal: no fallback, no crossing.
+    if model.contains("gone-404") {
+        return (
+            404,
+            json!({"error": {"message": "No endpoints found that support image input", "code": 404}})
+                .to_string(),
+        );
+    }
     if model.contains("flaky-first-a1")
         || model.contains("b1-flaky-first")
         || model.contains("a1-fails")
@@ -1247,5 +1299,215 @@ vision = true
             .iter()
             .any(|(child, _)| child == "text-only-smartlocal"),
         "a target is not a child; the skip happens at candidate level inside the child"
+    );
+}
+
+/// The retirement notice is the ONE 404 that may roll a candidate over.
+///
+/// Measured 2026-10-22: `minimax/minimax-m3.1-flash:free` began answering 404 with a
+/// retirement notice naming its paid replacement. Left terminal, that stranded every
+/// route whose R1 was the retired slug. This drives the real HTTP path, so the notice
+/// has to survive redaction and classification to reach the fallback decision.
+#[tokio::test]
+async fn a_verified_retirement_notice_falls_through_to_the_next_candidate() {
+    let upstream = Upstream::new();
+    let url = upstream.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.retiring]
+format = "openai_responses"
+base_url = "{url}"
+
+[targets.retired-r1]
+id = "minimax/minimax-m3.1-flash:free"
+llm_client = "retiring"
+
+[targets.healthy-r2]
+id = "vendor/ok-a1"
+llm_client = "retiring"
+
+[routes.ST_High]
+id = "ST_High"
+type = "passthrough"
+target = "retired-r1"
+candidates = ["healthy-r2"]
+"#
+    );
+    let (status, body) = call(
+        runner(&config),
+        "ST_High",
+        json!({"model": "ST_High", "input": "hi"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        seen_models(&upstream).await,
+        ["minimax/minimax-m3.1-flash:free", "vendor/ok-a1"],
+        "the retired R1 must be attempted, then the healthy R2 must serve"
+    );
+}
+
+/// Every other 404 stays terminal. A modality mismatch or an unknown endpoint is a
+/// defect in the request or the deployment, not a model lifecycle event, and retrying
+/// it on another candidate would hide it.
+#[tokio::test]
+async fn an_unrelated_404_remains_terminal() {
+    let upstream = Upstream::new();
+    let url = upstream.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.rejecting]
+format = "openai_responses"
+base_url = "{url}"
+
+[targets.gone-r1]
+id = "vendor/gone-404-a1"
+llm_client = "rejecting"
+
+[targets.healthy-r2]
+id = "vendor/ok-a1"
+llm_client = "rejecting"
+
+[routes.ST_Low]
+id = "ST_Low"
+type = "passthrough"
+target = "gone-r1"
+candidates = ["healthy-r2"]
+"#
+    );
+    let (status, body) = call(
+        runner(&config),
+        "ST_Low",
+        json!({"model": "ST_Low", "input": "hi"}),
+    )
+    .await;
+
+    // The public surface maps the upstream status, so the exact code is the server's
+    // contract; what matters here is that the failure is surfaced, not routed around.
+    assert!(!status.is_success(), "{body}");
+    assert!(body.get("error").is_some(), "{body}");
+    assert_eq!(
+        seen_models(&upstream).await,
+        ["vendor/gone-404-a1"],
+        "an unrelated 404 must not reach R2"
+    );
+}
+
+/// An account-wide free-tier cap must cost exactly one provider call.
+///
+/// The route below declares six candidates and sits inside a composite with a second,
+/// healthy child. Every candidate draws on the SAME daily allowance, so once the first
+/// one reports that allowance is zero, trying candidate two through six spends five more
+/// requests to learn nothing, and crossing to the other child does the same against a
+/// different allowance that this credential does not have either. The single observable
+/// that distinguishes a real fix from a plausible one is the call count.
+#[tokio::test]
+async fn an_account_wide_quota_exhaustion_stops_after_one_call() {
+    let quota = Upstream::new();
+    let healthy = Upstream::new();
+    let quota_url = quota.clone().server();
+    let healthy_url = healthy.clone().server();
+
+    let config = format!(
+        "schema_version = 1\n{}\n{}\n[composites.ST_Route]\nchildren = [\"ST_Free\", \"ST_Paid\"]\n",
+        leaf_named(
+            "ST_Free",
+            &quota_url,
+            &[
+                "account-quota-1",
+                "account-quota-2",
+                "account-quota-3",
+                "account-quota-4",
+                "account-quota-5",
+                "account-quota-6",
+            ],
+            "vendor/",
+        ),
+        leaf_named("ST_Paid", &healthy_url, &["ok-1"], "vendor/")
+    );
+
+    let result = runner(&config)
+        .execute_composite(
+            "ST_Route",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("ST_Route".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "an exhausted allowance is surfaced, not papered over by a sibling"
+    );
+    assert_eq!(
+        quota.calls(),
+        1,
+        "five further candidates would each spend a call on a known-empty allowance: {:?}",
+        seen_models(&quota).await
+    );
+    assert_eq!(
+        healthy.calls(),
+        0,
+        "crossing to another child would spend a request from an allowance already at zero"
+    );
+}
+
+/// The provider-pool 429 is the control: it is model-scoped, so fallthrough stays intact.
+///
+/// Without this, the account-quota rule could be widened to "any 429 stops everything" and
+/// the test above would still pass while silently removing recovery that works today.
+#[tokio::test]
+async fn a_provider_pool_rate_limit_still_falls_through_the_candidates() {
+    let quota = Upstream::new();
+    let config = format!(
+        "schema_version = 1\n{}\n[composites.ST_Route]\nchildren = [\"ST_Tier3\"]\n",
+        leaf_named(
+            "ST_Tier3",
+            &quota.clone().server(),
+            &["pool-429-1", "pool-429-2", "ok-3"],
+            "vendor/",
+        )
+    );
+
+    let outcome = runner(&config)
+        .execute_composite(
+            "ST_Route",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("ST_Route".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+            },
+            None,
+        )
+        .await
+        .expect("the third candidate serves");
+
+    assert_eq!(outcome.child_route, "ST_Tier3");
+    assert_eq!(outcome.final_target, "vendor/ok-3");
+    // The retry budget is allowed to retry a pool 429, so counts are not the contract
+    // here; the candidate sequence is. Collapse repeats and the order must be unbroken.
+    let models = seen_models(&quota).await;
+    let mut sequence: Vec<&str> = Vec::new();
+    for model in &models {
+        if sequence.last().copied() != Some(model.as_str()) {
+            sequence.push(model.as_str());
+        }
+    }
+    assert_eq!(
+        sequence,
+        ["vendor/pool-429-1", "vendor/pool-429-2", "vendor/ok-3"],
+        "a provider-pool 429 is model-scoped and must keep its fallthrough"
     );
 }

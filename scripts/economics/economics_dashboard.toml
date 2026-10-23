@@ -45,9 +45,7 @@ openrouter_account = "openrouter"
 openrouter_secondary_account = "openrouter_stephen"
 
 message = """
-Switchyard economics V8.0: provider/route/family/cost-class attribution with
-separate token components (reasoning is inside completion, not additive),
-provider account state read with Switchyard's own credentials, both OpenRouter
-financial accounts shown separately, and rolling 1h/24h windows computed from
-observed events rather than from increase() over a counter.
+V8.0: rolling 1h/24h windows with coverage, both OpenRouter accounts shown
+separately, DeepSeek balance components. Reasoning inside completion, cached
+inside prompt; rolling totals come from observed events, not increase().
 """

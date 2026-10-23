@@ -498,3 +498,31 @@ def test_acceptance_checks_ignore_placeholder_series() -> None:
     assert scrape["switchyard_economics_rolling_requests"][0][1] == 3.0
     # A family that is absent from the scrape is absent, not a zero series.
     assert "switchyard_economics_provider_balance_component" not in scrape
+
+
+def test_cost_panels_can_show_a_sub_cent_amount() -> None:
+    # A provider-reported cost is frequently far below one cent. With four
+    # decimals and a non-currency unit, a real cost of 8.248e-06 renders as
+    # "0.0000" - visually a measured zero, which is the one thing a cost panel
+    # must never look like when the figure is non-zero.
+    document = _request()["dashboard"]
+    cost_panels = [
+        panel
+        for panel in document["panels"]
+        if panel.get("type") != "row"
+        and "Cost" in panel.get("title", "")
+        and any(
+            "provider_cost" in t.get("expr", "") for t in panel.get("targets", [])
+        )
+    ]
+    assert cost_panels, "the cost panels must exist"
+    for panel in cost_panels:
+        defaults = panel.get("fieldConfig", {}).get("defaults", {})
+        unit = defaults.get("unit")
+        decimals = defaults.get("decimals")
+        assert unit and unit.startswith("currency"), (
+            f"{panel.get('title')} shows money with unit {unit!r}"
+        )
+        assert decimals is not None and decimals >= 6, (
+            f"{panel.get('title')} renders sub-cent costs as zero (decimals={decimals})"
+        )

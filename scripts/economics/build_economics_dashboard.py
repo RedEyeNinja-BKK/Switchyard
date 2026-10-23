@@ -612,8 +612,8 @@ def build_dashboard(config):
             0,
             y,
             w=12,
-            unit="short",
-            decimals=4,
+            unit="currencyUSD",
+            decimals=6,
         )
     )
     panels.append(
@@ -826,8 +826,8 @@ def build_dashboard(config):
             16,
             y,
             w=8,
-            unit="short",
-            decimals=4,
+            unit="currencyUSD",
+            decimals=6,
         )
     )
     y += 8

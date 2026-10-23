@@ -1350,7 +1350,7 @@ def build_dashboard(config):
     }
 
 
-def build_request(config):
+def build_request(config, expected_version=None):
     """Builds the publishing request for the dashboard document.
 
     The publishing tool accepts one request shape:
@@ -1359,14 +1359,23 @@ def build_request(config):
     which the tool rejects as an unsupported field, and omits "op" and "uid",
     which the tool requires. The tool builds the upstream payload itself,
     including overwrite=True, so the request must not carry it.
+
+    A first publication creates the dashboard, and the tool requires that
+    request to omit expected_version. Publishing a revision is an update, which
+    the tool refuses unless expected_version names the version currently live -
+    that check is what stops a stale request from overwriting someone else's
+    change.
     """
-    return {
-        "op": "create",
+    request = {
+        "op": "create" if expected_version is None else "update",
         "uid": config["uid"],
         "message": config["message"],
         "folder_uid": None,
         "dashboard": build_dashboard(config),
     }
+    if expected_version is not None:
+        request["expected_version"] = expected_version
+    return request
 
 
 def load_config(path):
@@ -1389,13 +1398,24 @@ def main(argv=None):
         required=True,
         help="Where to write the request document.",
     )
+    parser.add_argument(
+        "--expected-version",
+        type=int,
+        default=None,
+        help=(
+            "The version currently live, to publish this build as an update. "
+            "Omit for a first publication, which creates the dashboard."
+        ),
+    )
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
-    request = build_request(config)
+    request = build_request(config, expected_version=args.expected_version)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(request, handle, indent=1)
-    print(f"wrote {args.out}: {len(request['dashboard']['panels'])} panels")
+    action = request["op"]
+    detail = f", expected_version={request['expected_version']}" if action == "update" else ""
+    print(f"wrote {args.out}: {len(request['dashboard']['panels'])} panels, op={action}{detail}")
     return 0
 
 

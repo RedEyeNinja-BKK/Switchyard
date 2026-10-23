@@ -335,3 +335,31 @@ def test_every_legacy_deepseek_figure_is_attributed_to_its_source() -> None:
     text = "\n".join(coverage)
     assert "localclaw" in text, "the coverage note must name the exporter it relies on"
     assert "Read from Switchyard" in text, "the note must separate the two sources"
+
+
+def test_a_first_publication_creates_and_carries_no_expected_version() -> None:
+    # The publishing tool rejects a create that names expected_version, so the
+    # create request must leave the field out entirely rather than send null.
+    request = builder.build_request(_config())
+    assert request["op"] == "create"
+    assert "expected_version" not in request
+
+
+def test_publishing_a_revision_updates_and_names_the_live_version() -> None:
+    # An update without expected_version would be a blind overwrite. The tool
+    # requires the version it expects to replace, which is what refuses a stale
+    # request and protects a concurrent change.
+    request = builder.build_request(_config(), expected_version=3)
+    assert request["op"] == "update"
+    assert request["expected_version"] == 3
+
+
+def test_both_request_shapes_carry_only_the_fields_the_tool_accepts() -> None:
+    allowed = {"op", "uid", "message", "folder_uid", "dashboard", "expected_version"}
+    for request in (
+        builder.build_request(_config()),
+        builder.build_request(_config(), expected_version=7),
+    ):
+        extra = set(request) - allowed
+        assert not extra, f"the publishing tool refuses unknown fields: {sorted(extra)}"
+        assert "overwrite" not in request, "the tool builds overwrite itself"

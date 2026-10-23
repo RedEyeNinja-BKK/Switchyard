@@ -145,6 +145,19 @@ is not done as part of a build.
 # Create the economics dashboard.
 printf '%s' "$(cat /tmp/economics-v8.json)" | sudo -n "$LAUNCHER" dashboard-write
 
+# Publish a revision over the live one. Read the version immediately before
+# building: the tool refuses an update whose expected_version is not current,
+# which is what stops a stale request from overwriting a concurrent change.
+LIVE=$(printf '%s' '{"uid":"turnstone-switchyard-economics-v8"}' | \
+  sudo -n "$LAUNCHER" dashboard | python3 -c \
+  'import json,sys; d=json.load(sys.stdin); \
+   print((d.get("document") or d).get("version"))')
+python3 scripts/economics/build_economics_dashboard.py \
+  --config scripts/economics/economics_dashboard.toml \
+  --out /tmp/economics-v8-revision.json \
+  --expected-version "$LIVE"
+printf '%s' "$(cat /tmp/economics-v8-revision.json)" | sudo -n "$LAUNCHER" dashboard-write
+
 # Update the routing dashboard to add the back-link.
 printf '%s' "$(cat /tmp/routing-with-economics-link.json)" | \
   sudo -n "$LAUNCHER" dashboard-write

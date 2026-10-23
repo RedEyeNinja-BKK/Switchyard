@@ -218,11 +218,12 @@ def test_every_panel_fits_the_grid() -> None:
         assert grid["x"] + grid["w"] <= 24, panel.get("title")
 
 
-def test_the_dashboard_discloses_partial_openrouter_coverage() -> None:
-    # The deployment holds two OpenRouter credentials. Account figures are
-    # collected for the global key only, so the money panels describe one
-    # account. Publishing that as complete financial coverage would misstate
-    # real spend, so the limitation is stated on the dashboard itself.
+def test_the_dashboard_states_that_both_openrouter_accounts_are_separate() -> None:
+    # Replaces an earlier test that asserted OpenRouter coverage was PARTIAL,
+    # because the second account was not collected. That is no longer true: both
+    # accounts now have readers. The requirement never was "say it is partial" - it
+    # was "never let one account's money stand for the deployment's position". The
+    # assertion follows the requirement into its new form.
     document = _request()["dashboard"]
     rules = [
         panel["options"]["content"]
@@ -231,9 +232,9 @@ def test_the_dashboard_discloses_partial_openrouter_coverage() -> None:
     ]
     assert rules, "the accounting-rules panel must exist"
     text = "\n".join(rules)
-    assert "PARTIAL" in text
-    assert "openrouter_stephen" in text
-    assert "not collected" in text
+    assert "two financial accounts" in text
+    assert "never added together" in text
+    assert "PARTIAL" not in text, "the coverage gap is closed; the caveat must go"
 
 
 def test_the_money_panels_name_the_account_they_cover() -> None:
@@ -363,3 +364,118 @@ def test_both_request_shapes_carry_only_the_fields_the_tool_accepts() -> None:
         extra = set(request) - allowed
         assert not extra, f"the publishing tool refuses unknown fields: {sorted(extra)}"
         assert "overwrite" not in request, "the tool builds overwrite itself"
+
+
+def test_both_openrouter_accounts_are_shown_and_never_combined() -> None:
+    # The deployment holds two OpenRouter credentials belonging to two separate
+    # financial accounts. One account's balance must never be published as though it
+    # were the deployment's OpenRouter position, and the two must never be added.
+    document = _request()["dashboard"]
+    config = _config()
+    secondary = config["openrouter_secondary_account"]
+    titles = [panel.get("title", "") for panel in document["panels"]]
+    for field in ("Status", "Remaining (USD)", "Purchased Credit (USD)", "Usage (total, USD)"):
+        assert f"{secondary} {field}" in titles, f"the second account must show its {field}"
+
+    # Served traffic may be aggregated across both credentials: it is a count of
+    # requests, not money. Money may not be. No financial query may span both
+    # accounts, because the two balances are separate credit.
+    financial_families = (
+        "switchyard_economics_provider_balance",
+        "switchyard_economics_provider_credit",
+        "switchyard_economics_provider_usage",
+        "switchyard_economics_provider_balance_component",
+    )
+    for panel in document["panels"]:
+        for target in panel.get("targets", []):
+            expression = target.get("expr", "")
+            if not any(family in expression for family in financial_families):
+                continue
+            spans_both = 'provider=~"openrouter.*"' in expression or (
+                'provider="openrouter"' in expression and secondary in expression
+            )
+            assert not spans_both, (
+                f"{panel.get('title')} aggregates a financial figure across both "
+                "OpenRouter accounts"
+            )
+
+    # Each account's money panels select that account explicitly or by its own name.
+    money = [
+        panel
+        for panel in document["panels"]
+        if any(word in panel.get("title", "") for word in ("Remaining (", "Purchased Credit"))
+        and "OpenRouter" in panel.get("title", "") or secondary in panel.get("title", "")
+    ]
+    assert money
+    for panel in money:
+        joined = " ".join(t.get("expr", "") for t in panel.get("targets", []))
+        assert 'provider="openrouter"' in joined or f'provider="{secondary}"' in joined, (
+            f"{panel.get('title')} does not name the account it reads"
+        )
+
+
+def test_the_rolling_row_states_its_coverage_and_its_limits() -> None:
+    # A 24-hour rolling total is only a day if the process has been up for a day.
+    # Without a coverage figure an operator reads a partial window as a quiet one.
+    document = _request()["dashboard"]
+    titles = [panel.get("title", "") for panel in document["panels"]]
+    assert "1h Window Coverage" in titles
+    assert "24h Window Coverage" in titles
+
+    body = "\n".join(
+        panel["options"]["content"]
+        for panel in document["panels"]
+        if panel.get("type") == "text" and "ROLLING WINDOWS" in panel.get("title", "")
+    )
+    assert body, "the rolling row must disclose how its numbers are produced"
+    for claim in ("in memory", "restart", "one minute", "Bangkok calendar day"):
+        assert claim.lower() in body.lower(), f"the disclosure must mention {claim!r}"
+
+
+def test_the_rolling_figures_come_from_events_and_not_from_increase() -> None:
+    # increase() extrapolates from whichever samples exist, so a window containing a
+    # restart reports usage it never held. The rolling families are the fix for that
+    # and must not themselves be derived with increase().
+    document = _request()["dashboard"]
+    rolling = [
+        panel
+        for panel in document["panels"]
+        if any("switchyard_economics_rolling_" in t.get("expr", "")
+               for t in panel.get("targets", []))
+    ]
+    assert rolling, "the rolling panels must exist"
+    for panel in rolling:
+        for target in panel.get("targets", []):
+            assert "increase(" not in target.get("expr", ""), (
+                f"{panel.get('title')} derives a rolling figure with increase()"
+            )
+
+
+def test_the_deepseek_balance_parts_are_not_added_to_the_total() -> None:
+    # Granted and topped-up credit are parts of the reported balance, not additions
+    # to it. A query that summed them with the total would count the balance twice.
+    document = _request()["dashboard"]
+    parts = [
+        panel
+        for panel in document["panels"]
+        if "provider_balance_component" in json.dumps(panel)
+    ]
+    assert parts, "the balance-component panels must exist"
+    for panel in parts:
+        for target in panel.get("targets", []):
+            expression = target.get("expr", "")
+            assert "provider_balance_component" in expression
+            # A component query may not also select the total and sum the two.
+            assert not (
+                "provider_balance{" in expression and "sum(" in expression
+            ), f"{panel.get('title')} combines the components with the total"
+
+
+def test_no_panel_still_claims_openrouter_coverage_is_partial() -> None:
+    # The second account is now read. Text that still says it is not collected would
+    # contradict the panels beside it.
+    document = _request()["dashboard"]
+    for panel in document["panels"]:
+        blob = json.dumps(panel)
+        assert "has no account figures" not in blob
+        assert "not collected**, so its spend is invisible" not in blob

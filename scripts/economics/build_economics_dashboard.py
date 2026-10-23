@@ -68,6 +68,18 @@ CAL_REQUESTS = "switchyard_economics_calendar_requests"
 CAL_DAY_START = "switchyard_economics_calendar_day_start"
 CAL_DAY_END = "switchyard_economics_calendar_day_end"
 CAL_DAY_ELAPSED = "switchyard_economics_calendar_day_elapsed_seconds"
+CAL_COST = "switchyard_economics_calendar_provider_cost"
+
+# Rolling windows computed by the deployment from the events it observed, rather
+# than by `increase()` over a counter. `window` is `1h` or `24h`.
+ROLL_TOKENS = "switchyard_economics_rolling_tokens"
+ROLL_REQUESTS = "switchyard_economics_rolling_requests"
+ROLL_COST = "switchyard_economics_rolling_provider_cost"
+ROLL_COVERAGE = "switchyard_economics_rolling_coverage_seconds"
+
+# The parts of a provider's balance, where the provider breaks the total down.
+# These are components OF the total, never additional to it.
+BALANCE_COMPONENT = "switchyard_economics_provider_balance_component"
 
 # Figures the older localclaw economics exporter publishes and Switchyard does
 # not. Switchyard reads DeepSeek's balance endpoint, which returns a level and
@@ -294,6 +306,8 @@ def build_dashboard(config):
     uid = config["uid"]
     title = config["title"]
     routing_uid = config["routing_uid"]
+    openrouter_account = config["openrouter_account"]
+    openrouter_secondary = config["openrouter_secondary_account"]
     model_filter = 'job="' + job + '",model=~"$model"'
 
     # The datasource is a deployment fact, so every panel records the one the
@@ -586,6 +600,267 @@ def build_dashboard(config):
     )
     y += 9
 
+    panels.append(
+        stat(
+            "Provider-Reported Cost Today (Bangkok)",
+            f'sum by (currency) ({CAL_COST}{{job="{job}"}})',
+            "The cost providers themselves reported for requests served since Bangkok midnight, "
+            "per currency. This is what the providers say they charged, not a Switchyard "
+            "estimate. A currency that appears here is one a provider actually billed in; the "
+            "currencies are never added together. The panel is empty when no provider reported "
+            "a cost today, which is not the same as a day that cost nothing.",
+            0,
+            y,
+            w=12,
+            unit="short",
+            decimals=4,
+        )
+    )
+    panels.append(
+        stat(
+            "Requests Today (Bangkok)",
+            f'sum({CAL_REQUESTS}{{job="{job}"}})',
+            "Every request served since Bangkok midnight, across all routes and providers.",
+            12,
+            y,
+            w=12,
+        )
+    )
+    y += 5
+
+    panels.append(row("ROLLING WINDOWS (1h · 24h — IN-MEMORY)", y))
+    y += 1
+
+    # Coverage first, because every other figure in this row is bounded by it. A
+    # reader who takes a 24-hour total for a full day when the process restarted an
+    # hour ago has been misled by the dashboard, not by the number.
+    panels.append(
+        stat(
+            "1h Window Coverage",
+            f'{ROLL_COVERAGE}{{job="{job}",window="1h"}}',
+            "How much of the one-hour window this process has actually observed: its uptime, "
+            "capped at one hour. At 3600 the window is complete. Below that the rolling "
+            "figures cover only the time since the last restart, and everything before it is "
+            "outside the window rather than zero.",
+            0,
+            y,
+            w=6,
+            unit="s",
+            decimals=0,
+        )
+    )
+    panels.append(
+        stat(
+            "24h Window Coverage",
+            f'{ROLL_COVERAGE}{{job="{job}",window="24h"}}',
+            "How much of the 24-hour window this process has actually observed: its uptime, "
+            "capped at 24 hours. Only at 86400 is a rolling 24-hour total a complete day. Below "
+            "that, read every 24h figure on this row as a partial day and say so rather than "
+            "comparing it with yesterday.",
+            6,
+            y,
+            w=6,
+            unit="s",
+            decimals=0,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "orange", "value": None},
+                    {"color": "green", "value": 86400},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "Rolling 1h Requests",
+            f'sum({ROLL_REQUESTS}{{job="{job}",window="1h"}})',
+            "Requests served in the trailing hour, counted from the events this process "
+            "observed.",
+            12,
+            y,
+            w=6,
+        )
+    )
+    panels.append(
+        stat(
+            "Rolling 24h Requests",
+            f'sum({ROLL_REQUESTS}{{job="{job}",window="24h"}})',
+            "Requests served in the trailing 24 hours, counted from observed events. Bounded by "
+            "24h Window Coverage beside it: if that reads less than 86400, this is a partial "
+            "day.",
+            18,
+            y,
+            w=6,
+        )
+    )
+    y += 5
+
+    panels.append(
+        stat(
+            "Rolling 1h Prompt Tokens",
+            f'sum({ROLL_TOKENS}{{job="{job}",window="1h",component="prompt"}})',
+            "Prompt tokens in the trailing hour. The prompt total includes the cached and "
+            "cache-creation components, which are published separately and never added to it.",
+            0,
+            y,
+            w=6,
+        )
+    )
+    panels.append(
+        stat(
+            "Rolling 24h Prompt Tokens",
+            f'sum({ROLL_TOKENS}{{job="{job}",window="24h",component="prompt"}})',
+            "Prompt tokens in the trailing 24 hours, subject to the coverage caveat above.",
+            6,
+            y,
+            w=6,
+        )
+    )
+    panels.append(
+        stat(
+            "Rolling 1h Completion Tokens",
+            f'sum({ROLL_TOKENS}{{job="{job}",window="1h",component="completion"}})',
+            "Completion tokens in the trailing hour. Reasoning is inside completion, not "
+            "additional to it.",
+            12,
+            y,
+            w=6,
+        )
+    )
+    panels.append(
+        stat(
+            "Rolling 24h Completion Tokens",
+            f'sum({ROLL_TOKENS}{{job="{job}",window="24h",component="completion"}})',
+            "Completion tokens in the trailing 24 hours, with reasoning included in the total.",
+            18,
+            y,
+            w=6,
+        )
+    )
+    y += 5
+
+    panels.append(
+        timeseries(
+            "Rolling requests by window",
+            [
+                target(
+                    f'sum({ROLL_REQUESTS}{{job="{job}",window="1h"}})',
+                    legend="1h",
+                ),
+                target(
+                    f'sum({ROLL_REQUESTS}{{job="{job}",window="24h"}})',
+                    legend="24h",
+                    ref="B",
+                ),
+            ],
+            "The two windows over time. They are different questions and different magnitudes, "
+            "so they share an axis rather than a total. A step down to zero is a restart, after "
+            "which the window repopulates from what the new process observes.",
+            0,
+            y,
+            w=12,
+            h=8,
+        )
+    )
+    panels.append(
+        timeseries(
+            "Rolling 24h tokens by component",
+            [
+                target(
+                    f'sum by (component) ({ROLL_TOKENS}{{job="{job}",window="24h"}})',
+                    legend="{{component}}",
+                ),
+            ],
+            "Each token component over the trailing day. The components are not additive: "
+            "prompt contains cached and cache-creation, and completion contains reasoning, so "
+            "the lines are shown side by side and never summed into one total.",
+            12,
+            y,
+            w=12,
+            h=8,
+        )
+    )
+    y += 8
+
+    panels.append(
+        barchart(
+            "Rolling 24h requests by route family",
+            [
+                target(
+                    f'sum by (route_family) ({ROLL_REQUESTS}{{job="{job}",window="24h"}})',
+                    legend="{{route_family}}",
+                ),
+            ],
+            "Where the last day of traffic went, by route family: a tier, a routing primitive, "
+            "or a directly addressed route.",
+            0,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    panels.append(
+        barchart(
+            "Rolling 24h requests by provider",
+            [
+                target(
+                    f'sum by (provider) ({ROLL_REQUESTS}{{job="{job}",window="24h"}})',
+                    legend="{{provider}}",
+                ),
+            ],
+            "Where the last day of traffic went, by the provider that served it.",
+            8,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    panels.append(
+        stat(
+            "Rolling 24h Provider-Reported Cost",
+            f'sum by (currency) ({ROLL_COST}{{job="{job}",window="24h"}})',
+            "The cost providers reported for requests served in the trailing day, per currency. "
+            "Empty when no provider reported a cost in the window: a provider that reports no "
+            "per-request cost produces no series, which is different from a measured zero.",
+            16,
+            y,
+            w=8,
+            unit="short",
+            decimals=4,
+        )
+    )
+    y += 8
+
+    panels.append(
+        text(
+            "ROLLING WINDOWS — HOW THESE NUMBERS ARE PRODUCED, AND WHEN THEY ARE INCOMPLETE",
+            "**These are computed from events, not from `increase()`.** A PromQL `increase()` "
+            "over a counter extrapolates from whichever samples happen to exist, so a window "
+            "that begins before the process started, or that contains a restart, is reported as "
+            "usage the window never held. Switchyard records the events itself and totals the "
+            "ones inside the window, so a one-hour figure means what was observed in the last "
+            "hour.\n\n"
+            "**They are held in memory and reset on restart.** After a restart the windows begin "
+            "empty and repopulate from newly observed traffic. The `Window Coverage` panels "
+            "state how much of each window the current process has actually seen, so a partial "
+            "day is never presented as a complete one. Compare 24h totals against yesterday "
+            "only when 24h coverage reads a full 86400 seconds.\n\n"
+            "**They are exact to one minute.** Events aggregate into one-minute buckets and "
+            "buckets older than 24 hours are discarded, so memory follows the last day of "
+            "activity. A rolling figure can therefore differ from the instant-by-instant truth "
+            "by at most the final partial minute; it is not presented as more precise than that.\n\n"
+            "**These are not the Bangkok calendar day.** The calendar day resets at midnight in "
+            "UTC+07:00; a rolling 24-hour window slides continuously. They answer different "
+            "questions and are never substituted for one another.",
+            0,
+            y,
+            w=24,
+            h=11,
+        )
+    )
+    y += 11
+
     panels.append(row("OPENAI ALLOWANCE WINDOWS (primary 5-hr · secondary weekly)", y))
     y += 1
 
@@ -817,6 +1092,54 @@ def build_dashboard(config):
     )
     y += 5
 
+    # The balance the provider breaks down into the kinds of credit it is made of.
+    # These are parts OF the total, so they are shown beside it and never added up
+    # with it.
+    panels.append(
+        stat(
+            "DeepSeek Remaining — Topped-Up (CNY)",
+            f'last_over_time({BALANCE_COMPONENT}{{provider="deepseek",component="topped_up",currency="CNY",scope="account",period="total",job="{job}"}}[3h])',
+            "Credit that was PAID FOR and is still available, as DeepSeek reports it. This is "
+            "money left, not money spent: an account that bought a great deal and used it can "
+            "show a small remaining figure. It is a component of the balance total, so adding "
+            "it to that total would count the same credit twice.",
+            0,
+            y,
+            w=8,
+            unit="CNY",
+            decimals=2,
+        )
+    )
+    panels.append(
+        stat(
+            "DeepSeek Remaining — Granted (CNY)",
+            f'last_over_time({BALANCE_COMPONENT}{{provider="deepseek",component="granted",currency="CNY",scope="account",period="total",job="{job}"}}[3h])',
+            "Credit DeepSeek gave away, still available. A promotional grant and money that was "
+            "paid for are different credit and are kept apart, because they run out for "
+            "different reasons.",
+            8,
+            y,
+            w=8,
+            unit="CNY",
+            decimals=2,
+        )
+    )
+    panels.append(
+        stat(
+            "DeepSeek Remaining — Total (CNY)",
+            f'last_over_time({BALANCE}{{provider="deepseek",currency="CNY",scope="account",period="total",job="{job}"}}[3h])',
+            "The balance total DeepSeek reports, which is the sum of the two components beside "
+            "it. Shown so the components can be checked against the whole rather than trusted "
+            "on their own.",
+            16,
+            y,
+            w=8,
+            unit="CNY",
+            decimals=2,
+        )
+    )
+    y += 5
+
     panels.append(
         stat(
             "DeepSeek Top-Ups (total, CNY)",
@@ -936,8 +1259,9 @@ def build_dashboard(config):
         stat(
             "OpenRouter Status",
             f'last_over_time({FRESHNESS}{{provider="openrouter",job="{job}"}}[3h])',
-            "Seconds since Switchyard last read the OpenRouter account successfully. The "
-            "financial panels below describe the GLOBAL key's account only.",
+            "Seconds since Switchyard last read the primary OpenRouter account successfully. "
+            "Each financial panel on this row names the account it covers; the deployment holds "
+            "two OpenRouter accounts and neither figure includes the other.",
             0,
             y,
             w=6,
@@ -1084,8 +1408,8 @@ def build_dashboard(config):
             ],
             "Requests routed to OpenRouter in the trailing 24 hours, by the model that served "
             "them. Covers BOTH OpenRouter credentials the deployment holds, because this is "
-            "served traffic rather than account state: the financial panels above cover the "
-            "global key's account only.",
+            "served traffic rather than account state. Served usage is attributed to the "
+            "client that served it, which is a different label from the financial account.",
             12,
             y,
             w=12,
@@ -1115,6 +1439,95 @@ def build_dashboard(config):
         )
     )
     y += 8
+
+    panels.append(
+        text(
+            "OPENROUTER — TWO ACCOUNTS, SHOWN SEPARATELY",
+            "This deployment holds two OpenRouter credentials belonging to **two different "
+            "financial accounts**, each with its own purchased credit. The panels above and "
+            "below name the account they cover, and the two accounts are never added together: "
+            "their balances are separate money, and a single combined figure would describe no "
+            "account that exists.\n\n"
+            f"**{openrouter_account}** - the account the client named after the provider"
+            " reads.\n"
+            f"**{openrouter_secondary}** - a second account read with its own credential, "
+            "serving its own traffic.\n\n"
+            "Switchyard reads each account with the credential it already serves that "
+            "account's traffic with. Where the provider states which account a key belongs "
+            "to, the two readings are also checked against each other: if both credentials "
+            "turned out to resolve to one account, it is read once and published once, so "
+            "the same money is never counted twice.",
+            0,
+            y,
+            w=24,
+            h=8,
+        )
+    )
+    y += 8
+
+    # The second account, in the same shape as the first, so the two can be compared
+    # directly and neither is hidden behind a sum.
+    panels.append(
+        stat(
+            f"{openrouter_secondary} Status",
+            f'last_over_time({FRESHNESS}{{provider="{openrouter_secondary}",job="{job}"}}[3h])',
+            "Seconds since Switchyard last read the second OpenRouter account successfully. A "
+            "value near the polling interval is healthy; one that keeps climbing means that "
+            "account is not being read, and its figures below are stale.",
+            0,
+            y,
+            w=6,
+            unit="s",
+            decimals=0,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "green", "value": None},
+                    {"color": "orange", "value": 900},
+                    {"color": "red", "value": 3600},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            f"{openrouter_secondary} Remaining (USD)",
+            f'last_over_time({BALANCE}{{provider="{openrouter_secondary}",currency="USD",scope="account",period="total",job="{job}"}}[3h])',
+            "Credit left on the second OpenRouter account: purchased less consumed. This is "
+            "that account's money alone, and is not combined with the other account's balance.",
+            6,
+            y,
+            w=6,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    panels.append(
+        stat(
+            f"{openrouter_secondary} Purchased Credit (USD)",
+            f'last_over_time({CREDIT}{{provider="{openrouter_secondary}",currency="USD",scope="account",period="total",job="{job}"}}[3h])',
+            "Total credit purchased on the second account, as the provider reports it. The "
+            "difference between this and its usage is its remaining balance.",
+            12,
+            y,
+            w=6,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    panels.append(
+        stat(
+            f"{openrouter_secondary} Usage (total, USD)",
+            f'last_over_time({PROVIDER_USAGE}{{provider="{openrouter_secondary}",currency="USD",scope="account",period="total",job="{job}"}}[3h])',
+            "Lifetime usage on the second account: what has been consumed, not what is left.",
+            18,
+            y,
+            w=6,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    y += 5
 
     panels.append(row("PROVIDER ACCOUNT COVERAGE", y))
     y += 1
@@ -1202,13 +1615,12 @@ def build_dashboard(config):
                     instant=True,
                 ),
             ],
-            "Which providers this deployment can show the money side of, read column by "
+            "Which accounts this deployment can show the money side of, read column by "
             "column: a row carrying prompt tokens but no freshness value is serving traffic "
-            "whose account credit, balance and usage are not collected at all. "
-            "openrouter_stephen is the known case - its tokens are attributed correctly but it "
-            "has no account figures, so every OpenRouter financial panel describes the global "
-            "key's account only and must not be read as the deployment's total OpenRouter "
-            "spend.\n\n"
+            "whose account credit, balance and usage are not collected at all. Both OpenRouter "
+            "accounts now appear, each under its own label, because each is a separate "
+            "financial account. They are never summed: a combined figure would describe no "
+            "account that exists.\n\n"
             "One caveat when reading the rows: the OpenAI account appears twice under two "
             "names, because the deployment runs two OpenAI clients on one credential. Served "
             "usage is labelled openai_nt and account state is labelled openai, so one account "
@@ -1253,14 +1665,12 @@ def build_dashboard(config):
             "figures.** The credit the provider sold, the credit consumed against it, and the "
             "credit still available are three separate series. The remaining balance is the "
             "difference between the first two.\n\n"
-            "**OpenRouter financial coverage is PARTIAL.** This deployment holds two "
-            "OpenRouter credentials and serves through both. Account figures are collected "
-            "for the global key's account only. The second account, `openrouter_stephen`, "
-            "has its served tokens attributed correctly but its account credit, balance and "
-            "usage are **not collected**, so its spend is invisible here. The OpenRouter "
-            "credit, remaining and consumed panels therefore describe one account, not the "
-            "deployment's total OpenRouter position, and must not be presented as complete "
-            "financial reporting. A missing figure is absent, never a measured zero.\n\n"
+            "**OpenRouter holds two financial accounts, and both are shown.** This deployment "
+            "holds two OpenRouter credentials belonging to two separate accounts, each with "
+            "its own purchased credit. Each account's balance, credit and usage appear under "
+            "their own labels and are never added together, because their money is separate. "
+            "Check both before drawing a conclusion about OpenRouter spending. A missing "
+            "figure is absent, never a measured zero.\n\n"
             "**Cost class is a deployment fact.** `local` is a deployment the operator hosts, "
             "`free` is a model the provider prices at zero, `subscription` is an "
             "allowance-bearing credential, and `metered` is a paid API key. A free or "

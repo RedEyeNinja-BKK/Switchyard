@@ -75,6 +75,9 @@ enum MetricKind {
 /// Rolling-window totals over served usage.
 pub struct RollingWindows {
     totals: Mutex<BTreeMap<EventKey, f64>>,
+    /// When this process started observing, which bounds how much of any window it can
+    /// possibly have seen.
+    started: u64,
 }
 
 /// The process-wide rolling windows.
@@ -104,7 +107,18 @@ impl RollingWindows {
     pub fn new() -> Self {
         Self {
             totals: Mutex::new(BTreeMap::new()),
+            started: now_seconds(),
         }
+    }
+
+    /// How much of a window this process could actually have observed.
+    ///
+    /// A 24-hour figure is only a complete 24 hours if the process has been running
+    /// for that long. After a restart the window still exists, but everything before
+    /// the restart is outside it, and a reader that did not know that would take a
+    /// partial day for a full one. This is the number that says which it is.
+    pub fn coverage_seconds(&self, window_seconds: u64, now: u64) -> f64 {
+        now.saturating_sub(self.started).min(window_seconds) as f64
     }
 
     /// Records one amount against an attribution, now.
@@ -195,6 +209,15 @@ impl RollingWindows {
         }
         let meter = global::meter("switchyard");
         for (window_label, window_seconds) in WINDOWS {
+            // How much of this window the process has actually observed. Published
+            // beside the totals so a partial window cannot be mistaken for a full one.
+            meter
+                .f64_gauge("switchyard.economics_rolling_coverage_seconds")
+                .build()
+                .record(
+                    self.coverage_seconds(window_seconds, now),
+                    &[KeyValue::new("window", window_label.to_string())],
+                );
             for (attributes, total) in self.by_attribution(MetricKind::Tokens, window_seconds, now)
             {
                 let mut labels: Vec<KeyValue> = attributes
@@ -351,6 +374,22 @@ mod tests {
             windows.prune(&mut totals, now);
             assert_eq!(totals.len(), 1, "only the bucket inside retention survives");
         }
+    }
+
+    /// A window longer than the process has been running reports the coverage it
+    /// actually has, so a partial day is visible as partial rather than reported as a
+    /// quiet day.
+    #[test]
+    fn coverage_never_exceeds_the_process_lifetime() {
+        let windows = RollingWindows::new();
+        let started = windows.started;
+        // Ten minutes in: an hour-long window is a sixth observed, a day barely any.
+        assert_eq!(windows.coverage_seconds(3600, started + 600), 600.0);
+        assert_eq!(windows.coverage_seconds(86400, started + 600), 600.0);
+        // A day later the 24-hour window is complete and stays capped.
+        assert_eq!(windows.coverage_seconds(86400, started + 86400), 86400.0);
+        assert_eq!(windows.coverage_seconds(86400, started + 200_000), 86400.0);
+        assert_eq!(windows.coverage_seconds(3600, started + 200_000), 3600.0);
     }
 
     /// Publishing is idempotent: a rolling total is a level, so publishing it twice

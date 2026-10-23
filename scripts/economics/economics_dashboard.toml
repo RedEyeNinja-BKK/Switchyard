@@ -36,8 +36,18 @@ datasource_type = "prometheus"
 # prepare_v7_backlink.py.
 routing_uid = "turnstone-switchyard-v7"
 
+# The OpenRouter accounts this deployment holds. Each is a separate financial
+# account with its own credit, so the dashboard shows them side by side and
+# never adds them into one figure. `openrouter_account` is the one whose client
+# is named after the provider; `openrouter_secondary_account` is the second
+# account, whose client carries a distinct name and a distinct credential.
+openrouter_account = "openrouter"
+openrouter_secondary_account = "openrouter_stephen"
+
 message = """
 Switchyard economics V8.0: provider/route/family/cost-class attribution with
-separate token components (reasoning is inside completion, not additive) and
-provider account state read with Switchyard's own credentials.
+separate token components (reasoning is inside completion, not additive),
+provider account state read with Switchyard's own credentials, both OpenRouter
+financial accounts shown separately, and rolling 1h/24h windows computed from
+observed events rather than from increase() over a counter.
 """

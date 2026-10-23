@@ -154,9 +154,9 @@ def test_no_query_uses_a_composite_currency_label() -> None:
 
 def test_the_credit_the_consumed_credit_and_the_balance_are_different_panels() -> None:
     titles = {title for title, _ in _expressions()}
-    assert "OPENROUTER PURCHASED CREDIT (USD, ACCOUNT)" in titles
-    assert "OPENROUTER CONSUMED CREDIT (USD, ACCOUNT)" in titles
-    assert "OPENROUTER REMAINING CREDIT (USD, ACCOUNT)" in titles
+    assert "OPENROUTER CREDIT (USD) - GLOBAL KEY ACCOUNT ONLY" in titles
+    assert "OPENROUTER CONSUMED (USD) - GLOBAL KEY ACCOUNT ONLY" in titles
+    assert "OPENROUTER REMAINING (USD) - GLOBAL KEY ACCOUNT ONLY" in titles
 
 
 def test_the_dashboard_links_back_to_the_routing_dashboard() -> None:
@@ -197,3 +197,57 @@ def test_every_panel_fits_the_grid() -> None:
     for panel in _request()["dashboard"]["panels"]:
         grid = panel["gridPos"]
         assert grid["x"] + grid["w"] <= 24, panel.get("title")
+
+
+def test_the_dashboard_discloses_partial_openrouter_coverage() -> None:
+    # The deployment holds two OpenRouter credentials. Account figures are
+    # collected for the global key only, so the money panels describe one
+    # account. Publishing that as complete financial coverage would misstate
+    # real spend, so the limitation is stated on the dashboard itself.
+    document = _request()["dashboard"]
+    rules = [
+        panel["options"]["content"]
+        for panel in document["panels"]
+        if panel.get("type") == "text" and "ACCOUNTING" in panel.get("title", "")
+    ]
+    assert rules, "the accounting-rules panel must exist"
+    text = "\n".join(rules)
+    assert "PARTIAL" in text
+    assert "openrouter_stephen" in text
+    assert "not collected" in text
+
+
+def test_the_money_panels_name_the_account_they_cover() -> None:
+    # A panel titled only "OPENROUTER CREDIT" would read as the deployment's
+    # total OpenRouter credit. It is one account's credit.
+    titles = [panel.get("title", "") for panel in _request()["dashboard"]["panels"]]
+    money = [
+        title
+        for title in titles
+        if "OPENROUTER" in title
+        and any(word in title for word in ("CREDIT", "REMAINING", "CONSUMED", "USAGE"))
+    ]
+    assert money, "the OpenRouter money panels must exist"
+    for title in money:
+        assert "GLOBAL KEY" in title, f"{title} must name the account it covers"
+
+
+def test_coverage_is_shown_per_provider_not_as_a_subtraction() -> None:
+    # Served usage and account state name the same account differently: the
+    # OpenAI account appears as openai_nt in served usage and as openai in
+    # account state, because two clients share one credential. Subtracting the
+    # provider counts would therefore be wrong in both directions - it can read
+    # zero while a provider is uncovered, and it can report a covered provider
+    # as a gap. Coverage is answered per row instead, where a provider carrying
+    # tokens but no freshness value is visible.
+    document = _request()["dashboard"]
+    titles = [panel.get("title", "") for panel in document["panels"]]
+    assert "ACCOUNT FINANCIAL COVERAGE BY PROVIDER" in titles
+
+    # No panel may subtract the two distinct-provider counts.
+    for panel in document["panels"]:
+        for target in panel.get("targets", []):
+            expression = target.get("expr", "")
+            assert not (
+                "account_freshness_seconds" in expression and "requests_total" in expression
+            ), f"{panel.get('title')} derives coverage by subtraction"

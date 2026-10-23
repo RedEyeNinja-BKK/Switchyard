@@ -57,6 +57,7 @@ REQUESTS = "switchyard_economics_requests_total"
 PROVIDER_COST = "switchyard_economics_provider_cost_total"
 ACCOUNT_FETCH = "switchyard_economics_account_fetch_total"
 AUTH_FAILURES = "switchyard_economics_account_auth_failures_total"
+FRESHNESS = "switchyard_economics_account_freshness_seconds"
 BALANCE = "switchyard_economics_provider_balance"
 CREDIT = "switchyard_economics_provider_credit"
 PROVIDER_USAGE = "switchyard_economics_provider_usage"
@@ -240,6 +241,27 @@ def barchart(title, targets, description, x, y, w=12, h=9, unit="short", stack=F
         "targets": targets,
         "title": title,
         "type": "barchart",
+    }
+
+
+def table(title, targets, description, x, y, w=12, h=9, unit="short"):
+    return {
+        "datasource": DS,
+        "description": description,
+        "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
+        "gridPos": {"h": h, "w": w, "x": x, "y": y},
+        "id": next_id(),
+        "options": {
+            "legend": {
+                "calcs": [],
+                "displayMode": "list",
+                "placement": "bottom",
+            },
+            "tooltip": {"mode": "multi", "sort": "desc"},
+        },
+        "targets": targets,
+        "title": title,
+        "type": "table",
     }
 
 
@@ -557,6 +579,94 @@ def build_dashboard(config):
     panels.append(row("PROVIDER ACCOUNT STATE", y))
     y += 1
 
+    # Coverage is stated before any money figure, because the biggest way this
+    # dashboard could mislead is by showing one account's credit beside another
+    # account's traffic.
+    panels.append(
+        stat(
+            "PROVIDERS WITH ACCOUNT FINANCIAL COVERAGE",
+            f'count(count by (provider) ({FRESHNESS}{{job="{job}"}}))',
+            "How many providers the deployment reads account state for. A provider that is "
+            "missing from this count may still serve traffic, in which case its tokens are "
+            "attributed correctly but its credit, balance and usage are not collected at all.",
+            0,
+            y,
+            w=8,
+        )
+    )
+    panels.append(
+        stat(
+            "PROVIDERS SERVING TRAFFIC",
+            f'count(count by (provider) ({REQUESTS}{{job="{job}"}}))',
+            "How many providers have served at least one request. Compare with the coverage "
+            "count: a provider in this number but not in that one is billing for work the "
+            "dashboard cannot show the money side of.",
+            8,
+            y,
+            w=8,
+        )
+    )
+    # Deliberately NOT a subtraction of the two counts above. Served and account
+    # series name the same account differently - the OpenAI account appears as
+    # openai_nt in served usage and as openai in account state, because two
+    # clients share one credential. A naive difference would therefore miscount
+    # in both directions: it can report zero while a provider is uncovered, and
+    # it can report a covered provider as a gap. The coverage question is
+    # answered by the per-provider table below, where a provider carrying tokens
+    # but no freshness figure is visible as a row.
+    panels.append(
+        stat(
+            "ACCOUNT READS OK (TOTAL)",
+            f'sum({ACCOUNT_FETCH}{{job="{job}",outcome="ok"}})',
+            "Successful provider account reads since the deployment started. This is the "
+            "count of confirmed account observations, not the number of accounts: a provider "
+            "that is read every interval increments once per read.",
+            16,
+            y,
+            w=8,
+        )
+    )
+    y += 5
+
+    panels.append(
+        table(
+            "ACCOUNT FINANCIAL COVERAGE BY PROVIDER",
+            [
+                target(
+                    f'sum by (provider) ({TOKENS}{{{model_filter},component="prompt"}})',
+                    legend="{{provider}}",
+                    ref="A",
+                    instant=True,
+                ),
+                target(
+                    f'sum by (provider) ({FRESHNESS}{{job="{job}"}})',
+                    legend="{{provider}}",
+                    ref="B",
+                    instant=True,
+                ),
+                target(
+                    f'sum by (provider) ({CREDIT}{{scope="account",period="total",job="{job}"}})',
+                    legend="{{provider}}",
+                    ref="C",
+                    instant=True,
+                ),
+            ],
+            "Which providers this deployment can show the money side of, read column by "
+            "column: a row carrying prompt tokens but no freshness value is serving traffic "
+            "whose account credit, balance and usage are not collected at all. "
+            "openrouter_stephen is the known case - its tokens are attributed correctly but "
+            "it has no account figures, so the OpenRouter credit, remaining and consumed "
+            "panels describe the global key's account only and must not be read as the "
+            "deployment's total OpenRouter spend. A blank cell is absence of collection, "
+            "never a measured zero.",
+            0,
+            y,
+            w=24,
+            h=8,
+        )
+    )
+    y += 8
+
     panels.append(
         stat(
             "ACCOUNT READS (TOTAL)",
@@ -583,11 +693,13 @@ def build_dashboard(config):
     )
     panels.append(
         stat(
-            "OPENROUTER PURCHASED CREDIT (USD, ACCOUNT)",
+            "OPENROUTER CREDIT (USD) - GLOBAL KEY ACCOUNT ONLY",
             f'{CREDIT}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
-            "The credit the provider sold to the account. This is not the money that is left: "
-            "the consumed credit is a separate figure and the remaining balance is a third. "
-            "Absent when the provider reported no credit.",
+            "The credit the provider sold to the GLOBAL key's account only. The deployment also "
+            "serves traffic through a second OpenRouter account (openrouter_stephen) whose "
+            "account figures are NOT collected, so this is not the deployment's total "
+            "OpenRouter credit. This is not the money that is left either: the consumed "
+            "credit is a separate figure and the remaining balance is a third.",
             12,
             y,
             w=6,
@@ -597,7 +709,7 @@ def build_dashboard(config):
     )
     panels.append(
         stat(
-            "DEEPSEEK BALANCE (CNY AND USD, ACCOUNT)",
+            "DEEPSEEK BALANCE (CNY / USD) - ACCOUNT",
             f'{BALANCE}{{provider="deepseek",scope="account",period="total",job="{job}"}}',
             "The prepaid balance the provider reported for the account, per currency. Absent "
             "when the provider reported no balance; a zero balance is a reported zero, which "
@@ -613,7 +725,7 @@ def build_dashboard(config):
 
     panels.append(
         stat(
-            "OPENROUTER REMAINING CREDIT (USD, ACCOUNT)",
+            "OPENROUTER REMAINING (USD) - GLOBAL KEY ACCOUNT ONLY",
             f'{BALANCE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
             "The credit the provider sold, less the credit consumed: the money still "
             "available on the account. Published as its own figure so it is read directly "
@@ -627,7 +739,7 @@ def build_dashboard(config):
     )
     panels.append(
         stat(
-            "OPENROUTER CONSUMED CREDIT (USD, ACCOUNT)",
+            "OPENROUTER CONSUMED (USD) - GLOBAL KEY ACCOUNT ONLY",
             f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
             "The credit the account has consumed. This is the provider's own figure for what "
             "has been charged against the account.",
@@ -640,7 +752,7 @@ def build_dashboard(config):
     )
     panels.append(
         stat(
-            "OPENROUTER KEY USAGE (USD, KEY, TOTAL)",
+            "OPENROUTER KEY USAGE (USD) - GLOBAL KEY ONLY",
             f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="total",job="{job}"}}',
             "The usage of the one API key the deployment holds, over the whole life of that "
             "key. This is a different amount from the account-wide figure, because the account "
@@ -701,7 +813,7 @@ def build_dashboard(config):
 
     panels.append(
         timeseries(
-            "PROVIDER REPORTED USAGE BY SCOPE AND PERIOD (OPENROUTER)",
+            "OPENROUTER USAGE BY SCOPE AND PERIOD - GLOBAL KEY ACCOUNT ONLY",
             [
                 target(
                     f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="total",job="{job}"}}',
@@ -724,11 +836,14 @@ def build_dashboard(config):
                     legend="account · total",
                 ),
             ],
-            "The usage the provider reported, kept apart by scope and by period. The key "
-            "figures are what the one key the deployment holds has used; the account figure "
-            "covers every key on the account. Each period is its own window, so none of these "
-            "is added to another. This is the provider's own figure for what has been "
-            "charged, kept separate from any Switchyard-derived estimate.",
+            "The usage the GLOBAL OpenRouter account reported, kept apart by scope and by "
+            "period. The key figures are what that one key has used; the account figure covers "
+            "every key on that account. Each period is its own window, so none of these is "
+            "added to another. The second OpenRouter account (openrouter_stephen) has no "
+            "account figures collected, so it does not appear here at all - its served tokens "
+            "are attributed in the usage-by-provider panels instead. This is the provider's "
+            "own figure for what has been charged, kept separate from any Switchyard-derived "
+            "estimate.",
             0,
             y,
             w=24,
@@ -768,6 +883,14 @@ def build_dashboard(config):
             "figures.** The credit the provider sold, the credit consumed against it, and the "
             "credit still available are three separate series. The remaining balance is the "
             "difference between the first two.\n\n"
+            "**OpenRouter financial coverage is PARTIAL.** This deployment holds two "
+            "OpenRouter credentials and serves through both. Account figures are collected "
+            "for the global key's account only. The second account, `openrouter_stephen`, "
+            "has its served tokens attributed correctly but its account credit, balance and "
+            "usage are **not collected**, so its spend is invisible here. The OpenRouter "
+            "credit, remaining and consumed panels therefore describe one account, not the "
+            "deployment's total OpenRouter position, and must not be presented as complete "
+            "financial reporting. A missing figure is absent, never a measured zero.\n\n"
             "**Cost class is a deployment fact.** `local` is a deployment the operator hosts, "
             "`free` is a model the provider prices at zero, `subscription` is an "
             "allowance-bearing credential, and `metered` is a paid API key. A free or "

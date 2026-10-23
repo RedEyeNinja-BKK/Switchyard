@@ -21,6 +21,9 @@ left exactly as it was.
 | Route access | per-client `allow` list; an unlisted model is refused before dispatch |
 | Paid access | `ST_Paid` additionally needs a positive ceiling |
 | Cost bound | worst-case cost reserved **before** dispatch, settled after |
+| Interruption | a stream that dies, or a client that walks away, is still charged |
+| Restart | outstanding reservations become spend, never a refund |
+| Discovery | granted composite routes appear in `/v1/models` for that client |
 | Request size | `max_request_bytes`, refused before the body is read |
 | Streaming | relayed with `read1`, so SSE stays incremental |
 | Secret hygiene | the caller's `Authorization` is never forwarded; logs carry method and path only |
@@ -76,4 +79,10 @@ component is designed to sit behind Serve, not to listen on a network.
 - **Streaming**: the first chunk must arrive before the stream ends. Buffer the
   relay and this fails.
 - **Secrecy**: no caller token may appear upstream or in the log.
-- **Charging**: the served model's reported cost is preferred over the rate table.
+- **Charging**: the served model's reported cost is preferred over the rate table;
+  an absurd report is capped at the reservation rather than trusted.
+- **Interruption**: a stream cut mid-flight and a client that disconnects are both
+  charged, and neither leaves a dangling reservation.
+- **Restart**: a reservation left behind is converted to spend exactly once.
+- **Discovery**: a granted composite is visible and marked `composite`, with no
+  invented capability facts; a route the client was not granted never appears.

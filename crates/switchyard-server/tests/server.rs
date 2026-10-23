@@ -761,6 +761,7 @@ fn random_state_with_retries(
         reasoning_dialect: ReasoningDialect::default(),
         max_retries,
         failure_cooldown: std::time::Duration::ZERO,
+        cooldown_group: None,
         timeout: None,
         attempt_timeout: None,
         stream_idle_timeout: None,

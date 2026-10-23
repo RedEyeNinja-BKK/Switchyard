@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -131,8 +131,25 @@ pub struct TranslatingLlmClient {
     client: reqwest::Client,
     forward_auth_client: reqwest::Client,
     cooldown_epoch: Instant,
-    // Milliseconds since cooldown_epoch. Each atomic is independent, so relaxed ordering suffices.
-    unavailable_until: HashMap<ModelId, AtomicU64>,
+    // Keyed by cooldown group when the backend declares one, otherwise by model, so
+    // several models behind one provider pool can share a cooldown. Milliseconds
+    // since cooldown_epoch; each atomic is independent, so relaxed ordering suffices.
+    unavailable_until: HashMap<String, AtomicU64>,
+    // The HTTP status that armed each cooldown, so a skipped call can report the
+    // real failure instead of a generic unavailability. Zero means "no status".
+    cooldown_status: HashMap<String, AtomicU32>,
+}
+
+/// The key a model's failure cooldown is recorded under.
+///
+/// A declared group means "these targets share one upstream pool", so one
+/// failure stands for all of them. Without a group the model is its own key,
+/// which is the existing per-model behaviour.
+fn cooldown_key(backend: &Backend, model: &ModelId) -> String {
+    backend
+        .cooldown_group()
+        .map(str::to_string)
+        .unwrap_or_else(|| model.as_str().to_string())
 }
 
 impl TranslatingLlmClient {
@@ -141,13 +158,20 @@ impl TranslatingLlmClient {
     pub fn new(model_configs: &[ModelConfig]) -> Result<Self> {
         // Pre-populate so concurrent calls update only atomics and keep map access lock-free.
         let mut unavailable_until = HashMap::new();
+        let mut cooldown_status = HashMap::new();
         for config in model_configs {
             for backend in std::iter::once(&config.default_backend)
                 .chain(config.other_backends.iter().flatten())
             {
                 backend.validate_configured_headers(&config.model_name)?;
             }
-            unavailable_until.insert(config.model_name.clone(), AtomicU64::new(0));
+            for key in std::iter::once(&config.default_backend)
+                .chain(config.other_backends.iter().flatten())
+                .map(|backend| cooldown_key(backend, &config.model_name))
+            {
+                unavailable_until.insert(key.clone(), AtomicU64::new(0));
+                cooldown_status.insert(key, AtomicU32::new(0));
+            }
         }
         let build_client = |builder: reqwest::ClientBuilder| {
             builder.build().map_err(|error| LlmClientError::Transport {
@@ -170,6 +194,7 @@ impl TranslatingLlmClient {
             forward_auth_client,
             cooldown_epoch: Instant::now(),
             unavailable_until,
+            cooldown_status,
         })
     }
 
@@ -262,9 +287,10 @@ impl TranslatingLlmClient {
         route_reasoning_effort: Option<&str>,
     ) -> Result<EncodedResponse> {
         let cooldown = backend.failure_cooldown();
+        let key = cooldown_key(backend, model);
         let unavailable_until =
             if matches!(endpoint, UpstreamEndpoint::Completion) && !cooldown.is_zero() {
-                self.unavailable_until.get(model)
+                self.unavailable_until.get(&key)
             } else {
                 None
             };
@@ -272,6 +298,27 @@ impl TranslatingLlmClient {
             && until.load(Ordering::Relaxed) > duration_millis(self.cooldown_epoch.elapsed())
         {
             tracing::debug!(model = %model, wire_format = %wire_format, "skipping backend during failure cooldown");
+            // A cooldown the target itself armed keeps its established answer:
+            // the model is merely resting, and the caller is told to come back.
+            // A cooldown inherited from a sibling in the same pool is different --
+            // the caller never saw that failure, so the failure is replayed rather
+            // than replaced by an unavailability it would classify differently.
+            if backend.cooldown_group().is_some() {
+                let armed = self
+                    .cooldown_status
+                    .get(&key)
+                    .map(|status| status.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if armed != 0
+                    && let Ok(code) = u16::try_from(armed)
+                    && let Ok(status) = StatusCode::from_u16(code)
+                {
+                    return Err(LlmClientError::UpstreamHttp {
+                        status,
+                        body: "upstream still cooling down after a recent failure".to_string(),
+                    });
+                }
+            }
             return Err(LlmClientError::TemporarilyUnavailable);
         }
 
@@ -383,6 +430,13 @@ impl TranslatingLlmClient {
                 && matches!(error, LlmClientError::UpstreamHttp { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS))
         {
             let deadline = duration_millis(self.cooldown_epoch.elapsed().saturating_add(cooldown));
+            if let Some(status) = self.cooldown_status.get(&key) {
+                let observed = match error {
+                    LlmClientError::UpstreamHttp { status, .. } => status.as_u16(),
+                    _ => 0,
+                };
+                status.store(u32::from(observed), Ordering::Relaxed);
+            }
             until.fetch_max(deadline, Ordering::Relaxed);
         }
         // Let cooldown expire naturally; a successful in-flight call may overlap a newer failure.
@@ -1620,6 +1674,7 @@ mod tests {
             reasoning_dialect: ReasoningDialect::default(),
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
+            cooldown_group: None,
             timeout: None,
             attempt_timeout: None,
             stream_idle_timeout: None,
@@ -2903,6 +2958,7 @@ mod tests {
             let backend = HttpBackendConfig {
                 forward_auth,
                 failure_cooldown: Duration::from_secs(60),
+                cooldown_group: None,
                 ..config_with_retries(&format!("{}/v1", server.uri()), 2)
             };
             let client = TranslatingLlmClient::new(&[ModelConfig::new(

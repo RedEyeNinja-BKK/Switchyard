@@ -81,6 +81,15 @@ pub struct HttpBackendConfig {
     pub max_retries: u32,
     /// Cooldown after an exhausted transient completion failure. Zero disables it.
     pub failure_cooldown: Duration,
+    /// Targets that share this name share one cooldown.
+    ///
+    /// The cooldown is otherwise per model. That is wrong when several models sit
+    /// behind one upstream provider pool: a 429 from the pool says nothing about
+    /// one model, and retrying a sibling immediately spends another rejected
+    /// request for the same reason. Naming the pool here makes the first failure
+    /// stand for all of them, and the armed failure is replayed so the caller
+    /// still sees the real status rather than a generic unavailability.
+    pub cooldown_group: Option<String>,
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
@@ -374,6 +383,11 @@ impl Backend {
         self.config().failure_cooldown
     }
 
+    /// The cooldown group this backend belongs to, when its targets share one.
+    pub fn cooldown_group(&self) -> Option<&str> {
+        self.config().cooldown_group.as_deref()
+    }
+
     /// Deadline for all attempts and the complete response; `None` leaves the wait unbounded.
     pub fn timeout(&self) -> Option<Duration> {
         self.config().timeout
@@ -499,6 +513,7 @@ mod tests {
             reasoning_dialect: ReasoningDialect::default(),
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
+            cooldown_group: None,
             timeout: None,
             attempt_timeout: None,
             stream_idle_timeout: None,

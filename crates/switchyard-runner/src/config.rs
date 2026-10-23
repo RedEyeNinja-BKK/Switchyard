@@ -641,6 +641,7 @@ impl DeploymentConfig {
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
             )?;
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
@@ -690,6 +691,7 @@ impl DeploymentConfig {
                     target.reasoning_effort.clone(),
                     target.reasoning_policy,
                     target.reasoning_dialect,
+                    target.cooldown_group.clone(),
                 )?,
                 None,
             ));
@@ -1539,6 +1541,13 @@ struct TargetConfig {
     /// Environment variable holding the decision backend's credential.
     #[serde(default)]
     decision_api_key_env: Option<String>,
+    /// Name shared by every target that sits behind one upstream provider pool.
+    ///
+    /// Their failure cooldowns then move together: a pool-wide 429 is one fact
+    /// about the pool, and immediately retrying a sibling model would spend a
+    /// request the pool has already refused. Unset keeps the cooldown per model.
+    #[serde(default)]
+    cooldown_group: Option<String>,
     /// Factual capability of the backing deployment behind this target.
     ///
     /// A target fact, not a policy: it says what this model can do, while the route's own
@@ -1607,6 +1616,9 @@ fn resolve_category_models(
         .collect()
 }
 
+// The per-target overrides are all forwarded verbatim from the target being built;
+// bundling them into a struct would only move the same fields one level down.
+#[allow(clippy::too_many_arguments)]
 fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
@@ -1615,6 +1627,7 @@ fn build_backend(
     reasoning_effort: Option<String>,
     reasoning_policy: Option<ReasoningPolicy>,
     reasoning_dialect: ReasoningDialect,
+    cooldown_group: Option<String>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -1687,6 +1700,7 @@ fn build_backend(
         reasoning_dialect,
         max_retries: config.max_retries,
         failure_cooldown: Duration::from_millis(config.failure_cooldown_ms),
+        cooldown_group,
         timeout: config.timeout_ms.map(Duration::from_millis),
         attempt_timeout: config.attempt_timeout_ms.map(Duration::from_millis),
         stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
@@ -3202,6 +3216,7 @@ confidence_threshold = 0.5
             None,
             None,
             ReasoningDialect::default(),
+            target.cooldown_group.clone(),
         )?;
 
         assert_eq!(
@@ -3243,6 +3258,7 @@ confidence_threshold = 0.5
             None,
             None,
             ReasoningDialect::default(),
+            target.cooldown_group.clone(),
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -3268,6 +3284,7 @@ confidence_threshold = 0.5
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
             );
             if expected == Some(0) {
                 assert!(backend.is_err());

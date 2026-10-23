@@ -1534,6 +1534,7 @@ mod tests {
                         reasoning_dialect: ReasoningDialect::default(),
                         max_retries: 0,
                         failure_cooldown: std::time::Duration::ZERO,
+                        cooldown_group: None,
                         timeout: None,
                         attempt_timeout: None,
                         stream_idle_timeout: None,
@@ -1686,6 +1687,7 @@ mod tests {
                     reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 0,
                     failure_cooldown: std::time::Duration::ZERO,
+                    cooldown_group: None,
                     timeout: None,
                     attempt_timeout: None,
                     stream_idle_timeout: None,
@@ -2541,6 +2543,7 @@ mod tests {
                     reasoning_dialect: ReasoningDialect::default(),
                     max_retries: 2,
                     failure_cooldown: cooldown,
+                    cooldown_group: None,
                     timeout: None,
                     attempt_timeout: None,
                     stream_idle_timeout: None,
@@ -2586,6 +2589,133 @@ mod tests {
         tokio::time::resume();
 
         assert_eq!(call(client).await?, ["weak", "weak", "weak", "strong"]);
+        Ok(())
+    }
+
+    /// Two models behind one upstream provider pool share a cooldown.
+    ///
+    /// The pool's 429 is a fact about the pool, not about one model, so calling the
+    /// sibling immediately spends another request the pool has already refused. The
+    /// control matters as much as the rule: without a declared group, and across two
+    /// different groups, every candidate is still tried.
+    #[tokio::test]
+    async fn a_shared_pool_cooldown_spares_the_sibling_and_keeps_the_real_status() -> Result<()> {
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                observed
+                    .lock()
+                    .push(body["model"].as_str().unwrap_or_default().to_string());
+                ResponseTemplate::new(429).set_body_json(json!({
+                    "error": {
+                        "message": "Provider returned error",
+                        "code": 429,
+                        "metadata": {"limit_source": "upstream_provider_shared_pool"}
+                    }
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let build = |group: Option<&'static str>| {
+            Backend::OpenAiChat(HttpBackendConfig {
+                base_url: format!("{}/v1", server.uri()),
+                api_key: None,
+                forward_auth: false,
+                extra_headers: BTreeMap::new(),
+                extra_body: BTreeMap::new(),
+                omit_body_fields: BTreeSet::new(),
+                reasoning_effort: None,
+                reasoning_policy: None,
+                reasoning_dialect: ReasoningDialect::default(),
+                max_retries: 0,
+                failure_cooldown: std::time::Duration::from_secs(60),
+                cooldown_group: group.map(str::to_string),
+                timeout: None,
+                attempt_timeout: None,
+                stream_idle_timeout: None,
+                requires_list_input: false,
+            })
+        };
+        let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
+            // `Response` carries no Debug, so the error is taken by match.
+            let error = match run(
+                Arc::new(CandidateAlgorithm {}),
+                ClientRouter::single(client),
+                request(),
+                to_category_map(names),
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("the pool refuses every request"),
+                Err(error) => error,
+            };
+            let calls: Vec<String> = std::mem::take(&mut *calls.lock());
+            (error, calls)
+        };
+        let is_rate_limited = |error: &LibsyError| {
+            matches!(
+                error,
+                LibsyError::ClientCall {
+                    source: LlmClientError::UpstreamHttp { status, .. },
+                    ..
+                } if *status == StatusCode::TOO_MANY_REQUESTS
+            )
+        };
+
+        let grouped = Arc::new(
+            TranslatingLlmClient::new(&[
+                ModelConfig::new("pool-a", build(Some("google-ai-studio")), None),
+                ModelConfig::new("pool-b", build(Some("google-ai-studio")), None),
+            ])
+            .map_err(|error| LibsyError::external("building test client", error))?,
+        );
+
+        // One failure stands for the pool: the sibling is not contacted.
+        let (error, seen) = attempt(Arc::clone(&grouped), &["pool-a", "pool-b"]).await;
+        assert_eq!(
+            seen,
+            ["pool-a"],
+            "the shared-pool sibling must not be called"
+        );
+        assert!(
+            is_rate_limited(&error),
+            "the caller still sees the pool's 429: {error}"
+        );
+
+        // While the group cools down, neither model is called, and the status the
+        // caller sees is still the upstream's rather than a generic unavailability.
+        let (error, seen) = attempt(Arc::clone(&grouped), &["pool-a", "pool-b"]).await;
+        assert!(
+            seen.is_empty(),
+            "a cooling group must make no upstream call: {seen:?}"
+        );
+        assert!(
+            is_rate_limited(&error),
+            "a cooled-down skip still reports 429: {error}"
+        );
+
+        // Control: the same two models with no declared group are both tried.
+        let ungrouped = Arc::new(
+            TranslatingLlmClient::new(&[
+                ModelConfig::new("pool-a", build(None), None),
+                ModelConfig::new("pool-b", build(None), None),
+            ])
+            .map_err(|error| LibsyError::external("building test client", error))?,
+        );
+        let (error, seen) = attempt(ungrouped, &["pool-a", "pool-b"]).await;
+        assert_eq!(
+            seen,
+            ["pool-a", "pool-b"],
+            "per-model cooldown is unchanged"
+        );
+        assert!(is_rate_limited(&error));
+
         Ok(())
     }
 
@@ -2667,6 +2797,7 @@ mod tests {
                 reasoning_dialect: ReasoningDialect::default(),
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
+                cooldown_group: None,
                 timeout: None,
                 attempt_timeout: None,
                 stream_idle_timeout: None,

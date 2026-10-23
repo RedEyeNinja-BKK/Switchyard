@@ -90,11 +90,30 @@ def test_the_generator_runs_from_the_command_line(tmp_path) -> None:
     assert written["dashboard"]["panels"]
 
 
-def test_no_panel_uses_a_windowed_increase() -> None:
-    # A windowed increase misses any increment that happened before Prometheus
-    # took its first sample of the series, so a real request can read as zero.
+def test_cumulative_panels_never_use_a_windowed_increase() -> None:
+    # A windowed increase on a cumulative panel misses any increment that
+    # happened before Prometheus took its first sample of the series, so a real
+    # request can read as zero. Cumulative panels therefore read the counter
+    # directly.
+    #
+    # A ROLLING panel is the opposite case: a trailing window is exactly what
+    # increase() computes, and it is what the historical dashboard showed. The
+    # rule is therefore that the two shapes stay distinct - a panel may use
+    # increase() only if it says it is a rolling window, and a panel that claims
+    # to be cumulative must not.
     for title, expression in _expressions():
-        assert "increase(" not in expression, title
+        if "increase(" not in expression:
+            continue
+        assert "rolling" in title.lower(), (
+            f"{title} uses increase() but is not labelled as a rolling window"
+        )
+
+    for title, expression in _expressions():
+        if "cumulative" not in title.lower():
+            continue
+        assert "increase(" not in expression, (
+            f"{title} claims to be cumulative but uses a windowed increase"
+        )
 
 
 def test_the_token_components_are_never_added_to_each_other() -> None:
@@ -154,9 +173,9 @@ def test_no_query_uses_a_composite_currency_label() -> None:
 
 def test_the_credit_the_consumed_credit_and_the_balance_are_different_panels() -> None:
     titles = {title for title, _ in _expressions()}
-    assert "OPENROUTER CREDIT (USD) - GLOBAL KEY ACCOUNT ONLY" in titles
-    assert "OPENROUTER CONSUMED (USD) - GLOBAL KEY ACCOUNT ONLY" in titles
-    assert "OPENROUTER REMAINING (USD) - GLOBAL KEY ACCOUNT ONLY" in titles
+    assert "OpenRouter Credits (total, USD · global key)" in titles
+    assert "OpenRouter Usage (total, USD · global key)" in titles
+    assert "OpenRouter Remaining (USD · global key)" in titles
 
 
 def test_the_dashboard_links_back_to_the_routing_dashboard() -> None:
@@ -218,18 +237,19 @@ def test_the_dashboard_discloses_partial_openrouter_coverage() -> None:
 
 
 def test_the_money_panels_name_the_account_they_cover() -> None:
-    # A panel titled only "OPENROUTER CREDIT" would read as the deployment's
-    # total OpenRouter credit. It is one account's credit.
+    # A panel titled only "OpenRouter Credits" would read as the deployment's
+    # total OpenRouter credit. It is one account's credit, so each money panel
+    # names the account it covers.
     titles = [panel.get("title", "") for panel in _request()["dashboard"]["panels"]]
     money = [
         title
         for title in titles
-        if "OPENROUTER" in title
-        and any(word in title for word in ("CREDIT", "REMAINING", "CONSUMED", "USAGE"))
+        if "OpenRouter" in title
+        and any(word in title for word in ("Credit", "Remaining", "Usage", "Spend"))
     ]
     assert money, "the OpenRouter money panels must exist"
     for title in money:
-        assert "GLOBAL KEY" in title, f"{title} must name the account it covers"
+        assert "global key" in title, f"{title} must name the account it covers"
 
 
 def test_coverage_is_shown_per_provider_not_as_a_subtraction() -> None:

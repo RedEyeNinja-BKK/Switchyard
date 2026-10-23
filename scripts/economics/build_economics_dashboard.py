@@ -576,54 +576,521 @@ def build_dashboard(config):
     )
     y += 9
 
-    panels.append(row("PROVIDER ACCOUNT STATE", y))
+    panels.append(row("OPENAI ALLOWANCE WINDOWS (primary 5-hr · secondary weekly)", y))
     y += 1
 
-    # Coverage is stated before any money figure, because the biggest way this
-    # dashboard could mislead is by showing one account's credit beside another
-    # account's traffic.
+    # V5.39 read these from localclaw-econ's resource exporter. Switchyard now
+    # reads the same allowance windows itself, so these are the same figures from
+    # the deployment's own credentials.
+    #
+    # Switchyard publishes the REMAINING percentage and the seconds to reset.
+    # Used percent is the complement, so it is computed here rather than stored,
+    # and a missing reading stays missing instead of becoming a false 100%.
     panels.append(
         stat(
-            "PROVIDERS WITH ACCOUNT FINANCIAL COVERAGE",
-            f'count(count by (provider) ({FRESHNESS}{{job="{job}"}}))',
-            "How many providers the deployment reads account state for. A provider that is "
-            "missing from this count may still serve traffic, in which case its tokens are "
-            "attributed correctly but its credit, balance and usage are not collected at all.",
+            "5-hr Remaining",
+            f'last_over_time({ALLOWANCE_PCT}{{provider="openai",pool="primary",job="{job}"}}[3h])',
+            "Remaining percentage of the primary five-hour window. Read by Switchyard with "
+            "the deployment's own OpenAI credential.",
+            0,
+            y,
+            w=4,
+            unit="percent",
+            decimals=0,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "red", "value": None},
+                    {"color": "orange", "value": 15},
+                    {"color": "green", "value": 40},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "5-hr Used",
+            f'(100 - last_over_time({ALLOWANCE_PCT}{{provider="openai",pool="primary",job="{job}"}}[3h]))',
+            "Consumed percentage of the primary five-hour window. The provider reports what is "
+            "left, so this is its complement.",
+            4,
+            y,
+            w=4,
+            unit="percent",
+            decimals=0,
+        )
+    )
+    panels.append(
+        stat(
+            "Time to 5-hr Reset",
+            f'last_over_time({ALLOWANCE_RESET}{{provider="openai",pool="primary",job="{job}"}}[3h]) / 60',
+            "Minutes until the five-hour window resets. Switchyard publishes the remaining "
+            "seconds, so this is that figure in minutes.",
+            8,
+            y,
+            w=4,
+            unit="m",
+            decimals=0,
+        )
+    )
+    panels.append(
+        stat(
+            "Weekly Remaining",
+            f'last_over_time({ALLOWANCE_PCT}{{provider="openai",pool="secondary",job="{job}"}}[3h])',
+            "Remaining percentage of the secondary weekly window.",
+            12,
+            y,
+            w=4,
+            unit="percent",
+            decimals=0,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "red", "value": None},
+                    {"color": "orange", "value": 15},
+                    {"color": "green", "value": 40},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "Weekly Used",
+            f'(100 - last_over_time({ALLOWANCE_PCT}{{provider="openai",pool="secondary",job="{job}"}}[3h]))',
+            "Consumed percentage of the secondary weekly window.",
+            16,
+            y,
+            w=4,
+            unit="percent",
+            decimals=0,
+        )
+    )
+    panels.append(
+        stat(
+            "Time to Weekly Reset",
+            f'last_over_time({ALLOWANCE_RESET}{{provider="openai",pool="secondary",job="{job}"}}[3h]) / 3600',
+            "Hours until the weekly window resets. Switchyard publishes the remaining seconds, "
+            "so this is that figure in hours. The window refreshes on a weekly cycle, not daily.",
+            20,
+            y,
+            w=4,
+            unit="h",
+            decimals=1,
+        )
+    )
+    y += 5
+
+    panels.append(
+        timeseries(
+            "5-hr window: used and remaining (Turnstone OpenAI)",
+            [
+                target(
+                    f'{ALLOWANCE_PCT}{{provider="openai",pool="primary",job="{job}"}}',
+                    legend="remaining %",
+                ),
+                target(
+                    f'(100 - {ALLOWANCE_PCT}{{provider="openai",pool="primary",job="{job}"}})',
+                    legend="used %",
+                ),
+            ],
+            "The primary five-hour window. Used and remaining are complements: together they "
+            "always sum to 100, so they cross at the halfway point.",
+            0,
+            y,
+            w=12,
+            h=8,
+            unit="percent",
+        )
+    )
+    panels.append(
+        timeseries(
+            "Weekly window: used and remaining (Turnstone OpenAI)",
+            [
+                target(
+                    f'{ALLOWANCE_PCT}{{provider="openai",pool="secondary",job="{job}"}}',
+                    legend="remaining %",
+                ),
+                target(
+                    f'(100 - {ALLOWANCE_PCT}{{provider="openai",pool="secondary",job="{job}"}})',
+                    legend="used %",
+                ),
+            ],
+            "The secondary weekly window. It refills on a different schedule from the "
+            "five-hour window, which is why the two are never combined.",
+            12,
+            y,
+            w=12,
+            h=8,
+            unit="percent",
+        )
+    )
+    y += 8
+
+    panels.append(row("DEEPSEEK TELEMETRY", y))
+    y += 1
+
+    panels.append(
+        stat(
+            "DeepSeek Status",
+            f'last_over_time({FRESHNESS}{{provider="deepseek",job="{job}"}}[3h])',
+            "Seconds since Switchyard last read DeepSeek's account successfully. A value near "
+            "the polling interval is healthy; a value that keeps climbing means the reads are "
+            "failing, which is different from the provider being out of credit.",
+            0,
+            y,
+            w=6,
+            unit="s",
+            decimals=0,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "green", "value": None},
+                    {"color": "orange", "value": 900},
+                    {"color": "red", "value": 3600},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "DeepSeek Balance (CNY)",
+            f'last_over_time({BALANCE}{{provider="deepseek",currency="CNY",scope="account",period="total",job="{job}"}}[3h])',
+            "The prepaid balance DeepSeek reported, in CNY. Thresholds follow the configured "
+            "operating floor: above 120 is comfortable, 60 is the floor, below it the lane is "
+            "close to refusing requests. A zero here is a reported zero, which is different "
+            "from an absent series.",
+            6,
+            y,
+            w=6,
+            unit="CNY",
+            decimals=2,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "red", "value": None},
+                    {"color": "orange", "value": 60},
+                    {"color": "green", "value": 120},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "DeepSeek Balance (USD)",
+            f'last_over_time({BALANCE}{{provider="deepseek",currency="USD",scope="account",period="total",job="{job}"}}[3h])',
+            "The prepaid balance in USD, which DeepSeek reports separately from CNY. Held "
+            "beside the CNY figure rather than converted: a conversion would invent an exchange "
+            "rate the provider never stated.",
+            12,
+            y,
+            w=6,
+            unit="currencyUSD",
+            decimals=2,
+        )
+    )
+    panels.append(
+        stat(
+            "DeepSeek 24h Balance Movement",
+            f'clamp_min(max_over_time({BALANCE}{{provider="deepseek",currency="CNY",scope="account",period="total",job="{job}"}}[24h]) '
+            f'- min_over_time({BALANCE}{{provider="deepseek",currency="CNY",scope="account",period="total",job="{job}"}}[24h]), 0)',
+            "How far the CNY balance moved in the trailing 24 hours. This is a BALANCE move, "
+            "not a spend figure: a top-up during the window is invisible in the balance and so "
+            "is not subtracted, and a top-up larger than the day's usage would make the true "
+            "spend exceed this number. Switchyard does not hold a DeepSeek top-up ledger, so it "
+            "cannot separate the two.",
+            18,
+            y,
+            w=6,
+            unit="CNY",
+            decimals=2,
+        )
+    )
+    y += 5
+
+    panels.append(
+        timeseries(
+            "DeepSeek balance trend (CNY)",
+            [
+                target(
+                    f'{BALANCE}{{provider="deepseek",currency="CNY",scope="account",period="total",job="{job}"}}',
+                    legend="balance ¥",
+                ),
+            ],
+            "The observed balance over time. A step up is a top-up; the slow decline between "
+            "steps is metered usage. Because both appear in the same series, the slope alone "
+            "cannot be read as a burn rate across a top-up.",
+            0,
+            y,
+            w=12,
+            h=8,
+            unit="CNY",
+        )
+    )
+    panels.append(
+        text(
+            "DEEPSEEK COVERAGE - WHAT IS AND IS NOT AVAILABLE",
+            "**Available from Switchyard:** the live balance in both currencies, and the age of "
+            "the last successful account read.\n\n"
+            "**NOT available, and deliberately not guessed:** DeepSeek lifetime spend, the "
+            "top-up ledger, and a true metered-spend figure. The historical dashboard derived "
+            "those from a balance-delta ledger maintained by a separate exporter. Switchyard "
+            "reads the balance endpoint only, which reports a level rather than a ledger, so a "
+            "top-up and a day of usage are indistinguishable from two readings alone. Those "
+            "panels are absent here rather than approximated.",
+            12,
+            y,
+            w=12,
+            h=8,
+        )
+    )
+    y += 8
+
+    panels.append(row("OPENROUTER USAGE TELEMETRY", y))
+    y += 1
+
+    panels.append(
+        stat(
+            "OpenRouter Status",
+            f'last_over_time({FRESHNESS}{{provider="openrouter",job="{job}"}}[3h])',
+            "Seconds since Switchyard last read the OpenRouter account successfully. The "
+            "financial panels below describe the GLOBAL key's account only.",
+            0,
+            y,
+            w=6,
+            unit="s",
+            decimals=0,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "green", "value": None},
+                    {"color": "orange", "value": 900},
+                    {"color": "red", "value": 3600},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "OpenRouter Remaining (USD · global key)",
+            f'last_over_time({BALANCE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}[3h])',
+            "Credit left on the GLOBAL key's account: what was purchased less what has been "
+            "consumed. Published directly by Switchyard so it is read rather than worked out "
+            "from two other panels.",
+            6,
+            y,
+            w=6,
+            unit="currencyUSD",
+            decimals=4,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "red", "value": None},
+                    {"color": "orange", "value": 10},
+                    {"color": "green", "value": 25},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "OpenRouter Usage (total, USD · global key)",
+            f'last_over_time({PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}[3h])',
+            "Lifetime usage the provider reports for the GLOBAL key's account. This is what has "
+            "been consumed, not what is left.",
+            12,
+            y,
+            w=6,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    panels.append(
+        stat(
+            "OpenRouter Credits (total, USD · global key)",
+            f'last_over_time({CREDIT}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}[3h])',
+            "Credits purchased on the GLOBAL key's account. This is the money put in, not the "
+            "money left.",
+            18,
+            y,
+            w=6,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    y += 5
+
+    panels.append(
+        stat(
+            "OpenRouter 24h Spend (USD · global key)",
+            f'clamp_min(max_over_time({PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}[24h]) '
+            f'- min_over_time({PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}[24h]), 0)',
+            "Spend on the GLOBAL key's account in the trailing 24 hours, measured as the rise "
+            "of the provider's own cumulative usage gauge. Unlike a balance, a usage gauge only "
+            "rises, so a top-up cannot distort it.",
             0,
             y,
             w=8,
+            unit="currencyUSD",
+            decimals=4,
         )
     )
     panels.append(
         stat(
-            "PROVIDERS SERVING TRAFFIC",
-            f'count(count by (provider) ({REQUESTS}{{job="{job}"}}))',
-            "How many providers have served at least one request. Compare with the coverage "
-            "count: a provider in this number but not in that one is billing for work the "
-            "dashboard cannot show the money side of.",
+            "OpenRouter Key Usage (total, USD · global key)",
+            f'last_over_time({PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="total",job="{job}"}}[3h])',
+            "Lifetime usage of the single GLOBAL key, over the whole life of that key. A "
+            "different amount from the account-wide figure whenever the account holds other keys.",
             8,
             y,
             w=8,
+            unit="currencyUSD",
+            decimals=4,
         )
     )
-    # Deliberately NOT a subtraction of the two counts above. Served and account
-    # series name the same account differently - the OpenAI account appears as
-    # openai_nt in served usage and as openai in account state, because two
-    # clients share one credential. A naive difference would therefore miscount
-    # in both directions: it can report zero while a provider is uncovered, and
-    # it can report a covered provider as a gap. The coverage question is
-    # answered by the per-provider table below, where a provider carrying tokens
-    # but no freshness figure is visible as a row.
     panels.append(
         stat(
-            "ACCOUNT READS OK (TOTAL)",
-            f'sum({ACCOUNT_FETCH}{{job="{job}",outcome="ok"}})',
-            "Successful provider account reads since the deployment started. This is the "
-            "count of confirmed account observations, not the number of accounts: a provider "
-            "that is read every interval increments once per read.",
+            "OpenRouter This Month (USD)",
+            f'last_over_time({PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="monthly",job="{job}"}}[3h])',
+            "Usage of the GLOBAL key in the current calendar month, as the provider reports it. "
+            "The provider's own window, not a rolling thirty days.",
             16,
             y,
             w=8,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    y += 5
+
+    panels.append(
+        timeseries(
+            "OpenRouter usage trend (USD)",
+            [
+                target(
+                    f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
+                    legend="account usage $",
+                ),
+                target(
+                    f'{CREDIT}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
+                    legend="credits purchased $",
+                ),
+                target(
+                    f'{BALANCE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
+                    legend="remaining $",
+                ),
+            ],
+            "Provider-reported cumulative usage, purchased credit and remaining balance for the "
+            "GLOBAL key's account. Usage climbing toward the credit line is the burn; the gap "
+            "between them is what is left.",
+            0,
+            y,
+            w=12,
+            h=8,
+            unit="currencyUSD",
+        )
+    )
+    panels.append(
+        timeseries(
+            "OpenRouter requests 24h by model (rolling)",
+            [
+                target(
+                    f'sum by (model) (increase({REQUESTS}{{provider=~"openrouter.*",job="{job}"}}[24h]))',
+                    legend="{{model}}",
+                ),
+            ],
+            "Requests routed to OpenRouter in the trailing 24 hours, by the model that served "
+            "them. Covers BOTH OpenRouter credentials the deployment holds, because this is "
+            "served traffic rather than account state: the financial panels above cover the "
+            "global key's account only.",
+            12,
+            y,
+            w=12,
+            h=8,
+            unit="short",
+        )
+    )
+    y += 8
+
+    panels.append(
+        timeseries(
+            "OpenRouter tokens 24h by direction (rolling)",
+            [
+                target(
+                    f'sum by (component) (increase({TOKENS}{{provider=~"openrouter.*",job="{job}",component!="cached"}}[24h]))',
+                    legend="{{component}}",
+                ),
+            ],
+            "Tokens routed to OpenRouter in the trailing 24 hours, by component. Cached is a "
+            "subset of prompt, so it is excluded from this stack to keep the totals true. This "
+            "covers both OpenRouter credentials.",
+            0,
+            y,
+            w=24,
+            h=8,
+            unit="short",
+        )
+    )
+    y += 8
+
+    panels.append(row("PROVIDER ACCOUNT COVERAGE", y))
+    y += 1
+
+    panels.append(
+        stat(
+            "Account Reads OK (total)",
+            f'sum({ACCOUNT_FETCH}{{job="{job}",outcome="ok"}})',
+            "Successful provider account reads since the deployment started. One per provider "
+            "per polling interval, so this counts observations, not accounts.",
+            0,
+            y,
+            w=6,
+        )
+    )
+    panels.append(
+        stat(
+            "Auth Failures (total)",
+            f'sum({AUTH_FAILURES}{{job="{job}"}})',
+            "Account reads rejected with 401 or 403. A non-zero value means the credential was "
+            "refused for the account surface, which is a different fault from the provider being "
+            "down. This panel is empty when no read has been rejected, which is the healthy state.",
+            6,
+            y,
+            w=6,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "green", "value": None},
+                    {"color": "red", "value": 1},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "Account Reads Failed (total)",
+            f'sum({ACCOUNT_FETCH}{{job="{job}",outcome="failed"}})',
+            "Account reads that reached nothing usable: an unreachable host, an unexpected "
+            "status, or a body that carried no account state.",
+            12,
+            y,
+            w=6,
+            thresholds={
+                "mode": "absolute",
+                "steps": [
+                    {"color": "green", "value": None},
+                    {"color": "orange", "value": 1},
+                ],
+            },
+        )
+    )
+    panels.append(
+        stat(
+            "Providers With Account Coverage",
+            f'count(count by (provider) ({FRESHNESS}{{job="{job}"}}))',
+            "How many providers Switchyard holds account figures for.",
+            18,
+            y,
+            w=6,
         )
     )
     y += 5
@@ -645,7 +1112,7 @@ def build_dashboard(config):
                     instant=True,
                 ),
                 target(
-                    f'sum by (provider) ({CREDIT}{{scope="account",period="total",job="{job}"}})',
+                    f'sum by (provider) ({CREDIT}{{job="{job}",scope="account",period="total"}})',
                     legend="{{provider}}",
                     ref="C",
                     instant=True,
@@ -654,10 +1121,10 @@ def build_dashboard(config):
             "Which providers this deployment can show the money side of, read column by "
             "column: a row carrying prompt tokens but no freshness value is serving traffic "
             "whose account credit, balance and usage are not collected at all. "
-            "openrouter_stephen is the known case - its tokens are attributed correctly but "
-            "it has no account figures, so the OpenRouter credit, remaining and consumed "
-            "panels describe the global key's account only and must not be read as the "
-            "deployment's total OpenRouter spend.\n\n"
+            "openrouter_stephen is the known case - its tokens are attributed correctly but it "
+            "has no account figures, so every OpenRouter financial panel describes the global "
+            "key's account only and must not be read as the deployment's total OpenRouter "
+            "spend.\n\n"
             "One caveat when reading the rows: the OpenAI account appears twice under two "
             "names, because the deployment runs two OpenAI clients on one credential. Served "
             "usage is labelled openai_nt and account state is labelled openai, so one account "
@@ -667,196 +1134,10 @@ def build_dashboard(config):
             0,
             y,
             w=24,
-            h=8,
+            h=9,
         )
     )
-    y += 8
-
-    panels.append(
-        stat(
-            "ACCOUNT READS (TOTAL)",
-            f'sum({ACCOUNT_FETCH}{{job="{job}"}})',
-            "Provider account reads since the deployment started. A provider that exposes no "
-            "account surface produces no series at all, because a provider that exposes nothing "
-            "has not reported a balance of zero.",
-            0,
-            y,
-            w=6,
-        )
-    )
-    panels.append(
-        stat(
-            "AUTH FAILURES (TOTAL)",
-            f'sum({AUTH_FAILURES}{{job="{job}"}})',
-            "Account reads rejected with 401 or 403, since the deployment started. A non-zero "
-            "value means the credential the deployment holds was refused for the account "
-            "surface, which is different from the provider being down.",
-            6,
-            y,
-            w=6,
-        )
-    )
-    panels.append(
-        stat(
-            "OPENROUTER CREDIT (USD) - GLOBAL KEY ACCOUNT ONLY",
-            f'{CREDIT}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
-            "The credit the provider sold to the GLOBAL key's account only. The deployment also "
-            "serves traffic through a second OpenRouter account (openrouter_stephen) whose "
-            "account figures are NOT collected, so this is not the deployment's total "
-            "OpenRouter credit. This is not the money that is left either: the consumed "
-            "credit is a separate figure and the remaining balance is a third.",
-            12,
-            y,
-            w=6,
-            unit="currencyUSD",
-            decimals=4,
-        )
-    )
-    panels.append(
-        stat(
-            "DEEPSEEK BALANCE (CNY / USD) - ACCOUNT",
-            f'{BALANCE}{{provider="deepseek",scope="account",period="total",job="{job}"}}',
-            "The prepaid balance the provider reported for the account, per currency. Absent "
-            "when the provider reported no balance; a zero balance is a reported zero, which "
-            "is different from absent.",
-            18,
-            y,
-            w=6,
-            unit="currencyUSD",
-            decimals=4,
-        )
-    )
-    y += 5
-
-    panels.append(
-        stat(
-            "OPENROUTER REMAINING (USD) - GLOBAL KEY ACCOUNT ONLY",
-            f'{BALANCE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
-            "The credit the provider sold, less the credit consumed: the money still "
-            "available on the account. Published as its own figure so it is read directly "
-            "rather than worked out by subtracting one panel from another.",
-            0,
-            y,
-            w=8,
-            unit="currencyUSD",
-            decimals=4,
-        )
-    )
-    panels.append(
-        stat(
-            "OPENROUTER CONSUMED (USD) - GLOBAL KEY ACCOUNT ONLY",
-            f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
-            "The credit the account has consumed. This is the provider's own figure for what "
-            "has been charged against the account.",
-            8,
-            y,
-            w=8,
-            unit="currencyUSD",
-            decimals=4,
-        )
-    )
-    panels.append(
-        stat(
-            "OPENROUTER KEY USAGE (USD) - GLOBAL KEY ONLY",
-            f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="total",job="{job}"}}',
-            "The usage of the one API key the deployment holds, over the whole life of that "
-            "key. This is a different amount from the account-wide figure, because the account "
-            "may hold other keys.",
-            16,
-            y,
-            w=8,
-            unit="currencyUSD",
-            decimals=4,
-        )
-    )
-    y += 5
-
-    panels.append(
-        timeseries(
-            "ALLOWANCE WINDOWS REMAINING (OPENAI)",
-            [
-                target(
-                    f'{ALLOWANCE_PCT}{{provider="openai",pool="primary",job="{job}"}}',
-                    legend="5-hour window",
-                ),
-                target(
-                    f'{ALLOWANCE_PCT}{{provider="openai",pool="secondary",job="{job}"}}',
-                    legend="weekly window",
-                ),
-            ],
-            "The remaining percentage of each allowance window the provider reported. The two "
-            "windows are shown separately because they refill on different schedules.",
-            0,
-            y,
-            w=12,
-            h=8,
-            unit="percent",
-        )
-    )
-    panels.append(
-        timeseries(
-            "ALLOWANCE WINDOW RESET (OPENAI)",
-            [
-                target(
-                    f'{ALLOWANCE_RESET}{{provider="openai",pool="primary",job="{job}"}}',
-                    legend="5-hour window",
-                ),
-                target(
-                    f'{ALLOWANCE_RESET}{{provider="openai",pool="secondary",job="{job}"}}',
-                    legend="weekly window",
-                ),
-            ],
-            "Seconds until each allowance window resets.",
-            12,
-            y,
-            w=12,
-            h=8,
-            unit="s",
-        )
-    )
-    y += 8
-
-    panels.append(
-        timeseries(
-            "OPENROUTER USAGE BY SCOPE AND PERIOD - GLOBAL KEY ACCOUNT ONLY",
-            [
-                target(
-                    f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="total",job="{job}"}}',
-                    legend="key · total",
-                ),
-                target(
-                    f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="daily",job="{job}"}}',
-                    legend="key · daily",
-                ),
-                target(
-                    f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="weekly",job="{job}"}}',
-                    legend="key · weekly",
-                ),
-                target(
-                    f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="key",period="monthly",job="{job}"}}',
-                    legend="key · monthly",
-                ),
-                target(
-                    f'{PROVIDER_USAGE}{{provider="openrouter",currency="USD",scope="account",period="total",job="{job}"}}',
-                    legend="account · total",
-                ),
-            ],
-            "The usage the GLOBAL OpenRouter account reported, kept apart by scope and by "
-            "period. The key figures are what that one key has used; the account figure covers "
-            "every key on that account. Each period is its own window, so none of these is "
-            "added to another. The second OpenRouter account (openrouter_stephen) has no "
-            "account figures collected, so it does not appear here at all - its served tokens "
-            "are attributed in the usage-by-provider panels instead. This is the provider's "
-            "own figure for what has been charged, kept separate from any Switchyard-derived "
-            "estimate.",
-            0,
-            y,
-            w=24,
-            h=8,
-            unit="currencyUSD",
-        )
-    )
-    y += 8
+    y += 9
 
     panels.append(row("HOW TO READ THIS DASHBOARD", y))
     y += 1

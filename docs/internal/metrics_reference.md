@@ -170,14 +170,22 @@ separate metric families, so a dashboard can never present one as the other.
 > (`input + cached + cache_creation`). Adding the components to the prompt total
 > double counts the cache. There is deliberately no "all tokens" series.
 
-`reasoning` is a *component of* `completion` in the same way, not an addition to
-it. `completion` is the provider's own output total, and on every provider that
-reports reasoning separately that reasoning count sits inside the completion count.
-Measured 2026-10-21 against the live OpenRouter API: a response reported
-`completion_tokens: 650` with `completion_tokens_details.reasoning_tokens: 521` and
-`total_tokens: 680`, where `prompt + completion == total_tokens` and
-`prompt + completion + reasoning` did not. A total token figure, were one published,
-would therefore be `prompt + completion` and nothing else.
+`reasoning` is reported separately, and its relationship to `completion` varies
+by provider and model. Reasoning is never added again when a total is calculated:
+the recorded total is `prompt + completion`.
+
+It is **not** true that reasoning is always a subset of completion. Measured
+2026-10-23 across 29,359 routing-log records: 17 reported reasoning above
+completion (including `z-ai/glm-5.3-flash` and `liquid/lfm-2.5-2.6b:free`), while
+`prompt + completion == total_tokens` held in all 29,359. An earlier version of
+this note asserted the subset universally from a single OpenRouter measurement;
+that was too strong and has been corrected.
+
+What still holds, and is why no panel adds the two: a provider that reports
+reasoning inside completion would be double counted if reasoning were added to
+`completion`, and a provider that reports it outside would be inflated. Either
+way the sum is not a token total, so `reasoning` is published beside
+`completion` and never summed with it.
 
 `reasoning` is published only when the provider reported it. A provider that does
 not report reasoning yields no such series, which reads as absent rather than as a

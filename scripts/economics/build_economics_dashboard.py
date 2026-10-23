@@ -21,12 +21,16 @@ THE ACCOUNTING RULES THE PANELS RESPECT
 
   * `prompt` already contains `cached` and `cache_creation`. No panel adds the
     components to the prompt total, and there is no "all tokens" panel.
-  * `completion` already contains `reasoning`, in the same shape. Measured
-    2026-10-21 against the live OpenRouter API: a response reported
-    `completion_tokens: 650` with `completion_tokens_details.reasoning_tokens: 521`
-    and `total_tokens: 680`, where `prompt + completion == total` and
-    `prompt + completion + reasoning` did not. A total, were one published, would
-    be `prompt + completion` and nothing else.
+  * `reasoning` is reported separately, and its relationship to `completion`
+    varies by provider and model. Reasoning is never added again when a total is
+    calculated: the recorded total is `prompt + completion`. It is NOT true that
+    reasoning is always a subset of completion — measured 2026-10-23 across the
+    routing log, 17 of 29359 records reported reasoning above completion
+    (`z-ai/glm-5.3-flash`, `liquid/lfm-2.5-2.6b:free`), while `prompt + completion
+    == total` held in all 29359. An earlier note here asserted the subset
+    universally from a single OpenRouter measurement; that was too strong and has
+    been corrected. Reasoning is published only when the provider reports it, so
+    an absent series means unreported, not a measured zero.
   * The provider-reported cost and the Switchyard estimate are different series,
     and no panel adds them together.
   * The usage panels read the counters directly rather than through a windowed
@@ -354,8 +358,8 @@ def build_dashboard(config):
             "COMPLETION TOKENS (TOTAL)",
             f'sum({TOKENS}{{{model_filter},component="completion"}})',
             "Completion tokens since the deployment started. This is the provider's own "
-            "output total, and it already contains the reasoning tokens a provider reports, so "
-            "reasoning is not added here.",
+            "output total. Reasoning is reported separately and is never added to it, so the "
+            "provider's figures are shown exactly as reported.",
             12,
             y,
             w=6,
@@ -506,15 +510,17 @@ def build_dashboard(config):
                 ),
                 target(
                     f'sum({TOKENS}{{{model_filter},component="reasoning"}})',
-                    legend="reasoning (inside completion)",
+                    legend="reasoning (reported separately)",
                 ),
             ],
             "The two output components. The completion series is the provider's own output "
-            "total, and the reasoning series sits inside it on every provider that reports "
-            "reasoning — measured 2026-10-21 against the live OpenRouter API, where "
-            "prompt + completion was the reported total and adding the reasoning count broke "
-            "it. Reasoning is reported only by providers that report it, so an absent reasoning "
-            "series means the provider does not report it — it is not a measured zero.",
+            "total and is never adjusted. The reasoning series is what the provider reported "
+            "separately; its relationship to completion varies by model, and reasoning can "
+            "exceed completion, so it is shown beside that total rather than as a part of it. "
+            "Adding the two would double count whenever reasoning does sit inside completion, "
+            "which is why no panel does it. Reasoning is reported only by providers that "
+            "report it, so an absent reasoning series means the provider does not report it — "
+            "it is not a measured zero.",
             12,
             y,
             w=12,
@@ -721,8 +727,8 @@ def build_dashboard(config):
         stat(
             "Rolling 1h Completion Tokens",
             f'sum({ROLL_TOKENS}{{job="{job}",window="1h",component="completion"}})',
-            "Completion tokens in the trailing hour. Reasoning is inside completion, not "
-            "additional to it.",
+            "Completion tokens in the trailing hour. Reasoning is reported separately and is "
+            "not added to this figure.",
             12,
             y,
             w=6,
@@ -732,7 +738,8 @@ def build_dashboard(config):
         stat(
             "Rolling 24h Completion Tokens",
             f'sum({ROLL_TOKENS}{{job="{job}",window="24h",component="completion"}})',
-            "Completion tokens in the trailing 24 hours, with reasoning included in the total.",
+            "Completion tokens in the trailing 24 hours. Reasoning is reported separately and "
+            "is never added to this figure.",
             18,
             y,
             w=6,
@@ -772,9 +779,11 @@ def build_dashboard(config):
                     legend="{{component}}",
                 ),
             ],
-            "Each token component over the trailing day. The components are not additive: "
-            "prompt contains cached and cache-creation, and completion contains reasoning, so "
-            "the lines are shown side by side and never summed into one total.",
+            "Each token component over the trailing day. Prompt contains cached and "
+            "cache-creation, so those are never added to it. Completion and reasoning are shown "
+            "as the provider reported them: reasoning is often a component of completion and "
+            "occasionally exceeds it, so the two lines are read side by side and never summed "
+            "into one total.",
             12,
             y,
             w=12,
@@ -1646,11 +1655,14 @@ def build_dashboard(config):
             "showing a total and one of its components — not two things to add up. There is "
             'deliberately no "all tokens" figure, because any such figure could double count '
             "the cache.\n\n"
-            "**Reasoning is a component of completion** on every provider that reports it "
-            "separately, and is absent on the providers that do not. An absent series means the "
-            "provider does not report it; it is not a measured zero. This is the same shape as "
-            "the cache inside the prompt total: a component is never added to the total that "
-            "contains it.\n\n"
+            "**Reasoning tokens are reported separately** and their relationship to "
+            "completion tokens varies by provider and model. They are not added again when "
+            "calculating total tokens. Switchyard's recorded total is prompt plus completion. "
+            "Provider-reported reasoning may not be a strict subset of completion.\n\n"
+            "An absent reasoning series means the provider does not report it; it is not a "
+            "measured zero. Unlike the cache inside the prompt total, reasoning is not assumed "
+            "to sit inside any other figure — it is shown beside completion and never summed "
+            "with it.\n\n"
             "**The provider-reported cost and a Switchyard estimate are different things.** They "
             "are published as separate metric families and are never added together. A provider "
             "that reports no per-request cost produces no cost series.\n\n"

@@ -130,8 +130,9 @@ def test_the_token_components_are_never_added_to_each_other() -> None:
 
 
 def test_no_panel_adds_the_reasoning_to_the_completion() -> None:
-    # Reasoning is inside completion. A panel that sums the two would double
-    # count the reasoning.
+    # Reasoning is reported separately and its relationship to completion varies
+    # by model. Summing the two would double count it wherever it does sit inside
+    # completion, so no panel may select both components in one query.
     for title, expression in _expressions():
         if 'component="completion"' in expression:
             assert 'component="reasoning"' not in expression, title
@@ -526,3 +527,55 @@ def test_cost_panels_can_show_a_sub_cent_amount() -> None:
         assert decimals is not None and decimals >= 6, (
             f"{panel.get('title')} renders sub-cent costs as zero (decimals={decimals})"
         )
+
+
+def test_no_text_claims_reasoning_is_always_inside_completion() -> None:
+    # Measured 2026-10-23 across 29,359 routing-log records: 17 reported reasoning
+    # above completion (z-ai/glm-5.3-flash, liquid/lfm-2.5-2.6b:free), while
+    # prompt + completion == total held in all of them. So a universal claim that
+    # reasoning is a subset of completion is false, and this dashboard asserted it
+    # in six places. The rule that survives is narrower: reasoning is never ADDED
+    # to a total, and the recorded total is prompt plus completion.
+    document = _request()["dashboard"]
+    universal = (
+        "component of completion** on every provider",
+        "component of completion on every provider",
+        "inside it on every provider",
+        "reasoning is inside completion",
+        "reasoning included in the total",
+        "completion contains reasoning",
+        "reasoning (inside completion)",
+        "already contains the reasoning tokens",
+    )
+    for panel in document["panels"]:
+        blob = json.dumps(panel)
+        for phrase in universal:
+            assert phrase not in blob, (
+                f"{panel.get('title')} asserts reasoning is universally inside "
+                f"completion: {phrase!r}"
+            )
+
+
+def test_the_accounting_rules_state_the_provider_dependent_relationship() -> None:
+    # The correction must be present, not merely the false claim absent: a panel
+    # that says nothing about reasoning leaves the reader to assume containment.
+    document = _request()["dashboard"]
+    rules = [
+        panel["options"]["content"]
+        for panel in document["panels"]
+        if panel.get("type") == "text" and panel.get("title") == "ACCOUNTING RULES"
+    ]
+    assert rules, "the accounting-rules panel must exist"
+    text = " ".join(rules[0].split())
+    assert "relationship to completion tokens varies by provider and model" in text
+    assert "not added again when calculating total tokens" in text
+    assert "recorded total is prompt plus completion" in text
+    assert "may not be a strict subset of completion" in text
+
+
+def test_the_arithmetic_rule_is_stated_as_prompt_plus_completion() -> None:
+    # The one invariant that does hold everywhere must still be stated, because it
+    # is why reasoning is never added.
+    document = _request()["dashboard"]
+    blob = " ".join(json.dumps(p) for p in document["panels"])
+    assert "prompt plus completion" in blob

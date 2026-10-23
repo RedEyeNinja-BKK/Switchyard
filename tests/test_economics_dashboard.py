@@ -479,3 +479,22 @@ def test_no_panel_still_claims_openrouter_coverage_is_partial() -> None:
         blob = json.dumps(panel)
         assert "has no account figures" not in blob
         assert "not collected**, so its spend is invisible" not in blob
+
+
+def test_acceptance_checks_ignore_placeholder_series() -> None:
+    # The read tool answers an unknown metric family with a series that carries no
+    # points rather than with an empty result. Counting series would therefore
+    # report an absent family as present - the exact inverse of the truth - so the
+    # acceptance check filters on points, not on series count.
+    sys.path.insert(0, str(REPO_ROOT / "scripts" / "economics"))
+    import acceptance_checks
+
+    scrape = acceptance_checks.parse_scrape(
+        'switchyard_economics_rolling_requests{window="1h"} 3\n'
+        'switchyard_economics_provider_balance{provider="deepseek",currency="CNY"} 74.36\n'
+    )
+    assert "switchyard_economics_rolling_requests" in scrape
+    assert len(scrape["switchyard_economics_rolling_requests"]) == 1
+    assert scrape["switchyard_economics_rolling_requests"][0][1] == 3.0
+    # A family that is absent from the scrape is absent, not a zero series.
+    assert "switchyard_economics_provider_balance_component" not in scrape

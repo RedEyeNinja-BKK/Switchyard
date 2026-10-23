@@ -251,3 +251,20 @@ def test_coverage_is_shown_per_provider_not_as_a_subtraction() -> None:
             assert not (
                 "account_freshness_seconds" in expression and "requests_total" in expression
             ), f"{panel.get('title')} derives coverage by subtraction"
+
+
+def test_the_coverage_table_explains_the_openai_naming_split() -> None:
+    # The OpenAI account legitimately occupies two rows: served usage is labelled
+    # openai_nt and account state is labelled openai, because two clients share
+    # one credential. Without explaining that, the table reads as a second
+    # uncovered provider.
+    document = _request()["dashboard"]
+    table = [
+        panel
+        for panel in document["panels"]
+        if panel.get("title") == "ACCOUNT FINANCIAL COVERAGE BY PROVIDER"
+    ]
+    assert table, "the coverage table must exist"
+    description = table[0]["description"]
+    assert "openai_nt" in description
+    assert "one credential" in description

@@ -657,8 +657,13 @@ def build_dashboard(config):
             "openrouter_stephen is the known case - its tokens are attributed correctly but "
             "it has no account figures, so the OpenRouter credit, remaining and consumed "
             "panels describe the global key's account only and must not be read as the "
-            "deployment's total OpenRouter spend. A blank cell is absence of collection, "
-            "never a measured zero.",
+            "deployment's total OpenRouter spend.\n\n"
+            "One caveat when reading the rows: the OpenAI account appears twice under two "
+            "names, because the deployment runs two OpenAI clients on one credential. Served "
+            "usage is labelled openai_nt and account state is labelled openai, so one account "
+            "legitimately occupies two rows with the figures split between them. That is a "
+            "naming split, not a second gap. A blank cell is absence of collection, never a "
+            "measured zero.",
             0,
             y,
             w=24,

@@ -213,6 +213,7 @@ Switchyard contacts a provider.
 | `switchyard_economics_provider_balance{provider,currency,scope,period}` | gauge | The remaining balance the provider reported. |
 | `switchyard_economics_provider_credit{provider,currency,scope,period}` | gauge | The purchased credit the provider reported. |
 | `switchyard_economics_provider_usage{provider,currency,scope,period}` | gauge | The usage the provider reported. |
+| `switchyard_economics_provider_balance_component{provider,currency,scope,period,component}` | gauge | One part of the balance, where the provider breaks its balance into parts. `component` is `granted` (credit the provider gave) or `topped_up` (credit that was paid for). |
 | `switchyard_economics_allowance_remaining_percent{provider,pool}` | gauge | Remaining allowance of a provider-reported window. |
 | `switchyard_economics_allowance_reset_seconds{provider,pool}` | gauge | Time until that window resets. |
 
@@ -246,6 +247,34 @@ A provider that reports a purchased credit but no consumed credit publishes no
 balance, because the remaining amount is not known. A provider that reports a
 balance directly, such as DeepSeek, publishes the balance and no credit.
 
+`provider_balance_component` is published *beside* `provider_balance`, never
+added to it. The provider reports the components as the parts the total is made
+of, so a query that summed the components and the total would count the balance
+twice. DeepSeek reports `granted_balance` and `topped_up_balance` alongside
+`total_balance` and all three are now carried.
+
+`topped_up_balance` is the topped-up money **still remaining**. It is not the
+amount ever purchased, and must never be read as a lifetime top-up figure: an
+account that bought a great deal and then spent it can report a small remaining
+topped-up balance.
+
+### Account identity and de-duplication
+
+The `provider` label on an account family names the *account*, not the client.
+A deployment may name several clients for one provider:
+
+* Clients sharing one credential read one account and produce one reader.
+* Clients holding different credentials are separate readers, and are labelled
+  with their own client name, so two OpenRouter accounts cannot overwrite each
+  other's balances.
+
+Where a provider states the identity of the account a key belongs to - OpenRouter
+reports `creator_user_id` on `/key` - the collector compares those values. Two
+credentials that resolve to one identity are one account: the first label reads
+it and the second stops being polled, so the account's money is counted once. If
+the reading label fails, the second is polled again rather than the account
+going unread. The identity is compared and never published.
+
 ### Bangkok calendar day
 
 | Metric | Type | Meaning |
@@ -255,9 +284,41 @@ balance directly, such as DeepSeek, publishes the balance and no credit.
 | `switchyard_economics_calendar_day_start` | gauge | Unix timestamp of the current Bangkok midnight. |
 | `switchyard_economics_calendar_day_end` | gauge | Unix timestamp of the next Bangkok midnight. |
 | `switchyard_economics_calendar_day_elapsed_seconds` | gauge | Seconds since the current Bangkok midnight. |
+| `switchyard_economics_calendar_provider_cost{...,currency}` | gauge | The provider-reported cost incurred in the current Bangkok day, by attribution and currency. |
 
 The day boundary is midnight in `UTC+07:00`, not midnight in UTC and not a
-rolling twenty-four hours. Prometheus cannot express this: the `@` modifier
+rolling twenty-four hours.
+
+### Rolling windows
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_rolling_tokens{window,component,...}` | gauge | Tokens consumed in the trailing window. |
+| `switchyard_economics_rolling_requests{window,...}` | gauge | Requests served in the trailing window. |
+| `switchyard_economics_rolling_provider_cost{window,...,currency}` | gauge | Provider-reported cost incurred in the trailing window, per currency. |
+
+`window` is `1h` or `24h`.
+
+These are computed from the events Switchyard itself observed, not from a
+PromQL `increase()` over a counter. That matters at the edges: `increase()`
+extrapolates from whatever samples exist, so a window that begins before the
+process started, or that contains a restart, is reported as usage the window
+never held. The rolling figures report what was observed inside the window and
+nothing else, so a window shorter than the process's uptime is honest and a
+longer one is limited to the uptime.
+
+Events are aggregated into one-minute buckets and buckets older than 24 hours are
+dropped, so memory follows the last day of activity rather than the life of the
+process. A rolling figure is therefore exact to the minute: a bucket is included
+when its start falls inside the window, so the reported value can differ from the
+instant-by-instant truth by at most the final partial minute.
+
+The rolling windows are gauges, not counters. A counter only grows, and a rolling
+total rises and falls; publishing it as a counter would report the last day's
+usage as though it were the process's lifetime total.
+
+A window that saw no usage for an attribution produces no series for it rather
+than a zero, so an idle provider is absent rather than falsely measured as zero. Prometheus cannot express this: the `@` modifier
 needs a literal timestamp, and a computed one is rejected by the API. Switchyard
 therefore publishes the calendar-day totals itself.
 

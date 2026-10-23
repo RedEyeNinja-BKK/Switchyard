@@ -94,10 +94,10 @@ operator acts on.
 
 ### Why Switchyard cannot produce them today
 
-Switchyard's DeepSeek reader calls `GET https://api.deepseek.com/user/balance`
-and keeps only `total_balance`. That endpoint reports a **level**, not a ledger.
-From two readings of a level, a top-up and a day of usage are indistinguishable,
-so Switchyard cannot derive:
+Switchyard's DeepSeek reader calls `GET https://api.deepseek.com/user/balance`.
+That endpoint reports a **level**, not a ledger, and it is the only account
+surface DeepSeek exposes. From two readings of a level, a top-up and a day of
+usage are indistinguishable, so Switchyard cannot derive:
 
 - **cumulative top-ups** — no purchase history exists in the response;
 - **lifetime spend** — would require accumulating balance deltas, which is an
@@ -111,21 +111,39 @@ so Switchyard cannot derive:
 The legacy figures are therefore *not* reclassified as native data, and no
 historical value is reconstructed or smoothed.
 
-### The one improvement that is cheap and native
+### What Switchyard now measures natively
 
 DeepSeek's balance response also carries `granted_balance` and
-`topped_up_balance` alongside `total_balance`. Switchyard discards both.
+`topped_up_balance` alongside `total_balance`, and Switchyard now reads all
+three. They are published as
+`switchyard_economics_provider_balance_component{component="granted"|"topped_up"}`,
+beside the total and never added to it.
 
-That means **remaining purchased credit and remaining granted credit are
-available today from a call Switchyard already makes**, and are not published
-only because the reader does not parse two fields it already receives. This
-would be a small reader change — no new credential, no new endpoint, no new
-collector.
+This is remaining credit by kind, not purchase history. `topped_up_balance` in
+particular is the topped-up money **still remaining**: an account that bought a
+great deal and spent it reports a small remaining figure.
 
-It would **not** replace the four legacy panels, because a remaining balance is
-not a cumulative purchase total. It would add a genuinely native figure next to
-them, and it would let the dashboard separate "purchased credit still
-available" from "credit purchased in total".
+### No historical API exists
+
+Probed 2026-10-23 with the deployment's own credential:
+
+| Endpoint | Result |
+|---|---|
+| `/user/balance` | 200 |
+| `/models` | 200 |
+| `/user/transactions` | 404 |
+| `/billing/transactions` | 404 |
+| `/user/usage` | 404 |
+| `/usage` | 404 |
+| `/dashboard/billing/usage` | 404 |
+
+DeepSeek publishes a point-in-time balance and a model list. It exposes no
+transaction ledger, no usage history and no per-request cost. Because the four
+legacy figures cannot be observed, they are not reconstructed: no balance
+differencing, and no rate-card estimate presented as a measurement.
+
+A reader added to DeepSeek's own reader would not fix this, and neither would
+polling more often: the information is not in the response.
 
 ### What full replacement requires
 
@@ -141,43 +159,92 @@ available" from "credit purchased in total".
 
 Until (1)–(3) exist, this exception stands and stays labelled.
 
-## 4. `openrouter_stephen`: served but not accounted
+### Proposed cutover (not applied)
 
-Switchyard attributes served usage to `provider="openrouter_stephen"` and
-publishes its tokens and requests. Account-level credit, balance and usage are
-**not** collected for that account.
+The legacy exporter must not be shut down and the four panels must not be
+deleted without an approved cutover. The proposed shape:
 
-The cause is explicit in `build_account_apis`: clients are matched by name
-against `openrouter`, `deepseek` and `openai`/`openai_nt`, and any other name
-falls through to no reader. A client named `openrouter_stephen` therefore
-produces no account series.
+1. **Add** two native balance-component panels to the DeepSeek row. Nothing is
+   removed, and the native figures appear beside the legacy ones with no
+   ambiguity about which is which.
+2. **Freeze** the legacy panels to a fixed historical time range and retitle
+   them `(historical, legacy exporter)`, so they read as an archive of a past
+   series rather than as a live measurement.
+3. **Move** them into a collapsed row that is closed by default, so the live
+   row is Switchyard-only.
+4. **Keep** the exporter running until the frozen window has been captured in a
+   preserved artifact — the dashboard JSON plus a snapshot — because once it
+   stops publishing, the historical series leaves Prometheus retention.
+5. **Remove** the panels only after that artifact is recorded and the operator
+   accepts that the historical figures are no longer queryable.
 
-The metric namespace also labels one account per provider, so a second
-OpenRouter account cannot share the `openrouter` label. A correct fix gives it
-its own label — matching how served usage already labels it — which is a
-provider-identity change, not a copy-paste of the existing reader.
+Steps 1–3 are a dashboard change and need a Grafana GO. Step 4 is an exporter
+retirement and needs its own GO. Nothing here is applied.
 
-Consequence for reporting: the OpenRouter financial panels describe the
-**global key only**. They must not be read as covering Stephen's account, and
-they are titled to say so. Total OpenRouter spend across the deployment is
-higher than the published figure by an unmeasured amount.
+## 4. OpenRouter: both accounts are now read
 
-## 5. Rolling-period accounting is not complete
+Measured 2026-10-23, the two configured OpenRouter clients hold **different
+credentials and belong to different financial accounts**:
 
-The usage panels are cumulative counters, not windowed totals. They show what
-the running deployment has served since it started, and they reset when it
-restarts. A "24h" figure built as `increase(...[24h])` over a counter is a
-rolling estimate and is labelled rolling wherever it appears.
+| Account | Owner identity | Credit pool |
+|---|---|---|
+| `openrouter` | one `creator_user_id` | its own purchased credit |
+| `openrouter_stephen` | a different `creator_user_id` and workspace | a separate credit pool |
 
-Not yet available:
+`build_account_apis` no longer matches client names against a fixed list. It
+decides the account surface from each client's **base URL**, so any configured
+OpenRouter client gets a reader, whatever the operator calls it. Clients sharing
+one credential collapse to one reader; clients with different credentials are
+separate readers published under their own client name.
 
-- validated rolling 1-hour and 24-hour accounting as first-class values;
-- a spend figure that survives a restart without a window boundary artefact;
-- month-to-date accounting native to Switchyard (the OpenRouter month figure is
-  provider-reported, not derived).
+Where the provider states which account a key belongs to — OpenRouter reports
+`creator_user_id` on `/key` — the collector compares those values. Two
+credentials resolving to one account are read once and published once, so a
+second key cannot double the account's reported money. If the reading label
+fails, the other credential takes over rather than the account going unread.
 
-Cumulative totals must not be relabelled as rolling, and a rolling figure must
-not be presented as cumulative.
+**Still open:** the published V8 (version 4) was built before this change, so its
+OpenRouter financial panels still describe the `openrouter` account only. They
+remain correctly titled as covering the global key. Publishing a dashboard that
+shows both accounts requires a separate Grafana GO.
+
+## 5. Rolling-period accounting
+
+Switchyard publishes three separate views of the same usage, and they answer
+different questions:
+
+| View | Series | Question |
+|---|---|---|
+| Cumulative | `switchyard_economics_tokens_total`, `_requests_total` | What has this process served since it started? |
+| Rolling | `switchyard_economics_rolling_tokens{window}`, `_rolling_requests{window}`, `_rolling_provider_cost{window}` | What was served in the last hour or day, ending now? |
+| Bangkok day | `switchyard_economics_calendar_tokens`, `_calendar_requests`, `_calendar_provider_cost` | What has been served since Bangkok midnight? |
+
+Cumulative totals are never relabelled as rolling. A cumulative counter resets
+when the process restarts; a rolling figure is bounded by the process's uptime,
+because nothing before the process started was observed.
+
+The rolling windows are computed from events Switchyard recorded itself, not
+from `increase()` over a counter. `increase()` extrapolates from whatever samples
+happen to exist, so a window containing a restart, or starting before the
+process did, is reported as usage it never held. Keeping the events avoids that:
+a one-hour figure means what was observed in the last hour.
+
+### What is still not native
+
+- **Month-to-date** is provider-reported for OpenRouter (the provider's own
+  `usage_monthly`), and unavailable for DeepSeek. There is no Switchyard-side
+  month accumulator.
+- **Billing-account rollup across accounts** is not published as a single
+  figure. Account families are per account by design, so a deployment-wide total
+  is a query over accounts, not a reported number.
+- **Rolling precision is one minute.** Events aggregate into one-minute buckets,
+  so a rolling figure can differ from the instant-by-instant truth by at most the
+  final partial minute. It is not presented as more precise than that.
+- **Restart** resets the rolling windows. A window longer than the uptime reports
+  only what the current process observed, which is the honest limit.
+
+A dashboard that shows a rolling figure must label it with its window, and one
+that shows a cumulative figure must not call it rolling.
 
 ## 6. Upstream model availability — not an economics concern
 

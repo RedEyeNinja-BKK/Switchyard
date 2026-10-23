@@ -243,6 +243,19 @@ fn record_terminal(
         // beside a Switchyard-derived estimate without ever confusing the two.
         if let Some(cost) = usage.cost {
             economics::metrics::record_provider_cost(attribution, model, cost);
+            // The same cost is accumulated into the two windows, so a "spend today"
+            // or "spend in the last hour" figure is a total of what happened rather
+            // than a difference between two counter samples. The currency travels
+            // with the amount; a charge in CNY is never added to one in USD.
+            let currency = usage.cost_currency.as_deref().unwrap_or("USD");
+            economics::metrics::record_provider_cost_in_rolling(attribution, model, cost, currency);
+            economics::metrics::record_provider_cost_in_calendar(
+                calendar,
+                attribution,
+                model,
+                cost,
+                currency,
+            );
         }
         // The same usage is counted into the Bangkok calendar-day window, with the
         // same components and the same accounting rules, so the day view and the
@@ -256,6 +269,20 @@ fn record_terminal(
         );
         economics::metrics::record_request_in_calendar(
             calendar,
+            attribution,
+            model,
+            economics::metrics::UsageOutcome::Served,
+        );
+        // And into the rolling windows, which are a third question again: the last
+        // hour and the last day, ending now, rather than since the process started or
+        // since Bangkok midnight.
+        economics::metrics::record_usage_in_rolling(
+            attribution,
+            model,
+            usage,
+            economics::metrics::UsageOutcome::Served,
+        );
+        economics::metrics::record_request_in_rolling(
             attribution,
             model,
             economics::metrics::UsageOutcome::Served,

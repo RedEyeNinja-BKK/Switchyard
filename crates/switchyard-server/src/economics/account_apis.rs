@@ -11,7 +11,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::providers::{
-    AccountAmount, AccountApi, AccountObservation, AccountScope, FetchOutcome, ReportingPeriod,
+    AccountAmount, AccountApi, AccountBalanceComponent, AccountObservation, AccountScope,
+    FetchOutcome, ReportingPeriod,
 };
 
 /// The HTTP client the account readers use.
@@ -94,6 +95,20 @@ impl OpenRouterAccount {
         match self.get_json("/key").await {
             Ok(body) => {
                 if let Some(data) = body.get("data") {
+                    // The account this key belongs to, as the provider itself reports it.
+                    // Two keys on one account share this value, which is what lets the
+                    // collector recognise them as one account instead of counting the
+                    // same money twice. It is an opaque identifier, not a secret: it
+                    // grants nothing and is never published.
+                    if let Some(owner) = data.get("creator_user_id").and_then(Value::as_str) {
+                        observation.account_identity = Some(owner.to_string());
+                    } else if let Some(workspace) = data.get("workspace_id").and_then(Value::as_str)
+                    {
+                        // A provisioning key may report no creator. The workspace is
+                        // the next identity the provider states outright, and is a
+                        // weaker but still provider-reported grouping.
+                        observation.account_identity = Some(format!("workspace:{workspace}"));
+                    }
                     // The key endpoint reports the usage of this key over several
                     // windows. Each window is a different amount, so each is
                     // published under its own period rather than folded into one
@@ -164,7 +179,7 @@ impl OpenRouterAccount {
         if observation.is_empty() {
             return FetchOutcome::Failed("provider reported no account state".to_string());
         }
-        FetchOutcome::Ok(observation)
+        FetchOutcome::Ok(Box::new(observation))
     }
 }
 
@@ -241,12 +256,88 @@ impl AccountApi for DeepSeekAccount {
                         total,
                     ));
                 }
+                // The same response breaks the balance into the two kinds of credit it
+                // is made of. They are components of the total above, not additions
+                // to it: granted credit was given by the provider, topped-up credit
+                // was paid for, and `total_balance` is their sum.
+                //
+                // `topped_up_balance` is the topped-up money still remaining. It is
+                // NOT the amount ever purchased, and must never be read as lifetime
+                // top-ups: a heavily used account can hold a small remaining topped-up
+                // balance after buying a great deal.
+                for (field, component) in [
+                    ("granted_balance", "granted"),
+                    ("topped_up_balance", "topped_up"),
+                ] {
+                    if let Some(value) = balance.get(field).and_then(decode_amount) {
+                        observation
+                            .balance_components
+                            .push(AccountBalanceComponent {
+                                component: component.to_string(),
+                                amount: AccountAmount::new(
+                                    currency,
+                                    AccountScope::Account,
+                                    ReportingPeriod::Total,
+                                    value,
+                                ),
+                            });
+                    }
+                }
             }
         }
         if observation.is_empty() {
             return FetchOutcome::Failed("provider reported no balance".to_string());
         }
-        FetchOutcome::Ok(observation)
+        FetchOutcome::Ok(Box::new(observation))
+    }
+}
+
+/// The provider account surface a client's base URL points at.
+///
+/// This is decided from the base URL rather than from the client's name, because the
+/// name is the operator's label for a lane and carries no guarantee. A deployment
+/// that adds a second OpenRouter client called anything at all still points at
+/// `openrouter.ai`, and must still get an account reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AccountSurface {
+    /// OpenRouter's key and credits endpoints.
+    OpenRouter,
+    /// DeepSeek's balance endpoint.
+    DeepSeek,
+    /// The OAuth-backed Codex allowance windows.
+    CodexAllowance,
+}
+
+impl AccountSurface {
+    /// The label this surface's account carries when a deployment names a client
+    /// after the provider itself.
+    ///
+    /// This is not a fallback name for the reader; it is the well-known label a
+    /// dashboard already selects on, kept stable so an added client cannot rename an
+    /// account that is already being read.
+    pub const fn canonical_label(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::DeepSeek => "deepseek",
+            Self::CodexAllowance => "openai",
+        }
+    }
+}
+
+/// Returns the account surface a base URL points at, if Switchyard can read one.
+/// A base URL that matches none of these is a provider whose account surface
+/// Switchyard does not read. That is not an error: a local inference server has no
+/// account, and a provider may expose an inference API without an account API.
+pub fn account_surface_for_base_url(base_url: &str) -> Option<AccountSurface> {
+    let url = base_url.to_ascii_lowercase();
+    if url.contains("openrouter.ai") {
+        Some(AccountSurface::OpenRouter)
+    } else if url.contains("api.deepseek.com") {
+        Some(AccountSurface::DeepSeek)
+    } else if url.contains("chatgpt.com") || url.contains("api.openai.com") {
+        Some(AccountSurface::CodexAllowance)
+    } else {
+        None
     }
 }
 
@@ -350,6 +441,6 @@ impl AccountApi for CodexAllowanceAccount {
         if observation.is_empty() {
             return FetchOutcome::Failed("provider reported no allowance".to_string());
         }
-        FetchOutcome::Ok(observation)
+        FetchOutcome::Ok(Box::new(observation))
     }
 }

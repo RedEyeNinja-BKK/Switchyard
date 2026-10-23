@@ -26,15 +26,19 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Builds a deployment whose clients are the ones named, each holding the
-/// environment variable named.
-fn facts(clients: &[(&str, &str)]) -> DeploymentFacts {
+/// environment variable named and pointing at the base URL given.
+///
+/// The base URL decides which account surface a client reads. It is supplied by the
+/// test rather than inferred from the client's name, because the name is only a
+/// label: a client called anything at all still points at a provider.
+fn facts(clients: &[(&str, &str, &str)]) -> DeploymentFacts {
     let mut deployment = DeploymentFacts::default();
-    for (name, key_env) in clients {
+    for (name, key_env, base_url) in clients {
         deployment.clients.insert(
             (*name).to_string(),
             ClientFacts {
                 name: (*name).to_string(),
-                base_url: "https://example.invalid/v1".to_string(),
+                base_url: (*base_url).to_string(),
                 api_key_env: Some((*key_env).to_string()),
                 billing: None,
             },
@@ -42,6 +46,10 @@ fn facts(clients: &[(&str, &str)]) -> DeploymentFacts {
     }
     deployment
 }
+
+const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+const DEEPSEEK_URL: &str = "https://api.deepseek.com";
+const CODEX_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 /// The environment a test declares: every named variable holds its own name.
 fn env_holding(names: &[&str]) -> impl Fn(&str) -> Option<String> {
@@ -63,8 +71,8 @@ fn env_holding(names: &[&str]) -> impl Fn(&str) -> Option<String> {
 #[test]
 fn two_clients_for_one_provider_produce_one_reader() {
     let deployment = facts(&[
-        ("openai", "SY_OPENAI_OAUTH_TOKEN"),
-        ("openai_nt", "SY_OPENAI_OAUTH_TOKEN"),
+        ("openai", "SY_OPENAI_OAUTH_TOKEN", CODEX_URL),
+        ("openai_nt", "SY_OPENAI_OAUTH_TOKEN", CODEX_URL),
     ]);
     let apis = build_account_apis(&deployment, &env_holding(&["SY_OPENAI_OAUTH_TOKEN"]));
     assert_eq!(
@@ -80,8 +88,12 @@ fn two_clients_for_one_provider_produce_one_reader() {
 #[test]
 fn clients_for_different_providers_each_produce_a_reader() {
     let deployment = facts(&[
-        ("openrouter", "SWITCHYARD_OPENROUTER_API_KEY"),
-        ("deepseek", "SWITCHYARD_DEEPSEEK_API_KEY"),
+        (
+            "openrouter",
+            "SWITCHYARD_OPENROUTER_API_KEY",
+            OPENROUTER_URL,
+        ),
+        ("deepseek", "SWITCHYARD_DEEPSEEK_API_KEY", DEEPSEEK_URL),
     ]);
     let apis = build_account_apis(
         &deployment,
@@ -99,7 +111,11 @@ fn clients_for_different_providers_each_produce_a_reader() {
 /// nothing for that provider rather than publishing a zero.
 #[test]
 fn a_client_without_a_credential_produces_no_reader() {
-    let deployment = facts(&[("openrouter", "SWITCHYARD_OPENROUTER_API_KEY")]);
+    let deployment = facts(&[(
+        "openrouter",
+        "SWITCHYARD_OPENROUTER_API_KEY",
+        OPENROUTER_URL,
+    )]);
     let apis = build_account_apis(&deployment, &env_holding(&[]));
     assert!(
         apis.is_empty(),
@@ -110,7 +126,11 @@ fn a_client_without_a_credential_produces_no_reader() {
 /// A client whose provider exposes no account surface produces no reader.
 #[test]
 fn a_provider_without_an_account_surface_produces_no_reader() {
-    let deployment = facts(&[("thaillm", "SWITCHYARD_THAILLM_API_KEY")]);
+    let deployment = facts(&[(
+        "thaillm",
+        "SWITCHYARD_THAILLM_API_KEY",
+        "https://thaillm.or.th/api/v1",
+    )]);
     let apis = build_account_apis(&deployment, &env_holding(&["SWITCHYARD_THAILLM_API_KEY"]));
     assert!(
         apis.is_empty(),
@@ -524,7 +544,7 @@ async fn the_collection_counts_only_the_providers_that_answered() {
     let mut collector = AccountCollector::new(vec![
         std::sync::Arc::new(Stub {
             provider: "ok",
-            outcome: FetchOutcome::Ok(AccountObservation {
+            outcome: FetchOutcome::Ok(Box::new(AccountObservation {
                 balances: vec![AccountAmount::new(
                     "USD",
                     AccountScope::Account,
@@ -532,7 +552,7 @@ async fn the_collection_counts_only_the_providers_that_answered() {
                     1.0,
                 )],
                 ..AccountObservation::default()
-            }),
+            })),
         }),
         std::sync::Arc::new(Stub {
             provider: "denied",
@@ -546,4 +566,247 @@ async fn the_collection_counts_only_the_providers_that_answered() {
     .with_interval(Duration::from_secs(1));
 
     assert_eq!(collector.collect_once().await, 1);
+}
+
+/// Two OpenRouter clients holding different credentials are two accounts, and each
+/// gets its own label.
+///
+/// The deployed configuration names `openrouter` and `openrouter_stephen`. They are
+/// separate accounts with separate credit, so a single shared label would make one
+/// account's balance silently overwrite the other's.
+#[test]
+fn two_openrouter_credentials_produce_two_labelled_readers() {
+    let deployment = facts(&[
+        (
+            "openrouter",
+            "SWITCHYARD_OPENROUTER_API_KEY",
+            OPENROUTER_URL,
+        ),
+        (
+            "openrouter_stephen",
+            "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY",
+            OPENROUTER_URL,
+        ),
+    ]);
+    let apis = build_account_apis(
+        &deployment,
+        &env_holding(&[
+            "SWITCHYARD_OPENROUTER_API_KEY",
+            "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY",
+        ]),
+    );
+    let mut labels: Vec<&str> = apis.iter().map(|api| api.provider()).collect();
+    labels.sort();
+    assert_eq!(labels, vec!["openrouter", "openrouter_stephen"]);
+}
+
+/// The account surface is decided by the base URL, so a client named something new
+/// still gets a reader. A deployment that adds a second OpenRouter client called
+/// anything at all must not silently get no account telemetry.
+#[test]
+fn a_newly_named_openrouter_client_still_gets_a_reader() {
+    let deployment = facts(&[(
+        "openrouter_third",
+        "SWITCHYARD_THIRD_OPENROUTER_API_KEY",
+        OPENROUTER_URL,
+    )]);
+    let apis = build_account_apis(
+        &deployment,
+        &env_holding(&["SWITCHYARD_THIRD_OPENROUTER_API_KEY"]),
+    );
+    assert_eq!(apis.len(), 1);
+    assert_eq!(apis[0].provider(), "openrouter_third");
+}
+
+/// A reader that reports an account already covered by another label is not
+/// published, because its figures are the same money.
+///
+/// Two keys on one OpenRouter account both answer `/key`, both report the same
+/// `creator_user_id`, and both report the same account-wide credit. Publishing both
+/// would double the account's reported balance.
+#[tokio::test]
+async fn two_keys_for_one_account_are_published_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"usage": 1.0, "creator_user_id": "user_shared"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/credits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"total_credits": 25.0, "total_usage": 1.0}
+        })))
+        .mount(&server)
+        .await;
+
+    let first = std::sync::Arc::new(OpenRouterAccount::new("key-a").with_base_url(server.uri()));
+    let second = std::sync::Arc::new(OpenRouterAccount::new("key-b").with_base_url(server.uri()));
+    let mut collector = AccountCollector::new(vec![
+        std::sync::Arc::new(
+            switchyard_server::economics::providers::LabeledAccount::new("openrouter", first),
+        ),
+        std::sync::Arc::new(
+            switchyard_server::economics::providers::LabeledAccount::new(
+                "openrouter_stephen",
+                second,
+            ),
+        ),
+    ]);
+
+    collector.collect_once().await;
+    // Both answered, but the second is recognised as the same account and is
+    // dropped from the poll set rather than counted twice every interval.
+    assert_eq!(
+        collector.polled_labels(),
+        vec!["openrouter".to_string()],
+        "one account must be polled under one label"
+    );
+}
+
+/// Two keys on two different accounts are both published.
+#[tokio::test]
+async fn keys_for_different_accounts_are_both_published() {
+    let first = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"usage": 1.0, "creator_user_id": "user_one"}
+        })))
+        .mount(&first)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/credits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"total_credits": 125.0, "total_usage": 1.0}
+        })))
+        .mount(&first)
+        .await;
+
+    let second = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"usage": 0.5, "creator_user_id": "user_two"}
+        })))
+        .mount(&second)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/credits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"total_credits": 25.0, "total_usage": 0.5}
+        })))
+        .mount(&second)
+        .await;
+
+    let mut collector = AccountCollector::new(vec![
+        std::sync::Arc::new(
+            switchyard_server::economics::providers::LabeledAccount::new(
+                "openrouter",
+                std::sync::Arc::new(OpenRouterAccount::new("a").with_base_url(first.uri())),
+            ),
+        ),
+        std::sync::Arc::new(
+            switchyard_server::economics::providers::LabeledAccount::new(
+                "openrouter_stephen",
+                std::sync::Arc::new(OpenRouterAccount::new("b").with_base_url(second.uri())),
+            ),
+        ),
+    ]);
+
+    collector.collect_once().await;
+    let mut labels = collector.polled_labels();
+    labels.sort();
+    assert_eq!(
+        labels,
+        vec!["openrouter".to_string(), "openrouter_stephen".to_string()],
+        "two distinct accounts must both be polled"
+    );
+}
+
+/// One account's rejected credential does not stop the other account being read.
+#[tokio::test]
+async fn a_rejected_credential_does_not_starve_the_other_account() {
+    let rejected = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&rejected)
+        .await;
+
+    let healthy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"usage": 2.0, "creator_user_id": "user_healthy"}
+        })))
+        .mount(&healthy)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/credits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"total_credits": 10.0, "total_usage": 2.0}
+        })))
+        .mount(&healthy)
+        .await;
+
+    let mut collector = AccountCollector::new(vec![
+        std::sync::Arc::new(
+            switchyard_server::economics::providers::LabeledAccount::new(
+                "openrouter",
+                std::sync::Arc::new(OpenRouterAccount::new("bad").with_base_url(rejected.uri())),
+            ),
+        ),
+        std::sync::Arc::new(
+            switchyard_server::economics::providers::LabeledAccount::new(
+                "openrouter_stephen",
+                std::sync::Arc::new(OpenRouterAccount::new("good").with_base_url(healthy.uri())),
+            ),
+        ),
+    ]);
+
+    let successful = collector.collect_once().await;
+    assert_eq!(successful, 1, "the healthy account must still be read");
+}
+
+/// A DeepSeek balance that reports its parts keeps them separate from the total.
+#[tokio::test]
+async fn the_deepseek_reader_reports_the_balance_and_its_parts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user/balance"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "is_available": true,
+            "balance_infos": [{
+                "currency": "CNY",
+                "total_balance": "81.76",
+                "granted_balance": "0.00",
+                "topped_up_balance": "81.76"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let reader = DeepSeekAccount::new("key").with_base_url(server.uri());
+    let FetchOutcome::Ok(observation) = reader.fetch().await else {
+        panic!("expected a successful reading");
+    };
+    assert_eq!(observation.balances.len(), 1);
+    assert_eq!(observation.balances[0].value, 81.76);
+
+    let parts: Vec<(&str, f64)> = observation
+        .balance_components
+        .iter()
+        .map(|part| (part.component.as_str(), part.amount.value))
+        .collect();
+    assert_eq!(parts, vec![("granted", 0.0), ("topped_up", 81.76)]);
+    for part in &observation.balance_components {
+        assert_eq!(
+            part.amount.period,
+            ReportingPeriod::Total,
+            "a remaining balance is not a purchase total and carries no window"
+        );
+    }
 }

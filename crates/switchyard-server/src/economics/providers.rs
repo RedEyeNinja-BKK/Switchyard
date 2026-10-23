@@ -112,6 +112,21 @@ impl AccountAmount {
     }
 }
 
+/// One component of a provider's balance.
+///
+/// A provider may report its balance as several parts that add up to the total, and
+/// the parts answer a different question from the total: a promotional grant and
+/// money that was actually paid for are not the same credit, even when they are spent
+/// the same way. The component is published beside the total, never added to it,
+/// because it is inside it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountBalanceComponent {
+    /// The component name the provider uses, lowercased.
+    pub component: String,
+    /// The amount of that component.
+    pub amount: AccountAmount,
+}
+
 /// What a provider reported about its account.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AccountObservation {
@@ -119,6 +134,17 @@ pub struct AccountObservation {
     pub balances: Vec<AccountAmount>,
     /// The purchased credit the provider reported.
     pub credits: Vec<AccountAmount>,
+    /// The parts of the balance the provider reported. Each is inside the balance
+    /// total rather than additional to it.
+    pub balance_components: Vec<AccountBalanceComponent>,
+    /// The verified identity of the financial account this reading came from.
+    ///
+    /// This is what decides whether two configured clients are reading one account or
+    /// two. It comes from a field the provider itself reports, not from the client's
+    /// alias and not from the credential, so two keys on one account are recognised as
+    /// one account even though their credentials differ. It must never carry secret
+    /// material: it is compared, never published.
+    pub account_identity: Option<String>,
     /// The usage the provider reported.
     pub usage: Vec<AccountAmount>,
     /// The remaining allowance of a provider-reported window, by pool name, as a
@@ -134,6 +160,7 @@ impl AccountObservation {
     pub fn is_empty(&self) -> bool {
         self.balances.is_empty()
             && self.credits.is_empty()
+            && self.balance_components.is_empty()
             && self.usage.is_empty()
             && self.allowance_remaining_percent.is_empty()
             && self.allowance_reset_seconds.is_empty()
@@ -144,7 +171,11 @@ impl AccountObservation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum FetchOutcome {
     /// The provider answered and the answer was understood.
-    Ok(AccountObservation),
+    ///
+    /// Boxed because an observation carries several small collections, and a
+    /// `FetchOutcome` that large would make every `Result` carrying it large too -
+    /// including the internal helpers that return one on every refused request.
+    Ok(Box<AccountObservation>),
     /// The provider rejected the credential.
     Unauthorized,
     /// The provider could not be reached, or answered something unusable.
@@ -170,6 +201,38 @@ pub trait AccountApi: Send + Sync {
     /// it on a runtime of its own, so a provider that is slow cannot delay an
     /// inference request.
     async fn fetch(&self) -> FetchOutcome;
+}
+
+/// An account reader published under a label chosen by the deployment.
+///
+/// The concrete readers know the provider *kind* they read, but the label an account
+/// carries is a naming decision the configuration makes: two OpenRouter accounts must
+/// not share one label, or their balances would silently overwrite each other. This
+/// wrapper carries that label without the reader having to know its own name.
+pub struct LabeledAccount {
+    label: String,
+    inner: std::sync::Arc<dyn AccountApi>,
+}
+
+impl LabeledAccount {
+    /// Publishes `inner` under `label`.
+    pub fn new(label: impl Into<String>, inner: std::sync::Arc<dyn AccountApi>) -> Self {
+        Self {
+            label: label.into(),
+            inner,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AccountApi for LabeledAccount {
+    fn provider(&self) -> &str {
+        &self.label
+    }
+
+    async fn fetch(&self) -> FetchOutcome {
+        self.inner.fetch().await
+    }
 }
 
 /// A provider whose account API Switchyard does not read.
@@ -279,6 +342,18 @@ impl AccountPublisher {
             &observation.usage,
             provider,
         );
+        // The parts of the balance, each of which is already inside the total above.
+        // Published under their own family so a query cannot accidentally add a
+        // component to the total that contains it.
+        for part in &observation.balance_components {
+            publish_amounts_with(
+                &meter,
+                "switchyard.economics_provider_balance_component",
+                std::slice::from_ref(&part.amount),
+                provider,
+                Some(("component", part.component.as_str())),
+            );
+        }
         for (pool, value) in &observation.allowance_remaining_percent {
             meter
                 .f64_gauge("switchyard.economics_allowance_remaining_percent")
@@ -349,15 +424,35 @@ fn publish_amounts(
     amounts: &[AccountAmount],
     provider: &str,
 ) {
+    publish_amounts_with(meter, name, amounts, provider, None);
+}
+
+/// Publishes reported amounts under one metric family, with one extra label.
+///
+/// The extra label separates amounts that are otherwise identical in currency,
+/// scope and period — the parts of a single balance, for instance. Without it those
+/// parts would collapse into one series and silently overwrite each other, leaving
+/// whichever was published last as the account's only reported figure.
+fn publish_amounts_with(
+    meter: &opentelemetry::metrics::Meter,
+    name: &'static str,
+    amounts: &[AccountAmount],
+    provider: &str,
+    extra: Option<(&'static str, &str)>,
+) {
     for amount in amounts {
-        meter.f64_gauge(name).build().record(
-            amount.value,
-            &[
-                KeyValue::new("provider", provider.to_string()),
-                KeyValue::new("currency", amount.currency.clone()),
-                KeyValue::new("scope", amount.scope.as_str()),
-                KeyValue::new("period", amount.period.as_str()),
-            ],
-        );
+        let mut attributes = vec![
+            KeyValue::new("provider", provider.to_string()),
+            KeyValue::new("currency", amount.currency.clone()),
+            KeyValue::new("scope", amount.scope.as_str()),
+            KeyValue::new("period", amount.period.as_str()),
+        ];
+        if let Some((key, value)) = extra {
+            attributes.push(KeyValue::new(key, value.to_string()));
+        }
+        meter
+            .f64_gauge(name)
+            .build()
+            .record(amount.value, &attributes);
     }
 }

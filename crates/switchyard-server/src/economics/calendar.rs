@@ -53,6 +53,8 @@ struct DayCounters {
     requests: Vec<(Vec<KeyValue>, u64)>,
     /// The tokens consumed in the day, by attribution and component.
     tokens: Vec<(Vec<KeyValue>, u64)>,
+    /// The provider-reported cost incurred in the day, by attribution and currency.
+    costs: Vec<(Vec<KeyValue>, f64)>,
 }
 
 /// Publishes calendar-day counters alongside the rolling and cumulative ones.
@@ -110,6 +112,25 @@ impl CalendarWindow {
         }
     }
 
+    /// Records a provider-reported cost in the current calendar day.
+    ///
+    /// The currency travels with the amount, because a day that folded a CNY charge
+    /// and a USD charge into one number would report a figure denominated in nothing.
+    pub fn record_cost(&self, attributes: &[KeyValue], currency: &str, cost: f64) {
+        let mut counters = self.counters.lock().expect("calendar window poisoned");
+        self.roll_over(&mut counters);
+        let mut key = attributes.to_vec();
+        key.push(KeyValue::new("currency", currency.to_string()));
+        match counters
+            .costs
+            .iter_mut()
+            .find(|(existing, _)| *existing == key)
+        {
+            Some((_, total)) => *total += cost,
+            None => counters.costs.push((key, cost)),
+        }
+    }
+
     /// Resets the counters when the Bangkok day has rolled over.
     fn roll_over(&self, counters: &mut DayCounters) {
         let today = bangkok_day_start(now_seconds());
@@ -117,6 +138,7 @@ impl CalendarWindow {
             counters.day_start = today;
             counters.requests.clear();
             counters.tokens.clear();
+            counters.costs.clear();
         }
     }
 
@@ -187,6 +209,12 @@ impl CalendarWindow {
                 .f64_gauge("switchyard.economics_calendar_tokens")
                 .build()
                 .record(*total as f64, attributes);
+        }
+        for (attributes, total) in &counters.costs {
+            meter
+                .f64_gauge("switchyard.economics_calendar_provider_cost")
+                .build()
+                .record(*total, attributes);
         }
     }
 }

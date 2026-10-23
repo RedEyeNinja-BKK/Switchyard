@@ -14,19 +14,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::account_apis::{CodexAllowanceAccount, DeepSeekAccount, OpenRouterAccount};
+use super::account_apis::{
+    AccountSurface, CodexAllowanceAccount, DeepSeekAccount, OpenRouterAccount,
+    account_surface_for_base_url,
+};
 use super::collector::AccountCollector;
-use super::providers::AccountApi;
+use super::providers::{AccountApi, LabeledAccount};
 
 /// How often the calendar counters are republished.
 const CALENDAR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
-
-/// A credential, held so that two clients can be compared without the secret ever
-/// becoming printable.
-///
-/// The type deliberately has no `Debug` implementation, so a structure holding one
-/// cannot be logged by accident.
-struct Credential(String);
 
 /// Builds the account readers a deployment's configuration authorizes.
 ///
@@ -45,13 +41,19 @@ pub fn build_account_apis(
     facts: &switchyard_runner::DeploymentFacts,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<Arc<dyn AccountApi>> {
-    let mut apis: Vec<Arc<dyn AccountApi>> = Vec::new();
-    // The provider label already read, with the credential it was read with. The
-    // provider label is the account's identity in the metric namespace, so one
-    // label means one account.
-    let mut read: BTreeMap<String, Credential> = BTreeMap::new();
+    // Group the clients by the account they read: one group per (surface,
+    // credential). Two clients holding one credential read one account, so they
+    // produce one reader; two clients holding different credentials are two readers
+    // until the provider itself says otherwise.
+    let mut groups: BTreeMap<(AccountSurface, String), Vec<String>> = BTreeMap::new();
 
     for client in facts.clients.values() {
+        let Some(surface) = account_surface_for_base_url(&client.base_url) else {
+            // A provider with no account surface produces no reader. It is not
+            // recorded as a zero balance, because a provider that exposes nothing has
+            // not reported a balance of zero.
+            continue;
+        };
         let Some(key_env) = &client.api_key_env else {
             continue;
         };
@@ -61,49 +63,40 @@ pub fn build_account_apis(
         if credential.is_empty() {
             continue;
         }
+        groups
+            .entry((surface, credential))
+            .or_default()
+            .push(client.name.clone());
+    }
 
-        let (provider, api): (String, Arc<dyn AccountApi>) = match client.name.as_str() {
-            "openrouter" => (
-                "openrouter".to_string(),
-                Arc::new(OpenRouterAccount::new(credential.clone())),
-            ),
-            "deepseek" => (
-                "deepseek".to_string(),
-                Arc::new(DeepSeekAccount::new(credential.clone())),
-            ),
-            "openai" | "openai_nt" => {
-                let account_id = env("SY_OPENAI_ACCOUNT_ID");
-                (
-                    "openai".to_string(),
-                    Arc::new(CodexAllowanceAccount::new(credential.clone(), account_id)),
-                )
-            }
-            // A provider with no account surface produces no reader. It is not
-            // recorded as a zero balance, because a provider that exposes nothing
-            // has not reported a balance of zero.
-            _ => continue,
+    let mut apis: Vec<Arc<dyn AccountApi>> = Vec::new();
+    for ((surface, credential), mut names) in groups {
+        names.sort();
+
+        // The account's label in the metric namespace. Each label means one account,
+        // so the label must be unique per account and stable across restarts.
+        //
+        // A client whose name already matches the surface is preferred, which keeps
+        // the labels a dashboard selects on — `openai`, `deepseek`, `openrouter` —
+        // unchanged for the deployments that already use them. Otherwise the first
+        // name in sorted order is used, so the choice does not depend on the order the
+        // configuration happened to declare the clients in.
+        let canonical = surface.canonical_label();
+        let label = if names.iter().any(|name| name == canonical) {
+            canonical.to_string()
+        } else {
+            names[0].clone()
         };
 
-        if let Some(existing) = read.get(&provider) {
-            // Two clients for one provider normally share one credential, which is
-            // the ordinary case and needs no report. Different credentials mean two
-            // accounts behind one label, which the metric namespace cannot
-            // represent; that is a configuration ambiguity worth saying out loud
-            // rather than resolving silently.
-            if existing.0 != credential {
-                tracing::warn!(
-                    provider = %provider,
-                    client = %client.name,
-                    "several clients share one provider account label but hold different \
-                     credentials; only the first is read, and the metric namespace cannot \
-                     distinguish the accounts"
-                );
+        let api: Arc<dyn AccountApi> = match surface {
+            AccountSurface::OpenRouter => Arc::new(OpenRouterAccount::new(credential)),
+            AccountSurface::DeepSeek => Arc::new(DeepSeekAccount::new(credential)),
+            AccountSurface::CodexAllowance => {
+                let account_id = env("SY_OPENAI_ACCOUNT_ID");
+                Arc::new(CodexAllowanceAccount::new(credential, account_id))
             }
-            continue;
-        }
-
-        read.insert(provider, Credential(credential));
-        apis.push(api);
+        };
+        apis.push(Arc::new(LabeledAccount::new(label, api)));
     }
     apis
 }
@@ -132,6 +125,10 @@ pub fn start(
         .spawn(move || {
             loop {
                 super::calendar::publish_calendar(&calendar);
+                // The rolling windows are republished on the same cadence. They are
+                // gauges over events the request path records, so a publish only
+                // recomputes totals and drops the buckets no window can still reach.
+                super::rolling::publish_global();
                 std::thread::sleep(CALENDAR_PUBLISH_INTERVAL);
             }
         })

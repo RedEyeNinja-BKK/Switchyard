@@ -234,6 +234,60 @@ pub fn record_request(attribution: &UsageAttribution, model: &str, outcome: Usag
         );
 }
 
+/// Records one request's tokens in the rolling windows.
+///
+/// The rolling windows keep the events themselves, so a one-hour figure means what
+/// was observed in the last hour rather than what a counter extrapolates. The same
+/// components and the same accounting rules are used as everywhere else, so a token
+/// is never counted twice between the prompt total and the cache inside it.
+pub fn record_usage_in_rolling(
+    attribution: &UsageAttribution,
+    model: &str,
+    usage: &Usage,
+    outcome: UsageOutcome,
+) {
+    let windows = super::rolling::global();
+    for (component, value) in token_components(usage) {
+        let attributes = attribution.attributes(model, component.as_str(), outcome.as_str());
+        windows.record_tokens(&attributes, value);
+    }
+}
+
+/// Records one served request in the rolling windows.
+pub fn record_request_in_rolling(
+    attribution: &UsageAttribution,
+    model: &str,
+    outcome: UsageOutcome,
+) {
+    let attributes = attribution.attributes(model, "request", outcome.as_str());
+    super::rolling::global().record_request(&attributes);
+}
+
+/// Records one provider-reported cost in the rolling windows.
+pub fn record_provider_cost_in_rolling(
+    attribution: &UsageAttribution,
+    model: &str,
+    cost: f64,
+    currency: &str,
+) {
+    let attributes =
+        attribution.attributes(model, "provider_reported", UsageOutcome::Served.as_str());
+    super::rolling::global().record_cost(&attributes, currency, cost);
+}
+
+/// Records one provider-reported cost in the Bangkok calendar day.
+pub fn record_provider_cost_in_calendar(
+    calendar: &super::CalendarWindow,
+    attribution: &UsageAttribution,
+    model: &str,
+    cost: f64,
+    currency: &str,
+) {
+    let attributes =
+        attribution.attributes(model, "provider_reported", UsageOutcome::Served.as_str());
+    calendar.record_cost(&attributes, currency, cost);
+}
+
 /// Publishes the provider-reported cost of one request.
 ///
 /// This is the amount the provider itself billed, in the provider's own currency. It

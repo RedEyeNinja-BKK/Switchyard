@@ -29,7 +29,7 @@ fn classification() -> DeploymentClassification {
         ),
         (
             "comfyninja".to_string(),
-            "http://reninja.tailc8ef7b.ts.net:8446/v1".to_string(),
+            "http://gpu-box.tailnet-example.ts.net:8446/v1".to_string(),
         ),
         (
             "openai".to_string(),

@@ -361,7 +361,7 @@ mod tests {
             ),
             (
                 "comfyninja".to_string(),
-                "http://reninja.tailc8ef7b.ts.net:8446/v1".to_string(),
+                "http://gpu-box.tailnet-example.ts.net:8446/v1".to_string(),
             ),
             (
                 "openai".to_string(),
@@ -566,8 +566,12 @@ mod tests {
         assert!(!is_local_host("https://openrouter.ai/api/v1"));
         assert!(!is_local_host("https://api.deepseek.com"));
         // A tailnet, a private address and a bare host name are local.
-        assert!(is_local_host("http://reninja.tailc8ef7b.ts.net:8446/v1"));
-        assert!(is_local_host("http://htpc-wsl.tailc8ef7b.ts.net:8889/v1"));
+        assert!(is_local_host(
+            "http://gpu-box.tailnet-example.ts.net:8446/v1"
+        ));
+        assert!(is_local_host(
+            "http://desk-box.tailnet-example.ts.net:8889/v1"
+        ));
         assert!(is_local_host("http://192.168.1.10:8080/v1"));
         assert!(is_local_host("http://localhost:4000/v1"));
         assert!(is_local_host("http://gpu-box:8000/v1"));

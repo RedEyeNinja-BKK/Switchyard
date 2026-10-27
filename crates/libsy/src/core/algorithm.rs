@@ -61,6 +61,25 @@ impl RuntimeModels {
         }
     }
 
+    /// The first model across every category, in category map order.
+    ///
+    /// A host that only needs "which target would this route call first" — without
+    /// knowing which category the algorithm prefers — reads this.
+    pub fn first_model(&self) -> Option<ModelId> {
+        self.by_category
+            .values()
+            .find_map(|models| models.first())
+            .cloned()
+    }
+
+    /// Every model across every category, in category map order.
+    ///
+    /// Order between categories is unspecified beyond the map's own order; callers that
+    /// need a declared order should read a specific category instead.
+    pub fn all_models(&self) -> Vec<ModelId> {
+        self.by_category.values().flatten().cloned().collect()
+    }
+
     /// Whether every category has been emptied by filtering.
     pub fn is_empty(&self) -> bool {
         self.by_category.values().all(|models| models.is_empty())

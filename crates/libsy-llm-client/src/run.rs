@@ -437,6 +437,18 @@ pub enum FailureClass {
     /// whole account is out, so trying the next candidate cannot help: it would spend
     /// a request from an allowance already known to be empty.
     AccountQuota,
+    /// The addressed model slug itself is gone.
+    ///
+    /// A model-lifecycle event: the provider no longer serves this slug at all, so no
+    /// property of the request can change the answer and another candidate or child may
+    /// legitimately serve. Distinct from a 404 that reports a filtered request — a
+    /// missing asset or an unsupported modality — which stays [`Self::Other`].
+    ///
+    /// Distinction is structural, measured against the live OpenRouter API on
+    /// 2026-10-27: a routing-filter 404 carries `error.metadata` (`failed_routing_step`,
+    /// `routing_funnel`), while a retirement notice carries none. A non-JSON body or an
+    /// absent `error` object is never a retirement.
+    ModelRetired,
     /// Anything else, including local failures with no provider involvement.
     Other,
 }
@@ -451,6 +463,25 @@ impl FailureClass {
     /// A context-window rejection is excluded on purpose: the next child may hold a
     /// smaller window still, and crossing would only trade one rejection for another.
     /// Capability evidence decides child order, not recovery from an oversized request.
+    ///
+    /// Account-quota exhaustion also crosses. That looks like the opposite of the rule
+    /// above, but the two are not in tension: a quota is a property of the credential, not
+    /// of the provider, so the next child is only worth trying when it draws on a
+    /// *different* credential. The composite cannot tell which is which from the class
+    /// alone, so the caller decides by arranging children that share a credential before
+    /// children that do not. A composite that puts two same-credential children in a row
+    /// wastes the second one; the class is permissive because the configuration is the
+    /// real gate.
+    ///
+    /// A retired model crosses for the same reason a transient failure does: the slug
+    /// itself is gone, so no retry against it can ever answer.
+    ///
+    /// A credential REJECTION (401) also crosses, with the same credential-scoped
+    /// reasoning as an exhausted allowance: the failure condemns the credential that
+    /// served it, not the request, so a child on another credential may still serve.
+    /// The composite judges the credential, which is why [`CredentialBlock`] exists; a
+    /// 403 guardrail or a caller-format refusal stays terminal, because those are
+    /// request facts another credential must not paper over.
     pub fn allows_cross_route(self) -> bool {
         matches!(
             self,
@@ -459,6 +490,8 @@ impl FailureClass {
                 | Self::RateLimited
                 | Self::TemporarilyUnavailable
                 | Self::Server
+                | Self::AccountQuota
+                | Self::ModelRetired
         )
     }
 
@@ -495,6 +528,40 @@ fn is_retired_minimax_free(error: &LibsyError) -> bool {
     })
 }
 
+/// Whether a 404 says the addressed model slug itself is gone.
+///
+/// Measured against the live OpenRouter API on 2026-10-27: a model-level 404 — the
+/// retirement-notice shape — is a bare `{"error": {"message", "code": 404}}` with no
+/// `error.metadata`, while a request filtered by routing carries structured metadata
+/// naming the failed step (`failed_routing_step`, `routing_funnel`). The provider's own
+/// structure is the discriminator: a 404 WITHOUT `error.metadata` says the model is
+/// gone regardless of the request, so another candidate may serve; a 404 WITH metadata
+/// says the request was filtered, which is a request fact that stays terminal. A
+/// non-JSON body, a missing `error` object, or any 404 OpenRouter annotates is not a
+/// retirement.
+///
+/// The predicate lives next to [`is_account_wide_quota`] for the same reason that
+/// predicate lives in `client.rs`: two decision layers (candidate fallback and
+/// whole-route composition) must reach the same verdict.
+pub(crate) fn is_retired_model(error: &LlmClientError) -> bool {
+    let LlmClientError::UpstreamHttp { status, body } = error else {
+        return false;
+    };
+    if *status != StatusCode::NOT_FOUND {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").and_then(Value::as_object);
+    let Some(error) = error else {
+        return false;
+    };
+    // No metadata on the error object: the provider did not say the request was
+    // filtered, so the 404 is about the model itself.
+    error.get("metadata").is_none_or(Value::is_null)
+}
+
 /// Whether a 429 says an ACCOUNT-WIDE allowance is exhausted, rather than one model
 /// or one provider being busy.
 ///
@@ -507,13 +574,128 @@ fn is_retired_minimax_free(error: &LibsyError) -> bool {
 /// Only a 429 with that explicit marker qualifies. A 429 without it stays a plain
 /// rate limit, so provider throttling keeps its existing fallthrough.
 ///
-/// The status/body predicate lives in [`crate::client::is_account_wide_quota`] because the
-/// retry loop must reach the same verdict; this wrapper only unwraps the routing error.
+/// The status/body predicate lives in [`crate::client::is_account_wide_quota`] because
+/// the retry loop must reach the same verdict; this wrapper only unwraps the routing
+/// error.
 fn is_account_wide_quota_exhausted(error: &LibsyError) -> bool {
     let LibsyError::ClientCall { source, .. } = error else {
         return false;
     };
     crate::client::is_account_wide_quota(source)
+}
+
+/// The scope of an exhausted allowance: which models on the credential it blocks.
+///
+/// `openrouter_free_tier_daily` is an allowance over `:free` slugs only — a paid slug
+/// on the same credential draws on the account balance, not this cap. An unnamed or
+/// unrecognized scope is treated as the whole credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuotaScope {
+    /// Free slugs only; paid slugs on the same credential remain servable.
+    FreeOnly,
+    /// Every model on the credential.
+    Credential,
+}
+
+/// The quota scope an OpenRouter error body names, when any is named.
+fn quota_scope(body: &str) -> QuotaScope {
+    let value = serde_json::from_str::<Value>(body).ok();
+    match value
+        .as_ref()
+        .and_then(|value| value["error"]["metadata"]["limit_source"].as_str())
+    {
+        Some("openrouter_free_tier_daily") => QuotaScope::FreeOnly,
+        _ => QuotaScope::Credential,
+    }
+}
+
+/// A credential-level block a whole-route composite acts on.
+///
+/// The wire error cannot name the credential — it names the failing target slug — so
+/// the composite resolves the credential from its own configuration, then constructs
+/// this block. `blocks` is judged against the resolved credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialBlock {
+    /// The credential that owns the exhausted allowance or was rejected. Configuration
+    /// supplies this identity, keyed by `llm_client`; the wire error does not carry it.
+    pub credential: String,
+    /// What the failure blocks on that credential.
+    pub kind: CredentialBlockKind,
+    /// The provider slug that reported the block.
+    pub target: String,
+}
+
+/// What one credential-level block covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialBlockKind {
+    /// The credential's free-model daily allowance is exhausted. Blocks only `:free`
+    /// slugs: paid slugs on the same credential draw on the account balance, not this
+    /// allowance, and remain servable.
+    FreeQuota,
+    /// The credential's whole allowance is gone (an exhausted balance, or a cap the
+    /// error body does not scope to free slugs). Blocks every slug on the credential.
+    WholeQuota,
+    /// The credential itself was rejected (invalid, revoked or unauthenticated key).
+    /// Blocks every slug on the credential.
+    ///
+    /// Deliberately NOT derived from 403: a 403 may be a per-request guardrail or policy
+    /// refusal, and treating those as credential-wide would bypass policy by sending the
+    /// refused request to another credential. Only the unambiguous 401 authentication
+    /// failure qualifies here.
+    Unauthorized,
+}
+
+impl CredentialBlock {
+    /// Whether this block stops a later child on `credential` from being worth a call
+    /// to `target`.
+    ///
+    /// A block recorded against one credential says nothing about another.
+    pub fn blocks(&self, credential: &str, target: &str) -> bool {
+        if credential != self.credential {
+            return false;
+        }
+        match self.kind {
+            CredentialBlockKind::FreeQuota => target.ends_with(":free"),
+            CredentialBlockKind::WholeQuota | CredentialBlockKind::Unauthorized => true,
+        }
+    }
+}
+
+/// Reads the credential-level block a failure carries, if any.
+///
+/// Returns the block KIND and the failing target slug. The composite pairs the kind
+/// with the credential its own configuration resolves for that slug; the wire error
+/// cannot carry the credential itself. `None` when the failure says nothing about any
+/// credential: ordinary request, transport, policy or per-model failures do not
+/// condemn one.
+pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, String)> {
+    let LibsyError::ClientCall { target, source } = error else {
+        return None;
+    };
+    let target = target.as_str().to_string();
+    // Account-wide quota first: a 429 with the free-tier marker is a quota, not a
+    // throttle, and its scope decides how much of the credential is blocked.
+    if crate::client::is_account_wide_quota(source) {
+        let LlmClientError::UpstreamHttp { body, .. } = source else {
+            return Some((CredentialBlockKind::WholeQuota, target));
+        };
+        let kind = match quota_scope(body) {
+            QuotaScope::FreeOnly => CredentialBlockKind::FreeQuota,
+            QuotaScope::Credential => CredentialBlockKind::WholeQuota,
+        };
+        return Some((kind, target));
+    }
+    // A bare 401 says the credential itself was rejected. The 401 that belongs to a
+    // FORWARDED caller credential must not be treated as a fault of the route's
+    // configured credential; the composite filters that case out when it cannot
+    // resolve the credential for the failing slug.
+    match source {
+        LlmClientError::UpstreamHttp {
+            status: StatusCode::UNAUTHORIZED,
+            ..
+        } => Some((CredentialBlockKind::Unauthorized, target)),
+        _ => None,
+    }
 }
 
 /// Classifies a provider failure without interpreting it again at each call site.
@@ -535,6 +717,7 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
         LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
         LlmClientError::UpstreamHttp { status, body } => match *status {
+            StatusCode::NOT_FOUND if is_retired_model(source) => FailureClass::ModelRetired,
             StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
             StatusCode::REQUEST_TIMEOUT => FailureClass::Timeout,
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => FailureClass::Auth,
@@ -559,15 +742,21 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     if is_retired_minimax_free(error) {
         return Some(RoutingFallbackReason::Unavailable);
     }
+    // A model-level 404 — the slug itself is gone — may be routed around. Measured
+    // 2026-10-27: a retirement 404 carries no `error.metadata`, while a routing-filter
+    // 404 (missing asset, unsupported modality) does and stays terminal below.
+    let LibsyError::ClientCall { source, .. } = error else {
+        return None;
+    };
+    if is_retired_model(source) {
+        return Some(RoutingFallbackReason::Unavailable);
+    }
     // An exhausted account-wide allowance is not a reason to try another candidate:
     // they all draw on the same allowance, so the next attempt cannot succeed and
     // only spends another request against a cap already known to be at zero.
     if is_account_wide_quota_exhausted(error) {
         return None;
     }
-    let LibsyError::ClientCall { source, .. } = error else {
-        return None;
-    };
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
         // Pre-commit expiry: this attempt returned no response at all, so another
@@ -2237,6 +2426,78 @@ mod tests {
         assert!(!FailureClass::Other.allows_cross_route());
     }
 
+    /// A model-level 404 — no `error.metadata` — is the retirement shape, measured
+    /// against the live OpenRouter API on 2026-10-27. The slug is gone regardless of
+    /// the request, so the candidate rolls over and a whole-route composite may cross.
+    #[test]
+    fn a_model_level_404_without_error_metadata_is_a_retired_slug() {
+        let retired = LibsyError::client_call(
+            "vendor/any-model:free",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::NOT_FOUND,
+                body: json!({
+                    "error": {"message": "whatever the notice says", "code": 404},
+                    "user_id": "user_x"
+                })
+                .to_string(),
+            },
+        );
+        assert_eq!(
+            fallback_reason(&retired),
+            Some(RoutingFallbackReason::Unavailable),
+            "a bare model-level 404 may be routed around"
+        );
+        assert_eq!(failure_class(&retired), FailureClass::ModelRetired);
+        assert!(failure_class(&retired).allows_cross_route());
+    }
+
+    /// A 404 carrying `error.metadata` says the REQUEST was filtered — a missing asset
+    /// or an unsupported modality, measured live 2026-10-27 as
+    /// `failed_routing_step`/`routing_funnel`. It is a request fact, not a model
+    /// lifecycle event, so it stays terminal. This is the structural replacement for
+    /// the retired MiniMax string special-case.
+    #[test]
+    fn a_404_with_error_metadata_is_a_filtered_request_and_stays_terminal() {
+        let filtered = LibsyError::client_call(
+            "recursive/flint-v1.0:free",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::NOT_FOUND,
+                body: json!({
+                    "error": {
+                        "message": "No endpoints found that support image input",
+                        "code": 404,
+                        "metadata": {
+                            "routing_funnel": [{"step": "Initial Endpoints", "endpoint_count": 1}],
+                            "failed_routing_step": "Filter by Image Support"
+                        }
+                    }
+                })
+                .to_string(),
+            },
+        );
+        assert_eq!(fallback_reason(&filtered), None, "{filtered:?}");
+        assert_eq!(failure_class(&filtered), FailureClass::Other);
+        assert!(!failure_class(&filtered).allows_cross_route());
+    }
+
+    /// A non-JSON 404 body has no structured evidence at all. It is NOT promoted to a
+    /// retirement: absence of proof is not proof of absence.
+    #[test]
+    fn a_non_json_404_body_is_not_a_retirement() {
+        for body in ["", "not json", r#"{"error":"bare string"}"#, r#"{}"#] {
+            let error = LibsyError::client_call(
+                "some/model",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::NOT_FOUND,
+                    body: body.to_string(),
+                },
+            );
+            assert_eq!(fallback_reason(&error), None, "{body:?}");
+            assert_eq!(failure_class(&error), FailureClass::Other, "{body:?}");
+        }
+    }
+
+    /// The historical MiniMax test remains and keeps its original assertions.
     #[test]
     fn only_the_verified_minimax_retirement_notice_is_a_fallback() {
         let retired = LibsyError::client_call(
@@ -2251,34 +2512,54 @@ mod tests {
             Some(RoutingFallbackReason::Unavailable)
         );
         assert!(failure_class(&retired).allows_cross_route());
-        for (target, message) in [
+        for (target, message, metadata) in [
+            // A DIFFERENT model with the same retirement wording is NOT the retirement:
+            // the notice alone never qualified. Now it is a bare model-level 404, which
+            // IS crossable — the wording never was the discriminator.
             (
                 "some/other-model:free",
                 "The free launch period for MiniMax M3.1 Flash ended on Oct 22, 2026. The `:free` variant has been retired",
+                false,
             ),
+            // A modality filter carries structured metadata: request fact, terminal.
             (
                 "minimax/minimax-m3.1-flash:free",
                 "No endpoints found that support video URLs",
+                true,
             ),
+            // The invalid-slug wording arrives as a 400 in practice (measured
+            // 2026-10-27); with a 404 wrapper it still has no metadata, so it reads as
+            // a model-level 404 and rolls over. The 400 itself is terminal below.
             (
                 "minimax/minimax-m3.1-flash:free",
                 "minimax/minimax-m3.1-flash:free is not a valid model ID",
+                false,
             ),
             (
                 "minimax/minimax-m3.1-flash:free",
                 "The free launch period for MiniMax M3.1 Flash ended on Oct 22, 2026. The `:free` variant has been retired",
+                false,
             ),
         ] {
+            let mut error_body = json!({"error": {"message": message}});
+            if metadata {
+                error_body["error"]["metadata"] = json!({"failed_routing_step": "Filter"});
+            }
             let error = LibsyError::client_call(
                 target,
                 LlmClientError::UpstreamHttp {
                     status: StatusCode::NOT_FOUND,
-                    body: json!({"error": {"message": message}}).to_string(),
+                    body: error_body.to_string(),
                 },
             );
-            assert_eq!(fallback_reason(&error), None, "{target}: {message}");
-            assert!(
+            assert_eq!(
+                fallback_reason(&error),
+                if metadata { None } else { Some(RoutingFallbackReason::Unavailable) },
+                "{target}: {message}"
+            );
+            assert_eq!(
                 !failure_class(&error).allows_cross_route(),
+                metadata,
                 "{target}: {message}"
             );
         }
@@ -2898,8 +3179,11 @@ mod tests {
 
 #[cfg(test)]
 mod account_quota_tests {
-    use super::{FailureClass, failure_class, fallback_reason};
+    use super::{
+        CredentialBlockKind, FailureClass, credential_block, failure_class, fallback_reason,
+    };
     use http::StatusCode;
+    use serde_json::json;
     use switchyard_libsy::LibsyError;
     use switchyard_protocol::LlmClientError;
 
@@ -2940,15 +3224,17 @@ mod account_quota_tests {
         assert_eq!(failure_class(&error), FailureClass::AccountQuota);
     }
 
-    /// An account-wide cap must not let a composite cross into another child route,
-    /// because every child shares the same credential and the same allowance.
+    /// An account-wide cap is crossable as a class, but the composite must not waste a
+    /// provider call on a second child that draws on the same credential. The class is
+    /// permissive; the configuration is the gate, so the test asserts the class and the
+    /// ordering rule separately.
     #[test]
-    fn an_account_wide_daily_cap_does_not_cross_a_composite() {
+    fn an_account_wide_daily_cap_is_crossable_but_same_credential_ordering_wastes_it() {
         let error = rate_limited(
             "dots-studio/dots-3-note-preview:free",
             Some("openrouter_free_tier_daily"),
         );
-        assert!(!failure_class(&error).allows_cross_route());
+        assert!(failure_class(&error).allows_cross_route());
         assert!(failure_class(&error).is_account_quota());
     }
 
@@ -2999,5 +3285,142 @@ mod account_quota_tests {
         );
         assert_eq!(failure_class(&error), FailureClass::Server);
         assert!(fallback_reason(&error).is_some());
+    }
+
+    /// The free-tier daily cap names its scope. The block it produces covers only
+    /// `:free` slugs on the credential that reported it: a paid slug on that same
+    /// credential draws on the account balance, not this allowance.
+    #[test]
+    fn the_free_tier_cap_blocks_only_free_slugs_on_its_own_credential() {
+        let error = rate_limited(
+            "dots-studio/dots-3-note-preview:free",
+            Some("openrouter_free_tier_daily"),
+        );
+        let (kind, slug) = credential_block(&error).expect("the cap carries a credential block");
+        assert_eq!(kind, CredentialBlockKind::FreeQuota);
+        let block = super::CredentialBlock {
+            credential: "openrouter_stephen".to_string(),
+            kind,
+            target: slug,
+        };
+        assert!(
+            block.blocks("openrouter_stephen", "recursive/flint-v1.0:free"),
+            "a free slug on the same credential is blocked"
+        );
+        assert!(
+            !block.blocks("openrouter_stephen", "z-ai/glm-5.3-flash"),
+            "a paid slug on the same credential is NOT blocked by the free cap"
+        );
+        assert!(
+            !block.blocks("htpc", "Qwen3.5-9B-MTP"),
+            "a different credential is untouched by this block"
+        );
+    }
+
+    /// A quota the error body does not scope to free slugs is treated as covering the
+    /// whole credential: the conservative reading, because the error left the scope
+    /// unnamed. A 402 (exhausted balance) is such a quota; a 403 WITH a budget marker
+    /// is another.
+    #[test]
+    fn an_unscoped_quota_covers_the_whole_credential() {
+        let payment = LibsyError::client_call(
+            "vendor/any-model",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::PAYMENT_REQUIRED,
+                body: json!({"error": {"message": "Insufficient credits", "code": 402}})
+                    .to_string(),
+            },
+        );
+        let (kind, slug) = credential_block(&payment).expect("402 carries a credential block");
+        assert_eq!(kind, CredentialBlockKind::WholeQuota);
+        let block = super::CredentialBlock {
+            credential: "openrouter_stephen".to_string(),
+            kind,
+            target: slug,
+        };
+        assert!(
+            block.blocks("openrouter_stephen", "z-ai/glm-5.3-flash"),
+            "an exhausted balance blocks paid slugs on the same credential"
+        );
+        assert!(!block.blocks("htpc", "Qwen3.5-9B-MTP"));
+
+        let budgeted = LibsyError::client_call(
+            "vendor/any-model",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::FORBIDDEN,
+                body: json!({
+                    "error": {"message": "budget limit", "code": 403,
+                              "metadata": {"limit_source": "credits"}}
+                })
+                .to_string(),
+            },
+        );
+        let (kind, _) = credential_block(&budgeted).expect("budget 403 carries a block");
+        assert_eq!(kind, CredentialBlockKind::WholeQuota);
+    }
+
+    /// A bare 401 rejects the credential itself. It blocks every slug on that
+    /// credential, and nothing on another credential.
+    #[test]
+    fn a_bare_401_blocks_the_whole_credential() {
+        let error = LibsyError::client_call(
+            "dots-studio/dots-3-note-preview:free",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::UNAUTHORIZED,
+                body: json!({"error": {"message": "No auth credentials found"}}).to_string(),
+            },
+        );
+        let (kind, slug) = credential_block(&error).expect("the 401 carries a credential block");
+        assert_eq!(kind, CredentialBlockKind::Unauthorized);
+        let block = super::CredentialBlock {
+            credential: "openrouter_stephen".to_string(),
+            kind,
+            target: slug,
+        };
+        assert!(
+            block.blocks("openrouter_stephen", "z-ai/glm-5.3-flash"),
+            "the whole credential is rejected, paid slugs included"
+        );
+        assert!(!block.blocks("htpc", "Qwen3.5-9B-MTP"));
+        // A 401 remains an auth failure to the classifier: terminal, NOT crossable.
+        assert_eq!(failure_class(&error), FailureClass::Auth);
+        assert!(!failure_class(&error).allows_cross_route());
+    }
+
+    /// Failures that say nothing about any credential produce no block: a per-model
+    /// 429, a policy refusal, a 403 guardrail, a transport drop or a plain request
+    /// error must not condemn the credential that served them.
+    #[test]
+    fn ordinary_failures_do_not_condemn_the_credential() {
+        let cases: Vec<LibsyError> = vec![
+            rate_limited("vendor/one:free", Some("upstream_provider_shared_pool")),
+            rate_limited("vendor/one:free", None),
+            LibsyError::client_call(
+                "vendor/one:free",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::FORBIDDEN,
+                    body: json!({"error": {"message": "moderation"}}).to_string(),
+                },
+            ),
+            LibsyError::client_call(
+                "vendor/one:free",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::BAD_REQUEST,
+                    body: json!({"error": {"message": "bad"}}).to_string(),
+                },
+            ),
+            LibsyError::client_call(
+                "vendor/one:free",
+                LlmClientError::Transport {
+                    source: std::io::Error::new(std::io::ErrorKind::TimedOut, "drop").into(),
+                },
+            ),
+        ];
+        for error in cases {
+            assert!(
+                credential_block(&error).is_none(),
+                "{error:?} must not produce a credential block"
+            );
+        }
     }
 }

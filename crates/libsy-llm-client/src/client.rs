@@ -984,16 +984,33 @@ impl AttemptFailure {
 /// - the route's candidate fallback, because every candidate draws on the same allowance.
 ///
 /// One definition, so the two layers cannot drift apart.
+///
+/// The same account-shaped fact also arrives on a 402 (`payment_required`) and on a
+/// 403 carrying a budget `limit_source`. Those statuses are NOT treated as account
+/// exhaustion here in general: a 402 is the caller's balance, and a bare 403 is a
+/// guardrail or policy refusal that must stay terminal. Only a status with an explicit
+/// budget `limit_source` qualifies, so a content-policy 403 still refuses.
 pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
     let LlmClientError::UpstreamHttp { status, body } = source else {
         return false;
     };
-    if *status != StatusCode::TOO_MANY_REQUESTS {
-        return false;
+    let limit_source = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|value| {
+        value["error"]["metadata"]["limit_source"]
+            .as_str()
+            .map(str::to_string)
+    });
+    match *status {
+        StatusCode::TOO_MANY_REQUESTS => {
+            limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
+        }
+        // Insufficient credits: the account balance is the shared resource, so no
+        // candidate on this credential can serve the request.
+        StatusCode::PAYMENT_REQUIRED => true,
+        // A 403 with a budget limit_source is an account cap. A 403 without one is a
+        // guardrail or policy refusal and is deliberately NOT included here.
+        StatusCode::FORBIDDEN => limit_source.is_some(),
+        _ => false,
     }
-    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
-        value["error"]["metadata"]["limit_source"].as_str() == Some("openrouter_free_tier_daily")
-    })
 }
 
 fn is_transient_failure(error: &LlmClientError) -> bool {

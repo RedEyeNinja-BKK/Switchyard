@@ -574,7 +574,8 @@ impl DeploymentConfig {
                     .unwrap_or(crate::config::RouteReasoningPolicy::Inherit),
                 config.escalation_max_input_tokens,
                 escalation_model,
-            );
+            )
+            .with_target_credentials(target_credentials(config, &self.targets));
             routes.push((config.id.clone(), route));
         }
         // The default logical decision lane. Every configured decision target in
@@ -1426,6 +1427,23 @@ fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
         .iter()
         .position(|hint| target_name.contains(hint) || model_id.contains(hint))
         .unwrap_or(3)
+}
+
+/// Resolves each target model id to the `llm_client` credential that serves it.
+///
+/// Whole-route composition uses this identity to decide whether a credential-level
+/// failure condemns the next child too: the wire error names a target slug, not the
+/// credential, and two routes with different `llm_client` names are different
+/// credentials even when they point at the same provider.
+fn target_credentials(
+    route: &RouteConfig,
+    targets: &BTreeMap<String, TargetConfig>,
+) -> std::collections::HashMap<ModelId, String> {
+    route
+        .routing_target_names()
+        .into_iter()
+        .filter_map(|name| targets.get(name).map(|target| (target.id.clone(), target.llm_client.clone())))
+        .collect()
 }
 
 /// A client endpoint, parsed when the config loads rather than checked afterwards.
@@ -3665,7 +3683,13 @@ mod composition_closure_tests {
         );
     }
 
-    /// Cross-child policy stays narrower than candidate fallback inside a route.
+    /// Cross-child policy stays narrower than candidate fallback inside a route, but an
+    /// exhausted credential allowance is crossable: the next child is only worth trying
+    /// when it draws on a different credential, and the composite cannot tell which is
+    /// which from the class alone, so the configuration is the gate. A retired model
+    /// crosses for the same reason a transient failure does. A credential REJECTION is
+    /// crossable through the composite's credential_block path, not this class table —
+    /// which is exactly why `Auth` stays terminal HERE.
     #[test]
     fn cross_route_recovery_excludes_policy_and_contract_failures() {
         use switchyard_llm_client::FailureClass;
@@ -3675,6 +3699,8 @@ mod composition_closure_tests {
             FailureClass::RateLimited,
             FailureClass::TemporarilyUnavailable,
             FailureClass::Server,
+            FailureClass::AccountQuota,
+            FailureClass::ModelRetired,
         ] {
             assert!(
                 class.allows_cross_route(),

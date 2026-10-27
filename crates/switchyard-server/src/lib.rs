@@ -795,6 +795,7 @@ fn composition_failure_label(class: switchyard_llm_client::FailureClass) -> &'st
         FailureClass::Auth => "auth",
         FailureClass::Request => "request",
         FailureClass::AccountQuota => "account_quota",
+        FailureClass::ModelRetired => "model_retired",
         FailureClass::Other => "other",
     }
 }

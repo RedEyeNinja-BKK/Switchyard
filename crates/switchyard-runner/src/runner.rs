@@ -150,6 +150,24 @@ impl Runner {
             .map(|(_, route)| route)
     }
 
+    /// The `llm_client` credential that serves `slug`, across every route.
+    ///
+    /// A whole-route composite resolves a failing child's credential through this: the
+    /// wire error names the target slug, and the same slug can be reached from more
+    /// than one route. The FIRST route that carries the slug decides the credential,
+    /// which is safe because every target of one `llm_client` shares one credential and
+    /// a slug reached through two different credentials is a deployment defect this
+    /// lookup cannot paper over — it reports one of them, and the mismatch stays a
+    /// configuration fact.
+    pub(crate) fn credential_for_slug(&self, slug: &str) -> Option<String> {
+        self.routes
+            .iter()
+            .find_map(|(_, route)| {
+                let model = ModelId::from(slug.to_string());
+                route.target_credential(&model).map(str::to_string)
+            })
+    }
+
     /// Returns the registered routes, for advertising and capability lookups.
     pub fn models(&self) -> impl Iterator<Item = ModelInfo<'_>> {
         self.routes.iter().map(|(id, route)| ModelInfo {

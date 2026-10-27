@@ -162,6 +162,13 @@ pub struct Route {
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
     models: Arc<RuntimeModels>,
+    /// The `llm_client` credential each target model id is served by, resolved at load.
+    ///
+    /// A whole-route composite needs this to decide whether a child that just reported
+    /// an exhausted or rejected credential condemns the NEXT child too: the wire error
+    /// names a target slug, not the credential, so the credential identity has to come
+    /// from configuration. Empty when the route was built without one (tests).
+    target_credentials: std::collections::HashMap<ModelId, String>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -198,7 +205,52 @@ impl Route {
             responses_auxiliary_target,
             decision_targets,
             models: Arc::new(models),
+            target_credentials: std::collections::HashMap::new(),
         }
+    }
+
+    /// Records the `llm_client` credential serving each target model id.
+    ///
+    /// Resolved once at load from configuration, so a composite never has to infer
+    /// credential identity from a wire error.
+    pub fn with_target_credentials(
+        mut self,
+        credentials: std::collections::HashMap<ModelId, String>,
+    ) -> Self {
+        self.target_credentials = credentials;
+        self
+    }
+
+    /// The `llm_client` credential serving `model`, when this route carries one.
+    pub fn target_credential(&self, model: &ModelId) -> Option<&str> {
+        self.target_credentials.get(model).map(String::as_str)
+    }
+
+    /// The first target model id this route would call, when it carries any.
+    ///
+    /// The credential-aware composite uses this as the representative target: the child
+    /// would call it first, so a credential-level block is judged against it.
+    pub fn first_target_model(&self) -> Option<ModelId> {
+        self.models.first_model()
+    }
+
+    /// The provider slug of the first target model id, when one exists.
+    pub fn first_target_slug(&self) -> &str {
+        self.first_target_model()
+            .map(|model| model.as_str().to_owned())
+            .unwrap_or_default()
+            .leak()
+    }
+
+    /// Whether every servable target on this route is a `:free` slug.
+    ///
+    /// A free-scope quota blocks the route only when this is true; a route with a paid
+    /// candidate still has a servable leg on the same credential.
+    pub fn all_targets_free(&self) -> bool {
+        self.models
+            .all_models()
+            .iter()
+            .all(|model| model.as_str().ends_with(":free"))
     }
 
     /// Returns the configured libsy algorithm name.

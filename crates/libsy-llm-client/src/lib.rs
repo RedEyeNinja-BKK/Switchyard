@@ -30,8 +30,10 @@ pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
 pub use observation::{LlmCallObservation, RunObservation, RunObserver};
 pub use raw::RawResponse;
-pub use run::{CapabilityFacts, ClientRouter, FailureClass, decide, failure_class, run};
-pub use switchyard_translation::RawEventStream;
+pub use run::{
+    CapabilityFacts, ClientRouter, CredentialBlock, CredentialBlockKind, FailureClass, decide,
+    failure_class, run, credential_block,
+};pub use switchyard_translation::RawEventStream;
 
 /// Registers process-wide compatibility gauges with the global meter provider.
 pub fn initialize_metrics() {

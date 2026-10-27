@@ -173,6 +173,11 @@ impl Runner {
         let mut children = Vec::new();
         let mut crossed = false;
         let mut last_error: Option<RunnerError> = None;
+        // Credential-level blocks learned from earlier children, paired with the
+        // credential identity configuration resolved. A block stops any later child
+        // whose target(s) draw on the same credential when the block covers what that
+        // child would call; a child served by a different credential is untouched.
+        let mut credential_blocks: Vec<switchyard_llm_client::CredentialBlock> = Vec::new();
 
         // A provider-bound continuation must stay with the child that owns it. Restarting
         // at the first child would either lose the conversation or silently serve it from a
@@ -209,6 +214,18 @@ impl Runner {
             None => spec.children.iter().collect(),
         };
 
+        // Estimated once, before the loop: every child shares the same request, so the
+        // answer does not depend on which child is being considered. The caller's output
+        // reservation rides with the input: a request that wants 16k of output does not
+        // fit a window its input leaves 15k short of, so the reservation is admitted
+        // alongside the input rather than discovered as an upstream rejection.
+        let raw_request = request.raw_request.as_ref().unwrap_or(&serde_json::Value::Null);
+        let mut estimated_input_tokens =
+            request_fit::estimate_input_tokens(raw_request);
+        if let Some(reservation) = request.llm_request.output.max_output_tokens {
+            estimated_input_tokens = estimated_input_tokens.saturating_add(reservation);
+        }
+
         for child_name in order.into_iter() {
             let Some(route) = self.route(child_name) else {
                 return Err(RunnerError::UnknownRouteModel(child_name.clone()));
@@ -225,6 +242,30 @@ impl Runner {
                     .unwrap_or(&serde_json::Value::Null),
             ) {
                 children.push((child_name.clone(), ChildOutcome::Skipped { capability }));
+                continue;
+            }
+
+            // A child whose context window cannot hold the estimated input is skipped the
+            // same way. Without this, a composite whose widest child is not its first child
+            // would spend a provider call per child that cannot fit the request before
+            // reaching one that can. The estimator floors at structural overhead, so a child
+            // with no declared window is left in place: absence is not a refusal.
+            if let Some(child_window) = route.capabilities().context_window
+                && estimated_input_tokens > child_window as u64
+            {
+                children.push((
+                    child_name.clone(),
+                    ChildOutcome::Skipped { capability: "context_window" },
+                ));
+                continue;
+            }
+
+            // A child drawing on a credential a previous child already exhausted or had
+            // rejected is skipped before its first provider call. Every target in the
+            // child shares one `llm_client`, so a block that covers one covers all; a
+            // child that names no credential is left in place rather than guessed at.
+            if let Some(blocked) = self.blocked_by_credential(route, &credential_blocks) {
+                children.push((child_name.clone(), blocked));
                 continue;
             }
 
@@ -262,7 +303,26 @@ impl Runner {
                 }
                 Err(error) => {
                     let class = self.classify(&error);
-                    if !class.allows_cross_route() {
+                    // Record what the failing child says about its credential BEFORE the
+                    // crossing decision, so later children are judged on the evidence the
+                    // failure actually carried.
+                    let block = self.credential_block(&error);
+                    if let Some(block) = &block {
+                        credential_blocks.push(block.clone());
+                    }
+                    // A credential-level failure is crossable ONLY when the failure says
+                    // the credential that SERVED the request is out or rejected — a
+                    // property of the credential, which another child on another
+                    // credential does not share. The block is None when the failure
+                    // names no credential this deployment resolves (a forwarded caller's
+                    // 401, or a slug no route owns), and then plain class policy
+                    // decides.
+                    let crossable = class.allows_cross_route()
+                        || matches!(
+                            block.as_ref().map(|block| &block.kind),
+                            Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
+                        );
+                    if !crossable {
                         // Terminal for the parent. Surfacing the child's own error keeps a
                         // contract, policy or credential fault visible instead of letting a
                         // different route answer for it.
@@ -363,6 +423,77 @@ impl Runner {
             RunnerError::Algorithm(inner) => switchyard_llm_client::failure_class(inner),
             _ => FailureClass::Other,
         }
+    }
+
+    /// Reads the credential-level block a child failure carries.
+    ///
+    /// Returns `None` unless the failure itself says a credential-level resource is out
+    /// or the credential was rejected. The wire error names the failing target slug,
+    /// not the credential, so the credential is resolved here from the configuration
+    /// this runner loaded: the block only exists when that resolution succeeds. A
+    /// 401 belonging to a FORWARDED caller credential is filtered the same way — the
+    /// composite cannot attribute it to the route's own credential, so it is not
+    /// recorded as one.
+    fn credential_block(
+        &self,
+        error: &RunnerError,
+    ) -> Option<switchyard_llm_client::CredentialBlock> {
+        let RunnerError::Algorithm(inner) = error else {
+            return None;
+        };
+        let (kind, slug) = switchyard_llm_client::credential_block(inner)?;
+        // Resolve the credential configuration knows for the failing slug. Without a
+        // resolved credential the block is not actionable, so it is dropped rather
+        // than guessed at — which also filters a 401 that belongs to a forwarded
+        // caller credential the configuration does not own.
+        let credential = self.credential_for_slug(&slug)?;
+        Some(switchyard_llm_client::CredentialBlock {
+            credential,
+            kind,
+            target: slug,
+        })
+    }
+
+    /// Whether this child would only spend a call on a credential already blocked.
+    ///
+    /// Every target in the child shares one `llm_client`, so the credential resolved
+    /// for its first target is the child's credential. A free-scope block (`:free`
+    /// slugs exhausted) skips the child only when every servable target is free: a
+    /// child with a paid candidate still has a servable leg on the same credential.
+    /// A whole-quota or unauthorized block skips the child outright.
+    fn blocked_by_credential(
+        &self,
+        route: &Route,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> Option<ChildOutcome> {
+        let credential = self.child_credential(route)?;
+        for block in blocks {
+            if matches!(block.kind, switchyard_llm_client::CredentialBlockKind::FreeQuota)
+                && !route.all_targets_free()
+            {
+                continue;
+            }
+            if (*block).blocks(&credential, route.first_target_slug()) {
+                return Some(ChildOutcome::Skipped {
+                    capability: match block.kind {
+                        switchyard_llm_client::CredentialBlockKind::FreeQuota => "credential_quota",
+                        switchyard_llm_client::CredentialBlockKind::WholeQuota => "credential_quota",
+                        switchyard_llm_client::CredentialBlockKind::Unauthorized => {
+                            "credential_unauthorized"
+                        }
+                    },
+                });
+            }
+        }
+        None
+    }
+
+    /// The `llm_client` credential serving this child's targets, when known.
+    fn child_credential(&self, route: &Route) -> Option<String> {
+        route
+            .first_target_model()
+            .and_then(|model| route.target_credential(&model))
+            .map(str::to_string)
     }
 }
 

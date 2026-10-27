@@ -147,11 +147,60 @@ fn script(request: &str, body: &Value) -> (u16, String) {
         );
     }
     // A 404 that is NOT a retirement notice stays terminal: no fallback, no crossing.
+    // Measured live 2026-10-27: the modality-filter 404 carries structured metadata
+    // naming the failed routing step, which is what keeps it terminal.
     if model.contains("gone-404") {
         return (
             404,
-            json!({"error": {"message": "No endpoints found that support image input", "code": 404}})
+            json!({"error": {"message": "No endpoints found that support image input", "code": 404, "metadata": {"failed_routing_step": "Filter by Image Support"}}})
                 .to_string(),
+        );
+    }
+    // A model-level 404 WITHOUT error.metadata: the retirement shape measured live on
+    // 2026-10-27. The slug itself is gone, so the candidate rolls over.
+    if model.contains("retired-404") {
+        return (
+            404,
+            json!({"error": {"message": "No such model", "code": 404}}).to_string(),
+        );
+    }
+    // A 404 WITH structured error.metadata: the request was filtered by routing —
+    // measured live on 2026-10-27 as failed_routing_step/routing_funnel. A request
+    // fact, and it stays terminal.
+    if model.contains("filtered-404") {
+        return (
+            404,
+            json!({"error": {
+                "message": "No endpoints found that support image input",
+                "code": 404,
+                "metadata": {
+                    "routing_funnel": [{"step": "Initial Endpoints", "endpoint_count": 1}],
+                    "failed_routing_step": "Filter by Image Support"
+                }
+            }})
+            .to_string(),
+        );
+    }
+    // A 401: the credential itself was rejected.
+    if model.contains("unauthorized") {
+        return (
+            401,
+            json!({"error": {"message": "No auth credentials found", "code": 401}}).to_string(),
+        );
+    }
+    // A 402: the account balance is exhausted (whole-credential quota).
+    if model.contains("payment-required") {
+        return (
+            402,
+            json!({"error": {"message": "Insufficient credits", "code": 402}}).to_string(),
+        );
+    }
+    // A bare 403 WITHOUT a budget marker: a guardrail or policy refusal. It is a
+    // request fact, and it must not block the credential.
+    if model.contains("guardrail-403") {
+        return (
+            403,
+            json!({"error": {"message": "Your request was rejected by our moderation system", "code": 403}}).to_string(),
         );
     }
     if model.contains("flaky-first-a1")
@@ -273,6 +322,45 @@ fn leaf_scoped(id: &str, base_url: &str, candidates: &[&str], vendor: &str, scop
 [llm_clients.{client}]
 format = "openai_responses"
 base_url = "{base_url}"
+{targets}
+[routes.{id}]
+id = "{id}"
+type = "passthrough"
+target = "{first}"
+candidates = [{}]
+"#,
+        ids.join(", ")
+    )
+}
+
+/// A leaf on a client the caller already declared: for two children sharing one
+/// credential.
+///
+/// Candidate strings may carry slug punctuation (`:` in `:free`), so the TOML table
+/// key is sanitized while the target `id` keeps the slug the provider reports.
+fn leaf_shared(
+    id: &str,
+    candidates: &[&str],
+    vendor: &str,
+    client: &str,
+) -> String {
+    let mut targets = String::new();
+    let mut ids = Vec::new();
+    let mut first = None;
+    for candidate in candidates {
+        let key = format!("{}-{id}", candidate.replace(':', "-"));
+        targets.push_str(&format!(
+            "\n[targets.{key}]\nid = \"{vendor}{candidate}\"\nllm_client = \"{client}\"\n"
+        ));
+        if first.is_none() {
+            first = Some(key.clone());
+        } else {
+            ids.push(format!("\"{key}\""));
+        }
+    }
+    let first = first.unwrap_or_default();
+    format!(
+        r#"
 {targets}
 [routes.{id}]
 id = "{id}"
@@ -1400,38 +1488,41 @@ candidates = ["healthy-r2"]
 
 /// An account-wide free-tier cap must cost exactly one provider call.
 ///
-/// The route below declares six candidates and sits inside a composite with a second,
-/// healthy child. Every candidate draws on the SAME daily allowance, so once the first
-/// one reports that allowance is zero, trying candidate two through six spends five more
-/// requests to learn nothing, and crossing to the other child does the same against a
-/// different allowance that this credential does not have either. The single observable
-/// that distinguishes a real fix from a plausible one is the call count.
+/// Both children share ONE credential (the deployed ST_Route shape). The free child's
+/// six candidates draw on the same daily allowance, so the first cap answer stops the
+/// child after one call. The paid child is NOT blocked — a paid slug draws on the
+/// balance, not the free allowance — so it serves, which is the correction the
+/// credential-scope work exists to make.
 #[tokio::test]
 async fn an_account_wide_quota_exhaustion_stops_after_one_call() {
     let quota = Upstream::new();
-    let healthy = Upstream::new();
     let quota_url = quota.clone().server();
-    let healthy_url = healthy.clone().server();
 
     let config = format!(
-        "schema_version = 1\n{}\n{}\n[composites.ST_Route]\nchildren = [\"ST_Free\", \"ST_Paid\"]\n",
-        leaf_named(
+        concat!(
+            "schema_version = 1\n",
+            "\n[llm_clients.shared]\nformat = \"openai_responses\"\nbase_url = \"{url}\"\n",
+            "{child_a}\n{child_b}\n",
+            "[composites.ST_Route]\nchildren = [\"ST_Free\", \"ST_Paid\"]\n"
+        ),
+        url = quota_url,
+        child_a = leaf_shared(
             "ST_Free",
-            &quota_url,
             &[
-                "account-quota-1",
-                "account-quota-2",
-                "account-quota-3",
-                "account-quota-4",
-                "account-quota-5",
-                "account-quota-6",
+                "account-quota-1:free",
+                "account-quota-2:free",
+                "account-quota-3:free",
+                "account-quota-4:free",
+                "account-quota-5:free",
+                "account-quota-6:free",
             ],
             "vendor/",
+            "shared",
         ),
-        leaf_named("ST_Paid", &healthy_url, &["ok-1"], "vendor/")
+        child_b = leaf_shared("ST_Paid", &["ok-1"], "vendor/", "shared"),
     );
 
-    let result = runner(&config)
+    let outcome = runner(&config)
         .execute_composite(
             "ST_Route",
             switchyard_protocol::Request {
@@ -1443,23 +1534,18 @@ async fn an_account_wide_quota_exhaustion_stops_after_one_call() {
             },
             None,
         )
-        .await;
+        .await
+        .expect("the paid leg serves after the free cap");
 
-    assert!(
-        result.is_err(),
-        "an exhausted allowance is surfaced, not papered over by a sibling"
-    );
     assert_eq!(
         quota.calls(),
-        1,
-        "five further candidates would each spend a call on a known-empty allowance: {:?}",
+        2,
+        "six free candidates stop after the first cap (1 call); the paid leg adds the \
+         second call on the same credential: {:?}",
         seen_models(&quota).await
     );
-    assert_eq!(
-        healthy.calls(),
-        0,
-        "crossing to another child would spend a request from an allowance already at zero"
-    );
+    assert_eq!(outcome.child_route, "ST_Paid");
+    assert!(outcome.crossed_child);
 }
 
 /// The provider-pool 429 is the control: it is model-scoped, so fallthrough stays intact.
@@ -1510,4 +1596,402 @@ async fn a_provider_pool_rate_limit_still_falls_through_the_candidates() {
         ["vendor/pool-429-1", "vendor/pool-429-2", "vendor/ok-3"],
         "a provider-pool 429 is model-scoped and must keep its fallthrough"
     );
+}
+
+/// A model-level 404 (no `error.metadata`) rolls to the next candidate.
+///
+/// Measured live 2026-10-27: a retirement 404 is a bare error object; a routing-filter
+/// 404 carries `error.metadata`. The provider's own structure decides, replacing the
+/// old MiniMax-only string match.
+#[tokio::test]
+async fn a_model_level_404_without_metadata_rolls_to_the_next_candidate() {
+    let upstream = Upstream::new();
+    let url = upstream.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.retiring]
+format = "openai_responses"
+base_url = "{url}"
+
+[targets.retired-r1]
+id = "vendor/retired-404-a1"
+llm_client = "retiring"
+
+[targets.healthy-r2]
+id = "vendor/ok-a1"
+llm_client = "retiring"
+
+[routes.ST_High]
+id = "ST_High"
+type = "passthrough"
+target = "retired-r1"
+candidates = ["healthy-r2"]
+"#
+    );
+    let (status, body) = call(
+        runner(&config),
+        "ST_High",
+        json!({"model": "ST_High", "input": "hi"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        seen_models(&upstream).await,
+        ["vendor/retired-404-a1", "vendor/ok-a1"],
+        "the retired R1 is attempted, then the healthy R2 serves"
+    );
+}
+
+/// A 404 carrying `error.metadata` says the REQUEST was filtered (missing asset or
+/// unsupported modality), so it stays terminal: no candidate rollover, no crossing.
+#[tokio::test]
+async fn a_404_with_error_metadata_is_terminal() {
+    let upstream = Upstream::new();
+    let url = upstream.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.rejecting]
+format = "openai_responses"
+base_url = "{url}"
+
+[targets.gone-r1]
+id = "vendor/filtered-404-a1"
+llm_client = "rejecting"
+
+[targets.healthy-r2]
+id = "vendor/ok-a1"
+llm_client = "rejecting"
+
+[routes.ST_Low]
+id = "ST_Low"
+type = "passthrough"
+target = "gone-r1"
+candidates = ["healthy-r2"]
+"#
+    );
+    let (status, body) = call(
+        runner(&config),
+        "ST_Low",
+        json!({"model": "ST_Low", "input": "hi"}),
+    )
+    .await;
+
+    assert!(!status.is_success(), "{body}");
+    assert_eq!(
+        seen_models(&upstream).await,
+        ["vendor/filtered-404-a1"],
+        "a filtered-request 404 must not reach R2"
+    );
+}
+
+/// A free-scope quota on one child does NOT block the paid child on the SAME
+/// credential. The two-tier design from the dual-route deploy: free tiers first, then
+/// the paid leg on the same credential, which draws on the account balance rather
+/// than the free allowance.
+#[tokio::test]
+async fn a_free_scope_quota_does_not_block_the_paid_leg_on_the_same_credential() {
+    let quota = Upstream::new();
+    let paid = Upstream::new();
+    let quota_url = quota.clone().server();
+    let paid_url = paid.clone().server();
+
+    // Both children sit on DIFFERENT llm_clients, so the credential identity differs;
+    // the paid child's single target is a non-:free slug. The free child returns the
+    // openrouter_free_tier_daily cap on its first call.
+    let config = format!(
+        "schema_version = 1\n{}\n{}\n[composites.ST_Route]\nchildren = [\"ST_Free\", \"ST_Paid\"]\n",
+        leaf_named("ST_Free", &quota_url, &["account-quota-1"], "vendor/"),
+        leaf_named("ST_Paid", &paid_url, &["paid-ok-1"], "vendor/")
+    );
+
+    let outcome = runner(&config)
+        .execute_composite(
+            "ST_Route",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("ST_Route".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+            },
+            None,
+        )
+        .await
+        .expect("the paid leg must still serve after the free cap");
+
+    assert_eq!(outcome.child_route, "ST_Paid");
+    assert!(outcome.crossed_child, "the request crossed from the free tier");
+    assert_eq!(quota.calls(), 1, "the free tier made exactly one call");
+    assert_eq!(paid.calls(), 1, "the paid leg served on the same credential");
+}
+
+/// A free-scope quota DOES block a later free-only child on the same credential: the
+/// whole point of recording the scope is to skip a child whose every target is a
+/// `:free` slug drawing on the same exhausted allowance.
+#[tokio::test]
+async fn a_free_scope_quota_blocks_a_later_free_only_child_on_the_same_credential() {
+    let quota = Upstream::new();
+    let quota_url = quota.clone().server();
+
+    // Two free-only children on ONE credential (shared client); the second would only
+    // spend a call on the allowance already known to be at zero.
+    let config = format!(
+        concat!(
+            "schema_version = 1\n",
+            "\n[llm_clients.shared]\nformat = \"openai_responses\"\nbase_url = \"{url}\"\n",
+            "{child_a}\n{child_b}\n",
+            "[composites.ST_Route]\nchildren = [\"ST_Free1\", \"ST_Free2\"]\n"
+        ),
+        url = quota_url,
+        child_a = leaf_shared("ST_Free1", &["account-quota-1:free"], "vendor/", "shared"),
+        child_b = leaf_shared("ST_Free2", &["account-quota-2:free"], "vendor/", "shared"),
+    );
+
+    let result = runner(&config)
+        .execute_composite(
+            "ST_Route",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("ST_Route".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(result.is_err(), "no child can serve: the allowance is out");
+    assert_eq!(
+        quota.calls(),
+        1,
+        "the second free child must be skipped without a provider call: {:?}",
+        seen_models(&quota).await
+    );
+}
+
+/// A whole-credential quota (402, exhausted balance) DOES block the paid leg on the
+/// same credential: the balance is the resource the paid slug draws on.
+#[tokio::test]
+async fn a_whole_credential_quota_blocks_the_paid_leg_on_the_same_credential() {
+    let payment = Upstream::new();
+    let payment_url = payment.clone().server();
+
+    // One route, paid slug, 402 on the first candidate. There is no second child, so
+    // the request fails; what the assert pins is that no attempt was wasted.
+    let config = format!(
+        "schema_version = 1\n{}",
+        leaf_named("ST_Paid", &payment_url, &["payment-required-1"], "vendor/")
+    );
+
+    let result = runner(&config)
+        .execute_route(
+            "ST_Paid",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("ST_Paid".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+            },
+            None,
+        )
+        .await;
+
+    assert!(result.is_err(), "the exhausted balance surfaces");
+    assert_eq!(
+        payment.calls(),
+        1,
+        "one attempt, no retries against a balance known to be empty"
+    );
+}
+
+/// A bare 401 blocks a later child on the SAME credential (the credential itself was
+/// rejected), while a child on a DIFFERENT credential is still reached.
+#[tokio::test]
+async fn an_unauthorized_credential_blocks_same_credential_children_but_not_others() {
+    let rejected = Upstream::new();
+    let healthy = Upstream::new();
+    let rejected_url = rejected.clone().server();
+    let healthy_url = healthy.clone().server();
+
+    // ST_Bad and ST_AlsoBad share one credential; ST_Good sits on another.
+    let config = format!(
+        concat!(
+            "schema_version = 1\n",
+            "\n[llm_clients.shared]\nformat = \"openai_responses\"\nbase_url = \"{bad_url}\"\n",
+            "{child_a}\n{child_b}\n",
+            "{child_c}\n",
+            "[composites.ST_Route]\nchildren = [\"ST_Bad\", \"ST_AlsoBad\", \"ST_Good\"]\n"
+        ),
+        bad_url = rejected_url,
+        child_a = leaf_shared("ST_Bad", &["unauthorized-1"], "vendor/", "shared"),
+        child_b = leaf_shared("ST_AlsoBad", &["ok-1"], "vendor/", "shared"),
+        child_c = leaf_named("ST_Good", &healthy_url, &["ok-1"], "vendor/"),
+    );
+
+    let outcome = runner(&config)
+        .execute_composite(
+            "ST_Route",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("ST_Route".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+            },
+            None,
+        )
+        .await
+        .expect("the other credential's child serves");
+
+    assert_eq!(outcome.child_route, "ST_Good");
+    assert!(outcome.crossed_child);
+    assert_eq!(
+        rejected.calls(),
+        1,
+        "the second child on the rejected credential is skipped without a call"
+    );
+    assert_eq!(healthy.calls(), 1);
+}
+
+/// A 403 WITHOUT a budget marker is a guardrail or policy refusal: it must NOT block
+/// the credential, and it stays terminal (no crossing, no second call).
+#[tokio::test]
+async fn a_policy_403_neither_blocks_the_credential_nor_crosses() {
+    let rejecting = Upstream::new();
+    let healthy = Upstream::new();
+    let rejecting_url = rejecting.clone().server();
+    let healthy_url = healthy.clone().server();
+
+    let config = format!(
+        "schema_version = 1\n{}\n{}\n[composites.ST_Route]\nchildren = [\"ST_Guard\", \"ST_Good\"]\n",
+        leaf_named("ST_Guard", &rejecting_url, &["guardrail-403-1"], "vendor/"),
+        leaf_named("ST_Good", &healthy_url, &["ok-1"], "vendor/")
+    );
+
+    let result = runner(&config)
+        .execute_composite(
+            "ST_Route",
+            switchyard_protocol::Request {
+                llm_request: switchyard_protocol::text_request(Some("ST_Route".into()), "hi"),
+                raw_request: None,
+                metadata: None,
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+            },
+            None,
+        )
+        .await;
+
+    // A 403 classifies as Auth, which is terminal: no crossing, no credential block.
+    // The refusal surfaces to the caller rather than being retried elsewhere.
+    assert!(result.is_err(), "the refusal surfaces");
+    assert_eq!(
+        rejecting.calls(),
+        1,
+        "no retry against a request the provider refuses"
+    );
+    assert_eq!(
+        healthy.calls(),
+        0,
+        "a request-fact refusal must not be retried on another credential"
+    );
+}
+
+/// Per-child context admission reserves the caller's output budget.
+///
+/// A request whose input leaves a child's window only 1k short must not be sent to
+/// that child when the caller reserved 16k of output: input plus reservation exceeds
+/// the window, and the provider would reject after a wasted call. The child with the
+/// larger window serves instead.
+#[tokio::test]
+async fn a_child_without_room_for_the_output_reservation_is_skipped() {
+    let small = Upstream::new();
+    let large = Upstream::new();
+    let small_url = small.clone().server();
+    let large_url = large.clone().server();
+
+    // The small child declares a 200k window; the large child 400k. The input is
+    // estimated at ~199k (793k chars / 4) so input alone fits the small child but
+    // input + 16k output does not.
+    let filler = "x".repeat(793_000);
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.small]
+format = "openai_responses"
+base_url = "{small_url}"
+
+[llm_clients.large]
+format = "openai_responses"
+base_url = "{large_url}"
+
+[targets.small-r1]
+id = "vendor/small-a1"
+llm_client = "small"
+
+[targets.large-r1]
+id = "vendor/large-a1"
+llm_client = "large"
+
+[routes.ST_Small]
+id = "ST_Small"
+type = "passthrough"
+target = "small-r1"
+context_window = 200000
+
+[routes.ST_Large]
+id = "ST_Large"
+type = "passthrough"
+target = "large-r1"
+context_window = 400000
+
+[composites.ST_Route]
+children = ["ST_Small", "ST_Large"]
+context_window = 400000
+"#
+    );
+
+    let outcome = runner(&config)
+        .execute_route(
+            "ST_Route",
+            switchyard_protocol::Request {
+                route_reasoning_policy: None,
+                route_reasoning_effort: None,
+                llm_request: switchyard_protocol::LlmRequest {
+                    model: Some("ST_Route".into()),
+                    messages: Vec::new(),
+                    output: switchyard_protocol::OutputParams {
+                        max_output_tokens: Some(16_000),
+                        ..Default::default()
+                    },
+                    ..switchyard_protocol::LlmRequest::default()
+                },
+                raw_request: Some(json!({
+                    "model": "ST_Route",
+                    "input": [{"role": "user", "content": [{"type": "input_text", "text": filler}]}]
+                })),
+                metadata: None,
+            },
+            None,
+        )
+        .await
+        .expect("the large child serves");
+
+    let composition = outcome.composition.expect("composite metadata");
+    assert_eq!(composition.child_route, "ST_Large");
+    assert_eq!(
+        small.calls(),
+        0,
+        "the small child cannot hold input plus the 16k reservation: {:?}",
+        seen_models(&small).await
+    );
+    assert_eq!(large.calls(), 1);
 }

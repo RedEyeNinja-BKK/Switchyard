@@ -521,6 +521,43 @@ def test_a_retained_artefact_is_never_pruned_and_never_deployable(box):
     assert "retained" in (result.stdout + result.stderr).lower()
 
 
+def test_a_gated_release_line_refuses_a_candidate_that_has_no_manifest(box):
+    """Once CURRENT carries a baseline, every candidate is checked against it.
+
+    Enforcing this with a flag means the check happens when the operator remembers.
+    The failure it guards against -- a healthy build that lost a subsystem -- is
+    invisible to health checks, so the one deployment that forgets the flag is
+    exactly the one that ships the regression.
+    """
+    baseline = adopted(box)
+    import json as _json
+    with open(os.path.join(box.releases, baseline, "capabilities.json"), "w") as fh:
+        _json.dump({"families": {}}, fh)
+
+    before = box.live_bytes()
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+
+    result = box.run("deploy", manifest, msha, candidate, csha, "--label", "no manifest")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "gated" in result.stdout, result.stdout + result.stderr
+    assert box.live_bytes() == before, "a refused candidate must not touch the live pair"
+    assert box.current() == baseline
+
+
+def test_a_line_without_a_baseline_says_so_instead_of_pretending(box):
+    """Bootstrapping is allowed, but never silently mistaken for a checked deploy."""
+    baseline = adopted(box)   # adopted without --capabilities: no baseline exists
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha, "--label", "bootstrap")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "gate skipped" in result.stdout, result.stdout
+    assert box.current() != baseline
+
+
 def _capability_stub(box, *, verify_rc):
     """A capability tool that passes the gate and then fails the live check.
 

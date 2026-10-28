@@ -447,14 +447,32 @@ validate_candidate() {
 
 capability_gate() {
   local binary=$1 caps=$2 baseline=$3
-  [ -n "$caps" ] || return 0
-  [ -f "$caps" ] || { say "capability manifest $caps not found"; return 1; }
+
+  # Once a release line has a baseline, the gate is part of deploying to it: a
+  # candidate that arrives without its own manifest cannot be compared, and
+  # skipping the comparison is exactly how a build that lost a subsystem reaches
+  # production. The baseline is therefore enforced by default, not by the operator
+  # remembering a flag.
   if [ ! -f "$baseline" ]; then
-    say "no deployed capability baseline at $baseline"
-    say "the preservation check cannot be made without one; adopt or deploy a release"
-    say "that carries a capability manifest before replacing this binary"
+    if [ -n "$caps" ]; then
+      say "no deployed capability baseline at $baseline"
+      say "the candidate has a manifest but CURRENT carries nothing to compare it against"
+      return 1
+    fi
+    say "no capability baseline at $baseline and no candidate manifest: gate skipped"
+    say "this host has no established baseline yet, so there is nothing to preserve"
+    return 0
+  fi
+  if [ -z "$caps" ]; then
+    say "this release line is gated: CURRENT carries a capability baseline at"
+    say "  $baseline"
+    say "the candidate must arrive with its own manifest, or the preservation check"
+    say "cannot be made. Generate it beside the build with:"
+    say "  capability_contract.py generate --binary <candidate> --source <tree> --out <file>"
+    say "and deploy with --capabilities <file>"
     return 1
   fi
+  [ -f "$caps" ] || { say "capability manifest $caps not found"; return 1; }
   python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
     --baseline "$baseline"
 }

@@ -254,3 +254,60 @@ pub(crate) fn encode(registry: &Registry) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("failed to encode Prometheus metrics: {error}"))?;
     Ok(body)
 }
+
+#[cfg(test)]
+mod tests {
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use prometheus::Registry;
+
+    use super::*;
+
+    /// Proves the recorders for families no deployment traffic can reach.
+    ///
+    /// Three families are `sparse` in the capability contract: the two composition
+    /// counters and the account-auth-failure counter. The live manifest routes every
+    /// model through a passthrough route, so no whole-route composite ever runs, and
+    /// no provider rejects our credential while everything is healthy. Their series
+    /// therefore do not exist on the deployment, and their absence is not evidence
+    /// that the instrumentation is gone.
+    ///
+    /// Compiled-in is proved by the preflight literal check. Reachable is proved here:
+    /// the real recorder is called and the exported family must appear. Without this,
+    /// "the counter is still wired" would rest on reading the source, which is exactly
+    /// the sort of claim that goes stale.
+    ///
+    /// The global provider is installed for the test process. It is set once and every
+    /// recorder under test uses `global::meter`, which is the same path production
+    /// takes -- a locally-constructed meter would prove nothing about the real one.
+    #[test]
+    fn every_sparse_recorder_publishes_its_family() {
+        let registry = Registry::new();
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build metrics exporter: {error}"));
+        let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+        global::set_meter_provider(provider.clone());
+
+        record_composition_attempt("parent", "child", "target", "selected", "none");
+        record_composition_cross("parent", "from", "to", "failed");
+        crate::economics::providers::AccountPublisher::new().record_unauthorized("test-provider");
+
+        let names: Vec<String> = registry
+            .gather()
+            .iter()
+            .map(|family| family.name().to_string())
+            .collect();
+
+        for expected in [
+            "switchyard_composition_attempt_total",
+            "switchyard_composition_cross_total",
+            "switchyard_economics_account_auth_failures_total",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "recorder for {expected} published nothing; exported families were {names:?}"
+            );
+        }
+    }
+}

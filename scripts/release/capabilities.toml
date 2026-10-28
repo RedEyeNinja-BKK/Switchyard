@@ -1,0 +1,392 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Capability contract classification table.
+#
+# The INVENTORY of instrumentation is generated at build time from the compiled
+# artifact and the source tree -- it is never written here. This file supplies
+# only the CLASSIFICATION, because whether a series appears on an idle
+# deployment is a fact about the instrument's semantics that no scanner can
+# infer.
+#
+# Every generated name must appear below. An unclassified name is a build
+# failure, so a subsystem cannot be added without someone deciding -- in this
+# file, in review -- whether its series are always present or event driven.
+#
+# classes
+#   always_present  appears on /metrics in a healthy deployment without any
+#                   request traffic. Either set at startup or refreshed by the
+#                   provider poller on its own interval, so the post-deployment
+#                   gate may wait up to `max_wait_seconds` for it.
+#   event_driven    appears only after its trigger occurs. Its ABSENCE after a
+#                   deployment is NOT a failure and must never be treated as one.
+#                   Proving it works requires a controlled trigger, never
+#                   spontaneous appearance and never a deliberately induced
+#                   production failure or provider charge.
+#
+# `subsystem` groups the surface for cross-release comparison: dropping every
+# family of a subsystem is a capability removal, which needs an approved
+# contract change rather than a silent pass.
+#
+# `trigger` is required for event_driven entries: it is the deterministic action
+# that is known to produce the series, so a trigger test can be written from it
+# rather than guessed.
+
+[meta]
+# Bumped when the shape of this contract changes in a way operators must notice.
+contract_version = 1
+
+# ---------------------------------------------------------------------------
+# economics -- the subsystem whose loss on 2026-10-27 this gate exists to catch
+# ---------------------------------------------------------------------------
+
+[families."switchyard.economics_account_fetch"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 400
+note = "Incremented by the provider poller on each account read."
+
+[families."switchyard.economics_account_fetch_duration_seconds"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 400
+note = "Recorded beside each account read."
+
+[families."switchyard.economics_account_freshness_seconds"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 400
+note = "Age of the last successful read, per provider."
+
+[families."switchyard.economics_allowance_remaining_percent"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 400
+note = "Published per allowance-bearing pool on each poll."
+
+[families."switchyard.economics_allowance_reset_seconds"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 400
+
+[families."switchyard.economics_provider_balance"]
+subsystem = "economics"
+kind = "f64_gauge"
+note_kind = "Built inside publish_amounts_with, which receives the name as an argument."
+class = "always_present"
+max_wait_seconds = 400
+note = "One gauge per amount the provider reports; needs an account read."
+
+[families."switchyard.economics_provider_balance_component"]
+subsystem = "economics"
+kind = "f64_gauge"
+note_kind = "Built inside publish_amounts_with, which receives the name as an argument."
+class = "always_present"
+max_wait_seconds = 400
+
+[families."switchyard.economics_provider_credit"]
+subsystem = "economics"
+kind = "f64_gauge"
+note_kind = "Built inside publish_amounts_with, which receives the name as an argument."
+class = "always_present"
+max_wait_seconds = 400
+
+[families."switchyard.economics_provider_usage"]
+subsystem = "economics"
+kind = "f64_gauge"
+note_kind = "Built inside publish_amounts_with, which receives the name as an argument."
+class = "always_present"
+max_wait_seconds = 400
+
+[families."switchyard.economics_calendar_day_start"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 60
+note = "Computed from the clock; available immediately."
+
+[families."switchyard.economics_calendar_day_end"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 60
+
+[families."switchyard.economics_calendar_day_elapsed_seconds"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 60
+
+[families."switchyard.economics_rolling_coverage_seconds"]
+subsystem = "economics"
+class = "always_present"
+max_wait_seconds = 60
+note = "States how much of each window the process has observed."
+
+[families."switchyard.economics_tokens"]
+attribution = true
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve one completion request through a route"
+note = "Counter incremented per served request, per token component."
+
+[families."switchyard.economics_requests"]
+attribution = true
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve one completion request through a route"
+
+[families."switchyard.economics_provider_cost"]
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve a request on a provider that reports a per-request cost"
+note = "No provider-reported cost in the window yields no series. Absence is not a zero."
+
+[families."switchyard.economics_calendar_requests"]
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve one completion request during the current Bangkok day"
+
+[families."switchyard.economics_calendar_tokens"]
+attribution = true
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve one completion request during the current Bangkok day"
+
+[families."switchyard.economics_calendar_provider_cost"]
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve a request on a cost-reporting provider during the current Bangkok day"
+
+[families."switchyard.economics_rolling_requests"]
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve one completion request"
+
+[families."switchyard.economics_rolling_tokens"]
+attribution = true
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve one completion request"
+
+[families."switchyard.economics_rolling_provider_cost"]
+subsystem = "economics"
+class = "event_driven"
+trigger = "serve a request on a cost-reporting provider"
+
+[families."switchyard.economics_account_auth_failures"]
+sparse = true
+reachability_test = "metrics::tests::every_sparse_recorder_publishes_its_family"
+subsystem = "economics"
+class = "event_driven"
+trigger = "a credential is refused on an account read -- NEVER induced deliberately"
+note = "Must not be triggered in production. Presence of this series is a fault signal, so a trigger test would have to manufacture a real authentication failure."
+
+[families."switchyard.economics_estimated_cost"]
+subsystem = "economics"
+class = "event_driven"
+trigger = "record_estimated_cost is called -- currently NEVER called anywhere"
+not_compiled = "Declared in metrics.rs with no call site. The name literal is dropped by the optimiser, so the instrument cannot be constructed at runtime. Recorded as a finding, not removed: the contract must still account for it, and no dashboard may present an estimated cost the code never records."
+note = "Dead instrumentation. Classified so the surface stays complete; regenerating against a build where it is live will fail the not_compiled check, which is the signal to promote it back to a normal entry."
+
+# ---------------------------------------------------------------------------
+# routing, serving and accounting
+# ---------------------------------------------------------------------------
+
+[families."switchyard.build_info"]
+subsystem = "telemetry"
+class = "always_present"
+max_wait_seconds = 60
+note = "Set once at startup."
+
+[families."switchyard.requests"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+note = "Client-side request counter in libsy-llm-client; exports as switchyard_requests_total."
+
+[families."switchyard.errors"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "a client call fails"
+
+[families."switchyard.llm_calls"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+
+[families."switchyard.llm_call_duration_ms"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+note = "Histogram: exports _bucket, _sum and _count together."
+
+[families."switchyard.runs"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+
+[families."switchyard.run_duration_ms"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+note = "Histogram: exports _bucket, _sum and _count together."
+
+[families."switchyard.decisions"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "a typed decision lane answers"
+
+[families."switchyard.classifier_fail_open"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "a classifier call fails and the request is admitted anyway"
+
+[families."switchyard.algorithms_in_flight"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "a scoring algorithm starts"
+note = "Up-down counter; exports as a gauge because the value can decrease."
+
+[families."switchyard.total_requests"]
+subsystem = "routing"
+class = "always_present"
+max_wait_seconds = 60
+note = "Observable gauge whose callback metrics::initialize registers at startup, so it is exported at 0 before any traffic."
+
+[families."switchyard.total_errors"]
+subsystem = "routing"
+class = "always_present"
+max_wait_seconds = 60
+note = "Observable gauge registered at startup beside switchyard.total_requests."
+
+[families."switchyard.client_responses"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+
+[families."switchyard.upstream_attempts"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+
+[families."switchyard.router_retry_recovered"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "a first attempt fails and a retry succeeds"
+
+[families."switchyard.routing_overhead_ms"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+
+[families."switchyard.model_call_latency_ms"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+
+[families."switchyard.total_latency_ms"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request"
+
+[families."switchyard.prompt_tokens"]
+attribution = true
+subsystem = "telemetry"
+class = "event_driven"
+trigger = "serve one request with prompt tokens"
+
+[families."switchyard.completion_tokens"]
+attribution = true
+subsystem = "telemetry"
+kind = "u64_counter"
+note_kind = "Built in a loop over a table of (name, value) pairs, so the constructor reads a variable."
+class = "event_driven"
+trigger = "serve one request with completion tokens"
+
+[families."switchyard.cached_tokens"]
+attribution = true
+subsystem = "telemetry"
+kind = "u64_counter"
+note_kind = "Built in a loop over a table of (name, value) pairs, so the constructor reads a variable."
+class = "event_driven"
+trigger = "serve one request whose provider reports a cache read"
+
+[families."switchyard.cache_creation_tokens"]
+attribution = true
+subsystem = "telemetry"
+kind = "u64_counter"
+note_kind = "Built in a loop over a table of (name, value) pairs, so the constructor reads a variable."
+class = "event_driven"
+trigger = "serve one request whose provider reports a cache write"
+
+[families."switchyard.reasoning_tokens"]
+attribution = true
+subsystem = "telemetry"
+kind = "u64_counter"
+note_kind = "Built in a loop over a table of (name, value) pairs, so the constructor reads a variable."
+class = "event_driven"
+trigger = "serve one request whose provider reports reasoning tokens"
+
+[families."switchyard.composition_attempt"]
+sparse = true
+reachability_test = "metrics::tests::every_sparse_recorder_publishes_its_family"
+subsystem = "routing"
+class = "event_driven"
+trigger = "address a composite route"
+
+[families."switchyard.composition_cross"]
+sparse = true
+reachability_test = "metrics::tests::every_sparse_recorder_publishes_its_family"
+subsystem = "routing"
+class = "event_driven"
+trigger = "a composite route crosses from one candidate to another"
+
+[families."switchyard.context_pressure_promotion"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "a request crosses a context-pressure threshold"
+
+[families."switchyard.advisor_gate.consult_failures"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "an advisor consultation fails"
+
+[families."switchyard.advisor_gate.discarded_tokens"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "an advisor discards a turn"
+
+[families."switchyard.advisor_gate.discarded_turns"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "an advisor discards a turn"
+
+[families."switchyard.advisor_gate.reviews"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "an advisor reviews a turn"
+
+[families."switchyard.stage_router.confidence"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "the staged router scores a candidate"
+
+[families."switchyard.stage_router.probability"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "the staged router scores a candidate"
+
+[families."switchyard.stage_router.routing_decisions"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "the staged router makes a decision"
+
+# ---------------------------------------------------------------------------
+# Reviewed capability removals.
+#
+# A candidate that drops a family or a whole subsystem fails preflight UNLESS it
+# appears here, which makes the removal a reviewable change with a name against
+# it. Never add an entry to make a failing build pass without deciding the
+# capability is genuinely gone.
+# ---------------------------------------------------------------------------
+
+[removed]
+# (none)

@@ -96,3 +96,11 @@ Never removes source, release builds, production binaries, credentials or
 rollback anchors — the protected set is snapshotted before any deletion and
 asserted afterwards. Skips the debug-profile removal while a build is running, so
 a compile is never truncated mid-write. Runs daily from `disk-retention.timer`.
+
+## Continuous integration
+
+Workflow runs arrive through `.github/workflows/ci.yml` on pull requests and on
+pushes to `main`. Changes under `scripts/release/` are covered by the release
+safety job, which runs the capability-contract tests and the installer acceptance
+suite; the suite creates its own sandbox, so it never reads or writes the release
+store of a real host.

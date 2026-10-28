@@ -1177,6 +1177,9 @@ fn responses_usage(usage: &serde_json::Map<String, Value>) -> Usage {
                     .and_then(|details| details.get("reasoning_tokens"))
             })
             .and_then(Value::as_u64),
+        // The provider's own figure for what it charged, when the stream reports one.
+        cost: usage.get("cost").and_then(Value::as_f64),
+        cost_currency: None,
     }
 }
 

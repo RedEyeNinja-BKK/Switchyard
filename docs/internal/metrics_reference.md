@@ -146,6 +146,194 @@ sum      (rate(switchyard_upstream_attempts_total{code!="200"}[5m]))
 The ready-to-deploy alert rules implementing these expressions live in
 [`examples/prometheus/switchyard.rules.yaml`](../../examples/prometheus/switchyard.rules.yaml).
 
+## Economics and token accounting
+
+These series attribute usage to the provider, route and cost class the deployment
+declares, and report the provider account state Switchyard reads with its own
+credentials. Every value comes from the deployment configuration, never from a
+model-name guess.
+
+### Token components
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_tokens_total{component,model,provider,route,route_family,cost_class,outcome}` | counter | Tokens consumed, split by component. `component` is one of `prompt`, `cached`, `cache_creation`, `completion`, `reasoning`. |
+| `switchyard_economics_requests_total{component="request",...}` | counter | Requests served, with the same attribution labels. |
+| `switchyard_economics_provider_cost_total{component="provider_reported",...}` | counter | The cost the **provider itself** reported for the request. |
+| `switchyard_economics_estimated_cost_total{component="estimated",...}` | counter | A Switchyard-derived cost estimate. **Reserved and currently unpublished**: Switchyard has no validated rate card, so nothing writes this family and a query against it returns no series. It is published beside the provider-reported cost, never instead of it. |
+
+The provider-reported cost and the Switchyard-derived estimate are deliberately
+separate metric families, so a dashboard can never present one as the other.
+
+> **Note:** `cached` and `cache_creation` are *components of* `prompt`, not
+> additions to it. `prompt` is the provider's own input total
+> (`input + cached + cache_creation`). Adding the components to the prompt total
+> double counts the cache. There is deliberately no "all tokens" series.
+
+`reasoning` is reported separately, and its relationship to `completion` varies
+by provider and model. Reasoning is never added again when a total is calculated:
+the recorded total is `prompt + completion`.
+
+It is **not** true that reasoning is always a subset of completion. Measured
+2026-10-23 across 29,359 routing-log records: 17 reported reasoning above
+completion (including `z-ai/glm-5.3-flash` and `liquid/lfm-2.5-2.6b:free`), while
+`prompt + completion == total_tokens` held in all 29,359. An earlier version of
+this note asserted the subset universally from a single OpenRouter measurement;
+that was too strong and has been corrected.
+
+What still holds, and is why no panel adds the two: a provider that reports
+reasoning inside completion would be double counted if reasoning were added to
+`completion`, and a provider that reports it outside would be inflated. Either
+way the sum is not a token total, so `reasoning` is published beside
+`completion` and never summed with it.
+
+`reasoning` is published only when the provider reported it. A provider that does
+not report reasoning yields no such series, which reads as absent rather than as a
+measured zero.
+
+### Attribution labels
+
+| Label | Values | Meaning |
+|---|---|---|
+| `provider` | One per configured `llm_client`. | The client the serving target is bound to. |
+| `route` | One per configured route. | The route the **caller** addressed. On a composed route this is the parent. |
+| `child_route` | One per configured child route; absent on a direct route. | The child that served the request. |
+| `route_family` | `direct`, `primitive`, `tier`. | A route's role, derived from its configuration: bound to one target, declares an ordered candidate list, or composes other routes. |
+| `cost_class` | `local`, `free`, `subscription`, `metered`. | How the provider bills the lane. |
+
+`cost_class` is a deployment fact. `local` is a deployment the operator hosts,
+`free` is a model the provider prices at zero, `subscription` is an
+allowance-bearing credential, and `metered` is a metered API key on a paid
+provider. A `free` or `subscription` lane must never be given a per-token price.
+
+### Account state
+
+Switchyard reads these provider account surfaces with the credential it already
+uses to serve inference, and publishes the result. Nothing downstream of
+Switchyard contacts a provider.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_account_fetch_total{provider,outcome}` | counter | One per account read. `outcome` is `ok`, `unauthorized` or `failed`. |
+| `switchyard_economics_account_auth_failures_total{provider}` | counter | Reads rejected with 401 or 403. |
+| `switchyard_economics_account_freshness_seconds{provider}` | gauge | Age of the last successful read. |
+| `switchyard_economics_account_fetch_duration_seconds{provider}` | gauge | How long the last read took. |
+| `switchyard_economics_provider_balance{provider,currency,scope,period}` | gauge | The remaining balance the provider reported. |
+| `switchyard_economics_provider_credit{provider,currency,scope,period}` | gauge | The purchased credit the provider reported. |
+| `switchyard_economics_provider_usage{provider,currency,scope,period}` | gauge | The usage the provider reported. |
+| `switchyard_economics_provider_balance_component{provider,currency,scope,period,component}` | gauge | One part of the balance, where the provider breaks its balance into parts. `component` is `granted` (credit the provider gave) or `topped_up` (credit that was paid for). |
+| `switchyard_economics_allowance_remaining_percent{provider,pool}` | gauge | Remaining allowance of a provider-reported window. |
+| `switchyard_economics_allowance_reset_seconds{provider,pool}` | gauge | Time until that window resets. |
+
+A provider that exposes no account surface produces no account series at all. It
+is not recorded as a zero balance: a provider that exposes nothing has not
+reported a balance of zero.
+
+The three amount families carry three separate labels, because a provider figure
+has three separate facts attached to it:
+
+| Label | Values | Meaning |
+|---|---|---|
+| `currency` | `USD`, `CNY`, ... | The currency the amount is denominated in. |
+| `scope` | `account`, `key` | Whether the amount covers the whole provider account or the single API key Switchyard holds. |
+| `period` | `total`, `daily`, `weekly`, `monthly` | The reporting window the amount covers. |
+
+These are not combined into one label. A currency label that also carried the
+scope or the period would make two different amounts indistinguishable without
+parsing the label value, and would invite a query to sum series that were never
+meant to be summed. A reader selects on `currency`, `scope` and `period`
+independently.
+
+The three amount families are three different facts and are not interchanged:
+
+* `provider_credit` is the credit the provider sold.
+* `provider_usage` with `scope="account"` is the credit that has been consumed.
+* `provider_balance` is the credit that is left, which is the difference between
+  the two.
+
+A provider that reports a purchased credit but no consumed credit publishes no
+balance, because the remaining amount is not known. A provider that reports a
+balance directly, such as DeepSeek, publishes the balance and no credit.
+
+`provider_balance_component` is published *beside* `provider_balance`, never
+added to it. The provider reports the components as the parts the total is made
+of, so a query that summed the components and the total would count the balance
+twice. DeepSeek reports `granted_balance` and `topped_up_balance` alongside
+`total_balance` and all three are now carried.
+
+`topped_up_balance` is the topped-up money **still remaining**. It is not the
+amount ever purchased, and must never be read as a lifetime top-up figure: an
+account that bought a great deal and then spent it can report a small remaining
+topped-up balance.
+
+### Account identity and de-duplication
+
+The `provider` label on an account family names the *account*, not the client.
+A deployment may name several clients for one provider:
+
+* Clients sharing one credential read one account and produce one reader.
+* Clients holding different credentials are separate readers, and are labelled
+  with their own client name, so two OpenRouter accounts cannot overwrite each
+  other's balances.
+
+Where a provider states the identity of the account a key belongs to - OpenRouter
+reports `creator_user_id` on `/key` - the collector compares those values. Two
+credentials that resolve to one identity are one account: the first label reads
+it and the second stops being polled, so the account's money is counted once. If
+the reading label fails, the second is polled again rather than the account
+going unread. The identity is compared and never published.
+
+### Bangkok calendar day
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_calendar_tokens{component,...}` | gauge | The same token components, for the current Bangkok day. |
+| `switchyard_economics_calendar_requests{...}` | gauge | The same request count, for the current Bangkok day. |
+| `switchyard_economics_calendar_day_start` | gauge | Unix timestamp of the current Bangkok midnight. |
+| `switchyard_economics_calendar_day_end` | gauge | Unix timestamp of the next Bangkok midnight. |
+| `switchyard_economics_calendar_day_elapsed_seconds` | gauge | Seconds since the current Bangkok midnight. |
+| `switchyard_economics_calendar_provider_cost{...,currency}` | gauge | The provider-reported cost incurred in the current Bangkok day, by attribution and currency. |
+
+The day boundary is midnight in `UTC+07:00`, not midnight in UTC and not a
+rolling twenty-four hours.
+
+### Rolling windows
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_economics_rolling_tokens{window,component,...}` | gauge | Tokens consumed in the trailing window. |
+| `switchyard_economics_rolling_requests{window,...}` | gauge | Requests served in the trailing window. |
+| `switchyard_economics_rolling_provider_cost{window,...,currency}` | gauge | Provider-reported cost incurred in the trailing window, per currency. |
+
+`window` is `1h` or `24h`.
+
+These are computed from the events Switchyard itself observed, not from a
+PromQL `increase()` over a counter. That matters at the edges: `increase()`
+extrapolates from whatever samples exist, so a window that begins before the
+process started, or that contains a restart, is reported as usage the window
+never held. The rolling figures report what was observed inside the window and
+nothing else, so a window shorter than the process's uptime is honest and a
+longer one is limited to the uptime.
+
+Events are aggregated into one-minute buckets and buckets older than 24 hours are
+dropped, so memory follows the last day of activity rather than the life of the
+process. A rolling figure is therefore exact to the minute: a bucket is included
+when its start falls inside the window, so the reported value can differ from the
+instant-by-instant truth by at most the final partial minute.
+
+The rolling windows are gauges, not counters. A counter only grows, and a rolling
+total rises and falls; publishing it as a counter would report the last day's
+usage as though it were the process's lifetime total.
+
+A window that saw no usage for an attribution produces no series for it rather
+than a zero, so an idle provider is absent rather than falsely measured as zero. Prometheus cannot express this: the `@` modifier
+needs a literal timestamp, and a computed one is rejected by the API. Switchyard
+therefore publishes the calendar-day totals itself.
+
+> **Note:** these are **gauges**, not counters. The calendar is republished every
+> thirty seconds; as counters the published total would grow by the day's total on
+> every publish.
+
 ## Cardinality
 
 All labels are bounded enums. No per-request or per-user values escape

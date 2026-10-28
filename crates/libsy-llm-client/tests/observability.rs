@@ -1001,6 +1001,8 @@ async fn successful_run_records_metrics_spans_and_outcome_metadata() -> switchya
             total_tokens: Some(25),
             reasoning_tokens: Some(2),
             cache: Usage::cache_details(Some(3), Some(4)),
+            cost: None,
+            cost_currency: None,
         },
     }) as Arc<dyn RoutedLlmClient>;
     let mut request = request_with_metadata("obs-session-1", "obs-corr-1");

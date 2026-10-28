@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Gateway acceptance tests: authentication, grants, accounting, streaming.
 
 Every check pins a property a plausible implementation gets wrong. The accounting

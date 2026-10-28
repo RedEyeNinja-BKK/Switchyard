@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Authenticated ingress gateway for the ST routes.
 
 One listen address, loopback only. Every request must carry a bearer token whose
@@ -132,7 +134,7 @@ class GatewayRefused(Exception):
 
 # --------------------------------------------------------------------- config
 def load_config() -> dict:
-    with open(CONFIG, "r", encoding="utf-8") as handle:
+    with open(CONFIG, encoding="utf-8") as handle:
         data = json.load(handle)
     if not isinstance(data, dict):
         raise ValueError("config must be a JSON object")
@@ -248,7 +250,7 @@ def usage_from_sse(tail: bytes) -> dict | None:
 # ---------------------------------------------------------------------- state
 def load_state() -> dict:
     try:
-        with open(STATE, "r", encoding="utf-8") as handle:
+        with open(STATE, encoding="utf-8") as handle:
             data = json.load(handle)
             return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
@@ -342,7 +344,7 @@ class Gateway(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         # Method and path only. Never the Authorization header, never a body.
-        sys.stderr.write("%s %s\n" % (self.command, self.path.split("?")[0]))
+        sys.stderr.write(f"{self.command} {self.path.split(chr(63))[0]}\n")
 
     # ---------------------------------------------------------------- responses
     def _json(self, code: int, payload: dict) -> None:

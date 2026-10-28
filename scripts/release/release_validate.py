@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA Corporation & Affiliates. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Run a release's own dry-run under the service's environment, without leaking it.
@@ -41,7 +41,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 
 # Long enough to describe a load failure, short enough not to become a dump.
 DETAIL_LINES = 12

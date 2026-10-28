@@ -361,8 +361,21 @@ def cmd_generate(args: argparse.Namespace) -> int:
     contract = load_contract(args.contract)
     declared = contract["families"]
 
+    if args.source_only:
+        if args.out or args.binary:
+            fail(EXIT_USAGE,
+                 "--source-only checks the contract against the source and writes "
+                 "nothing; drop --out and --binary. A manifest that is not bound to "
+                 "an artifact must never be produced, because nothing would stop it "
+                 "being deployed.")
+    elif not args.binary or not args.out:
+        fail(EXIT_USAGE, "generate needs --binary and --out, or --source-only")
+
     source, non_metric = scan_source(args.source)
-    blob = load_binary(args.binary)
+    # Without an artifact the source-side checks still run; only the two checks
+    # that need bytes are skipped. They are skipped, never faked: a source-only run
+    # makes no claim about what the build contains.
+    blob = None if args.source_only else load_binary(args.binary)
     typed, untyped = reconcile(source)
 
     # Resolve the names the scanner could not type from the contract's declared
@@ -372,7 +385,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
     # declared kind that contradicts a typed construction site is a hard failure
     # rather than a quiet correction.
     resolved = dict(typed)
-    kind_basis: dict[str, str] = {name: "source" for name in typed}
+    kind_basis: dict[str, str] = dict.fromkeys(typed, "source")
     for name in sorted(untyped):
         entry = declared.get(name) or {}
         declared_kind = entry.get("kind")
@@ -411,7 +424,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
             fail(EXIT_STALE,
                  f"{name} is declared not_compiled, but no construction site exists in "
                  "the source at all; remove the entry instead of marking it dead")
-        if in_binary(name):
+        if blob is not None and in_binary(name):
             fail(EXIT_DRIFT,
                  f"{name} is declared not_compiled in capabilities.toml but the string "
                  "is present in the artifact. The contract is out of date with the "
@@ -422,7 +435,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
     absent_from_binary: list[str] = []
     for instrument in sorted(resolved):
-        if not in_binary(instrument):
+        if blob is not None and not in_binary(instrument):
             absent_from_binary.append(instrument)
     if absent_from_binary:
         for name in absent_from_binary:
@@ -480,6 +493,13 @@ def cmd_generate(args: argparse.Namespace) -> int:
              f"{len(stale)} classified instrument(s) do not exist in this build. A "
              "contract entry with no instrument behind it makes the gate lie: it "
              "would report a capability as present when nothing exports it.")
+
+    if args.source_only:
+        print(f"source scan: {len(resolved)} instruments, {len(families)} families, "
+              f"{len(declared)} contract entries -- all classified, none stale")
+        print("no artifact checked: compile the binary and run again with --binary "
+              "to bind the manifest to it")
+        return 0
 
     subsystems: dict[str, list[str]] = {}
     for family, meta in families.items():
@@ -776,11 +796,17 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     g = sub.add_parser("generate", help="build the capability manifest for an artifact")
-    g.add_argument("--binary", required=True)
+    g.add_argument("--binary", default=None,
+                   help="the compiled artifact; required unless --source-only")
     g.add_argument("--source", required=True)
     g.add_argument("--contract", default=os.path.join(os.path.dirname(__file__),
                                                       "capabilities.toml"))
-    g.add_argument("--out", required=True)
+    g.add_argument("--out", default=None,
+                   help="where to write the manifest; required unless --source-only")
+    g.add_argument("--source-only", action="store_true",
+                   help="check that the source scan and capabilities.toml agree, "
+                        "without an artifact. Writes nothing: a manifest with no "
+                        "artifact binding would be unsafe to deploy from.")
     g.set_defaults(func=cmd_generate)
 
     v = sub.add_parser("validate", help="compare a candidate against the deployed baseline")

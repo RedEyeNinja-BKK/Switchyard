@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA Corporation & Affiliates. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """The capability contract's judgement, tested without a build.
@@ -241,6 +241,73 @@ def test_preflight_still_applies_the_comparison(tmp_path):
 # ---------------------------------------------------------------------------
 # the contract file itself
 # ---------------------------------------------------------------------------
+
+
+def _source_tree(root, instruments):
+    """A minimal source tree the scanner will accept.
+
+    The scanner only looks inside the server crates, so the fixture has to place
+    its Rust file there; anywhere else is deliberately invisible to it.
+    """
+    crate = root / "crates" / "switchyard-server" / "src"
+    crate.mkdir(parents=True)
+    body = "\n".join(f'let c = meter.u64_counter("{name}");' for name in instruments)
+    (crate / "metrics.rs").write_text(body + "\n")
+    return root
+
+
+def _contract(tmp_path, entries):
+    path = tmp_path / "capabilities.toml"
+    lines = ['[meta]', 'contract_version = 1', '']
+    for name, extra in entries.items():
+        lines.append(f'[families."{name}"]')
+        lines.append('class = "always_present"')
+        lines.append('subsystem = "core"')
+        for key, value in extra.items():
+            lines.append(f'{key} = "{value}"' if isinstance(value, str) else f'{key} = {str(value).lower()}')
+        lines.append('')
+    path.write_text("\n".join(lines))
+    return str(path)
+
+
+def test_source_only_checks_the_contract_without_an_artifact(tmp_path):
+    """CI has no compiled binary, and the classification check needs none.
+
+    A new instrument that nobody classified is exactly how a capability arrives
+    unnoticed. This runs on the source alone, so a pull request is stopped before
+    any build is made.
+    """
+    tree = _source_tree(tmp_path, ["switchyard.llm_calls", "switchyard.errors"])
+    contract = _contract(tmp_path, {"switchyard.llm_calls": {}, "switchyard.errors": {}})
+    assert cc.main(["generate", "--source", str(tree), "--contract", contract,
+                    "--source-only"]) == 0
+
+
+def test_source_only_reports_an_unclassified_instrument(tmp_path):
+    tree = _source_tree(tmp_path, ["switchyard.llm_calls", "switchyard.surprise_metric"])
+    contract = _contract(tmp_path, {"switchyard.llm_calls": {}})
+    assert cc.main(["generate", "--source", str(tree), "--contract", contract,
+                    "--source-only"]) == cc.EXIT_UNCLASSIFIED
+
+
+def test_source_only_reports_a_stale_contract_entry(tmp_path):
+    """An entry with nothing behind it makes the gate claim a capability exists."""
+    tree = _source_tree(tmp_path, ["switchyard.llm_calls"])
+    contract = _contract(tmp_path, {"switchyard.llm_calls": {},
+                                    "switchyard.removed_long_ago": {}})
+    assert cc.main(["generate", "--source", str(tree), "--contract", contract,
+                    "--source-only"]) == cc.EXIT_STALE
+
+
+def test_source_only_refuses_to_produce_a_manifest(tmp_path):
+    """A manifest with no artifact binding must not be writable at all."""
+    tree = _source_tree(tmp_path, ["switchyard.llm_calls"])
+    contract = _contract(tmp_path, {"switchyard.llm_calls": {}})
+    out = tmp_path / "caps.json"
+    rc = cc.main(["generate", "--source", str(tree), "--contract", contract,
+                  "--source-only", "--out", str(out)])
+    assert rc == cc.EXIT_USAGE
+    assert not out.exists(), "source-only must never write a manifest"
 
 
 def test_the_checked_in_contract_loads_and_is_internally_consistent():

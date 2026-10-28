@@ -247,12 +247,45 @@ jobs:
               sys.exit(f"FAIL: heavy packages pulled into slim install: {extras}")
           print(f"OK: all {len(forbidden)} heavy packages absent from slim install.")
           PY
+  # Release tooling. Two failure modes, neither of which a health check can see:
+  # a candidate that would silently lose a metric subsystem (metrics are created on
+  # first observation, so such a build starts, passes health and merely stops
+  # exporting), and an installer that cannot restore a previous release. The
+  # installer suite builds its own sandbox and never reads or writes a real release
+  # store, so this job needs no host and no credentials.
+  release-safety:
+    name: Release safety
+    needs: changes
+    if: needs.changes.outputs.full_ci == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - run: uv sync --locked --no-install-project
+      - name: Capability contract
+        run: uv run --no-sync pytest tests/test_capability_contract.py -v
+      # The manifest a release deploys is generated beside a compiled binary, which
+      # this job does not build. What it can still check -- and what stops an
+      # unclassified instrument from reaching a release -- is that the source scan and
+      # the checked-in contract agree. That needs no artifact.
+      - name: Source scan against the checked-in contract
+        run: |
+          uv run --no-sync python scripts/release/capability_contract.py generate \
+            --source . --source-only
+      - name: Installer and rollback acceptance suite (sandboxed, needs root)
+        run: sudo python3 scripts/release/test_activate_release.py
+
   # Single required check for branch protection. Gates on every job above so
   # the ruleset never needs editing when jobs are added or renamed.
   ci-success:
     name: CI Success
     if: always()
-    needs: [changes, lint, spdx-headers, rust, typecheck, test, litellm, slim-install-smoke]
+    needs: [changes, lint, spdx-headers, rust, typecheck, test, litellm, slim-install-smoke,
+            release-safety]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all jobs succeeded

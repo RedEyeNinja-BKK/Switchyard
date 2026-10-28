@@ -162,36 +162,53 @@ read-only metadata, no inference) and against the target declarations in the
 config. The route flags are not the same kind of claim, which matters here:
 
 - `vision = true` is a promise about **every** target the route can select.
-- `video = true` is a promise that **any** target can serve video; the loader
-  requires at least one child that declares it, and a target that omits `video`
-  is treated as "has not claimed video", not as a refusal.
+- `video = true` is a promise that **some** target can serve video; the loader
+  requires at least one child that declares it. For dispatch, the per-target fact
+  is `no_video = target.video != Some(true)`, so a target either declares
+  `video = true` or is video-incapable - omitting it is not a refusal at load
+  time, but it does exclude the target from a video request.
 
 | route | declared | target(s) upstream | provider input modalities | verdict |
 | --- | --- | --- | --- | --- |
-| `ST_Tier1g` | `vision=true` `video=true` | `dots-studio/dots-3-note-preview:free` (primary), `nvidia/nemotron-3.5-super-vl:free` (candidate) | `text,image` / `text,image,video` | vision correct; video **legal but misleading** |
+| `ST_Tier1g` | `vision=true` `video=true` | `dots-studio/dots-3-note-preview:free` (primary), `nvidia/nemotron-3.5-super-vl:free` (candidate) | `text,image` / `text,image,video` | correct on both; video routes to the eligible candidate |
 | `ST_Tier2g` | `vision=false` | `recursive/flint-v1.0:free`, `xingchen-agi/xing4.0-29b-a4b:free` | `text` / `text` | correct, and conservative |
 | `ST_Tier3g` | `vision=true` `video=true` | `google/gemma-4-26b-a4b-it:free`, `google/gemma-4-31b-it:free` | `image,text,video` / `image,text,video` | correct on both |
 
-`ST_Tier1g` is the one worth a decision. Its `video = true` passes the loader
-because the *candidate* handles video, but the **primary** target explicitly
-carries `video = false` and the provider confirms its input is text and image
-only. Video is therefore admitted on that route and dispatched to a model that
-cannot read it, and only reaches a video-capable model through a failed attempt
-plus fallback.
+`ST_Tier1g` advertises video while its **primary** target explicitly carries
+`video = false` and its input is text and image only at the provider. That is a
+narrower claim than "the primary cannot read it": the candidate selection filter
+in `Route::execute` removes every target that cannot serve the request *before any
+provider is contacted* (`no_video = target.video != Some(true)`, applied per
+target), so the video-incapable primary is not called, not called-and-failed. A
+video request selects the video-capable candidate as its first and only upstream
+attempt.
 
-This is not a regression introduced at 16:37. The pre-existing `ST_Tier1` has the
-identical shape - `video = true`, primary `stephen-dots-3-note-preview-free` with
-`video = false`, candidate `stephen-nemotron-3-5-super-vl-free` with `video = true` -
-so the twins reproduce the established pattern rather than inventing a new one.
-The same holds for the `openai_responses` transport the video path requires, which
-is satisfied: no silent video-to-text conversion is possible on this client.
+Measured on the deployed binary `f188c5a9…` (loopback mock provider, scratch
+configuration, no credential, no external request), with a primary declaring
+`video = false` and a candidate declaring `video = true` on a route declaring
+`video = true`:
 
-Smallest safe correction, for operator approval and **not** applied here: set
-`video = false` on `ST_Tier1g` (and `ST_Tier1`, for consistency) so a video request
-is refused at admission with `unsupported_capability` instead of being sent to a
-target that cannot read it. One line each, reversible, no model or route removed.
-The alternative - making the video-capable model the primary target - would move
-ordinary text traffic onto it, which is a routing decision, not a correction.
+| request | upstream calls | which model | caller status |
+| --- | --- | --- | --- |
+| video | **1** | the video-capable candidate | 200 |
+| image (control) | 1 | the primary | 200 |
+| video, route with no eligible candidate | **0** | none | 400 `unsupported_capability` |
+| video, whole-route composite whose first child is ineligible | **1** | the eligible child | 200 |
+| image, same composite (control) | 1 | the first child | 200 |
+
+The image controls matter: they show the route still prefers its primary for
+ordinary traffic, so the video case's exclusion is the capability filter working,
+not a candidate list that never dispatches to the primary. The composite case
+shows the same filter applied per child by composition, which skips the
+ineligible child and continues.
+
+So `video = true` on `ST_Tier1g` is correct and intentional, and no change to
+`ST_Tier1g` or `ST_Tier1` is warranted: selecting the eligible video candidate is
+the designed behaviour. An earlier revision of this record claimed the primary
+would be called and fail into fallback, and proposed setting `video = false` on
+those routes; that was an untested inference from the config alone and is
+withdrawn. The `openai_responses` transport requirement is satisfied as well, so
+no silent video-to-text conversion is possible on this client.
 
 ### Provenance: four separate claims
 
@@ -289,8 +306,10 @@ one unknown with another.
 - The build-time source state is unresolved beyond what the surviving artifact and
 the deployed binary's behaviour prove; it may have contained other uncommitted
   changes that no longer exist anywhere.
-- `ST_Tier1g` (and the pre-existing `ST_Tier1`) claim video while their primary
-  target is text-and-image only. See the capability findings above; the correction
-  needs operator approval.
+- `ST_Tier1g` (and the pre-existing `ST_Tier1`) advertise video with a
+  video-incapable primary. Verified correct: the candidate filter excludes the
+  primary before dispatch, so the eligible candidate is selected first. No change
+  needed; see the capability findings above.
 - Route-level `vision` and `video` are not represented in the capability manifest,
-  so the release gate cannot notice a wrong modality claim.
+  so the release gate cannot notice a wrong modality claim. That remains true even
+  though these particular claims are right.

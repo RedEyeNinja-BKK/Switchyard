@@ -41,6 +41,20 @@ EXPECTED_EMPTY = {
     "UPSTREAM ATTEMPTS BY STATUS OVER TIME": (
         "increase() over a 15m window with no attempts in that window"
     ),
+    # Composition counters are recorded per child attempt of a WHOLE-ROUTE composite.
+    # The live manifest routes every model through a passthrough route whose candidates
+    # are targets, not routes, so no composite runs and the series does not exist. The
+    # panels are kept because a composite route is the one place these facts are
+    # observable, and an absent series is not a failed query.
+    "ACCOUNT-WIDE QUOTA BLOCKS": (
+        "no whole-route composite has run since this process started"
+    ),
+    "COMPOSITION OUTCOMES BY CAPABILITY": (
+        "no whole-route composite has run since this process started"
+    ),
+    "ROUTE CROSSINGS BY REASON": (
+        "no composite child has failed over to a later child since this process started"
+    ),
 }
 
 MONEY = (

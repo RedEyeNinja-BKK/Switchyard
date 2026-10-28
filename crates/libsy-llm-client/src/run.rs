@@ -705,7 +705,7 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
 /// `invalid_prompt`) and that the top-level `error_type` is the stable, cross-format
 /// value. It is a sibling of the `error` object, not a member of it, and a failure
 /// envelope is not obliged to contain it — hence an `Option`.
-fn canonical_error_type(body: &str) -> Option<&'static str> {
+pub(crate) fn canonical_error_type(body: &str) -> Option<&'static str> {
     let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
     let candidate = value["error_type"]
         .as_str()

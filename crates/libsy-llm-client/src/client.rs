@@ -1040,8 +1040,28 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
         // A 403 with a budget limit_source is an account cap. A 403 without one is a
         // guardrail or policy refusal and is deliberately NOT included here.
         StatusCode::FORBIDDEN => limit_source.is_some(),
+        // OpenRouter masks a billing failure as `server_error` and states the real cause
+        // only in the sibling `error_type`. The status hides an account-level condition
+        // rather than describing a transient infrastructure fault.
+        status if status.is_server_error() => {
+            crate::run::canonical_error_type(body) == Some("payment_required")
+        }
         _ => false,
     }
+}
+
+/// A permanent provider condition reported behind a 5xx.
+///
+/// A 5xx normally means the provider's infrastructure failed and another attempt may
+/// succeed. OpenRouter also uses `server_error` to mask an authentication, authorization
+/// or billing failure, naming the real cause only in the sibling `error_type`. Retrying
+/// such a response cannot succeed, so the retry loop must not treat it as transient — the
+/// same marker the fallback classifier reads, applied here as well.
+fn is_masked_permanent_failure(body: &str) -> bool {
+    matches!(
+        crate::run::canonical_error_type(body),
+        Some("authentication" | "permission_denied" | "payment_required")
+    )
 }
 
 fn is_transient_failure(error: &LlmClientError) -> bool {
@@ -1054,7 +1074,10 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         LlmClientError::Transport { .. }
         | LlmClientError::Timeout { .. }
         | LlmClientError::AttemptTimeout { .. } => true,
-        LlmClientError::UpstreamHttp { status, .. } => {
+        LlmClientError::UpstreamHttp { status, body } => {
+            if status.is_server_error() && is_masked_permanent_failure(body) {
+                return false;
+            }
             metrics::is_retryable_http_status(status.as_u16())
         }
         _ => false,
@@ -3486,6 +3509,45 @@ mod tests {
             retry_after: None,
         };
         assert!(!context_window.is_retryable());
+    }
+
+    /// A 5xx that masks a permanent auth or billing failure is not infrastructure.
+    ///
+    /// OpenRouter reports `authentication`, `permission_denied` and `payment_required`
+    /// behind `server_error`, naming the real cause only in the sibling `error_type`.
+    /// Retrying cannot restore either condition, so the retry loop must read the same
+    /// marker the fallback classifier reads.
+    ///
+    /// The controls keep the general 5xx retry intact: a bare 5xx, an empty body, and a
+    /// 5xx naming an unrelated type must all still retry, or this rule would pass while
+    /// quietly removing recovery that works today.
+    #[test]
+    fn a_masked_permanent_failure_is_not_retried_but_plain_5xxs_are() {
+        let failure = |body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: body.to_string(),
+            },
+            status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+            retry_after: None,
+        };
+
+        for masked in ["authentication", "permission_denied", "payment_required"] {
+            let body = format!(
+                r#"{{"error":{{"code":"server_error"}},"error_type":"{masked}"}}"#
+            );
+            assert!(
+                !failure(&body).is_retryable(),
+                "a masked {masked} must fail fast"
+            );
+        }
+
+        assert!(failure(r#"{"error":{"code":"server_error"}}"#).is_retryable());
+        assert!(failure("").is_retryable());
+        assert!(
+            failure(r#"{"error":{"code":"server_error"},"error_type":"rate_limit_exceeded"}"#)
+                .is_retryable()
+        );
     }
 
     /// A daily account cap is not a throttle: retrying it immediately cannot succeed.

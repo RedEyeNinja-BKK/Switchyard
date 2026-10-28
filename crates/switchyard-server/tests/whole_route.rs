@@ -338,12 +338,7 @@ candidates = [{}]
 ///
 /// Candidate strings may carry slug punctuation (`:` in `:free`), so the TOML table
 /// key is sanitized while the target `id` keeps the slug the provider reports.
-fn leaf_shared(
-    id: &str,
-    candidates: &[&str],
-    vendor: &str,
-    client: &str,
-) -> String {
+fn leaf_shared(id: &str, candidates: &[&str], vendor: &str, client: &str) -> String {
     let mut targets = String::new();
     let mut ids = Vec::new();
     let mut first = None;
@@ -1725,9 +1720,16 @@ async fn a_free_scope_quota_does_not_block_the_paid_leg_on_the_same_credential()
         .expect("the paid leg must still serve after the free cap");
 
     assert_eq!(outcome.child_route, "ST_Paid");
-    assert!(outcome.crossed_child, "the request crossed from the free tier");
+    assert!(
+        outcome.crossed_child,
+        "the request crossed from the free tier"
+    );
     assert_eq!(quota.calls(), 1, "the free tier made exactly one call");
-    assert_eq!(paid.calls(), 1, "the paid leg served on the same credential");
+    assert_eq!(
+        paid.calls(),
+        1,
+        "the paid leg served on the same credential"
+    );
 }
 
 /// A free-scope quota DOES block a later free-only child on the same credential: the

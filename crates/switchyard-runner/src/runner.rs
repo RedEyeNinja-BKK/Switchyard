@@ -163,12 +163,10 @@ impl Runner {
     /// lookup cannot paper over — it reports one of them, and the mismatch stays a
     /// configuration fact.
     pub(crate) fn credential_for_slug(&self, slug: &str) -> Option<String> {
-        self.routes
-            .iter()
-            .find_map(|(_, route)| {
-                let model = ModelId::from(slug.to_string());
-                route.target_credential(&model).map(str::to_string)
-            })
+        self.routes.iter().find_map(|(_, route)| {
+            let model = ModelId::from(slug.to_string());
+            route.target_credential(&model).map(str::to_string)
+        })
     }
 
     /// Returns the registered routes, for advertising and capability lookups.

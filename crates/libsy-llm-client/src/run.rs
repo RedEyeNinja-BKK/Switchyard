@@ -2601,7 +2601,11 @@ mod tests {
             );
             assert_eq!(
                 fallback_reason(&error),
-                if metadata { None } else { Some(RoutingFallbackReason::Unavailable) },
+                if metadata {
+                    None
+                } else {
+                    Some(RoutingFallbackReason::Unavailable)
+                },
                 "{target}: {message}"
             );
             assert_eq!(
@@ -3363,17 +3367,17 @@ mod account_quota_tests {
             "a rejected credential must not be retried on another route"
         );
 
-        let permission = masked(r#"{"error":{"code":"server_error"},"error_type":"permission_denied"}"#);
+        let permission =
+            masked(r#"{"error":{"code":"server_error"},"error_type":"permission_denied"}"#);
         assert_eq!(failure_class(&permission), FailureClass::Auth);
 
-        let payment = masked(r#"{"error":{"code":"server_error"},"error_type":"payment_required"}"#);
+        let payment =
+            masked(r#"{"error":{"code":"server_error"},"error_type":"payment_required"}"#);
         assert_eq!(failure_class(&payment), FailureClass::AccountQuota);
         assert!(failure_class(&payment).is_account_quota());
 
         // A genuine infrastructure failure states nothing and stays transient.
-        let bare = masked(
-            r#"{"error":{"code":"server_error","message":"Provider overloaded"}}"#,
-        );
+        let bare = masked(r#"{"error":{"code":"server_error","message":"Provider overloaded"}}"#);
         assert_eq!(failure_class(&bare), FailureClass::Server);
         assert!(failure_class(&bare).allows_cross_route());
 

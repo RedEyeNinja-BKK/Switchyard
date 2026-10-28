@@ -1024,11 +1024,13 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
     let LlmClientError::UpstreamHttp { status, body } = source else {
         return false;
     };
-    let limit_source = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|value| {
-        value["error"]["metadata"]["limit_source"]
-            .as_str()
-            .map(str::to_string)
-    });
+    let limit_source = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value["error"]["metadata"]["limit_source"]
+                .as_str()
+                .map(str::to_string)
+        });
     match *status {
         StatusCode::TOO_MANY_REQUESTS => {
             limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
@@ -3533,9 +3535,7 @@ mod tests {
         };
 
         for masked in ["authentication", "permission_denied", "payment_required"] {
-            let body = format!(
-                r#"{{"error":{{"code":"server_error"}},"error_type":"{masked}"}}"#
-            );
+            let body = format!(r#"{{"error":{{"code":"server_error"}},"error_type":"{masked}"}}"#);
             assert!(
                 !failure(&body).is_retryable(),
                 "a masked {masked} must fail fast"

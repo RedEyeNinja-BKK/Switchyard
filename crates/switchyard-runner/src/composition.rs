@@ -219,9 +219,11 @@ impl Runner {
         // reservation rides with the input: a request that wants 16k of output does not
         // fit a window its input leaves 15k short of, so the reservation is admitted
         // alongside the input rather than discovered as an upstream rejection.
-        let raw_request = request.raw_request.as_ref().unwrap_or(&serde_json::Value::Null);
-        let mut estimated_input_tokens =
-            request_fit::estimate_input_tokens(raw_request);
+        let raw_request = request
+            .raw_request
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null);
+        let mut estimated_input_tokens = request_fit::estimate_input_tokens(raw_request);
         if let Some(reservation) = request.llm_request.output.max_output_tokens {
             estimated_input_tokens = estimated_input_tokens.saturating_add(reservation);
         }
@@ -255,7 +257,9 @@ impl Runner {
             {
                 children.push((
                     child_name.clone(),
-                    ChildOutcome::Skipped { capability: "context_window" },
+                    ChildOutcome::Skipped {
+                        capability: "context_window",
+                    },
                 ));
                 continue;
             }
@@ -468,8 +472,10 @@ impl Runner {
     ) -> Option<ChildOutcome> {
         let credential = self.child_credential(route)?;
         for block in blocks {
-            if matches!(block.kind, switchyard_llm_client::CredentialBlockKind::FreeQuota)
-                && !route.all_targets_free()
+            if matches!(
+                block.kind,
+                switchyard_llm_client::CredentialBlockKind::FreeQuota
+            ) && !route.all_targets_free()
             {
                 continue;
             }
@@ -477,7 +483,9 @@ impl Runner {
                 return Some(ChildOutcome::Skipped {
                     capability: match block.kind {
                         switchyard_llm_client::CredentialBlockKind::FreeQuota => "credential_quota",
-                        switchyard_llm_client::CredentialBlockKind::WholeQuota => "credential_quota",
+                        switchyard_llm_client::CredentialBlockKind::WholeQuota => {
+                            "credential_quota"
+                        }
                         switchyard_llm_client::CredentialBlockKind::Unauthorized => {
                             "credential_unauthorized"
                         }

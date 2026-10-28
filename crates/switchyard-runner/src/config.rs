@@ -1498,7 +1498,11 @@ fn target_credentials(
     route
         .routing_target_names()
         .into_iter()
-        .filter_map(|name| targets.get(name).map(|target| (target.id.clone(), target.llm_client.clone())))
+        .filter_map(|name| {
+            targets
+                .get(name)
+                .map(|target| (target.id.clone(), target.llm_client.clone()))
+        })
         .collect()
 }
 

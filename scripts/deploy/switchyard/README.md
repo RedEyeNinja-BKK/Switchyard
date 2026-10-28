@@ -96,3 +96,100 @@ Never removes source, release builds, production binaries, credentials or
 rollback anchors — the protected set is snapshotted before any deletion and
 asserted afterwards. Skips the debug-profile removal while a build is running, so
 a compile is never truncated mid-write. Runs daily from `disk-retention.timer`.
+
+## Deployment state record - 2026-10-28
+
+Recorded on the host and from the release store after a configuration-only
+deployment landed outside a planned change window. It documents state; it changes
+no behaviour, and it does not alter any release record.
+
+| | |
+| --- | --- |
+| CURRENT | `20261028T163707Z-f188c5a9cab31c0b-83c33c93`, label `dualfree-tier-20261028` |
+| CURRENT binary | `f188c5a9cab31c0b…` - byte-identical to the release it replaced |
+| CURRENT manifest | `83c33c93…`, 37,077 B |
+| CURRENT capabilities | `c64c1016…` - identical to the previous release's |
+| LAST-KNOWN-GOOD | `20261028T154640Z-f188c5a9cab31c0b-407d8da5`, label `stephen-st-paid-1017` |
+| also retained | `20261028T152055Z-f188c5a9cab31c0b-cc1dab83` |
+
+All three releases hold a full binary, manifest and capability manifest, and every
+recorded hash matches the bytes on disk (`verify` reports `binary ok`,
+`manifest ok`, `service healthy`). The previous configurations are therefore
+recoverable by `rollback`, which is a property the pre-`e40c7ff` installer did
+not have.
+
+### What the deployment changed
+
+Three routes were added - `ST_Tier1g`, `ST_Tier2g`, `ST_Tier3g` - carrying the same
+free model ids as the Stephen tiers but on the global
+`SWITCHYARD_OPENROUTER_API_KEY` instead of the Stephen key. `ST_Route` and
+`ST_RouteFree` gained those three ahead of `ST_Paid` and `smartlocal`. Routes
+47 → 50; targets 45 → 45; composites unchanged in count. No route or target was
+removed, and no existing route body changed - the diff against `407d8da5` is three
+new blocks plus two `children` lines.
+
+The intent is stated in the config itself: the Stephen credential's free allowance
+is an account-wide daily cap, and when it is exhausted every Stephen free model
+returns one class of 429, which previously fell straight through to paid `ST_Paid`.
+A twin on a separate account lets the composite spend the second free allowance
+first. Measured since activation, `switchyard_composition_cross_total` shows 30
+crossings `ST_Tier1 → ST_Tier1g` with `reason="account_quota"`, so the change is
+both loaded and doing what it was written to do.
+
+### Validation
+
+- The capability gate ran and passed. It could not have failed on inspection: the
+  manifest supplied with the candidate was a byte copy of the previous release's,
+  which is consistent with an unchanged binary but means the gate compared a
+  manifest with itself. The route-level capability flags this config introduces
+  (`vision`, `video`) are not represented in the manifest at all.
+- The candidate was exercised live before installation in a separate process against
+  the production credentials - three requests, one of which crossed into
+  `ST_Tier1g` and returned a completion. That is a stronger check than the
+  `--dry-run` this repository's `validate` verb performs.
+- `validate` itself was **not** run for this candidate: the only
+  `.validate-*.log` in the release root is from the 15:46 deploy.
+- Post-deployment verification passed. `CURRENT` is repointed before `post_verify`
+  runs, and a failure there rolls back, so `CURRENT` still naming the candidate
+  plus a live service is the evidence.
+- Re-verified read-only afterwards: `verify-live` PASS, every one of the 16
+  `always_present` families exposed, health 200, `NRestarts=0`.
+
+### Provenance caveat
+
+`release.json` declares `source_commit=7372e79` on branch `econ-restore-20261028`
+with `attested: true`. That commit does not describe this deployment. It is an
+`llm-client` fix, it is not present in the running binary (whose bytes are
+unchanged from the previous release, which was built before it), and the route
+change exists in no commit at all - the config was authored as
+`/tmp/routes_dualfree2.toml` on the host and staged from there.
+
+The `config-only-dualfree-tiers` basis is accurate. The source identity attached to
+it is not, and an operator reading `SOURCE-COMMIT.txt`-style provenance would
+conclude the deployed config came from `7372e79`, which it did not. The accurate
+record is: config-only, no source commit, staged file authored on `switchyard-vm`.
+
+### Authorization
+
+Not established. The deployment ran as
+`activate-release.sh deploy /opt/switchyard/staged/routes-dualfree-20261028.toml …`
+from an authenticated `turnstone-mgmt` SSH session originating on the Turnstone
+management host, minutes after that same host staged the file and copied the
+capability manifest. The release store, the staged documents and the CI workstream
+carry no approval, ticket or operator instruction for it.
+
+Resolving it needs one of: the initiating session's transcript, an operator
+confirmation, or the change record that authorized `dualfree-tier-20261028`.
+
+The deployment is healthy and is left in place. Reversing it would be a production
+change with its own risk, and doing so on an unknown authorization would compound
+one unknown with another.
+
+### Open items
+
+- The authorization gap above.
+- `CURRENT` is attested only in the declared sense; `LAST-KNOWN-GOOD` is not
+  attested at all, so the rollback target rests on observed bytes alone.
+- `ST_Tier1g` and `ST_Tier3g` declare `vision = true` and `video = true`. Modality
+  support for those free models was not verified here and is not covered by the
+  capability contract.

@@ -161,3 +161,102 @@ def test_the_dashboard_declares_the_cost_family_it_cannot_currency_filter(dashbo
         assert "switchyard_economics_provider_cost_total" not in expr, (
             f"{title} uses the unlabelled cumulative cost counter for a money figure"
         )
+
+
+# ------------------------------------------------- refId: the No Data defect
+def test_no_panel_reuses_a_refid(dashboard):
+    """Grafana keys query results by refId, so duplicates render as No Data.
+
+    This is the defect that broke the allowance-history and usage-trend charts:
+    both targets were valid, both had data, and both were labelled "A". A PromQL
+    check sees nothing wrong and a per-expression liveness check sees nothing
+    wrong, which is why the assertion lives in the structure gate.
+    """
+    offenders = []
+    for panel in dashboard["panels"]:
+        refs = [t.get("refId") for t in (panel.get("targets") or [])]
+        for ref in {r for r in refs if refs.count(r) > 1}:
+            offenders.append(f"{panel.get('title')}: refId {ref!r} x{refs.count(ref)}")
+    assert offenders == []
+
+
+def test_structure_gate_rejects_a_duplicate_refid():
+    """The negative control: the check must bite, not merely pass."""
+    import verify_generated_dashboard as v8
+
+    doc = {
+        "panels": [
+            {
+                "id": 1,
+                "title": "two queries, one refId",
+                "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+                "targets": [
+                    {"refId": "A", "expr": "sum(switchyard_runs_total)"},
+                    {"refId": "A", "expr": "sum(switchyard_requests_total)"},
+                ],
+            }
+        ]
+    }
+    problems = v8.structure(doc)
+    assert any("sharing refId" in p for p in problems), problems
+
+
+def test_the_repaired_history_charts_carry_two_distinct_refids(dashboard):
+    """Named explicitly: these are the charts that were broken in V8."""
+    wanted = {
+        "5-HR WINDOW — USED AND REMAINING",
+        "WEEKLY WINDOW — USED AND REMAINING",
+        "GLOBAL ACCOUNT — USAGE, CREDIT AND REMAINING",
+        "STEPHEN ACCOUNT — USAGE, CREDIT AND REMAINING",
+    }
+    seen = set()
+    for panel in dashboard["panels"]:
+        if panel.get("title") in wanted:
+            refs = [t.get("refId") for t in panel["targets"]]
+            assert refs == sorted(refs), f"{panel['title']}: {refs}"
+            assert len(set(refs)) == len(refs), f"{panel['title']}: {refs}"
+            seen.add(panel["title"])
+    assert seen == wanted
+
+
+def test_the_operator_critical_account_sections_are_present(dashboard):
+    """Feature parity with V8 on the panels an operator actually uses."""
+    titles = {p.get("title") for p in dashboard["panels"]}
+    for required in (
+        "5-HR REMAINING",
+        "5-HR USED",
+        "TIME TO 5-HR RESET",
+        "WEEKLY REMAINING",
+        "WEEKLY USED",
+        "TIME TO WEEKLY RESET",
+        "5-HR WINDOW — USED AND REMAINING",
+        "WEEKLY WINDOW — USED AND REMAINING",
+        "BALANCE (CNY)",
+        "REMAINING — TOPPED-UP (CNY)",
+        "REMAINING — GRANTED (CNY)",
+        "REMAINING — TOTAL (CNY)",
+        "BALANCE TREND (CNY)",
+        "GLOBAL — REMAINING (USD)",
+        "GLOBAL — TOTAL USAGE (USD)",
+        "GLOBAL — PURCHASED CREDITS (USD)",
+        "GLOBAL — 24H SPEND (USD)",
+        "GLOBAL — KEY USAGE (USD, CUMULATIVE)",
+        "GLOBAL — THIS MONTH (USD)",
+        "GLOBAL ACCOUNT — USAGE, CREDIT AND REMAINING",
+        "STEPHEN — REMAINING (USD)",
+        "STEPHEN — PURCHASED CREDITS (USD)",
+        "STEPHEN — TOTAL USAGE (USD)",
+    ):
+        assert required in titles, f"missing operator-critical panel: {required}"
+
+
+def test_no_panel_presents_a_structural_zero_currency_as_a_balance(dashboard):
+    """DeepSeek has no USD balance; a $0.00 panel would look measured."""
+    for panel in dashboard["panels"]:
+        for t in panel.get("targets") or []:
+            expr = t.get("expr") or ""
+            if "switchyard_economics_provider_balance" not in expr:
+                continue
+            assert 'currency="USD",scope="account"' not in expr or "deepseek" not in expr, (
+                f"{panel.get('title')} plots DeepSeek's structural USD zero as a balance"
+            )

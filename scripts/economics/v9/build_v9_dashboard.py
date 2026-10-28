@@ -1,38 +1,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build SWITCHYARD ECONOMICS & TOKEN ACCOUNTING V9.0.
+"""Build SWITCHYARD ECONOMICS & TOKEN ACCOUNTING V9.
 
-WHAT THIS IS
-  A second, separately versioned economics dashboard. It queries only families the
-  switchyard-server binary emits itself, verified against the live exposition, and
-  it refuses to build if any panel names anything else.
+WHAT THIS DASHBOARD IS FOR
+  Monitoring the provider accounts: what each one still holds, what it has
+  consumed, when its allowance refills, and how much money is exposed. Routing
+  economics and error classification are on the same dashboard because they
+  explain those figures, but they come after the account sections, not before.
 
-WHY IT EXISTS SEPARATELY FROM V8
-  V8 was built beside an external exporter and inherited panels that read it. Those
-  panels answered a different question — what some other process believed about
-  usage — and sitting next to genuinely measured panels made the two look alike.
-  V9 answers only what Switchyard itself measures. V8 stays published and untouched
-  so an operator can roll back to it, and so the difference between the two is
-  inspectable rather than asserted.
+WHY IT QUERIES ONLY NATIVE METRICS
+  A previous dashboard sat beside an external exporter and inherited panels that
+  read it. Those panels answered what another process believed about usage and
+  were visually indistinguishable from genuinely measured ones. Every family here
+  is emitted by the switchyard-server binary itself and is checked against
+  native_contract.ALLOWED at build time; an unreviewed family is a build failure,
+  not a blank panel.
 
-WHAT AN OPERATOR SHOULD BE ABLE TO ANSWER FROM THIS DASHBOARD
-  * Which provider accounts still have money or allowance, and how stale that answer is.
-  * What the deployment is spending, per provider and per model.
-  * Where requests actually went — provider, model, route family, cost class.
-  * Why upstream calls are failing, at the resolution the binary actually records.
-
-WHAT IT DELIBERATELY DOES NOT DO
-  * It does not estimate per-model cost. `record_estimated_cost` is declared in the
-    binary and never called, so no estimate exists; provider-REPORTED cost is a
-    different number and is labelled as such.
-  * It does not present HTTP-status-derived attempt outcomes as semantic provider
-    classification. `switchyard_upstream_attempts_total` labels an attempt with the
-    status code it received, and its `outcome` is a function of that code alone.
-    The semantic signal that does exist is the composition layer's `capability` and
-    `reason` labels, and those are shown separately.
-  * It does not attribute consumption to an agent or a domain. Switchyard records a
-    route and a model, not a caller identity, so such a panel would be invention.
+THE FOUR THINGS THAT MAKE A PROVIDER PANEL WRONG
+  1. CURRENCY. A provider can publish a real balance in one currency and a
+     zero-valued series in another. DeepSeek does exactly that: CNY 91.81 is real
+     and its USD series is 0 because DeepSeek keeps no USD balance. A panel
+     reading the USD series would show a confident, measured-looking "$0.00" for
+     an account holding 91.81 CNY. Every money query here pins its currency.
+  2. SCOPE. One balance is published under scope="account" and again under
+     scope="key". They describe the same money from two vantage points; adding
+     them double counts. Panels pin one scope or name the scope per row.
+  3. refId. Grafana keys query results by refId. Two targets sharing one refId in
+     a single panel collide, and the panel renders "No data" with a warning even
+     though both expressions are valid and both have data. This is the defect
+     that broke the allowance-history and usage-trend charts in the previous
+     dashboard; every target here gets a distinct refId, and the verifier refuses
+     a duplicate.
+  4. CUMULATIVE SEMANTICS. Account usage and balance are gauges sampled at each
+     poll, not counters. A delta over a window is `last_over_time - first_over_time`
+     and may legitimately be negative after a top-up or a provider correction.
+     Clamping it to zero would turn a replenishment into a measured zero spend.
 """
 
 import argparse
@@ -57,13 +60,12 @@ from build_economics_dashboard import (  # noqa: E402
     timeseries,
 )
 
-# Live native families. Dots become underscores in the exposition.
+# --- accounting ------------------------------------------------------------
 TOK = "switchyard_economics_tokens_total"
 REQ = "switchyard_economics_requests_total"
 RTOK = "switchyard_economics_rolling_tokens"
 RREQ = "switchyard_economics_rolling_requests"
 RCOST = "switchyard_economics_rolling_provider_cost"
-PCOST = "switchyard_economics_provider_cost_total"
 CCOST = "switchyard_economics_calendar_provider_cost"
 CREQ = "switchyard_economics_calendar_requests"
 CTOK = "switchyard_economics_calendar_tokens"
@@ -79,21 +81,46 @@ FETCHDUR = "switchyard_economics_account_fetch_duration_seconds"
 COVER = "switchyard_economics_rolling_coverage_seconds"
 AUTHFAIL = "switchyard_economics_account_auth_failures_total"
 
+# --- execution -------------------------------------------------------------
 ATTEMPTS = "switchyard_upstream_attempts_total"
 CLIENTOUT = "switchyard_client_responses_total"
 CALLS = "switchyard_llm_calls_total"
 COMPATT = "switchyard_composition_attempt_total"
 COMPCROSS = "switchyard_composition_cross_total"
 RETRYREC = "switchyard_router_retry_recovered_total"
-MODELERR = "switchyard_errors_total"
-MODELREQ = "switchyard_requests_total"
 PTOK = "switchyard_prompt_tokens_total"
 CTOKC = "switchyard_completion_tokens_total"
 RTOKC = "switchyard_reasoning_tokens_total"
 CACHED = "switchyard_cached_tokens_total"
 CACHECREATE = "switchyard_cache_creation_tokens_total"
 RUNS = "switchyard_runs_total"
-DECISIONS = "switchyard_decisions_total"
+
+# Thresholds. Remaining allowance is read the way an operator reads a fuel gauge:
+# the number only becomes interesting as it approaches empty.
+REMAINING_THRESHOLDS = {
+    "mode": "absolute",
+    "steps": [
+        {"color": "red", "value": None},
+        {"color": "orange", "value": 10},
+        {"color": "green", "value": 25},
+    ],
+}
+CONSUMED_THRESHOLDS = {
+    "mode": "absolute",
+    "steps": [
+        {"color": "green", "value": None},
+        {"color": "orange", "value": 60},
+        {"color": "red", "value": 85},
+    ],
+}
+LOW_CREDIT_THRESHOLDS = {
+    "mode": "absolute",
+    "steps": [
+        {"color": "red", "value": None},
+        {"color": "orange", "value": 1},
+        {"color": "green", "value": 5},
+    ],
+}
 
 
 def build_dashboard(config):
@@ -111,192 +138,70 @@ def build_dashboard(config):
         nonlocal y
         y += step
 
-    # ---------------------------------------------------------------- overview
-    add(row("1  EXECUTIVE OVERVIEW", y))
+    def acc(metric, provider, currency=None, scope="account", period="total", **extra):
+        """Builds a provider-account selector.
+
+        Written as a helper rather than inline f-strings because these selectors
+        carry five or six label matchers each and a single missing quote produces
+        a selector that silently matches nothing. Naming the dimensions also makes
+        the two easy mistakes visible at the call site: a money selector with no
+        currency matches every currency the provider publishes, and one with no
+        scope matches both the account view and the key view of the same balance.
+        """
+        parts = [jf, f'provider="{provider}"']
+        if currency is not None:
+            parts.append(f'currency="{currency}"')
+        if scope is not None:
+            parts.append(f'scope="{scope}"')
+        if period is not None:
+            parts.append(f'period="{period}"')
+        for key, value in extra.items():
+            parts.append(f'{key}="{value}"')
+        return f"{metric}{{" + ",".join(parts) + "}"
+
+    # ================================================== 1 PROVIDER OVERVIEW
+    add(row("1  PROVIDER ACCOUNT OVERVIEW", y))
     adv(1)
 
     add(
         stat(
-            "PROVIDER-REPORTED SPEND TODAY",
-            f'sum({CCOST}{{{jf},currency="USD",component="provider_reported"}})',
-            "What providers reported they charged during the current provider calendar day, in "
-            "USD. This is a reported figure, not an estimate: Switchyard records the cost the "
-            "provider returns. A provider that reports no per-request cost leaves this sum "
-            "lower, not wrong. Cost class `subscription` contributes nothing here by design.",
+            "OPENROUTER REMAINING (GLOBAL ACCOUNT)",
+            f"last_over_time({BALANCE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "What the global OpenRouter account has left to spend, in USD, as OpenRouter "
+            "itself reports it. This is the account balance, not a key's share of it. Red "
+            "below $1: at that point the next few requests decide whether the account runs "
+            "dry, and free-tier slugs would keep working while paid ones start failing.",
             0,
             y,
             unit="currencyUSD",
             decimals=4,
+            thresholds=LOW_CREDIT_THRESHOLDS,
         )
     )
     add(
         stat(
-            "PROVIDER-REPORTED SPEND, LAST 24H",
-            f'sum({RCOST}{{{jf},window="24h",currency="USD",component="provider_reported"}})',
-            "Provider-reported charge over Switchyard's own rolling 24h window, USD. The window "
-            "is computed by the binary from observed events, so it is not an increase() over "
-            "samples and does not undercount around a restart.",
+            "OPENROUTER REMAINING (STEPHEN ACCOUNT)",
+            f"last_over_time({BALANCE}{{{jf},provider=\"openrouter_stephen\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "The second OpenRouter account, a separate billing identity with its own credit. "
+            "Shown on its own because one account running dry does not stop the other from "
+            "serving, and adding the two would hide which one is nearly empty.",
             6,
             y,
             unit="currencyUSD",
             decimals=4,
-        )
-    )
-    add(
-        stat(
-            "REQUESTS TODAY",
-            f'sum({CREQ}{{{jf},component="request"}})',
-            "Requests served during the current provider calendar day. A composed request counts "
-            "once against the route the caller addressed, not once per child route.",
-            12,
-            y,
-            unit="short",
-        )
-    )
-    add(
-        stat(
-            "TOKENS TODAY",
-            f"sum({CTOK}{{{jf}}})",
-            "All token components recorded today, summed. Components are mutually exclusive in "
-            "this series — prompt, completion, cached, cache_creation, reasoning — so the sum is "
-            "a component total, not a billing figure. Read the token section for the split.",
-            18,
-            y,
-            unit="short",
-        )
-    )
-    adv(5)
-
-    add(
-        stat(
-            "UPSTREAM ATTEMPT ERROR RATE",
-            f'sum({ATTEMPTS}{{{jf},outcome=~"retryable_error|other_error"}}) / '
-            f'sum({ATTEMPTS}{{{jf}}})',
-            "Share of UPSTREAM ATTEMPTS that did not return 2xx. This is deliberately not a "
-            "request failure rate: one client request that retried and then succeeded counts "
-            "here as one failed attempt and one served request. Derived from the HTTP status "
-            "code, so it cannot distinguish a rate limit from an exhausted balance — the "
-            "provider-error section shows what semantic detail the binary does record.",
-            0,
-            y,
-            unit="percentunit",
-            decimals=2,
-        )
-    )
-    add(
-        stat(
-            "FINAL CLIENT ERROR RATE",
-            f'sum({CLIENTOUT}{{{jf},outcome=~"retryable_error|other_error"}}) / '
-            f"sum({CLIENTOUT}{{{jf}}})",
-            "Share of responses delivered to callers that ended in an error, after retries and "
-            "fallback have already been applied. This is the number a user experiences. It is "
-            "much lower than the attempt error rate precisely when recovery is working.",
-            6,
-            y,
-            unit="percentunit",
-            decimals=2,
-        )
-    )
-    add(
-        stat(
-            "RETRY RECOVERIES",
-            f"sum({RETRYREC}{{{jf}}})",
-            "Requests that failed an attempt and were served by a later attempt or another "
-            "candidate. Every one of these is an upstream error that never reached a caller, "
-            "which is why the two rates above differ.",
-            12,
-            y,
-            unit="short",
-        )
-    )
-    add(
-        stat(
-            "STALEST ACCOUNT READING",
-            f"max({FRESH}{{{jf}}})",
-            "Age in seconds of the oldest provider-account reading. This bounds how much any "
-            "balance on this dashboard should be trusted: a large number means the figures below "
-            "describe the past, not the present. It is a measurement about freshness, not about "
-            "whether the provider is reachable.",
-            18,
-            y,
-            unit="s",
-            decimals=0,
-        )
-    )
-    adv(5)
-
-    add(
-        timeseries(
-            "PROVIDER-REPORTED SPEND, ROLLING 24H, BY PROVIDER",
-            [
-                target(
-                    f"sum by (provider) ({RCOST}{{{jf},window=\"24h\",currency=\"USD\","
-                    'component="provider_reported"})',
-                    "{{provider}}",
-                )
-            ],
-            "Each provider's reported charge over the binary's rolling 24h window. Providers are "
-            "separate accounts with separate currency, so they are never summed into one line "
-            "here; the USD-only selection keeps the axis one currency.",
-            0,
-            y,
-        )
-    )
-    add(
-        timeseries(
-            "REQUESTS, ROLLING 24H, BY PROVIDER",
-            [
-                target(
-                    f'sum by (provider) ({RREQ}{{{jf},window="24h",component="request"}})',
-                    "{{provider}}",
-                )
-            ],
-            "Request volume per provider over the rolling 24h window. A provider with no line is "
-            "not necessarily offline: it may simply not have been routed to. Provider health is a "
-            "separate question from provider traffic and is answered by the error section.",
-            12,
-            y,
-        )
-    )
-    adv(9)
-
-    # ------------------------------------------------------------- accounts
-    add(row("2  PROVIDER ACCOUNTS AND FINANCIAL AVAILABILITY", y))
-    adv(1)
-
-    add(
-        stat(
-            "OPENROUTER CREDIT (ACCOUNT)",
-            f'sum({CREDIT}{{{jf},provider="openrouter",scope="account",currency="USD"}})',
-            "Remaining account-level credit on the primary OpenRouter account, USD. Selective on "
-            "`scope=\"account\"` on purpose: the same money is also published under `scope=\"key\"` "
-            "for per-key views, and adding both would double count one balance.",
-            0,
-            y,
-            unit="currencyUSD",
-            decimals=2,
-        )
-    )
-    add(
-        stat(
-            "OPENROUTER CREDIT (SECONDARY ACCOUNT)",
-            f'sum({CREDIT}{{{jf},provider="openrouter_stephen",scope="account",currency="USD"}})',
-            "Remaining credit on the second OpenRouter account. Shown separately rather than "
-            "combined because it is a distinct credential with distinct exhaustion behaviour: "
-            "one account running dry does not stop the other from serving.",
-            6,
-            y,
-            unit="currencyUSD",
-            decimals=2,
+            thresholds=LOW_CREDIT_THRESHOLDS,
         )
     )
     add(
         stat(
             "DEEPSEEK BALANCE (CNY)",
-            f'sum({BALANCE}{{{jf},provider="deepseek",scope="account",currency="CNY"}})',
-            "DeepSeek reports its balance in CNY and also publishes a zero-valued USD series. The "
-            "currency is pinned so the two are never added: one of them is real money and the "
-            "other is the absence of a USD balance.",
+            f"last_over_time({BALANCE}{{{jf},provider=\"deepseek\",currency=\"CNY\","
+            'scope="account",period="total"}[3h])',
+            "DeepSeek's balance in CNY, the only currency it holds. DeepSeek also publishes a "
+            "USD series that is structurally zero — it keeps no USD balance — so that series "
+            "is deliberately not shown as though it were a measured dollar amount.",
             12,
             y,
             unit="currencyCNY",
@@ -305,57 +210,63 @@ def build_dashboard(config):
     )
     add(
         stat(
-            "OPENAI ALLOWANCE REMAINING (PRIMARY POOL)",
-            f'max({ALLOW}{{{jf},provider="openai",pool="primary"}})',
-            "Remaining percentage of the primary subscription allowance. This is an allowance, "
-            "not a balance: running it to zero is a capacity signal, not a billing event, and it "
-            "resets on its own schedule rather than when someone pays.",
+            "OPENAI 5-HR REMAINING",
+            f"last_over_time({ALLOW}{{{jf},provider=\"openai\",pool=\"primary\"}}[3h])",
+            "Remaining percentage of the primary five-hour allowance. This is a rate window "
+            "that refills on a clock, not money: running it low throttles throughput without "
+            "costing anything, and waiting restores it.",
             18,
             y,
             unit="percent",
             decimals=0,
+            thresholds=REMAINING_THRESHOLDS,
         )
     )
     adv(5)
 
     add(
         table(
-            "ACCOUNT STATE — ONE ROW PER PROVIDER, CURRENCY AND SCOPE",
+            "EVERY PROVIDER ACCOUNT — BALANCE, CREDIT, USAGE, READ INTERVAL",
             [
                 target(
-                    f"{CREDIT}{{{jf}}}",
-                    "credit {{provider}} {{currency}} {{scope}} {{period}}",
+                    f'{BALANCE}{{{jf},scope="account",period="total"}}',
+                    "balance {{provider}} {{currency}}",
                     instant=True,
                     ref="A",
                 ),
                 target(
-                    f"{BALANCE}{{{jf}}}",
-                    "balance {{provider}} {{currency}} {{scope}} {{period}}",
+                    f'{CREDIT}{{{jf},scope="account",period="total"}}',
+                    "credit {{provider}} {{currency}}",
                     instant=True,
                     ref="B",
                 ),
                 target(
-                    f'{USAGE}{{{jf}}}',
-                    "usage {{provider}} {{currency}} {{scope}} {{period}}",
+                    f'{USAGE}{{{jf},scope="account",period="total"}}',
+                    "usage {{provider}} {{currency}}",
                     instant=True,
                     ref="C",
                 ),
+                target(
+                    f"last_over_time({FRESH}{{{jf}}}[3h])",
+                    "read interval {{provider}}",
+                    instant=True,
+                    ref="D",
+                ),
             ],
-            "Every financial figure the binary publishes, with the labels that make it "
-            "interpretable. Credit, balance and usage are three different questions and are not "
-            "interchangeable: credit is what has been bought and not yet spent, balance is the "
-            "provider's own remaining figure, and usage is what has been drawn in a period. Rows "
-            "are not summed, because they are in different currencies and describe different "
-            "facts.",
+            "One row per provider account per currency. Balance is what the provider says is "
+            "left; credit is what has been purchased; usage is cumulative consumption. They are "
+            "three different questions and are not summed, because a provider may publish "
+            "several currencies and only one of them is real money. The read interval is how "
+            "often that provider's account state is refreshed — see section 7 for why it is not "
+            "a health signal on its own.",
             0,
             y,
             h=9,
-            unit="currencyUSD",
         )
     )
     add(
         table(
-            "ACCOUNT READING HEALTH",
+            "ACCOUNT READ HEALTH",
             [
                 target(
                     f"sum by (provider, outcome) ({FETCH}{{{jf}}})",
@@ -364,168 +275,729 @@ def build_dashboard(config):
                     ref="A",
                 ),
                 target(
-                    f"max by (provider) ({FETCHDUR}{{{jf}}})",
-                    "duration {{provider}}",
+                    f"sum by (provider) ({FETCH}{{{jf}}}) - "
+                    f'sum by (provider) ({FETCH}{{{jf},outcome="ok"}})',
+                    "failed {{provider}}",
                     instant=True,
                     ref="B",
                 ),
                 target(
-                    f"max by (provider) ({FRESH}{{{jf}}})",
-                    "age {{provider}}",
+                    f"max by (provider) ({FETCHDUR}{{{jf}}})",
+                    "fetch seconds {{provider}}",
                     instant=True,
                     ref="C",
                 ),
             ],
-            "How the balance figures above were obtained. A provider whose reads are failing "
-            "still shows its last known balance, which will look current while being stale; this "
-            "table is how that is detected. A non-ok outcome here means the financial figures for "
-            "that provider are history, not measurement.",
+            "Whether the account figures are still being refreshed. This is the health signal "
+            "the read interval cannot provide: a provider whose reads have stopped keeps "
+            "publishing its last known balance, which looks current while being an old "
+            "observation. Rising `failed` with a flat `ok` is that condition.",
             12,
             y,
             h=9,
-            unit="short",
         )
     )
     adv(9)
 
-    add(
-        timeseries(
-            "ALLOWANCE REMAINING BY POOL",
-            [
-                target(
-                    f"{ALLOW}{{{jf},provider=\"openai\"}}",
-                    "{{pool}}",
-                )
-            ],
-            "Subscription allowance remaining, per pool, over time. A falling line inside a fixed "
-            "reset period is ordinary consumption; a line that hits zero and stays there is a "
-            "capacity wall that routing must route around.",
-            0,
-            y,
-        )
-    )
-    add(
-        timeseries(
-            "ACCOUNT READING AGE BY PROVIDER",
-            [
-                target(
-                    f"max by (provider) ({FRESH}{{{jf}}})",
-                    "{{provider}}",
-                )
-            ],
-            "Freshness of each provider's financial data. This rises between refreshes and drops "
-            "when a read succeeds, so the sawtooth is expected. A line that only rises means the "
-            "provider's account reads have stopped, and every balance for it should be treated as "
-            "an old observation.",
-            12,
-            y,
-        )
-    )
-    adv(9)
+    # ============================================ 2 OPENAI ALLOWANCE WINDOWS
+    add(row("2  OPENAI ALLOWANCE WINDOWS  (primary 5-hr · secondary weekly)", y))
+    adv(1)
 
     add(
         stat(
-            "ALLOWANCE RESET (PRIMARY POOL)",
-            f'max({RESET}{{{jf},provider="openai",pool="primary"}})',
-            "Seconds until the primary allowance resets, as the provider reported it. Useful for "
-            "deciding whether a capacity wall is minutes or hours away.",
+            "5-HR REMAINING",
+            f"last_over_time({ALLOW}{{{jf},provider=\"openai\",pool=\"primary\"}}[3h])",
+            "Percentage of the five-hour allowance still available.",
             0,
             y,
+            w=4,
+            unit="percent",
+            decimals=0,
+            thresholds=REMAINING_THRESHOLDS,
+        )
+    )
+    add(
+        stat(
+            "5-HR USED",
+            f"(100 - last_over_time({ALLOW}{{{jf},provider=\"openai\",pool=\"primary\"}}[3h]))",
+            "Percentage of the five-hour allowance consumed. Used and remaining are "
+            "complements and always total 100.",
+            4,
+            y,
+            w=4,
+            unit="percent",
+            decimals=0,
+            thresholds=CONSUMED_THRESHOLDS,
+        )
+    )
+    add(
+        stat(
+            "TIME TO 5-HR RESET",
+            f"last_over_time({RESET}{{{jf},provider=\"openai\",pool=\"primary\"}}[3h])",
+            "Countdown until the five-hour window refills, as the provider reports it. Rendered "
+            "as a duration, so it reads in minutes when close and in hours when not. It falls "
+            "toward zero and then jumps back up at the reset.",
+            8,
+            y,
+            w=4,
             unit="s",
             decimals=0,
         )
     )
     add(
         stat(
-            "ROLLING WINDOW COVERAGE (24H)",
-            f'max({COVER}{{{jf},window="24h"}})',
-            "Seconds of real observation behind the rolling 24h figures. The windows are computed "
-            "from observed events, so after a restart this is smaller than 86400 until the "
-            "deployment has been up a full day. While it is smaller, the 24h numbers are a "
-            "partial window and should not be compared with a full one.",
-            6,
-            y,
-            unit="s",
-            decimals=0,
-        )
-    )
-    add(
-        stat(
-            "AUTH FAILURES ON ACCOUNT READS",
-            f"sum({AUTHFAIL}{{{jf}}})",
-            "Times a provider rejected Switchyard's own credential while reading account state. "
-            "This family is event driven: it appears only after the first occurrence, so an "
-            "absent panel means no such failure has been recorded in this process, not that the "
-            "metric is missing. Zero here is the expected state.",
+            "WEEKLY REMAINING",
+            f"last_over_time({ALLOW}{{{jf},provider=\"openai\",pool=\"secondary\"}}[3h])",
+            "Percentage of the weekly allowance still available. This window refills on a "
+            "different schedule from the five-hour one, which is why the two are never combined "
+            "into a single figure.",
             12,
             y,
-            unit="short",
+            w=4,
+            unit="percent",
+            decimals=0,
+            thresholds=REMAINING_THRESHOLDS,
         )
     )
     add(
         stat(
-            "ACCOUNT READ FAILURES",
-            f'sum({FETCH}{{{jf},outcome!="ok"}})',
-            "Account reads that did not succeed, for any reason including a credential rejection. "
-            "Distinct from the panel beside it: a network failure and a rejected credential both "
-            "land here, and only the latter lands there.",
-            18,
+            "WEEKLY USED",
+            f"(100 - last_over_time({ALLOW}{{{jf},provider=\"openai\",pool=\"secondary\"}}[3h]))",
+            "Percentage of the weekly allowance consumed.",
+            16,
             y,
-            unit="short",
+            w=4,
+            unit="percent",
+            decimals=0,
+            thresholds=CONSUMED_THRESHOLDS,
+        )
+    )
+    add(
+        stat(
+            "TIME TO WEEKLY RESET",
+            f"last_over_time({RESET}{{{jf},provider=\"openai\",pool=\"secondary\"}}[3h])",
+            "Countdown until the weekly window refills. Rendered as a duration, so a figure "
+            "near a week reads in days and hours rather than as a raw second count.",
+            20,
+            y,
+            w=4,
+            unit="s",
+            decimals=0,
         )
     )
     adv(5)
 
-    # ---------------------------------------------------------------- tokens
-    add(row("3  TOKEN ECONOMICS", y))
+    add(
+        timeseries(
+            "5-HR WINDOW — USED AND REMAINING",
+            [
+                target(
+                    f'{ALLOW}{{{jf},provider="openai",pool="primary"}}',
+                    "remaining %",
+                    ref="A",
+                ),
+                target(
+                    f'(100 - {ALLOW}{{{jf},provider="openai",pool="primary"}})',
+                    "used %",
+                    ref="B",
+                ),
+            ],
+            "The five-hour window over time. Used and remaining are complementary, so the two "
+            "lines always total 100 and cross at the halfway point; a rise in one is a fall in "
+            "the other, not an independent event. Each downward slope is consumption and each "
+            "vertical recovery is the window refilling.",
+            0,
+            y,
+        )
+    )
+    add(
+        timeseries(
+            "WEEKLY WINDOW — USED AND REMAINING",
+            [
+                target(
+                    f'{ALLOW}{{{jf},provider="openai",pool="secondary"}}',
+                    "remaining %",
+                    ref="A",
+                ),
+                target(
+                    f'(100 - {ALLOW}{{{jf},provider="openai",pool="secondary"}})',
+                    "used %",
+                    ref="B",
+                ),
+            ],
+            "The weekly window over time, on its own refill schedule. A slower, deeper slope "
+            "here than in the five-hour window is the expected shape: the same traffic spread "
+            "across a much larger budget.",
+            12,
+            y,
+        )
+    )
+    adv(9)
+
+    add(
+        timeseries(
+            "RESET COUNTDOWNS OVER TIME",
+            [
+                target(
+                    f'last_over_time({RESET}{{{jf},provider="openai",pool="primary"}}[3h])',
+                    "5-hr to reset",
+                    ref="A",
+                ),
+                target(
+                    f'last_over_time({RESET}{{{jf},provider="openai",pool="secondary"}}[3h])',
+                    "weekly to reset",
+                    ref="B",
+                ),
+            ],
+            "Both countdowns on one axis, in seconds. Each is a sawtooth: a long fall as the "
+            "window is consumed, then a jump back to the full period at the reset. The jump is "
+            "when capacity returns.",
+            0,
+            y,
+        )
+    )
+    add(
+        text(
+            "WHY THESE ARE ALLOWANCES AND NOT SPEND",
+            "The OpenAI figures on this dashboard are **rate windows**, not money. A five-hour "
+            "window at 18% remaining does not mean 82% of a budget has been spent and lost — it "
+            "means throughput is currently throttled, and waiting restores it at no cost. That "
+            "is why they are not added to the dollar figures anywhere on this dashboard, and "
+            "why a low reading is a routing consideration rather than a financial event.\n\n"
+            "The two windows refill independently. A request can be refused by a nearly empty "
+            "five-hour window while the weekly window is barely touched, so they are shown "
+            "separately and never averaged.",
+            12,
+            y,
+            w=12,
+        )
+    )
+    adv(9)
+
+    # ================================================== 3 DEEPSEEK TELEMETRY
+    add(row("3  DEEPSEEK TELEMETRY", y))
+    adv(1)
+
+    ds_bal = acc(BALANCE, "deepseek", "CNY")
+    ds_top = acc(BALCOMP, "deepseek", "CNY", component="topped_up")
+    ds_grant = acc(BALCOMP, "deepseek", "CNY", component="granted")
+
+    add(
+        stat(
+            "ACCOUNT READ INTERVAL",
+            f"last_over_time({acc(FRESH, 'deepseek', None, None, None)}[3h])",
+            "Seconds between successful DeepSeek account reads - the polling cadence, not a "
+            "health status. It is recorded only when a read succeeds, so a stalled provider "
+            "leaves the last value standing rather than growing. Read health lives in the "
+            "ACCOUNT READ HEALTH table and in section 7.",
+            0,
+            y,
+            unit="s",
+            decimals=0,
+        )
+    )
+    add(
+        stat(
+            "BALANCE (CNY)",
+            f"last_over_time({ds_bal}[3h])",
+            "DeepSeek's remaining balance in CNY - the only currency this account holds.",
+            6,
+            y,
+            unit="currencyCNY",
+            decimals=2,
+        )
+    )
+    add(
+        stat(
+            "24H NET BALANCE CHANGE (CNY)",
+            f"last_over_time({ds_bal}[24h]) - first_over_time({ds_bal}[24h])",
+            "Net movement of the balance over 24h, signed. POSITIVE means the balance rose, "
+            "which is a top-up exceeding consumption - not spending. NEGATIVE means consumption "
+            "exceeded any top-up, which is the reading that represents money actually used. "
+            "Deliberately not clamped at zero: clamping would report a top-up as no change and "
+            "erase the very event an operator needs to see.",
+            12,
+            y,
+            unit="currencyCNY",
+            decimals=2,
+        )
+    )
+    add(
+        stat(
+            "24H BALANCE RANGE (CNY)",
+            f"max_over_time({ds_bal}[24h]) - min_over_time({ds_bal}[24h])",
+            "Highest minus lowest balance in the window - how far the balance travelled, "
+            "regardless of direction. This is what a top-up followed by spending looks like: a "
+            "large range with a small net change. Shown beside the net figure because the two "
+            "answer different questions.",
+            18,
+            y,
+            unit="currencyCNY",
+            decimals=2,
+        )
+    )
+    adv(5)
+
+    add(
+        stat(
+            "REMAINING — TOPPED-UP (CNY)",
+            f"last_over_time({ds_top}[3h])",
+            "The portion of the balance that came from payments. DeepSeek splits its balance "
+            "into purchased and granted credit, and the split matters because granted credit "
+            "typically expires while purchased credit does not.",
+            0,
+            y,
+            unit="currencyCNY",
+            decimals=2,
+        )
+    )
+    add(
+        stat(
+            "REMAINING — GRANTED (CNY)",
+            f"last_over_time({ds_grant}[3h])",
+            "The portion of the balance granted rather than purchased. Usually expires, so it "
+            "is worth less than the same amount of topped-up credit.",
+            6,
+            y,
+            unit="currencyCNY",
+            decimals=2,
+        )
+    )
+    add(
+        stat(
+            "REMAINING — TOTAL (CNY)",
+            f"sum(last_over_time({acc(BALCOMP, 'deepseek', 'CNY')}[3h]))",
+            "Topped-up plus granted, computed here from the components rather than read from a "
+            "second gauge. It must equal the balance panel; a divergence means the provider "
+            "changed how it splits the balance and the components no longer account for it.",
+            12,
+            y,
+            unit="currencyCNY",
+            decimals=2,
+        )
+    )
+    add(
+        stat(
+            "LOWEST BALANCE IN 24H (CNY)",
+            f"min_over_time({ds_bal}[24h])",
+            "The low-water mark of the balance over 24h. This is the figure that says how close "
+            "the account came to empty, which the current reading can hide if a top-up arrived "
+            "in the last few minutes.",
+            18,
+            y,
+            unit="currencyCNY",
+            decimals=2,
+        )
+    )
+    adv(5)
+
+    add(
+        timeseries(
+            "BALANCE TREND (CNY)",
+            [target(f"{ds_bal}", "balance ¥", ref="A")],
+            "The balance as sampled at each account read. Gaps in this line are missing "
+            "telemetry, not zero balances: the series simply has no sample there, and the line "
+            "is drawn broken rather than interpolated across them. A vertical jump upward is a "
+            "top-up; a steady decline is consumption.",
+            0,
+            y,
+        )
+    )
+    add(
+        timeseries(
+            "BALANCE COMPONENTS OVER TIME (CNY)",
+            [
+                target(f"last_over_time({ds_top}[3h])", "topped-up ¥", ref="A"),
+                target(f"last_over_time({ds_grant}[3h])", "granted ¥", ref="B"),
+            ],
+            "How the balance splits between purchased and granted credit. Granted credit "
+            "expiring shows as a step down in the granted line that the topped-up line does not "
+            "share - which is why the total can fall without any request having been served.",
+            12,
+            y,
+        )
+    )
+    adv(9)
+
+    add(
+        text(
+            "DEEPSEEK — WHAT IS MEASURED, AND WHAT THE CURVE DOES NOT SAY",
+            "**CNY only.** DeepSeek keeps no dollar balance. It publishes a USD series that is "
+            "structurally zero, and a panel reading it would show a confident `$0.00` for an "
+            "account holding real money. That series is withheld here rather than displayed, "
+            "because a zero that means \"this currency is not used\" is indistinguishable on a "
+            "dashboard from a zero that means \"this account is empty\".\n\n"
+            "**Movement is not spending.** The 24h net change is signed. A positive value is a "
+            "top-up larger than the consumption that followed; only a negative value measures "
+            "money actually used. The range panel sits beside it because a top-up and a day of "
+            "spending can cancel out to almost no net change while the balance has travelled a "
+            "long way.\n\n"
+            "**Gaps are gaps.** The trend line is drawn with breaks, not interpolated. A long "
+            "horizontal stretch means the account was not being read, which is a telemetry "
+            "problem, not a frozen balance.",
+            0,
+            y,
+            w=24,
+            h=7,
+        )
+    )
+    adv(7)
+
+
+    # ============================================ 4 OPENROUTER USAGE TELEMETRY
+    add(row("4  OPENROUTER USAGE TELEMETRY", y))
+    adv(1)
+
+    add(
+        stat(
+            "GLOBAL — READ INTERVAL",
+            f"last_over_time({FRESH}{{{jf},provider=\"openrouter\"}}[3h])",
+            "Polling cadence for the global account. Recorded only on a successful read, so it "
+            "does not grow when reads start failing.",
+            0,
+            y,
+            w=4,
+            unit="s",
+            decimals=0,
+        )
+    )
+    add(
+        stat(
+            "GLOBAL — REMAINING (USD)",
+            f"last_over_time({BALANCE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "Remaining account balance. Shown to four decimals because the number that matters "
+            "here is often a few cents — rounding to two would render a nearly-empty account as "
+            "indistinguishable from an empty one.",
+            4,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+            thresholds=LOW_CREDIT_THRESHOLDS,
+        )
+    )
+    add(
+        stat(
+            "GLOBAL — TOTAL USAGE (USD)",
+            f"last_over_time({USAGE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "Cumulative consumption on the account since it was created. This is a lifetime "
+            "figure and never decreases; it is not this month's spend, which is the panel near "
+            "the end of this section.",
+            8,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    add(
+        stat(
+            "GLOBAL — PURCHASED CREDITS (USD)",
+            f"last_over_time({CREDIT}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "Total credit ever purchased for the account. Together with remaining balance it "
+            "closes the accounting: purchased minus remaining should be the total usage.",
+            12,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    add(
+        stat(
+            "GLOBAL — 24H SPEND (USD)",
+            f"last_over_time({USAGE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="account",period="total"}[24h]) - '
+            f"first_over_time({USAGE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="account",period="total"}[24h])',
+            "Cumulative usage now minus cumulative usage 24h ago — what was actually consumed "
+            "in the window. Signed on purpose: a provider correction or reset that lowers the "
+            "cumulative figure produces a negative value, which is the truth about the series "
+            "rather than a fault to clamp away.",
+            16,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    add(
+        stat(
+            "GLOBAL — KEY USAGE (USD, CUMULATIVE)",
+            f"last_over_time({USAGE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="key",period="total"}[3h])',
+            "Usage attributed to this key rather than the whole account. Lower than account "
+            "usage when other keys also draw on the same credit — which is the normal case and "
+            "not a discrepancy.",
+            20,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    adv(5)
+
+    add(
+        stat(
+            "GLOBAL — THIS MONTH (USD)",
+            f"last_over_time({USAGE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="key",period="monthly"}[3h])',
+            "Consumption in the current calendar month, as the provider resets it. Distinct "
+            "from total usage: this is the figure that matters against a monthly budget.",
+            0,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    add(
+        stat(
+            "GLOBAL — THIS WEEK (USD)",
+            f"last_over_time({USAGE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="key",period="weekly"}[3h])',
+            "Consumption in the current week, as the provider resets it. Useful for spotting a "
+            "pace change before it shows up in the monthly figure.",
+            4,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    add(
+        stat(
+            "GLOBAL — TODAY (USD)",
+            f"last_over_time({USAGE}{{{jf},provider=\"openrouter\",currency=\"USD\","
+            'scope="key",period="daily"}[3h])',
+            "Consumption so far today. Zero is a real and common reading: it means nothing has "
+            "been spent through this key yet in the provider's current day.",
+            8,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    add(
+        stat(
+            "STEPHEN — REMAINING (USD)",
+            f"last_over_time({BALANCE}{{{jf},provider=\"openrouter_stephen\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "Remaining balance on the second OpenRouter account. A separate billing identity, "
+            "not a view of the first: its credit is bought separately and runs out separately.",
+            12,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+            thresholds=LOW_CREDIT_THRESHOLDS,
+        )
+    )
+    add(
+        stat(
+            "STEPHEN — PURCHASED CREDITS (USD)",
+            f"last_over_time({CREDIT}{{{jf},provider=\"openrouter_stephen\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "Credit purchased for the Stephen account.",
+            16,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    add(
+        stat(
+            "STEPHEN — TOTAL USAGE (USD)",
+            f"last_over_time({USAGE}{{{jf},provider=\"openrouter_stephen\",currency=\"USD\","
+            'scope="account",period="total"}[3h])',
+            "Cumulative consumption on the Stephen account.",
+            20,
+            y,
+            w=4,
+            unit="currencyUSD",
+            decimals=4,
+        )
+    )
+    adv(5)
+
+    add(
+        timeseries(
+            "GLOBAL ACCOUNT — USAGE, CREDIT AND REMAINING",
+            [
+                target(
+                    f'{USAGE}{{{jf},provider="openrouter",currency="USD",scope="account",'
+                    'period="total"}',
+                    "total usage $",
+                    ref="A",
+                ),
+                target(
+                    f'{CREDIT}{{{jf},provider="openrouter",currency="USD",scope="account",'
+                    'period="total"}',
+                    "credits purchased $",
+                    ref="B",
+                ),
+                target(
+                    f'{BALANCE}{{{jf},provider="openrouter",currency="USD",scope="account",'
+                    'period="total"}',
+                    "remaining $",
+                    ref="C",
+                ),
+            ],
+            "Three views of one account. Usage climbs, credit is a step function that rises on "
+            "each purchase, and remaining is bought minus consumed. The vertical gap between "
+            "the credit line and the usage line is the money still available — the same number "
+            "as the remaining panel, read geometrically. A step up in credit is a top-up; the "
+            "remaining line should jump with it.",
+            0,
+            y,
+        )
+    )
+    add(
+        timeseries(
+            "STEPHEN ACCOUNT — USAGE, CREDIT AND REMAINING",
+            [
+                target(
+                    f'{USAGE}{{{jf},provider="openrouter_stephen",currency="USD",'
+                    'scope="account",period="total"}',
+                    "total usage $",
+                    ref="A",
+                ),
+                target(
+                    f'{CREDIT}{{{jf},provider="openrouter_stephen",currency="USD",'
+                    'scope="account",period="total"}',
+                    "credits purchased $",
+                    ref="B",
+                ),
+                target(
+                    f'{BALANCE}{{{jf},provider="openrouter_stephen",currency="USD",'
+                    'scope="account",period="total"}',
+                    "remaining $",
+                    ref="C",
+                ),
+            ],
+            "The same three measurements for the Stephen account, kept on their own axis range "
+            "because its figures are an order of magnitude smaller and would otherwise look "
+            "flat beside the global account.",
+            12,
+            y,
+        )
+    )
+    adv(9)
+
+    add(
+        timeseries(
+            "REQUESTS, ROLLING 24H, BY MODEL",
+            [
+                target(
+                    f'sum by (model) ({RREQ}{{{jf},window="24h",component="request",'
+                    'provider=~"openrouter.*"})',
+                    "{{model}}",
+                    ref="A",
+                )
+            ],
+            "What the OpenRouter accounts actually served over the rolling window, per model. "
+            "Combined across both accounts because the question is which models the traffic "
+            "went to; the per-account split is in the panels above.",
+            0,
+            y,
+        )
+    )
+    add(
+        timeseries(
+            "SPEND, ROLLING 24H, BY MODEL (USD)",
+            [
+                target(
+                    f'sum by (model) ({RCOST}{{{jf},window="24h",currency="USD",'
+                    'component="provider_reported",provider=~"openrouter.*"})',
+                    "{{model}}",
+                    ref="A",
+                )
+            ],
+            "Which models are consuming the credit. Only metered traffic appears: free and "
+            "subscription-class requests cost nothing per call and are absent by design rather "
+            "than missing.",
+            12,
+            y,
+        )
+    )
+    adv(9)
+
+    add(
+        text(
+            "TWO ACCOUNTS, FOUR MEASUREMENTS, NONE INTERCHANGEABLE",
+            "Both OpenRouter accounts are shown because **they are separate billing identities**. "
+            "`openrouter` and `openrouter_stephen` hold separately purchased credit; one running "
+            "out does not affect the other, so merging them would hide which one is close to "
+            "empty and would misstate the exposure.\n\n"
+            "Within one account, four figures are easy to confuse and are deliberately kept "
+            "apart: **remaining** (what is left), **purchased credit** (what was ever bought), "
+            "**total usage** (lifetime consumption) and **this month** (consumption inside the "
+            "provider's current month). Remaining is not the difference between the other two "
+            "unless no top-up has ever been partial, and this month is not a fraction of total "
+            "usage in any fixed way.\n\n"
+            "**Scope is not a second account.** The same balance is published under "
+            "`scope=\"account\"` and `scope=\"key\"`. They describe the same money from two "
+            "vantage points, so adding them would double count it. Every panel here names the "
+            "scope it reads.",
+            0,
+            y,
+            w=24,
+            h=7,
+        )
+    )
+    adv(7)
+
+    # ============================================== 5 TOKEN ACCOUNTING
+    add(row("5  TOKEN ACCOUNTING AND OBSERVED USAGE", y))
     adv(1)
 
     add(
         stat(
             "PROMPT TOKENS",
             f"sum({PTOK}{{{jf}}})",
-            "Input tokens as the provider counted them, since the deployment started. This total "
-            "already contains the cached and cache-created tokens, so those components are shown "
-            "beside it and never added to it.",
+            "Input tokens as provider-counted, since the deployment started. This total already "
+            "contains the cached and cache-created tokens, so those are shown beside it and "
+            "never added to it.",
             0,
             y,
-            unit="short",
         )
     )
     add(
         stat(
             "COMPLETION TOKENS",
             f"sum({CTOKC}{{{jf}}})",
-            "Output tokens as provider-reported, since the deployment started. Reasoning is "
-            "published separately by the providers that report it and is not added here: the "
-            "recorded totals stay exactly as each provider reported them.",
+            "Output tokens as provider-reported. Reasoning is published separately by the "
+            "providers that report it and is not added here, so each provider's own figures are "
+            "preserved exactly.",
             6,
             y,
-            unit="short",
         )
     )
     add(
         stat(
             "REASONING TOKENS",
             f"sum({RTOKC}{{{jf}}})",
-            "Reasoning tokens, where the provider reports them. Its relationship to completion "
-            "varies by model — measured across the routing log, some models report reasoning "
-            "above completion — so no arithmetic relationship is asserted anywhere on this "
-            "dashboard. Absent means the provider did not report it, which is not a measured zero.",
+            "Reasoning tokens where reported. Its relationship to completion varies by model — "
+            "measured across the routing log, some models report reasoning above completion — so "
+            "no arithmetic relationship is asserted. Absent means unreported, not measured zero.",
             12,
             y,
-            unit="short",
         )
     )
     add(
         stat(
             "CACHED PROMPT TOKENS",
             f"sum({CACHED}{{{jf}}})",
-            "Prompt tokens served from the provider's cache. Comparing this with the prompt total "
-            "is how much of the input was not re-sent at full price.",
+            "Prompt tokens served from the provider's cache. Compared with the prompt total, "
+            "this is how much input was not re-sent at full price.",
             18,
             y,
-            unit="short",
         )
     )
     adv(5)
@@ -533,27 +1005,24 @@ def build_dashboard(config):
     add(
         barchart(
             "PROMPT TOKENS BY MODEL",
-            [target(f"sum by (model) ({PTOK}{{{jf}}})", "{{model}}")],
-            "Input volume per model. This is the cost driver that scales with conversation "
-            "length, and the one a routing decision can most directly move.",
+            [target(f"sum by (model) ({PTOK}{{{jf}}})", "{{model}}", ref="A")],
+            "Input volume per model — the cost driver that scales with conversation length and "
+            "the one routing can most directly move.",
             0,
             y,
-            unit="short",
         )
     )
     add(
         barchart(
             "OUTPUT TOKENS BY MODEL — COMPLETION AND REASONING",
             [
-                target(f'sum by (model) ({CTOKC}{{{jf}}})', "completion {{model}}"),
-                target(f'sum by (model) ({RTOKC}{{{jf}}})', "reasoning {{model}}"),
+                target(f'sum by (model) ({CTOKC}{{{jf}}})', "completion {{model}}", ref="A"),
+                target(f'sum by (model) ({RTOKC}{{{jf}}})', "reasoning {{model}}", ref="B"),
             ],
-            "Output volume per model, with reasoning alongside rather than inside completion. "
-            "Where both bars exist for a model, the split shows how much of the work was "
-            "deliberation; where reasoning is missing, that provider does not report it.",
+            "Output volume per model with reasoning alongside rather than inside completion. "
+            "Where both bars exist, the split shows how much of the work was deliberation.",
             12,
             y,
-            unit="short",
         )
     )
     adv(9)
@@ -561,13 +1030,12 @@ def build_dashboard(config):
     add(
         piechart(
             "TOKEN COMPONENT MIX TODAY",
-            [target(f"sum by (component) ({CTOK}{{{jf}}})", "{{component}}")],
-            "How today's recorded tokens divide between prompt, completion, cached, cache_creation "
-            "and reasoning. Components come from one series so the whole is the sum of its parts "
-            "as the binary recorded them.",
+            [target(f"sum by (component) ({CTOK}{{{jf}}})", "{{component}}", ref="A")],
+            "Today's tokens split by component, from one series so the whole is the sum of its "
+            "parts as the binary recorded them.",
             0,
             y,
-            unit="short",
+            w=8,
         )
     )
     add(
@@ -577,28 +1045,24 @@ def build_dashboard(config):
                 target(
                     f'sum by (component) ({RTOK}{{{jf},window="24h"}})',
                     "{{component}}",
+                    ref="A",
                 )
             ],
-            "Rolling 24h tokens by component. A cached share that grows while prompt stays flat "
-            "is the usual sign that prompt reuse is working, and is the difference between an "
-            "expensive conversation and a cheap one.",
+            "Rolling 24h tokens by component. A cached share growing while prompt stays flat is "
+            "the usual sign that prompt reuse is working.",
             8,
             y,
+            w=16,
         )
     )
     adv(9)
 
-    # --------------------------------------------------------------- traffic
-    add(row("4  OBSERVED TRAFFIC MIX", y))
-    adv(1)
-
     add(
         barchart(
             "REQUESTS BY PROVIDER",
-            [target(f'sum by (provider) ({REQ}{{{jf},component="request"}})', "{{provider}}")],
-            "Where requests were actually served, since the deployment started. This is observed "
-            "routing, not configuration: it shows which provider the routing layer chose, which "
-            "can differ from what a route's candidate list might suggest.",
+            [target(f'sum by (provider) ({REQ}{{{jf},component="request"}})', "{{provider}}", ref="A")],
+            "Where requests were actually served. Observed routing, not configuration: this is "
+            "the provider the routing layer chose.",
             0,
             y,
             w=8,
@@ -607,56 +1071,30 @@ def build_dashboard(config):
     add(
         barchart(
             "REQUESTS BY MODEL",
-            [target(f'sum by (model) ({REQ}{{{jf},component="request"}})', "{{model}}")],
-            "Requests per model. Read together with the error table below: a model carrying a "
-            "large share of traffic and a high error rate is an active routing problem, while the "
-            "same error rate on a lightly used model is not.",
+            [target(f'sum by (model) ({REQ}{{{jf},component="request"}})', "{{model}}", ref="A")],
+            "Requests per model. Read with the error table in section 6: a model carrying a "
+            "large share of traffic and a high error rate is an active problem.",
             8,
             y,
             w=8,
         )
     )
-    add(
-        barchart(
-            "REQUESTS BY ROUTE FAMILY",
-            [
-                target(
-                    f'sum by (route_family) ({REQ}{{{jf},component="request"}})',
-                    "{{route_family}}",
-                )
-            ],
-            "Requests by the kind of route the caller addressed — direct, primitive, tier or a "
-            "composite. This distinguishes deliberate direct calls from traffic that arrived "
-            "through a routing layer.",
-            16,
-            y,
-            w=8,
-        )
-    )
-    adv(9)
-
     add(
         piechart(
             "COST CLASS MIX",
-            [target(f"sum by (cost_class) ({REQ}{{{jf}}})", "{{cost_class}}")],
-            "Requests by whether serving them was metered, free, or drawn from a subscription "
-            "allowance. This is the economic character of the traffic: `subscription` requests "
-            "cost nothing per call and `metered` ones do, so the mix explains what the spend "
-            "figures are made of.",
-            0,
+            [
+                target(
+                    f'sum by (cost_class) ({REQ}{{{jf}}})',
+                    "{{cost_class}}",
+                    ref="A",
+                )
+            ],
+            "Requests by economic character. `subscription` costs nothing per call, `metered` "
+            "does, and free traffic is neither — so this explains what the spend figures are "
+            "made of.",
+            16,
             y,
             w=8,
-        )
-    )
-    add(
-        timeseries(
-            "REQUESTS, ROLLING 24H, BY MODEL",
-            [target(f'sum by (model) ({RREQ}{{{jf},window="24h"}})', "{{model}}")],
-            "Per-model request volume over the rolling window. Use this to see a shift in routing "
-            "as it happens, rather than as a total that hides when it changed.",
-            8,
-            y,
-            w=16,
         )
     )
     adv(9)
@@ -685,11 +1123,11 @@ def build_dashboard(config):
                     ref="C",
                 ),
             ],
-            "The routing decision and its consequence, joined on route and model. Reported cost "
-            "is a 24h window rather than a running total because the cumulative cost counter "
-            "carries no currency label, so it cannot be safely filtered to one currency; the "
-            "windowed family can. It is absent for subscription traffic, which is a property of "
-            "the provider rather than a gap in the data.",
+            "The routing decision and its consequence, joined on route and model. Cost is a 24h "
+            "window rather than a lifetime total because the cumulative cost counter carries no "
+            "currency label and cannot be safely filtered to one currency; the windowed family "
+            "can. It is absent for subscription traffic, which is a property of the provider "
+            "rather than a gap.",
             0,
             y,
             h=10,
@@ -697,16 +1135,17 @@ def build_dashboard(config):
     )
     add(
         timeseries(
-            "REPORTED COST, ROLLING 24H, BY MODEL",
+            "REQUESTS, ROLLING 24H, BY ROUTE FAMILY",
             [
                 target(
-                    f'sum by (model) ({RCOST}{{{jf},window="24h",currency="USD",'
-                    f'component="provider_reported"}})',
-                    "{{model}}",
+                    f'sum by (route_family) ({RREQ}{{{jf},window="24h",component="request"}})',
+                    "{{route_family}}",
+                    ref="A",
                 )
             ],
-            "Which model the money is going to. Only providers that report per-request cost "
-            "appear; subscription and free traffic is absent by design, not missing.",
+            "Requests by the kind of route addressed — direct, primitive, tier or composite. "
+            "Separates deliberate direct calls from traffic that arrived through a routing "
+            "layer.",
             12,
             y,
             h=10,
@@ -714,8 +1153,8 @@ def build_dashboard(config):
     )
     adv(10)
 
-    # ---------------------------------------------------------------- errors
-    add(row("5  PROVIDER ERRORS AND ECONOMIC RISK", y))
+    # ================================== 6 PROVIDER ERRORS AND ROUTING ECONOMICS
+    add(row("6  PROVIDER ERRORS AND ROUTING ECONOMICS", y))
     adv(1)
 
     add(
@@ -723,8 +1162,8 @@ def build_dashboard(config):
             "UPSTREAM ATTEMPTS FAILED",
             f'sum({ATTEMPTS}{{{jf},outcome!="ok"}})',
             "Upstream attempts that did not return 2xx. Attempts, not requests: a request that "
-            "retried twice and then succeeded contributes two here and zero to the panel beside "
-            "it. Confusing the two is how a healthy deployment looks broken.",
+            "retried twice and then succeeded contributes two here and nothing to the panel "
+            "beside it. Confusing the two makes a healthy deployment look broken.",
             0,
             y,
         )
@@ -733,8 +1172,8 @@ def build_dashboard(config):
         stat(
             "ATTEMPTS RECOVERED BY RETRY",
             f"sum({RETRYREC}{{{jf}}})",
-            "Failed attempts that a later attempt served. This is the count of upstream errors "
-            "that never became a caller-visible failure.",
+            "Failed attempts that a later attempt served. Upstream errors that never became a "
+            "caller-visible failure.",
             6,
             y,
         )
@@ -744,8 +1183,8 @@ def build_dashboard(config):
             "REQUESTS THAT REACHED A CALLER AS ERRORS",
             f'sum({CLIENTOUT}{{{jf},outcome=~"retryable_error|other_error"}})',
             "Responses delivered to callers that ended in an error, after every recovery "
-            "opportunity was used. This is the only error count on this dashboard that a user "
-            "would recognise as their own failed request.",
+            "opportunity was used. The only error count here a user would recognise as their "
+            "own failed request.",
             12,
             y,
         )
@@ -754,10 +1193,9 @@ def build_dashboard(config):
         stat(
             "ACCOUNT-WIDE QUOTA BLOCKS",
             f'sum({COMPATT}{{{jf},capability="account_quota"}})',
-            "Times the router found an entire account's allowance exhausted. This is the "
-            "semantic signal the binary does record: it is decided from the provider's structured "
-            "error, not from the status code, and it is what stops a request being retried "
-            "against a credential already known to be empty.",
+            "Times the router found an entire account's allowance exhausted. Decided from the "
+            "provider's structured error, not from the status code — the semantic signal that "
+            "stops a request being retried against a credential already known to be empty.",
             18,
             y,
         )
@@ -767,11 +1205,17 @@ def build_dashboard(config):
     add(
         barchart(
             "UPSTREAM ATTEMPTS BY STATUS AND HTTP-DERIVED OUTCOME",
-            [target(f"sum by (code, outcome) ({ATTEMPTS}{{{jf}}})", "{{code}} {{outcome}}")],
-            "Attempts grouped by the status code received and the outcome the binary derived from "
-            "that code alone. Read this as HTTP evidence, not as a diagnosis: `429 retryable_error` "
-            "covers both a genuine rate limit and an exhausted balance, because the status alone "
-            "cannot tell them apart. The composition panels below carry the semantic distinction.",
+            [
+                target(
+                    f"sum by (code, outcome) ({ATTEMPTS}{{{jf}}})",
+                    "{{code}} {{outcome}}",
+                    ref="A",
+                )
+            ],
+            "Attempts grouped by the status received and the outcome the binary derived from "
+            "that code alone. HTTP evidence, not a diagnosis: `429 retryable_error` covers both "
+            "a genuine rate limit and an exhausted balance, because the status cannot tell them "
+            "apart. The composition panels carry that distinction.",
             0,
             y,
         )
@@ -779,10 +1223,15 @@ def build_dashboard(config):
     add(
         timeseries(
             "UPSTREAM ATTEMPTS BY STATUS OVER TIME",
-            [target(f"sum by (code) (increase({ATTEMPTS}{{{jf}}}[15m]))", "{{code}}")],
-            "Attempt rate per status code. A steady 429 line is pacing pressure that retries can "
-            "absorb; a 401 or 403 line is a credential or policy problem that cannot be retried "
-            "away and needs an operator.",
+            [
+                target(
+                    f"sum by (code) (increase({ATTEMPTS}{{{jf}}}[15m]))",
+                    "{{code}}",
+                    ref="A",
+                )
+            ],
+            "Attempt rate per status. A steady 429 line is pacing pressure retries can absorb; "
+            "a 401 or 403 line is a credential or policy problem that cannot be retried away.",
             12,
             y,
         )
@@ -796,13 +1245,13 @@ def build_dashboard(config):
                 target(
                     f"sum by (capability, outcome) ({COMPATT}{{{jf}}})",
                     "{{capability}} {{outcome}}",
+                    ref="A",
                 )
             ],
-            "What the composition layer decided, classified by the capability it was handling. "
-            "This is the binary's own semantic classification and is the most trustworthy error "
-            "breakdown available: `credential_quota` means a credential's allowance was known "
-            "exhausted before a call was spent, and `account_quota` means an account-wide limit "
-            "was hit.",
+            "What the composition layer decided, by the capability it handled. This is the "
+            "binary's own semantic classification and the most trustworthy error breakdown "
+            "available: `credential_quota` means an allowance was known exhausted before a call "
+            "was spent; `account_quota` means an account-wide limit was hit.",
             0,
             y,
         )
@@ -818,13 +1267,12 @@ def build_dashboard(config):
                     ref="A",
                 )
             ],
-            "Each row is a request that left one child route for another, with the classified "
-            "reason. This is the recovery path made visible: a large `account_quota` count against "
-            "one child means that child's credential is routinely exhausted and the route is "
-            "paying for a crossing it could avoid by ordering candidates differently.",
+            "Requests that left one child route for another, with the classified reason. A "
+            "large `account_quota` count against one child means that child's credential is "
+            "routinely exhausted and the route is paying for a crossing it could avoid by "
+            "reordering candidates.",
             12,
             y,
-            unit="short",
         )
     )
     adv(9)
@@ -847,10 +1295,9 @@ def build_dashboard(config):
                     ref="B",
                 ),
             ],
-            "Per-model failure rate, with its denominator shown so a 100% rate on two calls is not "
-            "mistaken for a broken model. `clamp_min` keeps the division defined when a model has "
-            "no calls at all; it does not manufacture a zero result for a model that has not been "
-            "used.",
+            "Per-model failure rate with its denominator shown, so a 100% rate on two calls is "
+            "not mistaken for a broken model. `clamp_min` keeps the division defined when a "
+            "model has no calls; it does not manufacture a zero for an unused model.",
             0,
             y,
             h=9,
@@ -865,11 +1312,12 @@ def build_dashboard(config):
                     f'sum by (selected_model) (increase({CALLS}{{{jf},outcome="error"}}[1h])) / '
                     f"clamp_min(sum by (selected_model) (increase({CALLS}{{{jf}}}[1h])), 0.000001)",
                     "{{selected_model}}",
+                    ref="A",
                 )
             ],
-            "The same rate as a trend, which is what distinguishes a model that has always been "
-            "unreliable from one that started failing an hour ago. A rate computed over the "
-            "cumulative counters would hide the change entirely.",
+            "The same rate as a trend, which distinguishes a model that has always been "
+            "unreliable from one that started failing an hour ago — a change a cumulative rate "
+            "would hide.",
             12,
             y,
             h=9,
@@ -885,12 +1333,12 @@ def build_dashboard(config):
                 target(
                     f"sum by (outcome) (increase({CLIENTOUT}{{{jf}}}[15m]))",
                     "{{outcome}}",
+                    ref="A",
                 )
             ],
-            "What callers actually received. `ok` beside a smaller `retryable_error` is the "
-            "signature of recovery working; `other_error` growing without a matching upstream "
-            "explanation points at a local failure — a translation or configuration problem — "
-            "rather than a provider one.",
+            "What callers actually received. `ok` beside a smaller `retryable_error` is recovery "
+            "working; `other_error` growing without a matching upstream explanation points at a "
+            "local failure — a translation or configuration problem — rather than a provider.",
             0,
             y,
         )
@@ -898,103 +1346,138 @@ def build_dashboard(config):
     add(
         barchart(
             "RUN OUTCOMES BY ALGORITHM",
-            [target(f"sum by (algorithm, outcome) ({RUNS}{{{jf}}})", "{{algorithm}} {{outcome}}")],
-            "Routing runs and how they ended, grouped by the algorithm that selected. A run can "
-            "end differently from its upstream attempts, because the algorithm may fall back.",
+            [
+                target(
+                    f"sum by (algorithm, outcome) ({RUNS}{{{jf}}})",
+                    "{{algorithm}} {{outcome}}",
+                    ref="A",
+                )
+            ],
+            "Routing runs and how they ended, by the algorithm that selected. A run can end "
+            "differently from its upstream attempts because the algorithm may fall back.",
             12,
             y,
         )
     )
     adv(9)
 
-    # ----------------------------------------------------------- disclosures
-    add(row("6  COVERAGE, MEASUREMENT BASIS AND DISCLOSURES", y))
+    # ================================ 7 DATA QUALITY AND DISCLOSURES
+    add(row("7  DATA QUALITY, MEASUREMENT BASIS AND DISCLOSURES", y))
     adv(1)
+
+    add(
+        stat(
+            "ACCOUNT READS OK",
+            f'sum({FETCH}{{{jf},outcome="ok"}})',
+            "Successful provider account reads since this process started.",
+            0,
+            y,
+        )
+    )
+    add(
+        stat(
+            "ACCOUNT READS FAILED",
+            f"sum({FETCH}{{{jf}}}) - sum({FETCH}{{{jf},outcome=\"ok\"}})",
+            "Account reads that did not succeed, for any reason. Computed as total reads minus "
+            "successful reads rather than by filtering to a failing outcome, so a healthy "
+            "deployment reads a real 0 instead of No Data, while a vanished metric family still "
+            "leaves the panel empty. A rising count here means the balance figures above are "
+            "ageing.",
+            6,
+            y,
+        )
+    )
+    add(
+        stat(
+            "AUTH FAILURES ON ACCOUNT READS",
+            f"sum({AUTHFAIL}{{{jf}}})",
+            "Times a provider rejected our own credential while reading account state. Event "
+            "driven: the family appears only after the first occurrence, so an absent panel "
+            "means none has been recorded in this process, not that measurement is broken.",
+            12,
+            y,
+        )
+    )
+    add(
+        stat(
+            "PROVIDERS WITH ACCOUNT COVERAGE",
+            f"count(count by (provider) ({FRESH}{{{jf}}}))",
+            "How many provider accounts are being read at all. A provider missing here has no "
+            "native financial instrumentation, so its absence from the account sections is a "
+            "coverage gap rather than a zero balance.",
+            18,
+            y,
+        )
+    )
+    adv(5)
+
+    add(
+        stat(
+            "ROLLING 24H COVERAGE",
+            f'max({COVER}{{{jf},window="24h"}})',
+            "Seconds of real observation behind every rolling 24h figure on this dashboard. "
+            "After a restart this is below 86400 until the process has been up a full day; "
+            "while it is, the 24h numbers describe a partial window and should not be compared "
+            "with a full one.",
+            0,
+            y,
+            w=12,
+        )
+    )
+    add(
+        stat(
+            "PROVIDERS CURRENTLY REPORTING",
+            f"count(count by (provider) ({FETCH}{{{jf}}}))",
+            "Distinct providers that have completed at least one account read in this process. "
+            "A provider absent from the account sections entirely is a coverage gap, not a zero "
+            "balance: it has no native financial instrumentation, so nothing is known about its "
+            "money rather than everything being zero.",
+            12,
+            y,
+            w=12,
+        )
+    )
+    adv(5)
 
     add(
         text(
             "WHAT IS MEASURED, AND WHAT IS NOT",
             "**Measured.** Request counts, token components, provider-reported cost, provider "
             "account balances, credits, usage and allowances, per-attempt HTTP status, "
-            "composition decisions and crossings, and client-visible outcomes. These come from "
-            "`switchyard-server`'s own Prometheus exposition; the dashboard refuses to query "
-            "anything else.\n\n"
-            "**Not measured, and therefore absent.** Per-model *estimated* cost. The binary "
-            "declares `switchyard.economics_estimated_cost` and never calls it, so no series "
-            "exists and no panel presents one. Provider-*reported* cost is shown instead and is "
+            "composition decisions and crossings, and client-visible outcomes. All of it comes "
+            "from `switchyard-server`'s own Prometheus exposition; the generator refuses to "
+            "build a panel on any family outside that contract.\n\n"
+            "**Not measured.** Per-model *estimated* cost. The binary declares "
+            "`switchyard.economics_estimated_cost` and never calls it, so no series exists and "
+            "no panel presents one. Provider-*reported* cost is a different number and is "
             "labelled as the provider's own figure.\n\n"
             "**Not attributed.** Per-agent, per-domain or per-caller consumption. Switchyard "
-            "records the route, model and provider that served a request; it does not record who "
-            "asked. Any such breakdown would be invented, so there is none.",
-            0,
-            y,
-            w=12,
-            h=8,
-        )
-    )
-    add(
-        text(
-            "WHY THE TWO ERROR RATES DIFFER, AND WHY NEITHER IS A DIAGNOSIS",
-            "`switchyard_upstream_attempts_total` records one increment per attempt, labelled with "
-            "the HTTP status received. Its `outcome` label is a **function of that status alone** — "
-            "408, 429 and 5xx become `retryable_error`, everything else `other_error`. It is "
-            "honest about what it saw and silent about why.\n\n"
-            "That matters for two cases the providers document explicitly. A `429` may be a rate "
-            "limit that clears in seconds, or an exhausted balance that no retry can fix; the "
-            "status is identical. An OpenRouter `500 server_error` may be masked infrastructure "
-            "trouble, or a permanent authentication failure reported only in the top-level "
-            "`error_type`. Neither distinction is recoverable from the status code.\n\n"
-            "The semantic classification that *does* exist natively is the composition layer: its "
-            "`capability` and `reason` labels are decided from the provider's structured error. "
-            "Section 5 shows both facts side by side rather than presenting one as the other.",
-            12,
-            y,
-            w=12,
-            h=8,
-        )
-    )
-    adv(8)
-
-    add(
-        text(
-            "ACCURACY OF THE MONEY FIGURES",
-            "Three facts about the financial series are worth stating plainly, because each is a "
-            "way a cost dashboard misleads without being wrong.\n\n"
-            "**Currency is a label, not a constant.** The same provider can publish a real "
-            "balance in one currency and a zero-valued series in another — DeepSeek does exactly "
-            "that. Every money query here pins a currency, so a zero in an unused currency is "
-            "never mistaken for an exhausted account.\n\n"
-            "**Scope is a label, and it duplicates.** One balance is published under "
-            "`scope=\"account\"` and again under `scope=\"key\"`. They describe the same money "
-            "from two vantage points; adding them doubles it. This dashboard pins one scope per "
-            "panel, or names the scope in the legend when a panel deliberately shows both.\n\n"
-            "**One family cannot be currency-filtered.** The cumulative "
-            "`provider_cost_total` carries no currency label, unlike its calendar and rolling "
-            "counterparts. It is therefore not used for any money figure here; the windowed "
-            "families are, so spend is always attributable to a single currency.",
+            "records the route, model and provider that served a request; it does not record "
+            "who asked. Any such breakdown would be invented, so there is none.\n\n"
+            "**DeepSeek in USD.** Not shown. DeepSeek publishes a structurally zero USD series "
+            "because it keeps no dollar balance; displaying it would put a measured-looking "
+            "`$0.00` beside an account holding CNY 91.81.",
             0,
             y,
             w=12,
             h=9,
         )
     )
-
     add(
         text(
-            "ABSENCE HAS FOUR DIFFERENT MEANINGS HERE",
-            "**Zero.** A counter that exists and has not incremented. The traffic or spend is "
-            "genuinely zero.\n\n"
-            "**No event observed.** A family that only appears once its event happens — account "
-            "authentication failures are the example on this dashboard. An empty panel means the "
-            "event has not occurred in this process, not that measurement is broken.\n\n"
-            "**Partial window.** The rolling windows are computed by the binary from events it "
-            "observed. After a restart, `ROLLING WINDOW COVERAGE` drops below 86400s and the 24h "
-            "figures describe less than a day. The coverage panel exists so that is visible "
-            "rather than assumed away.\n\n"
-            "**Not instrumented.** Where a measurement does not exist at all — estimated cost, "
-            "per-caller attribution, partial-stream failure phase — no panel is drawn. An empty "
-            "panel would imply the number is available and zero, which is a stronger and falser "
-            "claim.",
+            "THE ACCOUNT READ INTERVAL IS NOT A HEALTH STATUS",
+            "`switchyard.economics_account_freshness_seconds` is recorded **only when a read "
+            "succeeds**, and its value is the elapsed time since the previous success. Two "
+            "consequences follow, and both matter for reading this dashboard.\n\n"
+            "It reports the **polling cadence** — roughly five minutes for a healthy provider — "
+            "not the age of the balance on screen. A panel labelled \"Status\" showing `5 mins` "
+            "was reporting the cadence, not saying the account was healthy five minutes ago.\n\n"
+            "It **cannot reveal staleness**. When reads start failing, no new value is recorded, "
+            "so the gauge keeps its last interval and the panel goes on showing a healthy-looking "
+            "number while the balance it describes gets older. That is why read health is shown "
+            "from `account_fetch_total` by outcome instead: a flat `ok` count beside a rising "
+            "failure count is the actual signal, and it is what section 1's ACCOUNT READ HEALTH "
+            "table displays.",
             12,
             y,
             w=12,
@@ -1005,16 +1488,40 @@ def build_dashboard(config):
 
     add(
         text(
-            "READING A PROVIDER CORRECTLY",
-            "A provider with **zero calls** is not offline; it simply was not routed to. A "
-            "provider with **exhausted credit** is not technically unavailable; it is financially "
-            "unavailable, and the difference decides whether the fix is a top-up or an "
-            "investigation. A **successfully retried** upstream error is not a failed request. "
-            "And a **stale balance** is an old observation, not a current one — the account "
-            "reading age panel is what separates the two.\n\n"
-            "These are different operational causes with different routing decisions and "
-            "different economic consequences, and this dashboard keeps them apart rather than "
-            "collapsing them into one error count.",
+            "WHY THE TWO ERROR RATES DIFFER, AND WHY NEITHER IS A DIAGNOSIS",
+            "`switchyard_upstream_attempts_total` records one increment per attempt, labelled "
+            "with the HTTP status received. Its `outcome` label is a **function of that status "
+            "alone** — 408, 429 and 5xx become `retryable_error`, everything else `other_error`. "
+            "It is honest about what it saw and silent about why.\n\n"
+            "Two cases the providers document explicitly are invisible in that label. A `429` "
+            "may be a rate limit that clears in seconds or an exhausted balance that no retry "
+            "can fix. An OpenRouter `500 server_error` may be masked infrastructure trouble or a "
+            "permanent authentication failure reported only in the top-level `error_type`. "
+            "Neither is recoverable from the status code.\n\n"
+            "The semantic classification that does exist natively is the composition layer: its "
+            "`capability` and `reason` labels are decided from the provider's structured error. "
+            "Section 6 shows both facts side by side rather than presenting one as the other.",
+            0,
+            y,
+            w=12,
+            h=9,
+        )
+    )
+    add(
+        text(
+            "ABSENCE HAS FOUR DIFFERENT MEANINGS HERE",
+            "**Zero.** A series that exists and reads zero. The traffic, spend or balance is "
+            "genuinely zero — `GLOBAL — TODAY` showing 0.00 is a real reading.\n\n"
+            "**No event observed.** A family that only appears once its event happens. Account "
+            "authentication failures are the example: an empty panel means the event has not "
+            "occurred in this process, not that measurement is broken.\n\n"
+            "**Partial window.** Rolling windows are computed by the binary from events it "
+            "observed. After a restart the coverage panel drops below 86400s and the 24h figures "
+            "describe less than a day.\n\n"
+            "**Not instrumented.** Where a measurement does not exist at all — estimated cost, "
+            "per-caller attribution, partial-stream failure phase — no panel is drawn. An empty "
+            "panel would imply the number is available and zero, which is a stronger and falser "
+            "claim.",
             12,
             y,
             w=12,
@@ -1033,7 +1540,7 @@ def build_dashboard(config):
                 "icon": "external link",
                 "tags": [],
                 "targetBlank": False,
-                "title": "Switchyard routing (V7)",
+                "title": "Switchyard routing (V7.21)",
                 "type": "link",
                 "url": f"/d/{config['routing_uid']}",
             },
@@ -1050,7 +1557,7 @@ def build_dashboard(config):
         "panels": panels,
         "refresh": "1m",
         "schemaVersion": 39,
-        "tags": ["switchyard", "economics", "native"],
+        "tags": ["switchyard", "economics", "native", "provider-accounts"],
         "templating": {"list": []},
         "time": {"from": "now-24h", "to": "now"},
         "timezone": "browser",
@@ -1066,23 +1573,29 @@ def build_dashboard(config):
 def check_native_contract(dashboard):
     """Refuses to produce a dashboard that queries anything non-native.
 
-    This runs at build time as well as in the test, so an expression cannot reach a
-    published document by way of a path the test does not exercise. The check is on
-    the rendered document rather than on the source that produced it: what matters
-    is the PromQL that will actually run.
+    Runs at build time as well as in the test, so an expression cannot reach a
+    published document by way of a path the test does not exercise. The check is
+    on the rendered document, because what matters is the PromQL that will run.
     """
     problems = []
     for panel in dashboard["panels"]:
-        for target_ in panel.get("targets", []):
-            expr = target_.get("expr", "")
+        refs = {}
+        for tgt in panel.get("targets") or []:
+            ref = tgt.get("refId")
+            refs[ref] = refs.get(ref, 0) + 1
+            expr = tgt.get("expr", "")
             for problem in native_contract.violations(expr):
-                problems.append(f"panel {panel.get('title')!r} [{target_.get('refId')}]: {problem}")
+                problems.append(f"panel {panel.get('title')!r} [{ref}]: {problem}")
             lowered = expr.lower()
-            for marker in ("localclaw_", "job=\"switchyard\"", "hermes", "openclaw", "dsh_"):
+            for marker in ("localclaw_", 'job="switchyard"', "hermes", "openclaw", "dsh_"):
                 if marker in lowered:
-                    problems.append(
-                        f"panel {panel.get('title')!r}: names a retired source ({marker})"
-                    )
+                    problems.append(f"panel {panel.get('title')!r}: retired source ({marker})")
+        for ref, count in refs.items():
+            if count > 1:
+                problems.append(
+                    f"panel {panel.get('title')!r}: {count} targets share refId {ref!r} — "
+                    "Grafana keys results by refId, so duplicates render as No Data"
+                )
     if problems:
         raise SystemExit(
             "dashboard rejected: non-native metric references\n  " + "\n  ".join(problems)
@@ -1110,7 +1623,7 @@ def load_config(path):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Build the V9.0 economics dashboard.")
+    parser = argparse.ArgumentParser(description="Build the V9 economics dashboard.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--expected-version", type=int, default=None)
@@ -1121,7 +1634,7 @@ def main(argv=None):
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(request, handle, indent=1)
     panels = request["dashboard"]["panels"]
-    queries = sum(len(panel.get("targets", [])) for panel in panels)
+    queries = sum(len(p.get("targets") or []) for p in panels)
     print(f"wrote {args.out}: {len(panels)} panels, {queries} queries, op={request['op']}")
     return 0
 

@@ -7,7 +7,13 @@
 job = "switchyard-v7"
 
 uid = "turnstone-switchyard-economics-v9"
-title = "SWITCHYARD ECONOMICS & TOKEN ACCOUNTING V9.0"
+title = "SWITCHYARD ECONOMICS & TOKEN ACCOUNTING V9.3"
+
+# Version labelling convention (operator, 2026-10-28): the dashboard title
+# carries V<major>.<grafana-dashboard-version>. Grafana's first publish is
+# version 1; when that document is updated to version 2 the title becomes V9.2,
+# and so on. The uid never changes, so rollback stays a version comparison
+# rather than a dashboard lookup.
 
 datasource_uid = "df7wrp11a9hq8c"
 datasource_type = "prometheus"
@@ -16,7 +22,7 @@ routing_uid = "turnstone-switchyard-v7"
 economics_v8_uid = "turnstone-switchyard-economics-v8"
 
 message = """
-V9.0: native Switchyard metrics only. Provider accounts, token accounting, observed
-routing mix and error economics. HTTP-derived attempt outcomes shown as such; no
-external exporter, no agent telemetry, no estimated cost.
+V9.3: provider account sections restored (OpenAI allowance windows, DeepSeek CNY, both
+OpenRouter accounts). Allowance + usage-trend charts repaired: duplicate refId caused No Data.
+Native-only contract retained.
 """

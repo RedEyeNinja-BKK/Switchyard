@@ -73,6 +73,16 @@ def structure(doc: dict) -> list[str]:
             continue
         if x + w > 24:
             bad.append(f"panel {pid} '{p['title']}' overflows the grid ({x}+{w})")
+        # Grafana keys query results by refId within a panel. Two targets sharing
+        # one refId collide: the expressions are both valid and both have data,
+        # and the panel still renders "No data" with a warning. This cost three
+        # charts in the previous dashboard, and neither a PromQL check nor a
+        # per-expression liveness check can see it.
+        refs = [t.get("refId") for t in (p.get("targets") or [])]
+        for ref in {r for r in refs if refs.count(r) > 1}:
+            bad.append(
+                f"panel {pid} '{p['title']}' has {refs.count(ref)} targets sharing refId {ref!r}"
+            )
         for (ox, oy, ow, oh, otitle) in seen:
             if x < ox + ow and ox < x + w and y < oy + oh and oy < y + h:
                 bad.append(f"panel {pid} '{p['title']}' overlaps '{otitle}'")

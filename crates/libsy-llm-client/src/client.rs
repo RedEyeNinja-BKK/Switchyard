@@ -990,6 +990,36 @@ impl AttemptFailure {
 /// exhaustion here in general: a 402 is the caller's balance, and a bare 403 is a
 /// guardrail or policy refusal that must stay terminal. Only a status with an explicit
 /// budget `limit_source` qualifies, so a content-policy 403 still refuses.
+/// The provider's own `error.code` values for a 429 that retrying cannot clear.
+///
+/// OpenAI documents these as billing, spend, or quota conditions rather than throttles,
+/// and states plainly that "retrying billing, spend, or quota errors won't restore API
+/// access". They carry no OpenRouter `metadata.limit_source`, so recognizing the marker
+/// alone leaves them classified as ordinary rate limits.
+///
+/// The list is deliberately closed and drawn from published provider documentation. An
+/// unknown code stays a rate limit, because guessing that an unrecognized 429 is
+/// permanent would strand a request that another attempt could have served.
+const BILLING_LIMIT_CODES: &[&str] = &[
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+    "insufficient_quota",
+];
+
+fn is_documented_billing_limit(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value["error"]["code"]
+                .as_str()
+                .or_else(|| value["error"]["type"].as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|code| BILLING_LIMIT_CODES.contains(&code.as_str()))
+}
+
 pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
     let LlmClientError::UpstreamHttp { status, body } = source else {
         return false;
@@ -1002,6 +1032,7 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
     match *status {
         StatusCode::TOO_MANY_REQUESTS => {
             limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
+                || is_documented_billing_limit(body)
         }
         // Insufficient credits: the account balance is the shared resource, so no
         // candidate on this credential can serve the request.
@@ -3507,6 +3538,60 @@ mod tests {
             mislabelled.is_retryable(),
             "a 503 is transient whatever its body says"
         );
+    }
+
+    /// OpenAI documents several distinct 429 causes that retrying cannot fix.
+    ///
+    /// A billing or spend cap is not a throttle. The provider's own documentation is
+    /// explicit: "Retrying billing, spend, or quota errors won't restore API access."
+    /// These arrive without OpenRouter's `metadata.limit_source` marker, so a check that
+    /// only understands that marker classifies them as ordinary rate limits and spends
+    /// requests against an allowance known to be empty.
+    ///
+    /// The control matters as much as the rule: a genuine rate limit on the same status
+    /// must keep its retries, or this change removes recovery that works today.
+    #[test]
+    fn documented_billing_429_codes_are_account_wide_but_rate_limits_still_retry() {
+        let failure = |body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: body.to_string(),
+            },
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            retry_after: None,
+        };
+
+        for code in [
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "insufficient_quota",
+        ] {
+            let body = format!(r#"{{"error":{{"type":"insufficient_quota","code":"{code}"}}}}"#);
+            let billing = failure(&body);
+            assert!(
+                is_account_wide_quota(&billing.error),
+                "{code} is an account-wide condition"
+            );
+            assert!(
+                !billing.is_retryable(),
+                "{code} cannot be fixed by retrying the same credential"
+            );
+        }
+
+        // A genuine rate limit keeps retrying. The provider sends `slow_down` and a bare
+        // "rate limit reached" for these; neither is a billing condition.
+        for body in [
+            r#"{"error":{"type":"rate_limit_error","code":"slow_down"}}"#,
+            r#"{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
+            r#"{"error":{"message":"Rate limit reached for requests"}}"#,
+        ] {
+            assert!(
+                failure(body).is_retryable(),
+                "a genuine rate limit must keep its retries: {body}"
+            );
+        }
     }
 
     #[test]

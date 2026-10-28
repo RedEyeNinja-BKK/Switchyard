@@ -698,7 +698,45 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
     }
 }
 
+/// The provider's own stable failure identity, when it supplies one.
+///
+/// OpenRouter states that the Responses API's `error.code` is a reduced mapping (for
+/// example, both `context_length_exceeded` and `invalid_request` surface as
+/// `invalid_prompt`) and that the top-level `error_type` is the stable, cross-format
+/// value. It is a sibling of the `error` object, not a member of it, and a failure
+/// envelope is not obliged to contain it — hence an `Option`.
+fn canonical_error_type(body: &str) -> Option<&'static str> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let candidate = value["error_type"]
+        .as_str()
+        .or_else(|| value["error"]["error_type"].as_str())?;
+    // Return a borrowed static so the caller can match on it without allocating; only
+    // values this classification acts on are recognized, everything else is unknown.
+    KNOWN_ERROR_TYPES
+        .iter()
+        .copied()
+        .find(|known| *known == candidate)
+}
+
+/// The `error_type` values this classification acts on.
+///
+/// Kept closed on purpose: an unrecognized type must fall back to the status-derived
+/// class rather than being guessed into a permanent failure.
+const KNOWN_ERROR_TYPES: &[&str] = &[
+    "authentication",
+    "permission_denied",
+    "payment_required",
+    "context_length_exceeded",
+    "content_policy_violation",
+];
+
 /// Classifies a provider failure without interpreting it again at each call site.
+///
+/// Provider-specific identity wins over the numeric status where the provider states it.
+/// The inverse is deliberately not done: `fallback_reason` keeps its status-derived
+/// answer, because whether one request should be tried on another candidate is a
+/// routing decision already measured against live providers, and narrowing it here would
+/// change candidate order without evidence.
 pub fn failure_class(error: &LibsyError) -> FailureClass {
     if is_retired_minimax_free(error) {
         return FailureClass::TemporarilyUnavailable;
@@ -721,7 +759,16 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
             StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
             StatusCode::REQUEST_TIMEOUT => FailureClass::Timeout,
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => FailureClass::Auth,
-            status if status.is_server_error() => FailureClass::Server,
+            // A 5xx is usually the provider's infrastructure, but OpenRouter masks a
+            // permanent authentication or authorization failure behind `server_error`
+            // and identifies the real cause only in the top-level `error_type`. Reading
+            // the status alone would send that request on to another candidate, turning
+            // one permanent fault into a cascade of futile attempts.
+            status if status.is_server_error() => match canonical_error_type(body) {
+                Some("authentication" | "permission_denied") => FailureClass::Auth,
+                Some("payment_required") => FailureClass::AccountQuota,
+                _ => FailureClass::Server,
+            },
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
                 if serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
                     value["error"]["code"].as_str() == Some("content_policy_violation")
@@ -3285,6 +3332,54 @@ mod account_quota_tests {
         );
         assert_eq!(failure_class(&error), FailureClass::Server);
         assert!(fallback_reason(&error).is_some());
+    }
+
+    /// OpenRouter masks a permanent authentication failure behind `server_error`.
+    ///
+    /// Its documented contract is that the Responses API's `error.code` is a reduced
+    /// mapping and only the sibling top-level `error_type` carries the real cause. A
+    /// status-only classifier calls this transient and sends the request to another
+    /// candidate, spending a second credential to re-learn that the first one is
+    /// rejected. The control is the third case: a genuine 5xx carries no `error_type`
+    /// and must keep its transient classification.
+    #[test]
+    fn a_masked_authentication_5xx_is_permanent_but_a_bare_5xx_is_not() {
+        let masked = |body: &str| {
+            LibsyError::client_call(
+                "some/model",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    body: body.to_string(),
+                },
+            )
+        };
+
+        let auth = masked(
+            r#"{"status":"failed","error":{"code":"server_error","message":"Invalid credentials"},"error_type":"authentication"}"#,
+        );
+        assert_eq!(failure_class(&auth), FailureClass::Auth);
+        assert!(
+            !failure_class(&auth).allows_cross_route(),
+            "a rejected credential must not be retried on another route"
+        );
+
+        let permission = masked(r#"{"error":{"code":"server_error"},"error_type":"permission_denied"}"#);
+        assert_eq!(failure_class(&permission), FailureClass::Auth);
+
+        let payment = masked(r#"{"error":{"code":"server_error"},"error_type":"payment_required"}"#);
+        assert_eq!(failure_class(&payment), FailureClass::AccountQuota);
+        assert!(failure_class(&payment).is_account_quota());
+
+        // A genuine infrastructure failure states nothing and stays transient.
+        let bare = masked(
+            r#"{"error":{"code":"server_error","message":"Provider overloaded"}}"#,
+        );
+        assert_eq!(failure_class(&bare), FailureClass::Server);
+        assert!(failure_class(&bare).allows_cross_route());
+
+        // An unrecognized type must not be guessed into a permanent class.
+        let unknown = masked(r#"{"error":{"code":"server_error"},"error_type":"unmapped"}"#);
+        assert_eq!(failure_class(&unknown), FailureClass::Server);
     }
 
     /// The free-tier daily cap names its scope. The block it produces covers only

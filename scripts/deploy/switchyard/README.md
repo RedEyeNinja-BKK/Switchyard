@@ -155,19 +155,115 @@ both loaded and doing what it was written to do.
 - Re-verified read-only afterwards: `verify-live` PASS, every one of the 16
   `always_present` families exposed, health 200, `NRestarts=0`.
 
-### Provenance caveat
+### Route capability findings
 
-`release.json` declares `source_commit=7372e79` on branch `econ-restore-20261028`
-with `attested: true`. That commit does not describe this deployment. It is an
-`llm-client` fix, it is not present in the running binary (whose bytes are
-unchanged from the previous release, which was built before it), and the route
-change exists in no commit at all - the config was authored as
-`/tmp/routes_dualfree2.toml` on the host and staged from there.
+Checked against the provider's own catalogue (`GET https://openrouter.ai/api/v1/models`,
+read-only metadata, no inference) and against the target declarations in the
+config. The route flags are not the same kind of claim, which matters here:
 
-The `config-only-dualfree-tiers` basis is accurate. The source identity attached to
-it is not, and an operator reading `SOURCE-COMMIT.txt`-style provenance would
-conclude the deployed config came from `7372e79`, which it did not. The accurate
-record is: config-only, no source commit, staged file authored on `switchyard-vm`.
+- `vision = true` is a promise about **every** target the route can select.
+- `video = true` is a promise that **any** target can serve video; the loader
+  requires at least one child that declares it, and a target that omits `video`
+  is treated as "has not claimed video", not as a refusal.
+
+| route | declared | target(s) upstream | provider input modalities | verdict |
+| --- | --- | --- | --- | --- |
+| `ST_Tier1g` | `vision=true` `video=true` | `dots-studio/dots-3-note-preview:free` (primary), `nvidia/nemotron-3.5-super-vl:free` (candidate) | `text,image` / `text,image,video` | vision correct; video **legal but misleading** |
+| `ST_Tier2g` | `vision=false` | `recursive/flint-v1.0:free`, `xingchen-agi/xing4.0-29b-a4b:free` | `text` / `text` | correct, and conservative |
+| `ST_Tier3g` | `vision=true` `video=true` | `google/gemma-4-26b-a4b-it:free`, `google/gemma-4-31b-it:free` | `image,text,video` / `image,text,video` | correct on both |
+
+`ST_Tier1g` is the one worth a decision. Its `video = true` passes the loader
+because the *candidate* handles video, but the **primary** target explicitly
+carries `video = false` and the provider confirms its input is text and image
+only. Video is therefore admitted on that route and dispatched to a model that
+cannot read it, and only reaches a video-capable model through a failed attempt
+plus fallback.
+
+This is not a regression introduced at 16:37. The pre-existing `ST_Tier1` has the
+identical shape - `video = true`, primary `stephen-dots-3-note-preview-free` with
+`video = false`, candidate `stephen-nemotron-3-5-super-vl-free` with `video = true` -
+so the twins reproduce the established pattern rather than inventing a new one.
+The same holds for the `openai_responses` transport the video path requires, which
+is satisfied: no silent video-to-text conversion is possible on this client.
+
+Smallest safe correction, for operator approval and **not** applied here: set
+`video = false` on `ST_Tier1g` (and `ST_Tier1`, for consistency) so a video request
+is refused at admission with `unsupported_capability` instead of being sent to a
+target that cannot read it. One line each, reversible, no model or route removed.
+The alternative - making the video-capable model the primary target - would move
+ordinary text traffic onto it, which is a routing decision, not a correction.
+
+### Provenance: four separate claims
+
+`release.json` records one field for source identity. Four different questions are
+being asked of it here, and only some answers are true as written.
+
+**Declared source commit - `7372e79`, branch `econ-restore-20261028`.** This is what
+the deploying command passed with `--source-commit`. It is a declaration made at
+deploy time, which the tool labels `declared-at-deploy` and reports as
+`attested: true`. It is not evidence about how the bytes were produced.
+
+**Actual source identity at build time - not the declared commit, and not fully
+recoverable.** The binary cannot have been built from `7372e79`, because the commit
+did not exist when the binary was made:
+
+| event | time (UTC) |
+| --- | --- |
+| binary built | 13:42:44 |
+| binary installed | 13:49:53 |
+| `7372e79` committed | 13:55:28 |
+
+The build artifact survives at `/var/tmp/econ-merge/target/release/switchyard-server`
+and is byte-identical to the deployed binary (`f188c5a9…`, 27,582,360 B), which dates
+the build to 13:42:44Z independently of the commit log. The change `7372e79` records
+is absent from its parent `688f5c2` and present in `7372e79` itself, so at 13:42:44
+it existed only in an uncommitted working tree. The build therefore came from a
+dirty tree that was committed thirteen minutes later. Whether that tree carried
+**other** uncommitted differences cannot now be established: the working tree has
+since moved on and no record of its state at build time survives. That question is
+recorded as unresolved rather than answered by inference.
+
+**Behavioural functionality in the deployed binary - present, measured.** Commit
+orders cannot settle this, so it was measured. The exact deployed bytes were run
+against a local mock provider on a loopback port, in a scratch directory, with a
+scratch configuration and no credential: no production configuration was touched
+and no external request was made. Each case sends one caller request and counts the
+upstream attempts the binary actually performs:
+
+| mock response | upstream attempts | caller status |
+| --- | --- | --- |
+| 200 with a valid completion (control) | 1 | 200 |
+| 500 `error_type="authentication"` | **1** | 500 |
+| 500 `error_type="permission_denied"` | **1** | 500 |
+| 500 `error_type="payment_required"` | **1** | 500 |
+| 503 `error_type="authentication"` | **1** | 503 |
+| 500 bare `server_error` (control) | 3 | 500 |
+| 500 `error_type="rate_limit_exceeded"` (control) | 3 | 500 |
+
+That is exactly the rule `7372e79` adds - a 5xx carrying a masked permanent
+`error_type` fails fast instead of being retried - together with the controls that
+commit preserves, where a bare or unrelated 5xx still retries. The fix's behaviour
+**is** in the deployed binary even though its commit postdates the build. An earlier
+reading of this release concluded the opposite from timestamps alone; that inference
+was wrong, because a commit that does not exist yet says nothing about what a
+working tree contained.
+
+**Origin of the route configuration - staged on the host, in no commit.** The three
+new routes exist in no commit on any ref (`git log --all -S ST_Tier1g` is empty).
+The file was authored as `/tmp/routes_dualfree2.toml` on `switchyard-vm` and copied
+to `/opt/switchyard/staged/routes-dualfree-20261028.toml` immediately before the
+deploy, with the capability manifest copied from `CURRENT` in the same command.
+
+**What the record should say.** The `config-only-dualfree-tiers` basis is accurate
+for the route change. The declared commit is accurate as a declaration and
+misleading as provenance: it names a commit the binary cannot have been built from,
+and says nothing about where the route change came from. The accurate summary is:
+*binary and config from an uncommitted working tree at 13:42:44Z; routes staged on
+the host and present in no commit; declared commit `7372e79` records the binary's
+request-retry behaviour and was committed after the build.*
+
+Nothing here retroactively attests the release. The `attested: true` flag keeps its
+narrow, declared meaning.
 
 ### Authorization
 
@@ -190,6 +286,11 @@ one unknown with another.
 - The authorization gap above.
 - `CURRENT` is attested only in the declared sense; `LAST-KNOWN-GOOD` is not
   attested at all, so the rollback target rests on observed bytes alone.
-- `ST_Tier1g` and `ST_Tier3g` declare `vision = true` and `video = true`. Modality
-  support for those free models was not verified here and is not covered by the
-  capability contract.
+- The build-time source state is unresolved beyond what the surviving artifact and
+the deployed binary's behaviour prove; it may have contained other uncommitted
+  changes that no longer exist anywhere.
+- `ST_Tier1g` (and the pre-existing `ST_Tier1`) claim video while their primary
+  target is text-and-image only. See the capability findings above; the correction
+  needs operator approval.
+- Route-level `vision` and `video` are not represented in the capability manifest,
+  so the release gate cannot notice a wrong modality claim.

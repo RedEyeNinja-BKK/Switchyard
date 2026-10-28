@@ -139,6 +139,10 @@ install_pair() {
 activate_release() {
   local dir=$1 id
   id=$(basename "$dir")
+  if is_retained "$id"; then
+    say "$id is a retained historical artefact, not a deployable release"
+    return 1
+  fi
   [ -f "$dir/switchyard-server" ] || { say "release $id has no binary"; return 1; }
   [ -f "$dir/routes.toml" ] || { say "release $id has no manifest"; return 1; }
   local want_bin want_man
@@ -179,6 +183,18 @@ if section:
         value = value[part]
 print(value if key is None else value[key])
 ' "$1" "$2" "${3-}"
+}
+# A boolean field, as the word `true`/`false`. Python prints `True`, which is a
+# different spelling from the JSON it was read from and reads like a mistake.
+json_bool() {
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as fh:
+    value = json.load(fh)
+for part in sys.argv[2].split("."):
+    value = value[part]
+print("true" if value else "false")
+' "$1" "$2"
 }
 # --------------------------------------------------------------- release store
 #
@@ -251,6 +267,22 @@ store_release() {
 
   local created
   created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # Attestation records WHEN the provenance was captured, and binds it to the
+  # binary hash. A deploy captures the source the operator declared at activation
+  # time; `adopt` can only describe bytes that are already running and never
+  # attests. This is deliberately NOT a claim of byte-reproducibility: a rebuild
+  # of the same commit has not been compared, and the field says so on its face.
+  local attested=false attestation
+  if [ "$action" = deploy ] && [ -n "$commit" ]; then
+    attested=true ; attestation="declared-at-deploy"
+  elif [ "$action" = deploy ]; then
+    attestation="deploy-without-source-commit"
+  else
+    attestation="captured-after-the-fact-from-running-bytes"
+  fi
+  local dirty_note=""
+  [ "$dirty" = true ] && dirty_note=" (working tree dirty)"
   cat >"$work/release.json" <<JSON
 {
   "schema": 2,
@@ -261,10 +293,33 @@ store_release() {
   "binary": {"file": "switchyard-server", "sha256": "$b_sha", "bytes": $(stat -c %s "$work/switchyard-server"), "mode": "$(stat -c %a "$work/switchyard-server")"},
   "manifest": {"file": "routes.toml", "sha256": "$m_sha", "bytes": $(stat -c %s "$work/routes.toml"), "mode": "$(stat -c %a "$work/routes.toml")", "group": "$MANIFEST_GROUP"},
   "capabilities": $caps_json,
-  "provenance": {"source_commit": "$commit", "source_branch": "$branch", "source_dirty": $dirty, "basis": "$basis", "attested": false},
+  "provenance": {"source_commit": "$commit", "source_branch": "$branch", "source_dirty": $dirty, "basis": "$basis", "attested": $attested, "attestation": "$attestation", "note": "Attested means the source identity was declared when these exact bytes were installed and is bound to the binary sha256 above. It does not claim the build is reproducible: no rebuild has been compared against it."},
   "configuration": {"unit": $(unit_identity_json), "env_files": $(env_identity_json), "note": "Environment file contents are deliberately not copied: the hash identifies the configuration, and the secret stays in its own file with its own permissions."}
 }
 JSON
+  # A human-readable companion, so the attestation status of a stored release can be
+  # read without parsing JSON and without anyone having to remember what it meant.
+  {
+    printf 'release       %s\n' "$(basename "$dir")"
+    printf 'recorded      %s (%s)\n' "$created" "$action"
+    printf 'binary        %s\n' "$b_sha"
+    printf 'manifest      %s\n' "$m_sha"
+    printf 'source commit %s\n' "${commit:-not recorded}"
+    printf 'source branch %s\n' "${branch:-not recorded}${dirty_note}"
+    printf 'basis         %s\n' "$basis"
+    printf 'attested      %s (%s)\n' "$attested" "$attestation"
+    printf '\n'
+    if [ "$attested" = true ]; then
+      printf 'The source identity above was declared when these exact bytes were installed,\n'
+      printf 'and is bound to the binary sha256. The build has not been shown to be\n'
+      printf 'reproducible: no rebuild of that commit was compared against this binary.\n'
+    else
+      printf 'This release is NOT attested. It records bytes observed on this host; it does\n'
+      printf 'not record a build. The source commit is advisory at best and may be unknown.\n'
+      printf 'Treat the binary and manifest hashes as the whole of the evidence.\n'
+    fi
+  } >"$work/PROVENANCE.txt"
+  chmod 0640 "$work/PROVENANCE.txt"
   chmod 0640 "$work/release.json"
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$work/release.json" \
     || { say "release metadata is not valid JSON"; rm -rf "$work"; return 1; }
@@ -313,6 +368,14 @@ point_at() {
   [ "$(link_target "$link")" = "$id" ] || die "could not point $link at $id"
 }
 
+# A stored directory may carry a RETAINED marker. Such an artefact is kept for the
+# record and is exempt from every automatic decision about it: retention never
+# prunes it, it never consumes a retention slot, and no verb will install, verify or
+# promote it as a release. It exists for history that cannot be re-established --
+# an artefact whose provenance predates the store, or one held deliberately because
+# it is evidence of what ran at a point in time.
+is_retained() { [ -f "$RELEASE_ROOT/$1/RETAINED" ]; }
+
 # Keeps the newest RETAIN releases plus CURRENT and LAST-KNOWN-GOOD. The two
 # pointers are protected by identity, not by age: an old release that is still the
 # rollback target must survive any amount of newer activity.
@@ -322,6 +385,13 @@ prune_releases() {
   keep_lkg=$(link_target "$LKG_LINK")
   while IFS= read -r id; do
     [ -n "$id" ] || continue
+    # A retained artefact is never pruned, and it does not consume a retention slot:
+    # otherwise marking one thing as permanent would silently shorten the history of
+    # everything else.
+    if is_retained "$id"; then
+      keep+=("$id")
+      continue
+    fi
     n=$((n + 1))
     if [ "$n" -le "$RETAIN" ] || [ "$id" = "$keep_current" ] || [ "$id" = "$keep_lkg" ]; then
       keep+=("$id")
@@ -470,6 +540,11 @@ cmd_deploy() {
     restored=1
     say "restoring $prev_id"
     if activate_release "$prev_dir"; then
+      # The pointer must name the binary that is actually running. This path is
+      # reached after CURRENT has already moved to the candidate, so without this
+      # the store would claim a release was current that had just been rolled back
+      # out -- and `verify` would report the live pair as mismatched.
+      point_at CURRENT "$prev_id" || say "could not repoint CURRENT to $prev_id"
       say "ROLLBACK VERIFIED: $prev_id is live, byte-verified and healthy"
       return 0
     fi
@@ -531,14 +606,19 @@ cmd_deploy() {
     fail_and_rollback "could not record the release durably"
   fi
   point_at CURRENT "$id"
-  if [ "$promote" -eq 1 ]; then
-    point_at LAST-KNOWN-GOOD "$id"
-    say "promoted $id to LAST-KNOWN-GOOD"
-  fi
 
   say "post-deployment verification"
   if ! post_verify "$caps"; then
     fail_and_rollback "post-deployment verification failed"
+  fi
+
+  # Promotion follows post-deployment verification, never the restart. Moving this
+  # above the check is a one-line change that points LAST-KNOWN-GOOD at a release
+  # whose own checks had not yet run, and a later rollback would then install it as
+  # if it were known good -- which is the opposite of what the pointer means.
+  if [ "$promote" -eq 1 ]; then
+    point_at LAST-KNOWN-GOOD "$id"
+    say "promoted $id to LAST-KNOWN-GOOD after post-deployment verification"
   fi
 
   same() { [ "$1" -ef "$2" ] 2>/dev/null; }
@@ -575,6 +655,9 @@ cmd_rollback() {
     esac
   fi
   [ -d "$RELEASE_ROOT/$target" ] || die "no release $target in $RELEASE_ROOT"
+  if is_retained "$target"; then
+    die "$target is a retained historical artefact and is not deployable"
+  fi
   if [ "$target" = "$from_id" ]; then
     say "CURRENT is already $target; verifying instead of reinstalling"
   fi
@@ -615,6 +698,9 @@ cmd_promote() {
     [ -n "$id" ] || die "no CURRENT release to promote"
   fi
   [ -d "$RELEASE_ROOT/$id" ] || die "no release $id"
+  if is_retained "$id"; then
+    die "$id is a retained historical artefact and cannot become the rollback target"
+  fi
   # Only a release that is live AND healthy may become the rollback target.
   local live
   live=$(link_target "$CURRENT_LINK")
@@ -639,6 +725,10 @@ cmd_verify() {
   fi
   local dir=$RELEASE_ROOT/$id
   [ -d "$dir" ] || die "no release $id"
+  if is_retained "$id"; then
+    die "$id is a retained historical artefact: it is kept for the record and is not \
+a release, so there is nothing to verify against a record it never had"
+  fi
   local want_bin want_man
   want_bin=$(json_field "$dir/release.json" binary sha256)
   want_man=$(json_field "$dir/release.json" manifest sha256)
@@ -678,6 +768,13 @@ cmd_list() {
     mark=""
     [ "$id" = "$cur" ] && mark="$mark CURRENT"
     [ "$id" = "$lkg" ] && mark="$mark LAST-KNOWN-GOOD"
+    is_retained "$id" && mark="$mark RETAINED"
+    # Attestation is the one property an operator must not have to open release.json
+    # to discover: an unattested release is a record of bytes, not of a build.
+    if [ -f "$RELEASE_ROOT/$id/release.json" ] \
+       && [ "$(json_bool "$RELEASE_ROOT/$id/release.json" provenance.attested 2>/dev/null)" != "true" ]; then
+      mark="$mark UNATTESTED"
+    fi
     printf '%-34s %-20s %-17s %s\n' "$id" "$created" "$bin" "${mark# }"
   done < <(list_release_ids)
 }

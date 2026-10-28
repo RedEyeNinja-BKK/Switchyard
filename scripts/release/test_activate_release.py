@@ -479,6 +479,194 @@ def test_list_survives_a_directory_that_is_not_a_release(box):
         f"one unreadable directory must not spoil the other row: {real_row!r}")
 
 
+def test_a_retained_artefact_is_never_pruned_and_never_deployable(box):
+    """A retained directory is history, and nothing automatic may touch it.
+
+    The store can hold an artefact whose provenance predates it: real bytes that
+    ran, with no release record and no way to reconstruct one. Marking it RETAINED
+    must make it permanent and inert -- not a rollback target, not a promotion
+    candidate, not something retention counts or deletes.
+    """
+    baseline = adopted(box)
+    legacy = os.path.join(box.releases, "legacy-20260101T000000Z")
+    os.makedirs(legacy)
+    with open(os.path.join(legacy, "switchyard-server"), "w") as fh:
+        fh.write("#!/bin/bash\nexit 0\n")
+    with open(os.path.join(legacy, "RETAINED"), "w") as fh:
+        fh.write("historical artefact\n")
+
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    for index in range(4):
+        result = box.run("deploy", manifest, msha, candidate, csha,
+                         "--label", f"round {index}", RETAIN="0")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    assert os.path.isdir(legacy), "a retained artefact must survive every prune"
+    assert os.path.isfile(os.path.join(legacy, "switchyard-server")), (
+        "retention must not delete the retained artefact's contents")
+    # It must not have consumed a retention slot either: the newest real release
+    # still has to be present.
+    assert os.path.isdir(os.path.join(box.releases, box.lkg() if box.lkg() else baseline))
+
+    for verb in (("rollback", os.path.basename(legacy)), ("promote", os.path.basename(legacy))):
+        result = box.run(*verb)
+        assert result.returncode != 0, f"{verb[0]} must refuse a retained artefact"
+        assert "retained" in (result.stdout + result.stderr).lower()
+    assert box.lkg() == baseline, "a refused promote must not move the rollback target"
+
+    result = box.run("verify", os.path.basename(legacy))
+    assert result.returncode != 0
+    assert "retained" in (result.stdout + result.stderr).lower()
+
+
+def _capability_stub(box, *, verify_rc):
+    """A capability tool that passes the gate and then fails the live check.
+
+    The script invokes the tool as `python3 "$CAPABILITY_TOOL" <verb>`, so a bash
+    stub is a SyntaxError rather than a stub -- which fails the deploy at the
+    capability gate, long before post-deployment verification runs. Every test
+    below therefore asserts the FAILURE REASON, not merely a non-zero exit: a
+    deploy that stops at an earlier gate would otherwise satisfy them.
+    """
+    path = os.path.join(box.root, "capability_stub.py")
+    with open(path, "w") as fh:
+        fh.write("import sys\n")
+        fh.write("verb = sys.argv[1] if len(sys.argv) > 1 else ''\n")
+        fh.write(f"if verb == 'verify-live':\n    sys.exit({verify_rc})\n")
+        fh.write("sys.exit(0)\n")
+    os.chmod(path, 0o644)
+    return path
+
+
+def test_promotion_waits_for_post_deployment_verification(box, tmp_path):
+    """LAST-KNOWN-GOOD must never name a release whose own checks had not run.
+
+    A restart proves the process started. Verification proves the release does
+    what it claims. If promotion happened between the two, a later rollback would
+    install the failed candidate as if it were known good -- the pointer would be
+    actively harmful rather than merely stale.
+    """
+    baseline = adopted(box)
+    before = box.live_bytes()
+    import json as _json
+    with open(os.path.join(box.releases, baseline, "capabilities.json"), "w") as fh:
+        _json.dump({"families": {}}, fh)
+
+    stub = _capability_stub(box, verify_rc=1)
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    caps = tmp_path / "caps.json"
+    caps.write_text("{}")
+
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", str(caps), "--promote",
+                     "--source-commit", "c" * 40,
+                     CAPABILITY_TOOL=stub)
+    assert result.returncode != 0, "a failed post-deployment check must fail the deploy"
+    assert "post-deployment verification failed" in result.stderr, (
+        "the deploy must fail AT post-deployment verification, not at an earlier gate: "
+        + result.stdout + result.stderr)
+    assert box.lkg() == baseline, (
+        "LAST-KNOWN-GOOD moved to a release that failed post-deployment verification")
+    assert box.current() == baseline, (
+        "CURRENT must name the binary that is actually running after a rollback")
+    assert box.live_bytes() == before
+
+
+def test_a_failed_post_deployment_check_restores_current(box, tmp_path):
+    """CURRENT follows the restored binary, not the attempt that was undone."""
+    baseline = adopted(box)
+    before = box.live_bytes()
+    import json as _json
+    with open(os.path.join(box.releases, baseline, "capabilities.json"), "w") as fh:
+        _json.dump({"families": {}}, fh)
+
+    stub = _capability_stub(box, verify_rc=1)
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    caps = tmp_path / "caps.json"
+    caps.write_text("{}")
+
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", str(caps), CAPABILITY_TOOL=stub)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "post-deployment verification failed" in result.stderr, (
+        "the deploy must fail AT post-deployment verification: "
+        + result.stdout + result.stderr)
+    assert box.live_bytes() == before
+    assert box.current() == baseline
+    verify = box.run("verify")
+    assert verify.returncode == 0, (
+        "after a restore the store must agree with the live pair: "
+        + verify.stdout + verify.stderr)
+
+
+def test_a_deploy_records_attested_provenance_and_adopt_does_not(box):
+    """Attestation distinguishes a recorded build from observed bytes.
+
+    A deploy knows the source it was asked to install, at the moment those bytes
+    went live. `adopt` knows only what is running. Collapsing the two would let a
+    reconstructed record masquerade as build provenance.
+    """
+    import json as _json
+
+    baseline = adopted(box)
+    adopted_record = _json.load(open(os.path.join(box.releases, baseline, "release.json")))
+    assert adopted_record["provenance"]["attested"] is False
+    assert adopted_record["provenance"]["basis"] == "adopted-unattested"
+    with open(os.path.join(box.releases, baseline, "PROVENANCE.txt")) as fh:
+        assert "NOT attested" in fh.read()
+
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--label", "attested release",
+                     "--source-commit", "d" * 40, "--source-branch", "release/line")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    deployed = box.current()
+    record = _json.load(open(os.path.join(box.releases, deployed, "release.json")))
+    provenance = record["provenance"]
+    assert provenance["attested"] is True
+    assert provenance["attestation"] == "declared-at-deploy"
+    assert provenance["source_commit"] == "d" * 40
+    assert provenance["source_branch"] == "release/line"
+    # The attestation must not overclaim: it is not a reproducibility proof.
+    assert "reproducible" in provenance["note"]
+
+    with open(os.path.join(box.releases, deployed, "PROVENANCE.txt")) as fh:
+        text = fh.read()
+    assert "declared-at-deploy" in text
+    assert "not been shown to be" in text
+
+    listing = box.run("list")
+    assert listing.returncode == 0
+    adopted_row = next(r for r in listing.stdout.splitlines() if baseline in r)
+    assert "UNATTESTED" in adopted_row
+    deployed_row = next(r for r in listing.stdout.splitlines() if deployed in r)
+    assert "UNATTESTED" not in deployed_row
+
+
+def test_a_deploy_without_a_source_commit_is_not_attested(box):
+    """The absence of a declared source is recorded, not papered over."""
+    import json as _json
+
+    adopted(box)
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha, "--label", "no source")
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = _json.load(open(os.path.join(box.releases, box.current(), "release.json")))
+    assert record["provenance"]["attested"] is False
+    assert record["provenance"]["attestation"] == "deploy-without-source-commit"
+
+
 # ---------------------------------------------------------------------------
 # the capability gate, wired into deployment
 # ---------------------------------------------------------------------------

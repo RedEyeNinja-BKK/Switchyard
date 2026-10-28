@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# V9.0 dashboard identity. V8 keeps its own config and its own uid, so publishing
+# V9.0 cannot overwrite the document an operator would roll back to.
+
+job = "switchyard-v7"
+
+uid = "turnstone-switchyard-economics-v9"
+title = "SWITCHYARD ECONOMICS & TOKEN ACCOUNTING V9.0"
+
+datasource_uid = "df7wrp11a9hq8c"
+datasource_type = "prometheus"
+
+routing_uid = "turnstone-switchyard-v7"
+economics_v8_uid = "turnstone-switchyard-economics-v8"
+
+message = """
+V9.0: native Switchyard metrics only. Provider accounts, token accounting, observed
+routing mix and error economics. HTTP-derived attempt outcomes shown as such; no
+external exporter, no agent telemetry, no estimated cost.
+"""

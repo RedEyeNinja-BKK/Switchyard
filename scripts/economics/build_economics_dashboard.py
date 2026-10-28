@@ -85,14 +85,11 @@ ROLL_COVERAGE = "switchyard_economics_rolling_coverage_seconds"
 # These are components OF the total, never additional to it.
 BALANCE_COMPONENT = "switchyard_economics_provider_balance_component"
 
-# Figures the older localclaw economics exporter publishes and Switchyard does
-# not. Switchyard reads DeepSeek's balance endpoint, which returns a level and
-# not a ledger, so a top-up and a day of usage are indistinguishable from two
-# readings. These series are still current, so the DeepSeek row keeps them
-# rather than dropping information the operator can act on.
-LEGACY_SPEND_DELTA = "localclaw_deepseek_spend_balance_delta_total_cny"
-LEGACY_TOP_UP = "localclaw_deepseek_top_up_total_cny"
-LEGACY_ACTUAL_COST = "localclaw_econ_actual_cost_total"
+# Retired with the localclaw exporter. Switchyard reads DeepSeek's balance
+# endpoint, which returns a level rather than a ledger, so a top-up ledger,
+# lifetime spend and request-derived cost cannot be reconstructed from it. Those
+# figures are not published here at all; the "NOT MEASURABLE HERE" panel says so
+# on the dashboard rather than leaving a gap unexplained.
 
 _uid = 1000
 
@@ -269,6 +266,36 @@ def barchart(title, targets, description, x, y, w=12, h=9, unit="short", stack=F
     }
 
 
+def piechart(title, targets, description, x, y, w=8, h=9, unit="short"):
+    return {
+        "datasource": DS,
+        "description": description,
+        "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
+        "gridPos": {"h": h, "w": w, "x": x, "y": y},
+        "id": next_id(),
+        "options": {
+            "displayLabels": ["percent"],
+            "legend": {
+                "calcs": ["sum"],
+                "displayMode": "table",
+                "placement": "right",
+                "showLegend": True,
+                "values": ["value", "percent"],
+            },
+            "pieType": "donut",
+            "reduceOptions": {
+                "calcs": ["lastNotNull"],
+                "fields": "",
+                "values": True,
+            },
+            "tooltip": {"mode": "multi", "sort": "desc"},
+        },
+        "targets": targets,
+        "title": title,
+        "type": "piechart",
+    }
+
+
 def table(title, targets, description, x, y, w=12, h=9, unit="short"):
     return {
         "datasource": DS,
@@ -306,7 +333,6 @@ def text(title, content, x, y, w=24, h=4):
 def build_dashboard(config):
     """Builds the dashboard document from a configuration mapping."""
     job = config["job"]
-    legacy_job = config["legacy_job"]
     uid = config["uid"]
     title = config["title"]
     routing_uid = config["routing_uid"]
@@ -870,6 +896,186 @@ def build_dashboard(config):
     )
     y += 11
 
+    # The observed-mix row: the presentation V5.39 used and V8 dropped. It answers
+    # "what is the traffic made of" and "where did it go" from the same rolling
+    # counters, so it adds a reading and not a measurement.
+    panels.append(row("TRAFFIC — OBSERVED MIX (rolling 24h)", y))
+    y += 1
+
+    panels.append(
+        piechart(
+            "REQUESTS BY PROVIDER (24H)",
+            [
+                target(
+                    f'sum by (provider) ({ROLL_REQUESTS}{{job="{job}",window="24h",model=~"$model"}})',
+                    legend="{{provider}}",
+                    ref="A",
+                    instant=True,
+                ),
+            ],
+            "The share of the last day's requests served by each provider. Composition, not "
+            "volume: the absolute counts are in the adjacent bar chart.",
+            0,
+            y,
+        )
+    )
+    panels.append(
+        piechart(
+            "REQUESTS BY COST CLASS (24H)",
+            [
+                target(
+                    f'sum by (cost_class) ({ROLL_REQUESTS}{{job="{job}",window="24h",model=~"$model"}})',
+                    legend="{{cost_class}}",
+                    ref="A",
+                    instant=True,
+                ),
+            ],
+            "The share of the last day's requests by how they are paid for: metered, "
+            "subscription, free or local. This replaces V5.39's reasoning-mode split, which "
+            "has no equivalent label in Switchyard's telemetry: reasoning effort is a route "
+            "setting, not an attribute recorded per request.",
+            8,
+            y,
+        )
+    )
+    panels.append(
+        piechart(
+            "REQUESTS BY MODEL (24H)",
+            [
+                target(
+                    f'sum by (model) ({ROLL_REQUESTS}{{job="{job}",window="24h",model=~"$model"}})',
+                    legend="{{model}}",
+                    ref="A",
+                    instant=True,
+                ),
+            ],
+            "The share of the last day's requests served by each model. Models that were not "
+            "addressed in the window are absent rather than zero.",
+            16,
+            y,
+        )
+    )
+    y += 9
+
+    panels.append(
+        barchart(
+            "REQUESTS 24H BY MODEL",
+            [
+                target(
+                    f'sum by (model) ({ROLL_REQUESTS}{{job="{job}",window="24h",model=~"$model"}})',
+                    legend="{{model}}",
+                ),
+            ],
+            "The absolute request count behind the model pie, ranked so a long tail stays "
+            "readable.",
+            0,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    panels.append(
+        barchart(
+            "COMPLETION TOKENS 24H BY MODEL",
+            [
+                target(
+                    f'sum by (model) ({ROLL_TOKENS}{{job="{job}",window="24h",component="completion",model=~"$model"}})',
+                    legend="{{model}}",
+                ),
+            ],
+            "Provider-reported output tokens over the last day, by model. Reasoning is inside "
+            "this figure rather than beside it, so it is not added again.",
+            8,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    panels.append(
+        barchart(
+            "PROMPT TOKENS 24H BY MODEL",
+            [
+                target(
+                    f'sum by (model) ({ROLL_TOKENS}{{job="{job}",window="24h",component="prompt",model=~"$model"}})',
+                    legend="{{model}}",
+                ),
+            ],
+            "Provider-reported input tokens over the last day, by model. The cached and "
+            "cache-created counts sit inside this figure, so they are not added to it.",
+            16,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    y += 8
+
+    panels.append(
+        timeseries(
+            "REQUEST RATE BY PROVIDER (rolling 1h)",
+            [
+                target(
+                    f'sum by (provider) ({ROLL_REQUESTS}{{job="{job}",window="1h"}})',
+                    legend="{{provider}}",
+                ),
+            ],
+            "The short window, so a provider that has just stopped serving is visible before the "
+            "24-hour view moves. The 1h window is in memory and restarts empty.",
+            0,
+            y,
+            w=12,
+            h=8,
+        )
+    )
+    panels.append(
+        timeseries(
+            "TOKEN MIX BY COMPONENT (24H, stacked)",
+            [
+                target(
+                    f'sum by (component) ({ROLL_TOKENS}{{job="{job}",window="24h"}})',
+                    legend="{{component}}",
+                ),
+            ],
+            "How the last day's tokens divide between prompt, cached, cache-created, completion "
+            "and reasoning. Stacked because the components are disjoint parts of one day's "
+            "traffic; the prompt bar is the input side and already contains its cache shares, so "
+            "read the stack as a shape and the individual panels for exact figures.",
+            12,
+            y,
+            w=12,
+            h=8,
+            stack=True,
+        )
+    )
+    y += 8
+
+    panels.append(
+        text(
+            "TRAFFIC — WHAT THESE WINDOWS MEAN",
+            "Every panel in this row reads the same two rolling counters — "
+            "`switchyard_economics_rolling_requests` and `…_rolling_tokens` — filtered by "
+            "`window`. They are a second *view* of the figures in the rows above, not a second "
+            "measurement, so a count here and a count above agree by construction.\n\n"
+            "**They are held in memory and reset on restart.** After a deployment restart the "
+            "24h window repopulates from newly observed traffic; the "
+            "`24h Window Coverage` panel in ROLLING WINDOWS states how much of the window the "
+            "current process has actually seen. Do not compare a partial day against a full "
+            "one.\n\n"
+            "**The composition pies are shares, not volumes.** A pie with three providers tells "
+            "you the split and not the total; the bar chart beside it carries the counts.\n\n"
+            "**The cost-class pie replaces a panel V5.39 had.** V5.39 split requests by "
+            "reasoning mode. Switchyard does not record reasoning effort per request — it is a "
+            "route setting, and a route can be reached by several callers with different "
+            "intentions — so that split cannot be reconstructed. `cost_class` is the "
+            "observability axis the telemetry actually carries.",
+            0,
+            y,
+            w=24,
+            h=11,
+        )
+    )
+    y += 11
+
     panels.append(row("OPENAI ALLOWANCE WINDOWS (primary 5-hr · secondary weekly)", y))
     y += 1
 
@@ -1149,50 +1355,10 @@ def build_dashboard(config):
     )
     y += 5
 
-    panels.append(
-        stat(
-            "DeepSeek Top-Ups (total, CNY)",
-            f'last_over_time({LEGACY_TOP_UP}{{job="{legacy_job}"}}[3h])',
-            "Every top-up ever credited to the DeepSeek account, in CNY, as recorded by the "
-            "older localclaw economics exporter. Switchyard does not publish a top-up ledger, "
-            "so this figure comes from that exporter and not from Switchyard's account reads.",
-            0,
-            y,
-            w=8,
-            unit="CNY",
-            decimals=2,
-        )
-    )
-    panels.append(
-        stat(
-            "DeepSeek Lifetime Spend (CNY)",
-            f'sum({LEGACY_SPEND_DELTA}{{job="{legacy_job}"}})',
-            "Cumulative spend inferred from balance deltas by the older localclaw economics "
-            "exporter. Switchyard reads the balance endpoint only, which reports a level rather "
-            "than a ledger, so it cannot reproduce this sum on its own.",
-            8,
-            y,
-            w=8,
-            unit="CNY",
-            decimals=2,
-        )
-    )
-    panels.append(
-        stat(
-            "Cumulative Actual Spend (CNY)",
-            f'sum({LEGACY_ACTUAL_COST}{{job="{legacy_job}",currency="CNY",provider="deepseek"}})',
-            "Request-derived spend for the DeepSeek lane, priced from the served model and token "
-            "counts by the older localclaw exporter. This is a computed cost, not a figure "
-            "DeepSeek billed, so it will not reconcile exactly against the balance movement.",
-            16,
-            y,
-            w=8,
-            unit="CNY",
-            decimals=2,
-        )
-    )
-    y += 5
-
+    # The top-up ledger, lifetime spend and request-derived actual cost that
+    # V5.39 read from the localclaw exporter are not reproduced: their inputs are
+    # a ledger and a rate card that Switchyard does not have. See the coverage
+    # text panel below, which states why rather than leaving the row short.
     panels.append(
         timeseries(
             "DeepSeek balance trend (CNY)",
@@ -1204,34 +1370,11 @@ def build_dashboard(config):
             ],
             "The observed balance over time. A step up is a top-up; the slow decline between "
             "steps is metered usage. Because both appear in the same series, the slope alone "
-            "cannot be read as a burn rate across a top-up.",
+            "cannot be read as a burn rate across a top-up, and the panel cannot separate the "
+            "two: a balance level is not a ledger.",
             0,
             y,
-            w=12,
-            h=8,
-            unit="CNY",
-        )
-    )
-    panels.append(
-        timeseries(
-            "DeepSeek lifetime spend (CNY)",
-            [
-                target(
-                    f'sum({LEGACY_SPEND_DELTA}{{job="{legacy_job}"}})',
-                    legend="lifetime spend ¥",
-                ),
-                target(
-                    f'sum({LEGACY_ACTUAL_COST}{{job="{legacy_job}",currency="CNY",provider="deepseek"}})',
-                    legend="actual spend ¥",
-                    ref="B",
-                ),
-            ],
-            "The exporter's running totals over time. Lifetime spend steps up in whole "
-            "reconciliation units, while actual spend moves with every priced request, so the "
-            "two lines answer different questions and are not expected to overlap.",
-            12,
-            y,
-            w=12,
+            w=24,
             h=8,
             unit="CNY",
         )
@@ -1242,15 +1385,16 @@ def build_dashboard(config):
         text(
             "DEEPSEEK COVERAGE - WHERE EACH NUMBER COMES FROM",
             "**Read from Switchyard:** the live balance in both currencies, the 24-hour balance "
-            "movement, and the age of the last successful account read. These come from "
-            "Switchyard's own credentialed read of DeepSeek's balance endpoint.\n\n"
-            "**Read from the older localclaw economics exporter:** the top-up ledger, lifetime "
-            "spend, and request-derived actual spend. Switchyard reads a balance level rather "
-            "than a ledger, so a top-up and a day of usage are indistinguishable from two "
-            "readings alone and it cannot reconstruct these three on its own. They are shown "
-            "because that exporter still publishes them and they are current, not because "
-            "Switchyard derives them.\n\n"
-            "**Not shown at all:** a true metered-spend figure. No available source separates "
+            "movement, the remaining-credit breakdown and the age of the last successful "
+            "account read. Every figure in this row comes from Switchyard's own credentialed "
+            "read of DeepSeek's balance endpoint.\n\n"
+            "**Not measurable here:** the top-up ledger, lifetime spend, and request-derived "
+            "actual cost. Switchyard reads a balance *level*, not a ledger, so a top-up and a "
+            "day of usage are indistinguishable from two readings alone. Those three figures "
+            "were computed by the retired localclaw exporter from a ledger and a rate card it "
+            "held in its own process; no metric carries their inputs, so they are absent rather "
+            "than approximated.\n\n"
+            "**Also not measured:** a true metered-spend figure. No available source separates "
             "metered spend from top-ups, so a panel claiming to would be an approximation "
             "dressed as a measurement.",
             0,
@@ -1644,6 +1788,74 @@ def build_dashboard(config):
     )
     y += 9
 
+    # The money side, one table per figure so that currency, scope and period
+    # each stay a column of their own. Summing across them would add CNY to USD
+    # and an account to a key.
+    panels.append(
+        table(
+            "PROVIDER-REPORTED USAGE BY PROVIDER AND CURRENCY",
+            [
+                target(
+                    f"{PROVIDER_USAGE}{{job=\"{job}\",scope=\"account\",period=\"total\"}}",
+                    legend="{{provider}}",
+                    ref="A",
+                    instant=True,
+                ),
+            ],
+            "What each provider says has been consumed on the account, in that provider's own "
+            "currency, as a lifetime figure. This is a provider report, not an estimate. The "
+            "currency is a column, so figures in CNY and USD are never added together.",
+            0,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    panels.append(
+        table(
+            "PURCHASED CREDIT BY PROVIDER AND CURRENCY",
+            [
+                target(
+                    f"{CREDIT}{{job=\"{job}\",scope=\"account\",period=\"total\"}}",
+                    legend="{{provider}}",
+                    ref="A",
+                    instant=True,
+                ),
+            ],
+            "Credit the provider sold to this account, lifetime, in each provider's currency. "
+            "This is what was bought, not what remains: see the balance table for what is left.",
+            8,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    panels.append(
+        table(
+            "REMAINING BALANCE BY PROVIDER AND CURRENCY",
+            [
+                target(
+                    f"{BALANCE}{{job=\"{job}\",scope=\"account\",period=\"total\"}}",
+                    legend="{{provider}}",
+                    ref="A",
+                    instant=True,
+                ),
+            ],
+            "What is left on each account, in that provider's currency. Read against the "
+            "purchased-credit table: remaining is not the same figure as credit bought, and "
+            "neither is the same as usage reported. A provider that does not publish a balance "
+            "simply has no row.\n\n"
+            "`scope` is shown because the account and the API-key vantage points describe the "
+            "same money. Only `account` rows are selected here; summing account and key rows "
+            "would count one balance twice.",
+            16,
+            y,
+            w=8,
+            h=8,
+        )
+    )
+    y += 8
+
     panels.append(row("HOW TO READ THIS DASHBOARD", y))
     y += 1
 
@@ -1700,6 +1912,41 @@ def build_dashboard(config):
         )
     )
     y += 12
+
+    panels.append(
+        text(
+            "NOT MEASURABLE HERE — WHAT THE OLD EXPORTER COMPUTED AND THIS ONE CANNOT",
+            "These figures appeared on the predecessor dashboards and are **absent here**, "
+            "because their inputs lived inside the retired localclaw economics exporter's "
+            "process — a balance ledger and a Python rate card — and no metric carries them. "
+            "Each is listed so the gap is stated rather than silently dropped.\n\n"
+            "| figure | why it cannot be derived |\n"
+            "|---|---|\n"
+            "| Savings today vs a pre-smart baseline | needs a validated baseline assumption "
+            "set; the exporter held one, Switchyard does not |\n"
+            "| Counterfactual cost (upper bound) | same baseline assumption set |\n"
+            "| Cost by model, today and lifetime | `switchyard_economics_*` money gauges carry "
+            "currency, scope, period and provider — never a model — so no per-model money "
+            "figure exists in the telemetry |\n"
+            "| DeepSeek top-up ledger, lifetime spend | a balance *level* is not a ledger; a "
+            "top-up and a day of usage are indistinguishable from two readings |\n"
+            "| Request-derived actual cost | requires the exporter's rate card, which was not a "
+            "metric |\n"
+            "| Exporter uptime, rate card and feature provenance | the exporter no longer runs |\n"
+            "| Domain observability (cloud · local · free · unattributed) | the classifier and "
+            "its authority pool lived in the exporter |\n\n"
+            "**No substitute is shown.** A panel that looked like the original while measuring "
+            "something else would be worse than an absent one. Per-model cost in particular is "
+            "not synthesised from token counts: that would be a rate-card *estimate* presented "
+            "as provider-reported *actual* cost, and the two are not interchangeable. Any future "
+            "per-model cost needs its own instrumentation and must label which of the two it is.",
+            0,
+            y,
+            w=24,
+            h=17,
+        )
+    )
+    y += 17
 
     return {
         "annotations": {"list": []},

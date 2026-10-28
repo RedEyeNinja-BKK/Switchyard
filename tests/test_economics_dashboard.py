@@ -292,51 +292,143 @@ def test_the_coverage_table_explains_the_openai_naming_split() -> None:
     assert "one credential" in description
 
 
-def test_the_deepseek_row_shows_every_figure_the_previous_dashboard_showed() -> None:
-    # The row the operator reads must not lose information in the move to
-    # Switchyard telemetry. Switchyard publishes the balance and its movement,
-    # but not the top-up ledger, lifetime spend, or request-derived actual cost -
-    # those live only in the older localclaw exporter. They are still current,
-    # so the row carries them rather than presenting a thinner row.
+def test_the_deepseek_row_shows_every_figure_switchyard_can_measure() -> None:
+    # Switchyard reads DeepSeek's balance endpoint, which reports a level and not
+    # a ledger. The row therefore carries what that read supports, and the three
+    # figures that need a ledger (top-up total, lifetime spend, request-derived
+    # actual cost) are deliberately absent. They used to be read from the retired
+    # localclaw exporter; keeping them would have meant a panel whose number no
+    # live metric produces.
     document = _request()["dashboard"]
     titles = {panel.get("title", "") for panel in document["panels"]}
     required = {
         "DeepSeek Status",
         "DeepSeek Balance (CNY)",
         "DeepSeek 24h Balance Movement",
+        "DeepSeek balance trend (CNY)",
+    }
+    assert required <= titles, f"missing from the DeepSeek row: {sorted(required - titles)}"
+    retired = {
         "DeepSeek Top-Ups (total, CNY)",
         "DeepSeek Lifetime Spend (CNY)",
         "Cumulative Actual Spend (CNY)",
-        "DeepSeek balance trend (CNY)",
         "DeepSeek lifetime spend (CNY)",
     }
-    assert required <= titles, f"missing from the DeepSeek row: {sorted(required - titles)}"
+    assert not (retired & titles), (
+        "panels with no live source must not be generated: "
+        f"{sorted(retired & titles)}"
+    )
 
 
-def test_every_legacy_deepseek_figure_is_attributed_to_its_source() -> None:
-    # Three figures cannot be derived from Switchyard's balance readings. The
-    # dashboard must say where they actually come from, or an operator reading
-    # them as Switchyard output will trust provenance that does not exist.
-    config = _config()
+def test_no_panel_reads_a_retired_family_or_scrape_job() -> None:
+    # The regression that matters: the localclaw exporter is gone, so a panel
+    # that names it renders empty while looking authoritative. This covers
+    # expressions AND prose, because a description naming a dead exporter is its
+    # own kind of wrong.
+    blob = json.dumps(_request()["dashboard"])
+    for token in (
+        "localclaw_",
+        'job="localclaw-econ"',
+        'job="localclaw"',
+        # The bare `switchyard` job was the localclaw-vm scrape of Switchyard and
+        # no longer exists; every selector must pin the configured job label.
+        'job="switchyard"',
+    ):
+        assert token not in blob, f"generated dashboard still references {token}"
+
+
+def test_the_retired_calculations_are_declared_rather_than_dropped() -> None:
+    # Removing a panel is not the same as explaining its absence. The dashboard
+    # must name each figure the old exporter computed, say why it cannot be
+    # derived, and refuse to substitute an estimate for a measurement.
     document = _request()["dashboard"]
-    legacy_job = config.get("legacy_job")
-    assert legacy_job, "the configuration must name the exporter that publishes these figures"
-    legacy_panels = [
-        panel
-        for panel in document["panels"]
-        if any(legacy_job in target.get("expr", "") for target in panel.get("targets", []))
-    ]
-    assert legacy_panels, "the legacy-sourced panels must exist"
-
-    coverage = [
+    notes = [
         panel["options"]["content"]
         for panel in document["panels"]
-        if panel.get("type") == "text" and "DEEPSEEK COVERAGE" in panel.get("title", "")
+        if panel.get("type") == "text" and "NOT MEASURABLE HERE" in panel.get("title", "")
     ]
-    assert coverage, "the DeepSeek coverage note must exist"
-    text = "\n".join(coverage)
-    assert "localclaw" in text, "the coverage note must name the exporter it relies on"
-    assert "Read from Switchyard" in text, "the note must separate the two sources"
+    assert notes, "the dashboard must carry a not-measurable disclosure"
+    text = "\n".join(notes)
+    for subject in (
+        "Savings today vs a pre-smart baseline",
+        "Counterfactual cost",
+        "Cost by model",
+        "top-up ledger",
+        "Request-derived actual cost",
+        "Domain observability",
+    ):
+        assert subject in text, f"the disclosure must name '{subject}'"
+    assert "No substitute is shown" in text
+    assert "rate-card" in text, "the disclosure must distinguish estimate from actual cost"
+
+
+def test_every_money_selector_pins_its_scope() -> None:
+    # provider_balance, provider_credit and provider_usage each carry both an
+    # `account` and a `key` scope describing the same money. An unpinned selector
+    # returns both and silently counts a balance twice.
+    money = (builder.BALANCE, builder.CREDIT, builder.PROVIDER_USAGE)
+    for title, expr in _expressions():
+        if any(name in expr for name in money):
+            assert 'scope="' in expr, f"{title} does not pin scope: {expr}"
+
+
+def test_the_observed_mix_row_restores_the_previous_presentation() -> None:
+    # V5.39 presented traffic as a mix - composition pies, ranked bars, a stacked
+    # component view. V8 had collapsed that into two bar charts. These panels are
+    # the presentation, not new measurement: every one reads the rolling counters
+    # already shown above.
+    document = _request()["dashboard"]
+    by_title = {panel.get("title"): panel for panel in document["panels"]}
+    pies = {
+        "REQUESTS BY PROVIDER (24H)",
+        "REQUESTS BY COST CLASS (24H)",
+        "REQUESTS BY MODEL (24H)",
+    }
+    for title in pies:
+        assert title in by_title, f"missing pie: {title}"
+        assert by_title[title]["type"] == "piechart"
+        assert by_title[title]["options"]["pieType"] == "donut"
+    for title in (
+        "REQUESTS 24H BY MODEL",
+        "COMPLETION TOKENS 24H BY MODEL",
+        "PROMPT TOKENS 24H BY MODEL",
+        "REQUEST RATE BY PROVIDER (rolling 1h)",
+        "TOKEN MIX BY COMPONENT (24H, stacked)",
+    ):
+        assert title in by_title, f"missing panel: {title}"
+    # Every new panel reads exactly one rolling counter, so it cannot disagree
+    # with the rows above it.
+    for title in pies | {"TOKEN MIX BY COMPONENT (24H, stacked)"}:
+        for target in by_title[title]["targets"]:
+            assert target["expr"].count("switchyard_economics_rolling_") == 1, (
+                f"{title} must read exactly one rolling counter: {target['expr']}"
+            )
+
+
+def test_each_currency_keeps_its_own_column_and_figure() -> None:
+    # Currency, scope and period are three separate labels, so a figure is only
+    # meaningful when all three are pinned. Adding a CNY row to a USD row would
+    # describe no account that exists.
+    document = _request()["dashboard"]
+    tables = {
+        panel["title"]: panel
+        for panel in document["panels"]
+        if panel.get("title")
+        in {
+            "PROVIDER-REPORTED USAGE BY PROVIDER AND CURRENCY",
+            "PURCHASED CREDIT BY PROVIDER AND CURRENCY",
+            "REMAINING BALANCE BY PROVIDER AND CURRENCY",
+        }
+    }
+    assert len(tables) == 3, f"expected three money tables, found {sorted(tables)}"
+    for title, panel in tables.items():
+        for target in panel["targets"]:
+            expr = target["expr"]
+            assert 'scope="account"' in expr, f"{title} must read the account vantage point"
+            assert 'period="total"' in expr, f"{title} must pin the period"
+            # The currency stays a returned label, never a filter: filtering to
+            # one currency would hide the other provider entirely.
+            assert "currency=" not in expr, f"{title} must not filter on currency: {expr}"
 
 
 def test_a_first_publication_creates_and_carries_no_expected_version() -> None:

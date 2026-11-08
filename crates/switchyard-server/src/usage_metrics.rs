@@ -117,6 +117,18 @@ pub(crate) fn observe(
                     }
                     if failed {
                         record_stream_error(&stats, &model);
+                        // A streamed request has already answered HTTP 200, so the
+                        // terminal request log line cannot report this death. Emit a
+                        // distinct event with the served model and a stage marker so a
+                        // mid-stream failure is observable instead of looking like a
+                        // clean 200. No upstream text is included.
+                        tracing::event!(
+                            target: "switchyard_server::request",
+                            tracing::Level::WARN,
+                            selected_model = %model,
+                            failure_stage = "stream",
+                            "LLM stream failed"
+                        );
                     }
                     // Responses clients may stop polling immediately after the terminal event.
                     // Commit first when that event already carries the final usage.

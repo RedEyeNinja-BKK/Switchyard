@@ -29,8 +29,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -68,6 +67,12 @@ pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 const HEADER_SELECTED_MODEL: &str = "x-model-router-selected-model";
+
+// Header Switchyard stamps with the provider-assigned request id of the final
+// upstream attempt, so a failure can be correlated with the provider's own logs
+// without logging either the request body or the error body.
+const HEADER_UPSTREAM_REQUEST_ID: &str = "x-switchyard-upstream-request-id";
+
 const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
     "baggage",
     "openai-processing-ms",
@@ -81,6 +86,14 @@ const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
 const FORWARDED_UPSTREAM_HEADER_PREFIXES: &[&str] =
     &["anthropic-ratelimit-", "x-ratelimit-", "x-upstream-"];
 const MAX_ROUTING_HEADER_VALUE_LEN: usize = 512;
+
+// Transport peer of the caller, captured from the accepted connection. This is the
+// only caller attribute the inference surface can offer that a request cannot
+// forge itself: Switchyard has no inbound authentication, so every header-derived
+// identity (`session_id`, `agent_id`, a caller-supplied request id) is advisory.
+// Recorded as a log field only; it is never used for authorization.
+#[derive(Clone, Default)]
+struct CallerPeer(String);
 
 /// Whether an upstream header is safe and useful to expose downstream.
 fn should_forward_upstream_header(name: &HeaderName) -> bool {
@@ -452,7 +465,7 @@ async fn serve_tls(
     let handle = axum_server::Handle::new();
     let server = server
         .handle(handle.clone())
-        .serve(router.into_make_service());
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>());
     serve_until_shutdown(server, handle, shutdown_timeout, shutdown).await
 }
 
@@ -467,7 +480,7 @@ async fn serve(
     let handle = axum_server::Handle::new();
     let server = server
         .handle(handle.clone())
-        .serve(router.into_make_service());
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>());
     serve_until_shutdown(server, handle, shutdown_timeout, shutdown).await
 }
 
@@ -566,6 +579,14 @@ async fn stamp_request_start(mut request: HttpRequest, next: Next) -> Response {
     request
         .extensions_mut()
         .insert(RequestStart(Instant::now()));
+    // Captured here because the handlers receive only the header map. When the
+    // listener was built without connect info the peer is unknown, not wrong.
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect| connect.0.ip().to_string())
+        .unwrap_or_default();
+    request.extensions_mut().insert(CallerPeer(peer));
     next.run(request).await
 }
 
@@ -643,28 +664,47 @@ fn server_io_error(error: std::io::Error) -> ServerError {
 async fn openai_chat_completions(
     State(state): State<ServerState>,
     Extension(started): Extension<RequestStart>,
+    peer: Option<Extension<CallerPeer>>,
     headers: HeaderMap,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    handle_endpoint(state, started, headers, body, WireFormat::OpenAiChat).await
+    handle_endpoint(state, started, peer.map(|Extension(peer)| peer).unwrap_or_default(), headers, body, WireFormat::OpenAiChat).await
 }
 
 async fn anthropic_messages(
     State(state): State<ServerState>,
     Extension(started): Extension<RequestStart>,
+    peer: Option<Extension<CallerPeer>>,
     headers: HeaderMap,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    handle_endpoint(state, started, headers, body, WireFormat::AnthropicMessages).await
+    handle_endpoint(
+        state,
+        started,
+        peer.map(|Extension(peer)| peer).unwrap_or_default(),
+        headers,
+        body,
+        WireFormat::AnthropicMessages,
+    )
+    .await
 }
 
 async fn openai_responses(
     State(state): State<ServerState>,
     Extension(started): Extension<RequestStart>,
+    peer: Option<Extension<CallerPeer>>,
     headers: HeaderMap,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    handle_endpoint(state, started, headers, body, WireFormat::OpenAiResponses).await
+    handle_endpoint(
+        state,
+        started,
+        peer.map(|Extension(peer)| peer).unwrap_or_default(),
+        headers,
+        body,
+        WireFormat::OpenAiResponses,
+    )
+    .await
 }
 
 // Forwards unmatched requests unchanged to the configured API root.
@@ -1065,12 +1105,13 @@ async fn openai_responses_auxiliary(
 async fn handle_endpoint(
     state: ServerState,
     started: RequestStart,
+    peer: CallerPeer,
     headers: HeaderMap,
     body: std::result::Result<Json<Value>, JsonRejection>,
     wire_format: WireFormat,
 ) -> Response {
     let span = observability::request_span(&headers);
-    handle_endpoint_inner(state, started, headers, body, wire_format)
+    handle_endpoint_inner(state, started, peer, headers, body, wire_format)
         .instrument(span)
         .await
 }
@@ -1078,6 +1119,7 @@ async fn handle_endpoint(
 async fn handle_endpoint_inner(
     state: ServerState,
     started: RequestStart,
+    peer: CallerPeer,
     headers: HeaderMap,
     body: std::result::Result<Json<Value>, JsonRejection>,
     wire_format: WireFormat,
@@ -1087,15 +1129,35 @@ async fn handle_endpoint_inner(
         .routing_log
         .as_ref()
         .map(|_| routing_log::RoutingLogContext::from_metadata(&metadata));
+    // Shape is read before the body is consumed so a request that fails before
+    // translation still carries message/tool/reasoning counts on its log line.
+    let shape = body.as_ref().ok().map_or_else(
+        || request_shape(&Value::Null, wire_format),
+        |body| request_shape(&body.0, wire_format),
+    );
+    let requested_model = body
+        .as_ref()
+        .ok()
+        .and_then(|body| body.0.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Route class (passthrough leaf vs composite cascade) is runner-owned state;
+    // reading it here keeps the classification in one place instead of inferring
+    // it from the name.
+    let algorithm = requested_model.as_deref().and_then(|model| {
+        state
+            .runner
+            .models()
+            .find(|info| info.id.as_str() == model)
+            .map(|info| info.algorithm.to_string())
+    });
+    // Shadow context admission: compute what enforcement WOULD decide, report it,
+    // and refuse nothing. A composite is evaluated against the smallest declared
+    // child window, because its own advertisement is not the binding constraint.
     let request_log = RequestLogContext {
         started: started.0,
         wire_format,
-        requested_model: body
-            .as_ref()
-            .ok()
-            .and_then(|body| body.0.get("model"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        requested_model,
         streaming: body
             .as_ref()
             .ok()
@@ -1104,6 +1166,9 @@ async fn handle_endpoint_inner(
             .unwrap_or(false),
         session_id: metadata.session_id.clone(),
         correlation_id: metadata.correlation_id.clone(),
+        shape,
+        caller_peer: (!peer.0.is_empty()).then_some(peer.0),
+        algorithm,
     };
 
     // Axum drops this future when the downstream client disconnects before the
@@ -1438,6 +1503,19 @@ async fn handle_llm_request(
     if let Some(served_model) = served_model.as_ref() {
         attach_routing_headers(&mut response, served_model.as_str());
     }
+    // Route identity for the terminal log line. `route` is what the caller asked for;
+    // a composite's facts say which child actually served and whether the request
+    // crossed children. Attached to the HTTP response because that is what the log
+    // guard reads when it emits, so the log line and the routing record agree.
+    let mut route_log = RequestLogRoute::default();
+    if let Some(composition) = execution.composition.as_ref() {
+        route_log.parent_route = Some(composition.parent_route.clone());
+        route_log.child_route = Some(composition.child_route.clone());
+        route_log.final_target = Some(composition.final_target.clone());
+        route_log.crossed_child = composition.crossed_child;
+        route_log.cross_child_reason = composition.cross_child_reason();
+    }
+    response.extensions_mut().insert(route_log);
     response
 }
 
@@ -1464,6 +1542,175 @@ impl Drop for RequestLogGuard {
     }
 }
 
+// Bit set of every reasoning representation present in a request. A request can
+// legitimately carry more than one at once (a `reasoning_details` array beside a
+// `reasoning_content` string, or several kinds across different turns), and a
+// single discriminator would hide that. The labels are type names only.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ReasoningKinds(u8);
+
+impl ReasoningKinds {
+    const CONTENT: u8 = 1 << 0;
+    const DETAILS: u8 = 1 << 1;
+    // A Responses `type: "reasoning"` input item.
+    const ITEM: u8 = 1 << 2;
+    // Anthropic `thinking` / `redacted_thinking` content block.
+    const THINKING: u8 = 1 << 3;
+
+    fn insert(&mut self, bit: u8) {
+        self.0 |= bit;
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    // Stable, order-fixed label list; `none` when no representation was seen.
+    fn labels(self) -> String {
+        if self.is_empty() {
+            return "none".to_string();
+        }
+        let mut out = Vec::new();
+        for (bit, label) in [
+            (Self::CONTENT, "reasoning_content"),
+            (Self::DETAILS, "reasoning_details"),
+            (Self::ITEM, "reasoning_item"),
+            (Self::THINKING, "thinking"),
+        ] {
+            if self.0 & bit != 0 {
+                out.push(label);
+            }
+        }
+        out.join("+")
+    }
+}
+
+// Sanitized fields logged for every request, success and failure, so a
+// downstream HTTP status can be correlated with the provider's own logs. Shape
+// only: no message bodies, no reasoning text, no error message content.
+struct RequestShape {
+    message_count: usize,
+    tool_count: usize,
+    reasoning: ReasoningKinds,
+}
+
+// Reads only structure out of the raw body: message/tool counts and which
+// reasoning representations are present. Values are counts and type
+// discriminators, never content.
+fn request_shape(body: &Value, wire_format: WireFormat) -> RequestShape {
+    fn count_tools(request: &serde_json::Map<String, Value>) -> usize {
+        request.get("tools").and_then(Value::as_array).map_or(0, Vec::len)
+    }
+    // Every representation is recorded, not just the first one found: a request
+    // that mixes `reasoning_details` and `reasoning_content` must report both.
+    fn reasoning_in_messages(messages: &[Value], kinds: &mut ReasoningKinds) {
+        for message in messages {
+            let Some(message) = message.as_object() else {
+                continue;
+            };
+            if message
+                .get("reasoning_details")
+                .and_then(Value::as_array)
+                .is_some_and(|details| !details.is_empty())
+            {
+                kinds.insert(ReasoningKinds::DETAILS);
+            }
+            for field in ["reasoning_content", "reasoning"] {
+                if message
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    kinds.insert(ReasoningKinds::CONTENT);
+                }
+            }
+        }
+    }
+    // Anthropic carries reasoning as content blocks on the message, so the
+    // block-level scan is separate from the top-level Chat fields.
+    fn reasoning_in_blocks(content: Option<&Value>, kinds: &mut ReasoningKinds) {
+        let Some(blocks) = content.and_then(Value::as_array) else {
+            return;
+        };
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking") | Some("redacted_thinking") => {
+                    kinds.insert(ReasoningKinds::THINKING)
+                }
+                Some("reasoning_text") | Some("summary_text") => {
+                    kinds.insert(ReasoningKinds::CONTENT)
+                }
+                _ => {}
+            }
+        }
+    }
+    match wire_format {
+        WireFormat::OpenAiChat | WireFormat::AnthropicMessages => {
+            let mut shape = RequestShape {
+                message_count: 0,
+                tool_count: 0,
+                reasoning: ReasoningKinds::default(),
+            };
+            if let Some(object) = body.as_object() {
+                shape.tool_count = count_tools(object);
+                if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+                    shape.message_count = messages.len();
+                    reasoning_in_messages(messages, &mut shape.reasoning);
+                    for message in messages {
+                        reasoning_in_blocks(message.get("content"), &mut shape.reasoning);
+                    }
+                    shape.tool_count += messages
+                        .iter()
+                        .filter(|message| {
+                            message
+                                .get("tool_calls")
+                                .and_then(Value::as_array)
+                                .is_some_and(|calls| !calls.is_empty())
+                        })
+                        .count();
+                }
+            }
+            shape
+        }
+        WireFormat::OpenAiResponses => {
+            let mut shape = RequestShape {
+                message_count: 0,
+                tool_count: 0,
+                reasoning: ReasoningKinds::default(),
+            };
+            if let Some(object) = body.as_object() {
+                shape.tool_count = count_tools(object);
+                if let Some(items) = object.get("input").and_then(Value::as_array) {
+                    shape.message_count = items.len();
+                    for item in items {
+                        let Some(item) = item.as_object() else {
+                            continue;
+                        };
+                        match item.get("type").and_then(Value::as_str) {
+                            Some("reasoning") => shape.reasoning.insert(ReasoningKinds::ITEM),
+                            Some("function_call") => shape.tool_count += 1,
+                            _ => {}
+                        }
+                        reasoning_in_blocks(item.get("content"), &mut shape.reasoning);
+                    }
+                }
+            }
+            shape
+        }
+    }
+}
+
+// Composite facts resolved by the runner for one request. Present only when a
+// composite served it; a leaf route carries none, which is itself the signal.
+#[derive(Clone, Default)]
+struct RequestLogRoute {
+    parent_route: Option<String>,
+    child_route: Option<String>,
+    final_target: Option<String>,
+    crossed_child: bool,
+    cross_child_reason: Option<String>,
+}
+
 // Request metadata held until the terminal response determines the event level.
 struct RequestLogContext {
     started: Instant,
@@ -1472,11 +1719,97 @@ struct RequestLogContext {
     streaming: bool,
     session_id: Option<String>,
     correlation_id: Option<String>,
+    shape: RequestShape,
+    // Transport peer, when the listener exposes it. Non-spoofable; unlike a
+    // caller-supplied header it cannot be forged by the request itself.
+    caller_peer: Option<String>,
+    algorithm: Option<String>,
 }
 
 // Error text carried separately so terminal logging never consumes an HTTP body.
 #[derive(Clone)]
 struct RequestLogError(String);
+
+// Failure-only diagnostics that survive until the terminal log line is emitted.
+// The provider's request id is the only identifier this side reads off an error
+// body; the message text itself is never logged.
+#[derive(Clone, Default)]
+struct RequestLogFailure {
+    error_class: &'static str,
+    upstream_request_id: Option<String>,
+}
+
+impl RequestLogFailure {
+    // Extracts the provider's own request identifier. Two shapes are recognized,
+    // because providers differ:
+    //
+    //   1. a structured field (`error.request_id`, `error.requestId`, top-level `id`);
+    //   2. the identifier embedded in the human-readable message, which is how
+    //      DeepSeek reports it — `... (request_id: 5502af93-...)`.
+    //
+    // Only the matched identifier is returned; the surrounding message is never
+    // retained, copied into a log field, or returned to the caller. The scan is
+    // bounded so a pathological body cannot turn diagnostics into work.
+    fn from_error_body(body: &str) -> Option<String> {
+        if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+            for value in [parsed.get("error"), parsed.get("id")].into_iter().flatten() {
+                for field in ["request_id", "requestId", "requestID"] {
+                    if let Some(id) = value
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+            // Fall through to message-text extraction: a provider may put the id
+            // only inside `error.message`.
+            if let Some(message) = parsed
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+            {
+                return request_id_in_text(message);
+            }
+        }
+        request_id_in_text(body)
+    }
+}
+
+// Finds a provider request id written into prose, e.g. "(request_id: <id>)",
+// "request id <id>", "request-id=<id>". The token must look like an identifier
+// (hex/uuid/underscored) and be bounded in length so ordinary words cannot match.
+fn request_id_in_text(text: &str) -> Option<String> {
+    // Bound the scan: an error message is small, and a huge body is not worth it.
+    const SCAN_LIMIT: usize = 64 * 1024;
+    // Truncate on a CHARACTER boundary, not a byte offset: a provider error body
+    // may contain multi-byte UTF-8, and slicing mid-character panics the server on
+    // the error path — turning a provider rejection into a crash.
+    let limit = text.len().min(SCAN_LIMIT);
+    let end = (0..=limit)
+        .rev()
+        .find(|offset| text.is_char_boundary(*offset))
+        .unwrap_or(0);
+    let text = &text[..end];
+    let lower = text.to_ascii_lowercase();
+    for marker in ["request_id", "request id", "request-id"] {
+        let mut from = 0;
+        while let Some(offset) = lower[from..].find(marker) {
+            let mut rest = &text[from + offset + marker.len()..];
+            rest = rest.trim_start_matches([' ', '\t', ':', '=', '"', '\'', '(', '#']);
+            let token: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                .collect();
+            if (8..=72).contains(&token.len()) && token.chars().any(|c| c.is_ascii_digit()) {
+                return Some(token);
+            }
+            from += offset + marker.len();
+        }
+    }
+    None
+}
 
 impl RequestLogContext {
     fn emit(self, response: &Response) {
@@ -1491,6 +1824,27 @@ impl RequestLogContext {
             .get::<RequestLogError>()
             .map(|error| error.0.as_str())
             .unwrap_or("");
+        let failure = response
+            .extensions()
+            .get::<RequestLogFailure>()
+            .cloned()
+            .unwrap_or_default();
+        // The provider's request id travels in a forwarded response header when the
+        // upstream supplied one; otherwise an error body field is the only source.
+        let upstream_request_id = response
+            .headers()
+            .get(HEADER_UPSTREAM_REQUEST_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or(failure.upstream_request_id.as_deref().map(str::to_string));
+
+        // Composite facts are decided by the runner and carried on the response for
+        // telemetry; absent on a leaf route, which is itself meaningful.
+        let route = response
+            .extensions()
+            .get::<RequestLogRoute>()
+            .cloned()
+            .unwrap_or_default();
 
         macro_rules! emit {
             ($level:expr, $message:literal) => {
@@ -1500,10 +1854,22 @@ impl RequestLogContext {
                     wire_format = %self.wire_format,
                     status = response.status().as_u16(),
                     requested_model = self.requested_model.as_deref().unwrap_or(""),
+                    algorithm = self.algorithm.as_deref().unwrap_or(""),
                     selected_model,
+                    parent_route = route.parent_route.as_deref().unwrap_or(""),
+                    child_route = route.child_route.as_deref().unwrap_or(""),
+                    final_target = route.final_target.as_deref().unwrap_or(""),
+                    crossed_child = route.crossed_child,
+                    cross_child_reason = route.cross_child_reason.as_deref().unwrap_or(""),
                     streaming = self.streaming,
                     session_id = self.session_id.as_deref().unwrap_or(""),
                     correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+                    caller_peer = self.caller_peer.as_deref().unwrap_or(""),
+                    upstream_request_id = upstream_request_id.as_deref().unwrap_or(""),
+                    error_class = failure.error_class,
+                    message_count = self.shape.message_count,
+                    tool_count = self.shape.tool_count,
+                    reasoning_kinds = %self.shape.reasoning.labels(),
                     handling_duration_ms = duration_ms,
                     error,
                     $message
@@ -1677,6 +2043,17 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
     response
         .extensions_mut()
         .insert(RequestLogError(format!("upstream_error (HTTP {status})")));
+    // Carry the provider's request id (when it supplied one) to the terminal log
+    // line: a forwarded response header may hold it, otherwise an error-body
+    // field is the only place it exists. Either way the message text stays out.
+    // The extension is written unconditionally so it overrides the local-invalid
+    // classification stamped when the ApiError it was built from was first turned
+    // into a response; the id is whatever the provider gave (possibly nothing).
+    let upstream_request_id = RequestLogFailure::from_error_body(body);
+    response.extensions_mut().insert(RequestLogFailure {
+        error_class: "upstream_rejected",
+        upstream_request_id,
+    });
     response
 }
 
@@ -1725,6 +2102,14 @@ impl ApiError {
         response
             .extensions_mut()
             .insert(RequestLogError(self.message.clone()));
+        // Errors the router itself rejected (invalid body, unknown capability,
+        // malformed role) carry no upstream RequestLogFailure, so classify them
+        // here: `upstream_rejected` marks a request the upstream answered 4xx,
+        // while these are local validation failures that never left the building.
+        response.extensions_mut().insert(RequestLogFailure {
+            error_class: "local_invalid_request",
+            upstream_request_id: None,
+        });
         response.extensions_mut().insert(self);
         response
     }
@@ -1735,9 +2120,16 @@ fn render_error_response(mut response: Response, wire_format: WireFormat) -> Res
         return response;
     };
     let log_error = response.extensions_mut().remove::<RequestLogError>();
+    // An upstream-originated error carries its own classification and (when the
+    // provider supplied one) its request id; keep whichever one the chain
+    // already stamped so the failure is not downgraded to a local rejection.
+    let failure = response.extensions_mut().remove::<RequestLogFailure>();
     let mut rendered = error.into_response(wire_format);
     if let Some(log_error) = log_error {
         rendered.extensions_mut().insert(log_error);
+    }
+    if let Some(failure) = failure {
+        rendered.extensions_mut().insert(failure);
     }
     rendered
 }
@@ -2266,6 +2658,13 @@ mod tests {
             streaming: false,
             session_id: Some("session".to_string()),
             correlation_id: None,
+            shape: RequestShape {
+                message_count: 0,
+                tool_count: 0,
+                reasoning: ReasoningKinds::default(),
+            },
+            caller_peer: Some("100.64.0.9".to_string()),
+            algorithm: Some("passthrough".to_string()),
         }
     }
 
@@ -2393,6 +2792,237 @@ mod tests {
             assert!(api_error.message.contains(LEAKED), "{}", api_error.message);
             assert_eq!(api_error.code, format!("invalid_request_{LEAKED}"));
         }
+    }
+
+    #[test]
+    fn failed_log_line_carries_upstream_request_id_without_message_text() {
+        // A request that the upstream rejected carries its `request_id` into the
+        // terminal log line, so the failure can be found in the provider's own
+        // logs. The error message text must not follow it.
+        const MISSING: &str = "missing reasoning evidence";
+        let body = format!(
+            r#"{{"error":{{"message":"{MISSING}","type":"upstream_error","code":"upstream_error","request_id":"req_test_123"}}}}"#
+        );
+        let mut response = render_error_response(
+            upstream_error(StatusCode::BAD_REQUEST, &body),
+            WireFormat::OpenAiChat,
+        );
+        response
+            .headers_mut()
+            .insert(HEADER_UPSTREAM_REQUEST_ID, "req_from_header".parse().expect("valid header"));
+        let events = captured_events(|| request_log_context().emit(&response));
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].1.contains("req_from_header"), "{}", events[0].1);
+        assert!(events[0].1.contains("upstream_rejected"), "{}", events[0].1);
+        assert!(!events[0].1.contains(MISSING), "{}", events[0].1);
+        // The header value wins over the body field: a header is provider-stamped,
+        // so it identifies the final upstream attempt.
+        assert!(!events[0].1.contains("req_test_123"), "{}", events[0].1);
+    }
+
+    #[test]
+    fn failed_log_line_reads_upstream_request_id_from_body() {
+        let body = r#"{"error":{"message":"x","code":"upstream_error","request_id":"req_body_only"}}"#;
+        let response = render_error_response(
+            upstream_error(StatusCode::BAD_REQUEST, body),
+            WireFormat::OpenAiChat,
+        );
+        let events = captured_events(|| request_log_context().emit(&response));
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].1.contains("req_body_only"), "{}", events[0].1);
+        assert!(events[0].1.contains("upstream_rejected"), "{}", events[0].1);
+    }
+
+    #[test]
+    fn local_rejection_is_not_classified_as_upstream() {
+        // A request Switchyard itself rejected (a malformed role, before any
+        // upstream call) must not be labelled as an upstream rejection.
+        let response = error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid value",
+            "invalid_request_error",
+            "invalid_body",
+        );
+        let events = captured_events(|| request_log_context().emit(&response));
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].1.contains("local_invalid_request"), "{}", events[0].1);
+        assert!(!events[0].1.contains("upstream_rejected"), "{}", events[0].1);
+    }
+
+    #[test]
+    fn request_shape_counts_structure_without_reading_content() {
+        let chat_body = serde_json::json!({
+            "model": "route",
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "messages": [
+                {"role": "system", "content": "private system content"},
+                {"role": "user", "content": "private user content"},
+                {
+                    "role": "assistant",
+                    "content": "private assistant content",
+                    "reasoning_content": "private reasoning trace",
+                    "reasoning_details": [{"type": "reasoning", "id": "rs_1", "encrypted_content": "private-ciphertext"}],
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather"}}]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "private tool result"}
+            ]
+        });
+        let shape = request_shape(&chat_body, WireFormat::OpenAiChat);
+        assert_eq!(shape.message_count, 4);
+        // One declared tool plus one tool call in the history.
+        assert_eq!(shape.tool_count, 2);
+        // Both representations are present in the same request, so both must be
+        // reported. A single discriminator would hide the reasoning_content field.
+        assert_eq!(shape.reasoning.labels(), "reasoning_content+reasoning_details");
+
+        let chat_no_reasoning = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let shape = request_shape(&chat_no_reasoning, WireFormat::OpenAiChat);
+        assert_eq!(shape.message_count, 1);
+        assert_eq!(shape.tool_count, 0);
+        assert_eq!(shape.reasoning.labels(), "none");
+
+        let responses_body = serde_json::json!({
+            "model": "route",
+            "tools": [{"type": "function", "name": "get_weather"}],
+            "input": [
+                {"type": "reasoning", "id": "rs_1", "summary": [], "content": [{"type": "reasoning_text", "text": "private"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "private"},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+        let shape = request_shape(&responses_body, WireFormat::OpenAiResponses);
+        assert_eq!(shape.message_count, 4);
+        assert_eq!(shape.tool_count, 2);
+        // The Responses reasoning item (`reasoning_item`) and the reasoning_text
+        // part inside it (`reasoning_content`) are distinct shapes and both count.
+        assert_eq!(shape.reasoning.labels(), "reasoning_content+reasoning_item");
+
+        // Anthropic thinking blocks are their own representation and must not be
+        // confused with a Chat reasoning_content string.
+        let anthropic_body = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "private"},
+                    {"type": "text", "text": "private"}
+                ]}
+            ]
+        });
+        let shape = request_shape(&anthropic_body, WireFormat::AnthropicMessages);
+        assert_eq!(shape.reasoning.labels(), "thinking");
+    }
+
+    // A request id embedded only in the provider's message text is still recovered,
+    // and the surrounding text is never carried into the log line.
+    #[test]
+    fn request_id_is_recovered_from_provider_message_text() {
+        const MESSAGE: &str = "The `reasoning_text` in the thinking mode must be passed back to the API. (request_id: 5502af93-ffbb-46bc-95ec-6402a807b7e8)";
+        let body = serde_json::json!({
+            "error": {"message": MESSAGE, "type": "upstream_error", "code": "invalid_request_error"}
+        })
+        .to_string();
+        assert_eq!(
+            RequestLogFailure::from_error_body(&body).as_deref(),
+            Some("5502af93-ffbb-46bc-95ec-6402a807b7e8")
+        );
+
+        let response = render_error_response(
+            upstream_error(StatusCode::BAD_REQUEST, &body),
+            WireFormat::OpenAiChat,
+        );
+        let events = captured_events(|| request_log_context().emit(&response));
+        assert_eq!(events.len(), 1);
+        assert!(events[0].1.contains("5502af93"), "{}", events[0].1);
+        // The message text itself must not appear anywhere in the log line.
+        assert!(!events[0].1.contains("thinking mode"), "{}", events[0].1);
+        assert!(!events[0].1.contains("passed back"), "{}", events[0].1);
+    }
+
+    // A multi-byte body must not panic the error path. Truncation happens on a
+    // character boundary, and scanning still recovers an id that appears before it.
+    #[test]
+    fn request_id_scan_is_safe_on_multibyte_bodies() {
+        // 70 KiB of a 3-byte character: the 64 KiB scan limit lands mid-character.
+        let padding = "漢".repeat(24_000);
+        let body = serde_json::json!({
+            "error": {
+                "message": format!("{padding} (request_id: 0123abcd-4567-89ef-0123-456789abcdef)"),
+                "code": "upstream_error"
+            }
+        })
+        .to_string();
+        // Must not panic, and must not fabricate an id from the multibyte padding.
+        let found = RequestLogFailure::from_error_body(&body);
+        assert!(found.is_none(), "unexpected id {found:?}");
+
+        // With the id before the padding, it is found and the scan stays bounded.
+        let body = serde_json::json!({
+            "error": {
+                "message": format!("failed (request_id: 0123abcd-4567-89ef-0123-456789abcdef) {padding}"),
+                "code": "upstream_error"
+            }
+        })
+        .to_string();
+        assert_eq!(
+            RequestLogFailure::from_error_body(&body).as_deref(),
+            Some("0123abcd-4567-89ef-0123-456789abcdef")
+        );
+    }
+
+    // A body with no identifier at all yields no id rather than a fabricated one.
+    #[test]
+    fn request_id_absent_is_reported_as_empty() {
+        let body = r#"{"error":{"message":"Provider returned error","type":"upstream_error","code":"upstream_error"}}"#;
+        assert!(RequestLogFailure::from_error_body(body).is_none());
+        let response = render_error_response(
+            upstream_error(StatusCode::BAD_REQUEST, body),
+            WireFormat::OpenAiChat,
+        );
+        let events = captured_events(|| request_log_context().emit(&response));
+        assert!(events[0].1.contains("upstream_request_id=\"\""), "{}", events[0].1);
+        assert!(events[0].1.contains("upstream_rejected"), "{}", events[0].1);
+    }
+
+    // A near-context-limit history must not make shape extraction expensive: the
+    // scan is bounded by message count, not by content size, because it reads only
+    // key presence. Measured on a body of the size the incident produced.
+    #[test]
+    fn shape_extraction_stays_cheap_on_a_large_history() {
+        let filler = "x".repeat(8 * 1024);
+        let mut messages = Vec::new();
+        for _ in 0..96 {
+            messages.push(serde_json::json!({"role": "user", "content": filler}));
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": "ok",
+                "reasoning_content": "r",
+                "tool_calls": [{"id": "c", "type": "function", "function": {"name": "t", "arguments": "{}"}}]
+            }));
+            messages.push(serde_json::json!({"role": "tool", "tool_call_id": "c", "content": filler}));
+        }
+        let body = serde_json::json!({"model": "route", "tools": [{"type": "function", "function": {"name": "t"}}], "messages": messages});
+        let started = Instant::now();
+        let shape = request_shape(&body, WireFormat::OpenAiChat);
+        let elapsed = started.elapsed();
+        eprintln!(
+            "shape scan: {} messages, {} bytes, {:?}",
+            shape.message_count,
+            serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0),
+            elapsed
+        );
+
+        assert_eq!(shape.message_count, 288);
+        assert_eq!(shape.tool_count, 97);
+        assert_eq!(shape.reasoning.labels(), "reasoning_content");
+        // Generous bound: the scan reads key presence, not values, so a body of
+        // several megabytes is a sub-millisecond traversal. This guards against a
+        // future change that starts copying or parsing content.
+        assert!(elapsed < Duration::from_millis(250), "took {elapsed:?}");
     }
 
     // LiteLLM's cost header passes through to the client; auth headers do not.

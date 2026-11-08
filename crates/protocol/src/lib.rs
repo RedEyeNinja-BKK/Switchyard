@@ -7,6 +7,7 @@
 pub mod category;
 pub mod client;
 pub mod codex_namespaces;
+pub mod correlation;
 pub mod decision;
 pub mod envelope;
 pub mod format;

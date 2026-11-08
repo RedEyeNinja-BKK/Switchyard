@@ -253,6 +253,9 @@ def main(argv: list[str]) -> int:
     inventory, failures = audit(config, advertised, exclusive)
 
     if args.inventory:
+        # Create the parent: a caller should not have to know a directory must
+        # exist first, and CI step order must not be able to break the verdict.
+        args.inventory.parent.mkdir(parents=True, exist_ok=True)
         args.inventory.write_text(json.dumps(inventory, indent=1), encoding="utf-8")
 
     if not args.quiet:

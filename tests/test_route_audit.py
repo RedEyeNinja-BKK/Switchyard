@@ -17,6 +17,7 @@ Two of these controls are here because the first version of the audit was wrong:
     credential rule is opt-in and only fires for a pair the caller declares.
 """
 
+import json
 import os
 import sys
 import tomllib
@@ -155,6 +156,20 @@ def test_an_unknown_target_client_is_refused(manifest):
     manifest["targets"]["remote-a-text"]["llm_client"] = "unconfigured"
     failures = verdict(manifest, advertised_from(manifest))
     assert any("is not configured" in failure for failure in failures), failures
+
+
+def test_the_inventory_is_written_into_a_directory_that_does_not_exist_yet(manifest, tmp_path):
+    # CI writes the inventory before any other step has created the directory. A
+    # verdict must not depend on step order, so the writer creates its parent.
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps({"data": list(advertised_from(manifest).values())}))
+    target = tmp_path / "nested" / "deeper" / "inventory.json"
+
+    exit_code = route_audit.main([str(FIXTURE), str(models), "--inventory", str(target), "--quiet"])
+
+    assert exit_code == 0
+    written = json.loads(target.read_text())
+    assert len(written) == len(manifest["routes"]) + len(manifest.get("composites", {}))
 
 
 def test_inventory_covers_every_definition_including_composites(manifest):

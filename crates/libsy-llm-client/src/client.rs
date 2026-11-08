@@ -1607,16 +1607,41 @@ fn omit_configured_body_fields(body: &mut Value, omit_body_fields: &BTreeSet<Str
 /// filtered to identifier characters and length-capped. A value that does not look
 /// like an identifier after filtering is dropped rather than repaired.
 fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
-    const MAX_REQUEST_ID_LEN: usize = 128;
-    ["x-request-id", "request-id"].iter().find_map(|name| {
-        let raw = headers.get(*name)?.to_str().ok()?.trim();
-        let cleaned: String = raw
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-            .take(MAX_REQUEST_ID_LEN)
-            .collect();
-        (!cleaned.is_empty()).then_some(cleaned)
-    })
+    ["x-request-id", "request-id"]
+        .iter()
+        .find_map(|name| json_request_id(headers.get(*name)?.to_str().ok()?))
+}
+
+/// The longest identifier any provider is known to issue. A longer value is not a
+/// truncated identifier, it is something else.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Accepts a header value only if it is exactly a provider identifier.
+///
+/// CORRELATION, NOT JSON SAFETY
+///
+/// The point of this value is that an operator can paste it into the provider's own
+/// log search and find the request. A value that has been "made safe" by removing
+/// characters no longer matches anything, so it is worse than no id at all: it looks
+/// like evidence and is not. The same applies to truncating a long value - the result
+/// is a different string that resolves to no request.
+///
+/// So this validates rather than repairs. Surrounding optional whitespace is trimmed
+/// (that is transport framing, not content), and every remaining byte must be an
+/// identifier character. Anything else - an embedded quote, a backslash, a comma, a
+/// newline, an empty value, an over-long value - yields `None`, and the caller records
+/// no id.
+///
+/// Identifier grammar: `A-Za-z0-9` plus `-_.:`.
+fn json_request_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches(|c: char| c == ' ' || c == '\t');
+    if trimmed.is_empty() || trimmed.len() > MAX_REQUEST_ID_LEN {
+        return None;
+    }
+    let identifier_shaped = trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    identifier_shaped.then(|| trimmed.to_string())
 }
 
 /// Folds a header-borne request id into an error body, where the field-borne one lives.
@@ -1644,20 +1669,34 @@ fn with_request_id(body: String, request_id: Option<&str>) -> String {
     let Ok(mut parsed) = serde_json::from_str::<Value>(&body) else {
         return body;
     };
+    // A provider-authored id is authoritative wherever it already sits, including at
+    // the top level (Anthropic's shape). Injecting beside it would put two different
+    // ids in one document, and the extractor prefers the nested one - so the header
+    // would silently override what the provider actually said.
+    if provider_named_a_request(&parsed) {
+        return body;
+    }
     let Some(error) = parsed.get_mut("error").and_then(Value::as_object_mut) else {
         return body;
     };
-    let already_named = ["request_id", "requestId", "requestID"]
-        .iter()
-        .any(|field| error.get(*field).is_some());
-    if already_named {
-        return body;
-    }
     error.insert(
         "request_id".to_string(),
         Value::String(request_id.to_string()),
     );
     parsed.to_string()
+}
+
+/// Whether the document already carries a provider-supplied request id.
+///
+/// Checks every location the extractor recognises, nested and top level, so the two
+/// functions cannot disagree about what counts as "already named".
+fn provider_named_a_request(document: &Value) -> bool {
+    const FIELDS: &[&str] = &["request_id", "requestId", "requestID"];
+    let nested = document
+        .get("error")
+        .is_some_and(|error| FIELDS.iter().any(|field| error.get(*field).is_some()));
+    let top_level = FIELDS.iter().any(|field| document.get(*field).is_some());
+    nested || top_level
 }
 
 // Anthropic and Bedrock both cap a request at four blocks carrying
@@ -3715,48 +3754,126 @@ mod tests {
         headers
     }
 
+    // Attaching an id must not change how the failure is CLASSIFIED.
+    //
+    // The error body is read by the routing classifier as well as by the retry
+    // predicate, so a body rewritten in a way those read differently would trade an
+    // observability gain for a routing regression. This pins the class, the status and
+    // the provider's own message across the change.
     #[test]
-    fn the_request_id_is_read_from_either_header_spelling() {
+    fn attaching_an_id_leaves_the_failure_classification_unchanged() {
+        use switchyard_protocol::LlmClientError;
+
+        let base = r#"{"error":{"message":"Provider returned error","code":"upstream_error"}}"#;
+        let with_id = with_request_id(base.to_string(), Some("req_folded"));
+
+        let classify = |body: &str| {
+            let error = switchyard_libsy::LibsyError::client_call(
+                "gpt",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::BAD_REQUEST,
+                    body: body.to_string(),
+                },
+            );
+            crate::run::failure_class(&error)
+        };
+
         assert_eq!(
-            upstream_request_id(&header_map(&[("x-request-id", "req_abc123")])).as_deref(),
-            Some("req_abc123")
+            classify(base),
+            classify(&with_id),
+            "classification must not move when an id is attached"
         );
+        // And it is still a request failure, not something another candidate recovers from.
+        assert_eq!(classify(&with_id), crate::run::FailureClass::Request);
+
+        let parsed: Value = serde_json::from_str(&with_id).expect("valid json");
+        assert_eq!(
+            parsed["error"]["message"],
+            Value::String("Provider returned error".into()),
+            "the provider's message must be untouched"
+        );
+        assert_eq!(
+            parsed["error"]["code"],
+            Value::String("upstream_error".into()),
+            "the provider's code must be untouched"
+        );
+    }
+
+    #[test]
+    fn an_identifier_shaped_header_value_is_preserved_exactly() {
+        // Exact preservation is the whole point: this string must be searchable in
+        // the provider's logs, so it may not be altered in any way.
+        for value in [
+            "req_abc123",
+            "5502af93-ffbb-46bc-95ec-6402a807b7e8",
+            "req-1.example_v2:a",
+        ] {
+            assert_eq!(
+                upstream_request_id(&header_map(&[("x-request-id", value)])).as_deref(),
+                Some(value),
+                "an identifier must survive byte for byte"
+            );
+        }
         // Anthropic's spelling, without the `x-` prefix.
         assert_eq!(
             upstream_request_id(&header_map(&[("request-id", "req_anthropic")])).as_deref(),
             Some("req_anthropic")
         );
-        assert_eq!(upstream_request_id(&header_map(&[])), None);
-        // An empty header is not an id.
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_transport_framing_not_identity() {
+        // Optional whitespace around a value is framing, so trimming it still yields
+        // the provider's identifier exactly.
         assert_eq!(
-            upstream_request_id(&header_map(&[("x-request-id", "  ")])),
-            None
+            upstream_request_id(&header_map(&[("x-request-id", "  req_padded\t ")])).as_deref(),
+            Some("req_padded")
         );
     }
 
-    // A header value is network input about to be written into a JSON document, so
-    // anything that is not identifier-shaped is removed rather than escaped.
+    // A value that is not exactly an identifier is REFUSED, never repaired.
+    //
+    // Repairing produces a string that looks like evidence and matches nothing in the
+    // provider's logs. Each of these previously yielded a synthetic id.
     #[test]
-    fn a_hostile_header_value_cannot_alter_the_body() {
-        let hostile = header_map(&[("x-request-id", "req_ok\",\"injected\":\"yes")]);
-        let id = upstream_request_id(&hostile).expect("id after filtering");
-        assert!(!id.contains('"'), "quotes must be stripped: {id}");
-        assert!(!id.contains('\\'), "backslashes must be stripped: {id}");
-
-        let body = with_request_id(
-            r#"{"error":{"message":"x","code":"bad"}}"#.to_string(),
-            Some(&id),
-        );
-        let parsed: Value = serde_json::from_str(&body).expect("body stays valid JSON");
-        assert_eq!(parsed["error"]["request_id"], Value::String(id));
-        assert!(parsed["error"].get("injected").is_none(), "{body}");
+    fn a_malformed_header_value_yields_no_id() {
+        for value in [
+            // Embedded quote plus injected fields: the old filter produced
+            // "req_okinjectedyes", which matches no request anywhere.
+            r#"req_ok","injected":"yes"#,
+            r#"req_ok\injected"#,
+            // A comma-separated list is several ids, not one.
+            "req_a,req_b",
+            // Interior whitespace is not part of an identifier.
+            "req ok",
+            "(req_ok)",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                upstream_request_id(&header_map(&[("x-request-id", value)])),
+                None,
+                "must refuse {value:?} rather than rewrite it"
+            );
+        }
     }
 
+    // An over-long value is a different string, not the provider's id truncated.
     #[test]
-    fn a_long_header_value_is_truncated() {
-        let long = "a".repeat(5_000);
-        let id = upstream_request_id(&header_map(&[("x-request-id", &long)])).expect("id");
-        assert_eq!(id.len(), 128);
+    fn an_over_long_header_value_yields_no_id() {
+        let at_limit = "a".repeat(MAX_REQUEST_ID_LEN);
+        assert_eq!(
+            upstream_request_id(&header_map(&[("x-request-id", &at_limit)])).as_deref(),
+            Some(at_limit.as_str()),
+            "exactly at the limit is still an identifier"
+        );
+        for over in ["a".repeat(MAX_REQUEST_ID_LEN + 1), "a".repeat(5_000)] {
+            assert_eq!(
+                upstream_request_id(&header_map(&[("x-request-id", &over)])),
+                None,
+                "truncating would invent an id that matches nothing"
+            );
+        }
     }
 
     #[test]
@@ -3781,31 +3898,44 @@ mod tests {
         );
     }
 
-    // Controls: the body must be untouched when there is nothing to add, and when it
-    // already names an id the provider chose.
+    // A provider-authored id is authoritative in EVERY location the extractor reads,
+    // including Anthropic's top level. Injecting beside it would put two ids in one
+    // document and, because the extractor prefers the nested one, would silently
+    // override what the provider actually said.
     #[test]
-    fn the_body_is_untouched_without_a_header_or_with_an_existing_id() {
+    fn a_provider_authored_id_is_never_overridden() {
+        for body in [
+            r#"{"error":{"message":"x","code":"bad","request_id":"req_provider"}}"#,
+            r#"{"error":{"message":"x","code":"bad","requestId":"req_provider"}}"#,
+            // Top level, the Anthropic shape.
+            r#"{"type":"error","error":{"message":"x"},"request_id":"req_provider"}"#,
+        ] {
+            let with_header = with_request_id(body.to_string(), Some("req_from_header"));
+            assert_eq!(
+                with_header, body,
+                "a provider id must leave the body byte-identical: {body}"
+            );
+            assert!(
+                !with_header.contains("req_from_header"),
+                "the header id must not appear: {with_header}"
+            );
+        }
+    }
+
+    // Controls: nothing is added when there is nothing to add, and nothing is
+    // restructured when the body is not a shape this understands.
+    #[test]
+    fn the_body_is_untouched_when_it_cannot_be_added_to() {
         let untouched = r#"{"error":{"message":"x","code":"bad"}}"#.to_string();
         assert_eq!(with_request_id(untouched.clone(), None), untouched);
 
-        let named =
-            r#"{"error":{"message":"x","code":"bad","request_id":"req_provider"}}"#.to_string();
-        assert_eq!(with_request_id(named.clone(), Some("req_header")), named);
-
-        // A body that is not JSON, or whose `error` is not an object, is left alone
-        // rather than wrapped into a shape the provider never sent.
         let plain = "upstream said no".to_string();
         assert_eq!(with_request_id(plain.clone(), Some("req_x")), plain);
+
         let odd = r#"{"error":"a string"}"#.to_string();
         assert_eq!(with_request_id(odd.clone(), Some("req_x")), odd);
     }
 
-    /// A daily account cap is not a throttle: retrying it immediately cannot succeed.
-    ///
-    /// The control matters as much as the rule. A 429 from a provider's shared pool
-    /// clears in seconds and must keep its retries, and so must a 429 carrying no
-    /// marker at all, or this test would pass while quietly removing recovery that
-    /// works today.
     #[test]
     fn an_account_wide_quota_429_is_not_retried_but_pool_429s_are() {
         let failure = |body: &str| AttemptFailure {

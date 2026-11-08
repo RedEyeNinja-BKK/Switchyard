@@ -279,14 +279,37 @@ mod tests {
     /// The global provider is installed for the test process. It is set once and every
     /// recorder under test uses `global::meter`, which is the same path production
     /// takes -- a locally-constructed meter would prove nothing about the real one.
+    ///
+    /// ORDERING MATTERS, and it is the whole reason this test was intermittent.
+    ///
+    /// `global::meter()` binds an instrument to whatever provider is global *at that
+    /// moment*. This binary also runs every test that builds a router, and building a
+    /// router calls `registry()`, whose one-time initialiser calls
+    /// `global::set_meter_provider` with the production provider. When that happened
+    /// between two recorder calls here, the later instruments bound to the production
+    /// provider and never reached this test's registry -- the failure said so: the
+    /// first family was exported and the second was not. Measured on the untouched
+    /// baseline: 2-3 runs in 12 failed.
+    ///
+    /// So the process-wide initialiser is resolved *first*, before this test installs
+    /// its provider. `get_or_init` runs it exactly once, so once it has returned no
+    /// later call can replace the provider underneath this test.
     #[test]
     fn every_sparse_recorder_publishes_its_family() {
+        // Resolve the one-time production initialiser before taking over the global
+        // provider, so nothing can swap it mid-test.
+        let _ = registry().expect("production metrics initialise");
+
         let registry = Registry::new();
         let exporter = opentelemetry_prometheus::exporter()
             .with_registry(registry.clone())
             .build()
             .unwrap_or_else(|error| panic!("failed to build metrics exporter: {error}"));
         let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+        // Put the process's own provider back afterwards: other tests keep creating
+        // instruments through `global::meter`, and they should land where the process
+        // would have put them, not in a registry that belongs to this assertion.
+        let previous = global::meter_provider();
         global::set_meter_provider(provider.clone());
 
         record_composition_attempt("parent", "child", "target", "selected", "none");
@@ -299,6 +322,8 @@ mod tests {
             .map(|family| family.name().to_string())
             .collect();
 
+        global::set_meter_provider(PreviouslyInstalled(previous));
+
         for expected in [
             "switchyard_composition_attempt_total",
             "switchyard_composition_cross_total",
@@ -308,6 +333,24 @@ mod tests {
                 names.iter().any(|name| name == expected),
                 "recorder for {expected} published nothing; exported families were {names:?}"
             );
+        }
+    }
+
+    /// Hands the provider that was installed before this test back to the global slot.
+    ///
+    /// `set_meter_provider` takes a concrete `MeterProvider`, while `meter_provider()`
+    /// returns an `Arc<dyn MeterProvider>` and the crate has no blanket impl for it, so
+    /// the delegation is written out rather than assumed.
+    struct PreviouslyInstalled(
+        std::sync::Arc<dyn opentelemetry::metrics::MeterProvider + Send + Sync>,
+    );
+
+    impl opentelemetry::metrics::MeterProvider for PreviouslyInstalled {
+        fn meter_with_scope(
+            &self,
+            scope: opentelemetry::InstrumentationScope,
+        ) -> opentelemetry::metrics::Meter {
+            self.0.meter_with_scope(scope)
         }
     }
 }

@@ -37,11 +37,28 @@ where the route declares it; `vision` governs images only.
 
 | Contract | State |
 |---|---|
-| **Cross-provider reasoning continuity** | **Not enforced.** `switchyard_translation::continuity` defines the contract and three fixtures demonstrate the defect; nothing consults it yet. |
-| Leaf-route context admission | **Absent.** A composite skips a child that cannot hold the request; a leaf is dispatched at whatever size the caller sends. Measured in shadow only. |
+| **Cross-provider reasoning continuity** | **Not enforced.** `switchyard_translation::continuity` defines the contract and three fixtures demonstrate the defect; nothing consults it yet. The contract is prepared in #24 and is not deployed. |
+| Leaf-route context admission | **Absent from deployed behaviour.** A composite skips a child that cannot hold the request; a leaf is dispatched at whatever size the caller sends. A report-only shadow evaluator is prepared in #23; it is neither merged nor deployed, and no enforcement exists. |
 | Session persistence and compaction | Owned by the calling agent, not by this repository. No test here can assert it. |
 | Live provider behaviour for every advertised route | Only the budget-guarded harness exists; **no route has been smoke-tested live** under this programme. |
-| Bounded contract on `smartfree-bounded` | **Fails today** on the deployed manifest; see the audit output. Correction prepared, not applied. |
+| Bounded contract on `smartfree-bounded` | **Fails today** on the deployed manifest: the route pins `route_reasoning_policy = "inherit"`, so `tier1-bounded` and `tier2-bounded` contain an unbounded leg. The wire test in #22 passes because it asserts the contract; the deployment does not satisfy it. A one-line config correction is prepared and verified, not applied. |
+
+## What is actually deployed
+
+As of 2026-11-08T19:59:51Z, from merged `main` `f8ed776`:
+
+| Item | Value |
+|---|---|
+| binary | `99b9447e9debd2ef...` (27,618,840 bytes) |
+| manifest | `038d3862b32a2f53...` (36,553 bytes, unchanged by the binary release) |
+| advertised routes | 48 leaves; the 5 composites are internal and not advertised |
+| observability | S0 request correlation is live: `parent_route`, `child_route`, `crossed_child`, `cross_child_reason`, `session_id`, `correlation_id`, `upstream_request_id`, `error_class`, `handling_duration_ms` |
+
+S0 does not fix the generic upstream 400. OpenRouter's generic error response
+carries no request identifier, so `upstream_request_id` has nothing to report for
+that failure and the original incident remains unattributed by this field. The
+observability work makes failures that carry an identifier attributable; it does
+not make a provider explain an error it did not identify.
 
 ## What "passing" does not mean
 

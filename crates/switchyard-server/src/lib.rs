@@ -1747,90 +1747,22 @@ struct RequestLogFailure {
 }
 
 impl RequestLogFailure {
-    // Extracts the provider's own request identifier. Two shapes are recognized,
-    // because providers differ:
+    // Extracts the provider's own request identifier.
     //
-    //   1. a structured field (`error.request_id`, `error.requestId`, top-level `id`);
-    //   2. the identifier embedded in the human-readable message, which is how
-    //      DeepSeek reports it — `... (request_id: 5502af93-...)`.
+    // The rule lives in `switchyard_protocol::correlation`, so the client that decides
+    // whether an error body already names a request and this reader that reports it
+    // cannot disagree about where an id may live. They did once: the writer checked only
+    // structured fields while this reader also accepted provider prose, so a body whose
+    // only id was prose had a header id injected over it and this reader then reported the
+    // injected value instead of the provider's own.
     //
-    // Only the matched identifier is returned; the surrounding message is never
-    // retained, copied into a log field, or returned to the caller. The scan is
-    // bounded so a pathological body cannot turn diagnostics into work.
+    // Only the matched identifier is returned; the surrounding message is never retained,
+    // copied into a log field, or returned to the caller.
     fn from_error_body(body: &str) -> Option<String> {
-        const FIELDS: &[&str] = &["request_id", "requestId", "requestID"];
-        if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-            // 1. Nested under `error`, which is the OpenAI-shaped location.
-            if let Some(error) = parsed.get("error") {
-                for field in FIELDS {
-                    if let Some(id) = error
-                        .get(*field)
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                    {
-                        return Some(id.to_string());
-                    }
-                }
-            }
-            // 2. Top level, which is Anthropic's shape (`{"type":"error",
-            //    "request_id":"req_..."}`). Deliberately not a bare top-level `id`:
-            //    that is the response OBJECT id (`resp_...`, `chatcmpl_...`), not a
-            //    request id, and logging it as one would mislabel the correlation.
-            for field in FIELDS {
-                if let Some(id) = parsed
-                    .get(*field)
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    return Some(id.to_string());
-                }
-            }
-            // 3. Written into the message text, which is where DeepSeek puts it:
-            //    measured 2026-11-08 on both its Chat and Responses error bodies.
-            if let Some(message) = parsed
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-            {
-                return request_id_in_text(message);
-            }
-        }
-        request_id_in_text(body)
+        let document =
+            serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()));
+        switchyard_protocol::correlation::provider_request_id(&document)
     }
-}
-
-// Finds a provider request id written into prose, e.g. "(request_id: <id>)",
-// "request id <id>", "request-id=<id>". The token must look like an identifier
-// (hex/uuid/underscored) and be bounded in length so ordinary words cannot match.
-fn request_id_in_text(text: &str) -> Option<String> {
-    // Bound the scan: an error message is small, and a huge body is not worth it.
-    const SCAN_LIMIT: usize = 64 * 1024;
-    // Truncate on a CHARACTER boundary, not a byte offset: a provider error body
-    // may contain multi-byte UTF-8, and slicing mid-character panics the server on
-    // the error path — turning a provider rejection into a crash.
-    let limit = text.len().min(SCAN_LIMIT);
-    let end = (0..=limit)
-        .rev()
-        .find(|offset| text.is_char_boundary(*offset))
-        .unwrap_or(0);
-    let text = &text[..end];
-    let lower = text.to_ascii_lowercase();
-    for marker in ["request_id", "request id", "request-id"] {
-        let mut from = 0;
-        while let Some(offset) = lower[from..].find(marker) {
-            let mut rest = &text[from + offset + marker.len()..];
-            rest = rest.trim_start_matches([' ', '\t', ':', '=', '"', '\'', '(', '#']);
-            let token: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                .collect();
-            if (8..=72).contains(&token.len()) && token.chars().any(|c| c.is_ascii_digit()) {
-                return Some(token);
-            }
-            from += offset + marker.len();
-        }
-    }
-    None
 }
 
 impl RequestLogContext {

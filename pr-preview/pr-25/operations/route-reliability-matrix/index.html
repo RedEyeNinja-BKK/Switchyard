@@ -1444,11 +1444,11 @@ where the route declares it; <code>vision</code> governs images only.</p>
 <tbody>
 <tr>
 <td><strong>Cross-provider reasoning continuity</strong></td>
-<td><strong>Not enforced.</strong> <code>switchyard_translation::continuity</code> defines the contract and three fixtures demonstrate the defect; nothing consults it yet.</td>
+<td><strong>Not enforced.</strong> <code>switchyard_translation::continuity</code> defines the contract and three fixtures demonstrate the defect; nothing consults it yet. The contract is prepared in #24 and is not deployed.</td>
 </tr>
 <tr>
 <td>Leaf-route context admission</td>
-<td><strong>Absent.</strong> A composite skips a child that cannot hold the request; a leaf is dispatched at whatever size the caller sends. Measured in shadow only.</td>
+<td><strong>Absent from deployed behaviour.</strong> A composite skips a child that cannot hold the request; a leaf is dispatched at whatever size the caller sends. A report-only shadow evaluator is prepared in #23; it is neither merged nor deployed, and no enforcement exists.</td>
 </tr>
 <tr>
 <td>Session persistence and compaction</td>
@@ -1460,10 +1460,43 @@ where the route declares it; <code>vision</code> governs images only.</p>
 </tr>
 <tr>
 <td>Bounded contract on <code>smartfree-bounded</code></td>
-<td><strong>Fails today</strong> on the deployed manifest; see the audit output. Correction prepared, not applied.</td>
+<td><strong>Fails today</strong> on the deployed manifest: the route pins <code>route_reasoning_policy = "inherit"</code>, so <code>tier1-bounded</code> and <code>tier2-bounded</code> contain an unbounded leg. The wire test in #22 passes because it asserts the contract; the deployment does not satisfy it. A one-line config correction is prepared and verified, not applied.</td>
 </tr>
 </tbody>
 </table>
+<h2 id="what-is-actually-deployed">What is actually deployed<a class="headerlink" href="#what-is-actually-deployed" title="Permanent link">&para;</a></h2>
+<p>As of 2026-11-08T19:59:51Z, from merged <code>main</code> <code>f8ed776</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>binary</td>
+<td><code>99b9447e9debd2ef...</code> (27,618,840 bytes)</td>
+</tr>
+<tr>
+<td>manifest</td>
+<td><code>038d3862b32a2f53...</code> (36,553 bytes, unchanged by the binary release)</td>
+</tr>
+<tr>
+<td>advertised routes</td>
+<td>48 leaves; the 5 composites are internal and not advertised</td>
+</tr>
+<tr>
+<td>observability</td>
+<td>S0 request correlation is live: <code>parent_route</code>, <code>child_route</code>, <code>crossed_child</code>, <code>cross_child_reason</code>, <code>session_id</code>, <code>correlation_id</code>, <code>upstream_request_id</code>, <code>error_class</code>, <code>handling_duration_ms</code></td>
+</tr>
+</tbody>
+</table>
+<p>S0 does not fix the generic upstream 400. OpenRouter's generic error response
+carries no request identifier, so <code>upstream_request_id</code> has nothing to report for
+that failure and the original incident remains unattributed by this field. The
+observability work makes failures that carry an identifier attributable; it does
+not make a provider explain an error it did not identify.</p>
 <h2 id="what-passing-does-not-mean">What "passing" does not mean<a class="headerlink" href="#what-passing-does-not-mean" title="Permanent link">&para;</a></h2>
 <p>A <code>200</code> with empty content is not a successful model call. A reasoning-mandatory
 model can spend a small output budget entirely on thinking and return nothing a

@@ -7,6 +7,7 @@ mod algorithm;
 pub mod capability;
 pub mod composition;
 mod config;
+pub mod context_shadow;
 pub mod decision_executor;
 pub mod decision_transport;
 pub mod facts;

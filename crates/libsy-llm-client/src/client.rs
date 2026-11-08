@@ -3674,6 +3674,53 @@ mod tests {
         Ok(())
     }
 
+    // Integration: when the provider names a request in its body AND sends a
+    // different header id, the provider's own value must survive the whole path
+    // through the real client. The header is a supplement, never an override.
+    #[tokio::test]
+    async fn a_provider_authored_id_survives_a_differing_header()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("x-request-id", "req_header_999")
+                    .set_body_json(json!({
+                        "error": {
+                            "message": "thinking mode failure (request_id: req_body_123)",
+                            "type": "upstream_error",
+                            "request_id": "req_body_123"
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let error = match client
+            .call_rewrite_model(request_for(None, false), Some(&ModelId::from("gpt")))
+            .await
+        {
+            Ok(_) => panic!("a 400 must not succeed"),
+            Err(error) => error,
+        };
+
+        let LlmClientError::UpstreamHttp { body, .. } = &error else {
+            panic!("expected an upstream HTTP error, got {error:?}");
+        };
+        assert!(
+            !body.contains("req_header_999"),
+            "the header id must not be injected over the provider's: {body}"
+        );
+        let parsed: Value = serde_json::from_str(body).expect("body is still JSON");
+        assert_eq!(
+            switchyard_protocol::correlation::provider_request_id(&parsed).as_deref(),
+            Some("req_body_123")
+        );
+        Ok(())
+    }
+
     // Control: a provider that sends no id header must produce a byte-identical
     // body, so the propagation cannot be mistaken for rewriting provider data.
     #[tokio::test]

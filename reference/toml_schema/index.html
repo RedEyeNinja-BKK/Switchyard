@@ -1896,6 +1896,12 @@ route reaches no upstream. A file without a <code>[targets]</code> table is reje
 <td>unset</td>
 <td>Deadline in milliseconds for all attempts, retry delays, and the complete response, including stream reads. Must be at least <code>1</code>. Unset leaves the wait unbounded.</td>
 </tr>
+<tr>
+<td><code>billing</code></td>
+<td style="text-align: center;">No</td>
+<td>inferred</td>
+<td>How this client's usage is billed: <code>metered</code>, <code>subscription</code>, or <code>local</code>. Stated rather than inferred, because the difference decides whether a per-token price may be attached to the lane at all. An allowance-bearing credential is not billed per token, so pricing it as if it were would manufacture a charge the provider never made. When unset, the client is treated as <code>metered</code> unless its base URL names a deployment the operator hosts, in which case it is <code>local</code>.</td>
+</tr>
 </tbody>
 </table>
 <p>The TOML never contains the secret itself. <code>api_key_env</code> names a variable that

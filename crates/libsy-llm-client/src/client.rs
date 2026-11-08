@@ -665,6 +665,10 @@ impl TranslatingLlmClient {
             });
         }
 
+        // A provider that issues a correlation id puts it in a response header, and
+        // this is the last point where that header exists: the body read consumes the
+        // response, and every caller above sees only the error.
+        let request_id = upstream_request_id(response.headers());
         let retry_after = retry_after_delay(response.headers());
         let body = match response.text().await {
             Ok(body) => body,
@@ -678,6 +682,10 @@ impl TranslatingLlmClient {
             }
         };
         let body = redact_forwarded_headers(body, metadata, backend.is_forwarding_auth());
+        // Carried in the body so one extractor serves both transports: a provider
+        // that reports the id as a field and one that reports it in a header end up
+        // in the same place.
+        let body = with_request_id(body, request_id.as_deref());
         metrics::record_upstream_attempt(Some(status.as_u16()));
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
@@ -1589,6 +1597,67 @@ fn omit_configured_body_fields(body: &mut Value, omit_body_fields: &BTreeSet<Str
     for key in omit_body_fields {
         object.remove(key);
     }
+}
+
+/// The provider's correlation id, if it sent one in a response header.
+///
+/// Reads the two spellings providers actually use: `x-request-id`, and Anthropic's
+/// unprefixed `request-id`. A header value is attacker-adjacent input - it arrives
+/// from the network and is about to be written into a JSON document - so it is
+/// filtered to identifier characters and length-capped. A value that does not look
+/// like an identifier after filtering is dropped rather than repaired.
+fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
+    const MAX_REQUEST_ID_LEN: usize = 128;
+    ["x-request-id", "request-id"].iter().find_map(|name| {
+        let raw = headers.get(*name)?.to_str().ok()?.trim();
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+            .take(MAX_REQUEST_ID_LEN)
+            .collect();
+        (!cleaned.is_empty()).then_some(cleaned)
+    })
+}
+
+/// Folds a header-borne request id into an error body, where the field-borne one lives.
+///
+/// WHY THE BODY AND NOT A NEW ERROR FIELD
+///
+/// Only the HTTP client has the response headers; every other constructor of an
+/// upstream error has no header to offer, so a new field on the error variant would
+/// be filled with `None` in twenty-odd places to serve one. The body already has a
+/// defined location for this value - `error.request_id` for the OpenAI shape, a
+/// top-level `request_id` for Anthropic's - and one extractor already reads both. So
+/// the id is moved to where the schema puts it rather than given a parallel home.
+///
+/// WHAT THIS DOES NOT DO
+///
+/// * It never invents an id: without a header the body is returned unchanged, byte
+///   for byte.
+/// * It never overrides the provider: a body that already carries an id keeps it.
+/// * It never restructures: a non-JSON body is left alone rather than wrapped, and a
+///   body whose `error` is not an object is left alone.
+fn with_request_id(body: String, request_id: Option<&str>) -> String {
+    let Some(request_id) = request_id else {
+        return body;
+    };
+    let Ok(mut parsed) = serde_json::from_str::<Value>(&body) else {
+        return body;
+    };
+    let Some(error) = parsed.get_mut("error").and_then(Value::as_object_mut) else {
+        return body;
+    };
+    let already_named = ["request_id", "requestId", "requestID"]
+        .iter()
+        .any(|field| error.get(*field).is_some());
+    if already_named {
+        return body;
+    }
+    error.insert(
+        "request_id".to_string(),
+        Value::String(request_id.to_string()),
+    );
+    parsed.to_string()
 }
 
 // Anthropic and Bedrock both cap a request at four blocks carrying
@@ -3548,6 +3617,187 @@ mod tests {
             failure(r#"{"error":{"code":"server_error"},"error_type":"rate_limit_exceeded"}"#)
                 .is_retryable()
         );
+    }
+
+    // End to end through the real HTTP client: a provider that reports its
+    // correlation id only in a response header must still hand that id to its
+    // caller, because the header is gone by the time the error reaches them.
+    #[tokio::test]
+    async fn a_header_only_request_id_reaches_the_returned_error()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("x-request-id", "req_header_only_42")
+                    .set_body_json(json!({
+                        "error": {"message": "provider returned error", "code": 400}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        // Response is not Debug (it may own a live stream), so match rather than
+        // unwrap: the error is the expected outcome, not an inconvenience.
+        let error = match client
+            .call_rewrite_model(request_for(None, false), Some(&ModelId::from("gpt")))
+            .await
+        {
+            Ok(_) => panic!("a 400 must not succeed"),
+            Err(error) => error,
+        };
+
+        let LlmClientError::UpstreamHttp { status, body } = &error else {
+            panic!("expected an upstream HTTP error, got {error:?}");
+        };
+        assert_eq!(*status, StatusCode::BAD_REQUEST);
+        let parsed: Value = serde_json::from_str(body).expect("body is still JSON");
+        assert_eq!(
+            parsed["error"]["request_id"],
+            Value::String("req_header_only_42".into()),
+            "the header id must survive into the error body: {body}"
+        );
+        // The provider's own message is untouched.
+        assert_eq!(
+            parsed["error"]["message"],
+            Value::String("provider returned error".into())
+        );
+        Ok(())
+    }
+
+    // Control: a provider that sends no id header must produce a byte-identical
+    // body, so the propagation cannot be mistaken for rewriting provider data.
+    #[tokio::test]
+    async fn a_failure_without_an_id_header_is_passed_through_untouched()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "provider returned error", "code": 400}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let error = match client
+            .call_rewrite_model(request_for(None, false), Some(&ModelId::from("gpt")))
+            .await
+        {
+            Ok(_) => panic!("a 400 must not succeed"),
+            Err(error) => error,
+        };
+
+        let LlmClientError::UpstreamHttp { body, .. } = &error else {
+            panic!("expected an upstream HTTP error, got {error:?}");
+        };
+        assert!(
+            !body.contains("request_id"),
+            "no id must not be invented: {body}"
+        );
+        Ok(())
+    }
+
+    // ---- upstream request id propagation -------------------------------------
+    //
+    // The id must survive the only place it exists: a response header on a failure.
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect("valid name"),
+                reqwest::header::HeaderValue::from_str(value).expect("valid value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn the_request_id_is_read_from_either_header_spelling() {
+        assert_eq!(
+            upstream_request_id(&header_map(&[("x-request-id", "req_abc123")])).as_deref(),
+            Some("req_abc123")
+        );
+        // Anthropic's spelling, without the `x-` prefix.
+        assert_eq!(
+            upstream_request_id(&header_map(&[("request-id", "req_anthropic")])).as_deref(),
+            Some("req_anthropic")
+        );
+        assert_eq!(upstream_request_id(&header_map(&[])), None);
+        // An empty header is not an id.
+        assert_eq!(
+            upstream_request_id(&header_map(&[("x-request-id", "  ")])),
+            None
+        );
+    }
+
+    // A header value is network input about to be written into a JSON document, so
+    // anything that is not identifier-shaped is removed rather than escaped.
+    #[test]
+    fn a_hostile_header_value_cannot_alter_the_body() {
+        let hostile = header_map(&[("x-request-id", "req_ok\",\"injected\":\"yes")]);
+        let id = upstream_request_id(&hostile).expect("id after filtering");
+        assert!(!id.contains('"'), "quotes must be stripped: {id}");
+        assert!(!id.contains('\\'), "backslashes must be stripped: {id}");
+
+        let body = with_request_id(
+            r#"{"error":{"message":"x","code":"bad"}}"#.to_string(),
+            Some(&id),
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("body stays valid JSON");
+        assert_eq!(parsed["error"]["request_id"], Value::String(id));
+        assert!(parsed["error"].get("injected").is_none(), "{body}");
+    }
+
+    #[test]
+    fn a_long_header_value_is_truncated() {
+        let long = "a".repeat(5_000);
+        let id = upstream_request_id(&header_map(&[("x-request-id", &long)])).expect("id");
+        assert_eq!(id.len(), 128);
+    }
+
+    #[test]
+    fn the_id_is_folded_into_the_body_it_was_missing_from() {
+        let body = with_request_id(
+            r#"{"error":{"message":"bad request","code":"invalid_request"}}"#.to_string(),
+            Some("req_folded"),
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(
+            parsed["error"]["request_id"],
+            Value::String("req_folded".into())
+        );
+        // Everything the provider said is preserved.
+        assert_eq!(
+            parsed["error"]["message"],
+            Value::String("bad request".into())
+        );
+        assert_eq!(
+            parsed["error"]["code"],
+            Value::String("invalid_request".into())
+        );
+    }
+
+    // Controls: the body must be untouched when there is nothing to add, and when it
+    // already names an id the provider chose.
+    #[test]
+    fn the_body_is_untouched_without_a_header_or_with_an_existing_id() {
+        let untouched = r#"{"error":{"message":"x","code":"bad"}}"#.to_string();
+        assert_eq!(with_request_id(untouched.clone(), None), untouched);
+
+        let named =
+            r#"{"error":{"message":"x","code":"bad","request_id":"req_provider"}}"#.to_string();
+        assert_eq!(with_request_id(named.clone(), Some("req_header")), named);
+
+        // A body that is not JSON, or whose `error` is not an object, is left alone
+        // rather than wrapped into a shape the provider never sent.
+        let plain = "upstream said no".to_string();
+        assert_eq!(with_request_id(plain.clone(), Some("req_x")), plain);
+        let odd = r#"{"error":"a string"}"#.to_string();
+        assert_eq!(with_request_id(odd.clone(), Some("req_x")), odd);
     }
 
     /// A daily account cap is not a throttle: retrying it immediately cannot succeed.

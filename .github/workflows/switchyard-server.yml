@@ -1,0 +1,227 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Switchyard server build and provenance.
+#
+# WHY A SEPARATE WORKFLOW
+#
+#   The server binary that runs in a deployment must be reproducible from a
+#   commit, and the artifact must carry its own identity. The existing CI job
+#   builds with `ubuntu-latest` and the rust-toolchain channel "1.99", which
+#   resolves to whatever patch release is current -- so two builds of one commit
+#   can differ. This workflow pins everything that enters the build and publishes
+#   a binary with the hashes needed to prove what it is.
+#
+#   It deliberately does NOT publish packages, tag releases, or deploy. The
+#   upstream package-publishing jobs are untouched and this workflow never
+#   triggers them.
+#
+# WHAT IS PINNED
+#
+#   * runner image ubuntu-24.04       (not -latest, so the native toolchain is fixed)
+#   * rustc/cargo 1.99.0              (not the channel alias)
+#   * the gcc major version           (recorded and asserted)
+#   * Cargo.lock                      (--locked everywhere)
+#
+#   A different compiler is not a different source, but it IS a different binary.
+#   The job prints the identity it actually used and fails if the toolchain is not
+#   the one this file names, so an artifact can never silently claim a toolchain
+#   it was not built with.
+
+name: Switchyard server build
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "scripts/release/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/switchyard-server.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "scripts/release/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+concurrency:
+  group: switchyard-server-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # The exact toolchain this artifact is defined by. Keep in step with the
+  # deployment note in scripts/release/README.md.
+  REQUIRED_RUST: "1.99.0"
+  REQUIRED_GCC_MAJOR: "13"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build, test and record provenance
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin rustc to the exact patch release rather than the channel alias.
+      - name: Install pinned Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "${REQUIRED_RUST}" --profile minimal \
+            --component rustfmt --component clippy
+          rustup override set "${REQUIRED_RUST}"
+
+      - name: Verify the toolchain is the one this workflow names
+        run: |
+          set -euo pipefail
+          rustc_version=$(rustc --version)
+          echo "rustc: ${rustc_version}"
+          echo "${rustc_version}" | grep -q " ${REQUIRED_RUST} " || {
+            echo "::error::rustc is not ${REQUIRED_RUST}: ${rustc_version}"; exit 1; }
+
+          gcc_version=$(gcc -dumpfullversion)
+          gcc_major=${gcc_version%%.*}
+          echo "gcc: ${gcc_version} (major ${gcc_major})"
+          [ "${gcc_major}" = "${REQUIRED_GCC_MAJOR}" ] || {
+            echo "::error::gcc major is ${gcc_major}, expected ${REQUIRED_GCC_MAJOR}"; exit 1; }
+
+          ldd --version | head -1
+          echo "glibc: $(ldd --version | head -1 | awk '{print $NF}')"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: Build the server binary
+        run: cargo build -p switchyard-server --release --locked
+
+      # The manifest audit needs a server to advertise the routes, and the
+      # committed fixture uses placeholder credentials, so no secret is involved:
+      # config load validates that an api_key_env variable EXISTS, never its value.
+      - name: Route manifest contract audit
+        env:
+          AUDIT_REMOTE_A_KEY: ci-placeholder
+          AUDIT_REMOTE_B_KEY: ci-placeholder
+          AUDIT_LOCAL_A_KEY: ci-placeholder
+        run: |
+          set -euo pipefail
+          fixture=crates/switchyard-server/tests/fixtures/routes.audit.toml
+          ./target/release/switchyard-server --config "${fixture}" --dry-run
+
+          ./target/release/switchyard-server --config "${fixture}" \
+            --host 127.0.0.1 --port 14999 &
+          server_pid=$!
+          trap 'kill "${server_pid}" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:14999/health >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+
+          python3 scripts/release/route_audit.py "${fixture}" \
+            --models-url http://127.0.0.1:14999 \
+            --inventory build/route-inventory.json
+
+      # An artifact is only trustworthy if it says what it is. Record the binary
+      # hash, the exact source commit, and the toolchain that produced it, and keep
+      # them beside the binary rather than only in the log.
+      - name: Record provenance
+        # Branch names and refs are caller-controlled, so they are passed through
+        # the environment rather than interpolated into the script: a ref
+        # containing shell metacharacters must never become code.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          binary=target/release/switchyard-server
+          {
+            echo "{"
+            printf '  "artifact": "switchyard-server",\n'
+            printf '  "sha256": "%s",\n' "$(sha256sum "${binary}" | cut -d' ' -f1)"
+            printf '  "bytes": %s,\n' "$(stat -c%s "${binary}")"
+            printf '  "build_commit": "%s",\n' "${GITHUB_SHA}"
+            printf '  "source_ref": "%s",\n' "${GITHUB_REF}"
+            # On a pull_request trigger GITHUB_SHA is the MERGE commit, so a
+            # provenance record naming only it does not identify the code the
+            # artifact was built from. Record the head commit too, and say which
+            # is which, so an artifact can never be attributed to the wrong tree.
+            printf '  "event": "%s",\n' "${EVENT_NAME}"
+            printf '  "head_commit": "%s",\n' "${HEAD_COMMIT}"
+            printf '  "head_ref": "%s",\n' "${HEAD_REF}"
+            printf '  "repository": "%s",\n' "${GITHUB_REPOSITORY}"
+            printf '  "run_id": "%s",\n' "${GITHUB_RUN_ID}"
+            printf '  "run_attempt": "%s",\n' "${GITHUB_RUN_ATTEMPT}"
+            printf '  "runner_image": "%s",\n' "$(lsb_release -ds 2>/dev/null || echo ubuntu-24.04)"
+            printf '  "rustc": "%s",\n' "$(rustc --version)"
+            printf '  "cargo": "%s",\n' "$(cargo --version)"
+            printf '  "gcc": "%s",\n' "$(gcc --version | head -1)"
+            printf '  "glibc": "%s"\n' "$(ldd --version | head -1 | awk '{print $NF}')"
+            echo "}"
+          } > build/provenance.json
+          cat build/provenance.json
+
+      # The target deployment runs Ubuntu 24.04 (glibc 2.39). A binary linked
+      # against a newer glibc loads here and fails there, which is only discovered
+      # at activation. Fail at build time instead.
+      - name: Verify the binary can run on the deployment image
+        run: |
+          set -euo pipefail
+          binary=target/release/switchyard-server
+          highest=$(objdump -T "${binary}" \
+            | grep -o 'GLIBC_[0-9]\+\.[0-9]\+' | sort -uV | tail -1 | sed 's/GLIBC_//')
+          echo "highest required glibc symbol: ${highest}"
+          python3 - "${highest}" <<'PY'
+          import sys
+          required = tuple(int(part) for part in sys.argv[1].split("."))
+          # Deployment image: Ubuntu 24.04, glibc 2.39.
+          limit = (2, 39)
+          if required > limit:
+              raise SystemExit(
+                  f"binary requires glibc {sys.argv[1]}, deployment provides "
+                  f"{limit[0]}.{limit[1]}"
+              )
+          print(f"compatible: requires {sys.argv[1]} <= {limit[0]}.{limit[1]}")
+          PY
+
+      - name: Upload the server binary and its provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: switchyard-server-${{ github.sha }}
+          path: |
+            target/release/switchyard-server
+            build/provenance.json
+            build/route-inventory.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach provenance to the job summary
+        if: always()
+        run: |
+          {
+            echo "### Switchyard server build"
+            echo
+            echo '```json'
+            cat build/provenance.json 2>/dev/null || echo '{"error":"no provenance recorded"}'
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

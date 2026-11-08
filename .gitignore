@@ -166,3 +166,6 @@ pytest-of-*/
 # codex
 .codex
 openthoughts-tblite/
+
+# Build provenance written by the switchyard-server workflow.
+/build/

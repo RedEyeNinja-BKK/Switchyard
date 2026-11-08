@@ -1,0 +1,225 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sanitized route manifest for CI contract enforcement.
+#
+# WHY THIS IS NOT THE PRODUCTION MANIFEST
+#
+#   The deployed manifest describes private topology (tailnet endpoints, a
+#   second credential's upstream set) and belongs to the deployment, not to a
+#   public repository. This fixture deliberately reproduces the STRUCTURE that
+#   the route audit enforces, with every endpoint a placeholder:
+#
+#     * direct leaves, including one with an ordered candidate list
+#     * primitive routes, bounded and unbounded
+#     * tier routes on a single credential
+#     * a composite over tiers, and composites over primitives
+#     * a video-capable route on a responses transport
+#     * a text-only route (vision = false)
+#     * a local-provider route and a remote-provider route
+#
+#   Every `api_key_env` names a placeholder variable that CI sets to a dummy
+#   value: config load validates that the variable EXISTS, never its content.
+#   No credential, endpoint, or model id here is real.
+
+schema_version = 1
+
+[llm_clients.remote_a]
+format = "openai_responses"
+base_url = "https://remote-a.invalid/v1"
+api_key_env = "AUDIT_REMOTE_A_KEY"
+max_retries = 2
+
+[llm_clients.remote_b]
+format = "openai_responses"
+base_url = "https://remote-b.invalid/v1"
+api_key_env = "AUDIT_REMOTE_B_KEY"
+max_retries = 2
+
+[llm_clients.local_a]
+format = "openai_responses"
+base_url = "http://local-a.invalid:8080/v1"
+api_key_env = "AUDIT_LOCAL_A_KEY"
+max_retries = 1
+
+# ---- targets -------------------------------------------------------------
+
+[targets.remote-a-omni]
+id = "vendor-a/omni-model"
+llm_client = "remote_a"
+vision = true
+video = true
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.remote-a-omni-alt]
+id = "vendor-a/omni-model-alt"
+llm_client = "remote_a"
+vision = true
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.remote-a-text]
+id = "vendor-a/text-only"
+llm_client = "remote_a"
+vision = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.remote-b-flash]
+id = "vendor-b/flash"
+llm_client = "remote_b"
+vision = true
+tool_calling = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+[targets.remote-b-bounded]
+id = "vendor-b/bounded-nt"
+llm_client = "remote_b"
+vision = true
+tool_calling = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[targets.local-a-mtp]
+id = "local-a/mtp"
+llm_client = "local_a"
+vision = true
+tool_calling = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+# ---- direct leaves -------------------------------------------------------
+
+[routes.direct-remote-a-omni]
+id = "direct-remote-a-omni"
+type = "passthrough"
+target = "remote-a-omni"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+# A leaf whose second model is an ordered candidate, not a second route.
+[routes.direct-remote-a-text]
+id = "direct-remote-a-text"
+type = "passthrough"
+target = "remote-a-text"
+candidates = ["remote-a-omni-alt"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-remote-b-flash]
+id = "direct-remote-b-flash"
+type = "passthrough"
+target = "remote-b-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+# ---- primitives ----------------------------------------------------------
+
+[routes.prims-unbounded]
+id = "prims-unbounded"
+type = "passthrough"
+target = "remote-b-flash"
+candidates = ["remote-a-omni"]
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "inherit"
+
+[routes.prims-unbounded-bounded]
+id = "prims-unbounded-bounded"
+type = "passthrough"
+target = "remote-b-bounded"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+
+[routes.prims-local]
+id = "prims-local"
+type = "passthrough"
+target = "local-a-mtp"
+candidates = []
+context_window = 225280
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "medium"
+
+[routes.prims-local-bounded]
+id = "prims-local-bounded"
+type = "passthrough"
+target = "local-a-mtp"
+candidates = []
+context_window = 225280
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+
+# ---- tiers ---------------------------------------------------------------
+
+[routes.Tier_One]
+id = "Tier_One"
+type = "passthrough"
+target = "remote-a-omni"
+candidates = ["remote-a-omni-alt"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+route_reasoning_policy = "inherit"
+
+[routes.Tier_Two]
+id = "Tier_Two"
+type = "passthrough"
+target = "remote-a-text"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+route_reasoning_policy = "inherit"
+
+# ---- composites ----------------------------------------------------------
+
+[composites.cascade]
+children = ["Tier_One", "Tier_Two"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+[composites.tier-a]
+children = ["prims-unbounded", "prims-local"]
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[composites.tier-a-bounded]
+children = ["prims-unbounded-bounded", "prims-local-bounded"]
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false

@@ -2781,6 +2781,51 @@ mod tests {
         );
     }
 
+    // A body that is not JSON at all. S0 read the raw text for an id, and this path
+    // must keep doing so: a provider that answers with a plain-text rejection still
+    // writes its id into the prose, and dropping the case would silently lose it.
+    #[test]
+    fn the_request_id_is_read_from_a_non_json_body() {
+        let body = "upstream rejected (request_id: 5502af93-ffbb-46bc-95ec-6402a807b7e8)";
+        assert_eq!(
+            RequestLogFailure::from_error_body(body).as_deref(),
+            Some("5502af93-ffbb-46bc-95ec-6402a807b7e8")
+        );
+    }
+
+    // Control: a plain-text body that mentions a request id without carrying one must
+    // report nothing rather than the word that follows the words.
+    #[test]
+    fn a_non_json_body_without_an_id_reports_nothing() {
+        for body in [
+            "upstream rejected without a correlation id",
+            "the request id header is missing",
+            "<html><body>502 Bad Gateway</body></html>",
+        ] {
+            assert_eq!(
+                RequestLogFailure::from_error_body(body),
+                None,
+                "must not invent an id from {body:?}"
+            );
+        }
+    }
+
+    // An unusable first field must not hide a usable later one: the id is what the
+    // provider can be looked up by, so a valid one anywhere wins over a broken one.
+    #[test]
+    fn a_malformed_first_field_does_not_hide_a_valid_later_one() {
+        for body in [
+            r#"{"error":{"request_id":"","requestId":"req_valid_123"}}"#,
+            r#"{"error":{"request_id":"  ","requestId":"req_valid_123"}}"#,
+            r#"{"error":{"request_id":7,"requestId":"req_valid_123"}}"#,
+            r#"{"request_id":"","requestID":"req_valid_456"}"#,
+        ] {
+            let id = RequestLogFailure::from_error_body(body)
+                .unwrap_or_else(|| panic!("no id recovered from {body}"));
+            assert!(id.starts_with("req_valid_"), "{body} -> {id}");
+        }
+    }
+
     // The log line carries the id and never the message that surrounded it.
     #[test]
     fn failed_log_line_carries_the_id_without_the_message_text() {

@@ -72,7 +72,16 @@ pub fn names_a_request(document: &Value) -> bool {
 /// A bare top-level `id` is deliberately never read: that is the response *object*
 /// id (`resp_…`, `chatcmpl_…`), and reporting it would put a value beside the
 /// provider's logs that does not exist there.
+///
+/// A document that is a JSON string is a body that was not JSON at all: the server
+/// preserves such a body verbatim and hands it over as a string, so its prose is the
+/// only place an id can be. That case is handled here rather than at each call site,
+/// because a call site that forgot it would drop the id silently — which is exactly
+/// what happened when this rule was consolidated out of the server.
 pub fn provider_request_id(document: &Value) -> Option<String> {
+    if let Some(text) = document.as_str() {
+        return request_id_in_text(text);
+    }
     if let Some(id) = document.get("error").and_then(structured_request_id) {
         return Some(id);
     }
@@ -87,11 +96,19 @@ pub fn provider_request_id(document: &Value) -> Option<String> {
 }
 
 /// A validated structured field on one object, if it carries one.
+///
+/// Validation happens *inside* the search. Selecting the first string and validating
+/// afterwards would let an empty, malformed or over-long first field mask a usable
+/// second one, so the body would look unnamed, a header id would be written over a
+/// real provider id, and the reader would report the injected value. A non-string
+/// value is skipped for the same reason: it is not an id, so it cannot end the search.
 fn structured_request_id(object: &Value) -> Option<String> {
-    REQUEST_ID_FIELDS
-        .iter()
-        .find_map(|field| object.get(*field).and_then(Value::as_str))
-        .and_then(validated_request_id)
+    REQUEST_ID_FIELDS.iter().find_map(|field| {
+        object
+            .get(*field)
+            .and_then(Value::as_str)
+            .and_then(validated_request_id)
+    })
 }
 
 /// The shortest prose token that can be a request id rather than a word.
@@ -257,6 +274,80 @@ mod tests {
                 provider_request_id(&document),
                 None,
                 "must not invent an id from {message:?}"
+            );
+        }
+    }
+
+    // The second finding in review: the first implementation selected the first
+    // *string* and validated it afterwards, so a body whose first field was present
+    // but unusable returned None even when a later field held a valid id. The body
+    // then looked unnamed, a header id was injected over a real provider id, and the
+    // reader reported the injected value.
+    #[test]
+    fn a_malformed_first_field_does_not_hide_a_valid_later_one() {
+        for (label, first) in [
+            ("empty", json!("")),
+            ("whitespace", json!("   ")),
+            ("malformed", json!(r#"req_ok","injected":"yes"#)),
+            ("over-long", json!("a".repeat(MAX_REQUEST_ID_LEN + 1))),
+            ("non-string number", json!(7)),
+            ("null", Value::Null),
+        ] {
+            let nested = json!({"error": {"request_id": first, "requestId": "req_valid_123"}});
+            assert_eq!(
+                provider_request_id(&nested).as_deref(),
+                Some("req_valid_123"),
+                "nested: a {label} first field must not hide the valid second one"
+            );
+            let top_level = json!({"request_id": first, "requestID": "req_valid_456"});
+            assert_eq!(
+                provider_request_id(&top_level).as_deref(),
+                Some("req_valid_456"),
+                "top level: a {label} first field must not hide the valid second one"
+            );
+        }
+    }
+
+    // Control for the above: when NO field carries a usable value, the body is
+    // unnamed and nothing is invented.
+    #[test]
+    fn no_usable_structured_field_leaves_the_body_unnamed() {
+        let document = json!({"error": {"request_id": "", "requestId": "  "}});
+        assert_eq!(provider_request_id(&document), None);
+        assert!(!names_a_request(&document));
+    }
+
+    // A provider that answers with a non-JSON body still writes its id into the
+    // prose. The server hands such a body to this rule as a JSON string - it could
+    // not parse it, so it preserved the bytes - and that case must be scanned. It
+    // was, before the rule was consolidated; dropping it lost ids from raw-text
+    // provider rejections.
+    #[test]
+    fn a_plain_text_body_is_scanned_for_an_id() {
+        let document = Value::String(
+            "upstream rejected (request_id: 5502af93-ffbb-46bc-95ec-6402a807b7e8)".to_string(),
+        );
+        assert_eq!(
+            provider_request_id(&document).as_deref(),
+            Some("5502af93-ffbb-46bc-95ec-6402a807b7e8")
+        );
+        assert!(names_a_request(&document));
+    }
+
+    // Control: plain text that mentions the words without carrying an id yields
+    // nothing, so no header is suppressed and no word is logged as an id.
+    #[test]
+    fn plain_text_without_an_identifier_does_not_match() {
+        for text in [
+            "upstream rejected without a correlation id",
+            "the request id header is missing",
+            "request_id was rejected",
+        ] {
+            let document = Value::String(text.to_string());
+            assert_eq!(
+                provider_request_id(&document),
+                None,
+                "must not invent an id from {text:?}"
             );
         }
     }

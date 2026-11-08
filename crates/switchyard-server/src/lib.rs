@@ -1747,90 +1747,22 @@ struct RequestLogFailure {
 }
 
 impl RequestLogFailure {
-    // Extracts the provider's own request identifier. Two shapes are recognized,
-    // because providers differ:
+    // Extracts the provider's own request identifier.
     //
-    //   1. a structured field (`error.request_id`, `error.requestId`, top-level `id`);
-    //   2. the identifier embedded in the human-readable message, which is how
-    //      DeepSeek reports it — `... (request_id: 5502af93-...)`.
+    // The rule lives in `switchyard_protocol::correlation`, so the client that decides
+    // whether an error body already names a request and this reader that reports it
+    // cannot disagree about where an id may live. They did once: the writer checked only
+    // structured fields while this reader also accepted provider prose, so a body whose
+    // only id was prose had a header id injected over it and this reader then reported the
+    // injected value instead of the provider's own.
     //
-    // Only the matched identifier is returned; the surrounding message is never
-    // retained, copied into a log field, or returned to the caller. The scan is
-    // bounded so a pathological body cannot turn diagnostics into work.
+    // Only the matched identifier is returned; the surrounding message is never retained,
+    // copied into a log field, or returned to the caller.
     fn from_error_body(body: &str) -> Option<String> {
-        const FIELDS: &[&str] = &["request_id", "requestId", "requestID"];
-        if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-            // 1. Nested under `error`, which is the OpenAI-shaped location.
-            if let Some(error) = parsed.get("error") {
-                for field in FIELDS {
-                    if let Some(id) = error
-                        .get(*field)
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                    {
-                        return Some(id.to_string());
-                    }
-                }
-            }
-            // 2. Top level, which is Anthropic's shape (`{"type":"error",
-            //    "request_id":"req_..."}`). Deliberately not a bare top-level `id`:
-            //    that is the response OBJECT id (`resp_...`, `chatcmpl_...`), not a
-            //    request id, and logging it as one would mislabel the correlation.
-            for field in FIELDS {
-                if let Some(id) = parsed
-                    .get(*field)
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    return Some(id.to_string());
-                }
-            }
-            // 3. Written into the message text, which is where DeepSeek puts it:
-            //    measured 2026-11-08 on both its Chat and Responses error bodies.
-            if let Some(message) = parsed
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-            {
-                return request_id_in_text(message);
-            }
-        }
-        request_id_in_text(body)
+        let document =
+            serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()));
+        switchyard_protocol::correlation::provider_request_id(&document)
     }
-}
-
-// Finds a provider request id written into prose, e.g. "(request_id: <id>)",
-// "request id <id>", "request-id=<id>". The token must look like an identifier
-// (hex/uuid/underscored) and be bounded in length so ordinary words cannot match.
-fn request_id_in_text(text: &str) -> Option<String> {
-    // Bound the scan: an error message is small, and a huge body is not worth it.
-    const SCAN_LIMIT: usize = 64 * 1024;
-    // Truncate on a CHARACTER boundary, not a byte offset: a provider error body
-    // may contain multi-byte UTF-8, and slicing mid-character panics the server on
-    // the error path — turning a provider rejection into a crash.
-    let limit = text.len().min(SCAN_LIMIT);
-    let end = (0..=limit)
-        .rev()
-        .find(|offset| text.is_char_boundary(*offset))
-        .unwrap_or(0);
-    let text = &text[..end];
-    let lower = text.to_ascii_lowercase();
-    for marker in ["request_id", "request id", "request-id"] {
-        let mut from = 0;
-        while let Some(offset) = lower[from..].find(marker) {
-            let mut rest = &text[from + offset + marker.len()..];
-            rest = rest.trim_start_matches([' ', '\t', ':', '=', '"', '\'', '(', '#']);
-            let token: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                .collect();
-            if (8..=72).contains(&token.len()) && token.chars().any(|c| c.is_ascii_digit()) {
-                return Some(token);
-            }
-            from += offset + marker.len();
-        }
-    }
-    None
 }
 
 impl RequestLogContext {
@@ -2847,6 +2779,51 @@ mod tests {
             RequestLogFailure::from_error_body(body).as_deref(),
             Some("75ed4351-0ca1-4ca4-ba16-1f96097160d9")
         );
+    }
+
+    // A body that is not JSON at all. S0 read the raw text for an id, and this path
+    // must keep doing so: a provider that answers with a plain-text rejection still
+    // writes its id into the prose, and dropping the case would silently lose it.
+    #[test]
+    fn the_request_id_is_read_from_a_non_json_body() {
+        let body = "upstream rejected (request_id: 5502af93-ffbb-46bc-95ec-6402a807b7e8)";
+        assert_eq!(
+            RequestLogFailure::from_error_body(body).as_deref(),
+            Some("5502af93-ffbb-46bc-95ec-6402a807b7e8")
+        );
+    }
+
+    // Control: a plain-text body that mentions a request id without carrying one must
+    // report nothing rather than the word that follows the words.
+    #[test]
+    fn a_non_json_body_without_an_id_reports_nothing() {
+        for body in [
+            "upstream rejected without a correlation id",
+            "the request id header is missing",
+            "<html><body>502 Bad Gateway</body></html>",
+        ] {
+            assert_eq!(
+                RequestLogFailure::from_error_body(body),
+                None,
+                "must not invent an id from {body:?}"
+            );
+        }
+    }
+
+    // An unusable first field must not hide a usable later one: the id is what the
+    // provider can be looked up by, so a valid one anywhere wins over a broken one.
+    #[test]
+    fn a_malformed_first_field_does_not_hide_a_valid_later_one() {
+        for body in [
+            r#"{"error":{"request_id":"","requestId":"req_valid_123"}}"#,
+            r#"{"error":{"request_id":"  ","requestId":"req_valid_123"}}"#,
+            r#"{"error":{"request_id":7,"requestId":"req_valid_123"}}"#,
+            r#"{"request_id":"","requestID":"req_valid_456"}"#,
+        ] {
+            let id = RequestLogFailure::from_error_body(body)
+                .unwrap_or_else(|| panic!("no id recovered from {body}"));
+            assert!(id.starts_with("req_valid_"), "{body} -> {id}");
+        }
     }
 
     // The log line carries the id and never the message that surrounded it.

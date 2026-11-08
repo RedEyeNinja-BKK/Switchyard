@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};use axum::http::header::CONTENT_TYPE;
+use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -668,7 +669,15 @@ async fn openai_chat_completions(
     headers: HeaderMap,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    handle_endpoint(state, started, peer.map(|Extension(peer)| peer).unwrap_or_default(), headers, body, WireFormat::OpenAiChat).await
+    handle_endpoint(
+        state,
+        started,
+        peer.map(|Extension(peer)| peer).unwrap_or_default(),
+        headers,
+        body,
+        WireFormat::OpenAiChat,
+    )
+    .await
 }
 
 async fn anthropic_messages(
@@ -1599,7 +1608,10 @@ struct RequestShape {
 // discriminators, never content.
 fn request_shape(body: &Value, wire_format: WireFormat) -> RequestShape {
     fn count_tools(request: &serde_json::Map<String, Value>) -> usize {
-        request.get("tools").and_then(Value::as_array).map_or(0, Vec::len)
+        request
+            .get("tools")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
     }
     // Every representation is recorded, not just the first one found: a request
     // that mixes `reasoning_details` and `reasoning_content` must report both.
@@ -1752,7 +1764,10 @@ impl RequestLogFailure {
     // bounded so a pathological body cannot turn diagnostics into work.
     fn from_error_body(body: &str) -> Option<String> {
         if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-            for value in [parsed.get("error"), parsed.get("id")].into_iter().flatten() {
+            for value in [parsed.get("error"), parsed.get("id")]
+                .into_iter()
+                .flatten()
+            {
                 for field in ["request_id", "requestId", "requestID"] {
                     if let Some(id) = value
                         .get(field)
@@ -2807,9 +2822,10 @@ mod tests {
             upstream_error(StatusCode::BAD_REQUEST, &body),
             WireFormat::OpenAiChat,
         );
-        response
-            .headers_mut()
-            .insert(HEADER_UPSTREAM_REQUEST_ID, "req_from_header".parse().expect("valid header"));
+        response.headers_mut().insert(
+            HEADER_UPSTREAM_REQUEST_ID,
+            "req_from_header".parse().expect("valid header"),
+        );
         let events = captured_events(|| request_log_context().emit(&response));
 
         assert_eq!(events.len(), 1);
@@ -2823,7 +2839,8 @@ mod tests {
 
     #[test]
     fn failed_log_line_reads_upstream_request_id_from_body() {
-        let body = r#"{"error":{"message":"x","code":"upstream_error","request_id":"req_body_only"}}"#;
+        let body =
+            r#"{"error":{"message":"x","code":"upstream_error","request_id":"req_body_only"}}"#;
         let response = render_error_response(
             upstream_error(StatusCode::BAD_REQUEST, body),
             WireFormat::OpenAiChat,
@@ -2848,8 +2865,16 @@ mod tests {
         let events = captured_events(|| request_log_context().emit(&response));
 
         assert_eq!(events.len(), 1);
-        assert!(events[0].1.contains("local_invalid_request"), "{}", events[0].1);
-        assert!(!events[0].1.contains("upstream_rejected"), "{}", events[0].1);
+        assert!(
+            events[0].1.contains("local_invalid_request"),
+            "{}",
+            events[0].1
+        );
+        assert!(
+            !events[0].1.contains("upstream_rejected"),
+            "{}",
+            events[0].1
+        );
     }
 
     #[test]
@@ -2876,7 +2901,10 @@ mod tests {
         assert_eq!(shape.tool_count, 2);
         // Both representations are present in the same request, so both must be
         // reported. A single discriminator would hide the reasoning_content field.
-        assert_eq!(shape.reasoning.labels(), "reasoning_content+reasoning_details");
+        assert_eq!(
+            shape.reasoning.labels(),
+            "reasoning_content+reasoning_details"
+        );
 
         let chat_no_reasoning = serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}]
@@ -2984,7 +3012,11 @@ mod tests {
             WireFormat::OpenAiChat,
         );
         let events = captured_events(|| request_log_context().emit(&response));
-        assert!(events[0].1.contains("upstream_request_id=\"\""), "{}", events[0].1);
+        assert!(
+            events[0].1.contains("upstream_request_id=\"\""),
+            "{}",
+            events[0].1
+        );
         assert!(events[0].1.contains("upstream_rejected"), "{}", events[0].1);
     }
 
@@ -3003,7 +3035,8 @@ mod tests {
                 "reasoning_content": "r",
                 "tool_calls": [{"id": "c", "type": "function", "function": {"name": "t", "arguments": "{}"}}]
             }));
-            messages.push(serde_json::json!({"role": "tool", "tool_call_id": "c", "content": filler}));
+            messages
+                .push(serde_json::json!({"role": "tool", "tool_call_id": "c", "content": filler}));
         }
         let body = serde_json::json!({"model": "route", "tools": [{"type": "function", "function": {"name": "t"}}], "messages": messages});
         let started = Instant::now();

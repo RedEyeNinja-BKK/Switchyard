@@ -144,6 +144,13 @@ jobs:
       # hash, the exact source commit, and the toolchain that produced it, and keep
       # them beside the binary rather than only in the log.
       - name: Record provenance
+        # Branch names and refs are caller-controlled, so they are passed through
+        # the environment rather than interpolated into the script: a ref
+        # containing shell metacharacters must never become code.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           mkdir -p build
@@ -159,9 +166,9 @@ jobs:
             # provenance record naming only it does not identify the code the
             # artifact was built from. Record the head commit too, and say which
             # is which, so an artifact can never be attributed to the wrong tree.
-            printf '  "event": "%s",\n' "${GITHUB_EVENT_NAME}"
-            printf '  "head_commit": "%s",\n' "${{ github.event.pull_request.head.sha || github.sha }}"
-            printf '  "head_ref": "%s",\n' "${{ github.head_ref || github.ref_name }}"
+            printf '  "event": "%s",\n' "${EVENT_NAME}"
+            printf '  "head_commit": "%s",\n' "${HEAD_COMMIT}"
+            printf '  "head_ref": "%s",\n' "${HEAD_REF}"
             printf '  "repository": "%s",\n' "${GITHUB_REPOSITORY}"
             printf '  "run_id": "%s",\n' "${GITHUB_RUN_ID}"
             printf '  "run_attempt": "%s",\n' "${GITHUB_RUN_ATTEMPT}"

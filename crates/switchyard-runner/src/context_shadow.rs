@@ -3,13 +3,27 @@
 
 //! Shadow evaluation of context-window admission.
 //!
+//! WHAT IS ALREADY ENFORCED, AND WHERE
+//!
+//! A composite skips a child whose window cannot hold the request, counting the
+//! caller's output reservation with the input, before any provider call. That is
+//! deployed and correct: a too-small child costs nothing and the next child is
+//! tried.
+//!
+//! What has no equivalent is a LEAF route. `direct-*`, the primitive routes and the
+//! tiers are dispatched at whatever size the caller sends, and the provider answers
+//! with a rejection. The one production case on record is exactly this shape: a
+//! leaf route, 1,077,758 input tokens plus a 32,768-token reserve against a
+//! 1,048,576 window, which reached the provider and came back as an opaque 400.
+//!
 //! WHY SHADOW FIRST
 //!
-//! Switchyard advertises a `context_window` per route but enforces nothing: a
-//! request larger than the effective window is dispatched and the provider rejects
-//! it. Turning that into a local refusal is a behaviour change for every caller, so
-//! it is measured before it is enforced. This module computes what admission *would*
-//! decide and reports the arithmetic; nothing here refuses a request.
+//! Refusing locally is a behaviour change for every caller, so it is measured
+//! before it is enforced. This module computes what admission *would* decide for
+//! every route -- leaf or composite -- and reports the arithmetic; nothing here
+//! refuses a request. Because the estimator is approximate and the reasoning it
+//! cannot see is provider-specific, the report separates a firm refusal from a
+//! verdict that only the uncertainty band decides.
 //!
 //! WHAT THE NUMBERS MEAN
 //!

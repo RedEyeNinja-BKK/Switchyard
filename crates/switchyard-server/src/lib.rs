@@ -43,9 +43,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
+use switchyard_runner::composition::Selection;
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
-    request_fit,
+    context_shadow, request_fit,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -1155,9 +1156,12 @@ async fn handle_endpoint_inner(
             .find(|info| info.id.as_str() == model)
             .map(|info| info.algorithm.to_string())
     });
-    // Shadow context admission: compute what enforcement WOULD decide, report it,
-    // and refuse nothing. A composite is evaluated against the smallest declared
-    // child window, because its own advertisement is not the binding constraint.
+    // Shadow context admission, computed before the body is consumed and reported
+    // only: nothing here refuses a request.
+    let admission = match (requested_model.as_deref(), body.as_ref()) {
+        (Some(model), Ok(Json(value))) => Some(shadow_admission(&state, model, value)),
+        _ => None,
+    };
     let request_log = RequestLogContext {
         started: started.0,
         wire_format,
@@ -1173,6 +1177,7 @@ async fn handle_endpoint_inner(
         shape,
         caller_peer: (!peer.0.is_empty()).then_some(peer.0),
         algorithm,
+        admission,
     };
 
     // Axum drops this future when the downstream client disconnects before the
@@ -1718,6 +1723,138 @@ struct RequestLogRoute {
     cross_child_reason: Option<String>,
 }
 
+// Shadow context admission for one request, for reporting only.
+//
+// Borrows the body: cloning a multi-megabyte history to compute numbers that are
+// only logged would cost real memory on every request.
+#[derive(Clone, Debug)]
+struct AdmissionShadow {
+    decision: &'static str,
+    limit_source: &'static str,
+    estimated_input_tokens: u64,
+    completion_reserve: u64,
+    effective_limit: u32,
+    over_by_tokens: u64,
+    // Set for a composite: how many children would be skipped for size, and
+    // whether any child could have taken the request.
+    children_total: usize,
+    children_skipped_for_size: usize,
+}
+
+fn shadow_admission(state: &ServerState, model: &str, body: &Value) -> AdmissionShadow {
+    let reserve = context_shadow::completion_reserve(body);
+    let opaque = has_opaque_reasoning(body);
+    let overhead = context_shadow::provider_reasoning_overhead(opaque, 0);
+    let estimate = request_fit::estimate_input_tokens;
+
+    let mut shadow = AdmissionShadow {
+        decision: "unknown",
+        limit_source: "undeclared",
+        estimated_input_tokens: estimate(body),
+        completion_reserve: reserve,
+        effective_limit: 0,
+        over_by_tokens: 0,
+        children_total: 0,
+        children_skipped_for_size: 0,
+    };
+
+    match state.runner.select(model) {
+        Ok(Selection::Composite(spec)) => {
+            let child_limits: Vec<Option<u32>> = spec
+                .children
+                .iter()
+                .map(|child| {
+                    state
+                        .runner
+                        .route_capabilities(child)
+                        .and_then(|caps| caps.context_window)
+                })
+                .collect();
+            let advertised = state
+                .runner
+                .route_capabilities(model)
+                .and_then(|caps| caps.context_window);
+            let composite = context_shadow::evaluate_composite(
+                &child_limits,
+                body,
+                reserve,
+                overhead,
+                advertised,
+                estimate,
+            );
+            shadow.children_total = composite.children.len();
+            shadow.children_skipped_for_size = composite.skipped_for_size.len();
+            // The composite verdict is "can any child take it", never "can the
+            // smallest child": a child whose window is too small is skipped before
+            // any provider call, so it does not make the request unservable.
+            shadow.decision = if composite.any_child_admits {
+                "admit"
+            } else if composite
+                .children
+                .iter()
+                .any(|child| child.decision == context_shadow::ShadowDecision::AdmitUncertain)
+            {
+                "admit_uncertain"
+            } else {
+                "refuse"
+            };
+            shadow.limit_source = if composite.widest_child_limit.is_some() {
+                "declared"
+            } else {
+                "composite_incomplete"
+            };
+            shadow.effective_limit = composite.widest_child_limit.unwrap_or(0);
+        }
+        _ => {
+            let limit = state
+                .runner
+                .route_capabilities(model)
+                .and_then(|caps| caps.context_window);
+            let source = if limit.is_some() {
+                context_shadow::LimitSource::Declared
+            } else {
+                context_shadow::LimitSource::Undeclared
+            };
+            let accounting =
+                context_shadow::evaluate(body, reserve, overhead, limit, source, estimate);
+            shadow.decision = accounting.decision.as_str();
+            shadow.limit_source = accounting.limit_source.as_str();
+            shadow.effective_limit = accounting.effective_limit.unwrap_or(0);
+            shadow.over_by_tokens = accounting.over_by_tokens;
+        }
+    }
+    shadow
+}
+
+// Whether the body carries reasoning whose length cannot be measured: ciphertext,
+// or a Responses reasoning item with an opaque payload. Key presence only.
+fn has_opaque_reasoning(body: &Value) -> bool {
+    let chat = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("reasoning_details")
+                    .and_then(Value::as_array)
+                    .is_some_and(|details| {
+                        details
+                            .iter()
+                            .any(|detail| detail.get("encrypted_content").is_some())
+                    })
+            })
+        });
+    chat || body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("reasoning")
+                    && item.get("encrypted_content").is_some()
+            })
+        })
+}
+
 // Request metadata held until the terminal response determines the event level.
 struct RequestLogContext {
     started: Instant,
@@ -1731,6 +1868,8 @@ struct RequestLogContext {
     // caller-supplied header it cannot be forged by the request itself.
     caller_peer: Option<String>,
     algorithm: Option<String>,
+    // Shadow context admission. Reported only; nothing is refused.
+    admission: Option<AdmissionShadow>,
 }
 
 // Error text carried separately so terminal logging never consumes an HTTP body.
@@ -1822,6 +1961,23 @@ impl RequestLogContext {
                     message_count = self.shape.message_count,
                     tool_count = self.shape.tool_count,
                     reasoning_kinds = %self.shape.reasoning.labels(),
+                    ctx_estimated_input_tokens = self
+                        .admission
+                        .as_ref()
+                        .map_or(0, |a| a.estimated_input_tokens),
+                    ctx_completion_reserve = self
+                        .admission
+                        .as_ref()
+                        .map_or(0, |a| a.completion_reserve),
+                    ctx_effective_limit = self.admission.as_ref().map_or(0, |a| a.effective_limit),
+                    ctx_limit_source = self.admission.as_ref().map_or("", |a| a.limit_source),
+                    ctx_shadow_decision = self.admission.as_ref().map_or("", |a| a.decision),
+                    ctx_shadow_over_by = self.admission.as_ref().map_or(0, |a| a.over_by_tokens),
+                    ctx_children_total = self.admission.as_ref().map_or(0, |a| a.children_total),
+                    ctx_children_skipped_for_size = self
+                        .admission
+                        .as_ref()
+                        .map_or(0, |a| a.children_skipped_for_size),
                     handling_duration_ms = duration_ms,
                     error,
                     $message
@@ -2617,6 +2773,7 @@ mod tests {
             },
             caller_peer: Some("100.64.0.9".to_string()),
             algorithm: Some("passthrough".to_string()),
+            admission: None,
         }
     }
 

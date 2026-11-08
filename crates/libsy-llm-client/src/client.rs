@@ -15,6 +15,7 @@ use http::StatusCode;
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value, json};
+use switchyard_protocol::correlation;
 use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
     ModelId, Request, Response, RoutedLlmClient,
@@ -1609,39 +1610,7 @@ fn omit_configured_body_fields(body: &mut Value, omit_body_fields: &BTreeSet<Str
 fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
     ["x-request-id", "request-id"]
         .iter()
-        .find_map(|name| validated_request_id(headers.get(*name)?.to_str().ok()?))
-}
-
-/// The longest identifier any provider is known to issue. A longer value is not a
-/// truncated identifier, it is something else.
-const MAX_REQUEST_ID_LEN: usize = 128;
-
-/// Accepts a header value only if it is exactly a provider identifier.
-///
-/// CORRELATION, NOT JSON SAFETY
-///
-/// The point of this value is that an operator can paste it into the provider's own
-/// log search and find the request. A value that has been "made safe" by removing
-/// characters no longer matches anything, so it is worse than no id at all: it looks
-/// like evidence and is not. The same applies to truncating a long value - the result
-/// is a different string that resolves to no request.
-///
-/// So this validates rather than repairs. Surrounding optional whitespace is trimmed
-/// (that is transport framing, not content), and every remaining byte must be an
-/// identifier character. Anything else - an embedded quote, a backslash, a comma, a
-/// newline, an empty value, an over-long value - yields `None`, and the caller records
-/// no id.
-///
-/// Identifier grammar: `A-Za-z0-9` plus `-_.:`.
-fn validated_request_id(raw: &str) -> Option<String> {
-    let trimmed = raw.trim_matches(|c: char| c == ' ' || c == '\t');
-    let identifier_shaped = !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
-    // Length is checked in bytes, which equals characters here because every byte
-    // above is ASCII.
-    (identifier_shaped && trimmed.len() <= MAX_REQUEST_ID_LEN).then(|| trimmed.to_string())
+        .find_map(|name| correlation::validated_request_id(headers.get(*name)?.to_str().ok()?))
 }
 
 /// Folds a header-borne request id into an error body, where the field-borne one lives.
@@ -1686,17 +1655,16 @@ fn with_request_id(body: String, request_id: Option<&str>) -> String {
     parsed.to_string()
 }
 
-/// Whether the document already carries a provider-supplied request id.
+/// Whether the document already carries a provider-authored request id.
 ///
-/// Checks every location the extractor recognises, nested and top level, so the two
-/// functions cannot disagree about what counts as "already named".
+/// Delegates to [`correlation::names_a_request`], the same function the server uses
+/// to report the id. Two copies of "where a provider id can live" would drift, and
+/// did: the writer once checked only structured fields, so a body whose only id was
+/// in the provider's message prose was treated as unnamed and had a header id
+/// injected over it. The reader then preferred the structured field and reported the
+/// injected value instead of the provider's.
 fn provider_named_a_request(document: &Value) -> bool {
-    const FIELDS: &[&str] = &["request_id", "requestId", "requestID"];
-    let nested = document
-        .get("error")
-        .is_some_and(|error| FIELDS.iter().any(|field| error.get(*field).is_some()));
-    let top_level = FIELDS.iter().any(|field| document.get(*field).is_some());
-    nested || top_level
+    correlation::names_a_request(document)
 }
 
 // Anthropic and Bedrock both cap a request at four blocks carrying
@@ -3861,13 +3829,16 @@ mod tests {
     // An over-long value is a different string, not the provider's id truncated.
     #[test]
     fn an_over_long_header_value_yields_no_id() {
-        let at_limit = "a".repeat(MAX_REQUEST_ID_LEN);
+        let at_limit = "a".repeat(switchyard_protocol::correlation::MAX_REQUEST_ID_LEN);
         assert_eq!(
             upstream_request_id(&header_map(&[("x-request-id", &at_limit)])).as_deref(),
             Some(at_limit.as_str()),
             "exactly at the limit is still an identifier"
         );
-        for over in ["a".repeat(MAX_REQUEST_ID_LEN + 1), "a".repeat(5_000)] {
+        for over in [
+            "a".repeat(switchyard_protocol::correlation::MAX_REQUEST_ID_LEN + 1),
+            "a".repeat(5_000),
+        ] {
             assert_eq!(
                 upstream_request_id(&header_map(&[("x-request-id", &over)])),
                 None,
@@ -3895,6 +3866,65 @@ mod tests {
         assert_eq!(
             parsed["error"]["code"],
             Value::String("invalid_request".into())
+        );
+    }
+
+    // The edge case that outlived the first round: prose is the ONLY id in the body,
+    // and a header must not be injected over it.
+    //
+    // Before the shared rule, `provider_named_a_request` checked only structured
+    // fields, so this body was treated as unnamed: the header id was written as
+    // `error.request_id`, and the server - preferring the structured field - then
+    // reported the header id instead of the provider's own. The body must be left
+    // byte-identical.
+    #[test]
+    fn a_prose_only_provider_id_is_not_overridden_by_a_header() {
+        let body = r#"{"error":{"message":"thinking mode failure (request_id: req_body_123)","type":"upstream_error"}}"#;
+        let with_header = with_request_id(body.to_string(), Some("req_header_999"));
+
+        assert_eq!(
+            with_header, body,
+            "a prose-only provider id must leave the body byte-identical"
+        );
+        assert!(
+            !with_header.contains("req_header_999"),
+            "the header id must not be injected: {with_header}"
+        );
+
+        // And the reader reports the provider's prose id, not a structured field that
+        // was never there.
+        let document: Value = serde_json::from_str(&with_header).expect("valid json");
+        assert_eq!(
+            switchyard_protocol::correlation::provider_request_id(&document).as_deref(),
+            Some("req_body_123")
+        );
+    }
+
+    // A header still supplements a body that has no id at all - the supplement is not
+    // withdrawn, only subordinated.
+    #[test]
+    fn a_header_supplements_a_body_with_no_id() {
+        let body = r#"{"error":{"message":"provider returned error","code":400}}"#;
+        let with_header = with_request_id(body.to_string(), Some("req_header_only"));
+        assert_ne!(with_header, body, "an id-free body should be supplemented");
+        let document: Value = serde_json::from_str(&with_header).expect("valid json");
+        assert_eq!(
+            switchyard_protocol::correlation::provider_request_id(&document).as_deref(),
+            Some("req_header_only")
+        );
+    }
+
+    // Control: prose that mentions a request id without carrying one must NOT count as
+    // a provider-authored id, or a header would be needlessly suppressed.
+    #[test]
+    fn prose_without_an_identifier_does_not_suppress_the_header() {
+        let body = r#"{"error":{"message":"the request id header is missing","code":400}}"#;
+        let with_header = with_request_id(body.to_string(), Some("req_header_only"));
+        let document: Value = serde_json::from_str(&with_header).expect("valid json");
+        assert_eq!(
+            switchyard_protocol::correlation::provider_request_id(&document).as_deref(),
+            Some("req_header_only"),
+            "a header must still be attached when the prose carries no id"
         );
     }
 

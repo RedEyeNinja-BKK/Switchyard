@@ -153,8 +153,15 @@ jobs:
             printf '  "artifact": "switchyard-server",\n'
             printf '  "sha256": "%s",\n' "$(sha256sum "${binary}" | cut -d' ' -f1)"
             printf '  "bytes": %s,\n' "$(stat -c%s "${binary}")"
-            printf '  "source_commit": "%s",\n' "${GITHUB_SHA}"
+            printf '  "build_commit": "%s",\n' "${GITHUB_SHA}"
             printf '  "source_ref": "%s",\n' "${GITHUB_REF}"
+            # On a pull_request trigger GITHUB_SHA is the MERGE commit, so a
+            # provenance record naming only it does not identify the code the
+            # artifact was built from. Record the head commit too, and say which
+            # is which, so an artifact can never be attributed to the wrong tree.
+            printf '  "event": "%s",\n' "${GITHUB_EVENT_NAME}"
+            printf '  "head_commit": "%s",\n' "${{ github.event.pull_request.head.sha || github.sha }}"
+            printf '  "head_ref": "%s",\n' "${{ github.head_ref || github.ref_name }}"
             printf '  "repository": "%s",\n' "${GITHUB_REPOSITORY}"
             printf '  "run_id": "%s",\n' "${GITHUB_RUN_ID}"
             printf '  "run_attempt": "%s",\n' "${GITHUB_RUN_ATTEMPT}"

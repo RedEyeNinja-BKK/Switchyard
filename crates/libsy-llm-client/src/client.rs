@@ -1609,7 +1609,7 @@ fn omit_configured_body_fields(body: &mut Value, omit_body_fields: &BTreeSet<Str
 fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
     ["x-request-id", "request-id"]
         .iter()
-        .find_map(|name| json_request_id(headers.get(*name)?.to_str().ok()?))
+        .find_map(|name| validated_request_id(headers.get(*name)?.to_str().ok()?))
 }
 
 /// The longest identifier any provider is known to issue. A longer value is not a
@@ -1633,15 +1633,15 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 /// no id.
 ///
 /// Identifier grammar: `A-Za-z0-9` plus `-_.:`.
-fn json_request_id(raw: &str) -> Option<String> {
+fn validated_request_id(raw: &str) -> Option<String> {
     let trimmed = raw.trim_matches(|c: char| c == ' ' || c == '\t');
-    if trimmed.is_empty() || trimmed.len() > MAX_REQUEST_ID_LEN {
-        return None;
-    }
-    let identifier_shaped = trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
-    identifier_shaped.then(|| trimmed.to_string())
+    let identifier_shaped = !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    // Length is checked in bytes, which equals characters here because every byte
+    // above is ASCII.
+    (identifier_shaped && trimmed.len() <= MAX_REQUEST_ID_LEN).then(|| trimmed.to_string())
 }
 
 /// Folds a header-borne request id into an error body, where the field-borne one lives.

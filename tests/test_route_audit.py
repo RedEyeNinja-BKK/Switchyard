@@ -17,8 +17,6 @@ Two of these controls are here because the first version of the audit was wrong:
     credential rule is opt-in and only fires for a pair the caller declares.
 """
 
-import copy
-import json
 import os
 import sys
 import tomllib
@@ -143,9 +141,7 @@ def test_mixing_declared_exclusive_credentials_is_refused(manifest):
     # Same manifest, but the caller declares these two clients must not share a
     # route. Which accounts those are is deployment knowledge, not a constant.
     manifest["routes"]["direct-remote-b-flash"]["candidates"] = ["remote-a-omni"]
-    failures = verdict(
-        manifest, advertised_from(manifest), ({"remote_a", "remote_b"},)
-    )
+    failures = verdict(manifest, advertised_from(manifest), ({"remote_a", "remote_b"},))
     assert any("mixes credentials" in failure for failure in failures), failures
 
 
@@ -163,8 +159,8 @@ def test_an_unknown_target_client_is_refused(manifest):
 
 def test_inventory_covers_every_definition_including_composites(manifest):
     inventory, _ = route_audit.audit(manifest, advertised_from(manifest))
-    leaves = {name for name in manifest["routes"]}
-    composites = {name for name in manifest.get("composites", {})}
+    leaves = set(manifest["routes"])
+    composites = set(manifest.get("composites", {}))
     rows = {row["route"] for row in inventory}
     # No definition may disappear from the audit because another shares its model.
     assert rows == leaves | composites

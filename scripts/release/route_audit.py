@@ -171,7 +171,7 @@ def audit(
 
         if is_bounded(name) and route.get("route_reasoning_policy") != "none":
             failures.append(
-                f"{name}: bounded route must pin route_reasoning_policy = \"none\", "
+                f'{name}: bounded route must pin route_reasoning_policy = "none", '
                 f"found {route.get('route_reasoning_policy')!r}"
             )
 
@@ -182,9 +182,7 @@ def audit(
             elif child not in routes:
                 failures.append(f"{name}: unknown child {child!r}")
             elif is_bounded(name) and not is_bounded(child):
-                failures.append(
-                    f"{name}: bounded composite names unbounded child {child!r}"
-                )
+                failures.append(f"{name}: bounded composite names unbounded child {child!r}")
         inventory.append(
             {
                 "route": name,
@@ -246,9 +244,7 @@ def main(argv: list[str]) -> int:
         parser.error("provide a captured models payload or --models-url")
 
     exclusive = tuple(
-        set(pair.split(","))
-        for pair in args.exclusive_credentials
-        if len(pair.split(",")) == 2
+        set(pair.split(",")) for pair in args.exclusive_credentials if len(pair.split(",")) == 2
     )
     for pair in args.exclusive_credentials:
         if len(pair.split(",")) != 2:

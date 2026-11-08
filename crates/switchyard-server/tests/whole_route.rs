@@ -91,6 +91,43 @@ fn script(request: &str, body: &Value) -> (u16, String) {
         .unwrap_or_default();
     let _ = request;
     if model.contains("always-400") {
+        // The shapes below are the ones real providers were measured returning on
+        // 2026-11-08; each is a distinct way a correlation id can appear.
+        if model.contains("prose-id") {
+            // DeepSeek writes the id into the message text, on both its APIs.
+            return (
+                400,
+                json!({"error": {
+                    "message": "The `reasoning_text` in the thinking mode must be passed back to the API. (request_id: 75ed4351-0ca1-4ca4-ba16-1f96097160d9)",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error"
+                }})
+                .to_string(),
+            );
+        }
+        if model.contains("nested-id") {
+            return (
+                400,
+                json!({"error": {
+                    "message": "bad request",
+                    "code": "invalid_request",
+                    "request_id": "req_nested_structured"
+                }})
+                .to_string(),
+            );
+        }
+        if model.contains("top-level-id") {
+            // A bare top-level `id` is the response OBJECT id, not a request id.
+            // Reporting it as one would mislabel the correlation.
+            return (
+                400,
+                json!({
+                    "id": "resp_object_id_must_not_be_used",
+                    "error": {"message": "bad request", "code": "invalid_request"}
+                })
+                .to_string(),
+            );
+        }
         return (
             400,
             json!({"error": {"message": "bad request", "code": "invalid_request"}}).to_string(),
@@ -1996,4 +2033,172 @@ context_window = 400000
         seen_models(&small).await
     );
     assert_eq!(large.calls(), 1);
+}
+
+// ---- request-log capture -------------------------------------------------
+//
+// The request log is the only place the correlation fields exist, so a test that
+// asserts them has to read the emitted event rather than the response body.
+
+#[derive(Clone, Default)]
+struct CapturedEvents(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl tracing_subscriber::Layer<tracing_subscriber::Registry> for CapturedEvents {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, tracing_subscriber::Registry>,
+    ) {
+        if event.metadata().target() != "switchyard_server::request" {
+            return;
+        }
+        let mut rendered = String::new();
+        event.record(
+            &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                rendered.push_str(&format!("{}={value:?} ", field.name()));
+            },
+        );
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), rendered));
+    }
+}
+
+/// Runs `future` to completion under a subscriber that records request-log events.
+///
+/// The subscriber is installed as the current-thread default and the future is
+/// awaited on that thread, which is what `#[tokio::test]` gives: no nested runtime,
+/// and the handler's own events are captured.
+async fn capture_request_events<F: std::future::Future>(
+    future: F,
+) -> (F::Output, Vec<(tracing::Level, String)>) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let captured = CapturedEvents::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    let output = future.await;
+    drop(guard);
+    let events = captured.0.lock().unwrap().clone();
+    (output, events)
+}
+
+/// A provider that writes its request id into the error message reaches the log.
+///
+/// End-to-end through the real router: a real HTTP upstream answers 400 with the
+/// DeepSeek-shaped body measured on 2026-11-08, and the terminal log line carries the
+/// id extracted from that prose. The message text itself must not follow it.
+#[tokio::test]
+async fn a_prose_request_id_reaches_the_request_log() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    let config = format!(
+        "schema_version = 1\n{}",
+        leaf_named("leaf", &base, &["always-400-prose-id"], "")
+    );
+    let body = json!({ "model": "leaf", "input": "hi", "max_output_tokens": 8 });
+    let (response, events) = capture_request_events(call(runner(&config), "leaf", body)).await;
+    assert_eq!(
+        response.0,
+        StatusCode::BAD_REQUEST,
+        "upstream 400 is surfaced"
+    );
+
+    let line = events
+        .iter()
+        .find(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, text)| text)
+        .expect("a failure line");
+    assert!(
+        line.contains("75ed4351-0ca1-4ca4-ba16-1f96097160d9"),
+        "the prose request id must be logged: {line}"
+    );
+    assert!(
+        !line.contains("reasoning_text") && !line.contains("passed back"),
+        "the provider message must not be logged: {line}"
+    );
+}
+
+/// A structured `error.request_id` reaches the log too.
+#[tokio::test]
+async fn a_structured_request_id_reaches_the_request_log() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    let config = format!(
+        "schema_version = 1\n{}",
+        leaf_named("leaf", &base, &["always-400-nested-id"], "")
+    );
+    let body = json!({ "model": "leaf", "input": "hi", "max_output_tokens": 8 });
+    let (response, events) = capture_request_events(call(runner(&config), "leaf", body)).await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+
+    let line = events
+        .iter()
+        .find(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, text)| text)
+        .expect("a failure line");
+    assert!(
+        line.contains("req_nested_structured"),
+        "the structured id must be logged: {line}"
+    );
+}
+
+/// A bare top-level `id` is a response object id and must never be logged as the
+/// provider's request id.
+#[tokio::test]
+async fn a_top_level_object_id_is_not_reported_as_a_request_id() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    let config = format!(
+        "schema_version = 1\n{}",
+        leaf_named("leaf", &base, &["always-400-top-level-id"], "")
+    );
+    let body = json!({ "model": "leaf", "input": "hi", "max_output_tokens": 8 });
+    let (response, events) = capture_request_events(call(runner(&config), "leaf", body)).await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+
+    let line = events
+        .iter()
+        .find(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, text)| text)
+        .expect("a failure line");
+    assert!(
+        !line.contains("resp_object_id_must_not_be_used"),
+        "a response object id must not be reported as a request id: {line}"
+    );
+    assert!(
+        line.contains("upstream_request_id=\"\""),
+        "with no request id the field must be empty: {line}"
+    );
+}
+
+/// Control: a provider that supplies no id must log an empty field, not a made-up one
+/// and not the response body's object id.
+#[tokio::test]
+async fn a_provider_without_an_id_logs_no_request_id() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    let config = format!(
+        "schema_version = 1\n{}",
+        leaf_named("leaf", &base, &["always-400"], "")
+    );
+    let runner = runner(&config);
+    let body = json!({
+        "model": "leaf",
+        "input": "hi",
+        "max_output_tokens": 8
+    });
+    let (response, events) = capture_request_events(call(runner, "leaf", body)).await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+
+    let line = events
+        .iter()
+        .find(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, text)| text)
+        .expect("a failure line");
+    assert!(
+        line.contains("upstream_request_id=\"\""),
+        "no id must be reported as empty: {line}"
+    );
 }

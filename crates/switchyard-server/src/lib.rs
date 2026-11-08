@@ -69,11 +69,6 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 const HEADER_SELECTED_MODEL: &str = "x-model-router-selected-model";
 
-// Header Switchyard stamps with the provider-assigned request id of the final
-// upstream attempt, so a failure can be correlated with the provider's own logs
-// without logging either the request body or the error body.
-const HEADER_UPSTREAM_REQUEST_ID: &str = "x-switchyard-upstream-request-id";
-
 const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
     "baggage",
     "openai-processing-ms",
@@ -1763,14 +1758,13 @@ impl RequestLogFailure {
     // retained, copied into a log field, or returned to the caller. The scan is
     // bounded so a pathological body cannot turn diagnostics into work.
     fn from_error_body(body: &str) -> Option<String> {
+        const FIELDS: &[&str] = &["request_id", "requestId", "requestID"];
         if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-            for value in [parsed.get("error"), parsed.get("id")]
-                .into_iter()
-                .flatten()
-            {
-                for field in ["request_id", "requestId", "requestID"] {
-                    if let Some(id) = value
-                        .get(field)
+            // 1. Nested under `error`, which is the OpenAI-shaped location.
+            if let Some(error) = parsed.get("error") {
+                for field in FIELDS {
+                    if let Some(id) = error
+                        .get(*field)
                         .and_then(Value::as_str)
                         .filter(|id| !id.is_empty())
                     {
@@ -1778,8 +1772,21 @@ impl RequestLogFailure {
                     }
                 }
             }
-            // Fall through to message-text extraction: a provider may put the id
-            // only inside `error.message`.
+            // 2. Top level, which is Anthropic's shape (`{"type":"error",
+            //    "request_id":"req_..."}`). Deliberately not a bare top-level `id`:
+            //    that is the response OBJECT id (`resp_...`, `chatcmpl_...`), not a
+            //    request id, and logging it as one would mislabel the correlation.
+            for field in FIELDS {
+                if let Some(id) = parsed
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    return Some(id.to_string());
+                }
+            }
+            // 3. Written into the message text, which is where DeepSeek puts it:
+            //    measured 2026-11-08 on both its Chat and Responses error bodies.
             if let Some(message) = parsed
                 .get("error")
                 .and_then(|error| error.get("message"))
@@ -1844,14 +1851,12 @@ impl RequestLogContext {
             .get::<RequestLogFailure>()
             .cloned()
             .unwrap_or_default();
-        // The provider's request id travels in a forwarded response header when the
-        // upstream supplied one; otherwise an error body field is the only source.
-        let upstream_request_id = response
-            .headers()
-            .get(HEADER_UPSTREAM_REQUEST_ID)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-            .or(failure.upstream_request_id.as_deref().map(str::to_string));
+        // A failed request carries no upstream response headers: the client turns a
+        // non-success status into an error and drops them, so the id a failure
+        // reports can only come from its error body -- a structured field or the
+        // provider's own prose. Reading a forwarded header here would be dead code
+        // that claims a capability the failure path does not have.
+        let upstream_request_id = failure.upstream_request_id.clone();
 
         // Composite facts are decided by the runner and carried on the response for
         // telemetry; absent on a leaf route, which is itself meaningful.
@@ -2809,47 +2814,58 @@ mod tests {
         }
     }
 
+    // One case per id shape a provider was measured returning on 2026-11-08, plus a
+    // negative control for the shape that is NOT a request id.
     #[test]
-    fn failed_log_line_carries_upstream_request_id_without_message_text() {
-        // A request that the upstream rejected carries its `request_id` into the
-        // terminal log line, so the failure can be found in the provider's own
-        // logs. The error message text must not follow it.
+    fn the_request_id_is_read_from_every_structured_location() {
+        for body in [
+            // Nested under `error`, the OpenAI-shaped location.
+            r#"{"error":{"message":"x","code":"upstream_error","request_id":"req_nested"}}"#,
+            r#"{"error":{"message":"x","code":"upstream_error","requestId":"req_nested_camel"}}"#,
+            // Top level, which is Anthropic's shape.
+            r#"{"type":"error","error":{"message":"x"},"request_id":"req_top"}"#,
+        ] {
+            let id = RequestLogFailure::from_error_body(body)
+                .unwrap_or_else(|| panic!("no id recovered from {body}"));
+            assert!(id.starts_with("req_"), "{body} -> {id}");
+        }
+    }
+
+    // A bare top-level `id` is the response OBJECT id, not a request id. Taking it
+    // would put a `resp_...` value next to a provider's logs where it does not exist.
+    #[test]
+    fn a_top_level_object_id_is_not_treated_as_a_request_id() {
+        let body = r#"{"id":"resp_object_id","error":{"message":"x","code":"upstream_error"}}"#;
+        assert_eq!(RequestLogFailure::from_error_body(body), None);
+    }
+
+    // DeepSeek writes the id only into the message text, on both of its APIs.
+    #[test]
+    fn the_request_id_is_read_from_provider_prose() {
+        let body = r#"{"error":{"message":"The supported API model names are deepseek-flash. (request_id: 75ed4351-0ca1-4ca4-ba16-1f96097160d9)","code":"invalid_request_error"}}"#;
+        assert_eq!(
+            RequestLogFailure::from_error_body(body).as_deref(),
+            Some("75ed4351-0ca1-4ca4-ba16-1f96097160d9")
+        );
+    }
+
+    // The log line carries the id and never the message that surrounded it.
+    #[test]
+    fn failed_log_line_carries_the_id_without_the_message_text() {
         const MISSING: &str = "missing reasoning evidence";
         let body = format!(
             r#"{{"error":{{"message":"{MISSING}","type":"upstream_error","code":"upstream_error","request_id":"req_test_123"}}}}"#
         );
-        let mut response = render_error_response(
+        let response = render_error_response(
             upstream_error(StatusCode::BAD_REQUEST, &body),
             WireFormat::OpenAiChat,
         );
-        response.headers_mut().insert(
-            HEADER_UPSTREAM_REQUEST_ID,
-            "req_from_header".parse().expect("valid header"),
-        );
         let events = captured_events(|| request_log_context().emit(&response));
 
         assert_eq!(events.len(), 1);
-        assert!(events[0].1.contains("req_from_header"), "{}", events[0].1);
+        assert!(events[0].1.contains("req_test_123"), "{}", events[0].1);
         assert!(events[0].1.contains("upstream_rejected"), "{}", events[0].1);
         assert!(!events[0].1.contains(MISSING), "{}", events[0].1);
-        // The header value wins over the body field: a header is provider-stamped,
-        // so it identifies the final upstream attempt.
-        assert!(!events[0].1.contains("req_test_123"), "{}", events[0].1);
-    }
-
-    #[test]
-    fn failed_log_line_reads_upstream_request_id_from_body() {
-        let body =
-            r#"{"error":{"message":"x","code":"upstream_error","request_id":"req_body_only"}}"#;
-        let response = render_error_response(
-            upstream_error(StatusCode::BAD_REQUEST, body),
-            WireFormat::OpenAiChat,
-        );
-        let events = captured_events(|| request_log_context().emit(&response));
-
-        assert_eq!(events.len(), 1);
-        assert!(events[0].1.contains("req_body_only"), "{}", events[0].1);
-        assert!(events[0].1.contains("upstream_rejected"), "{}", events[0].1);
     }
 
     #[test]

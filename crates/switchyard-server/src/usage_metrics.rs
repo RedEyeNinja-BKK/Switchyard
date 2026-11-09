@@ -89,12 +89,18 @@ pub(crate) fn observe(
             LlmResponse::Agg(agg)
         }
         LlmResponse::Stream(mut stream) => {
+            // Constructed BEFORE the generator, not inside it: `async_stream::stream!`
+            // does not run its body until the first poll, so a guard built in the body
+            // does not exist for a response the consumer never polls. Such a stream is
+            // still abandoned, and the routed-call metric already counts it as a failure,
+            // so constructing it here is what keeps the log and the counter agreeing.
+            // The generator captures it by move and it is dropped with the response,
+            // whether or not that response was ever polled.
+            let mut drop_reporter = StreamDropReporter::new(&model);
             let wrapped = async_stream::stream! {
                 let mut latest_usage = None;
                 let mut terminal_seen = false;
                 let mut recorded = false;
-                // Reports a stream the consumer abandons, which leaves no other trace.
-                let mut drop_reporter = StreamDropReporter::new(&model);
                 while let Some(item) = stream.next().await {
                     let termination = item_termination(&item);
                     let failed = termination.is_some();
@@ -933,5 +939,32 @@ mod tests {
         let warnings = warnings_of(observed(source), None).await;
 
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A response the consumer drops without ever polling it was still abandoned.
+    ///
+    /// `async_stream::stream!` does not run its body until the first poll, so a guard
+    /// constructed inside the body does not exist yet for an unpolled stream. That is a
+    /// real shape: a caller that discards a response after inspecting headers, or gives
+    /// up before reading. The routed-call metric already counts this case as a failure
+    /// (an unset outcome), so a log that stays silent here would disagree with the
+    /// counter it is supposed to explain.
+    #[tokio::test]
+    async fn a_stream_never_polled_reports_the_consumer() {
+        let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::MessageStop { reason: None },
+        ]))]);
+
+        let warnings = warnings_of(observed(source), Some(0)).await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "an unpolled response is abandoned, not completed: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("consumer_dropped"),
+            "the cause must name the consumer: {warnings:?}"
+        );
     }
 }

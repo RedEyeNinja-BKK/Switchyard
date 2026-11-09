@@ -2202,3 +2202,145 @@ async fn a_provider_without_an_id_logs_no_request_id() {
         "no id must be reported as empty: {line}"
     );
 }
+
+// ---- shadow context-admission -------------------------------------------
+//
+// Shadow admission is a measurement. It computes what a future enforcement rule
+// would decide and reports it on the request log; it must never change what the
+// caller or the provider sees. These two tests pin that boundary end to end, so a
+// change that turns the shadow into a gate fails here rather than in production.
+
+/// A leaf route declaring its own context window.
+///
+/// The shared `leaf` helpers declare none, which is the ordinary production shape.
+/// Shadow admission only has a verdict when a window is declared, so these tests
+/// need a route where the window is explicit.
+fn leaf_with_window(id: &str, base_url: &str, candidates: &[&str], window: u32) -> String {
+    let client = format!("client-{id}");
+    let mut targets = String::new();
+    let mut ids = Vec::new();
+    let mut first = None;
+    for candidate in candidates {
+        let name = format!("{candidate}-{id}");
+        targets.push_str(&format!(
+            "\n[targets.{name}]\nid = \"vendor/{candidate}\"\nllm_client = \"{client}\"\n"
+        ));
+        if first.is_none() {
+            first = Some(name.clone());
+        } else {
+            ids.push(format!("\"{name}\""));
+        }
+    }
+    let first = first.unwrap_or_default();
+    format!(
+        r#"
+[llm_clients.{client}]
+format = "openai_responses"
+base_url = "{base_url}"
+{targets}
+[routes.{id}]
+id = "{id}"
+type = "passthrough"
+target = "{first}"
+candidates = [{}]
+context_window = {window}
+"#,
+        ids.join(", ")
+    )
+}
+
+/// The single request-log event a completed request must produce.
+///
+/// Asserting the count first keeps every field assertion below honest: a search for
+/// a field in an empty set would otherwise pass by finding nothing.
+fn only_request_line(events: &[(tracing::Level, String)]) -> &str {
+    assert_eq!(
+        events.len(),
+        1,
+        "a completed request emits exactly one request-log event, got {events:?}"
+    );
+    &events[0].1
+}
+
+/// An oversized request on a declared-window leaf is classified `refuse` - and still
+/// served by the provider.
+///
+/// This is the production shape that motivated shadow admission: a leaf route with no
+/// local size check, where the provider is the only thing that rejects. The shadow now
+/// names that verdict ahead of the call; the call itself must be untouched.
+#[tokio::test]
+async fn a_shadow_refusal_still_reaches_the_provider() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    // ~40k ASCII characters, estimated at ~10k input tokens, plus a 1k output
+    // reservation, against a declared 1,024-token window: refuse at the point estimate.
+    let filler = "x".repeat(40_000);
+    let config = format!(
+        "schema_version = 1\n{}",
+        leaf_with_window("small", &base, &["a1"], 1_024)
+    );
+    let body = json!({
+        "model": "small",
+        "input": filler,
+        "max_output_tokens": 1_024
+    });
+
+    let (response, events) = capture_request_events(call(runner(&config), "small", body)).await;
+
+    let line = only_request_line(&events);
+    assert!(
+        line.contains("ctx_shadow_decision=\"refuse\""),
+        "the shadow must classify this request as over the window: {line}"
+    );
+    assert!(
+        line.contains("ctx_limit_source=\"declared\"")
+            && line.contains("ctx_effective_limit=1024 "),
+        "the verdict must come from the declared window, not a guess: {line}"
+    );
+
+    // The whole point: the shadow reported a refusal and blocked nothing.
+    assert_eq!(
+        upstream.calls(),
+        1,
+        "a shadow refusal must not stop the provider call"
+    );
+    assert_eq!(
+        response.0,
+        StatusCode::OK,
+        "the caller must see the provider's own status, not a local rejection"
+    );
+    assert_eq!(
+        response.1["id"], "resp_ok",
+        "the provider's own body must reach the caller"
+    );
+}
+
+/// Control: the same route and the same handler, with a request the window holds.
+///
+/// If the shadow were accidentally enforcing, the oversized case above could fail for
+/// a different reason than the control passing for a trivial one. Sharing the route
+/// config leaves request size as the only difference between the two.
+#[tokio::test]
+async fn a_request_the_shadow_admits_is_unchanged() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    let config = format!(
+        "schema_version = 1\n{}",
+        leaf_with_window("small", &base, &["a1"], 1_024)
+    );
+    let body = json!({
+        "model": "small",
+        "input": "hi",
+        "max_output_tokens": 8
+    });
+
+    let (response, events) = capture_request_events(call(runner(&config), "small", body)).await;
+
+    let line = only_request_line(&events);
+    assert!(
+        line.contains("ctx_shadow_decision=\"admit\""),
+        "a small request inside a declared window is admitted: {line}"
+    );
+    assert_eq!(upstream.calls(), 1);
+    assert_eq!(response.0, StatusCode::OK);
+}

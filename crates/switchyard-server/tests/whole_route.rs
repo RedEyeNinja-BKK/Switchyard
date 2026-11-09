@@ -2344,3 +2344,54 @@ async fn a_request_the_shadow_admits_is_unchanged() {
     assert_eq!(upstream.calls(), 1);
     assert_eq!(response.0, StatusCode::OK);
 }
+
+/// The composite branch of the shadow is wired, and it is wired to the same rule
+/// routing already uses: a child too small for the request is skipped, and the
+/// composite is not the smallest child.
+///
+/// The arithmetic is unit-tested in the runner; what this covers is the server-side
+/// plumbing - resolving each child's declared window through the runner, mapping the
+/// result onto the log fields, and not panicking on a request that reaches the
+/// composite path in production.
+#[tokio::test]
+async fn the_shadow_reports_a_composite_verdict_from_its_children() {
+    let small = Upstream::new();
+    let large = Upstream::new();
+    let small_url = small.clone().server();
+    let large_url = large.clone().server();
+
+    // ~10k estimated input tokens: over the small child's 1,024 window, well inside
+    // the large child's 400,000.
+    let filler = "x".repeat(40_000);
+    let config = format!(
+        "schema_version = 1\n{}\n{}\n[composites.tier]\nchildren = [\"small\", \"large\"]\ncontext_window = 400000\n",
+        leaf_with_window("small", &small_url, &["a1"], 1_024),
+        leaf_with_window("large", &large_url, &["a1"], 400_000)
+    );
+    let body = json!({
+        "model": "tier",
+        "input": filler,
+        "max_output_tokens": 1_024
+    });
+
+    let (response, events) = capture_request_events(call(runner(&config), "tier", body)).await;
+
+    let line = only_request_line(&events);
+    assert!(
+        line.contains("ctx_shadow_decision=\"admit\""),
+        "one child can take the request, so the composite admits: {line}"
+    );
+    assert!(
+        line.contains("ctx_children_total=2") && line.contains("ctx_children_skipped_for_size=1"),
+        "the shadow must report each child it evaluated and the one it skipped: {line}"
+    );
+    assert!(
+        line.contains("ctx_effective_limit=400000"),
+        "the reported window is the widest child, not the smallest: {line}"
+    );
+
+    // The skip is the existing, enforced routing rule, not shadow enforcement.
+    assert_eq!(small.calls(), 0, "the too-small child is skipped");
+    assert_eq!(large.calls(), 1, "the composable child serves");
+    assert_eq!(response.0, StatusCode::OK);
+}

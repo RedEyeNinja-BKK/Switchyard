@@ -175,6 +175,19 @@ struct RouteConfig {
     video: Option<bool>,
     /// Reasoning policy for this route. Applies on top of the target's factual policy.
     route_reasoning_policy: Option<RouteReasoningPolicy>,
+    /// Whether this route's reasoning policy is applied on a best-effort basis.
+    ///
+    /// Absent or `false` keeps the strict behaviour: a route policy the target cannot
+    /// express is a configuration error, because a route that reads as authoritative and
+    /// silently does nothing is a misconfiguration.
+    ///
+    /// `true` is for routes whose fallbacks are interchangeable models rather than a
+    /// designed lineup. Such a fallback is left to its own native reasoning behaviour
+    /// instead of being rejected, so replacing it stays a configuration-only change. The
+    /// policy is still applied to every target that can carry it, so opting in never
+    /// alters a target that could honour it — and it is scoped to this route, so a target
+    /// shared with another route keeps that route's strictness.
+    route_reasoning_policy_best_effort: bool,
     /// Estimated input tokens above which this route escalates to a wider-context leg.
     escalation_max_input_tokens: Option<u64>,
     /// Target this route prefers once it is under context pressure.
@@ -242,6 +255,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let vision = take_optional(&mut table, "vision")?;
         let video = take_optional(&mut table, "video")?;
         let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
+        let route_reasoning_policy_best_effort: Option<bool> =
+            take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -254,6 +269,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             vision,
             video,
             route_reasoning_policy,
+            route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
             escalation_target,
             algorithm,
@@ -527,14 +543,28 @@ impl DeploymentConfig {
                         if target.reasoning_effort.is_some() {
                             continue;
                         }
-                        requested
-                            .validate_for(target.reasoning_dialect)
-                            .map_err(|error| {
-                                RunnerError::configuration(format!(
-                                    "route {route_name} reasoning policy cannot be applied \
-                                     to target {target_name}: {error}"
-                                ))
-                            })?;
+                        if let Err(error) = requested.validate_for(target.reasoning_dialect) {
+                            if config.route_reasoning_policy_best_effort {
+                                // This route declared its policy best-effort, so a target
+                                // that cannot carry it keeps its own native reasoning
+                                // behaviour instead of being rejected. The policy is still
+                                // applied to every target that can express it, and the
+                                // request-time path already omits the fragment for a
+                                // dialect with no representation, so nothing unsupported is
+                                // sent to this one.
+                                tracing::debug!(
+                                    route = %route_name,
+                                    target = %target_name,
+                                    "route reasoning policy not expressible by target; \
+                                     leaving it to its native behaviour"
+                                );
+                                continue;
+                            }
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} reasoning policy cannot be applied \
+                                 to target {target_name}: {error}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2582,6 +2612,84 @@ new = ["send_message"]
             message.contains("route passthrough reasoning policy cannot be applied"),
             "a medium policy on an effort-only dialect must be rejected, got: {message}"
         );
+    }
+
+    /// A fallback that cannot express the route's reasoning policy is rejected by default.
+    ///
+    /// The primary can carry the policy and the fallback cannot, which is exactly the shape
+    /// of a bounded route whose second model has no reasoning switch. Rejecting is the
+    /// strict default: a route that reads as authoritative and silently does nothing on one
+    /// of its models is a misconfiguration.
+    #[test]
+    fn an_unexpressible_route_policy_on_a_fallback_is_rejected_by_default() {
+        let configured = best_effort_fixture(false);
+
+        let message = error_message(&configured);
+        assert!(
+            message.contains("route passthrough reasoning policy cannot be applied to target weak"),
+            "a fallback with no dialect must be rejected unless the route opts in, got: {message}"
+        );
+    }
+
+    /// The same route loads when it declares that its policy is best-effort.
+    ///
+    /// This is what keeps a fallback model a configuration-only concern: the model that
+    /// cannot express "no thinking" is still eligible and simply runs its native behaviour.
+    #[test]
+    fn a_best_effort_route_admits_a_fallback_that_cannot_carry_its_policy() {
+        runner_from_toml(&best_effort_fixture(true))
+            .expect("a best-effort route must load with an unexpressible fallback");
+
+        // Positive control: the same fixture without the opt-in is still refused, so this
+        // test is about the flag rather than about a fixture that never failed.
+        assert!(
+            runner_from_toml(&best_effort_fixture(false)).is_err(),
+            "the strict default must remain strict"
+        );
+    }
+
+    /// The opt-in is scoped to the route that declares it.
+    ///
+    /// A target is shared between routes, so the fallback's dialect cannot decide the
+    /// policy for every route that happens to reach it: a second route reaching the same
+    /// models without the opt-in must still be refused.
+    #[test]
+    fn best_effort_does_not_weaken_another_route_sharing_the_same_target() {
+        let strict_sibling = "[routes.strict-sibling]\nid = \"strict-sibling\"\ntype = \"passthrough\"\ntarget = \"strong\"\ncandidates = [\"weak\"]\nroute_reasoning_policy = \"none\"";
+        let optimistic = best_effort_fixture(true);
+        assert!(
+            !optimistic.contains("[routes.strict-sibling]"),
+            "the sibling route must be added here"
+        );
+
+        let message = error_message(&(optimistic + "\n" + strict_sibling));
+        assert!(
+            message.contains("route strict-sibling reasoning policy cannot be applied"),
+            "a route without the opt-in must stay strict, got: {message}"
+        );
+    }
+
+    /// The shared fixture: a route whose primary can express "no thinking" and whose
+    /// fallback cannot. `strong` is given a dialect; `weak` deliberately has none.
+    fn best_effort_fixture(best_effort: bool) -> String {
+        let strong = "[targets.strong]\nid = \"strong/model\"\nllm_client = \"responses\"";
+        assert!(
+            VALID_CONFIG.contains(strong),
+            "the strong target fixture must exist verbatim"
+        );
+        let passthrough = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"weak\"";
+        let route = "[routes.passthrough]\nid = \"switchyard/passthrough\"\ntype = \"passthrough\"\ntarget = \"strong\"\ncandidates = [\"weak\"]\nroute_reasoning_policy = \"none\"";
+        let route = if best_effort {
+            format!("{route}\nroute_reasoning_policy_best_effort = true")
+        } else {
+            route.to_string()
+        };
+        VALID_CONFIG
+            .replace(
+                strong,
+                &format!("{strong}\nreasoning_dialect = \"openai_effort\""),
+            )
+            .replace(passthrough, &route)
     }
 
     /// A threshold of zero means "every request", because the estimator floors at the

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use opentelemetry::{KeyValue, global};
-use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
+use switchyard_protocol::{
+    LlmClientError, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Response, Usage,
+};
 
 use crate::SharedRoutingLog;
 use std::sync::Arc;
@@ -91,17 +93,11 @@ pub(crate) fn observe(
                 let mut latest_usage = None;
                 let mut terminal_seen = false;
                 let mut recorded = false;
+                // Reports a stream the consumer abandons, which leaves no other trace.
+                let mut drop_reporter = StreamDropReporter::new(&model);
                 while let Some(item) = stream.next().await {
-                    let failed = match &item {
-                        Err(_) => true,
-                        Ok(event) => event.normalized().iter().any(|chunk| {
-                            matches!(
-                                chunk,
-                                LlmResponseChunk::StreamError { .. }
-                                    | LlmResponseChunk::DecodeError { .. }
-                            )
-                        }),
-                    };
+                    let termination = item_termination(&item);
+                    let failed = termination.is_some();
                     if let Ok(event) = &item {
                         for chunk in event.normalized() {
                             match chunk {
@@ -115,20 +111,37 @@ pub(crate) fn observe(
                             }
                         }
                     }
-                    if failed {
+                    if let Some(reason) = termination {
                         record_stream_error(&stats, &model);
                         // A streamed request has already answered HTTP 200, so the
                         // terminal request log line cannot report this death. Emit a
-                        // distinct event with the served model and a stage marker so a
-                        // mid-stream failure is observable instead of looking like a
-                        // clean 200. No upstream text is included.
+                        // distinct event with the served model, a stage marker and the
+                        // category that ended the stream, so a mid-stream failure is
+                        // observable instead of looking like a clean 200, and is not left
+                        // as four identical warnings nobody can attribute.
+                        //
+                        // `upstream_status` is 0 when the failure carried no HTTP status,
+                        // because 0 is not a status any provider can return. The provider's
+                        // text is deliberately absent: `StreamError` and `DecodeError` carry
+                        // a human-readable message that originates upstream, and a log is
+                        // not a place for it.
                         tracing::event!(
                             target: "switchyard_server::request",
                             tracing::Level::WARN,
                             selected_model = %model,
                             failure_stage = "stream",
+                            termination_reason = reason.as_str(),
+                            upstream_status = item_termination_status(&item),
                             "LLM stream failed"
                         );
+                        // The failure is now reported; dropping the stream afterwards is
+                        // not a second event.
+                        drop_reporter.disarm();
+                    }
+                    // A terminal event ends the stream on its own terms: a caller that
+                    // then stops reading is behaving normally, not abandoning it.
+                    if terminal_seen {
+                        drop_reporter.disarm();
                     }
                     // Responses clients may stop polling immediately after the terminal event.
                     // Commit first when that event already carries the final usage.
@@ -187,6 +200,8 @@ pub(crate) fn observe(
                         }
                     }
                 }
+                // The stream ended on its own, so its drop is not an abandoned one.
+                drop_reporter.disarm();
             };
             LlmResponse::Stream(Box::pin(wrapped))
         }
@@ -202,6 +217,157 @@ pub(crate) fn observe(
 // Records a terminal stream failure after the routed call was already counted.
 fn record_stream_error(stats: &StatsAccumulator, model: &str) {
     stats.record_response_error(model);
+}
+
+/// Why a routed stream stopped before delivering a terminal event.
+///
+/// A closed set on purpose. Four warnings that all read "LLM stream failed" were reported
+/// against one model with no way to tell a lost connection from an elapsed deadline, so
+/// the category is now part of the event. Every variant is decided here from structure
+/// only: the messages carried by [`LlmResponseChunk::StreamError`] and
+/// [`LlmResponseChunk::DecodeError`] are upstream text and are never retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamTermination {
+    /// The upstream delivered an error event inside an otherwise open stream.
+    UpstreamStreamError,
+    /// A frame arrived that this side could not decode.
+    DecodeError,
+    /// The connection failed or was lost mid-stream.
+    Transport,
+    /// A deadline elapsed while the stream was open.
+    Timeout,
+    /// The upstream answered with a non-success status mid-stream.
+    UpstreamHttp,
+    /// The upstream response could not be decoded as a whole.
+    InvalidResponse,
+    /// A failure this module does not classify. Kept so that adding a variant to
+    /// [`LlmClientError`] cannot silently land in a category that claims something else.
+    Other,
+    /// The stream was dropped by its consumer before it ended.
+    ConsumerDropped,
+}
+
+impl StreamTermination {
+    /// Stable value used when logging.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamStreamError => "upstream_stream_error",
+            Self::DecodeError => "decode_error",
+            Self::Transport => "transport",
+            Self::Timeout => "timeout",
+            Self::UpstreamHttp => "upstream_http",
+            Self::InvalidResponse => "invalid_response",
+            Self::Other => "other",
+            Self::ConsumerDropped => "consumer_dropped",
+        }
+    }
+}
+
+/// One item of a routed stream, as this module receives it.
+type StreamItem = Result<LlmResponseStreamEvent, LlmClientError>;
+
+/// Classifies one stream item; `None` when the item is not a failure.
+///
+/// An item carrying both an upstream error and a decode error is reported as the upstream
+/// error, because that is the cause and the decode failure is what it produced.
+fn item_termination(item: &StreamItem) -> Option<StreamTermination> {
+    match item {
+        Err(error) => Some(termination_of(error)),
+        Ok(event) => {
+            if event
+                .normalized()
+                .iter()
+                .any(|chunk| matches!(chunk, LlmResponseChunk::StreamError { .. }))
+            {
+                Some(StreamTermination::UpstreamStreamError)
+            } else if event
+                .normalized()
+                .iter()
+                .any(|chunk| matches!(chunk, LlmResponseChunk::DecodeError { .. }))
+            {
+                Some(StreamTermination::DecodeError)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Classifies a transport-level stream failure without retaining its message.
+fn termination_of(error: &LlmClientError) -> StreamTermination {
+    match error {
+        LlmClientError::Transport { .. } => StreamTermination::Transport,
+        // A per-attempt expiry and a whole-request expiry are both deadlines that elapsed.
+        // Which one it was matters to routing, not to the stream this event reports on.
+        LlmClientError::Timeout { .. } | LlmClientError::AttemptTimeout { .. } => {
+            StreamTermination::Timeout
+        }
+        LlmClientError::UpstreamHttp { .. } => StreamTermination::UpstreamHttp,
+        LlmClientError::InvalidResponse { .. } | LlmClientError::ResponseTranslation(_) => {
+            StreamTermination::InvalidResponse
+        }
+        _ => StreamTermination::Other,
+    }
+}
+
+/// The HTTP status that ended the stream, or `0` when the failure carried none.
+///
+/// A status is a number, not provider text, so it is safe to report beside the category;
+/// the body that came with it is not, and is never read here.
+fn item_termination_status(item: &StreamItem) -> u16 {
+    match item {
+        Err(LlmClientError::UpstreamHttp { status, .. }) => status.as_u16(),
+        _ => 0,
+    }
+}
+
+/// Reports a stream that was dropped before it ended.
+///
+/// A buffered request abandoned by its client is observable through the request log's
+/// drop guard. A streamed one is not: the response has already answered 200 and this
+/// wrapper is simply dropped, so without this the only trace of an abandoned stream is
+/// that nothing was written, which reads as success.
+///
+/// Disarmed as soon as the stream reaches a terminal event or reports its own failure,
+/// because dropping a stream that already ended is normal: a Responses client may stop
+/// reading immediately after the terminal event.
+///
+/// "Dropped" is one signal, not two. A client that disconnects and a caller that cancels
+/// look identical from inside the stream, so this reports the condition it can prove
+/// rather than guessing which party caused it.
+struct StreamDropReporter {
+    model: String,
+    armed: bool,
+}
+
+impl StreamDropReporter {
+    fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamDropReporter {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::event!(
+            target: "switchyard_server::request",
+            tracing::Level::WARN,
+            selected_model = %self.model,
+            failure_stage = "stream",
+            termination_reason = StreamTermination::ConsumerDropped.as_str(),
+            upstream_status = 0_u16,
+            "LLM stream ended before its terminal event"
+        );
+    }
 }
 
 pub(crate) fn token_usage(usage: &Usage) -> TokenUsage {
@@ -347,7 +513,10 @@ fn record_latency(model: &str, latency: Duration) {
 mod tests {
     use futures_util::{StreamExt, stream};
     use serde_json::Value;
-    use switchyard_protocol::{LlmResponseChunk, LlmResponseStreamEvent, Metadata, Response};
+    use switchyard_protocol::{
+        LlmClientError, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
+        Response,
+    };
 
     use super::*;
 
@@ -480,5 +649,289 @@ mod tests {
             .expect("record is JSON");
         assert_eq!(record["child_route"], "smartlocal", "{record}");
         assert_eq!(record["final_target"], "vendor/vl", "{record}");
+    }
+
+    // ---- stream termination observability ---------------------------------
+    //
+    // A streamed request answers HTTP 200 before any of this runs, so a failure here
+    // cannot change a status code and leaves no other trace. These tests fix what the
+    // one event it can emit is allowed to say: the category that ended the stream, and
+    // never the provider text that accompanied it.
+
+    /// Collects this module's events while it is the active subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<parking_lot::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl tracing_subscriber::Layer<tracing_subscriber::Registry> for CapturedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, tracing_subscriber::Registry>,
+        ) {
+            if event.metadata().target() != "switchyard_server::request" {
+                return;
+            }
+            let mut message = String::new();
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    message.push_str(&format!("{}={value:?} ", field.name()));
+                },
+            );
+            self.0.lock().push((*event.metadata().level(), message));
+        }
+    }
+
+    /// Observes a source stream, so a test drives the wrapper the server actually serves.
+    fn observed(
+        source: impl futures_util::Stream<Item = Result<LlmResponseStreamEvent, LlmClientError>>
+        + Send
+        + 'static,
+    ) -> LlmResponseStream {
+        let response = Response {
+            llm_response: LlmResponse::Stream(Box::pin(source)),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        };
+        let observed = observe(
+            response,
+            StatsAccumulator::default(),
+            ObservationContext {
+                model: "model/terminating".to_string(),
+                started: Instant::now(),
+                cache_eligible: 0.0,
+                routing_log: None,
+                composition: None,
+                attribution: None,
+                calendar: Arc::new(economics::CalendarWindow::new()),
+            },
+        );
+        let LlmResponse::Stream(stream) = observed.llm_response else {
+            panic!("expected a stream");
+        };
+        stream
+    }
+
+    /// Drains `take` items and then drops the stream, or drains it to the end when
+    /// `take` is `None`. Returns the warnings emitted, as `field=value` text.
+    async fn warnings_of(mut stream: LlmResponseStream, take: Option<usize>) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        match take {
+            None => while stream.next().await.is_some() {},
+            Some(count) => {
+                for _ in 0..count {
+                    let _ = stream.next().await;
+                }
+                drop(stream);
+            }
+        }
+        drop(guard);
+        captured
+            .0
+            .lock()
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, message)| message.clone())
+            .collect()
+    }
+
+    fn stream_error_source(
+        message: &str,
+    ) -> impl futures_util::Stream<Item = Result<LlmResponseStreamEvent, LlmClientError>> + Send + 'static
+    {
+        stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::StreamError {
+                message: message.to_string(),
+            },
+        ]))])
+    }
+
+    #[tokio::test]
+    async fn an_upstream_stream_error_names_the_upstream_as_the_cause() {
+        let warnings = warnings_of(observed(stream_error_source("upstream gave up")), None).await;
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(r#"termination_reason="upstream_stream_error""#),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    /// An undecodable frame is our reader's problem, not the provider's, and must not be
+    /// reported as an upstream failure.
+    #[tokio::test]
+    async fn a_decode_error_is_distinguished_from_an_upstream_failure() {
+        let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::DecodeError {
+                message: "unexpected frame".to_string(),
+            },
+        ]))]);
+
+        let warnings = warnings_of(observed(source), None).await;
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(r#"termination_reason="decode_error""#),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            !warnings[0].contains("upstream_stream_error"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    /// A lost connection and an elapsed deadline are the two causes that were
+    /// indistinguishable in the field, so each must reach the log by its own name.
+    #[tokio::test]
+    async fn a_transport_failure_and_a_deadline_are_reported_separately() {
+        let transport = stream::iter([Err(LlmClientError::Transport {
+            source: Box::new(std::io::Error::other("connection reset")),
+        })]);
+        let timeout = stream::iter([Err(LlmClientError::Timeout {
+            source: Box::new(std::io::Error::other("deadline")),
+        })]);
+
+        let transport = warnings_of(observed(transport), None).await;
+        let timeout = warnings_of(observed(timeout), None).await;
+
+        assert_eq!(transport.len(), 1, "{transport:?}");
+        assert!(
+            transport[0].contains(r#"termination_reason="transport""#),
+            "{}",
+            transport[0]
+        );
+        assert_eq!(timeout.len(), 1, "{timeout:?}");
+        assert!(
+            timeout[0].contains(r#"termination_reason="timeout""#),
+            "{}",
+            timeout[0]
+        );
+    }
+
+    /// The status that ended the stream is a number and is safe to report; the body that
+    /// came with it is not, and must not reach the log.
+    #[tokio::test]
+    async fn an_upstream_http_failure_reports_its_status_but_not_its_body() {
+        const LEAKED: &str = "provider-body-canary";
+        let source = stream::iter([Err(LlmClientError::UpstreamHttp {
+            status: http::StatusCode::BAD_GATEWAY,
+            body: LEAKED.to_string(),
+        })]);
+
+        let warnings = warnings_of(observed(source), None).await;
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(r#"termination_reason="upstream_http""#),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("upstream_status=502"),
+            "{}",
+            warnings[0]
+        );
+        assert!(!warnings[0].contains(LEAKED), "{}", warnings[0]);
+    }
+
+    /// The provider's own error text is the thing this event must not carry.
+    #[tokio::test]
+    async fn the_failure_message_never_reaches_the_log() {
+        const LEAKED: &str = "sk-or-v1-canary-in-provider-prose";
+
+        let warnings = warnings_of(observed(stream_error_source(LEAKED)), None).await;
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!warnings[0].contains(LEAKED), "{}", warnings[0]);
+    }
+
+    /// A stream dropped before it ends leaves no other trace, so the drop itself has to
+    /// be the signal.
+    #[tokio::test]
+    async fn a_stream_dropped_before_its_terminal_event_reports_the_consumer() {
+        let source = stream::iter([
+            Ok(LlmResponseStreamEvent::new(vec![
+                LlmResponseChunk::TextDelta {
+                    index: 0,
+                    text: "partial".to_string(),
+                },
+            ])),
+            Ok(LlmResponseStreamEvent::new(vec![
+                LlmResponseChunk::MessageStop { reason: None },
+            ])),
+        ]);
+
+        let warnings = warnings_of(observed(source), Some(1)).await;
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(r#"termination_reason="consumer_dropped""#),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    /// Control: dropping a stream that already ended is normal. A Responses client may
+    /// stop reading the moment it has the terminal event, and that is not a failure.
+    #[tokio::test]
+    async fn a_stream_dropped_after_its_terminal_event_reports_nothing() {
+        let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::Usage(Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                ..Usage::default()
+            }),
+            LlmResponseChunk::MessageStop { reason: None },
+        ]))]);
+
+        let warnings = warnings_of(observed(source), Some(1)).await;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Control: a stream that ends on its own reports nothing, so the event above cannot
+    /// fire on every stream and become noise.
+    #[tokio::test]
+    async fn a_stream_that_ends_on_its_own_reports_nothing() {
+        let source = stream::iter([
+            Ok(LlmResponseStreamEvent::new(vec![
+                LlmResponseChunk::TextDelta {
+                    index: 0,
+                    text: "complete".to_string(),
+                },
+            ])),
+            Ok(LlmResponseStreamEvent::new(vec![
+                LlmResponseChunk::MessageStop { reason: None },
+            ])),
+        ]);
+
+        let warnings = warnings_of(observed(source), None).await;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Control: a stream that ends without ever sending a terminal event, and without
+    /// failing, is still a stream that finished. This module already handles that shape by
+    /// committing what it saw, so its drop must stay silent; only a stream cut short by
+    /// its consumer is an abandoned one.
+    #[tokio::test]
+    async fn a_stream_that_ends_without_a_terminal_event_reports_nothing() {
+        let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::TextDelta {
+                index: 0,
+                text: "no stop event".to_string(),
+            },
+        ]))]);
+
+        let warnings = warnings_of(observed(source), None).await;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

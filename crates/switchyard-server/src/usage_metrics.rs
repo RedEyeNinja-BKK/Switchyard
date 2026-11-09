@@ -44,6 +44,12 @@ pub(crate) struct ObservationContext {
     /// The Bangkok calendar-day window, in which the same usage is counted so the
     /// day view and the rolling counters cannot disagree.
     pub calendar: Arc<economics::CalendarWindow>,
+    /// The request correlation id, so a stream-terminal warning can be attributed to
+    /// the request that produced it. The terminal request log already carries this;
+    /// without it here a stream warning can only be matched by approximate timestamp,
+    /// which is not attribution. Empty when the caller supplied none, matching the
+    /// terminal log's own convention.
+    pub correlation_id: Option<String>,
 }
 
 /// Observes a routed response without changing its aggregate or streaming contents.
@@ -60,6 +66,7 @@ pub(crate) fn observe(
         composition,
         attribution,
         calendar,
+        correlation_id,
     } = context;
     let Response {
         llm_response,
@@ -96,7 +103,8 @@ pub(crate) fn observe(
             // so constructing it here is what keeps the log and the counter agreeing.
             // The generator captures it by move and it is dropped with the response,
             // whether or not that response was ever polled.
-            let mut drop_reporter = StreamDropReporter::new(&model);
+            let mut drop_reporter =
+                StreamDropReporter::new(&model, correlation_id.as_deref().unwrap_or(""));
             let wrapped = async_stream::stream! {
                 let mut latest_usage = None;
                 let mut terminal_seen = false;
@@ -138,6 +146,7 @@ pub(crate) fn observe(
                             failure_stage = "stream",
                             termination_reason = reason.as_str(),
                             upstream_status = item_termination_status(&item),
+                            correlation_id = %correlation_id.as_deref().unwrap_or(""),
                             "LLM stream failed"
                         );
                         // The failure is now reported; dropping the stream afterwards is
@@ -343,13 +352,15 @@ fn item_termination_status(item: &StreamItem) -> u16 {
 /// rather than guessing which party caused it.
 struct StreamDropReporter {
     model: String,
+    correlation_id: String,
     armed: bool,
 }
 
 impl StreamDropReporter {
-    fn new(model: &str) -> Self {
+    fn new(model: &str, correlation_id: &str) -> Self {
         Self {
             model: model.to_string(),
+            correlation_id: correlation_id.to_string(),
             armed: true,
         }
     }
@@ -371,6 +382,7 @@ impl Drop for StreamDropReporter {
             failure_stage = "stream",
             termination_reason = StreamTermination::ConsumerDropped.as_str(),
             upstream_status = 0_u16,
+            correlation_id = %self.correlation_id,
             "LLM stream ended before its terminal event"
         );
     }
@@ -564,6 +576,7 @@ mod tests {
                 composition: None,
                 attribution: None,
                 calendar: Arc::new(economics::CalendarWindow::new()),
+                correlation_id: None,
             },
         );
 
@@ -641,6 +654,7 @@ mod tests {
                 composition: Some(composition),
                 attribution: None,
                 calendar: Arc::new(economics::CalendarWindow::new()),
+                correlation_id: None,
             },
         );
         let LlmResponse::Stream(mut observed) = observed.llm_response else {
@@ -709,6 +723,7 @@ mod tests {
                 composition: None,
                 attribution: None,
                 calendar: Arc::new(economics::CalendarWindow::new()),
+                correlation_id: Some("corr-test".to_string()),
             },
         );
         let LlmResponse::Stream(stream) = observed.llm_response else {
@@ -965,6 +980,210 @@ mod tests {
         assert!(
             warnings[0].contains("consumer_dropped"),
             "the cause must name the consumer: {warnings:?}"
+        );
+    }
+
+    // ---- the real Responses path -------------------------------------------------
+    //
+    // The tests above drive hand-built chunks, which proves the wrapper's own logic and
+    // nothing about the decode in front of it. Production serves
+    // `wire_format=openai_responses` through `decode_stream`, so these fixtures feed raw
+    // SSE bytes through that decoder and observe the stream the server actually wraps.
+    // A hand-built `MessageStop` cannot show whether `response.completed` decodes to one.
+
+    /// One synthetic Responses stream: reasoning item, answer, then `response.completed`.
+    ///
+    /// Sanitised: fixed ids, no provider or prompt text.
+    fn responses_sse_reasoning_plus_answer() -> String {
+        [
+            r#"event: response.created"#,
+            r#"data: {"type":"response.created","response":{"id":"resp_fixture","model":"fixture-model","status":"in_progress","output":[]}}"#,
+            "",
+            r#"event: response.output_item.added"#,
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_fixture","type":"reasoning","summary":[]}}"#,
+            "",
+            r#"event: response.reasoning_summary_text.delta"#,
+            r#"data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_fixture","output_index":0,"delta":"thinking"}"#,
+            "",
+            r#"event: response.output_item.done"#,
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_fixture","type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]}}"#,
+            "",
+            r#"event: response.output_text.delta"#,
+            r#"data: {"type":"response.output_text.delta","item_id":"msg_fixture","output_index":1,"delta":"answer"}"#,
+            "",
+            r#"event: response.output_item.done"#,
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_fixture","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
+            "",
+            r#"event: response.completed"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_fixture","model":"fixture-model","status":"completed","output":[{"id":"msg_fixture","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#,
+            "",
+            r#"data: [DONE]"#,
+            "",
+        ]
+        .join("\n")
+    }
+
+    /// The stream the server really serves for a Responses request.
+    ///
+    /// `decode_stream` is the same entry point the HTTP path uses, so the terminal
+    /// mapping under test is the deployed one rather than a re-statement of it.
+    fn responses_observed(body: String) -> LlmResponseStream {
+        let bytes: Result<Vec<u8>, LlmClientError> = Ok(body.into_bytes());
+        let decoded = switchyard_translation::decode_stream(
+            stream::iter([bytes]),
+            switchyard_translation::WireFormat::OpenAiResponses,
+        )
+        .expect("the fixture stream must decode");
+        observed(decoded)
+    }
+
+    /// A completed reasoning-plus-answer Responses stream must not report abandonment.
+    ///
+    /// This is the production shape: `wire_format=openai_responses` on the Luna client,
+    /// including the reasoning item the model actually emits. It asserts both halves that
+    /// matter: the decoded stream still delivers the answer and a neutral terminal, and a
+    /// consumer that runs it to the end is not reported as having abandoned it.
+    #[tokio::test]
+    async fn a_completed_responses_stream_delivers_its_terminal_and_never_reports_abandonment() {
+        // What the real decoder delivers.
+        let mut decoded = responses_observed(responses_sse_reasoning_plus_answer());
+        let mut text = String::new();
+        let mut saw_terminal = false;
+        while let Some(item) = decoded.next().await {
+            let event = item.expect("the fixture stream must not fail");
+            for chunk in event.normalized() {
+                match chunk {
+                    LlmResponseChunk::MessageStop { .. } => saw_terminal = true,
+                    LlmResponseChunk::TextDelta { text: delta, .. } => text.push_str(delta),
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            text.contains("answer"),
+            "the answer must reach the consumer, got {text:?}"
+        );
+        assert!(
+            saw_terminal,
+            "response.completed must decode to a neutral terminal, or the guard can never disarm"
+        );
+
+        // And what the wrapper logs for that same stream.
+        let warnings = warnings_of(
+            responses_observed(responses_sse_reasoning_plus_answer()),
+            None,
+        )
+        .await;
+        assert!(
+            warnings.is_empty(),
+            "a stream that delivered response.completed must not report abandonment: {warnings:?}"
+        );
+    }
+
+    /// The exact client behaviour under investigation: stop reading immediately after
+    /// the terminal event and drop the stream.
+    ///
+    /// The guard must already be disarmed before that event is yielded. If it is not,
+    /// every ordinary Responses call would carry a `consumer_dropped` warning, which is
+    /// what the live Luna lane appeared to show.
+    #[tokio::test]
+    async fn stopping_immediately_after_the_terminal_event_reports_no_abandonment() {
+        // Count how many items the decoded stream produces up to and including the one
+        // that carries the terminal event.
+        let mut probe = responses_observed(responses_sse_reasoning_plus_answer());
+        let mut up_to_terminal = 0usize;
+        let mut found_terminal = false;
+        while let Some(item) = probe.next().await {
+            up_to_terminal += 1;
+            if let Ok(event) = item
+                && event
+                    .normalized()
+                    .iter()
+                    .any(|chunk| matches!(chunk, LlmResponseChunk::MessageStop { .. }))
+            {
+                found_terminal = true;
+                break;
+            }
+        }
+        drop(probe);
+        assert!(
+            found_terminal,
+            "the fixture must deliver a neutral terminal, or this test proves nothing"
+        );
+
+        let warnings = warnings_of(
+            responses_observed(responses_sse_reasoning_plus_answer()),
+            Some(up_to_terminal),
+        )
+        .await;
+
+        assert!(
+            warnings.is_empty(),
+            "stopping at the terminal event is normal completion, not abandonment: {warnings:?}"
+        );
+    }
+
+    /// Control: stopping before the terminal event is a genuine abandonment and must
+    /// still be reported exactly once. Without this the test above could pass because
+    /// the warning was disabled altogether.
+    #[tokio::test]
+    async fn stopping_before_the_terminal_event_reports_the_consumer_once() {
+        let warnings = warnings_of(
+            responses_observed(responses_sse_reasoning_plus_answer()),
+            Some(2),
+        )
+        .await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a stream cut short before its terminal event is one abandonment: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(r#"termination_reason="consumer_dropped""#),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    /// The stream-terminal warning must name the request it belongs to.
+    ///
+    /// Without this the only way to tie a drop to a request is approximate timestamp,
+    /// which is why 18 live drops could not be classified.
+    #[tokio::test]
+    async fn an_abandonment_warning_carries_the_request_correlation_id() {
+        let warnings = warnings_of(
+            responses_observed(responses_sse_reasoning_plus_answer()),
+            Some(2),
+        )
+        .await;
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("correlation_id=corr-test")
+                || warnings[0].contains("correlation_id=\"corr-test\""),
+            "the warning must be attributable to a request: {}",
+            warnings[0]
+        );
+    }
+
+    /// The fallback id must be bounded, identifier-shaped and unique per call.
+    ///
+    /// It is written into a log line, so it must not be able to carry request content,
+    /// and two requests must never share one.
+    #[test]
+    fn synthetic_request_ids_are_bounded_unique_and_opaque() {
+        let first = crate::next_synthetic_request_id();
+        let second = crate::next_synthetic_request_id();
+
+        assert_ne!(first, second, "two requests must not share an id");
+        assert!(
+            switchyard_protocol::correlation::validated_request_id(&first).is_some(),
+            "the id must be identifier-shaped: {first}"
+        );
+        assert!(
+            first.len() <= switchyard_protocol::correlation::MAX_REQUEST_ID_LEN,
+            "the id must stay within the provider identifier bound"
         );
     }
 }

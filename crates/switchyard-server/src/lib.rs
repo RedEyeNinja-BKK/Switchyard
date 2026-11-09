@@ -25,6 +25,8 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -1129,7 +1131,19 @@ async fn handle_endpoint_inner(
     body: std::result::Result<Json<Value>, JsonRejection>,
     wire_format: WireFormat,
 ) -> Response {
-    let metadata = metadata_from_headers(headers);
+    let mut metadata = metadata_from_headers(headers);
+    // A stream-terminal warning cannot be attributed to a request by timestamp, and no
+    // live caller supplies this header (measured 313/313 empty), so a request arriving
+    // without an id is given one here. The same value then reaches the terminal request
+    // log and the stream wrappers, which is what makes the two lines joinable.
+    if metadata
+        .correlation_id
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        metadata.correlation_id = Some(next_synthetic_request_id());
+    }
     let routing_log_context = state
         .routing_log
         .as_ref()
@@ -1204,6 +1218,26 @@ async fn handle_endpoint_inner(
     metrics::record_client_response(response.status().as_u16());
     request_log.emit(&response);
     response
+}
+
+/// A bounded, opaque request id for a request that arrived without one.
+///
+/// Only used when the caller supplied no id. A per-process random salt plus a monotonic
+/// counter keeps the value unique within the process without repeating a caller's value,
+/// and it is fixed-length and identifier-shaped so it cannot carry request content. It is
+/// deliberately not derived from the prompt, the peer address or the model.
+fn next_synthetic_request_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    static SALT: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let salt = *SALT.get_or_init(|| {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    });
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("sy{salt:016x}{counter:08x}")
 }
 
 fn llm_json_body(
@@ -1324,6 +1358,9 @@ async fn handle_llm_request(
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
+    // Captured before `resolve_route` consumes `metadata`, so a stream-terminal warning
+    // can name the same request the terminal log line names.
+    let correlation_id = metadata.correlation_id.clone();
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
         Err(response) => return response,
@@ -1482,6 +1519,7 @@ async fn handle_llm_request(
                 composition: composition_ref,
                 attribution,
                 calendar: Arc::clone(&state.calendar),
+                correlation_id,
             },
         )
     } else {

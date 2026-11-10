@@ -1337,6 +1337,12 @@ async fn handle_llm_request(
                 .unwrap_or("composite"),
         )
     });
+    // Keep the caller's correlation id before `request` is moved into the runner, so the
+    // stream-observation wrapper can echo it into any abandonment warning.
+    let request_correlation_id = request
+        .metadata
+        .as_ref()
+        .and_then(|m| m.correlation_id.clone());
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let observer = stats_observer(
@@ -1477,6 +1483,7 @@ async fn handle_llm_request(
             usage_metrics::ObservationContext {
                 model: served_model.as_str().to_string(),
                 started: started.0,
+                correlation_id: request_correlation_id.clone(),
                 cache_eligible,
                 routing_log: state.routing_log.zip(routing_log_context),
                 composition: composition_ref,

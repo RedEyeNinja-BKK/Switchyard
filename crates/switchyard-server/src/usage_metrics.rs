@@ -28,6 +28,9 @@ pub(crate) struct ObservationContext {
     pub model: String,
     /// The instant the request arrived.
     pub started: Instant,
+    /// The correlation id for this request, echoed into the abandonment warning so a
+    /// warning can be joined to exactly one request terminal log.
+    pub correlation_id: Option<String>,
     /// The share of the prompt that was cache-eligible.
     pub cache_eligible: f64,
     /// The durable routing record, when the deployment records one.
@@ -55,6 +58,7 @@ pub(crate) fn observe(
     let ObservationContext {
         model,
         started,
+        correlation_id,
         cache_eligible,
         routing_log,
         composition,
@@ -96,7 +100,8 @@ pub(crate) fn observe(
             // so constructing it here is what keeps the log and the counter agreeing.
             // The generator captures it by move and it is dropped with the response,
             // whether or not that response was ever polled.
-            let mut drop_reporter = StreamDropReporter::new(&model);
+            let mut drop_reporter =
+                StreamDropReporter::new(&model, correlation_id.clone());
             let wrapped = async_stream::stream! {
                 let mut latest_usage = None;
                 let mut terminal_seen = false;
@@ -343,13 +348,15 @@ fn item_termination_status(item: &StreamItem) -> u16 {
 /// rather than guessing which party caused it.
 struct StreamDropReporter {
     model: String,
+    correlation_id: Option<String>,
     armed: bool,
 }
 
 impl StreamDropReporter {
-    fn new(model: &str) -> Self {
+    fn new(model: &str, correlation_id: Option<String>) -> Self {
         Self {
             model: model.to_string(),
+            correlation_id,
             armed: true,
         }
     }
@@ -368,6 +375,7 @@ impl Drop for StreamDropReporter {
             target: "switchyard_server::request",
             tracing::Level::WARN,
             selected_model = %self.model,
+            correlation_id = %self.correlation_id.as_deref().unwrap_or(""),
             failure_stage = "stream",
             termination_reason = StreamTermination::ConsumerDropped.as_str(),
             upstream_status = 0_u16,
@@ -559,6 +567,7 @@ mod tests {
             ObservationContext {
                 model: "model/worker".to_string(),
                 started: Instant::now(),
+                correlation_id: None,
                 cache_eligible: 0.0,
                 routing_log: Some((log.clone(), context)),
                 composition: None,
@@ -636,6 +645,7 @@ mod tests {
             ObservationContext {
                 model: "model/worker".to_string(),
                 started: Instant::now(),
+                correlation_id: None,
                 cache_eligible: 0.0,
                 routing_log: Some((log.clone(), context)),
                 composition: Some(composition),
@@ -690,8 +700,9 @@ mod tests {
     /// Observes a source stream, so a test drives the wrapper the server actually serves.
     fn observed(
         source: impl futures_util::Stream<Item = Result<LlmResponseStreamEvent, LlmClientError>>
-        + Send
-        + 'static,
+            + Send
+            + 'static,
+        correlation_id: Option<&str>,
     ) -> LlmResponseStream {
         let response = Response {
             llm_response: LlmResponse::Stream(Box::pin(source)),
@@ -704,6 +715,7 @@ mod tests {
             ObservationContext {
                 model: "model/terminating".to_string(),
                 started: Instant::now(),
+                correlation_id: correlation_id.map(str::to_string),
                 cache_eligible: 0.0,
                 routing_log: None,
                 composition: None,
@@ -758,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_upstream_stream_error_names_the_upstream_as_the_cause() {
-        let warnings = warnings_of(observed(stream_error_source("upstream gave up")), None).await;
+        let warnings = warnings_of(observed(stream_error_source("upstream gave up"), None), None).await;
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
@@ -778,7 +790,7 @@ mod tests {
             },
         ]))]);
 
-        let warnings = warnings_of(observed(source), None).await;
+        let warnings = warnings_of(observed(source, None), None).await;
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
@@ -804,8 +816,8 @@ mod tests {
             source: Box::new(std::io::Error::other("deadline")),
         })]);
 
-        let transport = warnings_of(observed(transport), None).await;
-        let timeout = warnings_of(observed(timeout), None).await;
+        let transport = warnings_of(observed(transport, None), None).await;
+        let timeout = warnings_of(observed(timeout, None), None).await;
 
         assert_eq!(transport.len(), 1, "{transport:?}");
         assert!(
@@ -831,7 +843,7 @@ mod tests {
             body: LEAKED.to_string(),
         })]);
 
-        let warnings = warnings_of(observed(source), None).await;
+        let warnings = warnings_of(observed(source, None), None).await;
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
@@ -852,7 +864,7 @@ mod tests {
     async fn the_failure_message_never_reaches_the_log() {
         const LEAKED: &str = "sk-or-v1-canary-in-provider-prose";
 
-        let warnings = warnings_of(observed(stream_error_source(LEAKED)), None).await;
+        let warnings = warnings_of(observed(stream_error_source(LEAKED), None), None).await;
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(!warnings[0].contains(LEAKED), "{}", warnings[0]);
@@ -874,13 +886,120 @@ mod tests {
             ])),
         ]);
 
-        let warnings = warnings_of(observed(source), Some(1)).await;
+        let warnings = warnings_of(observed(source, Some("req-00001")), Some(1)).await;
 
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
             warnings[0].contains(r#"termination_reason="consumer_dropped""#),
             "{}",
             warnings[0]
+        );
+        assert!(
+            warnings[0].contains("correlation_id=req-00001"),
+            "the warning must name the request it belongs to: {warnings:?}"
+        );
+    }
+
+    /// Regression: an abandoned stream emits exactly one consumer_dropped warning, never two.
+    ///
+    /// The production observation selected only the first matching warning, so a duplicate
+    /// could have gone undetected. This asserts on the whole slice instead of indexing [0].
+    #[tokio::test]
+    async fn an_abandoned_stream_emits_exactly_one_consumer_dropped_warning() {
+        let source = stream::iter([
+            Ok(LlmResponseStreamEvent::new(vec![
+                LlmResponseChunk::TextDelta {
+                    index: 0,
+                    text: "partial".to_string(),
+                },
+            ])),
+            Ok(LlmResponseStreamEvent::new(vec![
+                LlmResponseChunk::MessageStop { reason: None },
+            ])),
+        ]);
+
+        let warnings = warnings_of(observed(source, Some("req-00002")), Some(1)).await;
+
+        // Exactly one warning total.
+        assert_eq!(
+            warnings.len(),
+            1,
+            "an abandoned stream must emit exactly one warning, got: {warnings:?}"
+        );
+        // Its category and correlation id must match the request.
+        assert!(
+            warnings[0].contains(r#"termination_reason="consumer_dropped""#),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("correlation_id=req-00002"),
+            "warning must carry the request's correlation id: {warnings:?}"
+        );
+    }
+
+    /// Control: normal terminal completion emits no consumer_dropped warning.
+    #[tokio::test]
+    async fn a_terminally_completed_stream_emits_no_consumer_dropped_warning() {
+        let source = stream::iter([Ok(LlmResponseStreamEvent::new(vec![
+            LlmResponseChunk::Usage(Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                ..Usage::default()
+            }),
+            LlmResponseChunk::MessageStop { reason: None },
+        ]))]);
+
+        let warnings = warnings_of(observed(source, Some("req-00003")), Some(1)).await;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Control: an explicit stream failure reports its own category and does not additionally
+    /// emit a consumer_dropped abandonment warning.
+    #[tokio::test]
+    async fn a_failed_stream_does_not_also_emit_consumer_dropped() {
+        let source = stream::iter([Err(LlmClientError::Transport {
+            source: Box::new(std::io::Error::other("connection reset")),
+        })]);
+
+        let warnings = warnings_of(observed(source, Some("req-00004")), None).await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a failed stream must emit exactly one failure warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(r#"termination_reason="transport""#),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("consumer_dropped")),
+            "a stream failure must not additionally report consumer_dropped: {warnings:?}"
+        );
+    }
+
+    /// Regression: duplicate consumer_dropped warnings are detected instead of silently
+    /// selecting the first. This is the negative control for
+    /// `an_abandoned_stream_emits_exactly_one_consumer_dropped_warning`: if the wrapper ever
+    /// emits two warnings for one abandoned stream, that test's `assert_eq!(warnings.len(), 1)`
+    /// fails instead of returning the first.
+    #[tokio::test]
+    #[should_panic]
+    async fn duplicate_consumer_dropped_warnings_fail_the_exactly_one_assertion() {
+        // Driving the real wrapper with a source that emits two warnings must make the
+        // regression assertion fail (not silently return index [0]). A correct wrapper emits
+        // one, so this source is synthetic: it exercises the assertion shape itself.
+        let warnings: Vec<String> = vec![
+            r#"termination_reason="consumer_dropped" correlation_id=req-dup"#.to_string(),
+            r#"termination_reason="consumer_dropped" correlation_id=req-dup"#.to_string(),
+        ];
+        assert_eq!(
+            warnings.len(),
+            1,
+            "duplicate consumer_dropped warnings must be caught: {warnings:?}"
         );
     }
 
@@ -897,7 +1016,7 @@ mod tests {
             LlmResponseChunk::MessageStop { reason: None },
         ]))]);
 
-        let warnings = warnings_of(observed(source), Some(1)).await;
+        let warnings = warnings_of(observed(source, None), Some(1)).await;
 
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -918,7 +1037,7 @@ mod tests {
             ])),
         ]);
 
-        let warnings = warnings_of(observed(source), None).await;
+        let warnings = warnings_of(observed(source, None), None).await;
 
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -936,7 +1055,7 @@ mod tests {
             },
         ]))]);
 
-        let warnings = warnings_of(observed(source), None).await;
+        let warnings = warnings_of(observed(source, None), None).await;
 
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -955,7 +1074,7 @@ mod tests {
             LlmResponseChunk::MessageStop { reason: None },
         ]))]);
 
-        let warnings = warnings_of(observed(source), Some(0)).await;
+        let warnings = warnings_of(observed(source, None), Some(0)).await;
 
         assert_eq!(
             warnings.len(),

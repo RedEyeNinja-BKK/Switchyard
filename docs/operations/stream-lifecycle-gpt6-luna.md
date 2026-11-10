@@ -32,13 +32,13 @@ The post-fix window also showed:
 
 ## Conclusion
 
-The `consumer_dropped` warnings are **caller-side client disconnections mid-SSE-stream**, not provider failures. Every dropped stream reached a terminal HTTP 200 with the same content fields as completed streams; the client simply closed the SSE connection before the terminal event arrived. The upstream completed the call successfully.
+The evidence **proves premature stream abandonment before the terminal event** (`MessageStop` / `[done]`) and 53/53 warning-to-request correlation joins. The terminal HTTP 200 entries show that an HTTP response was started/logged, **not** that SSE delivery completed or that the upstream finished successfully. The pattern is **consistent with downstream client or intermediary disconnection**; the available signals do **not** establish which party initiated the close, nor do they establish a provider-side defect. The Luna-versus-DeepSeek difference remains unexplained.
 
 ## Recommendation
 
 No production routing or config change is warranted. The correlation_id plumbing (PR #30 / branch `fix/p3-duplicate-warn-assertion`) makes these warnings attributable going forward.
 
-If the operator wants a diagnostic signal to distinguish caller disconnects from provider failures, add an optional bounded `client_closed` marker emitted when the SSE transport observes the client close, gated so it cannot fire more than once per stream. That is an additive, non-routing change and can be taken up separately.
+If the operator wants to distinguish an observed downstream close from other stream termination paths, consider a separately reviewed, bounded `client_closed` marker sourced from the **actual SSE transport disconnect signal**. Preserve an unknown/not-observed state rather than treating absence of evidence as `false`; emit once per stream without logging prompt, reasoning, or response bodies. No production experiment or routing change is authorized by this investigation.
 
 ## Evidence files
 

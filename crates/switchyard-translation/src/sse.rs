@@ -66,6 +66,22 @@ pub(crate) fn is_terminal_event(format: WireFormat, event: &Value) -> bool {
     }
 }
 
+/// Returns whether decoding can stop once this format's terminal event arrived.
+///
+/// Anthropic and Responses end on a terminal JSON event: nothing follows
+/// `message_stop`, and nothing follows `response.completed`. Waiting for the
+/// socket to close instead keeps the downstream body open after the answer is
+/// already complete, so the caller's own close is then mistaken for a drop.
+///
+/// Chat Completions is deliberately excluded: a usage-only frame can follow the
+/// `finish_reason` and precede `[DONE]`, and stopping early would lose it.
+pub(crate) fn stops_at_terminal_event(format: WireFormat) -> bool {
+    match format {
+        WireFormat::AnthropicMessages | WireFormat::OpenAiResponses => true,
+        WireFormat::OpenAiChat => false,
+    }
+}
+
 pub(crate) fn parse_json_sse_frame(
     frame: &str,
     done_marker: Option<&str>,

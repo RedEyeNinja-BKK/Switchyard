@@ -40,8 +40,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The hermetic tests are part of the gate: they prove the script still
+      # parses and that its state/marker logic holds before it touches the API.
+      # The runner image has no pytest, so install it rather than assume it.
       - name: Test the drift check
-        run: python -m pytest tests/test_upstream_drift.py -q
+        run: |
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m pytest tests/test_upstream_drift.py -q
 
       - name: Report upstream drift
         env:

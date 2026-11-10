@@ -14,6 +14,40 @@ use switchyard_translation::{LlmStreamError, RawEventStream, WireFormat};
 
 use crate::redaction::Redactor;
 
+// An HTTP SSE response body's lifetime cannot prove who initiated its closure.
+// A downstream socket, intermediary, or server cancellation can drop the body.
+struct SseBodyGuard {
+    correlation_id: String,
+    armed: bool,
+}
+
+impl SseBodyGuard {
+    fn new(correlation_id: Option<String>) -> Self {
+        Self {
+            correlation_id: correlation_id.unwrap_or_default(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SseBodyGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::info!(
+                target: "switchyard_server::request",
+                correlation_id = %self.correlation_id,
+                stream_boundary = "sse_http_body",
+                body_outcome = "dropped_before_terminal_frame",
+                "SSE body dropped before terminal frame was yielded"
+            );
+        }
+    }
+}
+
 /// Boxed stream type accepted by Axum's SSE response wrapper.
 pub(crate) type SseFrameStream =
     std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
@@ -23,11 +57,23 @@ pub(crate) fn frame_stream(
     stream: RawEventStream,
     target_format: WireFormat,
     redactor: Arc<Redactor>,
+    correlation_id: Option<String>,
 ) -> Sse<SseFrameStream> {
+    // Build before the lazy generator to observe even an unpolled body.
+    let mut body_guard = SseBodyGuard::new(correlation_id);
     let framed = async_stream::stream! {
         let mut stream = stream;
         let mut failed = false;
         while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
+            let successful_terminal = match (&item, target_format) {
+                (Ok(value), WireFormat::OpenAiResponses) => {
+                    value.get("type").and_then(Value::as_str) == Some("response.completed")
+                }
+                (Ok(value), WireFormat::AnthropicMessages) => {
+                    value.get("type").and_then(Value::as_str) == Some("message_stop")
+                }
+                _ => false,
+            };
             let event = match item {
                 Ok(value) => match frame_event(target_format, value, &redactor) {
                     Ok(event) => event,
@@ -58,6 +104,10 @@ pub(crate) fn frame_stream(
                     error_event(target_format, error.to_string(), &redactor)
                 }
             };
+            // Yielded into the framing stream is NOT confirmation of delivery.
+            if successful_terminal || failed {
+                body_guard.disarm();
+            }
             yield Ok(event);
             if failed {
                 break;
@@ -67,8 +117,11 @@ pub(crate) fn frame_stream(
         // `[DONE]` is the OpenAI Chat success sentinel: clients stop reading there and
         // keep what they have as a finished answer, so it must not follow a failed turn.
         if !failed && target_format == WireFormat::OpenAiChat {
+            body_guard.disarm();
             yield Ok(Event::default().data("[DONE]"));
         }
+        // EOF is not a body cancellation; a missing upstream terminal is separate.
+        body_guard.disarm();
     };
 
     Sse::new(Box::pin(framed) as SseFrameStream)
@@ -133,7 +186,7 @@ mod tests {
     use std::error::Error;
 
     use axum::{body::to_bytes, response::IntoResponse};
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
     use switchyard_protocol::LlmClientError;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -148,6 +201,7 @@ mod tests {
             stream,
             WireFormat::OpenAiChat,
             Arc::new(Redactor::default()),
+            None,
         )
         .into_response();
         Ok(String::from_utf8(
@@ -257,6 +311,128 @@ mod tests {
         Ok(())
     }
 
+    // Observe only INFO-level body-boundary events: the regular stream guard
+    // records its own WARN separately, so this must not create duplicate WARNs.
+    #[derive(Clone, Default)]
+    struct BodyInfoCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing_subscriber::Layer<tracing_subscriber::Registry> for BodyInfoCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, tracing_subscriber::Registry>,
+        ) {
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            let mut fields = String::new();
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    fields.push_str(&format!("{}={value:?} ", field.name()));
+                },
+            );
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    #[test]
+    fn sse_body_boundary_distinguishes_abandonment_from_normal_terminal() -> TestResult {
+        let capture = BodyInfoCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                // Stop after a data frame, before response.completed is framed.
+                let early: RawEventStream = Box::pin(stream::iter(vec![
+                    Ok(json!({"type":"response.output_text.delta","delta":"example"})),
+                    Ok(json!({"type":"response.completed"})),
+                ]));
+                let body = frame_stream(
+                    early,
+                    WireFormat::OpenAiResponses,
+                    Arc::new(Redactor::default()),
+                    Some("corr-early".to_string()),
+                )
+                .into_response()
+                .into_body();
+                let mut body = body.into_data_stream();
+                assert!(body.next().await.is_some());
+                drop(body);
+
+                // A completed stream must not produce a body-abandonment event.
+                let finished: RawEventStream = Box::pin(stream::iter(vec![
+                    Ok(json!({"type":"response.output_text.delta","delta":"example"})),
+                    Ok(json!({"type":"response.completed"})),
+                ]));
+                let response = frame_stream(
+                    finished,
+                    WireFormat::OpenAiResponses,
+                    Arc::new(Redactor::default()),
+                    Some("corr-finished".to_string()),
+                )
+                .into_response();
+                let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+                // Never-polled body is also dropped before a terminal frame.
+                let unpolled: RawEventStream =
+                    Box::pin(stream::iter(vec![Ok(json!({"type":"response.completed"}))]));
+                let response = frame_stream(
+                    unpolled,
+                    WireFormat::OpenAiResponses,
+                    Arc::new(Redactor::default()),
+                    Some("corr-unpolled".to_string()),
+                )
+                .into_response();
+                drop(response);
+
+                // Explicit upstream error has its own classification, not a
+                // misleading second body-abandonment observation.
+                let failed: RawEventStream = Box::pin(stream::iter(vec![Err(
+                    LlmStreamError::Client(LlmClientError::General("error".to_string())),
+                )]));
+                let response = frame_stream(
+                    failed,
+                    WireFormat::OpenAiResponses,
+                    Arc::new(Redactor::default()),
+                    Some("corr-failed".to_string()),
+                )
+                .into_response();
+                let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            });
+        });
+
+        let events = capture.0.lock().unwrap().clone();
+        let dropped: Vec<_> = events
+            .iter()
+            .filter(|line| line.contains("dropped_before_terminal_frame"))
+            .collect();
+        assert_eq!(dropped.len(), 2, "{events:?}");
+        assert!(
+            dropped.iter().any(|line| line.contains("corr-early")),
+            "{events:?}"
+        );
+        assert!(
+            dropped.iter().any(|line| line.contains("corr-unpolled")),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|line| line.contains("corr-finished")),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|line| line.contains("corr-failed")),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|line| line.contains("client_closed")),
+            "{events:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn anthropic_stream_error_uses_api_error_type() -> TestResult {
         let failure = LlmClientError::General("boom".to_string());
@@ -266,6 +442,7 @@ mod tests {
             stream,
             WireFormat::AnthropicMessages,
             Arc::new(Redactor::default()),
+            None,
         )
         .into_response();
         let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;

@@ -1519,7 +1519,7 @@ async fn handle_llm_request(
                 composition: composition_ref,
                 attribution,
                 calendar: Arc::clone(&state.calendar),
-                correlation_id,
+                correlation_id: correlation_id.clone(),
             },
         )
     } else {
@@ -1534,6 +1534,7 @@ async fn handle_llm_request(
         response_model,
         request_extensions,
         Arc::clone(&state.redactor),
+        correlation_id,
     ) {
         Ok(response) => response,
         Err(error) => return server_error(error.to_string()),

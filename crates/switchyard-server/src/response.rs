@@ -26,6 +26,7 @@ pub(crate) fn into_http_response(
     served_model: Option<String>,
     request_extensions: ProviderExtensions,
     redactor: Arc<crate::redaction::Redactor>,
+    correlation_id: Option<String>,
 ) -> Result<HttpResponse, BoxError> {
     match response.llm_response {
         LlmResponse::Agg(response) => {
@@ -44,7 +45,7 @@ pub(crate) fn into_http_response(
                 served_model,
                 &request_extensions,
             )?;
-            Ok(frame_stream(events, target_format, redactor).into_response())
+            Ok(frame_stream(events, target_format, redactor, correlation_id).into_response())
         }
     }
 }

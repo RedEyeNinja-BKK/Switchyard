@@ -1,0 +1,51 @@
+name: Upstream drift
+
+# Read-only: reports when NVIDIA-NeMo/Switchyard moves and which of its merged
+# changes touch files this fork has changed. It never merges, rebases, pushes or
+# deploys, and it keeps a single comment in the tracked issue up to date instead
+# of adding a new one each day.
+
+on:
+  schedule:
+    # Daily at 03:17 UTC, off the hour so it does not queue behind other jobs.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number that receives the drift report
+        required: false
+        default: "35"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: Compare fork with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the report script
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test the drift check
+        run: python -m pytest tests/test_upstream_drift.py -q
+
+      - name: Report upstream drift
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE: ${{ github.event.inputs.issue || '35' }}
+        run: python scripts/upstream_drift.py --issue "$ISSUE" --overlap .github/upstream-overlap-paths.txt

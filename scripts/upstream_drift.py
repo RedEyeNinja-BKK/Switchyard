@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -31,6 +32,12 @@ from typing import Any
 
 MARKER_PREFIX = "<!-- switchyard-upstream-drift v1"
 MARKER_SUFFIX = "-->"
+# The marker is rendered on its own line at the end of the comment. It must be
+# matched as a line, not as a substring: a post that merely *mentions* the marker
+# -- a design note, or a report explaining this file -- contains the same text,
+# and treating that post as the report would rewrite somebody else's comment.
+# This happened once, to the alignment report that described this workflow.
+MARKER_LINE = re.compile(rf"^{re.escape(MARKER_PREFIX)}", re.MULTILINE)
 UPSTREAM = "NVIDIA-NeMo/Switchyard"
 # The paths this fork has changed since the pinned common ancestor. Regenerate
 # with: git diff --name-only <ancestor> origin/main | sort
@@ -53,14 +60,28 @@ def load_overlap_paths(path: Path | str) -> set[str]:
     return paths
 
 
+def marker_span(body: str) -> tuple[int, int] | None:
+    """Return the span of the report marker and its payload, or None.
+
+    The marker must start a line. Only the rendered report puts it there; prose
+    that quotes the marker does not, so a comment about this workflow can never
+    be mistaken for its output.
+    """
+    match = MARKER_LINE.search(body)
+    if match is None:
+        return None
+    end = body.find(MARKER_SUFFIX, match.start())
+    if end < 0:
+        return None
+    return match.start(), end
+
+
 def parse_state(body: str) -> dict[str, Any]:
     """Recover the state embedded in a previous report, or {} when absent."""
-    start = body.find(MARKER_PREFIX)
-    if start < 0:
+    span = marker_span(body)
+    if span is None:
         return {}
-    end = body.find(MARKER_SUFFIX, start)
-    if end < 0:
-        return {}
+    start, end = span
     payload = body[start + len(MARKER_PREFIX) : end].strip()
     try:
         parsed = json.loads(payload)
@@ -239,7 +260,7 @@ def find_marker_comment(github: Any, issue: int) -> dict[str, Any] | None:
     """Return this bot's previous report comment, if it exists."""
     comments = github.get(f"/repos/{_repo()}/issues/{issue}/comments?per_page=100")
     for comment in comments:
-        if MARKER_PREFIX in (comment.get("body") or ""):
+        if marker_span(comment.get("body") or "") is not None:
             return comment
     return None
 

@@ -340,6 +340,46 @@ def test_publish_keeps_one_comment_and_does_not_rewrite_an_identical_body(monkey
     assert writes[-1] == ("POST", "/repos/RedEyeNinja-BKK/Switchyard/issues/35/comments")
 
 
+def test_a_comment_that_only_mentions_the_marker_is_not_adopted(monkeypatch):
+    """Prose quoting the marker must never be rewritten as if it were the report.
+
+    This is a regression: the alignment report described the marker in a
+    sentence, the substring search adopted it, and the next run overwrote that
+    report with the drift output.
+    """
+    monkeypatch.setenv("GITHUB_REPOSITORY", "RedEyeNinja-BKK/Switchyard")
+    writes = []
+
+    def record(method, path, body):
+        writes.append((method, path))
+        return {}
+
+    monkeypatch.setattr(drift, "github_request", record)
+
+    prose = (
+        "It keeps exactly one comment, identified by `" + drift.MARKER_PREFIX + "` "
+        "at the end of its own body, and returns created/updated/unchanged."
+    )
+    github = FakeGithub(
+        {"/repos/RedEyeNinja-BKK/Switchyard/issues/35/comments": [{"id": 7, "body": prose}]}
+    )
+
+    assert drift.parse_state(prose) == {}
+    assert drift.find_marker_comment(github, 35) is None
+    assert (
+        drift.publish(github, 35, drift.render_comment({"upstream_sha": "abc"}, "s")) == "created"
+    )
+    assert writes == [("POST", "/repos/RedEyeNinja-BKK/Switchyard/issues/35/comments")]
+
+
+def test_the_rendered_marker_is_recognised_on_its_own_line():
+    body = drift.render_comment({"upstream_sha": "abc", "ahead": 1}, "summary")
+
+    assert drift.find_marker_comment is not None
+    assert drift.marker_span(body) is not None
+    assert drift.parse_state(body)["upstream_sha"] == "abc"
+
+
 def test_the_baseline_report_does_not_claim_a_delta_it_has_not_measured():
     state = {"upstream_sha": "abc", "baseline": True, "overlapping_prs": []}
 

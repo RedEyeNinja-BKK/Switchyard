@@ -314,6 +314,12 @@ where
                             value,
                             normalized,
                         );
+                        // The terminal event is the last thing these protocols send.
+                        // Stop here rather than waiting for a close that may never
+                        // come, and never decode what follows a finished answer.
+                        if saw_terminal && sse::stops_at_terminal_event(source) {
+                            break;
+                        }
                     }
                 }
             } else {
@@ -729,6 +735,58 @@ mod tests {
         let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
         let chunks = decode_all(bytes, WireFormat::OpenAiChat)?;
         assert_eq!(text_of(&chunks), "Hello world");
+        Ok(())
+    }
+
+    #[test]
+    fn decode_stream_stops_at_a_responses_terminal_event() -> Result<(), BoxError> {
+        // A Responses provider may hold the socket open after `response.completed`.
+        // Nothing after that event belongs to an answer the caller can still use, and
+        // waiting for the close leaves the downstream body open past the terminal
+        // frame, where the caller's own close then reads as a dropped stream.
+        let sse = b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"after-terminal\"}\n\n"
+            .to_vec();
+        let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
+        let events = decode_all(bytes, WireFormat::OpenAiResponses)?;
+
+        let terminal = events
+            .iter()
+            .flat_map(LlmResponseStreamEvent::normalized)
+            .any(|chunk| matches!(chunk, LlmResponseChunk::MessageStop { .. }));
+        assert!(
+            terminal,
+            "the terminal event itself must still be delivered"
+        );
+        assert!(
+            !text_of(&events).contains("after-terminal"),
+            "decoded past the terminal event: {:?}",
+            text_of(&events)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_stream_keeps_trailing_usage_after_a_chat_stop() -> Result<(), BoxError> {
+        // The negative control for the rule above: Chat Completions reports usage in a
+        // frame after `finish_reason` and before `[DONE]`, so it must keep reading.
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n\
+             data: [DONE]\n\n"
+            .to_vec();
+        let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
+        let events = decode_all(bytes, WireFormat::OpenAiChat)?;
+
+        let usage = events
+            .iter()
+            .flat_map(LlmResponseStreamEvent::normalized)
+            .find_map(|chunk| match chunk {
+                LlmResponseChunk::Usage(usage) => Some(usage.clone()),
+                _ => None,
+            });
+        let usage = usage.ok_or("trailing usage frame was dropped")?;
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(2));
         Ok(())
     }
 

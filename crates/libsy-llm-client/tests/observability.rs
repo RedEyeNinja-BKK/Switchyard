@@ -2073,3 +2073,81 @@ async fn in_flight_gauge_clears_when_a_run_is_abandoned() -> switchyard_libsy::R
     );
     Ok(())
 }
+
+/// Usage the upstream already reported must be recorded even when nobody reads the
+/// buffered replay, and reading the replay must not export a second observation.
+#[tokio::test]
+async fn buffered_routing_records_usage_before_the_replay_is_read() -> switchyard_libsy::Result<()>
+{
+    let _guard = serialize_test().lock().await;
+    let (_, _, _, span_exporter, _) = telemetry();
+
+    for drained in [false, true] {
+        let model = if drained {
+            "buffered-replay-drained"
+        } else {
+            "buffered-replay-dropped"
+        };
+        let mut request = request_with_metadata(model, model);
+        request.llm_request.stream = true;
+        let (_, mut response) = run(
+            Arc::new(RoutingCallAlgo {
+                name: model.to_string(),
+                target: model.into(),
+            }),
+            Arc::new(StreamingUsageClient) as Arc<dyn RoutedLlmClient>,
+            request,
+        )
+        .await?;
+
+        // The routing call is buffered to completion before the response is returned, so
+        // the provider's usage is already known at this point whether or not the caller
+        // ever reads the replay.
+        let call = find_otel_span(span_exporter, &format!("chat {model}"), model);
+        assert_eq!(
+            otel_attribute(&call, "gen_ai.usage.input_tokens"),
+            Some(&OtelValue::I64(21)),
+            "upstream usage was not recorded at the end of the upstream stream"
+        );
+        assert_eq!(
+            otel_attribute(&call, "gen_ai.usage.output_tokens"),
+            Some(&OtelValue::I64(5))
+        );
+
+        let exported = span_exporter
+            .get_finished_spans()
+            .expect("exported spans")
+            .len();
+        if drained {
+            let LlmResponse::Stream(ref mut stream) = response.llm_response else {
+                return Err(test_error("expected a reconstructed stream"));
+            };
+            let mut text = String::new();
+            while let Some(event) = stream.next().await {
+                let event = event.map_err(|error| {
+                    let message = error.to_string();
+                    test_error(Box::leak(message.into_boxed_str()))
+                })?;
+                for chunk in event.normalized() {
+                    if let switchyard_protocol::LlmResponseChunk::TextDelta {
+                        text: delta, ..
+                    } = chunk
+                    {
+                        text.push_str(delta);
+                    }
+                }
+            }
+            assert_eq!(text, "hello");
+        }
+        drop(response);
+        assert_eq!(
+            span_exporter
+                .get_finished_spans()
+                .expect("exported spans")
+                .len(),
+            exported,
+            "reading or dropping the replay must not export another observation"
+        );
+    }
+    Ok(())
+}

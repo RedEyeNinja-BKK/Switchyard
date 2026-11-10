@@ -345,21 +345,33 @@ async fn call_one(
     let client = clients.route(model_id);
     let started = Instant::now();
     let result = async {
-        let mut response = client?.call(request).await?;
-        if buffer && let LlmResponse::Stream(chunks) = response.llm_response {
-            response.llm_response = LlmResponse::Stream(buffer_routing_stream(chunks).await?);
+        let response = async {
+            let client = client?;
+            client.call(request).await
         }
-        Ok(response)
+        .await
+        .map_err(|source| LibsyError::client_call(model_id.clone(), source));
+        // Observe dispatch and the live upstream I/O once, before routing buffering.
+        // Attaching the observer to the replay instead would export the call span when
+        // the caller drains the replay rather than when the provider finished, and a
+        // buffering failure would discard usage the upstream had already reported.
+        let mut response = observability::observe_client_call(response)?;
+        if buffer && let LlmResponse::Stream(chunks) = response.llm_response {
+            response.llm_response = LlmResponse::Stream(
+                buffer_routing_stream(chunks)
+                    .await
+                    .map_err(|source| LibsyError::client_call(model_id.clone(), source))?,
+            );
+        }
+        Ok::<Response, LibsyError>(response)
     }
-    .await
-    .map_err(|source| LibsyError::client_call(model_id.clone(), source));
+    .await;
     let duration = started.elapsed();
 
     let result = result.map(|mut response| {
         response.set_served_model(model_id);
         response
     });
-    let result = observability::observe_client_call(result);
     let result = if !buffer {
         metrics::observe_routed_request(algorithm, model_id, Some(duration), result)
     } else {

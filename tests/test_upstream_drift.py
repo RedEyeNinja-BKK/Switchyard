@@ -13,12 +13,9 @@ These tests use a canned GitHub client, so nothing here reaches the network and
 no rate limit can turn a green run into a red one.
 """
 
-import json
 from pathlib import Path
 
-import pytest
-
-import upstream_drift as drift
+from scripts import upstream_drift as drift
 
 
 def test_state_marker_round_trips_through_a_comment_body():
@@ -133,7 +130,11 @@ def test_collect_reports_pin_release_divergence_and_overlapping_merges():
         {
             "/repos/NVIDIA-NeMo/Switchyard/commits/main": {"sha": "9cea42af" + "0" * 32},
             "/repos/NVIDIA-NeMo/Switchyard/releases": [
-                {"tag_name": "v0.4.0a1", "prerelease": True, "published_at": "2026-10-29T22:20:21Z"},
+                {
+                    "tag_name": "v0.4.0a1",
+                    "prerelease": True,
+                    "published_at": "2026-10-29T22:20:21Z",
+                },
                 {"tag_name": "v0.3.0", "prerelease": False, "published_at": "2026-09-22T18:06:59Z"},
             ],
             "/repos/NVIDIA-NeMo/Switchyard/compare/": {
@@ -266,7 +267,13 @@ def test_a_documentation_only_overlap_is_labelled_and_a_long_list_is_capped():
         "ahead": 1,
         "behind": 2,
         "overlapping_prs": [
-            {"number": n, "title": "t", "merged_at": "2026-11-10T00:00:00Z", "overlap_count": 1, "docs_only": True}
+            {
+                "number": n,
+                "title": "t",
+                "merged_at": "2026-11-10T00:00:00Z",
+                "overlap_count": 1,
+                "docs_only": True,
+            }
             for n in range(1, 26)
         ],
     }
@@ -317,21 +324,13 @@ def test_publish_keeps_one_comment_and_does_not_rewrite_an_identical_body(monkey
     body = drift.render_comment({"upstream_sha": "abc"}, "No change since the last observation.")
 
     same = FakeGithub(
-        {
-            "/repos/RedEyeNinja-BKK/Switchyard/issues/35/comments": [
-                {"id": 11, "body": body}
-            ]
-        }
+        {"/repos/RedEyeNinja-BKK/Switchyard/issues/35/comments": [{"id": 11, "body": body}]}
     )
     assert drift.publish(same, 35, body) == "unchanged"
     assert writes == []
 
     changed = FakeGithub(
-        {
-            "/repos/RedEyeNinja-BKK/Switchyard/issues/35/comments": [
-                {"id": 11, "body": body}
-            ]
-        }
+        {"/repos/RedEyeNinja-BKK/Switchyard/issues/35/comments": [{"id": 11, "body": body}]}
     )
     assert drift.publish(changed, 35, body + "\\n") == "updated"
     assert writes == [("PATCH", "/repos/RedEyeNinja-BKK/Switchyard/issues/comments/11")]

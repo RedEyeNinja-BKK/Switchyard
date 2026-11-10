@@ -25,8 +25,9 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 MARKER_PREFIX = "<!-- switchyard-upstream-drift v1"
 MARKER_SUFFIX = "-->"
@@ -105,7 +106,9 @@ def render_comment(state: dict[str, Any], summary: str) -> str:
     elif state.get("baseline"):
         lines.append("Baseline recorded. Deltas will be reported from this pin onwards.")
     else:
-        lines.append("No merged upstream change since the pin touches a file this fork has changed.")
+        lines.append(
+            "No merged upstream change since the pin touches a file this fork has changed."
+        )
     lines += [
         "",
         "<sub>Read-only check: it never merges, rebases, pushes or deploys. "
@@ -224,8 +227,7 @@ def collect(
                         # A documentation-only overlap is still reported, but named as
                         # such, so a reader can dismiss it without opening the PR.
                         "docs_only": all(
-                            path.startswith("docs/") or path.endswith(".md")
-                            for path in touched
+                            path.startswith("docs/") or path.endswith(".md") for path in touched
                         ),
                     }
                 )
@@ -285,10 +287,7 @@ def summarise(previous: dict[str, Any], current: dict[str, Any]) -> str:
             "this fork has changed, after this pin."
         )
     if current.get("release") != previous.get("release"):
-        return (
-            f"New upstream release `{current.get('release')}` "
-            f"(was `{previous.get('release')}`)."
-        )
+        return f"New upstream release `{current.get('release')}` (was `{previous.get('release')}`)."
     new_prs = [
         pr
         for pr in current.get("overlapping_prs") or []
@@ -340,7 +339,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"upstream drift check failed: {error}", file=sys.stderr)
         return 1
 
-    print(f"{action}: {json.dumps({k: current[k] for k in ('upstream_sha', 'release', 'ahead', 'behind')})}")
+    print(
+        f"{action}: {json.dumps({k: current[k] for k in ('upstream_sha', 'release', 'ahead', 'behind')})}"
+    )
     return 0
 
 

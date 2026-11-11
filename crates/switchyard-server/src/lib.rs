@@ -1345,6 +1345,25 @@ fn resolve_route(
             "unsupported_capability",
         ));
     }
+    // A same-format request is forwarded verbatim, so a video part this surface cannot
+    // express would reach the provider unchanged and come back as an opaque upstream error.
+    // Only the Responses surface is checked: the Chat spelling is the one measured to work,
+    // and refusing shapes there would risk breaking a path that is proven.
+    if wire_format == WireFormat::OpenAiResponses
+        && let Some(issue) = request_fit::unsupported_responses_video_part(&body)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "route {requested_model} cannot send this video part on the OpenAI Responses \
+                 surface: {} (`{}`). Supply video as {{\"type\":\"input_video\",\
+                 \"video_url\":\"<https URL or data: URI>\"}}",
+                issue.detail, issue.part_type
+            ),
+            "invalid_request_error",
+            "invalid_video_part",
+        ));
+    }
     let request = Request {
         llm_request,
         raw_request: Some(body),

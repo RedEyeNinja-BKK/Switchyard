@@ -347,6 +347,69 @@ impl RouteConfig {
 }
 
 impl DeploymentConfig {
+    /// The media capabilities a composite actually guarantees.
+    ///
+    /// A composite can serve a request only through one of its children, so what it can
+    /// promise is what the children between them accept. When the parent states a medium or
+    /// a carrier it keeps its word (an explicit `false` is a policy cap, not an omission),
+    /// and when it states nothing the answer is derived from the children:
+    ///
+    /// * a medium is claimed only when some child declares it -- an undeclared child is not
+    ///   evidence that it reads images, so derivation never invents a claim;
+    /// * a carrier is the union over the children that admit the medium, so a composite over
+    ///   inline-only children advertises inline and a mixed set advertises both.
+    ///
+    /// Deriving rather than hand-editing every parent is what keeps the declaration honest
+    /// when a child's carrier narrows: the parent follows, and
+    /// `validate_composite_media_claims` still refuses an explicit claim no child keeps.
+    fn composite_capabilities(
+        &self,
+        composite: &CompositeRouteConfig,
+    ) -> crate::ModelCapabilities {
+        let children: Vec<crate::ModelCapabilities> = composite
+            .children
+            .iter()
+            .filter_map(|child| self.routes.get(child))
+            .map(RouteConfig::capabilities)
+            .collect();
+        let serves =
+            |medium: fn(&crate::ModelCapabilities) -> Option<bool>| {
+                children.iter().any(|caps| medium(caps) == Some(true))
+            };
+        let carrier_union = |medium: fn(&crate::ModelCapabilities) -> Option<bool>,
+                             carrier: fn(&crate::ModelCapabilities) -> Option<MediaCarrier>| {
+            children
+                .iter()
+                .filter(|caps| medium(caps) == Some(true))
+                .map(|caps| carrier(caps).unwrap_or(MediaCarrier::DEFAULT))
+                .reduce(MediaCarrier::union)
+        };
+        let video = composite.video.unwrap_or_else(|| serves(|caps| caps.video));
+        let vision = composite.vision.unwrap_or_else(|| serves(|caps| caps.vision));
+        crate::ModelCapabilities {
+            context_window: composite.context_window,
+            tool_calling: composite.tool_calling,
+            reasoning: composite.reasoning,
+            vision: Some(vision),
+            video: Some(video),
+            // A stated carrier is a policy narrowing; otherwise the union of the children's
+            // carriers, never the permissive default, so the parent cannot advertise a
+            // carrier nothing below it serves.
+            video_carrier: video.then(|| {
+                composite.video_carrier.or_else(|| {
+                    carrier_union(|caps| caps.video, |caps| caps.video_carrier)
+                })
+                .unwrap_or(MediaCarrier::DEFAULT)
+            }),
+            image_carrier: vision.then(|| {
+                composite.image_carrier.or_else(|| {
+                    carrier_union(|caps| caps.vision, |caps| caps.image_carrier)
+                })
+                .unwrap_or(MediaCarrier::DEFAULT)
+            }),
+        }
+    }
+
     fn decision_target(&self, name: &str) -> Option<DecisionTarget> {
         let target = self.targets.get(name)?;
         let client = self.llm_clients.get(&target.llm_client)?;
@@ -494,8 +557,7 @@ impl DeploymentConfig {
         let fallback_base_url = self.fallback_base_url()?;
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
-        self.validate_composite_video_claims()?;
-        self.validate_composite_carrier_claims()?;
+        self.validate_composite_media_claims()?;
         self.validate_video_transport()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
@@ -714,17 +776,7 @@ impl DeploymentConfig {
             runner = runner.with_composite(name.clone(), composite.children.clone());
             runner = runner.with_composite_capabilities(
                 name.clone(),
-                crate::ModelCapabilities {
-                    context_window: composite.context_window,
-                    tool_calling: composite.tool_calling,
-                    reasoning: composite.reasoning,
-                    vision: composite.vision,
-                    video: composite.video,
-                    video_carrier: (composite.video == Some(true))
-                        .then(|| composite.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
-                    image_carrier: (composite.vision == Some(true))
-                        .then(|| composite.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
-                },
+                self.composite_capabilities(composite),
             );
         }
 
@@ -990,73 +1042,86 @@ impl DeploymentConfig {
         Ok(())
     }
 
-    /// Checks that a composite claiming video has a child that can serve it.
+    /// Checks a composite's effective media claim against the children that must keep it.
     ///
-    /// A composite is registered with its own declared capabilities and is resolved
-    /// before its children, so a claim nothing below it can keep would advertise video to
-    /// callers and then skip every child at request time.
-    fn validate_composite_video_claims(&self) -> RunnerResult<()> {
-        for (name, composite) in &self.composites {
-            if composite.video != Some(true) {
-                continue;
-            }
-            let supported = composite.children.iter().any(|child| {
-                self.routes
-                    .get(child)
-                    .is_some_and(|route| route.capabilities().video == Some(true))
-            });
-            if !supported {
-                return Err(RunnerError::configuration(format!(
-                    "composite route {name} declares video = true but none of its children \
-                     does; declare a child that does, or stop claiming it"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Checks that a composite's carrier claim is kept by at least one child, per carrier.
+    /// A composite is resolved before its children and reports its own guarantee, so a claim
+    /// nothing below it can keep would advertise a medium and then skip every child at
+    /// request time. The claim checked here is the *effective* one -- a stated value, or the
+    /// value derived from the children when the parent states nothing -- so a derived claim
+    /// is held to the same standard as a hand-written one.
     ///
-    /// A composite reports its own declaration to callers, so it makes the same promise a
-    /// leaf route does. Reading each child's *effective* carrier means a child that narrowed
-    /// to inline cannot keep the remote half of a composite advertising both.
-    fn validate_composite_carrier_claims(&self) -> RunnerResult<()> {
+    /// Two failures are refused and one is only reported:
+    ///
+    /// * a carrier stated without the medium it narrows, which would otherwise be silently
+    ///   inert;
+    /// * an effective claim no child can keep (an explicit over-claim);
+    /// * a parent that states *less* than its children serve (an explicit under-claim). That
+    ///   is safe -- nothing false is advertised -- so it is warned about rather than refused,
+    ///   and naming it at load is what stops a narrowed child from leaving a stale parent
+    ///   promise behind unnoticed.
+    fn validate_composite_media_claims(&self) -> RunnerResult<()> {
         for (name, composite) in &self.composites {
-            for (label, claimed) in [
+            let children: Vec<crate::ModelCapabilities> = composite
+                .children
+                .iter()
+                .filter_map(|child| self.routes.get(child))
+                .map(RouteConfig::capabilities)
+                .collect();
+            let effective = self.composite_capabilities(composite);
+            let claims = [
                 (
                     "vision",
-                    (composite.vision == Some(true))
-                        .then(|| composite.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+                    composite.vision,
+                    composite.image_carrier,
+                    effective.vision,
+                    effective.image_carrier,
                 ),
                 (
                     "video",
-                    (composite.video == Some(true))
-                        .then(|| composite.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+                    composite.video,
+                    composite.video_carrier,
+                    effective.video,
+                    effective.video_carrier,
                 ),
-            ] {
-                let Some(claimed) = claimed else {
+            ];
+            for (label, stated_medium, stated_carrier, effective_medium, effective_carrier) in
+                claims
+            {
+                if stated_carrier.is_some() && stated_medium != Some(true) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} states a {label} carrier but does not claim \
+                         {label}; a carrier narrows a medium, so state {label} = true or drop \
+                         the carrier"
+                    )));
+                }
+                let serving = |caps: &crate::ModelCapabilities| match label {
+                    "vision" => caps.vision == Some(true),
+                    _ => caps.video == Some(true),
+                };
+                let child_carrier = |caps: &crate::ModelCapabilities| match label {
+                    "vision" => caps.image_carrier.unwrap_or(MediaCarrier::DEFAULT),
+                    _ => caps.video_carrier.unwrap_or(MediaCarrier::DEFAULT),
+                };
+                let Some(claimed) = effective_medium
+                    .filter(|medium| *medium)
+                    .and(effective_carrier)
+                else {
                     continue;
                 };
+                if !children.iter().any(serving) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} declares {label} = true but none of its \
+                         children does; declare a child that does, or stop claiming it"
+                    )));
+                }
                 let missing: Vec<MediaCarrier> = claimed
                     .carriers()
                     .iter()
                     .copied()
                     .filter(|need| {
-                        !composite.children.iter().any(|child| {
-                            let Some(route) = self.routes.get(child) else {
-                                return false;
-                            };
-                            let capabilities = route.capabilities();
-                            let (medium, carrier) = match label {
-                                "vision" => (capabilities.vision, capabilities.image_carrier),
-                                _ => (capabilities.video, capabilities.video_carrier),
-                            };
-                            let admits_medium = match label {
-                                "vision" => medium != Some(false),
-                                _ => medium == Some(true),
-                            };
-                            admits_medium && carrier.unwrap_or(MediaCarrier::Both).includes(*need)
-                        })
+                        !children
+                            .iter()
+                            .any(|caps| serving(caps) && child_carrier(caps).includes(*need))
                     })
                     .collect();
                 if !missing.is_empty() {
@@ -1065,6 +1130,25 @@ impl DeploymentConfig {
                          child serves {missing:?}; declare a child that does, or narrow the \
                          composite's carrier"
                     )));
+                }
+                // Report, do not refuse: an explicit promise narrower than what the children
+                // serve is safe, but it is the shape that goes stale when a child changes.
+                if stated_medium == Some(false)
+                    || stated_carrier.is_some_and(|stated| stated != claimed)
+                {
+                    let available = children
+                        .iter()
+                        .filter(|caps| serving(caps))
+                        .map(child_carrier)
+                        .reduce(MediaCarrier::union);
+                    if let Some(available) = available.filter(|available| *available != claimed) {
+                        tracing::warn!(
+                            "composite route {name} states {label} = {stated_medium:?} carrier \
+                             {stated_carrier:?} but its children serve {available:?}; the parent \
+                             refuses media a child could serve. Omit the statement to derive it \
+                             from the children."
+                        );
+                    }
                 }
             }
         }
@@ -2380,6 +2464,189 @@ new = ["send_message"]
                 .any(|model| model.id.as_str() == "switchyard/hier")
         );
         Ok(())
+    }
+
+    /// Two leaves whose carriers differ, a text-only leaf, and composites over each.
+    /// The composites state nothing about media: what they advertise must come from the
+    /// children, except where a test deliberately states a policy cap.
+    fn composite_media_config(extra: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.inline]
+id = "inline/model"
+llm_client = "responses"
+vision = true
+image_carrier = "inline"
+video = true
+video_carrier = "inline"
+
+[targets.both]
+id = "both/model"
+llm_client = "responses"
+vision = true
+video = true
+video_carrier = "both"
+
+[targets.text]
+id = "text/model"
+llm_client = "primary"
+
+[routes.child_inline]
+id = "child-inline"
+type = "passthrough"
+target = "inline"
+vision = true
+image_carrier = "inline"
+video = true
+video_carrier = "inline"
+
+[routes.child_both]
+id = "child-both"
+type = "passthrough"
+target = "both"
+vision = true
+video = true
+video_carrier = "both"
+
+[routes.child_text]
+id = "child-text"
+type = "passthrough"
+target = "text"
+
+[composites.tier_inline]
+children = ["child_inline"]
+
+[composites.tier_mixed]
+children = ["child_inline", "child_both"]
+
+[composites.tier_text]
+children = ["child_text"]
+
+[composites.tier_bounded]
+children = ["child_inline"]
+
+{extra}
+"#
+        )
+    }
+
+    fn composite_media(runner: &Runner, name: &str) -> crate::ModelCapabilities {
+        runner
+            .route_capabilities(name)
+            .unwrap_or_else(|| panic!("composite {name} is not registered"))
+    }
+
+    #[test]
+    fn a_composite_derives_video_and_carrier_from_its_only_child() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_inline");
+        assert_eq!(media.video, Some(true));
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        assert_eq!(media.vision, Some(true));
+        assert_eq!(media.image_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn a_mixed_composite_derives_the_union_of_child_carriers() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_mixed");
+        // Inline + Both is Both: a request on either carrier has a child that serves it.
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Both));
+        assert_eq!(media.image_carrier, Some(MediaCarrier::Both));
+        Ok(())
+    }
+
+    #[test]
+    fn a_composite_over_text_only_children_claims_no_video() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_text");
+        // Derived, never invented: no child declares video, so the composite refuses it
+        // locally instead of offering a medium every child would skip.
+        assert_eq!(media.video, Some(false));
+        assert_eq!(media.video_carrier, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_bounded_lane_derives_independently_from_its_own_child() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        // A bounded composite's children are different routes; its declaration must be read
+        // from those children, not inherited from the unbounded twin.
+        let media = composite_media(&runner, "tier_bounded");
+        assert_eq!(media.video, Some(true));
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_video_false_stays_a_policy_cap() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(
+            "[composites.capped]\nchildren = [\"child_both\"]\nvideo = false\n",
+        ))?;
+        let media = composite_media(&runner, "capped");
+        assert_eq!(media.video, Some(false));
+        assert_eq!(media.video_carrier, None);
+        Ok(())
+    }
+
+    #[test]
+    fn video_true_without_a_carrier_derives_the_union_not_the_permissive_default(
+    ) -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(
+            "[composites.stated]\nchildren = [\"child_inline\"]\nvideo = true\n",
+        ))?;
+        let media = composite_media(&runner, "stated");
+        // The old default would have been Both, advertising a remote carrier that no child
+        // below the composite serves.
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn a_composite_cannot_advertise_a_carrier_no_child_serves() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.overclaim]\nchildren = [\"child_inline\"]\nvideo = true\n\
+             video_carrier = \"both\"\n",
+        ))
+        .err()
+        .expect("an explicit both claim over inline-only children must be refused");
+        let text = error.to_string();
+        assert!(text.contains("overclaim"), "{text}");
+        assert!(text.contains("Remote"), "{text}");
+    }
+
+    #[test]
+    fn a_composite_cannot_state_a_carrier_without_the_medium_it_narrows() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.inert]\nchildren = [\"child_inline\"]\nvideo = false\n\
+             video_carrier = \"inline\"\n",
+        ))
+        .err()
+        .expect("a carrier on a composite that refuses the medium must be refused");
+        let text = error.to_string();
+        assert!(text.contains("inert"), "{text}");
+    }
+
+    #[test]
+    fn a_composite_claiming_video_over_text_only_children_is_refused() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.hollow]\nchildren = [\"child_text\"]\nvideo = true\n",
+        ))
+        .err()
+        .expect("a video claim no child can keep must be refused");
+        let text = error.to_string();
+        assert!(text.contains("hollow"), "{text}");
     }
 
     #[test]

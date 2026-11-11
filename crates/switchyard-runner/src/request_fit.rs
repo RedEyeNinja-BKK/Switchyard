@@ -370,6 +370,62 @@ pub fn requires_video(request: &LlmRequest, body: &Value) -> bool {
     request_media(request, body, &|medium| medium == "video").is_some()
 }
 
+/// A video part the OpenAI Responses wire cannot carry, described for the caller.
+///
+/// Measured against the provider's own `/responses` endpoint: video is accepted only as
+/// `{"type":"input_video","video_url":"<https URL or data: URI>"}` with a STRING
+/// `video_url`. The Chat spelling (`video_url` as an object) and inline bytes under
+/// `video` are each answered `400 invalid_prompt` ("invalid_union, expected string").
+///
+/// This matters here because a same-format request is forwarded verbatim, by design, so a
+/// caller's unsupported part reaches the provider unchanged and comes back as an opaque
+/// upstream error. Detecting it before dispatch turns that into an accurate local refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoPartShape {
+    /// The `type` the caller used, quoted back so the message names what was sent.
+    pub part_type: String,
+    /// What was wrong with that part, in the caller's vocabulary.
+    pub detail: &'static str,
+}
+
+/// The first video part in a Responses body that the provider cannot parse, if any.
+///
+/// Only the shapes that were measured to fail are refused; a part already in the accepted
+/// spelling, or one carrying a provider `file_id` this deployment cannot verify, is left
+/// alone rather than guessed at.
+pub fn unsupported_responses_video_part(body: &Value) -> Option<VideoPartShape> {
+    preserved_shaped_blocks(body, &["input_video", "video_url", "video"]).find_map(|block| {
+        let object = block.as_object()?;
+        let part_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if part_type != "input_video" {
+            return Some(VideoPartShape {
+                part_type,
+                detail: "this surface accepts video only as an `input_video` part",
+            });
+        }
+        match object.get("video_url") {
+            Some(Value::String(_)) => None,
+            Some(_) => Some(VideoPartShape {
+                part_type,
+                detail: "`video_url` must be a string here, not an object",
+            }),
+            None if object.get("file_id").and_then(Value::as_str).is_some() => None,
+            None if object.contains_key("video") => Some(VideoPartShape {
+                part_type,
+                detail: "inline bytes belong in a `data:` URI supplied as the string `video_url`",
+            }),
+            None => Some(VideoPartShape {
+                part_type,
+                detail: "the part carries no `video_url`",
+            }),
+        }
+    })
+}
+
 /// Whether a content slice holds a media block supplied as a URL.
 fn request_media(
     request: &LlmRequest,
@@ -1165,5 +1221,86 @@ mod tests {
         assert_eq!(parts[0]["type"], "input_video");
         assert_eq!(parts[0]["video_url"], "https://example.test/clip.mp4");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod video_part_shape_tests {
+    use super::unsupported_responses_video_part;
+    use serde_json::json;
+
+    /// The one accepted spelling: `input_video` with a string `video_url`, either a URL or
+    /// a `data:` URI. Measured against the live provider endpoint, which rejects the
+    /// object form with 400 and this one with 200.
+    #[test]
+    fn the_accepted_spellings_are_not_flagged() {
+        for video_url in [
+            "https://example.test/clip.mp4",
+            "data:video/mp4;base64,AAAA",
+        ] {
+            let body = json!({"input": [{"role": "user", "content": [
+                {"type": "input_video", "video_url": video_url},
+                {"type": "input_text", "text": "describe"}
+            ]}]});
+            assert!(
+                unsupported_responses_video_part(&body).is_none(),
+                "{video_url} is the accepted shape"
+            );
+        }
+        // A file reference is the provider's own alternative to inline bytes.
+        let body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "file_id": "file-123"}
+        ]}]});
+        assert!(unsupported_responses_video_part(&body).is_none());
+    }
+
+    /// The object form is what the provider answers with 400, so it must be refused here
+    /// with a reason a caller can act on rather than forwarded into an opaque error.
+    #[test]
+    fn the_object_form_is_refused_with_its_reason() {
+        for (body, expected) in [
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video", "video_url": {"url": "https://example.test/clip.mp4"}}
+                ]}]}),
+                "`video_url` must be a string here, not an object",
+            ),
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video", "video": {"media_type": "video/mp4", "data": "AAAA"}}
+                ]}]}),
+                "inline bytes belong in a `data:` URI supplied as the string `video_url`",
+            ),
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "video_url", "video_url": "https://example.test/clip.mp4"}
+                ]}]}),
+                "this surface accepts video only as an `input_video` part",
+            ),
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video"}
+                ]}]}),
+                "the part carries no `video_url`",
+            ),
+        ] {
+            let shape = unsupported_responses_video_part(&body)
+                .unwrap_or_else(|| panic!("{body} must be refused"));
+            assert_eq!(shape.detail, expected, "{body}");
+        }
+    }
+
+    /// Only video is the guard's business: images, audio and files keep their own paths,
+    /// and a text-only body must stay untouched.
+    #[test]
+    fn non_video_content_is_never_flagged() {
+        let body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.test/a.png"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+            {"type": "input_file", "file_id": "file-1"},
+            {"type": "input_text", "text": "describe"}
+        ]}]});
+        assert!(unsupported_responses_video_part(&body).is_none());
+        assert!(unsupported_responses_video_part(&json!({"input": "hello"})).is_none());
     }
 }

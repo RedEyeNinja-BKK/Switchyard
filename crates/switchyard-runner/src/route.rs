@@ -118,6 +118,19 @@ impl MediaCarrier {
     /// A route or target that predates carriers declared a medium and meant both, so the
     /// default must be the permissive end rather than an empty set.
     pub const DEFAULT: Self = Self::Both;
+
+    /// The carriers covered by either set.
+    ///
+    /// This is the union a composite needs: it can serve a request only through one of its
+    /// children, so what it can promise is what the children between them accept. `Inline`
+    /// and `Remote` together are `Both`, and `Both` absorbs the other two.
+    pub const fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Both, _) | (_, Self::Both) => Self::Both,
+            (Self::Inline, Self::Remote) | (Self::Remote, Self::Inline) => Self::Both,
+            (carrier, _) => carrier,
+        }
+    }
 }
 
 /// The video carrier a target's capability facts describe, or `None` when it serves neither.
@@ -671,5 +684,44 @@ mod context_policy_tests {
                 "the route keeps the policy it was configured with"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::MediaCarrier;
+
+    /// A composite can only promise what its children between them accept, so the union
+    /// states exactly that: `Both` absorbs either carrier and the two singletons meet in
+    /// `Both`. Nothing narrower may come out of a union.
+    #[test]
+    fn the_union_is_the_least_set_covering_both() {
+        use MediaCarrier::{Both, Inline, Remote};
+        for (left, right, expected) in [
+            (Inline, Inline, Inline),
+            (Remote, Remote, Remote),
+            (Both, Both, Both),
+            (Inline, Remote, Both),
+            (Remote, Inline, Both),
+            (Both, Inline, Both),
+            (Inline, Both, Both),
+            (Remote, Both, Both),
+            (Both, Remote, Both),
+        ] {
+            assert_eq!(left.union(right), expected, "{left:?} u {right:?}");
+            // Union is commutative in effect as well as in claim.
+            assert_eq!(right.union(left), expected, "{right:?} u {left:?}");
+        }
+    }
+
+    /// `includes` is the question a composite's promise asks of a child, and it must be
+    /// narrower than equality: `Both` is included only by `Both`, and a singleton is
+    /// included by anything that admits it.
+    #[test]
+    fn includes_is_not_equality() {
+        use MediaCarrier::{Both, Inline, Remote};
+        assert!(Both.includes(Inline) && Both.includes(Remote) && Both.includes(Both));
+        assert!(Inline.includes(Inline) && !Inline.includes(Remote) && !Inline.includes(Both));
+        assert!(Remote.includes(Remote) && !Remote.includes(Inline) && !Remote.includes(Both));
     }
 }

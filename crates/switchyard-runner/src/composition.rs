@@ -352,13 +352,21 @@ impl Runner {
             }
         }
 
-        // Nothing answered. If no child was even eligible, the request itself asks for
-        // something no child can serve, which is the caller's problem rather than a
-        // deployment fault.
-        if let Some(capability) = children.iter().find_map(|(_, outcome)| match outcome {
-            ChildOutcome::Skipped { capability } => Some(*capability),
-            _ => None,
-        }) {
+        // Nothing answered, and the reason depends on whether anything was asked. A child
+        // is only contacted when it was eligible, so a recorded failure proves the request
+        // reached a provider: the answer is that failure, not the capability some other
+        // child happened to lack. Reporting the skip instead would name the wrong cause --
+        // a request an eligible child actually refused would read as unroutable, which is
+        // the opposite diagnosis for the caller.
+        let contacted = children
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, ChildOutcome::Failed { .. }));
+        if !contacted
+            && let Some(capability) = children.iter().find_map(|(_, outcome)| match outcome {
+                ChildOutcome::Skipped { capability } => Some(*capability),
+                _ => None,
+            })
+        {
             return Err(RunnerError::unsupported_capability(
                 parent_route,
                 capability,

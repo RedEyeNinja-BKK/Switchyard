@@ -1087,11 +1087,15 @@ impl DeploymentConfig {
             for (label, stated_medium, stated_carrier, effective_medium, effective_carrier) in
                 claims
             {
-                if stated_carrier.is_some() && stated_medium != Some(true) {
+                // A stated carrier narrows a medium that is *served*, whether it was stated
+                // or derived. Reading the raw statement here would refuse a narrowing over a
+                // derived medium, which is a normal thing to write once children are the
+                // source of the capability.
+                if stated_carrier.is_some() && effective_medium != Some(true) {
                     return Err(RunnerError::configuration(format!(
-                        "composite route {name} states a {label} carrier but does not claim \
-                         {label}; a carrier narrows a medium, so state {label} = true or drop \
-                         the carrier"
+                        "composite route {name} states a {label} carrier but does not serve \
+                         {label}; a carrier narrows a medium, so state {label} = true beside a \
+                         child that serves it, or drop the carrier"
                     )));
                 }
                 let serving = |caps: &crate::ModelCapabilities| match label {
@@ -2636,6 +2640,29 @@ children = ["child_inline"]
         .expect("a carrier on a composite that refuses the medium must be refused");
         let text = error.to_string();
         assert!(text.contains("inert"), "{text}");
+    }
+
+    #[test]
+    fn a_stated_carrier_narrows_a_derived_medium() {
+        // The medium is not stated; it is derived from the one inline-only child. Narrowing
+        // it to what that child serves is not inert, so it must load.
+        runner_from_toml(&composite_media_config(
+            "[composites.narrowed]\nchildren = [\"child_inline\"]\n\
+             video_carrier = \"inline\"\n",
+        ))
+        .expect("a carrier matching the derived capability must load");
+
+        // The same shape with a carrier no child serves must still be refused, naming the
+        // carrier that is missing rather than the (unstated) medium.
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.widened]\nchildren = [\"child_inline\"]\n\
+             video_carrier = \"both\"\n",
+        ))
+        .err()
+        .expect("a derived medium cannot be widened past its children");
+        let text = error.to_string();
+        assert!(text.contains("widened"), "{text}");
+        assert!(text.contains("Remote"), "{text}");
     }
 
     #[test]

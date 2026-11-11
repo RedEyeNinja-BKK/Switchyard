@@ -3694,6 +3694,66 @@ async fn video_and_audio_never_reach_the_upstream() -> TestResult {
     Ok(())
 }
 
+// A caller may spell video the Chat way on the Responses surface -- Turnstone's own
+// Responses client does. The provider accepts only `input_video` with a string
+// `video_url`, so ingress translates the spelling instead of refusing a request it can
+// carry. What must reach the upstream is the accepted shape, with the bytes intact.
+#[tokio::test]
+async fn the_chat_video_spelling_is_translated_before_the_responses_surface() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let base = format!("{}/buffered", upstream.base_url.trim_end_matches("/v1"));
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_responses"
+base_url = "{base}"
+[targets]
+shared = {{ id = "model/efficient", llm_client = "upstream", video = true, video_carrier = "inline" }}
+[routes]
+watcher = {{ id = "watcher", type = "passthrough", target = "shared", vision = true, video = true, video_carrier = "inline" }}
+"#,
+    ))?);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(json!({
+            "model": "watcher",
+            "input": [{"role": "user", "content": [
+                {"type": "text", "text": "watch"},
+                {"type": "video_url", "video_url": {
+                    "url": "data:video/mp4;base64,AAAA", "media_type": "video/mp4"
+                }}
+            ]}]
+        })),
+    )
+    .await?;
+    assert_ne!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "a translatable video part must not be refused: {:?}",
+        response.json().ok()
+    );
+
+    let calls = upstream.calls.lock().await;
+    assert_eq!(calls.len(), 1, "the request must reach the upstream exactly once");
+    let parts = calls[0]["input"][0]["content"]
+        .as_array()
+        .expect("upstream body should carry input content");
+    let video = parts
+        .iter()
+        .find(|part| part["type"] == "input_video")
+        .unwrap_or_else(|| panic!("no input_video part in {parts:?}"));
+    assert_eq!(video["video_url"], "data:video/mp4;base64,AAAA");
+    assert!(
+        video.get("video").is_none(),
+        "the object spelling is what the provider rejects: {video}"
+    );
+    Ok(())
+}
+
 // Approval replies can resume tool use without a tools field or a decoded tool call.
 #[tokio::test]
 async fn tool_approval_replies_follow_route_capabilities() -> TestResult {

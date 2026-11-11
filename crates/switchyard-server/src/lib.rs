@@ -1274,6 +1274,14 @@ fn resolve_route(
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
         metadata.remove(switchyard_translation::util::SWITCHYARD_METADATA_KEY);
     }
+    // A caller and this deployment may spell the same video part differently: the provider
+    // accepts exactly one form, and the Chat spelling is what several clients (including
+    // Turnstone's own Responses client) send. Translate the spelling before decoding, so a
+    // same-format forward carries the accepted shape; anything that cannot be mapped is
+    // refused below with a reason instead of reaching the provider as an opaque error.
+    if wire_format == WireFormat::OpenAiResponses {
+        request_fit::normalize_responses_video_parts(&mut body);
+    }
     let llm_request = decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     let requested_model = llm_request

@@ -388,6 +388,106 @@ pub struct VideoPartShape {
     pub detail: &'static str,
 }
 
+/// Rewrites video parts on the Responses surface into the one spelling the provider accepts.
+///
+/// The accepted spelling is `{"type":"input_video","video_url":"<https URL or data: URI>"}`
+/// with a string. A caller may reasonably send the Chat spelling instead -- `video_url` as
+/// the part type, or `video_url` as an object -- and Turnstone's own Responses client does
+/// exactly that. Refusing those would make video unreachable from the client rather than
+/// from the provider, so the shape is translated instead: only the spelling changes, and a
+/// caller-supplied media type rides along rather than being dropped.
+///
+/// Shapes that cannot be mapped faithfully (no URL, no bytes) are left untouched for
+/// [`unsupported_responses_video_part`] to refuse with a reason.
+pub fn normalize_responses_video_parts(body: &mut Value) -> usize {
+    fn data_uri(media_type: Option<&str>, data: &str) -> Option<String> {
+        media_type.map(|media_type| format!("data:{media_type};base64,{data}"))
+    }
+
+    fn normalize_part(part: &mut Value) -> bool {
+        let Some(object) = part.as_object_mut() else {
+            return false;
+        };
+        let part_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if part_type != "input_video" && part_type != "video_url" {
+            return false;
+        }
+        // `video_url` as an object: either a URL wrapper or the same shape Chat uses.
+        if let Some(Value::Object(nested)) = object.get("video_url").cloned() {
+            if let Some(url) = nested.get("url").and_then(Value::as_str).map(str::to_string) {
+                object.insert("type".to_string(), Value::String("input_video".to_string()));
+                object.insert("video_url".to_string(), Value::String(url));
+                if let Some(media_type) = nested.get("media_type").and_then(Value::as_str)
+                    && !object.contains_key("media_type")
+                {
+                    object.insert(
+                        "media_type".to_string(),
+                        Value::String(media_type.to_string()),
+                    );
+                }
+                return true;
+            }
+            if let Some(uri) = nested
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(|data| data_uri(nested.get("media_type").and_then(Value::as_str), data))
+            {
+                object.insert("type".to_string(), Value::String("input_video".to_string()));
+                object.insert("video_url".to_string(), Value::String(uri));
+                return true;
+            }
+        }
+        // Inline bytes under `video`, which is how the Chat decoder spells them.
+        if let Some(uri) = object
+            .get("video")
+            .and_then(Value::as_object)
+            .and_then(|video| {
+                video
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .and_then(|data| data_uri(video.get("media_type").and_then(Value::as_str), data))
+            })
+        {
+            object.insert("type".to_string(), Value::String("input_video".to_string()));
+            object.insert("video_url".to_string(), Value::String(uri));
+            object.remove("video");
+            return true;
+        }
+        // Already a string URL under the right type: only the type may still need fixing.
+        if part_type == "video_url"
+            && object.get("video_url").and_then(Value::as_str).is_some()
+        {
+            object.insert("type".to_string(), Value::String("input_video".to_string()));
+            return true;
+        }
+        false
+    }
+
+    let Some(input) = body.get_mut("input") else {
+        return 0;
+    };
+    let mut rewritten = 0;
+    let items: Vec<&mut Value> = match input {
+        Value::Array(items) => items.iter_mut().collect(),
+        other => vec![other],
+    };
+    for item in items {
+        if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+            for part in content.iter_mut() {
+                rewritten += usize::from(normalize_part(part));
+            }
+            continue;
+        }
+        // A part may also appear directly as an input item.
+        rewritten += usize::from(normalize_part(item));
+    }
+    rewritten
+}
+
 /// The first video part in a Responses body that the provider cannot parse, if any.
 ///
 /// Only the shapes that were measured to fail are refused; a part already in the accepted
@@ -1271,9 +1371,11 @@ mod video_part_shape_tests {
                 ]}]}),
                 "inline bytes belong in a `data:` URI supplied as the string `video_url`",
             ),
+            // A `video_url` part that carries a URL is normalized before this predicate
+            // runs, so what is left for this branch is the part with no video payload at all.
             (
                 json!({"input": [{"role": "user", "content": [
-                    {"type": "video_url", "video_url": "https://example.test/clip.mp4"}
+                    {"type": "video_url"}
                 ]}]}),
                 "this surface accepts video only as an `input_video` part",
             ),
@@ -1302,5 +1404,68 @@ mod video_part_shape_tests {
         ]}]});
         assert!(unsupported_responses_video_part(&body).is_none());
         assert!(unsupported_responses_video_part(&json!({"input": "hello"})).is_none());
+    }
+
+    /// The Chat spelling is what several clients send on the Responses surface. Translating
+    /// the spelling is what makes video reachable; the media type must ride along.
+    #[test]
+    fn the_chat_spelling_is_translated_into_the_accepted_part() {
+        let mut body = json!({"input": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4",
+                                                "media_type": "video/mp4"}}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 1);
+        let part = &body["input"][0]["content"][0];
+        assert_eq!(part["type"], "input_video");
+        assert_eq!(part["video_url"], "https://example.test/clip.mp4");
+        assert_eq!(part["media_type"], "video/mp4");
+        assert!(unsupported_responses_video_part(&body).is_none());
+    }
+
+    #[test]
+    fn inline_bytes_become_a_data_uri_under_the_accepted_type() {
+        let mut body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video": {"media_type": "video/mp4", "data": "AAAA"}}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 1);
+        let part = &body["input"][0]["content"][0];
+        assert_eq!(part["type"], "input_video");
+        assert_eq!(part["video_url"], "data:video/mp4;base64,AAAA");
+        assert!(part.get("video").is_none(), "the object spelling is dropped");
+        assert!(unsupported_responses_video_part(&body).is_none());
+    }
+
+    /// A correct part is left byte-identical, and running the pass twice changes nothing:
+    /// ingress must not rewrite a body that is already what the provider accepts.
+    #[test]
+    fn the_accepted_shape_is_untouched_and_the_pass_is_idempotent() {
+        let original = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "data:video/mp4;base64,AAAA"},
+            {"type": "input_text", "text": "describe"},
+            {"type": "input_image", "image_url": "https://example.test/a.png"}
+        ]}]});
+        let mut body = original.clone();
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 0);
+        assert_eq!(body, original);
+        // And a body the pass did rewrite settles: a second pass finds nothing to do.
+        let mut rewritten = json!({"input": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": "https://example.test/clip.mp4"}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut rewritten), 1);
+        assert_eq!(super::normalize_responses_video_parts(&mut rewritten), 0);
+    }
+
+    /// Nothing is invented for a part that carries no payload: it is left exactly as sent so
+    /// the caller gets the accurate refusal rather than a silently emptied part.
+    #[test]
+    fn an_unmappable_part_is_left_for_the_refusal() {
+        let mut body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video"}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 0);
+        assert_eq!(body, json!({"input": [{"role": "user", "content": [
+            {"type": "input_video"}
+        ]}]}));
+        assert!(unsupported_responses_video_part(&body).is_some());
     }
 }

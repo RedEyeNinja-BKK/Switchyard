@@ -1031,6 +1031,24 @@ pub struct CapabilityFacts {
     /// Unlike `no_vision`, this is set for a target that says nothing: video is never
     /// inferred from image support, so "undeclared" and "cannot" are the same fact here.
     pub no_video: bool,
+    /// The backing deployment cannot accept a video the provider must FETCH.
+    ///
+    /// Separate from `no_video`: an endpoint can read inline bytes and still refuse a URL,
+    /// which is what the free Nemotron endpoint does (200 inline, 404 for `video_url`). A
+    /// candidate is dropped when the request's carrier is the one it cannot serve.
+    pub no_remote_video: bool,
+    /// The backing deployment cannot accept video supplied inline.
+    ///
+    /// The converse of `no_remote_video`. Both default to `false`, so a deployment built
+    /// before carriers existed admits either, which is the behaviour it already had.
+    pub no_inline_video: bool,
+    /// The backing deployment cannot accept an image the provider must FETCH.
+    ///
+    /// The image counterpart of `no_remote_video`, and the same measured distinction: an
+    /// endpoint can read inline bytes and 404 a remote URL for images as well as video.
+    pub no_remote_image: bool,
+    /// The backing deployment cannot accept an image supplied inline.
+    pub no_inline_image: bool,
     /// The backing deployment cannot accept tool definitions or calls.
     pub no_tool_calling: bool,
 }

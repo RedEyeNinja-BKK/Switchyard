@@ -7,6 +7,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use libsy::{Algorithm, LibsyError, RoutingOutcome, RuntimeModels};
+use serde::Deserialize;
 use serde_json::Value;
 use switchyard_llm_client::{
     AuxiliaryOperation, ClientRouter, RunObservation, RunObserver, TranslatingLlmClient,
@@ -26,6 +27,12 @@ use crate::config::RouteReasoningPolicy;
 ///
 /// `video` is the exception to "absent means permitted": video is admitted only when a
 /// route declares it, because no deployment carried video before the field existed.
+///
+/// `video_carrier` is the second axis of the same fact. An endpoint that can read inline
+/// media but cannot fetch a remote URL is video-capable for one carrier only, and a flag
+/// that cannot tell them apart either over-claims (admitting a remote URL into a late
+/// provider 404) or under-claims (refusing inline media the endpoint does serve). It is
+/// `None` on an undeclared route, where the boolean already refuses everything.
 #[derive(Clone, Copy, Default)]
 pub struct ModelCapabilities {
     pub context_window: Option<u32>,
@@ -40,6 +47,113 @@ pub struct ModelCapabilities {
     /// video-capable, and the providers that serve the two are not the same. Absent means
     /// "cannot accept video".
     pub video: Option<bool>,
+    /// Which video carriers the routed model accepts, when video is declared.
+    ///
+    /// Only meaningful alongside `video = Some(true)`; a target declaring video must state
+    /// its carriers, because "can read video" without saying which carrier leaves the same
+    /// ambiguity the boolean has.
+    pub video_carrier: Option<MediaCarrier>,
+    /// Which image carriers the routed model accepts, when vision is declared.
+    ///
+    /// The image counterpart, and optional for the historical reason `vision` is: a
+    /// deployment that predates carriers declares images and means both.
+    pub image_carrier: Option<MediaCarrier>,
+}
+
+/// The two ways media reaches a provider, which are not the same capability.
+///
+/// Measured on the live free/paid OpenRouter endpoints: `nvidia/nemotron-3.5-super-vl:free`
+/// answers 200 for an inline `data:` image or video and 404 for a remote URL of either,
+/// with `No endpoints found that support video URLs`. The model lists video among its input
+/// modalities either way, so a modality-only declaration cannot express the difference.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaCarrier {
+    /// Inline bytes in the request: a `data:` URL or base64 payload.
+    Inline,
+    /// The provider fetches the media itself from a URL.
+    Remote,
+    /// Both carriers are served.
+    #[default]
+    Both,
+}
+
+impl MediaCarrier {
+    /// Whether this carrier set admits a request carrying `remote` media.
+    pub const fn admits_remote(self) -> bool {
+        matches!(self, Self::Remote | Self::Both)
+    }
+
+    /// Whether this carrier set admits a request carrying inline media.
+    pub const fn admits_inline(self) -> bool {
+        matches!(self, Self::Inline | Self::Both)
+    }
+
+    /// The individual carriers this set covers, so a caller can require each one.
+    pub const fn carriers(self) -> &'static [Self] {
+        match self {
+            Self::Inline => &[Self::Inline],
+            Self::Remote => &[Self::Remote],
+            Self::Both => &[Self::Inline, Self::Remote],
+        }
+    }
+
+    /// Whether this carrier set covers `carrier`.
+    ///
+    /// Distinct from equality on purpose: asking whether a set *includes* a carrier is the
+    /// question a route's promise asks of its targets, and `Both` is the only set that
+    /// includes `Both`.
+    pub const fn includes(self, carrier: Self) -> bool {
+        match carrier {
+            Self::Both => matches!(self, Self::Both),
+            Self::Inline => self.admits_inline(),
+            Self::Remote => self.admits_remote(),
+        }
+    }
+}
+
+impl MediaCarrier {
+    /// The carrier a request is checked against when the config states none.
+    ///
+    /// A route or target that predates carriers declared a medium and meant both, so the
+    /// default must be the permissive end rather than an empty set.
+    pub const DEFAULT: Self = Self::Both;
+}
+
+/// The video carrier a target's capability facts describe, or `None` when it serves neither.
+///
+/// `None` is not "unstated": it is the case where the target refuses video, expressed either
+/// as `no_video` or as both carrier facts at once. Returning a carrier there would name a
+/// transport the target cannot use, and the caller's video boolean already refuses it.
+fn carrier_from_facts(facts: &switchyard_llm_client::CapabilityFacts) -> Option<MediaCarrier> {
+    if facts.no_video {
+        return None;
+    }
+    combine_carrier_facts(facts.no_remote_video, facts.no_inline_video)
+}
+
+/// The image carrier a target's capability facts describe, or `None` when it serves neither.
+///
+/// Mirrors `carrier_from_facts` for the other medium. Without this the per-candidate filter
+/// would read an image carrier of "both" for every target, and a route that advertises both
+/// would send a remote image to an inline-only candidate.
+fn image_carrier_from_facts(
+    facts: &switchyard_llm_client::CapabilityFacts,
+) -> Option<MediaCarrier> {
+    if facts.no_vision {
+        return None;
+    }
+    combine_carrier_facts(facts.no_remote_image, facts.no_inline_image)
+}
+
+/// Turn the two refusal facts into the carrier set they describe.
+fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrier> {
+    match (no_remote, no_inline) {
+        (false, false) => Some(MediaCarrier::Both),
+        (false, true) => Some(MediaCarrier::Remote),
+        (true, false) => Some(MediaCarrier::Inline),
+        (true, true) => None,
+    }
 }
 
 /// Caller credential family required by a forwarded-auth route.
@@ -349,6 +463,11 @@ impl Route {
                         // Carried as a concrete boolean like the other facts, so an
                         // undeclared target is treated as video-incapable here.
                         video: Some(!facts.no_video),
+                        // A target is video-capable at all only if some carrier survives;
+                        // otherwise the boolean above already refuses it and naming a
+                        // carrier would read as a capability it does not have.
+                        video_carrier: carrier_from_facts(facts),
+                        image_carrier: image_carrier_from_facts(facts),
                         ..crate::ModelCapabilities::default()
                     };
                     crate::request_fit::unsupported_capability(
@@ -417,10 +536,15 @@ impl Route {
                 .target_capabilities()
                 .iter()
                 .find_map(|(_model, facts)| {
+                    // Mirror the eligibility predicate's reading of these facts, or the
+                    // refusal would name a different capability than the one that
+                    // actually excluded the candidate.
                     let capabilities = crate::ModelCapabilities {
                         vision: Some(!facts.no_vision),
                         tool_calling: Some(!facts.no_tool_calling),
                         video: Some(!facts.no_video),
+                        video_carrier: carrier_from_facts(facts),
+                        image_carrier: image_carrier_from_facts(facts),
                         ..crate::ModelCapabilities::default()
                     };
                     crate::request_fit::unsupported_capability(

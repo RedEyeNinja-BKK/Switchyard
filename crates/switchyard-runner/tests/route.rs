@@ -233,6 +233,12 @@ fn escalating_route(
         switchyard_llm_client::CapabilityFacts {
             no_vision: true,
             no_video: true,
+            // This fixture is the "cannot see anything" leg; it serves no carrier, so the
+            // carrier facts agree with the video fact rather than widening it.
+            no_remote_video: true,
+            no_inline_video: true,
+            no_remote_image: true,
+            no_inline_image: true,
             no_tool_calling: false,
         },
     )]));

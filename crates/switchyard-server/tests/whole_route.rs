@@ -654,6 +654,146 @@ children = ["smartfree", "smartlocal"]
     assert_eq!(vision.calls(), 1);
 }
 
+/// A carrier the route cannot serve is refused at the surface, before any provider call.
+///
+/// This is the measured shape of the free Nemotron endpoint: it answers an inline `data:`
+/// image and 404s a remote URL. Without the carrier fact the request would be forwarded and
+/// the caller would receive an upstream 404 instead of a routing answer.
+#[tokio::test]
+async fn a_remote_image_is_refused_by_an_inline_only_route_without_a_call() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.client]
+format = "openai_responses"
+base_url = "{base}"
+
+[targets.inline-vl]
+id = "vendor/inline-vl"
+llm_client = "client"
+vision = true
+image_carrier = "inline"
+
+[routes.vl]
+id = "test/vl"
+type = "passthrough"
+target = "inline-vl"
+candidates = []
+vision = true
+image_carrier = "inline"
+"#
+    );
+    let remote = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": "https://example.test/cat.jpg"}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", remote).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "unsupported_capability", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("other form"),
+        "the refusal names the carrier, not a missing medium: {body}"
+    );
+    assert_eq!(
+        upstream.calls(),
+        0,
+        "a carrier the target cannot serve is never forwarded"
+    );
+
+    let inline = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", inline).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream.calls(), 1, "the inline form is admitted");
+}
+
+/// Within one route that advertises both carriers, each request reaches the candidate that
+/// serves its form, and the other candidate receives nothing.
+///
+/// This is the dispatch half of the change: the route claim is truthful, and the per-target
+/// facts decide which candidate runs. A single boolean could not express it.
+#[tokio::test]
+async fn each_carrier_reaches_the_candidate_that_serves_it() {
+    let inline_only = Upstream::new();
+    let remote_only = Upstream::new();
+    let inline_url = inline_only.clone().server();
+    let remote_url = remote_only.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.inline]
+format = "openai_responses"
+base_url = "{inline_url}"
+
+[llm_clients.remote]
+format = "openai_responses"
+base_url = "{remote_url}"
+
+[targets.inline-vl]
+id = "vendor/inline-vl"
+llm_client = "inline"
+vision = true
+image_carrier = "inline"
+
+[targets.remote-vl]
+id = "vendor/remote-vl"
+llm_client = "remote"
+vision = true
+image_carrier = "remote"
+
+[routes.vl]
+id = "test/vl"
+type = "passthrough"
+target = "inline-vl"
+candidates = ["remote-vl"]
+vision = true
+image_carrier = "both"
+"#
+    );
+    let remote = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.test/cat.jpg"}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", remote).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (inline_only.calls(), remote_only.calls()),
+        (0, 1),
+        "a remote image must skip the inline-only candidate"
+    );
+
+    let inline = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", inline).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (inline_only.calls(), remote_only.calls()),
+        (1, 1),
+        "an inline image goes to the declared head candidate and not the fallback"
+    );
+}
+
 /// Every child receives the pristine request. A child that prepared provider-specific
 /// fields must not leak them into the next child's request.
 #[tokio::test]

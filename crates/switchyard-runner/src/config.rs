@@ -23,8 +23,9 @@ use switchyard_protocol::{
 };
 
 use crate::{
-    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError, capability, decision_executor, decision_transport,
+    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, MediaCarrier,
+    ModelCapabilities, Route, Runner, RunnerError, capability, decision_executor,
+    decision_transport,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -132,6 +133,15 @@ pub(crate) struct CompositeRouteConfig {
     /// Whether any child can accept video input. Stated, never inferred from `vision`.
     #[serde(default)]
     pub(crate) video: Option<bool>,
+    /// Which video carriers any child can accept, when the composite claims video.
+    ///
+    /// Same reasoning as the route field: a composite resolves before its children, so a
+    /// carrier it cannot back would advertise a medium and then skip every child.
+    #[serde(default)]
+    pub(crate) video_carrier: Option<MediaCarrier>,
+    /// Which image carriers any child can accept, when the composite claims vision.
+    #[serde(default)]
+    pub(crate) image_carrier: Option<MediaCarrier>,
 }
 
 /// One explicitly ordered decision lane.
@@ -173,6 +183,15 @@ struct RouteConfig {
     reasoning: Option<bool>,
     vision: Option<bool>,
     video: Option<bool>,
+    /// Which video carriers this route admits, when it claims video.
+    ///
+    /// A route promise, not a target fact: the target says what one endpoint can serve and
+    /// this says what the route lets through. They are intersected at load, so a route that
+    /// promises both carriers over an inline-only target is a configuration error rather
+    /// than a request that fails at the provider.
+    video_carrier: Option<MediaCarrier>,
+    /// Which image carriers this route admits, when it claims vision.
+    image_carrier: Option<MediaCarrier>,
     /// Reasoning policy for this route. Applies on top of the target's factual policy.
     route_reasoning_policy: Option<RouteReasoningPolicy>,
     /// Whether this route's reasoning policy is applied on a best-effort basis.
@@ -254,6 +273,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
         let video = take_optional(&mut table, "video")?;
+        let video_carrier = take_optional::<MediaCarrier, _>(&mut table, "video_carrier")?;
+        let image_carrier = take_optional::<MediaCarrier, _>(&mut table, "image_carrier")?;
         let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
         let route_reasoning_policy_best_effort: Option<bool> =
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
@@ -268,6 +289,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
             reasoning,
             vision,
             video,
+            video_carrier,
+            image_carrier,
             route_reasoning_policy,
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
@@ -305,6 +328,12 @@ impl RouteConfig {
             reasoning: self.reasoning,
             vision: self.vision,
             video: self.video,
+            // A route that claims a medium without naming carriers means every carrier, so
+            // a caller reading `/v1/models` and a request carrying either form agree.
+            video_carrier: (self.video == Some(true))
+                .then(|| self.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+            image_carrier: (self.vision == Some(true))
+                .then(|| self.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
         }
     }
 
@@ -466,6 +495,7 @@ impl DeploymentConfig {
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
         self.validate_composite_video_claims()?;
+        self.validate_composite_carrier_claims()?;
         self.validate_video_transport()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
@@ -690,6 +720,10 @@ impl DeploymentConfig {
                     reasoning: composite.reasoning,
                     vision: composite.vision,
                     video: composite.video,
+                    video_carrier: (composite.video == Some(true))
+                        .then(|| composite.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+                    image_carrier: (composite.vision == Some(true))
+                        .then(|| composite.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
                 },
             );
         }
@@ -862,6 +896,22 @@ impl DeploymentConfig {
     /// targets: a route may deliberately be narrower than its widest target.
     fn validate_route_capability_claims(&self) -> RunnerResult<()> {
         for (route_name, route) in &self.routes {
+            // A carrier without its medium would be a silently inert field: `capabilities()`
+            // only reports a carrier for a medium the route actually claims, so a route
+            // writing `video_carrier` without `video = true` would read as configured and do
+            // nothing. Refuse it rather than accept a no-op.
+            if route.video_carrier.is_some() && route.video != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares video_carrier without video = true; a carrier \
+                     is a narrowing of a medium the route must first claim"
+                )));
+            }
+            if route.image_carrier.is_some() && route.vision != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares image_carrier without vision = true; a carrier \
+                     is a narrowing of a medium the route must first claim"
+                )));
+            }
             let capabilities = route.capabilities();
             let mut names: Vec<&str> = route.routing_target_names().into_iter().collect();
             names.sort_unstable();
@@ -889,6 +939,51 @@ impl DeploymentConfig {
                         "route {route_name} declares {label} = true but none of its targets \
                          supports it; declare a target that does, or stop claiming it"
                     )));
+                }
+                // A carrier claim is a promise about a specific transport, and every carrier
+                // the route advertises must be backed by some target below it. "Both" is two
+                // promises: a target that only fetches URLs does not keep the inline half,
+                // so a route advertising both over inline-only targets would send a caller
+                // into a refusal the advertisement said could not happen.
+                let claimed_carrier = match label {
+                    "vision" => capabilities.image_carrier,
+                    "video" => capabilities.video_carrier,
+                    _ => None,
+                };
+                if let Some(claimed) = claimed_carrier {
+                    let missing: Vec<MediaCarrier> = claimed
+                        .carriers()
+                        .iter()
+                        .copied()
+                        .filter(|need| {
+                            !names.iter().any(|name| {
+                                let Some(target) = self.targets.get(*name) else {
+                                    return false;
+                                };
+                                // A target that refuses the medium serves none of its
+                                // carriers, whatever its carrier field says.
+                                let admits_medium = match label {
+                                    "vision" => target.vision != Some(false),
+                                    _ => target.video == Some(true),
+                                };
+                                // An undeclared carrier on an admitted medium means both,
+                                // exactly as it does on a route.
+                                let served = match label {
+                                    "vision" => target.image_carrier,
+                                    _ => target.video_carrier,
+                                }
+                                .unwrap_or(MediaCarrier::Both);
+                                admits_medium && served.includes(*need)
+                            })
+                        })
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares {label} carrier {claimed:?} but no \
+                             target serves {missing:?}; declare a target that does, or narrow \
+                             the route's carrier"
+                        )));
+                    }
                 }
             }
         }
@@ -920,6 +1015,87 @@ impl DeploymentConfig {
         Ok(())
     }
 
+    /// Checks that a composite's carrier claim is kept by at least one child, per carrier.
+    ///
+    /// A composite reports its own declaration to callers, so it makes the same promise a
+    /// leaf route does. Reading each child's *effective* carrier means a child that narrowed
+    /// to inline cannot keep the remote half of a composite advertising both.
+    fn validate_composite_carrier_claims(&self) -> RunnerResult<()> {
+        for (name, composite) in &self.composites {
+            for (label, claimed) in [
+                (
+                    "vision",
+                    (composite.vision == Some(true))
+                        .then(|| composite.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+                ),
+                (
+                    "video",
+                    (composite.video == Some(true))
+                        .then(|| composite.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+                ),
+            ] {
+                let Some(claimed) = claimed else {
+                    continue;
+                };
+                let missing: Vec<MediaCarrier> = claimed
+                    .carriers()
+                    .iter()
+                    .copied()
+                    .filter(|need| {
+                        !composite.children.iter().any(|child| {
+                            let Some(route) = self.routes.get(child) else {
+                                return false;
+                            };
+                            let capabilities = route.capabilities();
+                            let (medium, carrier) = match label {
+                                "vision" => (capabilities.vision, capabilities.image_carrier),
+                                _ => (capabilities.video, capabilities.video_carrier),
+                            };
+                            let admits_medium = match label {
+                                "vision" => medium != Some(false),
+                                _ => medium == Some(true),
+                            };
+                            admits_medium && carrier.unwrap_or(MediaCarrier::Both).includes(*need)
+                        })
+                    })
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} declares {label} carrier {claimed:?} but no \
+                         child serves {missing:?}; declare a child that does, or narrow the \
+                         composite's carrier"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that every declared carrier is backed by the medium it narrows.
+    ///
+    /// A video declaration without a carrier is the ambiguity this change removes: the
+    /// provider may answer an inline video and 404 a URL, and nothing in the manifest would
+    /// say which. Requiring the carrier turns that into a load error instead of a
+    /// caller-visible 404 at request time. An image carrier is the mirror case and needs the
+    /// vision claim it narrows.
+    fn validate_target_carriers(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if target.video == Some(true) && target.video_carrier.is_none() {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares video = true but no video_carrier; state \
+                     which of \"inline\" / \"remote\" / \"both\" it serves"
+                )));
+            }
+            if target.image_carrier.is_some() && target.vision != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares image_carrier without vision = true; \
+                     a carrier is a narrowing of a medium it must first claim"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Checks that a target claiming video sits on a transport that can carry it.
     ///
     /// Video has one faithful wire representation, the Responses `input_video` part. The
@@ -928,6 +1104,9 @@ impl DeploymentConfig {
     /// of the video. Refusing at load makes that a configuration error rather than a
     /// silent conversion at request time.
     fn validate_video_transport(&self) -> RunnerResult<()> {
+        // Carrier declarations are checked for EVERY target, not only the video ones: an
+        // image carrier is a real narrowing on a target that may declare no video at all.
+        self.validate_target_carriers()?;
         for (target_name, target) in &self.targets {
             if target.video != Some(true) {
                 continue;
@@ -1260,6 +1439,26 @@ impl DeploymentConfig {
                         // Video is never inferred: a target that does not state support is
                         // treated as unable to receive it.
                         no_video: target.video != Some(true),
+                        // A target that declares video without carriers means both, so an
+                        // older manifest keeps the behaviour it had before carriers existed.
+                        no_remote_video: !matches!(
+                            target.video_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Remote | MediaCarrier::Both
+                        ),
+                        no_inline_video: !matches!(
+                            target.video_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Inline | MediaCarrier::Both
+                        ),
+                        // Images carry the same distinction and the same default: a target
+                        // that declares vision without carriers means both.
+                        no_remote_image: !matches!(
+                            target.image_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Remote | MediaCarrier::Both
+                        ),
+                        no_inline_image: !matches!(
+                            target.image_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Inline | MediaCarrier::Both
+                        ),
                         no_tool_calling: target.tool_calling == Some(false),
                     },
                 );
@@ -1691,6 +1890,21 @@ struct TargetConfig {
     /// video, and on this deployment it does not. Omitted means "cannot".
     #[serde(default)]
     video: Option<bool>,
+    /// Which video carriers this deployment accepts, when it accepts video at all.
+    ///
+    /// Required whenever `video` is `true`. A provider can list video among a model's input
+    /// modalities and still refuse to fetch a URL for it: the free Nemotron endpoint answers
+    /// an inline `data:` video and 404s `video_url` with "No endpoints found that support
+    /// video URLs". Declaring `video = true` without this field leaves the same ambiguity
+    /// the boolean has, so the load refuses it rather than guessing a carrier.
+    #[serde(default)]
+    video_carrier: Option<MediaCarrier>,
+    /// Which image carriers this deployment accepts, when it accepts images at all.
+    ///
+    /// The image counterpart of `video_carrier`, and optional for the same historical reason
+    /// `vision` is: a deployment that predates carriers declares images and means both.
+    #[serde(default)]
+    image_carrier: Option<MediaCarrier>,
     #[serde(default)]
     tool_calling: Option<bool>,
 }
@@ -3303,7 +3517,7 @@ confidence_threshold = 0.5
     fn video_declaration_requires_a_responses_client() -> RunnerResult<()> {
         let configured = VALID_CONFIG.replacen(
             "id = \"classifier/model\"",
-            "id = \"classifier/model\"\nvideo = true",
+            "id = \"classifier/model\"\nvideo = true\nvideo_carrier = \"both\"",
             1,
         );
         let message = match runner_from_toml(&configured) {
@@ -3342,7 +3556,7 @@ confidence_threshold = 0.5
         let configured = VALID_CONFIG
             .replacen(
                 "id = \"strong/model\"",
-                "id = \"strong/model\"\nvideo = true",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"both\"",
                 1,
             )
             .replacen(
@@ -3356,6 +3570,201 @@ confidence_threshold = 0.5
             .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
         let capabilities = route.capabilities();
         assert_eq!(capabilities.video, Some(true));
+        Ok(())
+    }
+
+    /// A video declaration must say which carrier it serves.
+    ///
+    /// Without it the manifest cannot express the one distinction that matters: the free
+    /// Nemotron endpoint answers an inline video and 404s a URL, and `video = true` alone
+    /// would admit the request that then fails at the provider.
+    #[test]
+    fn a_video_target_must_state_its_carrier() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"strong/model\"",
+            "id = \"strong/model\"\nvideo = true",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "video without a carrier was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("no video_carrier"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// An image carrier is a narrowing of a medium the target must first claim.
+    #[test]
+    fn an_image_carrier_needs_a_vision_claim() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"strong/model\"",
+            "id = \"strong/model\"\nimage_carrier = \"inline\"",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "carrier without vision was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("image_carrier without vision"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A carrier on a route that claims no medium is an inert field, so the load refuses it.
+    #[test]
+    fn a_carrier_without_its_medium_is_refused() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "targets = [\"strong\", \"weak\"]",
+            "targets = [\"strong\", \"weak\"]\nvideo_carrier = \"inline\"",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("inert carrier was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("video_carrier without video = true"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// "Both" is two promises, and a route that advertises it needs targets for each half.
+    ///
+    /// The previous shape of this check accepted any claim while one target served *a*
+    /// carrier, so a route advertising both over an inline-only target still told callers a
+    /// remote URL would work. Every half of the claim is now required separately.
+    #[test]
+    fn a_route_advertising_both_carriers_needs_both_served() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("unserved carrier was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Both") && message.contains("Remote"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A target that refuses the medium does not serve any of its carriers.
+    ///
+    /// The carrier field defaults to "both" when absent, so reading it without first asking
+    /// whether the target admits the medium at all would let a vision-refusing target keep a
+    /// route's vision promise alive.
+    #[test]
+    fn a_target_refusing_the_medium_serves_no_carrier() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvision = true\nimage_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "id = \"weak/model\"",
+                "id = \"weak/model\"\nvision = false",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvision = true",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("refusing target was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Both"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A route may not promise a carrier no target of that route serves.
+    ///
+    /// This is the carrier counterpart of "video = true with no video target": the promise
+    /// would be advertised and then refused at request time. Both targets here are narrowed,
+    /// so a route asking for the other carrier has nothing behind it.
+    #[test]
+    fn a_route_may_not_promise_a_carrier_no_target_serves() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "id = \"weak/model\"",
+                "id = \"weak/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true\nvideo_carrier = \"remote\"",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "unsupported carrier was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Remote") && message.contains("no target serves"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// The same manifest is accepted once the route asks only for the carrier its targets
+    /// serve, which is the case this change exists to make expressible.
+    #[test]
+    fn an_inline_carrier_is_accepted_when_a_target_serves_it() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            );
+        let runner = runner_from_toml(&configured)?;
+        let route = runner
+            .route("switchyard/random")
+            .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
+        let capabilities = route.capabilities();
+        assert_eq!(capabilities.video, Some(true));
+        assert_eq!(capabilities.video_carrier, Some(MediaCarrier::Inline));
         Ok(())
     }
 
@@ -3384,7 +3793,7 @@ confidence_threshold = 0.5
             VALID_CONFIG
                 .replacen(
                     "id = \"strong/model\"",
-                    "id = \"strong/model\"\nvideo = true",
+                    "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"both\"",
                     1
                 )
                 .replacen(

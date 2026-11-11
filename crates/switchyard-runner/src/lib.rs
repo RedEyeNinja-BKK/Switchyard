@@ -29,6 +29,6 @@ pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_err
 pub use libsy::RuntimeModels;
 pub use provider_key_redactor::ProviderKeyRedactor;
 pub use route::{
-    AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
+    AuxiliaryTarget, CallerAuthKind, MediaCarrier, ModelCapabilities, Route, RunOutput, RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};

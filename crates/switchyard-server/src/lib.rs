@@ -1321,13 +1321,22 @@ fn resolve_route(
     {
         // `vision` is a declaration about images. Video and audio have no declaration at
         // all, so saying they "declare ... = false" would name a field the config lacks.
-        let detail = if matches!(capability, "video" | "audio") {
-            format!(
+        // A carrier refusal is neither: the medium is supported, the form the request
+        // supplies it in is not, and the caller needs to hear that difference.
+        let detail = match capability {
+            "video" | "audio" => format!(
                 "route {requested_model} cannot accept {capability} input: this deployment \
                  declares no {capability}-capable target"
-            )
-        } else {
-            format!("route {requested_model} declares {capability} = false")
+            ),
+            "image_carrier" => format!(
+                "route {requested_model} cannot accept an image supplied on that carrier: \
+                 the targets behind it serve the other form (inline bytes vs a remote URL)"
+            ),
+            "video_carrier" => format!(
+                "route {requested_model} cannot accept video supplied on that carrier: \
+                 the targets behind it serve the other form (inline bytes vs a remote URL)"
+            ),
+            _ => format!("route {requested_model} declares {capability} = false"),
         };
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -1394,10 +1403,20 @@ async fn handle_llm_request(
         Ok(execution) => execution,
         Err(RunnerError::UnsupportedCapability { model, capability }) => {
             // A valid request that no eligible route can serve is the caller's problem, not a
-            // deployment fault, so it must not be reported as a server failure.
+            // deployment fault, so it must not be reported as a server failure. A carrier
+            // refusal names a form, not a missing media type, so it reads as one.
+            let requirement = match capability {
+                "image_carrier" => {
+                    "an image supplied on that carrier (every candidate serves the other form)"
+                }
+                "video_carrier" => {
+                    "video supplied on that carrier (every candidate serves the other form)"
+                }
+                other => other,
+            };
             return error_response(
                 StatusCode::BAD_REQUEST,
-                format!("no eligible route for model {model:?}: requires {capability}"),
+                format!("no eligible route for model {model:?}: requires {requirement}"),
                 "invalid_request_error",
                 "unsupported_capability",
             );
@@ -2442,6 +2461,26 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
             "tool_calling": capabilities.tool_calling,
             "vision": capabilities.vision,
             "video": capabilities.video,
+            // The carrier is the half of the fact a boolean cannot express: an endpoint can
+            // read inline media and still refuse a URL. Reported only when it is narrower
+            // than "either", so a caller reading a plain video target sees no new field and
+            // a caller reading a carrier-restricted one learns which form works.
+            "video_carriers": match capabilities.video_carrier {
+                Some(switchyard_runner::MediaCarrier::Both) | None => Value::Null,
+                Some(carrier) => json!(match carrier {
+                    switchyard_runner::MediaCarrier::Inline => ["inline"],
+                    switchyard_runner::MediaCarrier::Remote => ["remote"],
+                    switchyard_runner::MediaCarrier::Both => unreachable!(),
+                }),
+            },
+            "image_carriers": match capabilities.image_carrier {
+                Some(switchyard_runner::MediaCarrier::Both) | None => Value::Null,
+                Some(carrier) => json!(match carrier {
+                    switchyard_runner::MediaCarrier::Inline => ["inline"],
+                    switchyard_runner::MediaCarrier::Remote => ["remote"],
+                    switchyard_runner::MediaCarrier::Both => unreachable!(),
+                }),
+            },
             "supported_inbound_formats": [
                 "openai-chat-completions",
                 "openai-responses",

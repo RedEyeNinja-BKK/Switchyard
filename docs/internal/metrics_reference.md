@@ -36,7 +36,7 @@ tier for the selected model, such as `strong` or `weak` for a two-tier classifie
 | Metric | Type | Meaning |
 |---|---|---|
 | `switchyard_requests_total{model}` | counter | Successful routed model calls per endpoint. |
-| `switchyard_errors_total{model}` | counter | Failed routed model calls per endpoint. |
+| `switchyard_errors_total{model,reason}` | counter | Failed routed model calls per endpoint, by terminal condition (`non_stream_error`, `stream_error`, `decode_error`, `raw_stream_error`, `dropped`). |
 | `switchyard_prompt_tokens_total{model}` | counter | Prompt-token billing per endpoint. |
 | `switchyard_completion_tokens_total{model}` | counter | Completion-token usage per endpoint. |
 | `switchyard_cached_tokens_total{model}` | counter | Cached prompt tokens per endpoint. |

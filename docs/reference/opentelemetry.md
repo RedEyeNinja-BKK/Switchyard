@@ -88,7 +88,7 @@ Metrics use the `switchyard` meter scope. The tables use OTel instrument names.
 | `switchyard.total_requests` | ObservableGauge | none | Process-wide total of successful and failed answer candidates after routing, including reused routing responses. |
 | `switchyard.total_errors` | ObservableGauge | none | Process-wide total of failures after routing, including failed answer candidates and reused routing responses. |
 | `switchyard.requests` | Counter | `model` | Successful answer candidates or reused routing responses, by model ID. |
-| `switchyard.errors` | Counter | `model` | Failed answer candidates or reused routing responses, by model ID. |
+| `switchyard.errors` | Counter | `model`, `reason` | Failed answer candidates or reused routing responses, by model ID and failure reason. |
 | `switchyard.model_call_latency_ms` | Histogram | `model` | Successful answer-candidate duration in milliseconds, including that candidate's retries and stream consumption. Excludes routing time and reused routing responses. |
 | `switchyard.routing_overhead_ms` | Histogram | `algorithm` | LLM client driver's time to obtain a successful routing outcome, including judge calls but excluding any subsequent answer call. |
 | `switchyard.classifier_fail_open` | Counter | `judge_model`, `reason` | Judge failures that caused classification to proceed without a verdict. |
@@ -130,7 +130,22 @@ compatibility values.
 
 For streams, these five instruments record when the response stream ends or is dropped.
 Stream errors count as failures. Dropping an unfinished stream also counts as a failure;
-a terminal message permits a successful drop. Failed calls have no
+a terminal message **or a clean end of body without one** permits a successful drop.
+
+The `reason` label on `switchyard.errors` records which terminal condition made the call
+a failure, from a bounded set: `non_stream_error` (the call failed before any response
+body existed), `stream_error` (an in-band upstream failure event), `decode_error` (an
+in-band decode failure), `raw_stream_error` (a stream item was itself an error), and
+`dropped` (the consumer stopped reading before any terminal condition). Successful calls
+do not reach this counter and carry no `reason`.
+
+`dropped` proves the stream ended before a terminal condition; it does not identify who
+caused that. A consumer abandoning the stream and a mid-stream provider death produce
+the same label.
+
+The `reason` label is additive: `sum by (model) (rate(switchyard_errors_total[5m]))`
+still returns the previous value, while a selector that names only `model` now matches
+one series per reason instead of one per model. Failed calls have no
 `model_call_latency_ms` sample.
 
 ### Algorithm-specific metrics

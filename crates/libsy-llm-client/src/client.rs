@@ -2588,6 +2588,104 @@ mod tests {
             .expect("call completes");
     }
 
+    /// A bounded route must actually switch reasoning OFF on the wire, not merely
+    /// declare it in configuration.
+    ///
+    /// This is the `smartfree-bounded` shape: a target that asks for reasoning
+    /// (`openrouter_enabled`, policy enabled) reached through a route whose contract
+    /// is "no reasoning". The route policy is applied last, so it has to overwrite
+    /// the target's `enabled: true` with `enabled: false`. A configuration-only
+    /// assertion would pass while the wire still requested thinking.
+    #[tokio::test]
+    async fn a_bounded_route_sends_reasoning_disabled_to_a_thinking_target() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "reasoning": {"enabled": false}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        // The target itself asks for reasoning; the route is what must negate it.
+        let client = TranslatingLlmClient::new(&responses_map_with_policy(
+            &format!("{}/v1", server.uri()),
+            switchyard_protocol::ReasoningPolicy::Enabled,
+        ))
+        .expect("client");
+
+        let mut llm_request = switchyard_protocol::text_request(Some("gpt".into()), "hi");
+        // The caller also asks for reasoning effort; the bounded route must still win.
+        llm_request.reasoning.effort = Some("high".to_string());
+
+        let request = Request {
+            llm_request,
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: Some(switchyard_protocol::ReasoningPolicy::Disabled),
+            route_reasoning_effort: None,
+        };
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .expect("call completes");
+    }
+
+    /// Control for the test above: without a route policy the same target keeps its
+    /// own reasoning switch, so the negation is proven to come from the route.
+    #[tokio::test]
+    async fn an_unbounded_route_leaves_the_thinking_target_enabled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "reasoning": {"enabled": true}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "model": "gpt",
+                "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&responses_map_with_policy(
+            &format!("{}/v1", server.uri()),
+            switchyard_protocol::ReasoningPolicy::Enabled,
+        ))
+        .expect("client");
+
+        let request = Request {
+            llm_request: switchyard_protocol::text_request(Some("gpt".into()), "hi"),
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
+        };
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .expect("call completes");
+    }
+
     /// A configured reasoning effort replaces the caller's value on both OpenAI wire formats,
     /// which `extra_body` (defaults only) cannot do.
     #[tokio::test]

@@ -1,0 +1,1111 @@
+# REDACTED REVIEW COPY -- NOT DEPLOYABLE.
+# Every endpoint below is a reserved placeholder. The canonical manifest stays on the
+# host; see README.md for its digest and for the commands that are safe to run.
+
+# Switchyard V6 release candidate. Generated and validated; do not hand-edit.
+schema_version = 1
+
+[llm_clients.deepseek]
+format = "openai_responses"
+base_url = "https://api.deepseek.com"
+api_key_env = "SWITCHYARD_DEEPSEEK_API_KEY"
+max_retries = 2
+
+[llm_clients.htpc]
+format = "openai_responses"
+base_url = "http://htpc-wsl.tailnet-example.ts.net:8889/v1"
+api_key_env = "SWITCHYARD_HTPC_API_KEY"
+max_retries = 2
+
+[llm_clients.thaillm]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+api_key_env = "SWITCHYARD_THAILLM_API_KEY"
+max_retries = 2
+
+[llm_clients.openai]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+requires_list_input = true
+max_retries = 2
+
+[llm_clients.openai_nt]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+requires_list_input = true
+max_retries = 2
+
+[llm_clients.openrouter]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+max_retries = 2
+
+[targets.deepseek-deepseek-flash]
+id = "deepseek-flash"
+llm_client = "deepseek"
+vision = true
+reasoning_effort = "high"
+
+[targets.htpc-qwen3_5-9b]
+id = "Qwen3.5-9B-Q4_0"
+llm_client = "htpc"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.htpc-qwen3_5-9b-mtp]
+id = "Qwen3.5-9B-MTP"
+llm_client = "htpc"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.openai-gpt-6-luna]
+id = "gpt-6-luna"
+llm_client = "openai"
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_effort = "high"
+
+[targets.openai-gpt-6-luna-nt]
+id = "gpt-6-luna"
+llm_client = "openai_nt"
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[targets.openai-gpt-6-sol]
+id = "gpt-6-sol"
+llm_client = "openai"
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_effort = "high"
+
+[targets.openrouter-glm-5_3-flash]
+id = "z-ai/glm-5.3-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "high"
+
+[targets.openrouter-liquid-lfm-2_5-2_6b-free]
+id = "liquid/lfm-2.5-2.6b:free"
+llm_client = "openrouter"
+vision = false
+reasoning_effort = "high"
+
+
+[targets.openrouter-qwen3_7-flash]
+id = "qwen/qwen3.7-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+[targets.openrouter-qwen3_8-flash]
+id = "qwen/qwen3.8-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+# Nemotron 3.5 Super VL is smartfree's R2 leg and its multimodal escalation.
+# MEASURED 2026-11-11 on this free endpoint, per CARRIER:
+#   * inline image (data: URL, 64px and 256px) -> 200, answered "Red"
+#   * remote image URL -> 404 "No endpoints found that support image URLs"
+#   * inline video (data: video/mp4) -> 200; remote video URL -> 404 "No endpoints
+#     found that support video URLs"
+# Video is TRUE with video_carrier = "inline": the carrier axis is what makes this
+# declaration honest. It admits inline video, which this endpoint answers 200, and
+# still refuses a remote video URL locally, which this endpoint answers with a
+# terminal 404. The refusal names the carrier, not the modality.
+[targets.openrouter-nemotron-3_5-super-vl-free]
+id = "nvidia/nemotron-3.5-super-vl:free"
+llm_client = "openrouter"
+vision = true
+video = true
+video_carrier = "inline"
+# Measured 2026-11-11: a data: image and a data: video return 200; a remote
+# image_url and a remote video_url both return 404 "No endpoints found that support
+# video URLs". The endpoint reads inline bytes only, for images as well as video, so
+# the remote carrier must be refused here instead of forwarded into a provider 404.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+# Baidu ERNIE 5.5 Flash Preview, free tier. Measured 2026-11-11 through the
+# Responses wire this deployment uses: plain 200, tool call 200 with a real
+# function_call item, streaming 200, and image input rejected with
+# "No endpoints found that support image input" (404). So it is declared
+# text-only here -- no vision/video -- and route-level filtering keeps
+# multimodal requests on the Nemotron candidate. Reasoning is emitted by
+# default upstream, hence "enabled"/openrouter_enabled, matching how the other
+# OpenRouter targets carry it.
+[targets.openrouter-ernie-5_5-flash-preview-free]
+id = "baidu/ernie-5.5-flash-preview:free"
+llm_client = "openrouter"
+# vision/video must be EXPLICIT false: an omitted capability is "undeclared" and
+# the runner treats undeclared vision as permitted, so only an explicit refusal
+# keeps image requests off this text-only target.
+vision = false
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.thaillm-openthaigpt]
+id = "openthaigpt-thaillm-8b-instruct-v7.2"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-qwen3_5-9b]
+id = "qwen3.5-9b"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-qwen3_6-35b-a3b]
+id = "qwen3.6-35b-a3b"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-thalle]
+id = "thalle-0.2-thaillm-8b-fa"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-typhoon]
+id = "typhoon-s-thaillm-8b-instruct"
+llm_client = "thaillm"
+vision = false
+
+# ---- direct target routes (for independent qualification) ----
+[routes.direct-deepseek-deepseek-flash]
+id = "direct-deepseek-deepseek-flash"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-htpc-qwen3_5-9b]
+id = "direct-htpc-qwen3_5-9b"
+type = "passthrough"
+target = "htpc-qwen3_5-9b"
+candidates = []
+context_window = 81920
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-htpc-qwen3_5-9b-mtp]
+id = "direct-htpc-qwen3_5-9b-mtp"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+candidates = []
+context_window = 81920
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-openai-gpt-6-luna]
+id = "direct-openai-gpt-6-luna"
+type = "passthrough"
+target = "openai-gpt-6-luna"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openai-gpt-6-luna-nt]
+id = "direct-openai-gpt-6-luna-nt"
+type = "passthrough"
+target = "openai-gpt-6-luna-nt"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openai-gpt-6-sol]
+id = "direct-openai-gpt-6-sol"
+type = "passthrough"
+target = "openai-gpt-6-sol"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-glm-5_3-flash]
+id = "direct-openrouter-glm-5_3-flash"
+type = "passthrough"
+target = "openrouter-glm-5_3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-liquid-lfm-2_5-2_6b-free]
+id = "direct-openrouter-liquid-lfm-2_5-2_6b-free"
+type = "passthrough"
+target = "openrouter-liquid-lfm-2_5-2_6b-free"
+candidates = []
+context_window = 67584
+tool_calling = true
+reasoning = true
+vision = false
+
+
+[routes.direct-openrouter-qwen3_7-flash]
+id = "direct-openrouter-qwen3_7-flash"
+type = "passthrough"
+target = "openrouter-qwen3_7-flash"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-qwen3_8-flash]
+id = "direct-openrouter-qwen3_8-flash"
+type = "passthrough"
+target = "openrouter-qwen3_8-flash"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-nemotron-3_5-super-vl-free]
+id = "direct-openrouter-nemotron-3_5-super-vl-free"
+type = "passthrough"
+target = "openrouter-nemotron-3_5-super-vl-free"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-ernie-5_5-flash-preview-free]
+id = "direct-openrouter-ernie-5_5-flash-preview-free"
+type = "passthrough"
+target = "openrouter-ernie-5_5-flash-preview-free"
+candidates = []
+context_window = 1024000
+tool_calling = true
+reasoning = true
+
+[routes.direct-thaillm-openthaigpt]
+id = "direct-thaillm-openthaigpt"
+type = "passthrough"
+target = "thaillm-openthaigpt"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-qwen3_5-9b]
+id = "direct-thaillm-qwen3_5-9b"
+type = "passthrough"
+target = "thaillm-qwen3_5-9b"
+candidates = []
+context_window = 32768
+tool_calling = false
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-qwen3_6-35b-a3b]
+id = "direct-thaillm-qwen3_6-35b-a3b"
+type = "passthrough"
+target = "thaillm-qwen3_6-35b-a3b"
+candidates = []
+context_window = 32768
+tool_calling = false
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-thalle]
+id = "direct-thaillm-thalle"
+type = "passthrough"
+target = "thaillm-thalle"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-typhoon]
+id = "direct-thaillm-typhoon"
+type = "passthrough"
+target = "thaillm-typhoon"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+# ---- five primitives ----
+[routes.smart]
+id = "smart"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = ["openrouter-glm-5_3-flash", "openrouter-qwen3_8-flash"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "inherit"
+
+[routes.smart-bounded]
+id = "smart-bounded"
+type = "passthrough"
+target = "openai-gpt-6-luna-nt"
+candidates = ["stephen-dots-3-note-preview-free"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+route_reasoning_policy_best_effort = true
+
+[routes.smartfree]
+id = "smartfree"
+type = "passthrough"
+target = "openrouter-ernie-5_5-flash-preview-free"
+candidates = ["openrouter-nemotron-3_5-super-vl-free"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+route_reasoning_policy = "inherit"
+
+[routes.smartfree-bounded]
+id = "smartfree-bounded"
+type = "passthrough"
+target = "openrouter-nemotron-3_5-super-vl-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+route_reasoning_policy = "none"
+
+# ---- four whole-route tiers ----
+[composites.tier1]
+children = ["smartfree", "smart"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[composites.tier1-bounded]
+children = ["smartfree-bounded", "smart-bounded"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[composites.tier2]
+children = ["smartfree"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[composites.tier2-bounded]
+children = ["smartfree-bounded"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+
+# ---- decision backends ----
+[targets.direct-htpc-laya]
+id = "laya-rl-agent"
+llm_client = "htpc"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "http://192.0.2.10:8011"
+decision_api_key_env = "SWITCHYARD_LAYA_API_KEY"
+
+[targets.direct-htpc-jev-style]
+id = "jev-style-0.8b-decision-v3"
+llm_client = "htpc"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "http://192.0.2.10:8765"
+decision_api_key_env = "SWITCHYARD_JEV_STYLE_API_KEY"
+
+[targets.direct-openrouter-span-01-lite]
+id = "respan/span-01-lite"
+llm_client = "openrouter"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "https://openrouter.ai"
+decision_api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+supported_types = { noul = true, choice = false, score = false }
+state_forms = { plain_string = true, structured = false }
+
+# ---- decision lanes (order is configuration, from the requalification) ----
+# ---- decision DIRECT foundations -> SMART families -> TIER policy ----
+# No default_decision_lane is declared. The field only accepts a configured
+# [decision_lanes.*] name, and the previous value named the COMPOSITION
+# tier1-decision, which the binary rejects at load time. It sat inside a
+# decision target's supported_types map, where it was inert. /v1/decisions
+# requires an explicit `model`, so nothing falls back to a default lane.
+[decision_lanes.smartfree-decision]
+targets = ["direct-openrouter-span-01-lite"]
+
+[decision_lanes.smartlocal-decision]
+targets = ["direct-htpc-jev-style", "direct-htpc-laya"]
+
+# GENERATED: tier1-decision COMPOSES the two SMART policy lanes above.
+# It does not copy their targets, so each family stays independently
+# addressable and a family change is inherited rather than duplicated.
+[decision_lane_composition.tier1-decision]
+children = ["smartfree-decision", "smartlocal-decision"]
+
+
+[targets."direct-openrouter-stephen-span-01-lite"]
+id = "respan/span-01-lite"
+llm_client = "openrouter_stephen"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "https://openrouter.ai"
+decision_api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+supported_types = { noul = true, choice = false, score = false }
+state_forms = { plain_string = true, structured = false }
+
+# ---- ST_Decisions: Stephen-only decision lane (additive) ----
+# Mirrors smartfree-decision's two targets but uses Stephen's OpenRouter
+# credential exclusively. Global openrouter credential is never a fallback.
+[decision_lanes.ST_Decisions]
+targets = ["direct-openrouter-stephen-span-01-lite"]
+
+# ---- embeddings and reranking ----
+[capability_clients.embedding-local]
+format = "openai_embeddings"
+base_url = "https://reninja.tailnet-example.ts.net:8448"
+model = "Qwen3-Embedding-0.6B"
+
+# Free embedding lane on the GLOBAL credential. Nemotron's free embed model is not
+# listed in /api/v1/models (it is an alpha/programme model) but answers on the
+# standard embeddings wire. Verified 2026-11-11 on both credentials: 4096 dims,
+# L2-normalised, byte-identical vectors across credentials (cosine 1.000000).
+# The contract is nevertheless named for THIS lane: config requires every
+# embedding contract to belong to exactly one client, and this client holds the
+# global credential, which has its own free-tier cap. Vectors are comparable
+# with ST_Embed's, so a consumer may reuse an index across the two.
+[capability_clients.embedding-free-nemotron]
+format = "openai_embeddings"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-embed-8b:free"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capability_clients.reranker-local]
+format = "cohere_jina_rerank"
+base_url = "https://reninja.tailnet-example.ts.net:8449"
+model = "qwen3-reranker-0.6b-q8_0"
+timeout_seconds = 120
+
+# Free rerank lane on the GLOBAL credential. Same model family as Stephen's
+# ST_Rerank and the same scores cross-credential; measured 0.85s for 20 documents
+# where smartlocal-rerank took 11.0s.
+[capability_clients.reranker-free]
+format = "cohere_jina_rerank"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-rerank-8b:free"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capabilities.smartlocal-embedding]
+id = "smartlocal-embedding"
+target = "embedding-local"
+contract = "local-embedding-space:v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+# Replaces the retired 1024-dim free embedding lane (its upstream
+# liquid/lfm-2.5-embedding-350m:free model is no longer in the catalogue and no
+# consumer referenced the lane).
+[capabilities.smartfree-embedding]
+id = "smartfree-embedding"
+target = "embedding-free-nemotron"
+contract = "openrouter-embedding-space:nemotron3.5-embed8b-v1"
+dimensions = 4096
+normalization = "L2"
+max_batch = 64
+
+[capabilities.smartlocal-rerank]
+id = "smartlocal-rerank"
+target = "reranker-local"
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+[capabilities.smartfree-rerank]
+id = "smartfree-rerank"
+target = "reranker-free"
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+# =====================================================================
+# STEPHEN (OpenRouter, dedicated credential)
+# =====================================================================
+# One llm_client, one credential. Every target below it resolves to
+# SWITCHYARD_STEPHEN_OPENROUTER_API_KEY and to nothing else. Clients are
+# built per llm_client and each route's router is populated from that
+# route's targets only, so a target on this client can never be served by
+# the global `openrouter` credential.
+#
+# max_retries = 0 is deliberate. OpenRouter's free-tier daily cap is
+# ACCOUNT-WIDE ("openrouter_free_tier_daily"): once it is exhausted every
+# free model returns 429. Retrying inside one candidate would multiply the
+# attempts against a cap that cannot be satisfied by retrying, and would
+# spend the route's whole fallback budget on the same exhausted account.
+# The ordered candidate list is the retry strategy instead: one attempt per
+# candidate, then an honest failure.
+#
+# attempt_timeout_ms bounds "this candidate is producing nothing" so a hung
+# upstream advances to the next candidate instead of consuming the call.
+[llm_clients.openrouter_stephen]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+max_retries = 0
+attempt_timeout_ms = 120000
+
+# ---- Stephen completion targets ----
+[targets.stephen-nemotron-3-5-super-vl-free]
+id = "nvidia/nemotron-3.5-super-vl:free"
+llm_client = "openrouter_stephen"
+vision = true
+video = true
+video_carrier = "inline"
+# Same upstream model as the global Nemotron target, measured the same way on this
+# credential: inline image 200, remote image 404. Inline is the only proven carrier.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.stephen-flint-v1-0-free]
+id = "recursive/flint-v1.0:free"
+llm_client = "openrouter_stephen"
+vision = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+# ---- Stephen primitive routes ----
+# ---- ST_Route: FREE ONLY -------------------------------------------------
+# Tier1 -> Tier2 -> Tier3. No paid tier is declared anywhere in this manifest,
+# so no free request can escalate into a paid one. Children are whole routes, so
+# each exhausts its own candidate list before the parent crosses.
+[composites.ST_Route]
+# ST_Paid is the fourth stage. It draws on the SAME Stephen credential as the free
+# tiers, so an account-wide cap on it does not help: no declared route crosses to a different credential
+# crosses to a different credential (htpc). Order within the shared credential is the
+# gate; putting ST_Paid last means a quota or auth failure on the free tiers is
+# terminal here, which is correct, because no later child could answer it.
+children = ["ST_Tier1", "ST_Tier2", "ST_Tier3", "ST_Paid"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+# ---- Stephen embedding and reranking capabilities ----
+[capability_clients.embedding-stephen]
+format = "openai_embeddings"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-embed-8b:free"
+api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capability_clients.reranker-stephen]
+format = "cohere_jina_rerank"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-rerank-8b:free"
+api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capabilities.ST_Embed]
+id = "ST_Embed"
+target = "embedding-stephen"
+contract = "stephen-embedding-space:nemotron3.5-embed8b-v1"
+dimensions = 4096
+normalization = "L2"
+max_batch = 64
+
+[capabilities.ST_Rerank]
+id = "ST_Rerank"
+target = "reranker-stephen"
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+# =====================================================================
+# ST tier hierarchy (Stephen's dedicated OpenRouter credential)
+# =====================================================================
+# Only genuinely new targets are declared here. nemotron / flint already
+# exist with correct capability facts. Every ST target resolves to
+# SWITCHYARD_STEPHEN_OPENROUTER_API_KEY and nothing else, because clients are
+# built per [llm_clients.*].
+
+[targets.stephen-dots-3-note-preview-free]
+id = "dots-studio/dots-3-note-preview:free"
+llm_client = "openrouter_stephen"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+# Both Gemma routes sit on one Google AI Studio pool, so a pool-wide 429 is one
+# fact about the pool rather than about either model. Declaring the shared group
+# makes the first failure stand for both: the sibling is skipped instead of
+# spending a second request the pool has already refused. The skip replays the
+# upstream status, so a caller still sees 429 rather than a generic outage.
+[targets.stephen-gemma-4-26b-a4b-it-free]
+id = "google/gemma-4-26b-a4b-it:free"
+llm_client = "openrouter_stephen"
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+cooldown_group = "google-ai-studio"
+
+[targets.stephen-gemma-4-31b-it-free]
+id = "google/gemma-4-31b-it:free"
+llm_client = "openrouter_stephen"
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+cooldown_group = "google-ai-studio"
+
+# ---- ST_Tier1: vision-capable free tier ----------------------------------
+# Dots is R1: its isolated inference and vision tests succeeded where Nemotron
+# showed intermittent upstream 500s. Dots carries a published expiration
+# (2026-12-31), so its replacement must stay a configuration-only change.
+[routes.ST_Tier1]
+id = "ST_Tier1"
+type = "passthrough"
+target = "stephen-dots-3-note-preview-free"
+candidates = ["stephen-nemotron-3-5-super-vl-free"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+route_reasoning_policy = "inherit"
+
+# ---- ST_Tier2: text-only free tier ---------------------------------------
+[routes.ST_Tier2]
+id = "ST_Tier2"
+type = "passthrough"
+target = "stephen-flint-v1-0-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+route_reasoning_policy = "inherit"
+
+# ---- ST_Tier3: Gemma free tier -------------------------------------------
+# context_window is the model-level contract OpenRouter publishes for these two
+# slugs, and OpenRouter filters endpoints by prompt length when it routes.
+#
+# Measured per-endpoint facts (2026-10-22) that the route-level number hides:
+#   gemma-4-26b-a4b-it:free  endpoints span 131072..262144; DeepInfra caps
+#                            max output at 16384
+#   gemma-4-31b-it:free      endpoints span 131072..262144; Venice caps
+#                            max output at 8192
+# Switchyard does not enforce context_window locally: there is no pre-dispatch
+# admission check and no truncation, so an over-long request or an over-large
+# max_output_tokens reaches the provider and comes back as an upstream 400.
+# That is an honest failure, never a silently shortened prompt. If these tiers
+# must guarantee the floor rather than the ceiling, declare 131072 instead and
+# accept that requests in 131073..262144 are refused at a tier that could have
+# served them.
+[routes.ST_Tier3]
+id = "ST_Tier3"
+type = "passthrough"
+target = "stephen-gemma-4-26b-a4b-it-free"
+candidates = ["stephen-gemma-4-31b-it-free"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+route_reasoning_policy = "inherit"
+
+# ---- ST_Paid: explicitly selected ONLY -----------------------------------
+# Paid inference, never entered automatically. ST_Route lists only the free
+# tiers, so a free request cannot escalate here; reaching this route requires
+# naming it. Candidates are ordered within the paid tier only, so a paid failure
+# falls back to another paid model on the SAME credential and never to a free
+# target or the global key.
+#
+# All three slugs were verified against the provider catalogue on 2026-10-28:
+#   z-ai/glm-5.3-flash              ctx 1048576, text+image+video -> text, tools
+#   deepseek/deepseek-v4.1-flash    ctx 1048576, text+image -> text, tools
+#   deepseek/deepseek-v4.1-flash-1017 ctx 1048576, text+image -> text, tools
+# Worst-case endpoint prices are USD 0.225/2.00, 0.60/2.40 and 0.45/1.80 per
+# million tokens; the gateway reserves against those figures.
+[targets.stephen-paid-glm-5-3-flash]
+id = "z-ai/glm-5.3-flash"
+llm_client = "openrouter_stephen"
+vision = true
+video = true
+# Measured 2026-11-11 through this deployment's Responses wire: text, inline image,
+# remote image, inline video and remote video each returned 200. This is the only
+# target proven on both carriers for both media, so both are declared explicitly
+# rather than left to the pre-carrier default.
+video_carrier = "both"
+image_carrier = "both"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.stephen-paid-deepseek-v4-1-flash]
+id = "deepseek/deepseek-v4.1-flash"
+llm_client = "openrouter_stephen"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+# deepseek/deepseek-v4.1-flash-1017 is the 2026-10-17 snapshot of the same
+# model family, verified in the provider catalogue on 2026-10-28 (ctx
+# 1048576, text+image -> text, tools). It shares the Stephen credential and
+# therefore never appears on the global client in the same route.
+[targets.stephen-paid-deepseek-v4-1-flash-1017]
+id = "deepseek/deepseek-v4.1-flash-1017"
+llm_client = "openrouter_stephen"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[routes.ST_Paid]
+id = "ST_Paid"
+type = "passthrough"
+target = "stephen-paid-deepseek-v4-1-flash-1017"
+candidates = ["stephen-paid-deepseek-v4-1-flash", "stephen-paid-glm-5-3-flash"]
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+route_reasoning_policy = "inherit"
+
+# ---- global catalog addition: recursive/flint-v1.0:free ----
+# Same upstream model as the Stephen free tier's Flint candidate, different
+# client and different credential. The two targets coexist because execution is keyed by
+# (llm_client, model id): a route may not mix two clients for one model id,
+# and these two models never share a route.
+[targets.openrouter-flint-v1-0-free]
+id = "recursive/flint-v1.0:free"
+llm_client = "openrouter"
+vision = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[routes.direct-openrouter-flint-v1-0-free]
+id = "direct-openrouter-flint-v1-0-free"
+type = "passthrough"
+target = "openrouter-flint-v1-0-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+
+
+# =====================================================================
+# Stephen direct routes - one addressable route per Stephen model
+# =====================================================================
+# Every Stephen model is reachable on its own, so it can be called directly,
+# pinned in a client, or measured individually, instead of only existing as a
+# leg inside a tier. These are leaves: a passthrough route names ONE target and
+# declares no candidates, because its whole job is to expose exactly that model.
+#
+# NAMING - every Stephen route is `direct-openrouter-stephen-<model>`. The
+# `stephen` token sits in one fixed position for all eight, so the set is
+# contiguous when sorted and the credential is readable from the name alone.
+#
+# The primitives (ST_Tier1/2/3, ST_Paid) keep their own target+candidate
+# ladder. The engine does NOT let a route reference another route, and nested
+# composites are rejected at config load ("child routes must be leaves"), so the
+# ladder is layered by responsibility rather than by reference:
+#
+#   direct-*  (one model, no fallback)
+#     -> ST_Tier1/2/3 + ST_Paid  (ordered fallback within one capability class)
+#       -> ST_Route              (composite; free tiers only, never ST_Paid)
+
+[routes.direct-openrouter-stephen-deepseek-v4-1-flash]
+id = "direct-openrouter-stephen-deepseek-v4-1-flash"
+type = "passthrough"
+target = "stephen-paid-deepseek-v4-1-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-stephen-deepseek-v4-1-flash-1017]
+id = "direct-openrouter-stephen-deepseek-v4-1-flash-1017"
+type = "passthrough"
+target = "stephen-paid-deepseek-v4-1-flash-1017"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-stephen-dots-3-note-preview-free]
+id = "direct-openrouter-stephen-dots-3-note-preview-free"
+type = "passthrough"
+target = "stephen-dots-3-note-preview-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free]
+id = "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free"
+type = "passthrough"
+target = "stephen-gemma-4-26b-a4b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-stephen-google-gemma-4-31b-it-free]
+id = "direct-openrouter-stephen-google-gemma-4-31b-it-free"
+type = "passthrough"
+target = "stephen-gemma-4-31b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-stephen-flint-v1-0-free]
+id = "direct-openrouter-stephen-flint-v1-0-free"
+type = "passthrough"
+target = "stephen-flint-v1-0-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes.direct-openrouter-stephen-glm-5-3-flash]
+id = "direct-openrouter-stephen-glm-5-3-flash"
+type = "passthrough"
+target = "stephen-paid-glm-5-3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+[routes.direct-openrouter-stephen-nemotron-3-5-super-vl-free]
+id = "direct-openrouter-stephen-nemotron-3-5-super-vl-free"
+type = "passthrough"
+target = "stephen-nemotron-3-5-super-vl-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+# =====================================================================
+# Global (non-Stephen) counterparts for Stephen models that had none
+# =====================================================================
+# Four Stephen models had no route on the GLOBAL `openrouter` credential. Each
+# gets a target and a direct route here so the model is reachable with the
+# global key as well as Stephen's. Targets must be declared per client - one
+# route may not mix two credentials - so these are separate targets pointing at
+# the same upstream ids as their Stephen counterparts.
+#
+# Pricing note: deepseek/deepseek-v4.1-flash is a METERED model, unlike the
+# `:free` slugs around it. It is reachable on the global key by name only; the
+# gateway, not the route, is what bounds spend.
+
+[targets.openrouter-deepseek-v4-1-flash]
+id = "deepseek/deepseek-v4.1-flash"
+llm_client = "openrouter"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.openrouter-dots-3-note-preview-free]
+id = "dots-studio/dots-3-note-preview:free"
+llm_client = "openrouter"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.openrouter-google-gemma-4-26b-a4b-it-free]
+id = "google/gemma-4-26b-a4b-it:free"
+llm_client = "openrouter"
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.openrouter-google-gemma-4-31b-it-free]
+id = "google/gemma-4-31b-it:free"
+llm_client = "openrouter"
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[routes.direct-openrouter-deepseek-v4_1-flash]
+id = "direct-openrouter-deepseek-v4_1-flash"
+type = "passthrough"
+target = "openrouter-deepseek-v4-1-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-dots-3-note-preview-free]
+id = "direct-openrouter-dots-3-note-preview-free"
+type = "passthrough"
+target = "openrouter-dots-3-note-preview-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-gemma-4-26b-a4b-it-free]
+id = "direct-openrouter-gemma-4-26b-a4b-it-free"
+type = "passthrough"
+target = "openrouter-google-gemma-4-26b-a4b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-gemma-4-31b-it-free]
+id = "direct-openrouter-gemma-4-31b-it-free"
+type = "passthrough"
+target = "openrouter-google-gemma-4-31b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"

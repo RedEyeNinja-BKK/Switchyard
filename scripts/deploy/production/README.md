@@ -31,16 +31,16 @@ Two manifests are published, because activating the routing change safely takes 
 
 | | candidate | recovery |
 |---|---|---|
-| derived from live manifest | `858590db2522870983d1d814ef891454078cd550f62463c8a359d944930981a6` | live manifest, then the candidate's removals |
-| deployed bytes (host only) | `9627a389f8b5abbcb4af99302579e0e3ece4d56e38c5ef92d877da3296719ccc` | `505c8dc632601059f196b281d69054fa4866709735a63c0503a5b21fc8f392d6` |
-| redacted projection here | `routes.redacted.toml` `c8785fb763771c246d9faf6c20b15e1a3ca97ab33eb87b81a3cea1f070e21ea7` | `routes.recovery.redacted.toml` `4a556bb2b20e5ccf6e9a8bae843d2bae0643c5229bc72794ad21bc667d9412a0` |
-| routes / targets | 42 / 36 | 38 / 34 |
+| derived from live manifest | `9627a389f8b5abbcb4af99302579e0e3ece4d56e38c5ef92d877da3296719ccc` | live manifest of 2026-11-13, then the candidate's removals |
+| deployed bytes (host only) | `8fc1f862c1d41f23818648c3c0aeb09da6ac1ec9ea3305e8a86946994a269cba` | `505c8dc632601059f196b281d69054fa4866709735a63c0503a5b21fc8f392d6` |
+| redacted projection here | `routes.redacted.toml` `1345f2d4bfd36853ba07d136dfa2744bc6831572d9d39667f0f4b0f21751260a` | `routes.recovery.redacted.toml` `4a556bb2b20e5ccf6e9a8bae843d2bae0643c5229bc72794ad21bc667d9412a0` |
+| routes / targets | 43 / 38 | 38 / 34 |
 | deployed binary (unchanged) | `eceabe3a6f7bcbd215d1fc9d4b1eae1e4abce659b5f99d1e76abb5dd1a92df6d` | same |
 | source commit of that binary | `1a21604fb2b1e1c85c0bc30c8e8905fda01f83c8` | same |
-| derived at | 2026-11-13 | 2026-11-13 |
+| derived at | 2026-11-16 | 2026-11-13 |
 
-The live manifest was 46 routes and 40 targets. Nothing outside the sections listed under
-[The change](#the-change) differs, and no target's own fields change at all.
+The recovery manifest is unchanged from the 2026-11-13 activation. The candidate manifest
+was 42 routes and 36 targets before the 2026-11-16 change described below.
 
 ### Checking that the public copy really is the deployed file
 
@@ -49,9 +49,9 @@ checker does both layers in one call:
 
 ```sh
 # On the host, against the canonical file: digest AND projection must both match.
-python3 scripts/deploy/production/manifest_contract.py /var/lib/switchyard/staging/routes.candidate.toml \
+python3 scripts/deploy/production/manifest_contract.py /var/lib/switchyard/staging/routes.smartfree-20261116.toml \
   --profile candidate \
-  --sha256 9627a389f8b5abbcb4af99302579e0e3ece4d56e38c5ef92d877da3296719ccc \
+  --sha256 8fc1f862c1d41f23818648c3c0aeb09da6ac1ec9ea3305e8a86946994a269cba \
   --redacted scripts/deploy/production/routes.redacted.toml
 ```
 
@@ -69,6 +69,53 @@ its own output changes nothing), and it is deterministic. `--print-mapping` show
 rewritten.
 
 ## The change
+
+### 2026-11-16 — free ladder, bounded NT lane, and the DeepSeek NT route
+
+The free lane is now an explicit three-model ladder. Capability filtering happens before
+dispatch, so a text-only R1 is never asked to read an image and a video never reaches a
+text or image leg:
+
+| rank | target | model | eligible input |
+|---|---|---|---|
+| R1 | `openrouter-ernie-5_5-flash-preview-free` | `baidu/ernie-5.5-flash-preview:free` | text |
+| R2 | `openrouter-ling-3_2-flash-free` | `inclusionai/ling-3.2-flash:free` | text, inline image |
+| R3 | `openrouter-nemotron-3_5-super-vl-free` | `nvidia/nemotron-3.5-super-vl:free` | text, inline image, inline video |
+
+`smartfree` keeps `context_window = 1000000`, the smallest advertised window in the
+ladder, and `image_carrier = "inline"` / `video_carrier = "inline"` because those are the
+carriers this deployment can prove. Audio has no declaration and fails closed at the route
+gate with no provider call.
+
+The bounded lane is now exactly two non-thinking models:
+
+| rank | route | enforcement |
+|---|---|---|
+| R1 | `direct-openai-gpt-6-luna-nt` | `reasoning_policy = "disabled"`, dialect `openai_effort` |
+| R2 | `direct-deepseek-deepseek-flash-nt` | `reasoning_policy = "disabled"`, dialect `openai_effort` |
+
+The new DeepSeek NT route is a first-class direct route. It reuses the existing
+`SWITCHYARD_DEEPSEEK_API_KEY` through a separate `deepseek_nt` client, because one
+`(model id, llm_client)` pair may exist and the thinking-capable target already owns
+`deepseek`/`deepseek-flash`. Both the target and the route set the no-thinking policy, so a
+caller-supplied `reasoning.effort` cannot turn reasoning back on. On the Responses wire the
+dialect emits `{"reasoning":{"effort":"none"}}`, which is DeepSeek's documented
+disable-thinking form for that API.
+
+`smartfree-bounded` is removed. `tier1-bounded` and `tier2-bounded` were composites whose
+only free leg was `smartfree-bounded`; with it gone they no longer described a bounded tier,
+so they are removed rather than silently rewired. `tier1`, `tier2`, `smartlocal-bounded`,
+`smart`, and the direct thinking routes are unchanged.
+
+Live checks on 2026-11-16: ERNIE text 200; Ling text/tool-call 200 (image probes hit the
+provider's shared-pool 429); Nemotron text/image 200 (inline video returned the provider's
+account-level 402, `requires at least $1.00 in balance for video`, which is a funding gate,
+not a format or routing failure); DeepSeek `reasoning.effort=none` returned a message with
+zero reasoning tokens, while the thinking route returned a reasoning item.
+
+---
+
+### 2026-11-13 — Studio profile retirement
 
 Local inference is served by Unsloth Studio on `comfyninja`, whose profile registry now holds
 exactly two profiles, both backed by the `UD-Q4_K_M` trunk:

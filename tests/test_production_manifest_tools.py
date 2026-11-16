@@ -183,11 +183,16 @@ def _synthetic(profile="candidate"):
         for name in ("smartlocal", "smartlocal-bounded"):
             routes[name] = dict(contract["smartlocal"], id=name, type="passthrough",
                                 candidates=[contract["smartlocal"]["escalation_target"]])
+    # Ladder routes carry their own expected bodies, so the fixture is built from the
+    # contract rather than from a second hand-copied inventory.
+    for name, body in contract.get("lane_routes", {}).items():
+        routes[name] = dict(body, id=name, type="passthrough")
     # Composite children are route ids, so they have to exist for the contract's composite
     # assertions and for the referential check.
-    for name in ("smartfree", "smartfree-bounded", "smart", "smart-bounded"):
-        routes.setdefault(name, {"id": name, "type": "passthrough", "candidates": [],
-                                 "target": reusable})
+    for composite in contract["composites"].values():
+        for name in composite.get("children") or []:
+            routes.setdefault(name, {"id": name, "type": "passthrough", "candidates": [],
+                                     "target": reusable})
     index = 0
     while len(routes) < counts["routes"]:
         name = "filler-route-%02d" % index
@@ -224,7 +229,39 @@ def test_contract_catches_a_route_count_that_moved():
 
     fails = manifest_contract.check(doc, "candidate")
 
-    assert any("routes: expected 42" in failure for failure in fails)
+    expected = manifest_contract.CONTRACTS["candidate"]["counts"]["routes"]
+    assert any("routes: expected %d" % expected in failure for failure in fails)
+
+
+def test_contract_catches_a_reintroduced_smartfree_bounded():
+    doc = _synthetic()
+    doc["routes"]["smartfree-bounded"] = {"id": "smartfree-bounded", "type": "passthrough",
+                                         "target": "filler-target-00", "candidates": []}
+
+    fails = manifest_contract.check(doc, "candidate")
+
+    assert any("retired route survives: smartfree-bounded" in failure for failure in fails)
+
+
+def test_contract_pins_the_smartfree_ladder_order():
+    doc = _synthetic()
+    doc["routes"]["smartfree"]["candidates"] = [
+        "openrouter-nemotron-3_5-super-vl-free", "openrouter-ling-3_2-flash-free"]
+
+    fails = manifest_contract.check(doc, "candidate")
+
+    assert any("smartfree.candidates" in failure for failure in fails)
+
+
+def test_contract_pins_the_bounded_lane_to_no_thinking():
+    doc = _synthetic()
+    doc["routes"]["smart-bounded"]["route_reasoning_policy"] = "inherit"
+
+    fails = manifest_contract.check(doc, "candidate")
+
+    assert any("smart-bounded.route_reasoning_policy" in failure for failure in fails)
+
+
 def test_contract_catches_a_context_window_that_was_not_measured():
     doc = _synthetic()
     doc["routes"]["smartlocal"]["context_window"] = 225280

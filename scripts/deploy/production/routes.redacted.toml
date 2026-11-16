@@ -11,6 +11,12 @@ base_url = "https://api.deepseek.com"
 api_key_env = "SWITCHYARD_DEEPSEEK_API_KEY"
 max_retries = 2
 
+[llm_clients.deepseek_nt]
+format = "openai_responses"
+base_url = "https://api.deepseek.com"
+api_key_env = "SWITCHYARD_DEEPSEEK_API_KEY"
+max_retries = 2
+
 [llm_clients.htpc]
 format = "openai_responses"
 base_url = "http://htpc-wsl.tailnet-example.ts.net:8889/v1"
@@ -69,6 +75,13 @@ id = "deepseek-flash"
 llm_client = "deepseek"
 vision = true
 reasoning_effort = "high"
+
+[targets.deepseek-deepseek-flash-nt]
+id = "deepseek-flash"
+llm_client = "deepseek_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
 
 [targets.htpc-qwen3_5-9b]
 id = "Qwen3.5-9B-Q4_0"
@@ -174,6 +187,16 @@ llm_client = "openrouter"
 # keeps image requests off this text-only target.
 vision = false
 video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.openrouter-ling-3_2-flash-free]
+id = "inclusionai/ling-3.2-flash:free"
+llm_client = "openrouter"
+vision = true
+video = false
+image_carrier = "inline"
 tool_calling = true
 reasoning_policy = "enabled"
 reasoning_dialect = "openrouter_enabled"
@@ -350,6 +373,28 @@ context_window = 1024000
 tool_calling = true
 reasoning = true
 
+[routes.direct-openrouter-ling-3_2-flash-free]
+id = "direct-openrouter-ling-3_2-flash-free"
+type = "passthrough"
+target = "openrouter-ling-3_2-flash-free"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+image_carrier = "inline"
+
+[routes.direct-deepseek-deepseek-flash-nt]
+id = "direct-deepseek-deepseek-flash-nt"
+type = "passthrough"
+target = "deepseek-deepseek-flash-nt"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+
 [routes.direct-thaillm-openthaigpt]
 id = "direct-thaillm-openthaigpt"
 type = "passthrough"
@@ -416,13 +461,12 @@ route_reasoning_policy = "inherit"
 id = "smart-bounded"
 type = "passthrough"
 target = "openai-gpt-6-luna-nt"
-candidates = ["stephen-dots-3-note-preview-free"]
+candidates = ["deepseek-deepseek-flash-nt"]
 context_window = 262144
 tool_calling = true
 reasoning = true
 vision = true
 route_reasoning_policy = "none"
-route_reasoning_policy_best_effort = true
 
 [routes.smartlocal]
 id = "smartlocal"
@@ -471,37 +515,18 @@ escalation_target = "comfyninja-qwen3_8-27b-q4-mtp-vl"
 id = "smartfree"
 type = "passthrough"
 target = "openrouter-ernie-5_5-flash-preview-free"
-candidates = ["openrouter-nemotron-3_5-super-vl-free"]
+candidates = ["openrouter-ling-3_2-flash-free", "openrouter-nemotron-3_5-super-vl-free"]
 context_window = 1000000
 tool_calling = true
 reasoning = true
 vision = true
 video = true
 video_carrier = "inline"
-# Narrowed to what its targets serve: the measured vision target on this route
-# answers inline media only and 404s a remote URL, so advertising "both" here
-# would promise a carrier nothing below the route can deliver.
 image_carrier = "inline"
 route_reasoning_policy = "inherit"
 
-[routes.smartfree-bounded]
-id = "smartfree-bounded"
-type = "passthrough"
-target = "openrouter-nemotron-3_5-super-vl-free"
-candidates = []
-context_window = 262144
-tool_calling = true
-reasoning = true
-vision = true
-video = true
-video_carrier = "inline"
-# Narrowed to what its targets serve: the measured vision target on this route
-# answers inline media only and 404s a remote URL, so advertising "both" here
-# would promise a carrier nothing below the route can deliver.
-image_carrier = "inline"
-route_reasoning_policy = "none"
 
-# ---- four whole-route tiers ----
+
 [composites.tier1]
 children = ["smartfree", "smart"]
 context_window = 1000000
@@ -509,12 +534,7 @@ tool_calling = true
 reasoning = true
 vision = true
 
-[composites.tier1-bounded]
-children = ["smartfree-bounded", "smart-bounded"]
-context_window = 1000000
-tool_calling = true
-reasoning = true
-vision = true
+
 
 [composites.tier2]
 children = ["smartfree", "smartlocal"]
@@ -523,14 +543,8 @@ tool_calling = true
 reasoning = true
 vision = true
 
-[composites.tier2-bounded]
-children = ["smartfree-bounded", "smartlocal-bounded"]
-context_window = 225280
-tool_calling = true
-reasoning = true
-vision = true
 
-# ---- decision backends ----
+
 [targets.direct-htpc-laya]
 id = "laya-rl-agent"
 llm_client = "htpc"

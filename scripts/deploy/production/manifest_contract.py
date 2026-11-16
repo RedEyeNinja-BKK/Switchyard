@@ -61,6 +61,16 @@ RETIRED_IDS = (
     "direct-comfyninja-qwen3_8-27b-q4",
 )
 
+# Routes and composites retired by the 2026-11-16 directive. `smartfree-bounded`
+# could not enforce its no-thinking contract across a free lane whose models reason
+# by default, and the two bounded tier composites existed only to include it.
+# Reintroducing any of them under its old name is the failure this check catches.
+RETIRED_BOUNDED = (
+    "smartfree-bounded",
+    "tier1-bounded",
+    "tier2-bounded",
+)
+
 # The composite context that must never be advertised: it exceeds what either candidate can
 # serve, so advertising it would promise capacity no leg can deliver.
 FORBIDDEN_CONTEXT = 163840
@@ -68,7 +78,7 @@ FORBIDDEN_CONTEXT = 163840
 CONTRACTS = {
     "candidate": {
         "counts": {
-            "llm_clients": 8, "targets": 36, "routes": 42, "composites": 5,
+            "llm_clients": 9, "targets": 38, "routes": 43, "composites": 3,
             "decision_lanes": 3, "capability_clients": 6, "capabilities": 6,
         },
         "routes": {
@@ -76,20 +86,47 @@ CONTRACTS = {
                 "context_window": 179712, "tool_calling": True, "reasoning": True, "vision": False}},
             COMFYNINJA_VISION: {"direct-comfyninja-qwen3_8-27b-q4-mtp-vl": {
                 "context_window": 152832, "tool_calling": True, "reasoning": True, "vision": True}},
+            "deepseek-deepseek-flash-nt": {"direct-deepseek-deepseek-flash-nt": {
+                "context_window": 1048576, "tool_calling": True, "vision": True,
+                "route_reasoning_policy": "none", "candidates": []}},
+            "openrouter-ling-3_2-flash-free": {"direct-openrouter-ling-3_2-flash-free": {
+                "context_window": 1048576, "tool_calling": True, "vision": True,
+                "image_carrier": "inline", "candidates": []}},
         },
+        "lane_routes": {
+            "smartfree": {
+                "target": "openrouter-ernie-5_5-flash-preview-free",
+                "candidates": ["openrouter-ling-3_2-flash-free",
+                               "openrouter-nemotron-3_5-super-vl-free"],
+                "context_window": 1000000, "tool_calling": True, "vision": True,
+                "video": True, "video_carrier": "inline", "image_carrier": "inline",
+            },
+            "smart-bounded": {
+                "target": "openai-gpt-6-luna-nt",
+                "candidates": ["deepseek-deepseek-flash-nt"],
+                "context_window": 262144, "route_reasoning_policy": "none",
+            },
+        },
+        "forbid_routes": RETIRED_BOUNDED,
         "smartlocal": {
             "target": HTPC_PRIMARY,
             "escalation_target": COMFYNINJA_VISION,
             "escalation_max_input_tokens": 61440,
             "context_window": 81920,
         },
-        "target_ids": {COMFYNINJA_TEXT: "comfyninja/qwen3.8-27b-q4-mtp",
-                       COMFYNINJA_VISION: "comfyninja/qwen3.8-27b-q4-mtp-vl"},
+        "target_ids": {
+            COMFYNINJA_TEXT: "comfyninja/qwen3.8-27b-q4-mtp",
+            COMFYNINJA_VISION: "comfyninja/qwen3.8-27b-q4-mtp-vl",
+            "openrouter-ernie-5_5-flash-preview-free": "baidu/ernie-5.5-flash-preview:free",
+            "openrouter-ling-3_2-flash-free": "inclusionai/ling-3.2-flash:free",
+            "openrouter-nemotron-3_5-super-vl-free": "nvidia/nemotron-3.5-super-vl:free",
+            "deepseek-deepseek-flash-nt": "deepseek-flash",
+            "openai-gpt-6-luna-nt": "gpt-6-luna",
+        },
         "forbid_targets": [],
         "composites": {
+            "tier1": {"children": ["smartfree", "smart"], "context_window": 1000000},
             "tier2": {"children": ["smartfree", "smartlocal"], "context_window": 225280},
-            "tier2-bounded": {"children": ["smartfree-bounded", "smartlocal-bounded"],
-                              "context_window": 225280},
         },
     },
     "recovery": {
@@ -158,6 +195,24 @@ def check(doc: dict, profile: str) -> list[str]:
                 if route.get(key) != value:
                     fails.append("%s.%s: expected %r, found %r"
                                  % (name, key, value, route.get(key)))
+
+    # Ladder routes are the routing contract itself: the ordered candidates, the
+    # advertised capabilities, and the policy that makes the bounded lane non-thinking.
+    for name, expected in contract.get("lane_routes", {}).items():
+        route = routes.get(name)
+        if route is None:
+            fails.append("route missing: %s" % name)
+            continue
+        for key, value in expected.items():
+            if route.get(key) != value:
+                fails.append("%s.%s: expected %r, found %r"
+                             % (name, key, value, route.get(key)))
+
+    for name in contract.get("forbid_routes", ()):
+        if name in routes:
+            fails.append("retired route survives: %s" % name)
+        if name in composites:
+            fails.append("retired composite survives: %s" % name)
 
     local = contract["smartlocal"]
     if local:

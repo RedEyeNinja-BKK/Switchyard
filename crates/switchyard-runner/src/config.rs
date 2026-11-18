@@ -118,6 +118,16 @@ pub(crate) struct DeploymentConfig {
 pub(crate) struct CompositeRouteConfig {
     /// Child route names in preference order.
     pub(crate) children: Vec<String>,
+    /// When this composite may try its next child.
+    ///
+    /// Defaults to the historical failure-class rule, which is right for a composite whose
+    /// children sit on different credentials. A composite whose children share one
+    /// credential has a different question to answer: whether the *scope* the failed child
+    /// used is exhausted while the next child's scope is not. `credential_block` says that
+    /// and nothing more, so an ordinary rate limit, a timeout or a provider fault cannot
+    /// spend a paid call.
+    #[serde(default)]
+    pub(crate) cross_on: CompositeCrossPolicy,
     /// Certified context this composite guarantees, as an explicit policy promise.
     ///
     /// Stated rather than derived: a composite whose first child accepts a million tokens
@@ -142,6 +152,34 @@ pub(crate) struct CompositeRouteConfig {
     /// Which image carriers any child can accept, when the composite claims vision.
     #[serde(default)]
     pub(crate) image_carrier: Option<MediaCarrier>,
+}
+
+/// When a whole-route composite may try its next child.
+///
+/// The two answers differ in what they treat as evidence. `failure_class` asks whether the
+/// failure looks recoverable somewhere else, which is the right question when children sit
+/// on different credentials. `credential_block` asks whether the failure named a
+/// credential-scoped resource as out, which is the right question when children share one
+/// credential and the later child's *scope* is what differs.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositeCrossPolicy {
+    /// Cross on any failure class that says another complete route might answer.
+    ///
+    /// This is the historical rule and stays the default, so an existing composite's
+    /// behaviour does not change because a new policy became available.
+    #[default]
+    FailureClass,
+    /// Cross only when the failed child reported a credential-level block AND a later
+    /// child on that credential still has a servable scope.
+    ///
+    /// A block is what the provider said about the credential, not what the request
+    /// looked like: the free-model daily allowance reported exhausted is a block, while a
+    /// 20-per-minute throttle, a timeout, a transport fault or a per-model refusal is not.
+    /// A later child on a different credential is unaffected by any block and is judged on
+    /// its own failure. A whole-credential exhaustion or a rejected key blocks every child
+    /// on that credential, so no later child is called and the child's own error surfaces.
+    CredentialBlock,
 }
 
 /// One explicitly ordered decision lane.
@@ -775,6 +813,7 @@ impl DeploymentConfig {
         // resolving a route cannot tell whether it is a leaf or a composite.
         for (name, composite) in &self.composites {
             runner = runner.with_composite(name.clone(), composite.children.clone());
+            runner = runner.with_composite_cross_policy(name.clone(), composite.cross_on);
             runner = runner.with_composite_capabilities(
                 name.clone(),
                 self.composite_capabilities(composite),
@@ -1827,10 +1866,19 @@ fn route_locality(
             return Locality::Unknown;
         };
         legs += 1;
-        match client.billing {
-            None => return Locality::Unknown,
-            Some(BillingKind::Local) => saw_local = true,
-            Some(BillingKind::Metered | BillingKind::Subscription) => saw_external = true,
+        // A declared locality is authoritative. Undeclared falls back to a `local`
+        // billing, which states the same fact for an operator-hosted client; any other
+        // undeclared combination stays unknown rather than being given a cost class it
+        // did not claim, because a subscription credential is still an external provider.
+        match client.locality {
+            Some(crate::config::ClientLocality::Local) => saw_local = true,
+            Some(crate::config::ClientLocality::External) => saw_external = true,
+            None => match client.billing {
+                Some(BillingKind::Local) => saw_local = true,
+                Some(BillingKind::Metered | BillingKind::Subscription) | None => {
+                    return Locality::Unknown;
+                }
+            },
         }
     }
 
@@ -1941,6 +1989,25 @@ struct LlmClientConfig {
     /// provider never made.
     #[serde(default)]
     billing: Option<BillingKind>,
+    /// Where requests sent to this client are transported, as the deployment declares it.
+    ///
+    /// Deliberately separate from `billing`. That field classifies cost for the economics
+    /// surface, and a subscription credential is still an external provider; deriving an
+    /// egress claim from it would let an economics label decide whether a payload leaves
+    /// the operator's infrastructure. Locality answers that second question on its own and
+    /// stays undeclared when the deployment does not state it.
+    #[serde(default)]
+    locality: Option<ClientLocality>,
+}
+
+/// Where a client's traffic terminates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientLocality {
+    /// The operator's own deployment: requests never leave operator infrastructure.
+    Local,
+    /// A third-party provider reached over the public network.
+    External,
 }
 
 /// How a client's usage is billed.
@@ -2207,6 +2274,75 @@ fn validate_value(label: &str, value: &str) -> RunnerResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Locality is the client's own declaration, not a cost class read from billing.
+    ///
+    /// A subscription credential is still an external provider, so `billing` cannot answer
+    /// this question. An undeclared client stays unknown rather than being given the
+    /// answer its billing field implies.
+    #[test]
+    fn route_locality_comes_from_the_declared_transport() {
+        let base = r#"
+schema_version = 1
+
+[llm_clients.ext]
+format = "openai_responses"
+base_url = "https://provider.test/v1"
+locality = "external"
+
+[targets.ext-a]
+id = "vendor/ext-a"
+llm_client = "ext"
+
+[routes.remote]
+id = "remote"
+type = "passthrough"
+target = "ext-a"
+candidates = []
+
+[llm_clients.mine]
+format = "openai_responses"
+base_url = "http://host.test:8446/v1"
+billing = "local"
+
+[targets.mine-a]
+id = "vendor/mine-a"
+llm_client = "mine"
+
+[routes.here]
+id = "here"
+type = "passthrough"
+target = "mine-a"
+candidates = []
+
+[llm_clients.undeclared]
+format = "openai_responses"
+base_url = "https://other.test/v1"
+billing = "subscription"
+
+[targets.undeclared-a]
+id = "vendor/undeclared-a"
+llm_client = "undeclared"
+
+[routes.unknown]
+id = "unknown"
+type = "passthrough"
+target = "undeclared-a"
+candidates = []
+"#;
+        let runner = crate::Runner::from_toml(base).expect("deployment builds");
+        let by_id = runner
+            .models()
+            .map(|model| (model.id.as_str().to_string(), model.locality))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_id["remote"], crate::route::Locality::Upstream);
+        assert_eq!(by_id["here"], crate::route::Locality::Local);
+        assert_eq!(
+            by_id["unknown"],
+            crate::route::Locality::Unknown,
+            "a subscription credential alone states no locality"
+        );
+    }
 
     #[test]
     fn route_presentation_fields_are_split_from_the_algorithm() {

@@ -34,6 +34,8 @@ use crate::{Route, RunOutput, Runner, RunnerError, request_fit};
 pub struct CompositeSpec {
     /// Child routes in preference order.
     pub children: Vec<String>,
+    /// When the parent may move on to the next child.
+    pub cross_on: crate::config::CompositeCrossPolicy,
 }
 
 /// What a composite did for one request.
@@ -321,11 +323,22 @@ impl Runner {
                     // names no credential this deployment resolves (a forwarded caller's
                     // 401, or a slug no route owns), and then plain class policy
                     // decides.
-                    let crossable = class.allows_cross_route()
-                        || matches!(
-                            block.as_ref().map(|block| &block.kind),
-                            Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
-                        );
+                    //
+                    // A composite that states `cross_on = "credential_block"` narrows
+                    // this to the block alone, because its children share one credential
+                    // and the question is which SCOPE that credential still serves. An
+                    // ordinary rate limit, a timeout or a provider fault carries no block
+                    // and then crosses nowhere.
+                    let crossable = match spec.cross_on {
+                        crate::config::CompositeCrossPolicy::FailureClass => {
+                            class.allows_cross_route()
+                                || matches!(
+                                    block.as_ref().map(|block| &block.kind),
+                                    Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
+                                )
+                        }
+                        crate::config::CompositeCrossPolicy::CredentialBlock => block.is_some(),
+                    };
                     if !crossable {
                         // Terminal for the parent. Surfacing the child's own error keeps a
                         // contract, policy or credential fault visible instead of letting a

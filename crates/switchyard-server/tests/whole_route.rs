@@ -2535,3 +2535,159 @@ async fn the_shadow_reports_a_composite_verdict_from_its_children() {
     assert_eq!(large.calls(), 1, "the composable child serves");
     assert_eq!(response.0, StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// `cross_on = "credential_block"`: a composite whose children share one credential
+// may only spend a later child when the failure said the earlier child's SCOPE is
+// gone. Everything else - a throttle, a timeout, a provider fault - is not evidence.
+// The fixture's `script` answers by the model name in the body, so one backend can
+// serve both children and still prove which child reached it.
+// ---------------------------------------------------------------------------
+
+/// Builds a Stephen-shaped deployment: a free child and a paid child on ONE credential,
+/// joined by a composite that only crosses on a credential block.
+fn stephen_shared_credential(free_slug: &str, paid_slug: &str, base: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.stephen]
+format = "openai_responses"
+base_url = "{base}"
+
+[targets.free-leg]
+id = "{free_slug}"
+llm_client = "stephen"
+
+[routes.ST_Free]
+id = "ST_Free"
+type = "passthrough"
+target = "free-leg"
+candidates = []
+vision = false
+
+[targets.paid-leg]
+id = "{paid_slug}"
+llm_client = "stephen"
+
+[routes.ST_Paid]
+id = "ST_Paid"
+type = "passthrough"
+target = "paid-leg"
+candidates = []
+vision = false
+
+[composites.ST_Route]
+children = ["ST_Free", "ST_Paid"]
+cross_on = "credential_block"
+"#
+    )
+}
+
+/// An ordinary rate limit on the free child must not spend a paid call.
+#[tokio::test]
+async fn a_throttled_free_child_does_not_cross_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/pool-429-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_ne!(status, StatusCode::OK, "the throttle is surfaced: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().all(|model| model.contains("pool-429-leg")),
+        "only the free leg may be called, but the backend saw {models:?}"
+    );
+}
+
+/// A confirmed account-wide daily free-allowance exhaustion DOES cross, because the
+/// paid scope on the same credential is still servable.
+#[tokio::test]
+async fn an_exhausted_free_allowance_crosses_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/account-quota-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "the paid leg serves: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the paid child must be reached after a free-allowance exhaustion: {models:?}"
+    );
+}
+
+/// A whole-credential exhaustion crosses the CLASS but must still spend no call: the
+/// block condemns every later child on that credential.
+#[tokio::test]
+async fn a_whole_credential_exhaustion_spends_no_later_call() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/payment-required-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_ne!(status, StatusCode::OK, "the 402 is surfaced: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().all(|model| !model.contains("paid-leg-1017")),
+        "a whole-credential block must stop the paid child: {models:?}"
+    );
+}
+
+/// The same failures under the historical policy DO cross, which is what makes the
+/// narrower policy a real difference rather than a description of what already happens.
+#[tokio::test]
+async fn the_historical_policy_still_crosses_on_a_throttle() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/pool-429-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    )
+    .replace("cross_on = \"credential_block\"\n", "");
+
+    let (status, _body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the default policy crosses on a 429"
+    );
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().any(|model| model.contains("paid-leg-1017")),
+        "control: the default crosses where the narrower policy does not: {models:?}"
+    );
+}

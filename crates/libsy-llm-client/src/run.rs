@@ -667,10 +667,22 @@ impl CredentialBlock {
             return false;
         }
         match self.kind {
-            CredentialBlockKind::FreeQuota => target.ends_with(":free"),
+            CredentialBlockKind::FreeQuota => is_free_scope(target),
             CredentialBlockKind::WholeQuota | CredentialBlockKind::Unauthorized => true,
         }
     }
+}
+
+/// Whether a slug draws on the credential's free-model allowance.
+///
+/// OpenRouter scopes this allowance to free model variants, spelled with a `:free`
+/// suffix, and its Free Models Router (`openrouter/free`) selects among those same
+/// variants, so it spends the same allowance without carrying the suffix. Treating the
+/// router as paid would send it one guaranteed-rejected call on every request after the
+/// allowance is gone, which can never succeed because the allowance is account-wide
+/// rather than per model.
+fn is_free_scope(target: &str) -> bool {
+    target.ends_with(":free") || target == "openrouter/free"
 }
 
 /// Reads the credential-level block a failure carries, if any.
@@ -1466,6 +1478,44 @@ mod tests {
 
     use crate::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
     use switchyard_protocol::Category;
+
+    /// The free-model allowance covers the provider's free-model ROUTER too.
+    ///
+    /// The router spends the same account-wide allowance but its slug carries no `:free`
+    /// suffix, so a suffix test alone would send it one guaranteed-rejected call after the
+    /// allowance is gone. A paid slug on the same credential stays unblocked.
+    #[test]
+    fn a_free_quota_block_covers_the_free_models_router_but_not_a_paid_slug() {
+        let block = CredentialBlock {
+            credential: "openrouter_stephen".to_string(),
+            kind: CredentialBlockKind::FreeQuota,
+            target: "baidu/ernie-5.5-flash-preview:free".to_string(),
+        };
+        assert!(block.blocks("openrouter_stephen", "inclusionai/ling-3.2-flash:free"));
+        assert!(block.blocks("openrouter_stephen", "openrouter/free"));
+        assert!(!block.blocks("openrouter_stephen", "deepseek/deepseek-v4.1:flash"));
+        assert!(
+            !block.blocks("openrouter", "openrouter/free"),
+            "another credential shares neither the allowance nor the block"
+        );
+    }
+
+    /// A whole-credential or rejected-key block stops every slug, including the router.
+    #[test]
+    fn a_whole_credential_block_covers_every_slug() {
+        for kind in [
+            CredentialBlockKind::WholeQuota,
+            CredentialBlockKind::Unauthorized,
+        ] {
+            let block = CredentialBlock {
+                credential: "openrouter_stephen".to_string(),
+                kind,
+                target: "openrouter/free".to_string(),
+            };
+            assert!(block.blocks("openrouter_stephen", "openrouter/free"));
+            assert!(block.blocks("openrouter_stephen", "deepseek/deepseek-v4.1:flash"));
+        }
+    }
 
     struct CandidateAlgorithm {}
 

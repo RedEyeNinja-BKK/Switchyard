@@ -48,10 +48,15 @@ pub struct Lane {
 }
 
 /// Borrowed model metadata returned while listing routes.
+#[derive(Clone, Copy)]
 pub struct ModelInfo<'a> {
     pub id: &'a ModelId,
     pub algorithm: &'a str,
     pub capabilities: ModelCapabilities,
+    /// The reasoning policy this route imposes, independent of what its target accepts.
+    pub reasoning_policy: crate::config::RouteReasoningPolicy,
+    /// Where this route's work is performed, as declared by its clients' billing.
+    pub locality: crate::route::Locality,
 }
 
 /// Fully resolved routing decision.
@@ -175,6 +180,8 @@ impl Runner {
             id,
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
+            reasoning_policy: route.route_reasoning_policy(),
+            locality: route.locality(),
         })
     }
 

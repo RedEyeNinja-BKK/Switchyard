@@ -47,8 +47,8 @@ use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::composition::Selection;
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
-    context_shadow, request_fit,
+    CallerAuthKind, DecisionTarget, Locality, ModelInfo, Route, RouteReasoningPolicy, RunOutput,
+    Runner, RunnerError, context_shadow, request_fit,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -2371,7 +2371,7 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
         state
             .runner
             .models()
-            .map(|model| (model.id.as_str(), model.capabilities)),
+            .map(|model| (model.id.as_str(), model)),
     ))
 }
 
@@ -2452,9 +2452,7 @@ async fn not_found() -> Response {
     )
 }
 
-fn model_list_payload<'a>(
-    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
-) -> Value {
+fn model_list_payload<'a>(entries: impl IntoIterator<Item = (&'a str, ModelInfo<'a>)>) -> Value {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|(model_id, _)| *model_id);
     let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
@@ -2462,7 +2460,7 @@ fn model_list_payload<'a>(
     let last_id = model_ids.last().copied();
     json!({
         "object": "list",
-        "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
+        "data": entries.iter().map(|(model, info)| model_entry_json(model, *info)).collect::<Vec<_>>(),
         // Codex requires this key; an empty list preserves its own catalog and instructions.
         "models": [],
         "first_id": first_id,
@@ -2473,7 +2471,31 @@ fn model_list_payload<'a>(
     })
 }
 
-fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
+/// Names a locality for the wire.
+///
+/// Spelled out rather than derived from the variant name so a reader of the JSON is not
+/// relying on a Rust identifier surviving the trip.
+fn locality_label(locality: Locality) -> &'static str {
+    match locality {
+        Locality::Local => "local",
+        Locality::Upstream => "upstream",
+        Locality::Mixed => "mixed",
+        Locality::Unknown => "unknown",
+    }
+}
+
+/// Names a route reasoning policy for the wire.
+fn reasoning_policy_label(policy: RouteReasoningPolicy) -> &'static str {
+    match policy {
+        RouteReasoningPolicy::Inherit => "inherit",
+        RouteReasoningPolicy::Medium => "medium",
+        RouteReasoningPolicy::High => "high",
+        RouteReasoningPolicy::None => "none",
+    }
+}
+
+fn model_entry_json(model: &str, info: ModelInfo<'_>) -> Value {
+    let capabilities = info.capabilities;
     json!({
         "id": model,
         "object": "model",
@@ -2483,6 +2505,13 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "display_name": model,
         // OpenAI-compatible clients read the context window from this field.
         "context_length": capabilities.context_window,
+        // Where the work happens, from each leg's declared billing. `unknown` is reported
+        // as itself: a route over an undeclared client has no locality fact to state.
+        "locality": locality_label(info.locality),
+        // The policy this route imposes on top of the target's own capability, which is
+        // what `capabilities.reasoning` reports separately. `inherit` means this route
+        // states none and the target decides.
+        "reasoning_policy": reasoning_policy_label(info.reasoning_policy),
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,

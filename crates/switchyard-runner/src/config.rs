@@ -752,7 +752,8 @@ impl DeploymentConfig {
                 config.escalation_max_input_tokens,
                 escalation_model,
             )
-            .with_target_credentials(target_credentials(config, &self.targets));
+            .with_target_credentials(target_credentials(config, &self.targets))
+            .with_locality(route_locality(config, &self.targets, &self.llm_clients));
             routes.push((config.id.clone(), route));
         }
         // The default logical decision lane. Every configured decision target in
@@ -1800,6 +1801,46 @@ fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
         .iter()
         .position(|hint| target_name.contains(hint) || model_id.contains(hint))
         .unwrap_or(3)
+}
+
+/// Resolves a route's locality from the billing its targets' clients declare.
+///
+/// The answer is the fact the configuration states, not an inference from a name, a slug
+/// or a base URL. A single leg whose client states no billing makes the whole answer
+/// `Unknown`: one unstated leg is enough that "this never leaves the building" could be
+/// false, and calling it external instead would be a guess presented as a fact.
+fn route_locality(
+    route: &RouteConfig,
+    targets: &BTreeMap<String, TargetConfig>,
+    clients: &BTreeMap<String, LlmClientConfig>,
+) -> crate::route::Locality {
+    use crate::route::Locality;
+
+    let mut legs = 0usize;
+    let mut saw_local = false;
+    let mut saw_external = false;
+    for name in route.routing_target_names() {
+        let Some(target) = targets.get(name) else {
+            continue;
+        };
+        let Some(client) = clients.get(&target.llm_client) else {
+            return Locality::Unknown;
+        };
+        legs += 1;
+        match client.billing {
+            None => return Locality::Unknown,
+            Some(BillingKind::Local) => saw_local = true,
+            Some(BillingKind::Metered | BillingKind::Subscription) => saw_external = true,
+        }
+    }
+
+    match (legs, saw_local, saw_external) {
+        (0, _, _) => Locality::Unknown,
+        (_, true, false) => Locality::Local,
+        (_, false, true) => Locality::Upstream,
+        (_, true, true) => Locality::Mixed,
+        (_, false, false) => Locality::Unknown,
+    }
 }
 
 /// Resolves each target model id to the `llm_client` credential that serves it.

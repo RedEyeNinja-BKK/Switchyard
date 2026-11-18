@@ -18,6 +18,31 @@ use thiserror::Error;
 use crate::DecisionTarget;
 use crate::config::RouteReasoningPolicy;
 
+/// Where a route's work is actually performed.
+///
+/// Derived from the `billing` declaration of the `llm_client` each target resolves
+/// through, never from a model name, a slug or a base URL. A route served by the
+/// operator's own deployment and one served by an external provider answer differently
+/// to a caller asking "does this leave the building?", and that is a fact configuration
+/// already holds once a deployment states it.
+///
+/// `Unknown` is a real answer, not a placeholder: a deployment that has not declared how a
+/// client is billed cannot have its locality inferred, and claiming one would put a guess
+/// on a surface where a reader cannot tell it from a fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Locality {
+    /// Every leg is an operator-hosted deployment: no external provider charge.
+    Local,
+    /// Every leg is served by an external provider.
+    Upstream,
+    /// Legs disagree: some operator-hosted, some external.
+    Mixed,
+    /// At least one leg's billing is undeclared. Never inferred.
+    #[default]
+    Unknown,
+}
+
 /// Capabilities declared for one route.
 ///
 /// `GET /v1/models` includes `context_window`, `tool_calling`, `vision` and `video` in
@@ -285,6 +310,9 @@ pub struct Route {
     escalation_target: Option<ModelId>,
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
+    /// Where this route's work is performed, resolved once at load from each target's
+    /// `llm_client` billing declaration.
+    locality: Locality,
     anthropic_auxiliary_target: Option<AuxiliaryTarget>,
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
@@ -328,6 +356,7 @@ impl Route {
             escalation_target,
             caller_auth,
             capabilities,
+            locality: Locality::Unknown,
             anthropic_auxiliary_target,
             responses_auxiliary_target,
             decision_targets,
@@ -408,6 +437,17 @@ impl Route {
     /// Returns model-list capability metadata.
     pub fn capabilities(&self) -> ModelCapabilities {
         self.capabilities
+    }
+
+    /// Records where this route's work is performed, resolved from configuration.
+    pub fn with_locality(mut self, locality: Locality) -> Self {
+        self.locality = locality;
+        self
+    }
+
+    /// Returns where this route's work is performed.
+    pub fn locality(&self) -> Locality {
+        self.locality
     }
 
     /// Returns the forwarded caller credential family.

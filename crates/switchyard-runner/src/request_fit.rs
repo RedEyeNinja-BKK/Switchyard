@@ -648,6 +648,49 @@ fn has_media_key(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool
         .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
 }
 
+/// Tokens charged for one inline media payload, by media family.
+///
+/// A provider prices media by what it decodes to — resolution for an image, duration and
+/// frame count for a video — and never by the length of the base64 text that carries it.
+/// Charging `chars / 4` for a `data:` URI therefore prices a one-megabyte screenshot at a
+/// quarter of a million tokens, which pushes an ordinary request past a 262,144-token
+/// child window and marks that child ineligible for a request it could have served.
+///
+/// These are conservative ceilings rather than measurements: each sits well above the
+/// published per-image tile cost and well below a genuinely large document, so media is
+/// admitted against a window it can actually fit while a real text prompt is still charged
+/// in full. A `data:` URI naming no media type is not media and is length-priced as text.
+const INLINE_IMAGE_TOKENS: u64 = 4_096;
+const INLINE_AUDIO_TOKENS: u64 = 16_384;
+const INLINE_VIDEO_TOKENS: u64 = 65_536;
+
+/// The token cost of an inline media payload, when `text` is one.
+///
+/// `None` for ordinary text and for a `data:` URI that names no media family, both of
+/// which keep their length-based charge.
+fn inline_media_tokens(text: &str) -> Option<u64> {
+    let trimmed = text.trim_start();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 5 || !bytes[..5].eq_ignore_ascii_case(b"data:") {
+        return None;
+    }
+    // `data:[<mediatype>][;base64],<data>` — the media type ends at the first comma or
+    // parameter, and the payload itself never contains a comma.
+    let header = &trimmed[5..];
+    let media_type = header.split(',').next().unwrap_or_default();
+    let family = media_type.split(';').next().unwrap_or_default().trim();
+    let major = family.split('/').next().unwrap_or_default();
+    if !family.contains('/') {
+        return None;
+    }
+    match major.to_ascii_lowercase().as_str() {
+        "image" => Some(INLINE_IMAGE_TOKENS),
+        "audio" => Some(INLINE_AUDIO_TOKENS),
+        "video" => Some(INLINE_VIDEO_TOKENS),
+        _ => None,
+    }
+}
+
 /// Estimated input tokens for a request body.
 ///
 /// Ported from the retired FleetRouter rather than re-derived, so an escalation decision
@@ -657,6 +700,10 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
     fn walk(value: &Value, acc: &mut u64) {
         match value {
             Value::String(text) => {
+                if let Some(media) = inline_media_tokens(text) {
+                    *acc = acc.saturating_add(media).saturating_add(1);
+                    return;
+                }
                 let chars = text.chars().count() as u64;
                 let ascii = text.bytes().filter(|byte| byte.is_ascii()).count() as u64;
                 let non_ascii = chars.saturating_sub(ascii);

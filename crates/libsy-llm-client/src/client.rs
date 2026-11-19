@@ -1033,11 +1033,7 @@ const FREE_MODEL_DAILY_MESSAGE: &str = "free-models-per-day";
 fn names_free_model_daily_cap(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|value| {
-            value["error"]["message"]
-                .as_str()
-                .map(str::to_string)
-        })
+        .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
         .is_some_and(|message| message.contains(FREE_MODEL_DAILY_MESSAGE))
 }
 

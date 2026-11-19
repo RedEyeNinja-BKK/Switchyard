@@ -246,6 +246,9 @@ impl Runner {
                     .unwrap_or(&serde_json::Value::Null),
             ) {
                 children.push((child_name.clone(), ChildOutcome::Skipped { capability }));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
                 continue;
             }
 
@@ -263,6 +266,9 @@ impl Runner {
                         capability: "context_window",
                     },
                 ));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
                 continue;
             }
 
@@ -477,6 +483,26 @@ impl Runner {
             kind,
             target: slug,
         })
+    }
+
+    /// Whether an eligibility skip may advance to the next child.
+    ///
+    /// Eligibility is a fact about the request — it needs vision, it does not fit this
+    /// window — and not a statement about any credential. Under the historical policy the
+    /// parent simply moves on to a child that can serve it, and that stays true.
+    ///
+    /// A composite that states `cross_on = "credential_block"` admits exactly ONE reason
+    /// to reach a later child: the provider said the earlier child's credential scope is
+    /// gone. Reaching a later child because the request was ineligible would spend that
+    /// child's account for a reason the policy does not name, so the skip is terminal for
+    /// the parent. The caller still gets the truthful diagnosis: the end-of-loop reporting
+    /// names the missing capability when nothing was called, and the child's own failure
+    /// when something was.
+    fn eligibility_advances(&self, spec: &CompositeSpec) -> bool {
+        !matches!(
+            spec.cross_on,
+            crate::config::CompositeCrossPolicy::CredentialBlock
+        )
     }
 
     /// Whether this child would only spend a call on a credential already blocked.

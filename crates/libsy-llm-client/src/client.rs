@@ -1017,6 +1017,30 @@ const BILLING_LIMIT_CODES: &[&str] = &[
     "insufficient_quota",
 ];
 
+/// The free-model daily allowance, spelled out in a message instead of the marker.
+///
+/// OpenRouter normally names this allowance in `error.metadata.limit_source`, but not
+/// always: measured 2026-11-19 the refusal arrived as
+/// `{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit
+/// exceeded: free-models-per-day-high-balance."}}` — a bare 429 with no metadata, on a
+/// paid-tier key with credit remaining. The sentence can only name the per-credential
+/// free-model allowance, so it belongs with the marker rather than in the retry loop.
+///
+/// Matched on the whole phrase and not on "rate limit exceeded": the per-minute
+/// spelling of the same sentence is a genuine throttle that must keep its retries.
+const FREE_MODEL_DAILY_MESSAGE: &str = "free-models-per-day";
+
+fn names_free_model_daily_cap(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value["error"]["message"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .is_some_and(|message| message.contains(FREE_MODEL_DAILY_MESSAGE))
+}
+
 fn is_documented_billing_limit(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1044,6 +1068,7 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
         StatusCode::TOO_MANY_REQUESTS => {
             limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
                 || is_documented_billing_limit(body)
+                || names_free_model_daily_cap(body)
         }
         // Insufficient credits: the account balance is the shared resource, so no
         // candidate on this credential can serve the request.
@@ -4111,6 +4136,57 @@ mod tests {
                 "a genuine rate limit must keep its retries: {body}"
             );
         }
+    }
+
+    /// The free-model daily allowance, when OpenRouter omits its usual marker.
+    ///
+    /// Measured 2026-11-19 against this deployment's own credential: a request for
+    /// `openrouter/free` answered
+    /// `{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit
+    /// exceeded: free-models-per-day-high-balance. "}}` — a plain 429 carrying no
+    /// `metadata` at all. The key was paid tier with credit remaining, so the only
+    /// resource that sentence can name is the per-credential free-model allowance every
+    /// free model on it shares. Without recognizing it the request walks the rest of the
+    /// ladder, spending one refused call per rung against an allowance already at zero.
+    ///
+    /// The control is the per-minute spelling of the same sentence: that is a genuine
+    /// throttle and must keep its retries, so the match cannot be "rate limit exceeded".
+    #[test]
+    fn an_unmarked_free_model_daily_cap_is_account_wide_but_a_per_minute_throttle_retries() {
+        let failure = |body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: body.to_string(),
+            },
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            retry_after: None,
+        };
+
+        // The recorded body, trimmed only of the provider's trailing space.
+        let measured = failure(
+            r#"{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit exceeded: free-models-per-day-high-balance."}}"#,
+        );
+        assert!(
+            is_account_wide_quota(&measured.error),
+            "the free-model daily allowance is shared by every candidate on the credential"
+        );
+        assert!(
+            !measured.is_retryable(),
+            "a daily allowance cannot clear on the next attempt"
+        );
+
+        // A throttle on the same status keeps recovering.
+        let per_minute = failure(
+            r#"{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit exceeded: free-models-per-min."}}"#,
+        );
+        assert!(
+            !is_account_wide_quota(&per_minute.error),
+            "a per-minute throttle is not the daily allowance"
+        );
+        assert!(
+            per_minute.is_retryable(),
+            "a per-minute throttle must keep its retries"
+        );
     }
 
     #[test]

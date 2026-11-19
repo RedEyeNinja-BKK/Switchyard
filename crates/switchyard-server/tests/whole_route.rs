@@ -2691,3 +2691,139 @@ async fn the_historical_policy_still_crosses_on_a_throttle() {
         "control: the default crosses where the narrower policy does not: {models:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The remaining `credential_block` question, measured 2026-11-19: an eligibility
+// skip is not a credential block, so it must not spend a paid call.
+//
+// The four production crossings after release 20261119T001835Z were all logged
+// `ST_Free:ineligible`, i.e. the free child was never called because the request
+// did not fit its declared window - not because Stephen's daily free allowance was
+// reported exhausted. The owner's policy admits ONE paid-crossing reason: confirmed
+// account-wide daily free-allowance exhaustion. These tests pin that the other
+// skip reasons do not spend the paid leg.
+// ---------------------------------------------------------------------------
+
+/// A Stephen-shaped deployment whose free child declares a small window and no vision,
+/// so a request can be turned away from it without any provider call.
+fn stephen_with_declared_limits(free_ctx: u32, paid_ctx: u32, base: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.stephen]
+format = "openai_responses"
+base_url = "{base}"
+
+[targets.free-leg]
+id = "vendor/account-quota-leg:free"
+llm_client = "stephen"
+
+[routes.ST_Free]
+id = "ST_Free"
+type = "passthrough"
+target = "free-leg"
+candidates = []
+context_window = {free_ctx}
+vision = false
+
+[targets.paid-leg]
+id = "vendor/paid-leg-1017"
+llm_client = "stephen"
+
+[routes.ST_Paid]
+id = "ST_Paid"
+type = "passthrough"
+target = "paid-leg"
+candidates = []
+context_window = {paid_ctx}
+vision = true
+
+[composites.ST_Route]
+children = ["ST_Free", "ST_Paid"]
+cross_on = "credential_block"
+"#
+    )
+}
+
+/// A request the free child cannot hold must not become a paid call.
+///
+/// The free child is skipped for its window, which is a routing fact about the
+/// request, not a statement about the credential. Crossing to the paid leg here
+/// spends money for a reason the owner did not authorize.
+#[tokio::test]
+async fn a_context_ineligible_free_child_does_not_cross_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_with_declared_limits(2_000, 1_000_000, &backend.clone().server());
+
+    let oversized = "q".repeat(200_000); // about 50,000 estimated tokens
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": oversized}]}),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an over-window request must fail closed rather than spend the paid leg: {body}"
+    );
+    let models = seen_models(&backend).await;
+    assert!(
+        !models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the paid child must not be called for a context skip: {models:?}"
+    );
+}
+
+/// A request the free child cannot read (no vision) must not become a paid call.
+#[tokio::test]
+async fn a_vision_ineligible_free_child_does_not_cross_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_with_declared_limits(1_000_000, 1_000_000, &backend.clone().server());
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "describe"},
+            {"type": "input_image", "image_url": "https://example.test/a.png"}
+        ]}]}),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a capability skip must fail closed rather than spend the paid leg: {body}"
+    );
+    let models = seen_models(&backend).await;
+    assert!(
+        !models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the paid child must not be called for a capability skip: {models:?}"
+    );
+}
+
+/// The approved reason still crosses: a confirmed daily free-allowance exhaustion
+/// reaches the paid leg even though the free child was never eligible for a skip
+/// reason. This is the positive control for the guard above, so the guard cannot be
+/// satisfied by refusing every request.
+#[tokio::test]
+async fn the_approved_daily_free_exhaustion_still_crosses_after_the_guard() {
+    let backend = Upstream::new();
+    let config = stephen_with_declared_limits(1_000_000, 1_000_000, &backend.clone().server());
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "the paid leg serves: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the approved quota crossing must survive: {models:?}"
+    );
+}

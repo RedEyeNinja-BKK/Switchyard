@@ -782,6 +782,10 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => {
             FailureClass::TemporarilyUnavailable
         }
+        // A full minute window is a throttle, not an outage: the leg is servable again
+        // within the minute, so a composite may cross to a sibling with headroom and the
+        // caller is told to retry shortly rather than to wait for tomorrow.
+        LlmClientError::MinuteAllowanceThrottled { .. } => FailureClass::RateLimited,
         // The payload, not the leg, is the problem: nothing about another candidate makes
         // content that must not leave this deployment admissible.
         LlmClientError::PayloadNotCleared { .. } => FailureClass::Request,
@@ -899,6 +903,9 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         source,
         LlmClientError::DailyRequestAllowanceExhausted { .. }
             | LlmClientError::DailyRequestAllowanceUnavailable { .. }
+            // A minute window regains room on its own, so this leg is worth returning to
+            // later in the same call; the route may also reach a sibling with headroom now.
+            | LlmClientError::MinuteAllowanceThrottled { .. }
     ) {
         return Some(RoutingFallbackReason::Unavailable);
     }
@@ -2071,6 +2078,7 @@ mod tests {
                         stream_idle_timeout: None,
                         requires_list_input: false,
                         allowance: None,
+                        pacing: None,
                         requires_public_payload: false,
                         hosted_reasoning: None,
                     };
@@ -2227,6 +2235,7 @@ mod tests {
                     stream_idle_timeout: None,
                     requires_list_input: false,
                     allowance: None,
+                    pacing: None,
                     requires_public_payload: false,
                     hosted_reasoning: None,
                 }),
@@ -3182,6 +3191,7 @@ mod tests {
                     stream_idle_timeout: None,
                     requires_list_input: false,
                     allowance: None,
+                    pacing: None,
                     requires_public_payload: false,
                     hosted_reasoning: None,
                 })
@@ -3276,6 +3286,7 @@ mod tests {
                 stream_idle_timeout: None,
                 requires_list_input: false,
                 allowance: None,
+                pacing: None,
                 requires_public_payload: false,
                 hosted_reasoning: None,
             })
@@ -3431,6 +3442,7 @@ mod tests {
                 stream_idle_timeout: None,
                 requires_list_input: false,
                 allowance: None,
+                pacing: None,
                 requires_public_payload: false,
                 hosted_reasoning: None,
             })
@@ -3572,6 +3584,7 @@ mod tests {
                 stream_idle_timeout: None,
                 requires_list_input: false,
                 allowance: None,
+                pacing: None,
                 requires_public_payload: false,
                 hosted_reasoning: None,
             })

@@ -97,6 +97,25 @@ pub enum LlmClientError {
         reason: String,
     },
 
+    /// The target's own per-minute budget has no room for this request yet.
+    ///
+    /// A different fact from both the daily allowance above and an account-wide cap: the
+    /// window refills within a minute, so the leg is still servable and the route may advance
+    /// to a candidate with minute headroom. It must not be retried on the same leg inside one
+    /// call — that would spend the very window the next request needs, which is how a single
+    /// throttle becomes a burst against a provider whose whole point is the minute.
+    #[error(
+        "per-minute {scope} budget for {model} is full; it clears in about {retry_after_secs}s"
+    )]
+    MinuteAllowanceThrottled {
+        /// Target whose minute window is full.
+        model: ModelId,
+        /// Which limit refused: `requests_per_minute` or `input_tokens_per_minute`.
+        scope: String,
+        /// Seconds until the window has room for this request.
+        retry_after_secs: u64,
+    },
+
     /// The assembled payload contains content that must not leave the deployment.
     ///
     /// Raised at the last possible moment - over the exact JSON body about to be sent -

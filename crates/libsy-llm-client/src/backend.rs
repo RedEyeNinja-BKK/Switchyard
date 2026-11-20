@@ -118,6 +118,14 @@ pub struct HttpBackendConfig {
     /// Shared across every backend of one target, so a model reachable over two wire
     /// formats still draws on one budget.
     pub allowance: Option<std::sync::Arc<crate::allowance::DailyRequestAllowance>>,
+    /// The provider's per-minute pacing budget for this target, when it publishes one.
+    ///
+    /// A different resource from the daily allowance above, and refused differently: a daily
+    /// budget resets on the provider's clock, while a minute window refills continuously, so a
+    /// full window means "route to a leg with headroom, or answer with the interval" rather
+    /// than "wait for tomorrow". Shared by every alias of one physical model, because the
+    /// provider counts per model within a project and not per alias.
+    pub pacing: Option<std::sync::Arc<crate::allowance::PacedQuota>>,
     /// Whether this provider may only receive a payload cleared as public.
     ///
     /// Declared on the client because it is a fact about the provider - a free tier that
@@ -158,6 +166,7 @@ impl fmt::Debug for HttpBackendConfig {
                 "daily_request_limit",
                 &self.allowance.as_ref().map(|a| a.limit()),
             )
+            .field("minute_limits", &self.pacing.as_ref().map(|p| p.limits()))
             .field("requires_public_payload", &self.requires_public_payload)
             .field("hosted_reasoning", &self.hosted_reasoning)
             .finish()
@@ -418,6 +427,11 @@ impl Backend {
         self.config().allowance.as_deref()
     }
 
+    /// The target's per-minute pacing budget, when it declares one.
+    pub fn pacing(&self) -> Option<&crate::allowance::PacedQuota> {
+        self.config().pacing.as_deref()
+    }
+
     /// Whether the provider may only receive a payload cleared as public.
     pub fn requires_public_payload(&self) -> bool {
         self.config().requires_public_payload
@@ -566,6 +580,7 @@ mod tests {
             stream_idle_timeout: None,
             requires_list_input: false,
             allowance: None,
+            pacing: None,
             requires_public_payload: false,
             hosted_reasoning: None,
         }

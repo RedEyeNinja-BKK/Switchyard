@@ -28,7 +28,10 @@ pub mod privacy;
 pub mod raw;
 pub mod run;
 
-pub use allowance::{DailyRequestAllowance, ReserveError, allowance_path};
+pub use allowance::{
+    DailyRequestAllowance, GovernorKey, PacedQuota, PacingError, PacingScope, PacingTicket,
+    QuotaGovernor, ReserveError, Throttled, WindowLimits, allowance_path, estimate_input_tokens,
+};
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};

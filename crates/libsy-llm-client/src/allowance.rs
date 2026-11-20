@@ -59,10 +59,12 @@
 //! a reason naming the fault, which the caller reports and routes around, rather than
 //! spending budget nobody is counting.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use switchyard_protocol::ModelId;
 
@@ -483,6 +485,384 @@ fn fnv1a(value: &str) -> u64 {
     hash
 }
 
+/// Length of one pacing window.
+///
+/// A minute is what the providers that publish window limits publish them over. It is a
+/// sliding window, not a fixed clock minute: a fixed boundary would let a deployment send
+/// a full window either side of it, doubling the burst the limit exists to prevent.
+const WINDOW: Duration = Duration::from_secs(60);
+
+/// A provider's per-minute pacing limits for one model.
+///
+/// Both axes are optional and independent: a model may cap requests, input tokens, or both.
+/// Tokens are counted on the request side only — output is not known before the call, and
+/// the provider's own input budget is what this mirrors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowLimits {
+    /// Requests permitted in any rolling minute.
+    pub requests_per_minute: Option<u64>,
+    /// Input tokens permitted in any rolling minute.
+    pub input_tokens_per_minute: Option<u64>,
+}
+
+impl WindowLimits {
+    /// No window limits: nothing is recorded and nothing is refused.
+    pub const fn unlimited() -> Self {
+        Self {
+            requests_per_minute: None,
+            input_tokens_per_minute: None,
+        }
+    }
+
+    /// Whether this declares no limit at all.
+    pub fn is_unlimited(&self) -> bool {
+        self.requests_per_minute.is_none() && self.input_tokens_per_minute.is_none()
+    }
+}
+
+/// Identity of one paced budget.
+///
+/// The provider counts per project and physical model, so the key is exactly that and not
+/// the alias: `smart-nt`, `smart_gemini` and a direct leaf address to the same model must
+/// draw on one window, or each alias would be handed the full allowance. `feature` keeps a
+/// second family on the same model (an embedding call on a chat model, say) from spending
+/// the chat window unless the deployment says they share it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GovernorKey {
+    group: String,
+    model: ModelId,
+    feature: &'static str,
+}
+
+impl GovernorKey {
+    /// The paced budget for `model` in `group`, on the `feature` axis.
+    pub fn new(group: impl Into<String>, model: ModelId, feature: &'static str) -> Self {
+        Self {
+            group: group.into(),
+            model,
+            feature,
+        }
+    }
+
+    /// The quota group (provider project) this budget belongs to.
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+
+    /// The physical model this budget belongs to.
+    pub fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    /// The feature axis this budget belongs to.
+    pub fn feature(&self) -> &'static str {
+        self.feature
+    }
+}
+
+/// A granted minute-window reservation.
+///
+/// Returned so the caller can release it if the request never reaches the provider — the
+/// daily allowance refusing afterwards is the case that matters, because spending a window
+/// slot for a request that was never sent would turn a paced-out day into a burst.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PacingTicket {
+    key: GovernorKey,
+    sequence: u64,
+}
+
+/// Which limit refused a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacingScope {
+    /// The rolling request count.
+    Requests,
+    /// The rolling input-token count.
+    InputTokens,
+}
+
+impl PacingScope {
+    /// Stable label for logs and error bodies.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requests => "requests_per_minute",
+            Self::InputTokens => "input_tokens_per_minute",
+        }
+    }
+}
+
+/// A window with no room right now, and when it next will have room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Throttled {
+    /// The limit that refused.
+    pub scope: PacingScope,
+    /// How long until enough of the window has expired to admit this request.
+    pub retry_after: Duration,
+}
+
+/// Why a minute-window reservation could not be granted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacingError {
+    /// The window is full now but refills shortly: route elsewhere or report the interval.
+    Throttled(Throttled),
+    /// The request alone is larger than a whole window's input budget, so waiting cannot
+    /// help. A deployment that declares `input_tokens_per_minute` must also declare a
+    /// per-request ceiling at or below it; configuration validation enforces that, and this
+    /// variant is the defensive answer if a call arrives over it anyway.
+    ExceedsWindow {
+        /// The request's estimated input tokens.
+        needed: u64,
+        /// The whole window's input budget.
+        limit: u64,
+    },
+}
+
+/// Tracks rolling per-minute spend per [`GovernorKey`].
+///
+/// One instance is shared by every backend of a deployment, which is what makes the
+/// accounting cross-alias: two aliases of one physical model resolve to the same key and so
+/// to the same ledger. The state is in-process and deliberately not persisted — a window is
+/// a minute wide, and a restart is not a thing a provider's per-minute counter refunds, so
+/// the only cost of forgetting is that a restart may under-count for the remainder of the
+/// current window. Persisting it would add a lock and a disk write to every request to
+/// protect a value that expires in under a minute.
+#[derive(Debug, Default)]
+pub struct QuotaGovernor {
+    ledgers: Mutex<HashMap<GovernorKey, Ledger>>,
+}
+
+#[derive(Debug, Default)]
+struct Ledger {
+    spends: VecDeque<Spend>,
+    next_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Spend {
+    sequence: u64,
+    at: SystemTime,
+    tokens: u64,
+}
+
+impl QuotaGovernor {
+    /// An empty governor.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserves one request of `input_tokens` against `key`'s window, on the real clock.
+    pub fn reserve(
+        &self,
+        key: &GovernorKey,
+        limits: WindowLimits,
+        input_tokens: u64,
+    ) -> Result<Option<PacingTicket>, PacingError> {
+        self.reserve_at(key, limits, input_tokens, SystemTime::now())
+    }
+
+    /// [`Self::reserve`] against an explicit clock, for tests and replays.
+    pub fn reserve_at(
+        &self,
+        key: &GovernorKey,
+        limits: WindowLimits,
+        input_tokens: u64,
+        now: SystemTime,
+    ) -> Result<Option<PacingTicket>, PacingError> {
+        if limits.is_unlimited() {
+            return Ok(None);
+        }
+        if let Some(limit) = limits.input_tokens_per_minute
+            && input_tokens > limit
+        {
+            return Err(PacingError::ExceedsWindow {
+                needed: input_tokens,
+                limit,
+            });
+        }
+        let mut ledgers = self
+            .ledgers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let ledger = ledgers.entry(key.clone()).or_default();
+        let cutoff = now.checked_sub(WINDOW).unwrap_or(UNIX_EPOCH);
+        while ledger.spends.front().is_some_and(|spend| spend.at <= cutoff) {
+            ledger.spends.pop_front();
+        }
+
+        // Both axes are evaluated before anything is recorded: a request refused for one
+        // reason must not have consumed room on the other.
+        let mut refused: Option<Throttled> = None;
+        if let Some(limit) = limits.requests_per_minute {
+            let used = u64::try_from(ledger.spends.len()).unwrap_or(u64::MAX);
+            if used >= limit
+                && let Some(front) = ledger.spends.front()
+            {
+                refused = Some(Throttled {
+                    scope: PacingScope::Requests,
+                    retry_after: (front.at + WINDOW).duration_since(now).unwrap_or_default(),
+                });
+            }
+        }
+        if let Some(limit) = limits.input_tokens_per_minute {
+            let outstanding = ledger.spends.iter().fold(0_u64, |total, spend| {
+                total.saturating_add(spend.tokens)
+            });
+            if outstanding.saturating_add(input_tokens) > limit {
+                let mut remaining = outstanding;
+                let mut retry_after = WINDOW;
+                for spend in &ledger.spends {
+                    remaining = remaining.saturating_sub(spend.tokens);
+                    if remaining.saturating_add(input_tokens) <= limit {
+                        retry_after = (spend.at + WINDOW).duration_since(now).unwrap_or_default();
+                        break;
+                    }
+                }
+                // When both axes refuse, report the one that clears last: that is the wait
+                // the caller actually faces.
+                if refused.is_none_or(|existing| retry_after > existing.retry_after) {
+                    refused = Some(Throttled {
+                        scope: PacingScope::InputTokens,
+                        retry_after,
+                    });
+                }
+            }
+        }
+        if let Some(throttled) = refused {
+            return Err(PacingError::Throttled(throttled));
+        }
+
+        ledger.next_sequence += 1;
+        let sequence = ledger.next_sequence;
+        ledger.spends.push_back(Spend {
+            sequence,
+            at: now,
+            tokens: input_tokens,
+        });
+        Ok(Some(PacingTicket {
+            key: key.clone(),
+            sequence,
+        }))
+    }
+
+    /// Returns a granted reservation that never reached the provider.
+    ///
+    /// Only correct before the request is sent. An attempt that left the process keeps its
+    /// slot, for the same reason a daily reservation is never refunded: the provider may
+    /// have counted it.
+    pub fn release(&self, ticket: &PacingTicket) {
+        let mut ledgers = self
+            .ledgers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(ledger) = ledgers.get_mut(&ticket.key) {
+            ledger
+                .spends
+                .retain(|spend| spend.sequence != ticket.sequence);
+        }
+    }
+
+    /// The window's current spend for `key`, for reporting and tests.
+    pub fn used(&self, key: &GovernorKey, now: SystemTime) -> (u64, u64) {
+        let mut ledgers = self
+            .ledgers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(ledger) = ledgers.get_mut(key) else {
+            return (0, 0);
+        };
+        let cutoff = now.checked_sub(WINDOW).unwrap_or(UNIX_EPOCH);
+        while ledger.spends.front().is_some_and(|spend| spend.at <= cutoff) {
+            ledger.spends.pop_front();
+        }
+        let requests = u64::try_from(ledger.spends.len()).unwrap_or(u64::MAX);
+        let tokens = ledger
+            .spends
+            .iter()
+            .fold(0_u64, |total, spend| total.saturating_add(spend.tokens));
+        (requests, tokens)
+    }
+}
+
+/// One target's paced budget: the shared governor, the key it bills to, and the limits.
+///
+/// Carried by the backend because one HTTP attempt is the granularity the provider counts
+/// in, and the send path is the one place every candidate passes through.
+#[derive(Debug)]
+pub struct PacedQuota {
+    governor: std::sync::Arc<QuotaGovernor>,
+    key: GovernorKey,
+    limits: WindowLimits,
+}
+
+impl PacedQuota {
+    /// Binds `key` and `limits` to a shared governor.
+    pub fn new(governor: std::sync::Arc<QuotaGovernor>, key: GovernorKey, limits: WindowLimits) -> Self {
+        Self {
+            governor,
+            key,
+            limits,
+        }
+    }
+
+    /// The declared limits.
+    pub fn limits(&self) -> WindowLimits {
+        self.limits
+    }
+
+    /// The budget this target draws on.
+    pub fn key(&self) -> &GovernorKey {
+        &self.key
+    }
+
+    /// Reserves one request against the window.
+    pub fn reserve(&self, input_tokens: u64) -> Result<Option<PacingTicket>, PacingError> {
+        self.governor.reserve(&self.key, self.limits, input_tokens)
+    }
+
+    /// Releases a reservation that never reached the provider.
+    pub fn release(&self, ticket: &PacingTicket) {
+        self.governor.release(ticket);
+    }
+}
+
+/// A conservative estimate of a request body's input tokens, for pacing only.
+///
+/// The governor needs a number before the call, and the only body it can see is the exact
+/// one about to be sent. Counting characters over every string in the body and dividing by
+/// four is the standard approximation; it is deliberately crude, it is never reported as a
+/// measurement, and it over-counts JSON structure rather than under-counting text.
+///
+/// Strings that are themselves inline binary payloads (`data:` URIs) are skipped: their
+/// base64 length says nothing about the provider's image accounting, and counting it would
+/// refuse every vision request against a text budget. Those requests are paced by the
+/// request axis alone, which is what a per-request ceiling is for.
+pub fn estimate_input_tokens(body: &serde_json::Value) -> u64 {
+    fn count(value: &serde_json::Value, characters: &mut u64) {
+        match value {
+            serde_json::Value::String(text) => {
+                if !text.starts_with("data:") {
+                    *characters += u64::try_from(text.chars().count()).unwrap_or(u64::MAX);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    count(item, characters);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for field in fields.values() {
+                    count(field, characters);
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_) => {}
+        }
+    }
+    let mut characters = 0_u64;
+    count(body, &mut characters);
+    (characters / 4).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,5 +1181,227 @@ mod tests {
         assert_ne!(first, second);
         // The same pair resolves to the same path every time.
         assert_eq!(first, allowance_path(&directory, "a/b", "m"));
+    }
+
+    // ---- Per-minute pacing -------------------------------------------------
+
+    fn governor_key(model: &str) -> GovernorKey {
+        GovernorKey::new("google-free", ModelId::from(model), "generate")
+    }
+
+    fn minute_limits(requests: Option<u64>, tokens: Option<u64>) -> WindowLimits {
+        WindowLimits {
+            requests_per_minute: requests,
+            input_tokens_per_minute: tokens,
+        }
+    }
+
+    fn instant(offset: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000 + offset)
+    }
+
+    /// The case the field exists for: Gemma's free window is 16K input tokens per minute,
+    /// so two ten-thousand-token prompts cannot both depart inside one window.
+    #[test]
+    fn two_ten_thousand_token_prompts_cannot_share_a_sixteen_thousand_window() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("google/gemma-4-26b-a4b-it");
+        let limits = minute_limits(None, Some(16_000));
+        governor
+            .reserve_at(&key, limits, 10_000, instant(0))
+            .expect("the first prompt fits");
+        let refused = governor
+            .reserve_at(&key, limits, 10_000, instant(5))
+            .expect_err("the second cannot fit");
+        assert_eq!(
+            refused,
+            PacingError::Throttled(Throttled {
+                scope: PacingScope::InputTokens,
+                // The first reservation leaves the window sixty seconds after it was made.
+                retry_after: Duration::from_secs(55),
+            })
+        );
+    }
+
+    /// A burst of small requests is refused by the request axis even though the token
+    /// budget would have held them.
+    #[test]
+    fn the_thirty_first_request_is_refused_when_the_window_admits_thirty() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(30), None);
+        for second in 0..30 {
+            governor
+                .reserve_at(&key, limits, 1, instant(second))
+                .expect("admits thirty");
+        }
+        assert_eq!(
+            governor
+                .reserve_at(&key, limits, 1, instant(30))
+                .expect_err("the window is full"),
+            PacingError::Throttled(Throttled {
+                scope: PacingScope::Requests,
+                retry_after: Duration::from_secs(30),
+            })
+        );
+    }
+
+    /// The two axes are separate resources: room on one says nothing about the other.
+    #[test]
+    fn the_request_and_token_axes_are_independent() {
+        let tokens_full = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(100), Some(1_000));
+        tokens_full
+            .reserve_at(&key, limits, 900, instant(0))
+            .expect("fits");
+        assert!(matches!(
+            tokens_full.reserve_at(&key, limits, 200, instant(1)),
+            Err(PacingError::Throttled(Throttled {
+                scope: PacingScope::InputTokens,
+                ..
+            }))
+        ));
+
+        let requests_full = QuotaGovernor::new();
+        requests_full
+            .reserve_at(&key, limits, 1, instant(0))
+            .expect("fits");
+        // One request of one token leaves plenty of token room, so the request count is
+        // what refuses.
+        assert!(matches!(
+            requests_full.reserve_at(
+                &key,
+                minute_limits(Some(1), Some(1_000)),
+                1,
+                instant(1)
+            ),
+            Err(PacingError::Throttled(Throttled {
+                scope: PacingScope::Requests,
+                ..
+            }))
+        ));
+    }
+
+    /// The window slides: it opens again sixty seconds after the requests that filled it.
+    #[test]
+    fn a_window_refills_sixty_seconds_after_the_requests_that_filled_it() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(1), Some(16_000));
+        governor
+            .reserve_at(&key, limits, 100, instant(0))
+            .expect("fits");
+        assert!(governor.reserve_at(&key, limits, 100, instant(59)).is_err());
+        governor
+            .reserve_at(&key, limits, 100, instant(60))
+            .expect("the window rolled over");
+    }
+
+    /// One physical model has one window however many names it is served under; a different
+    /// model, or the same model in another project, has its own.
+    #[test]
+    fn aliases_of_one_physical_model_share_one_window() {
+        let governor = QuotaGovernor::new();
+        let limits = minute_limits(Some(1), None);
+        let direct = GovernorKey::new(
+            "google-free",
+            ModelId::from("google/gemma-4-26b-a4b-it"),
+            "generate",
+        );
+        let alias = GovernorKey::new(
+            "google-free",
+            ModelId::from("google/gemma-4-26b-a4b-it"),
+            "generate",
+        );
+        governor
+            .reserve_at(&direct, limits, 10, instant(0))
+            .expect("fits");
+        assert!(matches!(
+            governor.reserve_at(&alias, limits, 10, instant(1)),
+            Err(PacingError::Throttled(_))
+        ));
+
+        let sibling = GovernorKey::new(
+            "google-free",
+            ModelId::from("google/gemma-4-31b-it"),
+            "generate",
+        );
+        governor
+            .reserve_at(&sibling, limits, 10, instant(1))
+            .expect("a different model has its own window");
+
+        let other_project = GovernorKey::new(
+            "google-second-project",
+            ModelId::from("google/gemma-4-26b-a4b-it"),
+            "generate",
+        );
+        governor
+            .reserve_at(&other_project, limits, 10, instant(1))
+            .expect("another project has its own window");
+    }
+
+    /// A reservation returned before the request left gives its room back.
+    #[test]
+    fn a_released_reservation_gives_the_room_back() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(1), Some(16_000));
+        let ticket = governor
+            .reserve_at(&key, limits, 5_000, instant(0))
+            .expect("fits")
+            .expect("a limited key yields a ticket");
+        assert_eq!(governor.used(&key, instant(0)), (1, 5_000));
+        governor.release(&ticket);
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+        governor
+            .reserve_at(&key, limits, 5_000, instant(0))
+            .expect("the room was returned");
+    }
+
+    /// A request larger than a whole window can never be admitted, so waiting is not the
+    /// answer and is not offered.
+    #[test]
+    fn a_request_larger_than_a_whole_window_is_refused_rather_than_queued() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        assert_eq!(
+            governor.reserve_at(&key, minute_limits(None, Some(16_000)), 20_000, instant(0)),
+            Err(PacingError::ExceedsWindow {
+                needed: 20_000,
+                limit: 16_000
+            })
+        );
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+    }
+
+    /// A target that declares no window records nothing, so an undeclared deployment
+    /// behaves exactly as it did before the field existed.
+    #[test]
+    fn no_declared_window_records_nothing() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        assert_eq!(
+            governor.reserve_at(&key, WindowLimits::unlimited(), 1_000_000, instant(0)),
+            Ok(None)
+        );
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+    }
+
+    /// The estimate counts message text and never treats a base64 payload as prompt text.
+    #[test]
+    fn the_token_estimate_counts_text_and_ignores_inline_binary() {
+        let plain = serde_json::json!({
+            "messages": [{"role": "user", "content": "a".repeat(4_000)}]
+        });
+        let with_image = serde_json::json!({
+            "messages": [{"role": "user", "content": "a".repeat(4_000)}],
+            "image_url": format!("data:image/png;base64,{}", "A".repeat(40_000)),
+        });
+        // 4,000 characters of content plus the four-character role, divided by four.
+        assert_eq!(estimate_input_tokens(&plain), 1_001);
+        assert_eq!(estimate_input_tokens(&with_image), 1_001);
+        // An empty body is never zero tokens: it is still a request.
+        assert_eq!(estimate_input_tokens(&serde_json::json!({})), 1);
     }
 }

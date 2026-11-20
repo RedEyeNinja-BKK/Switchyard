@@ -666,7 +666,13 @@ impl DeploymentConfig {
         // Built once and shared: the dispatch gate reserves against these counters and
         // selection reads the same remainder, so one budget has one source of truth.
         let allowances = self.build_allowances()?;
-        let clients = self.build_clients(&mut provider_api_keys, &allowances)?;
+        self.validate_minute_windows()?;
+        // One governor for the whole deployment. Its key is (quota group, physical model),
+        // so every alias of one model draws on one window — which is what the provider
+        // counts, and the only way `smart-nt`, `smart_gemini` and a direct leaf cannot each
+        // spend the same minute's allowance.
+        let governor = Arc::new(switchyard_llm_client::QuotaGovernor::new());
+        let clients = self.build_clients(&mut provider_api_keys, &allowances, &governor)?;
         capability::CapabilityDeployment {
             clients: self.capability_clients.clone(),
             capabilities: self.capabilities.clone(),
@@ -1095,6 +1101,7 @@ impl DeploymentConfig {
         &self,
         provider_api_keys: &mut Vec<String>,
         allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+        governor: &Arc<switchyard_llm_client::QuotaGovernor>,
     ) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
         // Built before the per-target backends so each one can carry its own budget.
         let mut models_by_client = self
@@ -1113,6 +1120,7 @@ impl DeploymentConfig {
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
                 None,
                 None,
                 None,
@@ -1183,6 +1191,7 @@ impl DeploymentConfig {
                             target.id.clone(),
                         ))
                         .cloned(),
+                    pacing_for(target, client_config, governor),
                     hosted_reasoning,
                 )?,
                 None,
@@ -1355,6 +1364,76 @@ impl DeploymentConfig {
                              the route's carrier"
                         )));
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the per-minute window declarations before any backend carries one.
+    ///
+    /// Two rules, both of which fail closed at load rather than as a 429 under traffic: a
+    /// window whose per-request ceiling exceeds it can never admit that request however long
+    /// it waits, and two targets naming one physical model in one quota group share one
+    /// window, so stating different values would make whichever loaded first the real limit.
+    fn validate_minute_windows(&self) -> RunnerResult<()> {
+        let mut declared: HashMap<(String, ModelId), (Option<u64>, Option<u64>, &str)> =
+            HashMap::new();
+        for (target_name, target) in &self.targets {
+            if target.requests_per_minute.is_none() && target.input_tokens_per_minute.is_none() {
+                continue;
+            }
+            if target.requests_per_minute == Some(0) || target.input_tokens_per_minute == Some(0) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares a per-minute limit of zero; a window that \
+                     admits nothing would refuse every request, so omit the field instead"
+                )));
+            }
+            if let Some(limit) = target.input_tokens_per_minute {
+                match target.max_input_tokens {
+                    None => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares input_tokens_per_minute {limit} \
+                             without max_input_tokens; a per-request ceiling at or below the \
+                             minute budget is what keeps a request from being unservable no \
+                             matter how long it waits"
+                        )));
+                    }
+                    Some(max_input) if max_input > limit => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares max_input_tokens {max_input} above \
+                             its input_tokens_per_minute {limit}; a single request larger than \
+                             a whole window can never be admitted"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            let group = self
+                .llm_clients
+                .get(&target.llm_client)
+                .and_then(|client| client.quota_group.clone())
+                .unwrap_or_else(|| target.llm_client.clone());
+            match declared.entry((group.clone(), target.id.clone())) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let (first_rpm, first_tpm, first_name) = *existing.get();
+                    if first_rpm != target.requests_per_minute
+                        || first_tpm != target.input_tokens_per_minute
+                    {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} share model {} in quota \
+                             group {group} but declare different per-minute limits; one window \
+                             serves them both, so state it once",
+                            target.id
+                        )));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((
+                        target.requests_per_minute,
+                        target.input_tokens_per_minute,
+                        target_name.as_str(),
+                    ));
                 }
             }
         }
@@ -2572,6 +2651,25 @@ struct TargetConfig {
     /// allowance removes the target from consideration and the route advances.
     #[serde(default)]
     daily_request_limit: Option<u64>,
+    /// Requests permitted in any rolling minute, when the provider publishes a window.
+    ///
+    /// A different resource from `daily_request_limit` and enforced separately: the provider
+    /// counts requests per model per minute, and a daily budget reached by bursting through
+    /// the minute is refused long before the day is spent. Declared per target for the same
+    /// reason the daily budget is — the cap belongs to the model, not the client — and targets
+    /// that name one physical model in one quota group must state the same value, because one
+    /// window serves them all.
+    #[serde(default)]
+    requests_per_minute: Option<u64>,
+    /// Input tokens permitted in any rolling minute, when the provider publishes a window.
+    ///
+    /// Tokens are estimated from the outbound body before the call, so this is pacing rather
+    /// than billing: being slightly early is the safe direction, and the request is routed to
+    /// a leg with headroom rather than retried. Requires `max_input_tokens` at or below this
+    /// value — a request larger than a whole window's budget can never be admitted, and
+    /// discovering that at the send path would spend eligibility on a 429.
+    #[serde(default)]
+    input_tokens_per_minute: Option<u64>,
     /// The physical model's own request window, when the deployment knows it.
     ///
     /// A route's `context_window` is what callers are promised; this is what one backing
@@ -2663,6 +2761,34 @@ fn resolve_category_models(
 
 // The per-target overrides are all forwarded verbatim from the target being built;
 // bundling them into a struct would only move the same fields one level down.
+/// The shared minute-window budget one target draws on, when it declares limits.
+///
+/// The key is the provider's own identity — quota group plus physical model — not the
+/// target name or the route alias, because that is what the provider counts. Every alias
+/// therefore draws on one ledger, which is the whole point: three names for one model must
+/// not each be handed the same minute.
+fn pacing_for(
+    target: &TargetConfig,
+    client_config: &LlmClientConfig,
+    governor: &Arc<switchyard_llm_client::QuotaGovernor>,
+) -> Option<Arc<switchyard_llm_client::PacedQuota>> {
+    let limits = switchyard_llm_client::WindowLimits {
+        requests_per_minute: target.requests_per_minute,
+        input_tokens_per_minute: target.input_tokens_per_minute,
+    };
+    if limits.is_unlimited() {
+        return None;
+    }
+    let group = client_config
+        .quota_group
+        .clone()
+        .unwrap_or_else(|| target.llm_client.clone());
+    Some(Arc::new(switchyard_llm_client::PacedQuota::new(
+        Arc::clone(governor),
+        switchyard_llm_client::GovernorKey::new(group, target.id.clone(), "generate"),
+        limits,
+    )))
+}
 #[allow(clippy::too_many_arguments)]
 fn build_backend(
     client_name: &str,
@@ -2674,6 +2800,7 @@ fn build_backend(
     reasoning_dialect: ReasoningDialect,
     cooldown_group: Option<String>,
     allowance: Option<Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    pacing: Option<Arc<switchyard_llm_client::PacedQuota>>,
     hosted_reasoning: Option<HostedReasoningMarker>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
@@ -2753,6 +2880,7 @@ fn build_backend(
         stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
         requires_list_input: config.requires_list_input,
         allowance,
+        pacing,
         requires_public_payload: config.requires_public_payload,
         hosted_reasoning,
     };
@@ -4912,6 +5040,7 @@ confidence_threshold = 0.5
             target.cooldown_group.clone(),
             None,
             None,
+            None,
         )?;
 
         assert_eq!(
@@ -4956,6 +5085,7 @@ confidence_threshold = 0.5
             target.cooldown_group.clone(),
             None,
             None,
+            None,
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -4981,6 +5111,7 @@ confidence_threshold = 0.5
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
                 None,
                 None,
                 None,
@@ -5400,5 +5531,99 @@ mod composition_closure_tests {
                 "{class:?} must not cross routes"
             );
         }
+    }
+
+    // ---- Per-minute windows -------------------------------------------------
+
+    fn paced_config(extra: &str) -> DeploymentConfig {
+        // Self-contained: this module only needs one client for the window checks, and a
+        // shared fixture would make these assertions depend on unrelated route wiring.
+        toml::from_str(&format!(
+            "schema_version = 1\n\
+             [llm_clients.primary]\nformat = \"openai_chat\"\n\
+             base_url = \"https://example.test/v1\"\n\
+             [routes.noop]\nid = \"switchyard/noop\"\ntype = \"noop\"\n\
+             {extra}"
+        ))
+        .expect("the paced fixture parses")
+    }
+
+    /// A minute budget with no per-request ceiling, or a ceiling above the whole minute,
+    /// can never serve its largest admissible request, so both are refused at load rather
+    /// than discovered as a 429 under traffic.
+    #[test]
+    fn a_minute_window_must_contain_the_per_request_ceiling() {
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a token window without a ceiling is unfalsifiable");
+        assert!(
+            error.to_string().contains("without max_input_tokens"),
+            "{error}"
+        );
+
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n\
+             max_input_tokens = 20000\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a ceiling above the window can never be served");
+        assert!(error.to_string().contains("above"), "{error}");
+
+        paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n\
+             max_input_tokens = 16000\n",
+        )
+        .validate_minute_windows()
+        .expect("a ceiling at or below the window is accepted");
+    }
+
+    /// A zero window admits nothing, and one window serves every target that names the same
+    /// physical model in one quota group, so both mistakes are caught at load.
+    #[test]
+    fn minute_windows_reject_zero_and_disagreeing_declarations() {
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 0\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a zero window admits nothing");
+        assert!(error.to_string().contains("zero"), "{error}");
+
+        let error = paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 30\n",
+        )
+        .validate_minute_windows()
+        .expect_err("one window cannot have two limits");
+        assert!(error.to_string().contains("one window serves them both"), "{error}");
+
+        paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n",
+        )
+        .validate_minute_windows()
+        .expect("the same value stated twice is one declaration");
+    }
+
+    /// A different physical model keeps a separate window even on one credential.
+    #[test]
+    fn a_different_model_is_a_separate_window() {
+        paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-31b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 30\n",
+        )
+        .validate_minute_windows()
+        .expect("per-model windows are independent");
     }
 }

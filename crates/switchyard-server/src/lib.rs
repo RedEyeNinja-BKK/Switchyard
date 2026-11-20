@@ -2283,6 +2283,22 @@ fn client_error(error: &LlmClientError) -> Response {
             "server_error",
             "daily_allowance_unavailable",
         ),
+        // A full minute window is a short wait, not an outage and not the caller's mistake.
+        // Reported as the throttle it is, with the interval, so the caller can pace itself
+        // instead of retrying into a window that has not refilled.
+        LlmClientError::MinuteAllowanceThrottled {
+            model,
+            scope,
+            retry_after_secs,
+        } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "per-minute {scope} budget for {model} is full; it clears in about \
+                 {retry_after_secs}s, and another candidate may serve this request now"
+            ),
+            "rate_limit_error",
+            "minute_allowance_throttled",
+        ),
         _ => server_error(error.to_string()),
     }
 }

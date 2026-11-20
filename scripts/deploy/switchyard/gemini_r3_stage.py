@@ -141,8 +141,9 @@ SMART_NT_GOOGLE_FIRST = '''# ---- smart-nt: the bounded lane, selected adaptivel
 # The route-level filter drops a candidate before any provider call when it
 # cannot carry the request: an uncleared payload skips every Google leg (all
 # four declare requires_public_payload through their client), a vision request
-# skips all four (none declares vision), more than 16,000 input tokens skips the
-# Gemmas and more than 250,000 skips the Lites.
+# skips all four (none declares vision), more than 14,400 input tokens skips the
+# Gemmas and more than 250,000 skips the Lites. The per-minute windows below are
+# admission, not selection: an alias cannot spend a minute another alias already used.
 #
 # `route_reasoning_policy` is absent rather than kept: a route-level policy needs every
 # candidate's client to declare a reasoning dialect, and the Google clients deliberately
@@ -202,6 +203,9 @@ id = "gemini-3.5-flash-lite"
 llm_client = "google_gemini"
 vision = false
 video = false
+# The owner's measured free-tier row for this model: 10 requests a minute, 500 a day.
+# The request window is declared because a burst is what actually spends a day.
+requests_per_minute = 10
 daily_request_limit = 500
 ''',
     LITE_31: '''[targets."direct-google-gemini-3.1-flash-lite"]
@@ -209,6 +213,7 @@ id = "gemini-3.1-flash-lite"
 llm_client = "google_gemini"
 vision = false
 video = false
+requests_per_minute = 12
 daily_request_limit = 500
 ''',
 }
@@ -245,9 +250,9 @@ failure_cooldown_ms = 300000
 # serving receipt is what `smart-gemini-bounded` exists to collect, so nothing else depends
 # on them yet.
 #
-# The 262,144-token window is the model's physical capacity. The 16,000-token ceiling is
-# the free-tier tokens-per-minute allowance for this project, and it is the number that
-# binds: a bounded lane that accepted more would be spending calls Google refuses.
+# The 262,144-token window is the model's physical capacity. The 14,400-token per-minute
+# allowance is the number that binds: both the ceiling and the window are stated, so a
+# request too large for a whole minute is skipped at admission rather than sent into a 429.
 #
 # daily_request_limit is the model's own RPD allowance (14,400). It is a local budget, not
 # an observed balance -- see the note on the Lite targets above.
@@ -257,7 +262,12 @@ llm_client = "google_gemma_31b"
 vision = false
 video = false
 context_window = 262144
-max_input_tokens = 16000
+# 14,400 input tokens a minute is the measured free-tier window for this project. The
+# per-request ceiling sits at the window: anything larger can never be admitted, and
+# stating it here makes admission skip the leg instead of spending a call on a 429.
+max_input_tokens = 14400
+requests_per_minute = 15
+input_tokens_per_minute = 14400
 daily_request_limit = 14400
 # Free inside the allowance, and unable to carry a caller's reasoning control: the measured
 # wire refuses `reasoning_effort` with HTTP 400. Stating both lets selection prefer this leg
@@ -277,7 +287,9 @@ llm_client = "google_gemini"
 vision = false
 video = false
 context_window = 262144
-max_input_tokens = 16000
+max_input_tokens = 14400
+requests_per_minute = 7
+input_tokens_per_minute = 14400
 daily_request_limit = 14400
 free_tier = true
 accepts_reasoning_control = false
@@ -409,9 +421,9 @@ def verify(candidate: str, live: str) -> dict:
     composites = doc.get("composites", {})
     failures: list[str] = []
 
-    for name, window, ceiling, rpd in (
-        ("direct-google-gemma-4-31b-it", 262144, 16000, 14400),
-        ("direct-google-gemma-4-26b-a4b-it", 262144, 16000, 14400),
+    for name, window, ceiling, rpm, rpd in (
+        ("direct-google-gemma-4-31b-it", 262144, 14400, 15, 14400),
+        ("direct-google-gemma-4-26b-a4b-it", 262144, 14400, 7, 14400),
     ):
         target = targets.get(name, {})
         if target.get("context_window") != window:
@@ -420,6 +432,14 @@ def verify(candidate: str, live: str) -> dict:
             failures.append(f"{name}: max_input_tokens is {target.get('max_input_tokens')!r}")
         if target.get("daily_request_limit") != rpd:
             failures.append(f"{name}: daily_request_limit is {target.get('daily_request_limit')!r}")
+        # The minute window is what stops a burst from spending the day; a manifest that
+        # states the daily budget without it would pace nothing.
+        if target.get("requests_per_minute") != rpm:
+            failures.append(f"{name}: requests_per_minute is {target.get('requests_per_minute')!r}")
+        if target.get("input_tokens_per_minute") != rpd:
+            failures.append(
+                f"{name}: input_tokens_per_minute is {target.get('input_tokens_per_minute')!r}"
+            )
         # The 31B carries its own client entry for a longer capacity cooldown; both still
         # point at the same gated AI Studio project and share its daily counter.
         if target.get("llm_client") not in {"google_gemini", "google_gemma_31b"}:

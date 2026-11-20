@@ -640,6 +640,44 @@ impl TranslatingLlmClient {
                 });
             }
         }
+        // Paced before the daily budget, because the two refusals mean different things and
+        // only one of them is reversible. A minute window has room again shortly, so a
+        // request refused here should not spend a unit of the day's budget; the reservation
+        // is released again below if the daily allowance then refuses, since nothing reached
+        // the provider. Ordering it this way also means a route under minute pressure pays in
+        // the resource that refills rather than the one that does not.
+        let mut pacing = None;
+        if let Some(quota) = backend.pacing() {
+            match quota.reserve(crate::allowance::estimate_input_tokens(body)) {
+                Ok(ticket) => pacing = ticket,
+                Err(crate::allowance::PacingError::Throttled(throttled)) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::MinuteAllowanceThrottled {
+                            model: model.clone(),
+                            scope: throttled.scope.as_str().to_string(),
+                            retry_after_secs: throttled.retry_after.as_secs().max(1),
+                        },
+                        // No request left this process, so there is no upstream status to
+                        // report and nothing was counted by the provider.
+                        status: None,
+                        retry_after: Some(throttled.retry_after),
+                    });
+                }
+                Err(crate::allowance::PacingError::ExceedsWindow { needed, limit }) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::UnsupportedFeature {
+                            model: model.clone(),
+                            feature: format!(
+                                "an input of about {needed} tokens exceeds the target's \
+                                 {limit}-token per-minute input budget, which no wait can change"
+                            ),
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+            }
+        }
         // Spent before the request leaves, at the one point every attempt passes
         // through. A reservation is never refunded: an attempt that fails below may
         // still have reached the provider, and refunding it would let a retrying
@@ -648,6 +686,9 @@ impl TranslatingLlmClient {
             match allowance.try_reserve() {
                 Ok(()) => {}
                 Err(crate::allowance::ReserveError::Exhausted) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
                     return Err(AttemptFailure {
                         error: LlmClientError::DailyRequestAllowanceExhausted {
                             model: model.clone(),
@@ -658,6 +699,9 @@ impl TranslatingLlmClient {
                     });
                 }
                 Err(crate::allowance::ReserveError::Unusable(reason)) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
                     return Err(AttemptFailure {
                         error: LlmClientError::DailyRequestAllowanceUnavailable {
                             model: model.clone(),
@@ -1212,6 +1256,10 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         // now would burn the next day's budget against an answer already known to be no.
         LlmClientError::DailyRequestAllowanceExhausted { .. }
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => false,
+        // A minute window refills shortly, but not within a backoff: the same legs' next
+        // attempt would spend the room the next request needs. The route decides whether a
+        // sibling has headroom; this call does not sleep into its own throttle.
+        LlmClientError::MinuteAllowanceThrottled { .. } => false,
         // Retrying resends the same payload, which is the thing that was just refused.
         LlmClientError::PayloadNotCleared { .. } => false,
         // The feature is missing from the target, not from the attempt: sending it again,
@@ -2059,6 +2107,7 @@ mod tests {
             stream_idle_timeout: None,
             requires_list_input: false,
             allowance: None,
+            pacing: None,
             requires_public_payload: false,
             hosted_reasoning: None,
         }

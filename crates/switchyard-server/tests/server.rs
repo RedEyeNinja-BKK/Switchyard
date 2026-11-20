@@ -767,6 +767,7 @@ fn random_state_with_retries(
         stream_idle_timeout: None,
         requires_list_input: false,
         allowance: None,
+        pacing: None,
         requires_public_payload: false,
         hosted_reasoning: None,
     });

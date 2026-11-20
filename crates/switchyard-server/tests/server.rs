@@ -3740,7 +3740,11 @@ watcher = {{ id = "watcher", type = "passthrough", target = "shared", vision = t
     );
 
     let calls = upstream.calls.lock().await;
-    assert_eq!(calls.len(), 1, "the request must reach the upstream exactly once");
+    assert_eq!(
+        calls.len(),
+        1,
+        "the request must reach the upstream exactly once"
+    );
     let parts = calls[0]["input"][0]["content"]
         .as_array()
         .expect("upstream body should carry input content");

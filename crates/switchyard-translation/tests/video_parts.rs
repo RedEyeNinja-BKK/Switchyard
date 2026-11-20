@@ -192,7 +192,12 @@ fn chat_inline_video_becomes_a_responses_data_uri() -> TestResult {
     });
 
     let responses = engine
-        .translate_request(WireFormat::OpenAiChat, WireFormat::OpenAiResponses, &chat, &policy)?
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            &chat,
+            &policy,
+        )?
         .body;
 
     let parts = content_parts(&responses);
@@ -228,7 +233,10 @@ fn inline_video_without_a_media_type_is_reported_not_invented() -> TestResult {
     let parts = content_parts(&translated.body);
     assert_eq!(parts[0]["type"], "input_text");
     assert!(
-        parts[0]["text"].as_str().unwrap_or_default().contains("4 bytes"),
+        parts[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("4 bytes"),
         "the fallback must at least say what was dropped: {}",
         parts[0]
     );

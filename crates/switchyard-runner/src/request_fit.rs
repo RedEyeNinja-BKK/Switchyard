@@ -418,7 +418,11 @@ pub fn normalize_responses_video_parts(body: &mut Value) -> usize {
         }
         // `video_url` as an object: either a URL wrapper or the same shape Chat uses.
         if let Some(Value::Object(nested)) = object.get("video_url").cloned() {
-            if let Some(url) = nested.get("url").and_then(Value::as_str).map(str::to_string) {
+            if let Some(url) = nested
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
                 object.insert("type".to_string(), Value::String("input_video".to_string()));
                 object.insert("video_url".to_string(), Value::String(url));
                 if let Some(media_type) = nested.get("media_type").and_then(Value::as_str)
@@ -446,10 +450,9 @@ pub fn normalize_responses_video_parts(body: &mut Value) -> usize {
             .get("video")
             .and_then(Value::as_object)
             .and_then(|video| {
-                video
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .and_then(|data| data_uri(video.get("media_type").and_then(Value::as_str), data))
+                video.get("data").and_then(Value::as_str).and_then(|data| {
+                    data_uri(video.get("media_type").and_then(Value::as_str), data)
+                })
             })
         {
             object.insert("type".to_string(), Value::String("input_video".to_string()));
@@ -458,9 +461,7 @@ pub fn normalize_responses_video_parts(body: &mut Value) -> usize {
             return true;
         }
         // Already a string URL under the right type: only the type may still need fixing.
-        if part_type == "video_url"
-            && object.get("video_url").and_then(Value::as_str).is_some()
-        {
+        if part_type == "video_url" && object.get("video_url").and_then(Value::as_str).is_some() {
             object.insert("type".to_string(), Value::String("input_video".to_string()));
             return true;
         }
@@ -1431,7 +1432,10 @@ mod video_part_shape_tests {
         let part = &body["input"][0]["content"][0];
         assert_eq!(part["type"], "input_video");
         assert_eq!(part["video_url"], "data:video/mp4;base64,AAAA");
-        assert!(part.get("video").is_none(), "the object spelling is dropped");
+        assert!(
+            part.get("video").is_none(),
+            "the object spelling is dropped"
+        );
         assert!(unsupported_responses_video_part(&body).is_none());
     }
 
@@ -1463,9 +1467,12 @@ mod video_part_shape_tests {
             {"type": "input_video"}
         ]}]});
         assert_eq!(super::normalize_responses_video_parts(&mut body), 0);
-        assert_eq!(body, json!({"input": [{"role": "user", "content": [
-            {"type": "input_video"}
-        ]}]}));
+        assert_eq!(
+            body,
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_video"}
+            ]}]})
+        );
         assert!(unsupported_responses_video_part(&body).is_some());
     }
 }

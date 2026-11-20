@@ -20,8 +20,8 @@ use switchyard_protocol::{
     text_response,
 };
 use switchyard_runner::{
-    AlgorithmSpec, MediaCarrier, ModelCapabilities, Route, Runner, RunnerError,
-    RouteReasoningPolicy,
+    AlgorithmSpec, MediaCarrier, ModelCapabilities, Route, RouteReasoningPolicy, Runner,
+    RunnerError,
 };
 use switchyard_translation::{WireFormat, decode_request};
 
@@ -63,7 +63,10 @@ fn route(
         candidates: Vec::new(),
         subagents: None,
     }
-    .build(name, &BTreeMap::from([(target.clone(), ModelId::from(target.as_str()))]))
+    .build(
+        name,
+        &BTreeMap::from([(target.clone(), ModelId::from(target.as_str()))]),
+    )
     .expect("single target builds");
     // The eligibility filter reads capability *facts* on the client, not the route's
     // declaration, and video is refused to an uncharacterised target by design. Declaring
@@ -94,9 +97,7 @@ fn route(
             None,
             None,
             Vec::new(),
-            RuntimeModels::new(
-                [(Category::Any, vec![ModelId::from(target.as_str())])].into(),
-            ),
+            RuntimeModels::new([(Category::Any, vec![ModelId::from(target.as_str())])].into()),
             RouteReasoningPolicy::Inherit,
             None,
             None,
@@ -134,7 +135,11 @@ fn video_capable() -> ModelCapabilities {
 #[tokio::test]
 async fn a_contacted_child_failure_is_reported_instead_of_a_siblings_skip() {
     let runner = Runner::new(vec![
-        route("text_only", ModelCapabilities::default(), Arc::new(ServingClient)),
+        route(
+            "text_only",
+            ModelCapabilities::default(),
+            Arc::new(ServingClient),
+        ),
         route("video_child", video_capable(), Arc::new(FailingClient)),
     ])
     .with_composite(
@@ -163,12 +168,23 @@ async fn a_contacted_child_failure_is_reported_instead_of_a_siblings_skip() {
 #[tokio::test]
 async fn every_child_skipped_still_names_the_missing_capability() {
     let runner = Runner::new(vec![
-        route("first_text_only", ModelCapabilities::default(), Arc::new(ServingClient)),
-        route("second_text_only", ModelCapabilities::default(), Arc::new(ServingClient)),
+        route(
+            "first_text_only",
+            ModelCapabilities::default(),
+            Arc::new(ServingClient),
+        ),
+        route(
+            "second_text_only",
+            ModelCapabilities::default(),
+            Arc::new(ServingClient),
+        ),
     ])
     .with_composite(
         "composite",
-        vec!["first_text_only".to_string(), "second_text_only".to_string()],
+        vec![
+            "first_text_only".to_string(),
+            "second_text_only".to_string(),
+        ],
     );
 
     let error = runner

@@ -111,6 +111,20 @@ pub enum LlmClientError {
         codes: String,
     },
 
+    /// The caller asked for a feature the selected target's wire format cannot carry.
+    ///
+    /// Raised before the request is assembled, so nothing is sent. Terminal for the route
+    /// for the same reason a privacy finding is: every candidate on a Chat wire format
+    /// would have to answer without the feature too, so advancing would hand the caller a
+    /// plausible answer to a request that was never really made.
+    #[error("request for {model} needs a feature this target cannot serve: {feature}")]
+    UnsupportedFeature {
+        /// Target the request would have been sent to.
+        model: ModelId,
+        /// The feature and why this target cannot serve it.
+        feature: String,
+    },
+
     /// The upstream could not be reached or the request could not be sent.
     #[error("upstream transport error: {source}")]
     Transport {

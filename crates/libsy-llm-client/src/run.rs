@@ -785,6 +785,11 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         // The payload, not the leg, is the problem: nothing about another candidate makes
         // content that must not leave this deployment admissible.
         LlmClientError::PayloadNotCleared { .. } => FailureClass::Request,
+        // The feature is missing from the wire format the route selected, so it is a fact
+        // about the request as routed rather than an upstream fault. Classified as a request
+        // fault, which stops the route: a sibling on the same Chat wire format cannot honour
+        // it either, and the candidate that could is reached by a different route.
+        LlmClientError::UnsupportedFeature { .. } => FailureClass::Request,
         // A per-attempt expiry is a deadline that elapsed, so a whole-route
         // composite treats it exactly like an upstream 408.
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,

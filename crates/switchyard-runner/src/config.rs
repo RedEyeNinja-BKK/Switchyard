@@ -677,6 +677,7 @@ impl DeploymentConfig {
         self.validate_composite_media_claims()?;
         self.validate_physical_context_claims()?;
         self.validate_video_transport()?;
+        self.validate_responses_wire_targets()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
         self.validate_decision_lane_composition()?;
@@ -1610,6 +1611,36 @@ impl DeploymentConfig {
                 return Err(RunnerError::configuration(format!(
                     "target {target_name} declares video = true but its client uses {format}; \
                      video requires an openai_responses client"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a Responses backend pointed at a provider that serves no such path.
+    ///
+    /// Google documents `/v1beta/openai/chat/completions` and no `/openai/responses`
+    /// equivalent. A target configured as `openai_responses` against that base URL would build
+    /// a path the provider has never offered, and the resulting 404 is a missing endpoint
+    /// rather than a missing model - which is exactly the confusion that gets a healthy model
+    /// recorded as retired. Checked at load so the misconfiguration cannot reach a request,
+    /// and the message names the fix.
+    fn validate_responses_wire_targets(&self) -> RunnerResult<()> {
+        for (name, client) in &self.llm_clients {
+            if !matches!(client.format, ClientFormat::OpenAiResponses) {
+                continue;
+            }
+            if client
+                .base_url
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("generativelanguage.googleapis.com")
+            {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} uses openai_responses against {}; Google's \
+                     OpenAI-compatible surface documents /v1beta/openai/chat/completions only \
+                     and serves no Responses path. Use format = \"openai_chat\" for this client",
+                    client.base_url.as_str()
                 )));
             }
         }
@@ -2815,6 +2846,56 @@ candidates = []
             message.contains("hosted_reasoning") && message.contains("thought_tag"),
             "the refusal must name the field and the accepted value: {message}"
         );
+    }
+
+    #[test]
+    fn a_responses_client_cannot_be_pointed_at_google() {
+        // Google serves /v1beta/openai/chat/completions and no Responses path. A target built
+        // against that base with the Responses format would request an endpoint that does not
+        // exist, and a 404 from a missing path is not a retired model. Refused at load.
+        let deployment = |format: &str, base_url: &str| {
+            format!(
+                r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "{format}"
+base_url = "{base_url}"
+
+[targets.gemini]
+id = "gemini-3.5-flash-lite"
+llm_client = "google"
+
+[routes.chat]
+id = "chat"
+type = "passthrough"
+target = "gemini"
+candidates = []
+"#
+            )
+        };
+
+        crate::Runner::from_toml(&deployment(
+            "openai_chat",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ))
+        .expect("the documented Chat Completions path loads");
+
+        let Err(error) = crate::Runner::from_toml(&deployment(
+            "openai_responses",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        )) else {
+            panic!("a Responses client against Google must not load");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("openai_chat") && message.contains("generativelanguage"),
+            "the refusal must name the fix: {message}"
+        );
+
+        // Control: the format itself is still supported for providers that serve it.
+        crate::Runner::from_toml(&deployment("openai_responses", "https://api.openai.com/v1"))
+            .expect("a Responses client against a Responses provider loads");
     }
 
     #[test]

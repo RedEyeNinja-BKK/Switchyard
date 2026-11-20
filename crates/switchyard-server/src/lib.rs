@@ -2243,6 +2243,16 @@ fn client_error(error: &LlmClientError) -> Response {
         // these bytes to another candidate makes an uncleared body admissible, so this
         // is reported as a refusal the caller can act on rather than as an upstream
         // fault that invites a retry.
+        // The requested feature is absent from the selected target's wire format, which the
+        // caller chose the route for. Reporting it as a bad request is the honest answer: an
+        // upstream fault would invite a retry that cannot change it, and an ordinary answer
+        // would hide that part of the request was never carried out.
+        LlmClientError::UnsupportedFeature { model, feature } => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("request refused before egress by {model}: {feature}"),
+            "invalid_request_error",
+            "unsupported_feature",
+        ),
         LlmClientError::PayloadNotCleared { model, codes } => error_response(
             StatusCode::FORBIDDEN,
             format!(

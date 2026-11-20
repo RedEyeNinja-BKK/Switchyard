@@ -291,6 +291,19 @@ impl TranslatingLlmClient {
         route_reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
         route_reasoning_effort: Option<&str>,
     ) -> Result<EncodedResponse> {
+        // A caller's Responses-only feature may have no representation on this target's wire
+        // format, and the decode has already discarded it. Refused before the cooldown is even
+        // consulted, because the answer is about the request rather than the model's health.
+        // The check reads the caller's own preserved body: the normalized IR no longer carries
+        // the distinction, so this is the last point at which the loss is visible.
+        if !matches!(backend, Backend::OpenAiResponses(_))
+            && let Some(feature) = caller_responses_feature(&llm_request)
+        {
+            return Err(LlmClientError::UnsupportedFeature {
+                model: model.clone(),
+                feature: feature.message(),
+            });
+        }
         let cooldown = backend.failure_cooldown();
         let key = cooldown_key(backend, model);
         let unavailable_until =
@@ -425,7 +438,7 @@ impl TranslatingLlmClient {
         // Forwarded credentials can hit a user's quota while the backend remains healthy.
         if let Some(until) = unavailable_until
             && let Err(error) = &result
-            && is_transient_failure(error)
+            && rests_the_model(error)
             && !(backend.is_forwarding_auth()
                 && matches!(error, LlmClientError::UpstreamHttp { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS))
         {
@@ -1158,6 +1171,33 @@ fn is_masked_permanent_failure(body: &str) -> bool {
     )
 }
 
+/// Whether a failure should rest the model it came from, independent of whether the same
+/// request may be sent to that model again.
+///
+/// These are two questions and Google separates them. A 503 `UNAVAILABLE` means the model is
+/// overloaded: replaying the same call would fail the same way, but the model genuinely needs
+/// to be left alone for a while. A 400 policy block means the request was refused without
+/// saying anything about the model's health, so it must not rest it. Arming the cooldown on
+/// `is_transient_failure` alone conflated the two, with the result that a target configured
+/// with a long capacity cooldown never armed it on the very condition it was configured for:
+/// the 31B's `failure_cooldown_ms = 300000` was unreachable because its own 503 correctly
+/// forbids a same-model replay, and forbidding the replay was read as "nothing to cool down".
+///
+/// The retry decision is not loosened here. `is_transient_failure` still decides what may be
+/// replayed; this only decides what rests.
+fn rests_the_model(error: &LlmClientError) -> bool {
+    if is_transient_failure(error) {
+        return true;
+    }
+    match error {
+        LlmClientError::UpstreamHttp { status, body } => {
+            crate::google::parse(Some(status.as_u16()), body)
+                .is_some_and(|error| error.recovery().cool_down_model)
+        }
+        _ => false,
+    }
+}
+
 fn is_transient_failure(error: &LlmClientError) -> bool {
     // Checked before the status table: 429 is retryable in general, but a daily
     // account cap is not a throttle that clears in a moment.
@@ -1174,6 +1214,9 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => false,
         // Retrying resends the same payload, which is the thing that was just refused.
         LlmClientError::PayloadNotCleared { .. } => false,
+        // The feature is missing from the target, not from the attempt: sending it again,
+        // or to a sibling on the same wire format, cannot add it.
+        LlmClientError::UnsupportedFeature { .. } => false,
         LlmClientError::UpstreamHttp { status, body } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
                 return false;
@@ -1426,6 +1469,21 @@ fn translation_policy(backend: &Backend) -> TranslationPolicy {
         hosted_reasoning: backend.hosted_reasoning(),
         ..TranslationPolicy::default()
     }
+}
+
+// The caller's own Responses body, when this request arrived in that format.
+//
+// The decoder records the verbatim request for same-format replay, which is the only place
+// the fields a Chat target cannot carry survive. Without preservation there is nothing to
+// inspect and the guard cannot fire; that is the pre-existing behaviour, and it is why the
+// guard reads what was captured rather than reconstructing a body it never saw.
+fn caller_responses_feature(
+    request: &switchyard_protocol::LlmRequest,
+) -> Option<switchyard_translation::UnsupportedResponsesFeature> {
+    let format: switchyard_translation::FormatId =
+        switchyard_protocol::WireFormat::OpenAiResponses.into();
+    let body = request.preservation.requests.get(&format)?;
+    switchyard_translation::unsupported_feature(body)
 }
 
 // Overwrites the outbound body's `model` field with the resolved model id.
@@ -1912,8 +1970,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
     use std::io::{Read, Write};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
     use serde_json::json;
@@ -2499,6 +2557,224 @@ mod tests {
         assert_eq!(completion_text(&agg), "Hi there");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_responses_only_feature_is_refused_before_egress()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // A caller posts /responses with a hosted search tool at a Chat target. The decoder
+        // drops the tool, so forwarding the rest would answer from memory and present that as
+        // the requested search. Nothing may reach the provider instead.
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "answer",
+                    "model": "gemini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "no search happened"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gemini",
+            Backend::OpenAiChat(config(&format!("{}/v1", server.uri()))),
+            None,
+        )])?;
+        let body = json!({
+            "model": "gemini",
+            "input": "what closed higher yesterday?",
+            "tools": [{"type": "web_search"}]
+        });
+
+        let refused = client
+            .call_rewrite_model_raw(
+                body,
+                None,
+                Some(&ModelId::from("gemini".to_string())),
+                WireFormat::OpenAiResponses,
+            )
+            .await;
+        let Err(error) = refused else {
+            panic!("a hosted tool at a Chat target must not be served");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("web_search"),
+            "the refusal must name the feature: {message}"
+        );
+        assert!(
+            message.contains("openai_responses"),
+            "and the way to serve it: {message}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the refusal must happen before any upstream request"
+        );
+
+        // Control: the same request without the hosted tool is served, so the guard refuses
+        // the feature rather than the endpoint.
+        let served = client
+            .call_rewrite_model_raw(
+                json!({"model": "gemini", "input": "hello"}),
+                None,
+                Some(&ModelId::from("gemini".to_string())),
+                WireFormat::OpenAiResponses,
+            )
+            .await?;
+        assert!(matches!(served, RawResponse::Buffered(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_overloaded_google_model_rests_without_being_replayed()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The measured shape Google sent for the 31B while it was starting: a list-wrapped
+        // 503 whose own status word is UNAVAILABLE. It must be neither replayed nor left
+        // available for the next caller, and its sibling must be untouched by either fact.
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&calls);
+        const UNAVAILABLE: &str = r#"[{"error":{"code":503,"message":"The model is overloaded.","status":"UNAVAILABLE"}}]"#;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                observed.lock().expect("call log").push(model.clone());
+                if model == "large" {
+                    ResponseTemplate::new(503).set_body_string(UNAVAILABLE)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "answer",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        // The 31B's production configuration: a five-minute cooldown, no group, and a retry
+        // budget that would be spent if the condition did not forbid a replay.
+        let large = {
+            let mut backend = config(&format!("{}/v1", server.uri()));
+            backend.failure_cooldown = Duration::from_secs(300);
+            backend.max_retries = 2;
+            Backend::OpenAiChat(backend)
+        };
+        let small = {
+            let mut backend = config(&format!("{}/v1", server.uri()));
+            backend.failure_cooldown = Duration::from_secs(5);
+            backend.max_retries = 2;
+            Backend::OpenAiChat(backend)
+        };
+        let client = TranslatingLlmClient::new(&[
+            ModelConfig::new("large", large, None),
+            ModelConfig::new("small", small, None),
+        ])?;
+        let name = |model: &str| ModelId::from(model.to_string());
+
+        // First call: the overloaded model answers 503 once and is not replayed, even though
+        // three attempts were authorised.
+        let first = client
+            .call_rewrite_model(request_for(Some("large"), false), Some(&name("large")))
+            .await;
+        assert!(
+            matches!(
+                first,
+                Err(LlmClientError::UpstreamHttp {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ..
+                })
+            ),
+            "the caller sees the provider's own 503"
+        );
+        assert_eq!(
+            std::mem::take(&mut *calls.lock().expect("call log")),
+            ["large"],
+            "an UNAVAILABLE model must not be asked again inside the call"
+        );
+
+        // Second call: the cooldown is armed even though the failure was not retryable, so no
+        // request reaches the provider at all.
+        let second = client
+            .call_rewrite_model(request_for(Some("large"), false), Some(&name("large")))
+            .await;
+        assert!(
+            matches!(second, Err(LlmClientError::TemporarilyUnavailable)),
+            "a resting model answers without a provider call"
+        );
+        assert!(
+            calls.lock().expect("call log").is_empty(),
+            "the cooldown must arm on an unretryable capacity failure"
+        );
+
+        // The sibling is unaffected: the capacity fact was the large model's, and it was not
+        // declared as a shared pool.
+        let third = client
+            .call_rewrite_model(request_for(Some("small"), false), Some(&name("small")))
+            .await?;
+        assert_eq!(
+            third
+                .llm_response
+                .into_agg()
+                .await
+                .map(|agg| completion_text(&agg))?,
+            "ok"
+        );
+        assert_eq!(
+            std::mem::take(&mut *calls.lock().expect("call log")),
+            ["small"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_model_that_needs_resting_is_rested() {
+        let call = |status: u16, body: &str| LlmClientError::UpstreamHttp {
+            status: StatusCode::from_u16(status).expect("status"),
+            body: body.to_string(),
+        };
+        // Capacity: rest, do not replay.
+        let overloaded = call(
+            503,
+            r#"[{"error":{"code":503,"message":"overloaded","status":"UNAVAILABLE"}}]"#,
+        );
+        assert!(rests_the_model(&overloaded));
+        assert!(!is_transient_failure(&overloaded));
+        // A request fault says nothing about the model's health.
+        let blocked = call(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert!(!rests_the_model(&blocked));
+        // A credential fault is the operator's, and resting the model would hide it.
+        let denied = call(
+            403,
+            r#"{"error":{"code":"permission_denied","message":"no"}}"#,
+        );
+        assert!(!rests_the_model(&denied));
+        // An ordinary transport failure is retryable and therefore rests, as before.
+        let transport = LlmClientError::Transport {
+            source: Box::new(std::io::Error::other("reset")),
+        };
+        assert!(rests_the_model(&transport));
     }
 
     #[tokio::test]

@@ -17,13 +17,14 @@ mod provider_key_redactor;
 pub mod request_fit;
 mod route;
 mod runner;
+pub mod selection;
 
 pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, CategoryModelConfig, ClassifierMode,
     ClassifierPolicyConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
 pub use config::RouteReasoningPolicy;
-pub use config::{BillingKind, ClientLocality, CompositeCrossPolicy};
+pub use config::{BillingKind, ClientLocality, CompositeCrossPolicy, SelectionPolicy};
 pub use egress::{Admission, CLEARANCE_HEADER, Refusal};
 pub use facts::{ClientFacts, DeploymentFacts, RouteFacts, TargetFacts};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
@@ -35,3 +36,4 @@ pub use route::{
     RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};
+pub use selection::MeasuredSelector;

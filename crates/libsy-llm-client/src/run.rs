@@ -1094,6 +1094,24 @@ pub struct CapabilityFacts {
     /// deployment accepts. Defaults to `false`: only a deployment that states the
     /// requirement gets the gate, so every existing target keeps the behaviour it had.
     pub requires_public_payload: bool,
+    /// The physical model's own request window: input tokens plus the output it can emit.
+    ///
+    /// Distinct from the route's advertised `context_window`, which is a promise made to
+    /// callers before any target is chosen. A route aggregating several physical models may
+    /// advertise the widest of them; a request is only dispatched to a target that can
+    /// actually hold it. `None` means the deployment has not stated a physical window, and
+    /// the target stays eligible on this axis — which is what every pre-existing target
+    /// does.
+    pub context_window: Option<u64>,
+    /// The most input one request may carry at this target, when a provider caps it below
+    /// the model's own window.
+    ///
+    /// A per-request fit ceiling, not a rate. It exists for a model whose per-minute input
+    /// budget is smaller than its context window — the free hosted Gemma models accept a
+    /// 262,144-token window but allocate 16,000 input tokens per minute — because a request
+    /// larger than a whole minute's budget cannot be served at all, however long the caller
+    /// waits. `None` means only the context window applies.
+    pub max_input_tokens: Option<u64>,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.

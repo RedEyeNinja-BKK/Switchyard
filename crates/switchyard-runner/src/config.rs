@@ -300,7 +300,34 @@ struct RouteConfig {
     /// carries. `context_window` is a route-level promise, and upstream rejects it as an
     /// unknown field on a target, so which leg is wider has to be stated.
     escalation_target: Option<String>,
+    /// How this route orders the candidates that survived eligibility filtering.
+    ///
+    /// Declared order is the historical behaviour and stays the default, so no existing
+    /// route reorders because a new option became available. `measured` lets a route whose
+    /// candidates are interchangeable free models pick by what this deployment has actually
+    /// observed — completion, then latency — instead of by configuration order, which for
+    /// interchangeable models is an accident of spelling rather than a decision.
+    ///
+    /// Read by the manual `Deserialize` below, which is why it carries no attribute: this
+    /// struct removes its own fields from the table before the algorithm spec sees them.
+    selection: SelectionPolicy,
     algorithm: AlgorithmSpec,
+}
+
+/// How a route orders its eligible candidates.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionPolicy {
+    /// Walk candidates in the order configuration states. Unchanged behaviour.
+    #[default]
+    Declared,
+    /// Order by measured completion and latency, falling back to declared order.
+    ///
+    /// Only reorders among candidates that already survived every hard gate — privacy,
+    /// capability, physical fit, quota — so it can never spend a leg the deployment would
+    /// have refused. A target with too few observations keeps its declared position, so a
+    /// cold deployment behaves exactly like a declared-order one.
+    Measured,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -365,6 +392,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
+        let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -380,6 +408,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
             escalation_target,
+            selection: selection.unwrap_or_default(),
             algorithm,
         })
     }
@@ -447,30 +476,29 @@ impl DeploymentConfig {
     /// Deriving rather than hand-editing every parent is what keeps the declaration honest
     /// when a child's carrier narrows: the parent follows, and
     /// `validate_composite_media_claims` still refuses an explicit claim no child keeps.
-    fn composite_capabilities(
-        &self,
-        composite: &CompositeRouteConfig,
-    ) -> crate::ModelCapabilities {
+    fn composite_capabilities(&self, composite: &CompositeRouteConfig) -> crate::ModelCapabilities {
         let children: Vec<crate::ModelCapabilities> = composite
             .children
             .iter()
             .filter_map(|child| self.routes.get(child))
             .map(RouteConfig::capabilities)
             .collect();
-        let serves =
-            |medium: fn(&crate::ModelCapabilities) -> Option<bool>| {
-                children.iter().any(|caps| medium(caps) == Some(true))
-            };
-        let carrier_union = |medium: fn(&crate::ModelCapabilities) -> Option<bool>,
-                             carrier: fn(&crate::ModelCapabilities) -> Option<MediaCarrier>| {
-            children
-                .iter()
-                .filter(|caps| medium(caps) == Some(true))
-                .map(|caps| carrier(caps).unwrap_or(MediaCarrier::DEFAULT))
-                .reduce(MediaCarrier::union)
+        let serves = |medium: fn(&crate::ModelCapabilities) -> Option<bool>| {
+            children.iter().any(|caps| medium(caps) == Some(true))
         };
+        let carrier_union =
+            |medium: fn(&crate::ModelCapabilities) -> Option<bool>,
+             carrier: fn(&crate::ModelCapabilities) -> Option<MediaCarrier>| {
+                children
+                    .iter()
+                    .filter(|caps| medium(caps) == Some(true))
+                    .map(|caps| carrier(caps).unwrap_or(MediaCarrier::DEFAULT))
+                    .reduce(MediaCarrier::union)
+            };
         let video = composite.video.unwrap_or_else(|| serves(|caps| caps.video));
-        let vision = composite.vision.unwrap_or_else(|| serves(|caps| caps.vision));
+        let vision = composite
+            .vision
+            .unwrap_or_else(|| serves(|caps| caps.vision));
         crate::ModelCapabilities {
             context_window: composite.context_window,
             tool_calling: composite.tool_calling,
@@ -481,16 +509,16 @@ impl DeploymentConfig {
             // carriers, never the permissive default, so the parent cannot advertise a
             // carrier nothing below it serves.
             video_carrier: video.then(|| {
-                composite.video_carrier.or_else(|| {
-                    carrier_union(|caps| caps.video, |caps| caps.video_carrier)
-                })
-                .unwrap_or(MediaCarrier::DEFAULT)
+                composite
+                    .video_carrier
+                    .or_else(|| carrier_union(|caps| caps.video, |caps| caps.video_carrier))
+                    .unwrap_or(MediaCarrier::DEFAULT)
             }),
             image_carrier: vision.then(|| {
-                composite.image_carrier.or_else(|| {
-                    carrier_union(|caps| caps.vision, |caps| caps.image_carrier)
-                })
-                .unwrap_or(MediaCarrier::DEFAULT)
+                composite
+                    .image_carrier
+                    .or_else(|| carrier_union(|caps| caps.vision, |caps| caps.image_carrier))
+                    .unwrap_or(MediaCarrier::DEFAULT)
             }),
         }
     }
@@ -646,6 +674,7 @@ impl DeploymentConfig {
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
         self.validate_composite_media_claims()?;
+        self.validate_physical_context_claims()?;
         self.validate_video_transport()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
@@ -843,6 +872,15 @@ impl DeploymentConfig {
             .with_target_credentials(target_credentials(config, &self.targets))
             .with_locality(route_locality(config, &self.targets, &self.llm_clients))
             .with_clearance_key(clearance_key.clone());
+            // A route that opted into measured ordering gets its own evidence, so one
+            // route's observations never reorder another's candidates even when the two
+            // share a target.
+            let route = match config.selection {
+                crate::config::SelectionPolicy::Measured => {
+                    route.with_measured_selection(crate::selection::MeasuredSelector::new())
+                }
+                crate::config::SelectionPolicy::Declared => route,
+            };
             routes.push((config.id.clone(), route));
         }
         // The default logical decision lane. Every configured decision target in
@@ -865,10 +903,8 @@ impl DeploymentConfig {
         for (name, composite) in &self.composites {
             runner = runner.with_composite(name.clone(), composite.children.clone());
             runner = runner.with_composite_cross_policy(name.clone(), composite.cross_on);
-            runner = runner.with_composite_capabilities(
-                name.clone(),
-                self.composite_capabilities(composite),
-            );
+            runner = runner
+                .with_composite_capabilities(name.clone(), self.composite_capabilities(composite));
         }
 
         // The same lanes are registered on the runner, so the public surface and the
@@ -1285,6 +1321,111 @@ impl DeploymentConfig {
             }
         }
         Ok(())
+    }
+
+    /// Checks that a route's advertised context is capacity some target can actually serve.
+    ///
+    /// `context_window` on a route is what a caller reads before choosing it, and it is
+    /// plain metadata — nothing at request time compares it to a model's real window. A
+    /// route aggregating several physical models may therefore advertise the widest of
+    /// them, which is truthful: some eligible target can hold such a request. Advertising
+    /// more than the widest target is not, so a route that states a window while its
+    /// targets state physical windows must fit inside the largest of them. A target that
+    /// states no physical window is treated as undeclared rather than as zero, so a
+    /// manifest written before this field existed keeps loading unchanged.
+    fn validate_physical_context_claims(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if let Some(max_input) = target.max_input_tokens {
+                if max_input == 0 {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} max_input_tokens must be at least 1"
+                    )));
+                }
+                if let Some(window) = target.context_window
+                    && max_input > window
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} declares max_input_tokens {max_input} above its \
+                         context_window {window}; a per-request ceiling larger than the window \
+                         is never the binding limit, so one of the two is wrong"
+                    )));
+                }
+            }
+            if target.context_window == Some(0) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} context_window must be at least 1"
+                )));
+            }
+        }
+
+        for (route_name, route) in &self.routes {
+            let Some(claimed) = route.context_window else {
+                continue;
+            };
+            let declared: Vec<u64> = route
+                .routing_target_names()
+                .into_iter()
+                .filter_map(|name| self.targets.get(name))
+                .filter_map(|target| target.context_window)
+                .collect();
+            let Some(widest) = declared.iter().copied().max() else {
+                // No target states a physical window, so there is nothing to check against
+                // and the historical manifest keeps its behaviour.
+                continue;
+            };
+            if u64::from(claimed) > widest {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} advertises context_window {claimed} but its widest \
+                     declared target window is {widest}; the route would promise capacity no \
+                     candidate can serve"
+                )));
+            }
+        }
+
+        // A composite is resolved before its children, so the number a caller reads comes
+        // from the composite itself. Leaving it unchecked would let the one surface a
+        // bounded lane publishes be the only unverified promise in the file. A child
+        // route's own stated window is the tighter and therefore the authoritative value;
+        // only a child that states nothing falls back to its targets.
+        for (name, composite) in &self.composites {
+            let Some(claimed) = composite.context_window else {
+                continue;
+            };
+            let widest = composite
+                .children
+                .iter()
+                .filter_map(|child| self.routes.get(child))
+                .filter_map(|route| {
+                    route
+                        .context_window
+                        .map(u64::from)
+                        .or_else(|| self.widest_target_window(route))
+                })
+                .max();
+            let Some(widest) = widest else {
+                // Nothing below states a window, so there is no claim to contradict.
+                continue;
+            };
+            if u64::from(claimed) > widest {
+                return Err(RunnerError::configuration(format!(
+                    "composite {name} advertises context_window {claimed} but its widest \
+                     declared child window is {widest}; the composite would promise capacity \
+                     no child route can serve"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The widest physical window any target behind `route` declares, if any does.
+    fn widest_target_window(&self, route: &RouteConfig) -> Option<u64> {
+        route
+            .routing_target_names()
+            .into_iter()
+            .filter_map(|name| self.targets.get(name))
+            .filter_map(|target| target.context_window)
+            .map(u64::from)
+            .max()
     }
 
     /// Checks a composite's effective media claim against the children that must keep it.
@@ -1801,6 +1942,11 @@ impl DeploymentConfig {
                             .llm_clients
                             .get(&target.llm_client)
                             .is_some_and(|client| client.requires_public_payload),
+                        // The physical window and the per-request input ceiling travel as
+                        // facts so the pre-dispatch filter can drop a target that cannot
+                        // hold this request, before any provider is contacted.
+                        context_window: target.context_window,
+                        max_input_tokens: target.max_input_tokens,
                     },
                 );
             }
@@ -2343,6 +2489,26 @@ struct TargetConfig {
     /// allowance removes the target from consideration and the route advances.
     #[serde(default)]
     daily_request_limit: Option<u64>,
+    /// The physical model's own request window, when the deployment knows it.
+    ///
+    /// A route's `context_window` is what callers are promised; this is what one backing
+    /// model can actually hold, input plus output. A route whose aggregate claim exceeds
+    /// every candidate's physical window would promise capacity no target can serve, so
+    /// load refuses the pair rather than discovering it as an upstream 400. Unset leaves
+    /// the target unconstrained on this axis, which keeps every manifest written before the
+    /// field existed behaving exactly as it did.
+    #[serde(default)]
+    context_window: Option<u64>,
+    /// The most input a single request may carry here, when the provider caps it below the
+    /// context window.
+    ///
+    /// This is the per-minute input budget expressed as a per-request ceiling: a request
+    /// that needs more than a whole minute's allowance can never be served, so admitting it
+    /// would spend the target's eligibility and return a 429. The free hosted Gemma models
+    /// are the case that forced the field — 262,144-token window, 16,000 input tokens per
+    /// minute — and a 256K prompt is not a 16K request with a long wait.
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -3025,8 +3191,8 @@ children = ["child_inline"]
     }
 
     #[test]
-    fn video_true_without_a_carrier_derives_the_union_not_the_permissive_default(
-    ) -> RunnerResult<()> {
+    fn video_true_without_a_carrier_derives_the_union_not_the_permissive_default()
+    -> RunnerResult<()> {
         let runner = runner_from_toml(&composite_media_config(
             "[composites.stated]\nchildren = [\"child_inline\"]\nvideo = true\n",
         ))?;
@@ -3937,11 +4103,14 @@ efficient_target = "weak"
         );
         assert!(error_message(&unknown_classifier_field).contains("unknown field"));
 
+        // `context_window`, `max_input_tokens` and `daily_request_limit` are supported
+        // target fields, so the control names one that is not: a typo must still be
+        // refused rather than silently ignored.
         let target_capability = VALID_CONFIG.replace(
             "llm_client = \"responses\"",
-            "llm_client = \"responses\"\ncontext_window = 1000000",
+            "llm_client = \"responses\"\nwindow_magic = 1000000",
         );
-        assert!(error_message(&target_capability).contains("unknown field `context_window`"));
+        assert!(error_message(&target_capability).contains("unknown field `window_magic`"));
 
         let unknown_algorithm = VALID_CONFIG.replace("type = \"noop\"", "type = \"imaginary\"");
         assert!(error_message(&unknown_algorithm).contains("unknown variant"));

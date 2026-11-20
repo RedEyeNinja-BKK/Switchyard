@@ -235,6 +235,42 @@ impl Runner {
                 return Err(RunnerError::UnknownRouteModel(child_name.clone()));
             };
 
+            // A child whose every candidate may only receive cleared payloads, for a
+            // request that is not cleared, is skipped before it is called. Its own refusal
+            // is correct and stays in place for a directly addressed leaf; inside a
+            // composite the refusal means "this leg may not carry these bytes", and the
+            // next leg is exactly what the composite exists to reach. Letting the refusal
+            // surface as the child's failure would end the whole composite with a 403 and
+            // leave the private branch unable to skip the provider it may not use.
+            if route.payload_refused(&request) {
+                children.push((
+                    child_name.clone(),
+                    ChildOutcome::Skipped {
+                        capability: "privacy_clearance",
+                    },
+                ));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
+                continue;
+            }
+
+            // A child no candidate of which can hold this request is skipped the same way.
+            // Its own refusal is right when it is addressed directly, but inside a composite
+            // it means "this leg cannot serve these bytes" and the wider sibling is exactly
+            // what the aggregate route exists to reach. Reported under the binding limit so
+            // the caller learns which axis excluded it.
+            if let Some(limit) = route.physical_ineligibility(&request) {
+                children.push((
+                    child_name.clone(),
+                    ChildOutcome::Skipped { capability: limit },
+                ));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
+                continue;
+            }
+
             // A child that cannot serve this request was never eligible. Skipping it is
             // routing, not recovery, and it receives no provider call at all.
             if let Some(capability) = request_fit::unsupported_capability(

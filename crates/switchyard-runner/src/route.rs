@@ -163,6 +163,26 @@ impl MediaCarrier {
 /// `None` is not "unstated": it is the case where the target refuses video, expressed either
 /// as `no_video` or as both carrier facts at once. Returning a carrier there would name a
 /// transport the target cannot use, and the caller's video boolean already refuses it.
+/// What one model must be able to hold for this request: the input it carries plus the
+/// output the caller reserved.
+///
+/// A window that fits the input but not the reservation rejects the request upstream after
+/// the target was already chosen, so the fit is judged on the whole need. Both the
+/// per-candidate filter and the composite's pre-check read this, so the two cannot disagree
+/// about whether a request fits.
+fn required_tokens(request: &Request) -> u64 {
+    let raw = request
+        .raw_request
+        .as_ref()
+        .unwrap_or(&serde_json::Value::Null);
+    let input = crate::request_fit::estimate_input_tokens(raw);
+    request
+        .llm_request
+        .output
+        .max_output_tokens
+        .map_or(input, |reservation| input.saturating_add(reservation))
+}
+
 fn carrier_from_facts(facts: &switchyard_llm_client::CapabilityFacts) -> Option<MediaCarrier> {
     if facts.no_video {
         return None;
@@ -347,6 +367,11 @@ pub struct Route {
     /// names a target slug, not the credential, so the credential identity has to come
     /// from configuration. Empty when the route was built without one (tests).
     target_credentials: std::collections::HashMap<ModelId, String>,
+    /// Measured ordering among candidates that already survived every hard gate.
+    ///
+    /// `None` keeps declared order, which is what every route did before the option
+    /// existed, so a route that does not opt in is untouched by this machinery.
+    selector: Option<Arc<crate::selection::MeasuredSelector>>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -386,7 +411,20 @@ impl Route {
             models: Arc::new(models),
             clearance_key: Arc::new(crate::egress::ClearanceKey::refusing()),
             target_credentials: std::collections::HashMap::new(),
+            selector: None,
         }
+    }
+
+    /// Enables measured ordering among the candidates this route has already admitted.
+    ///
+    /// Set at load from the route's `selection` policy. Without it the route walks its
+    /// declared order, unchanged.
+    pub fn with_measured_selection(
+        mut self,
+        selector: Arc<crate::selection::MeasuredSelector>,
+    ) -> Self {
+        self.selector = Some(selector);
+        self
     }
 
     /// Records the key used to authenticate a caller's privacy clearance.
@@ -521,6 +559,76 @@ impl Route {
         self.clients.continuation_owner(request)
     }
 
+    /// Whether this route would refuse the request at the egress gate before contacting
+    /// any provider.
+    ///
+    /// A composite needs this, and needs it before the call rather than as a caught error:
+    /// a payload the gate will not release was never *attempted*, so crossing to the next
+    /// child is routing rather than recovery. Treating the refusal as a child failure made a
+    /// composite built as "Google, then a strict non-training leg" terminate with a 403
+    /// instead of skipping the leg the payload may not reach — which is the opposite of what
+    /// such a composite is for. A directly addressed leaf is unaffected: it still refuses.
+    ///
+    /// True only when every candidate this route could use is gated, so a route with any
+    /// ungated leg is left to the ordinary per-model filter.
+    pub fn payload_refused(&self, request: &Request) -> bool {
+        let facts = self.clients.target_capabilities();
+        if !facts.values().any(|facts| facts.requires_public_payload) {
+            return false;
+        }
+        let admission = crate::egress::evaluate(request, &self.clearance_key);
+        if admission.allowed() {
+            return false;
+        }
+        let candidates = self.models.all_models();
+        !candidates.is_empty()
+            && candidates.iter().all(|model| {
+                facts
+                    .get(model)
+                    .is_some_and(|facts| facts.requires_public_payload)
+            })
+    }
+
+    /// Whether no candidate of this route can hold the request, and why.
+    ///
+    /// The physical counterpart of [`Self::payload_refused`]: a composite needs to know
+    /// before the call, because a child that cannot fit the request is ineligible rather
+    /// than failing. Without it the child's own `UnsupportedCapability` error ends the
+    /// whole composite — the request never reaches a wider sibling — which is precisely
+    /// the case an aggregate route exists to handle.
+    ///
+    /// Returns the binding limit's name, or `None` when at least one candidate fits or when
+    /// a candidate states no limits at all. A target that states nothing is unconstrained,
+    /// not zero.
+    pub fn physical_ineligibility(&self, request: &Request) -> Option<&'static str> {
+        let facts = self.clients.target_capabilities();
+        let candidates = self.models.all_models();
+        if candidates.is_empty() {
+            return None;
+        }
+        let required = required_tokens(request);
+        let mut binding: Option<&'static str> = None;
+        for model in &candidates {
+            let Some(facts) = facts.get(model) else {
+                return None;
+            };
+            if let Some(window) = facts.context_window
+                && required > window
+            {
+                binding = Some("context_window");
+                continue;
+            }
+            if let Some(ceiling) = facts.max_input_tokens
+                && required > ceiling
+            {
+                binding = binding.or(Some("input_tokens_per_minute"));
+                continue;
+            }
+            return None;
+        }
+        binding
+    }
+
     pub async fn execute(
         &self,
         request: Request,
@@ -548,6 +656,7 @@ impl Route {
             .clone()
             .unwrap_or(serde_json::Value::Null);
         let estimated_input_tokens = crate::request_fit::estimate_input_tokens(&raw);
+        let required_tokens = required_tokens(&request);
         let eligibility = |model: &switchyard_protocol::ModelId| {
             if let Some(facts) = facts.get(model)
                 && facts.requires_public_payload
@@ -557,6 +666,20 @@ impl Route {
             }
             match facts.get(model) {
                 Some(facts) => {
+                    // Physical fit, judged on facts the deployment states about one backing
+                    // model. A request that cannot fit is not a request the target should
+                    // be asked to refuse: the route advances instead, which is what makes an
+                    // aggregate window honest across models of different sizes.
+                    if let Some(window) = facts.context_window
+                        && required_tokens > window
+                    {
+                        return false;
+                    }
+                    if let Some(ceiling) = facts.max_input_tokens
+                        && required_tokens > ceiling
+                    {
+                        return false;
+                    }
                     // An explicit `false` is a refusal; `None` would mean "undeclared",
                     // which the predicate treats as permitted, so the flag must be carried
                     // as a concrete boolean.
@@ -586,6 +709,21 @@ impl Route {
             }
         };
         let models = self.models.filtered(&eligibility);
+        // Among candidates that survived every hard gate, a route may prefer what this
+        // deployment has actually observed. This reorders one already-admitted list and
+        // cannot add, drop or resurrect a candidate, so a privacy, capability, fit or
+        // quota refusal is still final.
+        let models = match self.selector.as_ref() {
+            Some(selector) => {
+                let declared = models.all_models();
+                let original = self.models.all_models();
+                match selector.order(&declared, &original) {
+                    Some(ordered) => models.reordered(&ordered),
+                    None => models,
+                }
+            }
+            None => models,
+        };
         // Under context pressure the declared escalation leg is offered first, before any
         // provider is contacted. This reorders one list; it does not add a second
         // escalation engine, and the native retry, cooldown and fallback machinery still
@@ -673,12 +811,21 @@ impl Route {
                         &raw,
                     )
                 })
+                // A request that fits every capability and still found nothing was excluded
+                // on size. Naming the binding limit is the difference between a caller who
+                // knows to send less and one who reads "ineligible" and retries the same
+                // payload: the physical gate is the only other reason a candidate drops out,
+                // and it is reported only when no candidate fits at all.
+                .or_else(|| self.physical_ineligibility(&request))
                 .unwrap_or("an eligible route");
             return Err(RunnerError::unsupported_capability(
                 self.algorithm.name(),
                 capability,
             ));
         }
+        // The measurement rides on the observation the run already emits, so no separate
+        // timing path exists to disagree with the recorded one.
+        let observer = self.selecting_observer(observer);
         let (selected_model, response) = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
@@ -690,6 +837,20 @@ impl Route {
         Ok(RunOutput {
             selected_model,
             response,
+        })
+    }
+
+    /// Composes the route's own observer in front of the caller's, when this route measures.
+    fn selecting_observer(&self, observer: Option<RunObserver>) -> Option<RunObserver> {
+        let Some(selector) = self.selector.as_ref().map(Arc::clone) else {
+            return observer;
+        };
+        Some(match observer {
+            Some(observer) => Arc::new(move |observation: RunObservation| {
+                selector.observe(&observation);
+                observer(observation);
+            }),
+            None => Arc::new(move |observation: RunObservation| selector.observe(&observation)),
         })
     }
 

@@ -2239,6 +2239,40 @@ fn client_error(error: &LlmClientError) -> Response {
             )
         }
         LlmClientError::RequestEncoding(message) => server_error(message),
+        // The payload is the caller's, not the deployment's: no amount of resending
+        // these bytes to another candidate makes an uncleared body admissible, so this
+        // is reported as a refusal the caller can act on rather than as an upstream
+        // fault that invites a retry.
+        LlmClientError::PayloadNotCleared { model, codes } => error_response(
+            StatusCode::FORBIDDEN,
+            format!(
+                "payload assembled for {model} was refused before egress: {codes}. \
+                 Content that must not leave this deployment cannot be waived by a route."
+            ),
+            "invalid_request_error",
+            "payload_not_cleared",
+        ),
+        // A spent daily budget is not an outage: this leg cannot serve until the
+        // provider day rolls over, and the reset is stated so a caller does not retry
+        // into the same refusal. Every other candidate keeps its own budget.
+        LlmClientError::DailyRequestAllowanceExhausted { model, limit } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "daily request allowance for {model} is spent ({limit} per provider day); \
+                 it resets at the next provider day (midnight America/Los_Angeles)"
+            ),
+            "invalid_request_error",
+            "daily_allowance_exhausted",
+        ),
+        // Accounting that cannot be read is a deployment fault, and a silent one would
+        // leave a cap unenforced. Refused fail-closed, reported as unavailable rather
+        // than as something the caller did wrong.
+        LlmClientError::DailyRequestAllowanceUnavailable { model, reason } => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("daily request allowance for {model} cannot be accounted: {reason}"),
+            "server_error",
+            "daily_allowance_unavailable",
+        ),
         _ => server_error(error.to_string()),
     }
 }
@@ -3026,6 +3060,73 @@ mod tests {
             assert_eq!(api_error.error_type, "upstream_error");
             assert_eq!(api_error.code, "upstream_timeout");
         }
+    }
+
+    // The three allowance and privacy failures are caller-visible conditions with
+    // different meanings, so none of them may fall into the generic internal-error
+    // arm: an uncleared payload is the caller's to fix, a spent budget resets on the
+    // provider's day, and unreadable accounting is a deployment fault under which a
+    // cap is unenforced. Each is asserted by status and wire code.
+    #[test]
+    fn allowance_and_payload_refusals_render_as_their_own_failures() {
+        let cases = [
+            (
+                LlmClientError::PayloadNotCleared {
+                    model: ModelId::from("gemini-3.5-flash-lite"),
+                    codes: "api_key,email_address".to_string(),
+                },
+                StatusCode::FORBIDDEN,
+                "invalid_request_error",
+                "payload_not_cleared",
+            ),
+            (
+                LlmClientError::DailyRequestAllowanceExhausted {
+                    model: ModelId::from("gemini-3.5-flash-lite"),
+                    limit: 500,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "invalid_request_error",
+                "daily_allowance_exhausted",
+            ),
+            (
+                LlmClientError::DailyRequestAllowanceUnavailable {
+                    model: ModelId::from("gemini-3.5-flash-lite"),
+                    reason: "counter file is not readable".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "daily_allowance_unavailable",
+            ),
+        ];
+        for (error, status, error_type, code) in cases {
+            let response = client_error(&error);
+            assert_eq!(response.status(), status, "{code}");
+            let api_error = response
+                .extensions()
+                .get::<ApiError>()
+                .expect("ApiError extension");
+            assert_eq!(api_error.status, status, "{code}");
+            assert_eq!(api_error.error_type, error_type, "{code}");
+            assert_eq!(api_error.code, code, "{code}");
+        }
+    }
+
+    // A refusal names categories, never the value that matched: an error body is
+    // still egress, and a message quoting the finding would publish what the check
+    // exists to keep in.
+    #[test]
+    fn a_payload_refusal_repeats_codes_and_never_the_matched_value() {
+        let error = LlmClientError::PayloadNotCleared {
+            model: ModelId::from("gemini-3.5-flash-lite"),
+            codes: "api_key".to_string(),
+        };
+        let api_error = client_error(&error)
+            .extensions()
+            .get::<ApiError>()
+            .cloned()
+            .expect("ApiError extension");
+        assert!(api_error.message.contains("api_key"));
+        assert!(api_error.message.contains("gemini-3.5-flash-lite"));
     }
 
     // The provider's message can quote request content, so the request log

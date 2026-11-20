@@ -21,6 +21,7 @@ use switchyard_llm_client::{
 use switchyard_protocol::{
     Category, ModelId, ReasoningDialect, ReasoningPolicy, RoutedLlmClient, WireFormat,
 };
+use switchyard_translation::HostedReasoningMarker;
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, MediaCarrier,
@@ -1087,6 +1088,7 @@ impl DeploymentConfig {
                 ReasoningDialect::default(),
                 None,
                 None,
+                None,
             )?;
             let (Backend::OpenAiChat(config)
             | Backend::OpenAiResponses(config)
@@ -1126,6 +1128,14 @@ impl DeploymentConfig {
                     )));
                 }
             }
+            let hosted_reasoning = match target.hosted_reasoning.as_deref() {
+                None => None,
+                Some(value) => Some(HostedReasoningMarker::parse(value).ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "target {target_name} hosted_reasoning {value:?} is not a known marker; expected thought_tag"
+                    ))
+                })?),
+            };
             model_configs.push(ModelConfig::new(
                 target.id.clone(),
                 build_backend(
@@ -1146,6 +1156,7 @@ impl DeploymentConfig {
                             target.id.clone(),
                         ))
                         .cloned(),
+                    hosted_reasoning,
                 )?,
                 None,
             ));
@@ -1424,7 +1435,6 @@ impl DeploymentConfig {
             .into_iter()
             .filter_map(|name| self.targets.get(name))
             .filter_map(|target| target.context_window)
-            .map(u64::from)
             .max()
     }
 
@@ -2423,6 +2433,16 @@ struct TargetConfig {
     /// one transport routinely differ here, which is why it is not an `llm_client` setting.
     #[serde(default)]
     reasoning_dialect: ReasoningDialect,
+    /// The marker this target's upstream uses when it writes reasoning inline in the message.
+    ///
+    /// A per-target wire fact, like `reasoning_dialect`: Google's hosted Gemma endpoints
+    /// answer `<thought>…</thought>` followed by the answer and count only the answer in
+    /// `completion_tokens`, while the Gemini chat models on the same credential do not.
+    /// Declaring `thought_tag` moves the block into a reasoning block so the monologue is
+    /// never returned as output. An unrecognised value is a load error rather than a
+    /// silently disabled filter.
+    #[serde(default)]
+    hosted_reasoning: Option<String>,
     /// Wire family this target speaks when serving a typed decision call.
     #[serde(default)]
     decision_transport: Option<decision_transport::DecisionTransport>,
@@ -2574,6 +2594,7 @@ fn build_backend(
     reasoning_dialect: ReasoningDialect,
     cooldown_group: Option<String>,
     allowance: Option<Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    hosted_reasoning: Option<HostedReasoningMarker>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -2653,6 +2674,7 @@ fn build_backend(
         requires_list_input: config.requires_list_input,
         allowance,
         requires_public_payload: config.requires_public_payload,
+        hosted_reasoning,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -2750,6 +2772,48 @@ candidates = []
             by_id["unknown"],
             crate::route::Locality::Unknown,
             "a subscription credential alone states no locality"
+        );
+    }
+
+    /// A target declares the marker its upstream uses, or the deployment does not load.
+    ///
+    /// Accepting an unknown value would disable the filter silently, which is the defect
+    /// the filter exists to prevent, so the refusal must name the field and the accepted
+    /// value.
+    #[test]
+    fn a_target_names_its_hosted_reasoning_marker() {
+        let deployment = |marker: &str| {
+            format!(
+                r#"
+schema_version = 1
+
+[llm_clients.gemma]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma-a]
+id = "google/gemma"
+llm_client = "gemma"
+hosted_reasoning = "{marker}"
+
+[routes.chat]
+id = "chat"
+type = "passthrough"
+target = "gemma-a"
+candidates = []
+"#
+            )
+        };
+
+        crate::Runner::from_toml(&deployment("thought_tag")).expect("a known marker loads");
+
+        let Err(error) = crate::Runner::from_toml(&deployment("thought")) else {
+            panic!("an unknown marker must not load");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("hosted_reasoning") && message.contains("thought_tag"),
+            "the refusal must name the field and the accepted value: {message}"
         );
     }
 
@@ -4717,6 +4781,7 @@ confidence_threshold = 0.5
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
             None,
+            None,
         )?;
 
         assert_eq!(
@@ -4760,6 +4825,7 @@ confidence_threshold = 0.5
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
             None,
+            None,
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -4785,6 +4851,7 @@ confidence_threshold = 0.5
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
                 None,
                 None,
             );

@@ -768,6 +768,7 @@ fn random_state_with_retries(
         requires_list_input: false,
         allowance: None,
         requires_public_payload: false,
+        hosted_reasoning: None,
     });
     let target_models = routes
         .iter()

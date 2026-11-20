@@ -102,6 +102,11 @@ video = false
 context_window = 262144
 max_input_tokens = 16000
 daily_request_limit = 14400
+# Hosted Gemma writes its chain of thought into the visible message: the measured body is
+# `<thought>...</thought>` followed by the answer, with `completion_tokens` counting only the
+# answer and `total_tokens` counting both. Declaring the marker is what keeps the monologue
+# out of the caller's text; without it the whole block is returned as output.
+hosted_reasoning = "thought_tag"
 
 [targets."direct-google-gemma-4-26b-a4b-it"]
 id = "gemma-4-26b-a4b-it"
@@ -111,6 +116,7 @@ video = false
 context_window = 262144
 max_input_tokens = 16000
 daily_request_limit = 14400
+hosted_reasoning = "thought_tag"
 '''
 
 GEMMA_ROUTES = '''

@@ -78,3 +78,38 @@ function-calling, structured-output and thinking pages document Gemini models on
 support on the OpenAI-compatible surface is therefore **undocumented by the vendor** — the
 matrix above is the only evidence that exists for it, which is why it is recorded request by
 request.
+
+## The leak is closed at the target that declares the marker
+
+`hosted_reasoning = "thought_tag"` on a target is the switch. The target states the marker,
+the backend carries it, and both decode paths split on it: the buffered response moves the
+block into a `Reasoning` block before the message text is built, and the streamed response
+buffers only as much as it needs - enough to tell whether the message opens with the marker,
+then the block itself until its close - releasing answer text as soon as the block ends.
+
+A target that does not declare it is untouched. That is not politeness: the two Gemmas and
+the Gemini chat models share one credential, and a model that legitimately writes the token
+as text must not have it interpreted. The declaration is validated at load, so a typo is a
+configuration error rather than a silently disabled filter.
+
+The split refuses rather than repairs, and the refusals carry more weight than the happy
+path:
+
+- an unterminated block is a translation error - nothing was ever released as an answer, and
+  synthesising one from the truncated thought is the leak the filter exists to prevent;
+- a stream that ends inside a block fails the same way instead of emitting an empty answer;
+- a `<thought>` after the answer began, or a close with no open, is reported rather than
+  stripped, because the visible text is then known to be incomplete in a way this layer
+  cannot reconstruct.
+
+Accounting follows: the caller sees only the answer, so its visible text matches
+`completion_tokens`, while `total_tokens` still includes the thinking that was moved rather
+than discarded - it survives as a reasoning block for a caller that wants it.
+
+Receipts for the change: `switchyard-translation` 67 unit + 196 integration,
+`switchyard-llm-client` 167, `switchyard-runner` 274 - 704 tests, 0 failures, plus a
+`--dry-run` load of the regenerated manifest on the new binary (49 → 52 routes, the two Gemma
+leaves and `smart-gemini-bounded` added, nothing removed). Three mutants - buffered split
+disabled, stream filter disabled, end-of-stream refusal disabled - each turned a named test
+red; the control case (same body, no marker declared) stayed green, which is what shows the
+marker is the switch and not a global strip.

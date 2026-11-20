@@ -126,6 +126,15 @@ pub struct HttpBackendConfig {
     /// [`TranslatingLlmClient`](crate::TranslatingLlmClient) inspects the assembled wire
     /// body before sending it, which is the only check that sees exactly what leaves.
     pub requires_public_payload: bool,
+    /// The upstream writes its reasoning inline in the visible message, behind this marker.
+    ///
+    /// A provider property, declared once per client: Google's hosted Gemma endpoints on the
+    /// OpenAI-compatible surface answer with `<thought>…</thought>` followed by the answer,
+    /// and count only the answer in `completion_tokens`. Declaring the marker moves the block
+    /// into a reasoning block, so the monologue is not returned to the caller as output.
+    /// `None` leaves response text untouched, which is what a model that legitimately writes
+    /// those tokens as text requires.
+    pub hosted_reasoning: Option<switchyard_translation::HostedReasoningMarker>,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -150,6 +159,7 @@ impl fmt::Debug for HttpBackendConfig {
                 &self.allowance.as_ref().map(|a| a.limit()),
             )
             .field("requires_public_payload", &self.requires_public_payload)
+            .field("hosted_reasoning", &self.hosted_reasoning)
             .finish()
     }
 }
@@ -413,6 +423,13 @@ impl Backend {
         self.config().requires_public_payload
     }
 
+    /// The marker an upstream uses when it writes reasoning inline in the message.
+    ///
+    /// `None` means the upstream's text is already only the answer.
+    pub fn hosted_reasoning(&self) -> Option<switchyard_translation::HostedReasoningMarker> {
+        self.config().hosted_reasoning
+    }
+
     /// The cooldown group this backend belongs to, when its targets share one.
     pub fn cooldown_group(&self) -> Option<&str> {
         self.config().cooldown_group.as_deref()
@@ -550,6 +567,7 @@ mod tests {
             requires_list_input: false,
             allowance: None,
             requires_public_payload: false,
+            hosted_reasoning: None,
         }
     }
 

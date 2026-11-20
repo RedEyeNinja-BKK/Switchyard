@@ -1906,6 +1906,7 @@ mod tests {
                         requires_list_input: false,
                         allowance: None,
                         requires_public_payload: false,
+                        hosted_reasoning: None,
                     };
                     let backend = if responses {
                         Backend::OpenAiResponses(config)
@@ -2061,6 +2062,7 @@ mod tests {
                     requires_list_input: false,
                     allowance: None,
                     requires_public_payload: false,
+                    hosted_reasoning: None,
                 }),
                 None,
             )])
@@ -3015,6 +3017,7 @@ mod tests {
                     requires_list_input: false,
                     allowance: None,
                     requires_public_payload: false,
+                    hosted_reasoning: None,
                 })
             };
             TranslatingLlmClient::new(&[
@@ -3108,6 +3111,7 @@ mod tests {
                 requires_list_input: false,
                 allowance: None,
                 requires_public_payload: false,
+                hosted_reasoning: None,
             })
         };
         let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
@@ -3273,6 +3277,7 @@ mod tests {
                 requires_list_input: false,
                 allowance: None,
                 requires_public_payload: false,
+                hosted_reasoning: None,
             })
         };
         let client = Arc::new(

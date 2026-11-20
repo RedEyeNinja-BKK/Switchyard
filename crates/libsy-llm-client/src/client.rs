@@ -22,7 +22,7 @@ use switchyard_protocol::{
 };
 use switchyard_translation::{
     TargetCapabilities, TranslationError, TranslationPolicy, WireFormat,
-    decode_aggregated_response, decode_request, decode_stream,
+    decode_aggregated_response_with_policy, decode_request, decode_stream_with_policy,
     encode_aggregated_response_with_extensions, encode_request_with_policy,
     encode_stream_with_extensions,
 };
@@ -327,15 +327,10 @@ impl TranslatingLlmClient {
             return Err(LlmClientError::TemporarilyUnavailable);
         }
 
-        // A Responses upstream may declare that it requires a list-shaped `input`; the
-        // default policy carries no target capabilities, so it is supplied here.
-        let policy = TranslationPolicy {
-            target_capabilities: TargetCapabilities {
-                requires_list_input: Some(backend.requires_list_input()),
-                ..TargetCapabilities::default()
-            },
-            ..TranslationPolicy::default()
-        };
+        // A Responses upstream may declare that it requires a list-shaped `input`, and a
+        // hosted upstream may embed reasoning behind a marker. Both are per-target wire
+        // facts, so one helper supplies them to every translation site.
+        let policy = translation_policy(backend);
         let mut body = encode_request_with_policy(&llm_request, wire_format, &policy)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -836,22 +831,21 @@ impl TranslatingLlmClient {
                 })?;
                 // Map a provider's failed generation to 502, even under HTTP 200.
                 // Redact forwarded credentials before returning the provider error.
-                let agg =
-                    decode_aggregated_response(&body, wire_format).map_err(
-                        |error| match error {
-                            TranslationError::UpstreamFailure { error } => {
-                                LlmClientError::UpstreamHttp {
-                                    status: StatusCode::BAD_GATEWAY,
-                                    body: redact_forwarded_headers(
-                                        json!({ "error": error }).to_string(),
-                                        metadata.as_ref(),
-                                        backend.is_forwarding_auth(),
-                                    ),
-                                }
+                let policy = translation_policy(backend);
+                let agg = decode_aggregated_response_with_policy(&body, wire_format, &policy)
+                    .map_err(|error| match error {
+                        TranslationError::UpstreamFailure { error } => {
+                            LlmClientError::UpstreamHttp {
+                                status: StatusCode::BAD_GATEWAY,
+                                body: redact_forwarded_headers(
+                                    json!({ "error": error }).to_string(),
+                                    metadata.as_ref(),
+                                    backend.is_forwarding_auth(),
+                                ),
                             }
-                            error => LlmClientError::ResponseTranslation(error.to_string()),
-                        },
-                    )?;
+                        }
+                        error => LlmClientError::ResponseTranslation(error.to_string()),
+                    })?;
                 (LlmResponse::Agg(agg), upstream_headers)
             }
         };
@@ -1234,7 +1228,8 @@ async fn prepare_response_stream(
             .map(|bytes| bytes.to_vec())
             .map_err(convert_reqwest_error)
     });
-    let mut chunks = decode_stream(bytes, backend.wire_format())?;
+    let mut chunks =
+        decode_stream_with_policy(bytes, backend.wire_format(), &translation_policy(backend))?;
     // Hold non-output events until something usable arrives. A provider announces
     // the response (`response.created`, a role-only delta) and may then stall; if
     // the attempt returned at that announcement, the attempt bound would stop
@@ -1397,6 +1392,23 @@ fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> Reques
         builder = builder.header(name, value);
     }
     builder
+}
+
+// The translation policy one backend declares.
+//
+// Both facts are per-target wire properties: whether the Responses `input` must be a list,
+// and which marker the upstream uses for reasoning it writes inline in the message. They are
+// assembled here rather than at each encode/decode site because a decode path that forgets
+// the marker silently returns the provider's monologue to the caller.
+fn translation_policy(backend: &Backend) -> TranslationPolicy {
+    TranslationPolicy {
+        target_capabilities: TargetCapabilities {
+            requires_list_input: Some(backend.requires_list_input()),
+            ..TargetCapabilities::default()
+        },
+        hosted_reasoning: backend.hosted_reasoning(),
+        ..TranslationPolicy::default()
+    }
 }
 
 // Overwrites the outbound body's `model` field with the resolved model id.
@@ -1888,7 +1900,7 @@ mod tests {
     use std::thread::JoinHandle;
 
     use serde_json::json;
-    use switchyard_protocol::{completion_text, text_request};
+    use switchyard_protocol::{ContentBlock, completion_text, text_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1916,6 +1928,7 @@ mod tests {
             requires_list_input: false,
             allowance: None,
             requires_public_payload: false,
+            hosted_reasoning: None,
         }
     }
 
@@ -2010,6 +2023,13 @@ mod tests {
             Backend::OpenAiResponses(config(base_url)),
             None,
         )]
+    }
+
+    // A chat backend whose upstream writes its reasoning inline behind a marker.
+    fn chat_map_with_hosted_reasoning(base_url: &str) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.hosted_reasoning = Some(switchyard_translation::HostedReasoningMarker::ThoughtTag);
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
     fn chat_map_with_extra_body(
@@ -2404,6 +2424,79 @@ mod tests {
         let agg = response.llm_response.into_agg().await?;
         assert_eq!(completion_text(&agg), "Hi there");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_hosted_reasoning_never_reaches_the_caller()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The upstream writes its chain of thought into `content`. A backend that declares
+        // the marker must hand the caller only the answer.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "model": "gemma",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "<thought>plan</thought>\n\nready"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 71}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+
+        assert_eq!(completion_text(&agg), "ready");
+        let output = agg.first_output().expect("one output item");
+        assert!(
+            output
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Reasoning { .. })),
+            "the block must survive as reasoning, not be discarded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_hosted_reasoning_never_reaches_the_caller()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<thou\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"ght>plan</thought>\\n\\nready\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+
+        assert_eq!(completion_text(&agg), "ready");
         Ok(())
     }
 

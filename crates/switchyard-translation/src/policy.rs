@@ -82,6 +82,13 @@ pub struct TranslationPolicy {
     pub deterministic_ids: DeterministicIdPolicy,
     pub preservation: PreservationPolicy,
     pub target_capabilities: TargetCapabilities,
+    /// The upstream embeds its reasoning in the message text behind this marker.
+    ///
+    /// Set per target, because it is a wire property of one provider family rather than a
+    /// global preference: applying it everywhere would mangle a model that legitimately
+    /// writes those tokens as text. `None` leaves response text untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_reasoning: Option<crate::codecs::openai_chat::HostedReasoningMarker>,
 }
 
 impl Default for TranslationPolicy {
@@ -94,6 +101,7 @@ impl Default for TranslationPolicy {
             },
             preservation: PreservationPolicy::InMemory,
             target_capabilities: TargetCapabilities::default(),
+            hosted_reasoning: None,
         }
     }
 }

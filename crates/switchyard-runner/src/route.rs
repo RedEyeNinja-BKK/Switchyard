@@ -609,9 +609,7 @@ impl Route {
         let required = required_tokens(request);
         let mut binding: Option<&'static str> = None;
         for model in &candidates {
-            let Some(facts) = facts.get(model) else {
-                return None;
-            };
+            let facts = facts.get(model)?;
             if let Some(window) = facts.context_window
                 && required > window
             {

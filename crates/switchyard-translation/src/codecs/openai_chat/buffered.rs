@@ -532,12 +532,19 @@ pub(crate) fn role_from_openai(role: Option<&str>, path: &str) -> Result<Role> {
 }
 
 /// Decodes OpenAI-style content into normalized content blocks.
-/// Moves an inline hosted reasoning block out of the visible text.
+/// Moves an inline hosted reasoning block out of the visible text, and discards it.
 ///
 /// Each text block is split with the shared factory, so the buffered path and the streaming
 /// path agree on what a block is. A message that fails the split is an error: emitting the
 /// text unchanged would leak the monologue, and emitting only the part before the failure
 /// would truncate an answer without saying so.
+///
+/// The reasoning is dropped rather than rebuilt as a `Reasoning` block. A reasoning block is
+/// not private: the chat encoder writes it back out as `reasoning_content`, so carrying the
+/// monologue there would hand it to the caller through a second field while the answer looked
+/// clean. Text the model marked as its own thinking is internal to the target that declared
+/// the marker, and the provider's own `reasoning_content` field is the only reasoning this
+/// translation passes through.
 fn split_hosted_reasoning_blocks(
     marker: crate::codecs::openai_chat::HostedReasoningMarker,
     content: Vec<ContentBlock>,
@@ -548,13 +555,6 @@ fn split_hosted_reasoning_blocks(
         match block {
             ContentBlock::Text { text } => {
                 let split = crate::codecs::openai_chat::split_hosted_reasoning(&text)?;
-                if let Some(reasoning) = split.reasoning {
-                    rebuilt.push(ContentBlock::Reasoning {
-                        text: reasoning.to_string(),
-                        signature: None,
-                        details: Vec::new(),
-                    });
-                }
                 if !split.answer.is_empty() {
                     rebuilt.push(ContentBlock::Text {
                         text: split.answer.to_string(),

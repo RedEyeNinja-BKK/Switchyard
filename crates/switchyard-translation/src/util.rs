@@ -287,13 +287,20 @@ pub fn capture_request_preservation(
 }
 
 /// Captures an exact source response body according to preservation policy.
+///
+/// A target that declares a hosted reasoning marker is not eligible: this body is what the
+/// upstream wrote before the marker was split out of it, so any exact replay of it would hand
+/// the caller the monologue the split exists to remove. Refusing to capture is what makes the
+/// removal airtight - a gate at the replay site only covers the encoders that remember to ask,
+/// and the serving layer re-encodes in the caller's format where the target's policy is not in
+/// scope at all.
 pub fn capture_response_preservation(
     format: impl Into<FormatId>,
     body: &Value,
     policy: &TranslationPolicy,
 ) -> PreservationMetadata {
     let mut preservation = extract_preservation(body);
-    if policy.preservation != PreservationPolicy::Disabled {
+    if policy.preservation != PreservationPolicy::Disabled && policy.hosted_reasoning.is_none() {
         preservation.responses.insert(format.into(), body.clone());
     }
     preservation

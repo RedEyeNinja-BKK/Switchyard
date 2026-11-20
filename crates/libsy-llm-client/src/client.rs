@@ -2532,13 +2532,22 @@ mod tests {
         let agg = response.llm_response.into_agg().await?;
 
         assert_eq!(completion_text(&agg), "ready");
+        // Not merely out of the answer: the monologue must not survive in ANY block, because a
+        // reasoning block is re-encoded as `reasoning_content` and would reach the caller
+        // through that second field.
         let output = agg.first_output().expect("one output item");
         assert!(
-            output
+            !output
                 .content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::Reasoning { .. })),
-            "the block must survive as reasoning, not be discarded"
+            "a declared hosted marker must not leave a reasoning block: {:?}",
+            output.content
+        );
+        assert!(
+            !format!("{:?}", output.content).contains("plan"),
+            "the thought must not survive in any block: {:?}",
+            output.content
         );
         Ok(())
     }
@@ -2571,6 +2580,10 @@ mod tests {
         let agg = response.llm_response.into_agg().await?;
 
         assert_eq!(completion_text(&agg), "ready");
+        assert!(
+            !format!("{:?}", agg.first_output().map(|o| &o.content)).contains("plan"),
+            "the streamed thought must not survive in any block"
+        );
         Ok(())
     }
 

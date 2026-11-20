@@ -138,14 +138,18 @@ fn decode_openai_chat_stream(
                     // text on the wire, and a caller that already displayed it cannot be
                     // un-shown, so the filter decides before anything is pushed.
                     match state.thought_filter.push(text) {
-                        Ok(events) => out.extend(events.into_iter().map(|event| match event {
-                            crate::codecs::openai_chat::Filtered::Reasoning(text) => {
-                                LlmResponseChunk::ReasoningDelta { index: 0, text }
-                            }
-                            crate::codecs::openai_chat::Filtered::Answer(text) => {
-                                LlmResponseChunk::TextDelta { index: 0, text }
-                            }
-                        })),
+                        // The thought is dropped, not forwarded as a reasoning delta: the
+                        // chat encoder writes reasoning deltas out as `reasoning_content`, so
+                        // forwarding them would leak the monologue through the second field
+                        // after the answer channel had been cleaned.
+                        Ok(events) => {
+                            out.extend(events.into_iter().filter_map(|event| match event {
+                                crate::codecs::openai_chat::Filtered::Reasoning(_) => None,
+                                crate::codecs::openai_chat::Filtered::Answer(text) => {
+                                    Some(LlmResponseChunk::TextDelta { index: 0, text })
+                                }
+                            }))
+                        }
                         Err(leak) => out.push(LlmResponseChunk::StreamError {
                             message: format!(
                                 "upstream streamed a malformed inline reasoning block: {leak}"

@@ -7,6 +7,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use libsy::{Algorithm, LibsyError, RoutingOutcome, RuntimeModels};
+use serde::Deserialize;
 use serde_json::Value;
 use switchyard_llm_client::{
     AuxiliaryOperation, ClientRouter, RunObservation, RunObserver, TranslatingLlmClient,
@@ -17,6 +18,31 @@ use thiserror::Error;
 use crate::DecisionTarget;
 use crate::config::RouteReasoningPolicy;
 
+/// Where a route's work is actually performed.
+///
+/// Derived from the `billing` declaration of the `llm_client` each target resolves
+/// through, never from a model name, a slug or a base URL. A route served by the
+/// operator's own deployment and one served by an external provider answer differently
+/// to a caller asking "does this leave the building?", and that is a fact configuration
+/// already holds once a deployment states it.
+///
+/// `Unknown` is a real answer, not a placeholder: a deployment that has not declared how a
+/// client is billed cannot have its locality inferred, and claiming one would put a guess
+/// on a surface where a reader cannot tell it from a fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Locality {
+    /// Every leg is an operator-hosted deployment: no external provider charge.
+    Local,
+    /// Every leg is served by an external provider.
+    Upstream,
+    /// Legs disagree: some operator-hosted, some external.
+    Mixed,
+    /// At least one leg's billing is undeclared. Never inferred.
+    #[default]
+    Unknown,
+}
+
 /// Capabilities declared for one route.
 ///
 /// `GET /v1/models` includes `context_window`, `tool_calling`, `vision` and `video` in
@@ -26,6 +52,12 @@ use crate::config::RouteReasoningPolicy;
 ///
 /// `video` is the exception to "absent means permitted": video is admitted only when a
 /// route declares it, because no deployment carried video before the field existed.
+///
+/// `video_carrier` is the second axis of the same fact. An endpoint that can read inline
+/// media but cannot fetch a remote URL is video-capable for one carrier only, and a flag
+/// that cannot tell them apart either over-claims (admitting a remote URL into a late
+/// provider 404) or under-claims (refusing inline media the endpoint does serve). It is
+/// `None` on an undeclared route, where the boolean already refuses everything.
 #[derive(Clone, Copy, Default)]
 pub struct ModelCapabilities {
     pub context_window: Option<u32>,
@@ -40,6 +72,126 @@ pub struct ModelCapabilities {
     /// video-capable, and the providers that serve the two are not the same. Absent means
     /// "cannot accept video".
     pub video: Option<bool>,
+    /// Which video carriers the routed model accepts, when video is declared.
+    ///
+    /// Only meaningful alongside `video = Some(true)`; a target declaring video must state
+    /// its carriers, because "can read video" without saying which carrier leaves the same
+    /// ambiguity the boolean has.
+    pub video_carrier: Option<MediaCarrier>,
+    /// Which image carriers the routed model accepts, when vision is declared.
+    ///
+    /// The image counterpart, and optional for the historical reason `vision` is: a
+    /// deployment that predates carriers declares images and means both.
+    pub image_carrier: Option<MediaCarrier>,
+}
+
+/// The two ways media reaches a provider, which are not the same capability.
+///
+/// Measured on the live free/paid OpenRouter endpoints: `nvidia/nemotron-3.5-super-vl:free`
+/// answers 200 for an inline `data:` image or video and 404 for a remote URL of either,
+/// with `No endpoints found that support video URLs`. The model lists video among its input
+/// modalities either way, so a modality-only declaration cannot express the difference.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaCarrier {
+    /// Inline bytes in the request: a `data:` URL or base64 payload.
+    Inline,
+    /// The provider fetches the media itself from a URL.
+    Remote,
+    /// Both carriers are served.
+    #[default]
+    Both,
+}
+
+impl MediaCarrier {
+    /// Whether this carrier set admits a request carrying `remote` media.
+    pub const fn admits_remote(self) -> bool {
+        matches!(self, Self::Remote | Self::Both)
+    }
+
+    /// Whether this carrier set admits a request carrying inline media.
+    pub const fn admits_inline(self) -> bool {
+        matches!(self, Self::Inline | Self::Both)
+    }
+
+    /// The individual carriers this set covers, so a caller can require each one.
+    pub const fn carriers(self) -> &'static [Self] {
+        match self {
+            Self::Inline => &[Self::Inline],
+            Self::Remote => &[Self::Remote],
+            Self::Both => &[Self::Inline, Self::Remote],
+        }
+    }
+
+    /// Whether this carrier set covers `carrier`.
+    ///
+    /// Distinct from equality on purpose: asking whether a set *includes* a carrier is the
+    /// question a route's promise asks of its targets, and `Both` is the only set that
+    /// includes `Both`.
+    pub const fn includes(self, carrier: Self) -> bool {
+        match carrier {
+            Self::Both => matches!(self, Self::Both),
+            Self::Inline => self.admits_inline(),
+            Self::Remote => self.admits_remote(),
+        }
+    }
+}
+
+impl MediaCarrier {
+    /// The carrier a request is checked against when the config states none.
+    ///
+    /// A route or target that predates carriers declared a medium and meant both, so the
+    /// default must be the permissive end rather than an empty set.
+    pub const DEFAULT: Self = Self::Both;
+
+    /// The carriers covered by either set.
+    ///
+    /// This is the union a composite needs: it can serve a request only through one of its
+    /// children, so what it can promise is what the children between them accept. `Inline`
+    /// and `Remote` together are `Both`, and `Both` absorbs the other two.
+    pub const fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Both, _) | (_, Self::Both) => Self::Both,
+            (Self::Inline, Self::Remote) | (Self::Remote, Self::Inline) => Self::Both,
+            (carrier, _) => carrier,
+        }
+    }
+}
+
+/// The video carrier a target's capability facts describe, or `None` when it serves neither.
+///
+/// `None` is not "unstated": it is the case where the target refuses video, expressed either
+/// as `no_video` or as both carrier facts at once. Returning a carrier there would name a
+/// transport the target cannot use, and the caller's video boolean already refuses it.
+fn carrier_from_facts(facts: &switchyard_llm_client::CapabilityFacts) -> Option<MediaCarrier> {
+    if facts.no_video {
+        return None;
+    }
+    combine_carrier_facts(facts.no_remote_video, facts.no_inline_video)
+}
+
+/// The image carrier a target's capability facts describe, or `None` when it serves neither.
+///
+/// Mirrors `carrier_from_facts` for the other medium. Without this the per-candidate filter
+/// would read an image carrier of "both" for every target, and a route that advertises both
+/// would send a remote image to an inline-only candidate.
+fn image_carrier_from_facts(
+    facts: &switchyard_llm_client::CapabilityFacts,
+) -> Option<MediaCarrier> {
+    if facts.no_vision {
+        return None;
+    }
+    combine_carrier_facts(facts.no_remote_image, facts.no_inline_image)
+}
+
+/// Turn the two refusal facts into the carrier set they describe.
+fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrier> {
+    match (no_remote, no_inline) {
+        (false, false) => Some(MediaCarrier::Both),
+        (false, true) => Some(MediaCarrier::Remote),
+        (true, false) => Some(MediaCarrier::Inline),
+        (true, true) => None,
+    }
 }
 
 /// Caller credential family required by a forwarded-auth route.
@@ -103,6 +255,23 @@ pub enum RunnerError {
         model: String,
         capability: &'static str,
     },
+    /// Every candidate this route could use is one that may only receive cleared payloads,
+    /// and the pre-egress gate refused this request.
+    ///
+    /// The request is well-formed; the payload is not cleared for a provider this
+    /// deployment sends nothing uncleared to. Kept separate from
+    /// [`Self::UnsupportedCapability`] because the caller fixes it by clearing the
+    /// request, and separate from [`Self::Configuration`] because the deployment is
+    /// behaving exactly as declared. Reported as a 4xx: no retry of the same bytes can
+    /// change the answer.
+    #[error(
+        "route {route} refused the payload: {codes}",
+        codes = refusals.iter().map(|refusal| refusal.as_str()).collect::<Vec<_>>().join(", ")
+    )]
+    PrivacyRefused {
+        route: String,
+        refusals: Vec<crate::egress::Refusal>,
+    },
     #[error("caller format is incompatible with {} credentials", .0.as_str())]
     IncompatibleCallerFormat(CallerAuthKind),
     #[error("route has no compatible target for the auxiliary operation")]
@@ -158,10 +327,19 @@ pub struct Route {
     escalation_target: Option<ModelId>,
     caller_auth: Option<CallerAuthKind>,
     capabilities: ModelCapabilities,
+    /// Where this route's work is performed, resolved once at load from each target's
+    /// `llm_client` billing declaration.
+    locality: Locality,
     anthropic_auxiliary_target: Option<AuxiliaryTarget>,
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
     models: Arc<RuntimeModels>,
+    /// The secret that authenticates a caller's permission to publish a payload.
+    ///
+    /// Carried on the route rather than read from the environment at request time, so the
+    /// decision uses exactly the key the deployment was loaded with. Defaults to a key
+    /// that authenticates nothing.
+    clearance_key: Arc<crate::egress::ClearanceKey>,
     /// The `llm_client` credential each target model id is served by, resolved at load.
     ///
     /// A whole-route composite needs this to decide whether a child that just reported
@@ -201,12 +379,23 @@ impl Route {
             escalation_target,
             caller_auth,
             capabilities,
+            locality: Locality::Unknown,
             anthropic_auxiliary_target,
             responses_auxiliary_target,
             decision_targets,
             models: Arc::new(models),
+            clearance_key: Arc::new(crate::egress::ClearanceKey::refusing()),
             target_credentials: std::collections::HashMap::new(),
         }
+    }
+
+    /// Records the key used to authenticate a caller's privacy clearance.
+    ///
+    /// Set once at load from `[privacy] clearance_key_env`. A route left without one
+    /// refuses every gated payload rather than admitting it.
+    pub fn with_clearance_key(mut self, key: Arc<crate::egress::ClearanceKey>) -> Self {
+        self.clearance_key = key;
+        self
     }
 
     /// Records the `llm_client` credential serving each target model id.
@@ -283,6 +472,17 @@ impl Route {
         self.capabilities
     }
 
+    /// Records where this route's work is performed, resolved from configuration.
+    pub fn with_locality(mut self, locality: Locality) -> Self {
+        self.locality = locality;
+        self
+    }
+
+    /// Returns where this route's work is performed.
+    pub fn locality(&self) -> Locality {
+        self.locality
+    }
+
     /// Returns the forwarded caller credential family.
     pub fn caller_auth(&self) -> Option<CallerAuthKind> {
         self.caller_auth
@@ -332,12 +532,29 @@ impl Route {
         // so this adds no second fallback engine and issues no request to a target that
         // cannot answer it.
         let facts = self.clients.target_capabilities().clone();
+        // A target declaring `requires_public_payload` may only receive a payload that
+        // carries a current, well-formed clearance and passes local inspection. Decided
+        // here, once, and only when some candidate actually declares the requirement, so
+        // an ordinary route walks no payload. The result is per MODEL rather than per
+        // route, which is what makes a directly addressed gated leaf pass through the same
+        // gate as a composite child: it is the same filter either way.
+        let admission = facts
+            .values()
+            .any(|facts| facts.requires_public_payload)
+            .then(|| crate::egress::evaluate(&request, &self.clearance_key));
+        let refused = admission.as_ref().filter(|admission| !admission.allowed());
         let raw = request
             .raw_request
             .clone()
             .unwrap_or(serde_json::Value::Null);
         let estimated_input_tokens = crate::request_fit::estimate_input_tokens(&raw);
         let eligibility = |model: &switchyard_protocol::ModelId| {
+            if let Some(facts) = facts.get(model)
+                && facts.requires_public_payload
+                && refused.is_some()
+            {
+                return false;
+            }
             match facts.get(model) {
                 Some(facts) => {
                     // An explicit `false` is a refusal; `None` would mean "undeclared",
@@ -349,6 +566,11 @@ impl Route {
                         // Carried as a concrete boolean like the other facts, so an
                         // undeclared target is treated as video-incapable here.
                         video: Some(!facts.no_video),
+                        // A target is video-capable at all only if some carrier survives;
+                        // otherwise the boolean above already refuses it and naming a
+                        // carrier would read as a capability it does not have.
+                        video_carrier: carrier_from_facts(facts),
+                        image_carrier: image_carrier_from_facts(facts),
                         ..crate::ModelCapabilities::default()
                     };
                     crate::request_fit::unsupported_capability(
@@ -408,6 +630,16 @@ impl Route {
                     .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Disabled),
             };
         if models.is_empty() {
+            // A refusal the gate caused is reported as itself, not as a capability the
+            // request lacks: the caller's correction is different (clear the request,
+            // rather than change what it asks for), and the gate's reasons are the only
+            // actionable description of why the bytes could not leave.
+            if let Some(admission) = refused {
+                return Err(RunnerError::PrivacyRefused {
+                    route: self.algorithm.name().to_string(),
+                    refusals: admission.refusals().to_vec(),
+                });
+            }
             // Nothing in this route can serve the request, which is the caller's request
             // rather than a deployment fault. The skipped targets get no provider call.
             // Name what the request needs, not what the route happens to lack: the route's
@@ -417,10 +649,15 @@ impl Route {
                 .target_capabilities()
                 .iter()
                 .find_map(|(_model, facts)| {
+                    // Mirror the eligibility predicate's reading of these facts, or the
+                    // refusal would name a different capability than the one that
+                    // actually excluded the candidate.
                     let capabilities = crate::ModelCapabilities {
                         vision: Some(!facts.no_vision),
                         tool_calling: Some(!facts.no_tool_calling),
                         video: Some(!facts.no_video),
+                        video_carrier: carrier_from_facts(facts),
+                        image_carrier: image_carrier_from_facts(facts),
                         ..crate::ModelCapabilities::default()
                     };
                     crate::request_fit::unsupported_capability(
@@ -547,5 +784,44 @@ mod context_policy_tests {
                 "the route keeps the policy it was configured with"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::MediaCarrier;
+
+    /// A composite can only promise what its children between them accept, so the union
+    /// states exactly that: `Both` absorbs either carrier and the two singletons meet in
+    /// `Both`. Nothing narrower may come out of a union.
+    #[test]
+    fn the_union_is_the_least_set_covering_both() {
+        use MediaCarrier::{Both, Inline, Remote};
+        for (left, right, expected) in [
+            (Inline, Inline, Inline),
+            (Remote, Remote, Remote),
+            (Both, Both, Both),
+            (Inline, Remote, Both),
+            (Remote, Inline, Both),
+            (Both, Inline, Both),
+            (Inline, Both, Both),
+            (Remote, Both, Both),
+            (Both, Remote, Both),
+        ] {
+            assert_eq!(left.union(right), expected, "{left:?} u {right:?}");
+            // Union is commutative in effect as well as in claim.
+            assert_eq!(right.union(left), expected, "{right:?} u {left:?}");
+        }
+    }
+
+    /// `includes` is the question a composite's promise asks of a child, and it must be
+    /// narrower than equality: `Both` is included only by `Both`, and a singleton is
+    /// included by anything that admits it.
+    #[test]
+    fn includes_is_not_equality() {
+        use MediaCarrier::{Both, Inline, Remote};
+        assert!(Both.includes(Inline) && Both.includes(Remote) && Both.includes(Both));
+        assert!(Inline.includes(Inline) && !Inline.includes(Remote) && !Inline.includes(Both));
+        assert!(Remote.includes(Remote) && !Remote.includes(Inline) && !Remote.includes(Both));
     }
 }

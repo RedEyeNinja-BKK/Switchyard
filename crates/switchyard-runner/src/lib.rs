@@ -10,6 +10,7 @@ mod config;
 pub mod context_shadow;
 pub mod decision_executor;
 pub mod decision_transport;
+pub mod egress;
 pub mod facts;
 mod failure;
 mod provider_key_redactor;
@@ -21,14 +22,16 @@ pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, CategoryModelConfig, ClassifierMode,
     ClassifierPolicyConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
-pub use config::BillingKind;
 pub use config::RouteReasoningPolicy;
+pub use config::{BillingKind, ClientLocality, CompositeCrossPolicy};
+pub use egress::{Admission, CLEARANCE_HEADER, Refusal};
 pub use facts::{ClientFacts, DeploymentFacts, RouteFacts, TargetFacts};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 // Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.
 pub use libsy::RuntimeModels;
 pub use provider_key_redactor::ProviderKeyRedactor;
 pub use route::{
-    AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
+    AuxiliaryTarget, CallerAuthKind, Locality, MediaCarrier, ModelCapabilities, Route, RunOutput,
+    RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};

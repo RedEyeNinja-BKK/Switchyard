@@ -667,10 +667,22 @@ impl CredentialBlock {
             return false;
         }
         match self.kind {
-            CredentialBlockKind::FreeQuota => target.ends_with(":free"),
+            CredentialBlockKind::FreeQuota => is_free_scope(target),
             CredentialBlockKind::WholeQuota | CredentialBlockKind::Unauthorized => true,
         }
     }
+}
+
+/// Whether a slug draws on the credential's free-model allowance.
+///
+/// OpenRouter scopes this allowance to free model variants, spelled with a `:free`
+/// suffix, and its Free Models Router (`openrouter/free`) selects among those same
+/// variants, so it spends the same allowance without carrying the suffix. Treating the
+/// router as paid would send it one guaranteed-rejected call on every request after the
+/// allowance is gone, which can never succeed because the allowance is account-wide
+/// rather than per model.
+fn is_free_scope(target: &str) -> bool {
+    target.ends_with(":free") || target == "openrouter/free"
 }
 
 /// Reads the credential-level block a failure carries, if any.
@@ -762,6 +774,17 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
     match source {
         LlmClientError::ContextWindowExceeded { .. } => FailureClass::ContextWindow,
         LlmClientError::Transport { .. } => FailureClass::Transport,
+        // A spent per-target daily allowance says this leg cannot serve until the
+        // provider day rolls over, while every other target keeps its own budget. That
+        // is "unavailable", not `AccountQuota`: the latter condemns the whole credential
+        // and would wrongly stop a composite from crossing to a child on another one.
+        LlmClientError::DailyRequestAllowanceExhausted { .. }
+        | LlmClientError::DailyRequestAllowanceUnavailable { .. } => {
+            FailureClass::TemporarilyUnavailable
+        }
+        // The payload, not the leg, is the problem: nothing about another candidate makes
+        // content that must not leave this deployment admissible.
+        LlmClientError::PayloadNotCleared { .. } => FailureClass::Request,
         // A per-attempt expiry is a deadline that elapsed, so a whole-route
         // composite treats it exactly like an upstream 408.
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
@@ -815,6 +838,17 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     // only spends another request against a cap already known to be at zero.
     if is_account_wide_quota_exhausted(error) {
         return None;
+    }
+    // A target's OWN daily request allowance is a different fact from the account-wide
+    // cap above: the budget is per model within one project, so the other candidates on
+    // this deployment still have their own. The next candidate is therefore worth
+    // trying, and this leg costs nothing until the provider day rolls over.
+    if matches!(
+        source,
+        LlmClientError::DailyRequestAllowanceExhausted { .. }
+            | LlmClientError::DailyRequestAllowanceUnavailable { .. }
+    ) {
+        return Some(RoutingFallbackReason::Unavailable);
     }
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
@@ -1031,8 +1065,35 @@ pub struct CapabilityFacts {
     /// Unlike `no_vision`, this is set for a target that says nothing: video is never
     /// inferred from image support, so "undeclared" and "cannot" are the same fact here.
     pub no_video: bool,
+    /// The backing deployment cannot accept a video the provider must FETCH.
+    ///
+    /// Separate from `no_video`: an endpoint can read inline bytes and still refuse a URL,
+    /// which is what the free Nemotron endpoint does (200 inline, 404 for `video_url`). A
+    /// candidate is dropped when the request's carrier is the one it cannot serve.
+    pub no_remote_video: bool,
+    /// The backing deployment cannot accept video supplied inline.
+    ///
+    /// The converse of `no_remote_video`. Both default to `false`, so a deployment built
+    /// before carriers existed admits either, which is the behaviour it already had.
+    pub no_inline_video: bool,
+    /// The backing deployment cannot accept an image the provider must FETCH.
+    ///
+    /// The image counterpart of `no_remote_video`, and the same measured distinction: an
+    /// endpoint can read inline bytes and 404 a remote URL for images as well as video.
+    pub no_remote_image: bool,
+    /// The backing deployment cannot accept an image supplied inline.
+    pub no_inline_image: bool,
     /// The backing deployment cannot accept tool definitions or calls.
     pub no_tool_calling: bool,
+    /// The backing deployment may only receive payloads a caller has cleared for it.
+    ///
+    /// A provider property, not a request-fit capability, kept beside them because this is
+    /// the one per-target fact set the pre-dispatch filter reads. A free provider tier that
+    /// uses submitted content to improve its products makes every payload an egress event,
+    /// so a target behind it is ineligible unless the request carries a clearance that this
+    /// deployment accepts. Defaults to `false`: only a deployment that states the
+    /// requirement gets the gate, so every existing target keeps the behaviour it had.
+    pub requires_public_payload: bool,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.
@@ -1449,6 +1510,44 @@ mod tests {
     use crate::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
     use switchyard_protocol::Category;
 
+    /// The free-model allowance covers the provider's free-model ROUTER too.
+    ///
+    /// The router spends the same account-wide allowance but its slug carries no `:free`
+    /// suffix, so a suffix test alone would send it one guaranteed-rejected call after the
+    /// allowance is gone. A paid slug on the same credential stays unblocked.
+    #[test]
+    fn a_free_quota_block_covers_the_free_models_router_but_not_a_paid_slug() {
+        let block = CredentialBlock {
+            credential: "openrouter_stephen".to_string(),
+            kind: CredentialBlockKind::FreeQuota,
+            target: "baidu/ernie-5.5-flash-preview:free".to_string(),
+        };
+        assert!(block.blocks("openrouter_stephen", "inclusionai/ling-3.2-flash:free"));
+        assert!(block.blocks("openrouter_stephen", "openrouter/free"));
+        assert!(!block.blocks("openrouter_stephen", "deepseek/deepseek-v4.1:flash"));
+        assert!(
+            !block.blocks("openrouter", "openrouter/free"),
+            "another credential shares neither the allowance nor the block"
+        );
+    }
+
+    /// A whole-credential or rejected-key block stops every slug, including the router.
+    #[test]
+    fn a_whole_credential_block_covers_every_slug() {
+        for kind in [
+            CredentialBlockKind::WholeQuota,
+            CredentialBlockKind::Unauthorized,
+        ] {
+            let block = CredentialBlock {
+                credential: "openrouter_stephen".to_string(),
+                kind,
+                target: "openrouter/free".to_string(),
+            };
+            assert!(block.blocks("openrouter_stephen", "openrouter/free"));
+            assert!(block.blocks("openrouter_stephen", "deepseek/deepseek-v4.1:flash"));
+        }
+    }
+
     struct CandidateAlgorithm {}
 
     struct AnsweredAlgorithm {
@@ -1787,6 +1886,8 @@ mod tests {
                         attempt_timeout: None,
                         stream_idle_timeout: None,
                         requires_list_input: false,
+                        allowance: None,
+                        requires_public_payload: false,
                     };
                     let backend = if responses {
                         Backend::OpenAiResponses(config)
@@ -1940,6 +2041,8 @@ mod tests {
                     attempt_timeout: None,
                     stream_idle_timeout: None,
                     requires_list_input: false,
+                    allowance: None,
+                    requires_public_payload: false,
                 }),
                 None,
             )])
@@ -2892,6 +2995,8 @@ mod tests {
                     attempt_timeout: None,
                     stream_idle_timeout: None,
                     requires_list_input: false,
+                    allowance: None,
+                    requires_public_payload: false,
                 })
             };
             TranslatingLlmClient::new(&[
@@ -2983,6 +3088,8 @@ mod tests {
                 attempt_timeout: None,
                 stream_idle_timeout: None,
                 requires_list_input: false,
+                allowance: None,
+                requires_public_payload: false,
             })
         };
         let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
@@ -3146,6 +3253,8 @@ mod tests {
                 attempt_timeout: None,
                 stream_idle_timeout: None,
                 requires_list_input: false,
+                allowance: None,
+                requires_public_payload: false,
             })
         };
         let client = Arc::new(

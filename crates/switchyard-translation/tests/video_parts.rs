@@ -80,10 +80,12 @@ fn responses_inline_video_keeps_its_bytes() -> TestResult {
         )?
         .body;
 
+    // The bytes survive, but the spelling is the one the provider accepts: an
+    // `input_video` part whose `video_url` is the `data:` URI carrying those bytes. The
+    // object form this test used to assert is answered with 400 invalid_union.
     let parts = content_parts(&responses);
     assert_eq!(parts[0]["type"], "input_video");
-    assert_eq!(parts[0]["video"]["media_type"], "video/mp4");
-    assert_eq!(parts[0]["video"]["data"], "AAAA");
+    assert_eq!(parts[0]["video_url"], "data:video/mp4;base64,AAAA");
     Ok(())
 }
 
@@ -170,6 +172,72 @@ fn an_unrecognized_video_part_is_not_flattened_to_text() -> TestResult {
     assert!(
         parts.iter().all(|part| part["type"] != "input_text"),
         "an opaque video part must not become text: {parts:?}"
+    );
+    Ok(())
+}
+
+// The provider's Responses endpoint accepts video only as `input_video` with a string
+// `video_url`; measured against the live endpoint, the `{video: {data, media_type}}`
+// object shape is rejected with 400 (invalid_union, expected string). Inline bytes must
+// therefore cross the wire as the `data:` URI that carries the same bytes.
+#[test]
+fn chat_inline_video_becomes_a_responses_data_uri() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = translating_policy();
+    let chat = json!({
+        "model": "smartfree",
+        "messages": [{"role": "user", "content": [
+            {"type": "video_url", "video": {"media_type": "video/mp4", "data": "AAAA"}}
+        ]}]
+    });
+
+    let responses = engine
+        .translate_request(WireFormat::OpenAiChat, WireFormat::OpenAiResponses, &chat, &policy)?
+        .body;
+
+    let parts = content_parts(&responses);
+    assert_eq!(parts[0]["type"], "input_video");
+    assert_eq!(parts[0]["video_url"], "data:video/mp4;base64,AAAA");
+    assert!(
+        parts[0].get("video").is_none(),
+        "the object spelling is what the provider rejects"
+    );
+    Ok(())
+}
+
+// Without a media type there is no faithful `data:` URI. Inventing one would mislabel the
+// bytes, so the part is reported as text with a diagnostic rather than sent malformed.
+#[test]
+fn inline_video_without_a_media_type_is_reported_not_invented() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = translating_policy();
+    let chat = json!({
+        "model": "smartfree",
+        "messages": [{"role": "user", "content": [
+            {"type": "video_url", "video": {"data": "AAAA"}}
+        ]}]
+    });
+
+    let translated = engine.translate_request(
+        WireFormat::OpenAiChat,
+        WireFormat::OpenAiResponses,
+        &chat,
+        &policy,
+    )?;
+
+    let parts = content_parts(&translated.body);
+    assert_eq!(parts[0]["type"], "input_text");
+    assert!(
+        parts[0]["text"].as_str().unwrap_or_default().contains("4 bytes"),
+        "the fallback must at least say what was dropped: {}",
+        parts[0]
+    );
+    assert!(
+        translated
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.contains("lossy")),
+        "dropping inline video is a lossy conversion and must be reported"
     );
     Ok(())
 }

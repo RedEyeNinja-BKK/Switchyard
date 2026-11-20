@@ -16,15 +16,18 @@
 //! answer call from the routing outcome when needed. A host that just wants the answer does not
 //! have to drive the step stream itself.
 
+pub mod allowance;
 pub mod backend;
 pub mod client;
 pub mod error;
 pub mod metrics;
 mod observability;
 mod observation;
+pub mod privacy;
 pub mod raw;
 pub mod run;
 
+pub use allowance::{DailyRequestAllowance, ReserveError, allowance_path};
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};

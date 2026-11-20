@@ -67,6 +67,50 @@ pub enum LlmClientError {
     #[error("backend temporarily unavailable")]
     TemporarilyUnavailable,
 
+    /// The target's own daily request allowance is spent for the current provider day.
+    ///
+    /// Distinct from an account-wide cap: a per-project, per-model request budget (the
+    /// Google free tier publishes one per model) leaves every other candidate on the
+    /// deployment servable, so the request may advance to the next leg. It must not be
+    /// retried — the allowance resets on the provider's day boundary, not in a moment.
+    #[error(
+        "daily request allowance for {model} is spent ({limit} per provider day); it resets at the next provider day"
+    )]
+    DailyRequestAllowanceExhausted {
+        /// Target whose own allowance is spent.
+        model: ModelId,
+        /// The exhausted daily limit.
+        limit: u64,
+    },
+
+    /// The target's daily request allowance is configured but its accounting state is
+    /// unusable, so the request is refused rather than spent unaccounted.
+    ///
+    /// Fail-closed on purpose: sending anyway would overrun a hard daily cap whose whole
+    /// point is to be enforced, and the deployment still has other candidates to serve
+    /// the request.
+    #[error("daily request allowance for {model} cannot be accounted: {reason}")]
+    DailyRequestAllowanceUnavailable {
+        /// Target whose accounting failed.
+        model: ModelId,
+        /// Why the state could not be read or written.
+        reason: String,
+    },
+
+    /// The assembled payload contains content that must not leave the deployment.
+    ///
+    /// Raised at the last possible moment - over the exact JSON body about to be sent -
+    /// for a provider that may only receive a payload cleared as public. It is terminal
+    /// for the route rather than a fallback reason: another candidate would be handed the
+    /// same payload, so advancing would leak what this check just found.
+    #[error("payload for {model} carries content that must not leave this deployment: {codes}")]
+    PayloadNotCleared {
+        /// Target the payload was assembled for.
+        model: ModelId,
+        /// The finding codes, comma separated, without the matched values.
+        codes: String,
+    },
+
     /// The upstream could not be reached or the request could not be sent.
     #[error("upstream transport error: {source}")]
     Transport {

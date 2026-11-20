@@ -243,6 +243,7 @@ fn escalating_route(
             requires_public_payload: false,
             context_window: None,
             max_input_tokens: None,
+            ..switchyard_llm_client::CapabilityFacts::default()
         },
     )]));
     Route::new(

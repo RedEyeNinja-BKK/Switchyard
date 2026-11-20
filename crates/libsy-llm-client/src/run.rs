@@ -1153,6 +1153,21 @@ pub struct CapabilityFacts {
     pub no_inline_image: bool,
     /// The backing deployment cannot accept tool definitions or calls.
     pub no_tool_calling: bool,
+    /// The backing deployment cannot carry a caller's explicit reasoning control.
+    ///
+    /// Measured per family rather than inferred: a hosted free model can think natively and
+    /// still reject the control that asks it not to (Google's hosted Gemma answers HTTP 400
+    /// to `reasoning_effort: none`). A request that carries such a control is not sent to a
+    /// target that states this, because forwarding it would either fail the call or silently
+    /// enforce something the deployment never agreed to. Defaults to `false`, so a target
+    /// that states nothing keeps the behaviour it had.
+    pub no_reasoning_control: bool,
+    /// Whether the provider charges nothing for a request here within a declared allowance.
+    ///
+    /// A selection fact, not an economics one: it decides that a paid request may never be
+    /// chosen ahead of an eligible free one. Defaults to `false`, which is the conservative
+    /// answer - an undeclared target is never promoted above a target that states it is free.
+    pub free_tier: bool,
     /// The backing deployment may only receive payloads a caller has cleared for it.
     ///
     /// A provider property, not a request-fit capability, kept beside them because this is

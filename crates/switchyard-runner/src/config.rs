@@ -663,7 +663,10 @@ impl DeploymentConfig {
         }
 
         let mut provider_api_keys = Vec::new();
-        let clients = self.build_clients(&mut provider_api_keys)?;
+        // Built once and shared: the dispatch gate reserves against these counters and
+        // selection reads the same remainder, so one budget has one source of truth.
+        let allowances = self.build_allowances()?;
+        let clients = self.build_clients(&mut provider_api_keys, &allowances)?;
         capability::CapabilityDeployment {
             clients: self.capability_clients.clone(),
             capabilities: self.capabilities.clone(),
@@ -703,6 +706,11 @@ impl DeploymentConfig {
         }
         let lane_composition = self.resolve_decision_lane_composition(&lane_handles)?;
         let lane_identity = self.default_decision_lane.clone();
+        // One evidence set for the whole deployment, shared by every measured route. A
+        // physical model behaves the same whichever alias named it, so a request served by
+        // one route is evidence for the others — and a subsidiary route cannot accumulate
+        // observations nobody reads.
+        let measured_selector = crate::selection::MeasuredSelector::new();
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             // Before the unknown-target sweep below, so a malformed candidate list is
@@ -873,13 +881,31 @@ impl DeploymentConfig {
             )
             .with_target_credentials(target_credentials(config, &self.targets))
             .with_locality(route_locality(config, &self.targets, &self.llm_clients))
-            .with_clearance_key(clearance_key.clone());
-            // A route that opted into measured ordering gets its own evidence, so one
-            // route's observations never reorder another's candidates even when the two
-            // share a target.
+            .with_clearance_key(clearance_key.clone())
+            .with_daily_allowances(Arc::new(
+                config
+                    .routing_target_names()
+                    .into_iter()
+                    .filter_map(|name| self.targets.get(name))
+                    .filter_map(|target| {
+                        let group = self
+                            .llm_clients
+                            .get(&target.llm_client)
+                            .and_then(|client| client.quota_group.clone())
+                            .unwrap_or_else(|| target.llm_client.clone());
+                        allowances
+                            .get(&(group, target.id.clone()))
+                            .map(|allowance| (target.id.clone(), Arc::clone(allowance)))
+                    })
+                    .collect::<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>(
+                    ),
+            ));
+            // A measured route ranks candidates only after it has evidence, and shares that
+            // evidence with every other measured route so real work is not isolated to one
+            // alias.
             let route = match config.selection {
                 crate::config::SelectionPolicy::Measured => {
-                    route.with_measured_selection(crate::selection::MeasuredSelector::new())
+                    route.with_measured_selection(Arc::clone(&measured_selector))
                 }
                 crate::config::SelectionPolicy::Declared => route,
             };
@@ -1068,9 +1094,9 @@ impl DeploymentConfig {
     fn build_clients(
         &self,
         provider_api_keys: &mut Vec<String>,
+        allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
     ) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
         // Built before the per-target backends so each one can carry its own budget.
-        let allowances = self.build_allowances()?;
         let mut models_by_client = self
             .llm_clients
             .keys()
@@ -1975,6 +2001,12 @@ impl DeploymentConfig {
                             MediaCarrier::Inline | MediaCarrier::Both
                         ),
                         no_tool_calling: target.tool_calling == Some(false),
+                        // A target states when it cannot carry a caller's reasoning control;
+                        // an undeclared target keeps permitting it.
+                        no_reasoning_control: target.accepts_reasoning_control == Some(false),
+                        // Stated per target so selection can order a free candidate ahead of
+                        // a metered one without inferring cost from a provider name.
+                        free_tier: target.free_tier,
                         // Declared per credential and resolved to the target here, because
                         // the pre-dispatch filter reads target facts. A provider that may
                         // only receive cleared payloads makes every target behind that
@@ -2560,6 +2592,23 @@ struct TargetConfig {
     /// minute — and a 256K prompt is not a 16K request with a long wait.
     #[serde(default)]
     max_input_tokens: Option<u64>,
+    /// Whether the provider charges nothing for a request here inside a declared allowance.
+    ///
+    /// A selection fact, not an economics one. It lets a route rank a free candidate ahead
+    /// of a metered one structurally: no measured latency moves a paid leg in front of an
+    /// eligible free leg. Defaults to `false`, so an undeclared target keeps the order the
+    /// manifest states rather than being silently promoted over a stated-free one.
+    #[serde(default)]
+    free_tier: bool,
+    /// Whether the backing model accepts a caller's explicit reasoning control.
+    ///
+    /// `false` is a measured wire fact, not a policy: Google's hosted Gemma answers HTTP
+    /// 400 to `reasoning_effort`, while the Gemini chat models on the same credential accept
+    /// it. A target that states `false` is skipped for a request carrying any reasoning
+    /// control and stays eligible for one carrying none, so its native reasoning default is
+    /// never overridden. Unset keeps the previous behaviour, where control is permitted.
+    #[serde(default)]
+    accepts_reasoning_control: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

@@ -1,4 +1,10 @@
 {
+  "adaptive_routes": [
+    "smart-nt",
+    "smart_gemini",
+    "smart-gemini-chat",
+    "smart-gemini-bounded"
+  ],
   "added_context_windows": [
     "direct-google-gemini-3.1-flash-lite",
     "direct-google-gemini-3.5-flash-lite",
@@ -6,20 +12,46 @@
     "direct-google-gemma-4-31b-it"
   ],
   "bounded_candidates": [
-    "direct-google-gemma-4-31b-it",
-    "direct-google-gemma-4-26b-a4b-it"
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it"
   ],
-  "candidate_routes": 52,
+  "candidate_routes": 54,
   "candidate_targets": 46,
+  "chat_candidates": [
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite"
+  ],
+  "free_tier_targets": [
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it"
+  ],
   "gemma_targets": 2,
   "live_routes": 49,
-  "live_sha256_prefix_source": "/var/tmp/live-routes-20261121.toml",
+  "live_sha256_prefix_source": "/var/tmp/live-routes.toml",
   "live_targets": 44,
   "notes": [
     "[targets.\"direct-google-gemini-3.5-flash-lite\"]: context_window=1048576 max_input_tokens=250000",
     "[targets.\"direct-google-gemini-3.1-flash-lite\"]: context_window=1048576 max_input_tokens=250000",
     "targets: direct-google-gemma-4-31b-it, direct-google-gemma-4-26b-a4b-it",
-    "routes: direct-google-gemma-4-31b-it, direct-google-gemma-4-26b-a4b-it, smart-gemini-bounded (selection=measured)"
+    "routes: direct-google-gemma-4-31b-it, direct-google-gemma-4-26b-a4b-it, smart-gemini-chat, smart-gemini-bounded (selection=measured)",
+    "smart_gemini: composites -> routes, same pool, now addressable",
+    "smart-nt: four Google legs ahead of the unchanged paid ladder"
+  ],
+  "smart_gemini_candidates": [
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it"
+  ],
+  "smart_nt_candidates": [
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+    "openai-gpt-6-luna-nt",
+    "deepseek-deepseek-flash-nt"
   ],
   "trial_composite_unchanged": true
 }

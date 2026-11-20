@@ -929,3 +929,417 @@ target = "gemma"
         .expect("the inconsistent pair must be refused");
     assert!(error.to_string().contains("max_input_tokens"), "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Adaptive free-pool selection
+// ---------------------------------------------------------------------------
+//
+// These exercise the route, not the selector in isolation: a request is admitted,
+// candidates are filtered, the shared evidence and the deployment facts order the
+// survivors, and the called leg is counted. The point of each test is a decision that
+// cannot be reached by reading the manifest's order.
+
+/// Records what it was asked, including the body the route handed it.
+struct RecordingClient {
+    calls: Arc<AtomicUsize>,
+    bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl RoutedLlmClient for RecordingClient {
+    async fn call(&self, request: Request) -> Result<Response, LlmClientError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.bodies
+            .lock()
+            .expect("test mutex is never poisoned")
+            .push(
+                request
+                    .raw_request
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        Ok(Response {
+            llm_response: LlmResponse::Agg(text_response(
+                request.llm_request.model.clone(),
+                "served",
+            )),
+            metadata: None,
+            upstream_headers: Default::default(),
+        })
+    }
+}
+
+type CallCounters = HashMap<&'static str, Arc<AtomicUsize>>;
+type RecordedBodies = HashMap<&'static str, Arc<std::sync::Mutex<Vec<serde_json::Value>>>>;
+
+/// The deployed free Google pair, in the order the manifest lists them.
+const LITE_DAILY: u64 = 500;
+const GEMMA_DAILY: u64 = 14_400;
+const LITE_INPUT_CEILING: u64 = 250_000;
+const GEMMA_INPUT_CEILING: u64 = 16_000;
+
+fn free_lite() -> CapabilityFacts {
+    CapabilityFacts {
+        free_tier: true,
+        context_window: Some(1_048_576),
+        max_input_tokens: Some(LITE_INPUT_CEILING),
+        ..CapabilityFacts::default()
+    }
+}
+
+fn free_gemma(accepts_reasoning_control: bool) -> CapabilityFacts {
+    CapabilityFacts {
+        free_tier: true,
+        context_window: Some(262_144),
+        max_input_tokens: Some(GEMMA_INPUT_CEILING),
+        no_reasoning_control: !accepts_reasoning_control,
+        ..CapabilityFacts::default()
+    }
+}
+
+fn a_paid_leg() -> CapabilityFacts {
+    CapabilityFacts {
+        context_window: Some(262_144),
+        ..CapabilityFacts::default()
+    }
+}
+
+/// One test's private counter directory, since the allowance reads a real file.
+fn allowance_dir(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "switchyard-adaptive-{label}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("test allowance directory");
+    dir
+}
+
+/// A measured passthrough route over `legs`, declared in the order given.
+///
+/// `legs` carries each target's facts and daily budget, so a test states the deployment
+/// rather than the order it expects.
+fn recording_pool(
+    dir: &std::path::Path,
+    legs: &[(&'static str, CapabilityFacts, Option<u64>)],
+) -> (Route, CallCounters, RecordedBodies) {
+    let targets: Vec<(String, ModelId)> = legs
+        .iter()
+        .map(|(name, _, _)| {
+            (
+                format!("{name}-target"),
+                ModelId::from(format!("{name}-target").as_str()),
+            )
+        })
+        .collect();
+    let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
+    let algorithm = AlgorithmSpec::Passthrough {
+        target: names[0].clone(),
+        candidates: names[1..].to_vec(),
+        subagents: None,
+    }
+    .build("adaptive-pool", &BTreeMap::from_iter(targets.clone()))
+    .expect("the pool builds");
+
+    let mut calls = CallCounters::new();
+    let mut bodies = RecordedBodies::new();
+    let mut clients: Vec<(ModelId, Arc<dyn RoutedLlmClient>)> = Vec::new();
+    for ((_, model), (name, _, _)) in targets.iter().zip(legs.iter()) {
+        let calls_seen = Arc::new(AtomicUsize::new(0));
+        let bodies_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        calls.insert(name, Arc::clone(&calls_seen));
+        bodies.insert(name, Arc::clone(&bodies_seen));
+        clients.push((
+            model.clone(),
+            Arc::new(RecordingClient {
+                calls: calls_seen,
+                bodies: bodies_seen,
+            }) as Arc<dyn RoutedLlmClient>,
+        ));
+    }
+
+    let facts: HashMap<ModelId, CapabilityFacts> = targets
+        .iter()
+        .zip(legs.iter())
+        .map(|((_, model), (_, facts, _))| (model.clone(), *facts))
+        .collect();
+    let allowances: HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>> = targets
+        .iter()
+        .zip(legs.iter())
+        .filter_map(|((_, model), (name, _, limit))| {
+            limit.map(|limit| {
+                (
+                    model.clone(),
+                    Arc::new(switchyard_llm_client::DailyRequestAllowance::new(
+                        "google-test",
+                        model.clone(),
+                        limit,
+                        dir.join(format!("{name}.json")),
+                    )),
+                )
+            })
+        })
+        .collect();
+
+    let clients = ClientRouter::new(clients.into_iter().collect()).with_target_capabilities(facts);
+    let route = Route::new(
+        algorithm,
+        clients,
+        None,
+        ModelCapabilities::default(),
+        None,
+        None,
+        Vec::new(),
+        RuntimeModels::new(
+            [(
+                Category::Any,
+                targets.iter().map(|(_, model)| model.clone()).collect(),
+            )]
+            .into(),
+        ),
+        RouteReasoningPolicy::Inherit,
+        None,
+        None,
+    )
+    .with_clearance_key(clearance_key())
+    .with_measured_selection(MeasuredSelector::new())
+    .with_daily_allowances(Arc::new(allowances));
+    (route, calls, bodies)
+}
+
+fn calls_of(calls: &CallCounters, leg: &str) -> usize {
+    calls[leg].load(Ordering::SeqCst)
+}
+
+/// A small request lands on the leg whose daily budget can afford it, with no prior
+/// failure needed to discover that.
+///
+/// This is the correction the release exists for: the deployed chain spends the 500-request
+/// model first and reaches the 14,400-request model only when the first one fails.
+#[tokio::test]
+async fn a_small_bounded_task_reaches_the_daily_rich_leg_before_the_scarce_one() {
+    let dir = allowance_dir("small");
+    let (route, calls, _) = recording_pool(
+        &dir,
+        &[
+            ("lite", free_lite(), Some(LITE_DAILY)),
+            ("gemma", free_gemma(true), Some(GEMMA_DAILY)),
+        ],
+    );
+    let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
+
+    runner
+        .execute_route(
+            "adaptive-pool",
+            request(Some(&today_header()), "hello"),
+            None,
+        )
+        .await
+        .expect("the pool serves a small request");
+
+    assert_eq!(
+        calls_of(&calls, "gemma"),
+        1,
+        "the 14,400-request leg is the economical first choice for small work"
+    );
+    assert_eq!(
+        calls_of(&calls, "lite"),
+        0,
+        "the scarce leg was spent on work the daily-rich leg could serve"
+    );
+}
+
+/// A request that would claim most of the small leg's minute goes to the leg with
+/// headroom, even though its daily budget is smaller.
+#[tokio::test]
+async fn a_request_that_fills_the_small_legs_minute_goes_to_the_wide_leg() {
+    let dir = allowance_dir("large");
+    let (route, calls, _) = recording_pool(
+        &dir,
+        &[
+            ("lite", free_lite(), Some(LITE_DAILY)),
+            ("gemma", free_gemma(true), Some(GEMMA_DAILY)),
+        ],
+    );
+    let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
+
+    // ~12k estimated tokens: inside Gemma's 16,000-token ceiling but three quarters of
+    // its minute, so the Lite is the appropriate leg for it.
+    runner
+        .execute_route("adaptive-pool", long_request(8_000), None)
+        .await
+        .expect("the pool serves a large request");
+
+    assert_eq!(calls_of(&calls, "lite"), 1);
+    assert_eq!(calls_of(&calls, "gemma"), 0);
+}
+
+/// A tool exchange is budgeted as the conversation it becomes, so the first turn alone
+/// does not make the small leg look appropriate.
+#[tokio::test]
+async fn a_tool_exchange_is_not_placed_on_the_leg_that_cannot_hold_its_answer() {
+    let dir = allowance_dir("tools");
+    let (route, calls, _) = recording_pool(
+        &dir,
+        &[
+            ("gemma", free_gemma(true), Some(GEMMA_DAILY)),
+            ("lite", free_lite(), Some(LITE_DAILY)),
+        ],
+    );
+    let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
+
+    // ~9k estimated input tokens before the tool growth, comfortably inside Gemma's
+    // 16,000-token ceiling on its own but not once the answer turn is budgeted.
+    let prompt = "alpha ".repeat(6_000);
+    let mut tool_request = request(Some(&today_header()), &prompt);
+    tool_request.raw_request = Some(serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    }));
+
+    runner
+        .execute_route("adaptive-pool", tool_request, None)
+        .await
+        .expect("the pool serves a tool request");
+
+    assert_eq!(
+        calls_of(&calls, "lite"),
+        1,
+        "a tool conversation does not fit the leg that declares a 16,000-token minute"
+    );
+    assert_eq!(calls_of(&calls, "gemma"), 0);
+}
+
+/// Cost tier is structural: an eligible free leg is offered before a metered one whatever
+/// the manifest order says.
+#[tokio::test]
+async fn a_paid_leg_never_overtakes_an_eligible_free_leg() {
+    let dir = allowance_dir("tier");
+    let (route, calls, _) = recording_pool(
+        &dir,
+        &[
+            ("paid", a_paid_leg(), None),
+            ("free", free_gemma(true), Some(GEMMA_DAILY)),
+        ],
+    );
+    let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
+
+    runner
+        .execute_route(
+            "adaptive-pool",
+            request(Some(&today_header()), "hello"),
+            None,
+        )
+        .await
+        .expect("the free leg serves it");
+
+    assert_eq!(calls_of(&calls, "free"), 1);
+    assert_eq!(
+        calls_of(&calls, "paid"),
+        0,
+        "a metered leg was chosen ahead of an eligible free one"
+    );
+}
+
+/// A request carrying reasoning control skips a leg that cannot accept it, instead of
+/// being sent a parameter the provider rejects.
+#[tokio::test]
+async fn a_reasoning_control_skips_the_leg_that_cannot_accept_it() {
+    let dir = allowance_dir("control");
+    let (route, calls, _) = recording_pool(
+        &dir,
+        &[
+            ("gemma", free_gemma(false), Some(GEMMA_DAILY)),
+            ("lite", free_lite(), Some(LITE_DAILY)),
+        ],
+    );
+    let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
+
+    let mut controlled = request(Some(&today_header()), "hello");
+    controlled.llm_request.reasoning.effort = Some("none".to_string());
+
+    runner
+        .execute_route("adaptive-pool", controlled, None)
+        .await
+        .expect("the leg that accepts control serves it");
+
+    assert_eq!(
+        calls_of(&calls, "gemma"),
+        0,
+        "an unsupported reasoning control was forwarded to a target that states it cannot carry one"
+    );
+    assert_eq!(calls_of(&calls, "lite"), 1);
+}
+
+/// The deployment never invents a reasoning control for a Google leg, in either direction:
+/// a request that carries none reaches the target with none, so native thinking and the
+/// provider default stand.
+#[tokio::test]
+async fn a_google_leg_is_never_handed_a_reasoning_control_it_was_not_given() {
+    let dir = allowance_dir("native");
+    let (route, calls, bodies) =
+        recording_pool(&dir, &[("gemma", free_gemma(false), Some(GEMMA_DAILY))]);
+    let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
+
+    runner
+        .execute_route(
+            "adaptive-pool",
+            request(Some(&today_header()), "hello"),
+            None,
+        )
+        .await
+        .expect("served");
+
+    assert_eq!(calls_of(&calls, "gemma"), 1);
+    let seen = bodies["gemma"]
+        .lock()
+        .expect("test mutex is never poisoned")
+        .clone();
+    let body = seen.first().expect("the body reached the target");
+    for key in ["reasoning", "reasoning_effort", "thinking"] {
+        assert!(
+            body.get(key).is_none_or(serde_json::Value::is_null),
+            "the route invented a {key} field the caller never sent: {body}"
+        );
+    }
+    assert!(
+        body.pointer("/output_config/effort").is_none(),
+        "the route invented an output_config.effort the caller never sent: {body}"
+    );
+}
+
+/// An exhausted daily budget demotes a leg within its tier without making it ineligible:
+/// the hard quota gate stays the authority on whether a request may be sent at all.
+#[tokio::test]
+async fn a_spent_allowance_is_offered_after_a_leg_that_still_has_budget() {
+    let dir = allowance_dir("spent");
+    let (route, calls, _) = recording_pool(
+        &dir,
+        &[
+            ("gemma", free_gemma(true), Some(GEMMA_DAILY)),
+            ("lite", free_lite(), Some(1)),
+        ],
+    );
+    // Spend the Lite's single request before the measured order is computed.
+    let lite_path = dir.join("lite.json");
+    std::fs::write(
+        &lite_path,
+        format!(
+            "{{\"day\":{},\"spent\":1,\"limit\":1,\"group\":\"google-test\",\"model\":\"lite-target\",\"basis\":\"local_budget\",\"provider_remaining\":null}}\n",
+            switchyard_llm_client::allowance::provider_day(SystemTime::now())
+        ),
+    )
+    .expect("the counter is writable");
+    let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
+
+    runner
+        .execute_route(
+            "adaptive-pool",
+            request(Some(&today_header()), "hello"),
+            None,
+        )
+        .await
+        .expect("the leg with budget serves it");
+
+    assert_eq!(calls_of(&calls, "gemma"), 1);
+    assert_eq!(calls_of(&calls, "lite"), 0);
+}

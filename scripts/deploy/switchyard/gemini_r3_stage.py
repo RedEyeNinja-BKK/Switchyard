@@ -28,21 +28,25 @@ The five edits. Four are additive; the fifth promotes the ``smart-nt`` alias:
    and a 16,000-token per-request ceiling -- the window is the model's, the ceiling is the
    AI Studio free-tier TPM, and the ceiling is what binds.
 
-3. A ``smart-gemini-bounded`` passthrough route is added over the two Gemma targets with
-   ``selection = "measured"``. It is new, so no consumer moves; it is a route rather than a
-   composite so that measured selection applies to it, and its candidates are two models on
-   one credential with one price, which is exactly the choice worth making adaptively.
+3. The Google targets state what makes the pool adaptive: ``free_tier = true`` for the cost
+   direction, and ``accepts_reasoning_control = false`` on the Gemma legs, which refuse a
+   caller's reasoning control on the wire. Neither changes what the model does; both let
+   selection choose without inventing an order.
 
-4. A ``smart-gemini-chat`` passthrough over the two Lite leaves, and ``smart_gemini`` becomes
-   an addressable route over the same four targets. The group is what a consumer names; a
-   composite is not an addressable model, so the group has to be a route to be callable.
+4. ``smart_gemini``, ``smart-gemini-chat`` and ``smart-gemini-bounded`` are passthrough
+   routes over the free pool with ``selection = "measured"``. A composite is not an
+   addressable model, so a group a consumer names has to be a route; and measured selection
+   applies to a route's candidate list, so the bounded route is a route too rather than a
+   composite. Every measured route shares one evidence set, so work served under one alias
+   informs the others instead of training a route nothing calls.
 
-5. ``smart-nt`` keeps its kind and its alias, and gains the four Google legs ahead of the two
-   paid ones it already had. A passthrough's candidate list is filtered per target before any
-   provider call, so privacy, capability and input-size gates skip a Google leg without
-   ending the route. Promoting the alias to a composite was rejected: composites do not
-   appear in the served model list, so every consumer naming ``smart-nt`` would break.
-   ``smart-bounded`` and every other route are untouched.
+5. ``smart-nt`` keeps its kind and its alias, gains the four Google legs ahead of the two
+   paid ones it already had, and selects adaptively among them. A passthrough's candidate
+   list is filtered per target before any provider call, so privacy, capability and
+   input-size gates skip a Google leg without ending the route. Promoting the alias to a
+   composite was rejected: composites do not appear in the served model list, so every
+   consumer naming ``smart-nt`` would break. ``smart-bounded`` and every other route are
+   untouched.
 
 Usage::
 
@@ -94,7 +98,12 @@ candidates = [
     "direct-google-gemma-4-26b-a4b-it",
     "direct-google-gemma-4-31b-it",
 ]
-context_window = 262144
+selection = "measured"
+# Kept at the pool's widest real window: the Lite leaves can hold a 1,048,576-token request,
+# and the per-target fit gate skips a Gemma for anything above its own ceiling, so the
+# request still reaches a target that can serve it. Lowering this would reduce what the
+# alias advertises rather than describe the pool.
+context_window = 1048576
 tool_calling = true
 reasoning = true
 vision = false
@@ -117,28 +126,32 @@ vision = true
 route_reasoning_policy = "none"
 '''
 
-SMART_NT_GOOGLE_FIRST = '''# ---- smart-nt: the bounded lane, Google Free first -----------------------
+SMART_NT_GOOGLE_FIRST = '''# ---- smart-nt: the bounded lane, selected adaptively --------------------
 # Still a passthrough, and still under the same alias: a composite is not an
 # addressable model, so promoting this alias to a composite would remove it from
 # the served model list and break every consumer that names it.
 #
-# ORDER: chat Lites -> Gemma 26B -> 31B -> Luna-NT -> DeepSeek Flash-NT.
+# The declared order below is only a tie-break. `selection = "measured"` orders the
+# candidates that survive the hard gates by cost tier, remaining daily allowance,
+# input-token pressure and measured reliability and latency, so the 14,400-request
+# Gemma serves small bounded work and the Lite is reached when the request needs its
+# wider per-minute budget. A metered leg never moves ahead of an eligible free one,
+# and the two paid legs are reached only when no free leg can serve the request.
 #
 # The route-level filter drops a candidate before any provider call when it
 # cannot carry the request: an uncleared payload skips every Google leg (all
 # four declare requires_public_payload through their client), a vision request
 # skips all four (none declares vision), more than 16,000 input tokens skips the
-# Gemmas and more than 250,000 skips the Lites. What survives is served in this
-# order; the paid legs are reached exactly as they are today.
+# Gemmas and more than 250,000 skips the Lites.
 #
-# `route_reasoning_policy` is removed rather than kept: a route-level policy needs every
+# `route_reasoning_policy` is absent rather than kept: a route-level policy needs every
 # candidate's client to declare a reasoning dialect, and the Google clients deliberately
 # declare none -- their family cannot turn thinking off, so there is no correct wire form.
 # Nothing is lost for the two paid legs: `openai-gpt-6-luna-nt` and
 # `deepseek-deepseek-flash-nt` each declare `reasoning_policy = "disabled"` on the target,
-# and a target policy is authoritative and applied after the route's. The no-thinking
-# contract is therefore kept by the legs that have a dialect to carry it, and the Google
-# legs stay neutral instead of being sent a control they cannot honour.
+# and a target policy is authoritative and applied after the route's. The Google legs keep
+# their native reasoning and defaults; the Gemma legs additionally state that they cannot
+# carry a caller's reasoning control, so such a request is routed to a leg that can.
 #
 # Spend can only fall. Today every smart-nt request is served by Luna-NT; after
 # this change a Google leg serves when it is eligible and a paid leg serves when
@@ -154,6 +167,7 @@ candidates = [
     "openai-gpt-6-luna-nt",
     "deepseek-deepseek-flash-nt",
 ]
+selection = "measured"
 context_window = 262144
 tool_calling = true
 reasoning = true
@@ -172,6 +186,7 @@ id = "smart-gemini-chat"
 type = "passthrough"
 target = "direct-google-gemini-3.5-flash-lite"
 candidates = ["direct-google-gemini-3.1-flash-lite"]
+selection = "measured"
 context_window = 1048576
 tool_calling = true
 reasoning = true
@@ -204,6 +219,9 @@ LITE_PHYSICAL = '''# Capacity and admission are two different numbers and both a
 # one the provider cannot complete, so it is refused locally instead of being charged.
 context_window = 1048576
 max_input_tokens = 250000
+# A selection fact: requests served here cost nothing inside the allowance, so no metered
+# leg may be ordered ahead of this one. Without it the router could only use declared order.
+free_tier = true
 '''
 
 GEMMA_TARGETS = '''
@@ -241,6 +259,12 @@ video = false
 context_window = 262144
 max_input_tokens = 16000
 daily_request_limit = 14400
+# Free inside the allowance, and unable to carry a caller's reasoning control: the measured
+# wire refuses `reasoning_effort` with HTTP 400. Stating both lets selection prefer this leg
+# for small work and skip it for a request that carries a control, instead of forwarding a
+# parameter the provider rejects.
+free_tier = true
+accepts_reasoning_control = false
 # Hosted Gemma writes its chain of thought into the visible message: the measured body is
 # `<thought>...</thought>` followed by the answer, with `completion_tokens` counting only the
 # answer and `total_tokens` counting both. Declaring the marker is what keeps the monologue
@@ -255,6 +279,8 @@ video = false
 context_window = 262144
 max_input_tokens = 16000
 daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
 hosted_reasoning = "thought_tag"
 '''
 
@@ -409,6 +435,38 @@ def verify(candidate: str, live: str) -> dict:
         if target.get("context_window") != 1048576:
             failures.append(f"{name}: context_window is {target.get('context_window')!r}")
 
+    # Cost tier and reasoning-control facts are what makes the pool adaptive. Without them
+    # selection has nothing to order on and the declared order silently becomes the policy
+    # again, which is the defect this release corrects.
+    google_targets = (
+        "direct-google-gemini-3.5-flash-lite",
+        "direct-google-gemini-3.1-flash-lite",
+        "direct-google-gemma-4-26b-a4b-it",
+        "direct-google-gemma-4-31b-it",
+    )
+    for name in google_targets:
+        target = targets.get(name, {})
+        if target.get("free_tier") is not True:
+            failures.append(f"{name}: does not declare free_tier = true")
+    for name in ("direct-google-gemma-4-26b-a4b-it", "direct-google-gemma-4-31b-it"):
+        if targets.get(name, {}).get("accepts_reasoning_control") is not False:
+            failures.append(f"{name}: does not declare accepts_reasoning_control = false")
+
+    # Native thinking is preserved on every Google leg. A reasoning policy, effort or
+    # dialect on one of them would override the provider's own default, which this release
+    # must not do; the paid legs keep their own independent declaration.
+    for name in google_targets:
+        target = targets.get(name, {})
+        for field in ("reasoning_policy", "reasoning_effort", "reasoning_dialect"):
+            if field in target:
+                failures.append(f"{name}: carries {field}, which overrides native reasoning")
+    for name in ("smart-nt", "smart_gemini", "smart-gemini-chat", "smart-gemini-bounded"):
+        route = routes.get(name, {})
+        if "route_reasoning_policy" in route:
+            failures.append(f"{name}: carries a route-level reasoning policy")
+        if route.get("selection") != "measured":
+            failures.append(f"{name}: does not select adaptively")
+
     bounded = routes.get("smart-gemini-bounded", {})
     if bounded.get("type") != "passthrough":
         failures.append("smart-gemini-bounded is not a passthrough")
@@ -475,6 +533,10 @@ def verify(candidate: str, live: str) -> dict:
         failures.append(f"smart_gemini candidates are {gemini_children!r}")
     if "smart_gemini" in composites:
         failures.append("smart_gemini is still a composite; it would not be callable")
+    if gemini.get("context_window") != 1048576:
+        failures.append(
+            "smart_gemini does not advertise the pool's widest real window"
+        )
 
     nt = routes.get("smart-nt", {})
     if nt.get("type") != "passthrough":
@@ -523,6 +585,13 @@ def verify(candidate: str, live: str) -> dict:
         raise SystemExit("candidate failed verification:\n  " + "\n  ".join(failures))
 
     return {
+        "adaptive_routes": [
+            "smart-nt",
+            "smart_gemini",
+            "smart-gemini-chat",
+            "smart-gemini-bounded",
+        ],
+        "free_tier_targets": list(google_targets),
         "gemma_targets": 2,
         "chat_candidates": chat_children,
         "bounded_candidates": children,

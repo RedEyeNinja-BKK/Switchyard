@@ -3,6 +3,7 @@
 
 //! One configured algorithm and the clients that serve its targets.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -367,11 +368,17 @@ pub struct Route {
     /// names a target slug, not the credential, so the credential identity has to come
     /// from configuration. Empty when the route was built without one (tests).
     target_credentials: std::collections::HashMap<ModelId, String>,
-    /// Measured ordering among candidates that already survived every hard gate.
+    /// Ordering among candidates that already survived every hard gate.
     ///
     /// `None` keeps declared order, which is what every route did before the option
     /// existed, so a route that does not opt in is untouched by this machinery.
     selector: Option<Arc<crate::selection::MeasuredSelector>>,
+    /// The daily request allowance serving each target model id.
+    ///
+    /// Selection prefer the candidate with the most requests left in its own budget, so it
+    /// has to read the same counters the dispatch gate reserves against. Empty when the
+    /// route was built without them (tests, or a deployment with no daily limits).
+    daily_allowances: Arc<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -412,6 +419,7 @@ impl Route {
             clearance_key: Arc::new(crate::egress::ClearanceKey::refusing()),
             target_credentials: std::collections::HashMap::new(),
             selector: None,
+            daily_allowances: Arc::new(HashMap::new()),
         }
     }
 
@@ -424,6 +432,18 @@ impl Route {
         selector: Arc<crate::selection::MeasuredSelector>,
     ) -> Self {
         self.selector = Some(selector);
+        self
+    }
+
+    /// Records the daily request allowance behind each target model id.
+    ///
+    /// Selection and dispatch must read one budget: a candidate is offered later only
+    /// because the same counter that will reserve the request says it has room.
+    pub fn with_daily_allowances(
+        mut self,
+        allowances: Arc<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>,
+    ) -> Self {
+        self.daily_allowances = allowances;
         self
     }
 
@@ -684,6 +704,11 @@ impl Route {
                     let capabilities = crate::ModelCapabilities {
                         vision: Some(!facts.no_vision),
                         tool_calling: Some(!facts.no_tool_calling),
+                        // A target that cannot carry a caller's reasoning control must not
+                        // be handed one: the wire would either reject it or silently enforce
+                        // something the deployment never agreed to. The route advances to a
+                        // leg that can carry it, and a directly addressed leaf refuses.
+                        reasoning: Some(!facts.no_reasoning_control),
                         // Carried as a concrete boolean like the other facts, so an
                         // undeclared target is treated as video-incapable here.
                         video: Some(!facts.no_video),
@@ -713,9 +738,33 @@ impl Route {
         // quota refusal is still final.
         let models = match self.selector.as_ref() {
             Some(selector) => {
-                let declared = models.all_models();
-                let original = self.models.all_models();
-                match selector.order(&declared, &original) {
+                let demand = crate::selection::Demand {
+                    required_tokens,
+                    needs_tools: crate::request_fit::wants_tools(&request.llm_request, &raw),
+                };
+                let candidates: Vec<crate::selection::Candidate> = models
+                    .all_models()
+                    .into_iter()
+                    .map(|model| {
+                        let facts = facts.get(&model);
+                        crate::selection::Candidate {
+                            tier: if facts.is_some_and(|facts| facts.free_tier) {
+                                crate::selection::CostTier::Free
+                            } else {
+                                crate::selection::CostTier::Paid
+                            },
+                            remaining_today: self
+                                .daily_allowances
+                                .get(&model)
+                                .map(|allowance| allowance.remaining()),
+                            max_input_tokens: facts.and_then(|facts| facts.max_input_tokens),
+                            context_window: facts.and_then(|facts| facts.context_window),
+                            model,
+                        }
+                    })
+                    .collect();
+                let declared = self.models.all_models();
+                match selector.order(&candidates, demand, &declared) {
                     Some(ordered) => models.reordered(&ordered),
                     None => models,
                 }

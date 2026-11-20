@@ -37,18 +37,7 @@ pub fn unsupported_capability(
     {
         return Some("reasoning");
     }
-    if capabilities.tool_calling == Some(false)
-        && (!request.tools.is_empty()
-            || request.tool_choice.is_some()
-            || ["tools", "functions"].iter().any(|key| {
-                body.get(key)
-                    .and_then(Value::as_array)
-                    .is_some_and(|tools| !tools.is_empty())
-            })
-            || ["tool_choice", "parallel_tool_calls", "function_call"]
-                .iter()
-                .any(|key| body.get(key).is_some_and(|value| !value.is_null())))
-    {
+    if capabilities.tool_calling == Some(false) && wants_tools(request, body) {
         return Some("tool_calling");
     }
     // Audio first: it has no declaration at all and is refused wherever it appears. Video
@@ -73,6 +62,25 @@ pub fn unsupported_capability(
         )
         .find_map(|content| unsupported_content(capabilities, content))
         .or_else(|| unsupported_preserved_content(capabilities, body))
+}
+
+/// Whether the request carries tools or asks for a tool call.
+///
+/// One predicate for two readers: the capability gate refuses a target that cannot carry
+/// them, and selection costs the conversation as one that will grow. Reading the decoded
+/// request and the preserved body both, because a caller may send either spelling and a
+/// target must not be selected on one of them only.
+pub fn wants_tools(request: &LlmRequest, body: &Value) -> bool {
+    !request.tools.is_empty()
+        || request.tool_choice.is_some()
+        || ["tools", "functions"].iter().any(|key| {
+            body.get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
+        })
+        || ["tool_choice", "parallel_tool_calls", "function_call"]
+            .iter()
+            .any(|key| body.get(key).is_some_and(|value| !value.is_null()))
 }
 
 /// Video and audio, refused unless the route states it can read the medium.

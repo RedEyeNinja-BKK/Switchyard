@@ -70,6 +70,13 @@ class Sandbox:
                      f'  cp {self.state}/good {self.state}/healthy\n'
                      f'fi\n')
         os.chmod(self.restart_sh, 0o755)
+        # The unit is asked which EnvironmentFiles it reads. A sandbox has none, and
+        # the answer must not depend on whether the host happens to run a unit with
+        # this name: a real reply here would make the result host-dependent.
+        self.no_systemctl = os.path.join(root, "systemctl-none")
+        with open(self.no_systemctl, "w") as fh:
+            fh.write("#!/bin/bash\nexit 0\n")
+        os.chmod(self.no_systemctl, 0o755)
 
     def env(self, **overrides):
         env = {
@@ -84,6 +91,7 @@ class Sandbox:
             "HEALTH_ATTEMPTS": "4",
             "ENV_FILE_1": self.env1,
             "ENV_FILE_2": os.path.join(self.root, "absent.env"),
+            "SYSTEMCTL": self.no_systemctl,
             "MANIFEST_GROUP": "root",
             "VALIDATOR": VALIDATOR,
             "METRICS_URL": "http://127.0.0.1:9/metrics",
@@ -95,6 +103,31 @@ class Sandbox:
     def run(self, *args, **overrides):
         return subprocess.run(["bash", SCRIPT, *args], env=self.env(**overrides),
                               capture_output=True, text=True)
+
+    def write_env_file(self, name, assignments):
+        path = os.path.join(self.root, name)
+        with open(path, "w") as fh:
+            for key, value in assignments.items():
+                fh.write(f"{key}={value}\n")
+        return path
+
+    def write_systemctl(self, name, output, markers=True):
+        """A stub for `systemctl show -p EnvironmentFiles --value`.
+
+        `markers=True` reproduces current systemd, one `PATH (ignore_errors=no)` per
+        line; `markers=False` reproduces the older single-line form. Both shapes are
+        in the wild, so both are tested.
+        """
+        path = os.path.join(self.root, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/bash\n")
+            if markers:
+                for item in output:
+                    fh.write(f'printf \'%s\\n\' "{item} (ignore_errors=no)"\n')
+            else:
+                fh.write(f'echo "{" ".join(output)}"\n')
+        os.chmod(path, 0o755)
+        return path
 
     def write_candidate(self, name, body):
         path = os.path.join(self.root, name)
@@ -262,6 +295,83 @@ def test_a_candidate_that_fails_its_own_validation_is_refused(box):
     assert result.returncode == 1
     assert "does not validate" in result.stderr
     assert box.live_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# which environment the candidate is validated under
+#
+# The unit declares its EnvironmentFiles. This script used to know two of them by
+# name, which was correct until a third was added as a drop-in -- at which point a
+# candidate that needed only that third file was refused, with a message naming a
+# variable the operator could see on disk. The unit is asked instead; these four
+# cases hold that behaviour in place.
+# ---------------------------------------------------------------------------
+
+
+def _three_file_setup(box):
+    """Three env files, and a candidate that loads only when the third is read."""
+    files = (
+        box.write_env_file("one.env", {"FIRST_FILE_KEY": "one"}),
+        box.write_env_file("two.env", {"SECOND_FILE_KEY": "two"}),
+        box.write_env_file("three.env", {"THIRD_FILE_KEY": "from-the-third-file"}),
+    )
+    candidate, csha = box.write_candidate(
+        "candidate",
+        "#!/bin/bash\n"
+        '[ "${THIRD_FILE_KEY:-}" = "from-the-third-file" ] || exit 3\n'
+        'echo "server OK: fixture"\n')
+    manifest, msha = box.write_manifest("candidate.toml")
+    return files, (candidate, csha, manifest, msha)
+
+
+def test_the_candidate_is_validated_under_every_environment_file_the_unit_declares(box):
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-three", files)
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_unit_file_this_script_never_heard_of_is_not_skipped(box):
+    """The negative control for the case above.
+
+    Same candidate, same first two files; the stub now reports only those two. The
+    candidate must be refused -- which is what proves the pass came from the third
+    file being read, not from validation being toothless.
+    """
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    before = box.live_bytes()
+    systemctl = box.write_systemctl("systemctl-two", files[:2])
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 1
+    assert "does not validate" in result.stderr
+    assert box.live_bytes() == before
+
+
+def test_the_older_single_line_environment_file_list_is_read_too(box):
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-old", files, markers=False)
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_release_record_names_every_file_it_was_validated_under(box):
+    """The record is what an auditor reads; it must not name a subset."""
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-three", files)
+    box.mark_good(candidate)
+    assert box.run("deploy", manifest, msha, candidate, csha,
+                   SYSTEMCTL=systemctl).returncode == 0
+    text = open(os.path.join(box.releases, box.current(), "release.json")).read()
+    for path in files:
+        assert path in text, f"{path} must be recorded"
+        assert sha256(path) in text, f"{path} must be recorded by hash"
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,10 @@
+
+> **SUPERSEDED FOR OVERALL SCOPE AND REPO ACCESS — 2026-11-21.** Read the [CONTROLLING ALL FREE-TIER CAPABILITIES dossier](https://github.com/RedEyeNinja-BKK/Switchyard/blob/feat/gemini-r3-adaptive-bounded/docs/evidence/gemini-r3/2026-11-21/OWNER-CONTROLLING-ALL-FREE-CAPABILITIES.md) at `2633cbbc797a4076455ab3444ebcdbddecb7b216` FIRST. Owner confirms Turnstone's PAT **can access all repositories**, including private `agent-stack-private-development`; the earlier claim that it cannot was wrong and is retracted. Resolve any 404 as a path/ref/API/credential-context issue, not an established permission boundary. This file is a Gemma-specific *subsection* of the 26-actionable-model portfolio, **not the global work order**. Private Agent Stack Issue #35 remains the production governance thread.
+
 # OWNER READ FIRST — Gemma 4 measured contract and shortest R3 production path
 2026-11-21 · source facts and implementation decisions · **not a provider-call or deployment authorization**
 
-**This document intentionally lives in the Switchyard PR #46 branch, which Turnstone can read.** Earlier controlling reviewer notes were posted in `RedEyeNinja-BKK/agent-stack-private-development` (including Issue #35 comment 7048921000 and document at commit `796a2af`); Turnstone's Switchyard PAT cannot access them. **Stop trying that PAT on private agent-stack documents. Use this file and the PR #46 thread as the operative accessible instructions.** The private repository Issue #35 remains the production owner-writer authority.
+**Repository correction:** Owner confirms Turnstone's PAT has access to ALL owner repositories. Use private Agent Stack Issue #35 plus this Switchyard branch. A 404 on a document or comment requires checking repo/path/ref/API/actual auth context; it does not prove a permission limitation. This Gemma-specific note is subordinate to the linked all-Free-tier dossier.
 
 ## Measured reality: don't research or probe this again
 

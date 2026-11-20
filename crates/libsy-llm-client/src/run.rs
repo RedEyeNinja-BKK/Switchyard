@@ -795,9 +795,7 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
             // or a content block. Diagnosis stays a pure mapping; what may be retried or
             // routed around is decided by the recovery this module derives.
             _ if crate::google::parse(Some(status.as_u16()), body).is_some() => {
-                google_failure_class(
-                    crate::google::parse(Some(status.as_u16()), body).map(|error| error.condition),
-                )
+                google_failure_class(crate::google::parse(Some(status.as_u16()), body).as_ref())
             }
             StatusCode::NOT_FOUND if is_retired_model(source) => FailureClass::ModelRetired,
             StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
@@ -833,27 +831,38 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
 /// These map onto the classes the route already understands rather than adding a parallel
 /// vocabulary: a daily quota is the same fact as any other account-wide cap, and a content
 /// block is the same fact as any other provider-policy refusal.
-fn google_failure_class(condition: Option<crate::google::GoogleCondition>) -> FailureClass {
+fn google_failure_class(error: Option<&crate::google::GoogleError>) -> FailureClass {
     use crate::google::GoogleCondition as C;
-    match condition {
-        Some(C::DailyQuota) => FailureClass::AccountQuota,
-        Some(C::ShortWindowThrottle) => FailureClass::RateLimited,
-        Some(C::Capacity) => FailureClass::TemporarilyUnavailable,
-        Some(C::ProviderFault) => FailureClass::Server,
-        Some(C::ProviderDeadline) => FailureClass::Timeout,
-        Some(C::ModelNotFound) => FailureClass::ModelRetired,
-        Some(C::Unauthenticated | C::PermissionDenied | C::LeakedCredential) => FailureClass::Auth,
-        Some(C::ContentBlocked(_)) => FailureClass::ProviderPolicy,
-        Some(
-            C::ResourceNotFound
-            | C::InvalidRequest
-            | C::UnsupportedOperation
-            | C::Conflict
-            | C::Aborted
-            | C::MalformedTool
-            | C::IncompleteOutput,
-        ) => FailureClass::Request,
-        Some(C::ClientCancelled | C::Unknown) | None => FailureClass::Other,
+    let Some(error) = error else {
+        return FailureClass::Other;
+    };
+    match error.condition {
+        // `AccountQuota` means "every candidate behind this credential is out", so it is
+        // reserved for a scope Google positively identified as project-wide. A model-scoped
+        // daily quota retires one target and leaves its siblings servable, which is what
+        // `TemporarilyUnavailable` already means for a spent per-target allowance.
+        C::DailyQuota => {
+            if error.recovery().stop_candidate_list {
+                FailureClass::AccountQuota
+            } else {
+                FailureClass::TemporarilyUnavailable
+            }
+        }
+        C::ShortWindowThrottle => FailureClass::RateLimited,
+        C::Capacity => FailureClass::TemporarilyUnavailable,
+        C::ProviderFault => FailureClass::Server,
+        C::ProviderDeadline => FailureClass::Timeout,
+        C::ModelNotFound => FailureClass::ModelRetired,
+        C::Unauthenticated | C::PermissionDenied | C::LeakedCredential => FailureClass::Auth,
+        C::ContentBlocked(_) => FailureClass::ProviderPolicy,
+        C::ResourceNotFound
+        | C::InvalidRequest
+        | C::UnsupportedOperation
+        | C::Conflict
+        | C::Aborted
+        | C::MalformedTool
+        | C::IncompleteOutput => FailureClass::Request,
+        C::ClientCancelled | C::Unknown => FailureClass::Other,
     }
 }
 
@@ -888,14 +897,21 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     ) {
         return Some(RoutingFallbackReason::Unavailable);
     }
-    // A condition Google names as being about the request - a policy block, a malformed tool
-    // call, an unsupported parameter - is an answer, and handing it to another provider would
-    // be an attempt to evade that answer rather than to serve the caller.
+    // A condition Google names decides how much of the route it takes with it. A scope that
+    // stops the whole candidate list ends the route, and an outcome about the request - a
+    // policy block, a malformed tool call - is an answer, so handing it to another provider
+    // would be evading it rather than serving the caller. A quota scoped to one model is
+    // neither: its siblings on the same credential still have their own budget.
     if let LlmClientError::UpstreamHttp { status, body } = source
-        && crate::google::parse(Some(status.as_u16()), body)
-            .is_some_and(|error| error.recovery().keep_outcome)
+        && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
     {
-        return None;
+        let recovery = google.recovery();
+        if recovery.stop_candidate_list || recovery.keep_outcome {
+            return None;
+        }
+        if google.condition == crate::google::GoogleCondition::DailyQuota {
+            return Some(RoutingFallbackReason::Unavailable);
+        }
     }
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
@@ -1600,14 +1616,30 @@ mod tests {
         assert_eq!(failure_class(&throttle), FailureClass::RateLimited);
         assert!(fallback_reason(&throttle).is_some());
 
-        let quota = call(
+        // A model-scoped daily quota retires one leg; its siblings still have budget, so the
+        // route must be able to move on rather than ending on evidence that never said the
+        // project was out.
+        let model_quota = call(
             429,
             r#"{"error":{"code":"quota_exceeded","message":"daily"}}"#,
         );
-        assert_eq!(failure_class(&quota), FailureClass::AccountQuota);
+        assert_eq!(
+            failure_class(&model_quota),
+            FailureClass::TemporarilyUnavailable
+        );
+        assert!(fallback_reason(&model_quota).is_some());
+
+        // A positively project-wide quota is the opposite fact.
+        let project_quota = call(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                  {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier"}]}]}}"#,
+        );
+        assert_eq!(failure_class(&project_quota), FailureClass::AccountQuota);
         assert!(
-            fallback_reason(&quota).is_none(),
-            "another candidate draws on the same project quota"
+            fallback_reason(&project_quota).is_none(),
+            "a project-wide quota is shared by every candidate"
         );
 
         // Capacity, in the measured list-wrapped 31B shape.
@@ -3302,6 +3334,136 @@ mod tests {
             "per-model cooldown is unchanged"
         );
         assert!(is_rate_limited(&error));
+
+        Ok(())
+    }
+
+    /// One exhausted Free-tier model must not condemn its siblings on the same credential.
+    ///
+    /// This is the whole point of reading the quota's scope instead of its status: Google
+    /// allocates Free-tier RPD per model, so `gemini-3.6-flash` spending its 20 requests
+    /// says nothing about the Gemma leaf behind the same project key. Before the scope was
+    /// read, the first 429 became `AccountQuota` and the pool stopped - one model's spent
+    /// allowance silently retired every other Free capability on the credential.
+    #[tokio::test]
+    async fn one_spent_gemini_quota_retires_its_model_and_not_the_free_pool() -> Result<()> {
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        // The two 429 bodies the AI Studio surface really sends: the same `quota_exceeded`
+        // code, differing only in whether the quota id names a model.
+        const MODEL_SCOPED: &str = r#"{"error":{"code":429,"message":"quota",
+            "status":"RESOURCE_EXHAUSTED","details":[
+              {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED",
+               "domain":"googleapis.com","metadata":{
+                 "quota_limit":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                 "quota_limit_value":"20",
+                 "quota_metric":"generativelanguage.googleapis.com/generate_content_free_tier_requests"}},
+              {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                 {"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                  "quotaDimensions":{"location":"global","model":"gemini-3.6-flash"}}]}]}}"#;
+        const PROJECT_SCOPED: &str = r#"{"error":{"code":429,"message":"quota",
+            "status":"RESOURCE_EXHAUSTED","details":[
+              {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                 {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier",
+                  "quotaDimensions":{"location":"global"}}]}]}}"#;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                observed.lock().push(model.clone());
+                match model.as_str() {
+                    "spent-flash" => ResponseTemplate::new(429).set_body_string(MODEL_SCOPED),
+                    "spent-project" => ResponseTemplate::new(429).set_body_string(PROJECT_SCOPED),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "answer",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {}
+                    })),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let build = || {
+            Backend::OpenAiChat(HttpBackendConfig {
+                base_url: format!("{}/v1", server.uri()),
+                api_key: None,
+                forward_auth: false,
+                extra_headers: BTreeMap::new(),
+                extra_body: BTreeMap::new(),
+                omit_body_fields: BTreeSet::new(),
+                reasoning_effort: None,
+                reasoning_policy: None,
+                reasoning_dialect: ReasoningDialect::default(),
+                max_retries: 0,
+                failure_cooldown: std::time::Duration::from_secs(60),
+                // No group: the sibling shares the credential but not a pool-wide verdict.
+                cooldown_group: None,
+                timeout: None,
+                attempt_timeout: None,
+                stream_idle_timeout: None,
+                requires_list_input: false,
+                allowance: None,
+                requires_public_payload: false,
+                hosted_reasoning: None,
+            })
+        };
+        let client = |names: &[&str]| {
+            let models: Vec<ModelConfig> = names
+                .iter()
+                .map(|name| ModelConfig::new(*name, build(), None))
+                .collect();
+            TranslatingLlmClient::new(&models)
+                .map(Arc::new)
+                .map_err(|error| LibsyError::external("building test client", error))
+        };
+        let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
+            let outcome = run(
+                Arc::new(CandidateAlgorithm {}),
+                ClientRouter::single(client),
+                request(),
+                to_category_map(names),
+                None,
+            )
+            .await;
+            let calls: Vec<String> = std::mem::take(&mut *calls.lock());
+            (outcome, calls)
+        };
+
+        // A per-model quota retires that model and the sibling serves the request.
+        let per_model = client(&["spent-flash", "gemma-4-31b-it"])?;
+        let (outcome, seen) = attempt(per_model, &["spent-flash", "gemma-4-31b-it"]).await;
+        let (_, response) = outcome.expect("the healthy sibling answers");
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("gemma-4-31b-it"),
+            "the fallback model is the one that answered"
+        );
+        assert_eq!(
+            seen,
+            ["spent-flash", "gemma-4-31b-it"],
+            "a model-scoped quota must not stop the candidate list"
+        );
+
+        // Contrast: a positively project-wide quota still stops the pool after one call.
+        let project = client(&["spent-project", "gemma-4-31b-it"])?;
+        let (outcome, seen) = attempt(project, &["spent-project", "gemma-4-31b-it"]).await;
+        assert!(
+            outcome.is_err(),
+            "a project-wide quota leaves no candidate to serve"
+        );
+        assert_eq!(
+            seen,
+            ["spent-project"],
+            "a project-wide quota stops the list without a second call"
+        );
 
         Ok(())
     }

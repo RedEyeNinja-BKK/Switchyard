@@ -49,6 +49,25 @@ pub enum BlockReason {
     Image,
 }
 
+/// How much of the credential a spent quota covers.
+///
+/// Google's Free tier allocates RPD **per model** (20/day for a Flash, 500/day for a
+/// Flash-Lite) alongside separate feature quotas, so a bare `quota_exceeded` proves a quota
+/// is spent without proving which one. Treating every such answer as project-wide would let
+/// one exhausted model disable the rest of the pool on evidence that never said so.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GoogleQuotaScope {
+    /// One exact model: only its own quota identity is spent.
+    Model,
+    /// The whole project or credential: every candidate behind it shares the quota.
+    Project,
+    /// One feature or tool quota, separate from the model's own request budget.
+    Feature,
+    /// Google did not say. Never promoted to `Project` - an unproven scope is not a fact.
+    #[default]
+    Unknown,
+}
+
 /// One condition Google reports, whichever transport carried it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GoogleCondition {
@@ -102,6 +121,11 @@ pub struct GoogleError {
     /// The provider's own code, kept for diagnostics: `"rate_limit_exceeded"`, `"503"`,
     /// or a gRPC-style `status`.
     pub code: Option<String>,
+    /// How much of the credential a spent quota covers, as far as the body proves.
+    ///
+    /// Only meaningful for [`GoogleCondition::DailyQuota`]; every other condition leaves it
+    /// `Unknown`, because nothing else is scoped.
+    pub quota_scope: GoogleQuotaScope,
 }
 
 /// What Switchyard may do with a decoded Google error.
@@ -160,10 +184,15 @@ impl GoogleError {
                 retry_same_model: true,
                 ..GoogleRecovery::INERT
             },
-            // A spent daily quota does not clear on a backoff, and every candidate behind
-            // the same project draws on it.
+            // A spent daily quota does not clear on a backoff. Its SCOPE decides how much of
+            // the pool it takes with it, and only a scope Google positively identified as
+            // project- or credential-wide may stop the candidate list. A per-model quota, or
+            // one whose scope the body never named, retires that exact model and leaves the
+            // rest of the Free pool available - which is what the owner's per-model RPD
+            // allocation actually is.
             C::DailyQuota => GoogleRecovery {
-                stop_candidate_list: true,
+                cool_down_model: true,
+                stop_candidate_list: self.quota_scope == GoogleQuotaScope::Project,
                 ..GoogleRecovery::INERT
             },
             // Capacity is a fact about one model, and Google's own 31B behaviour shows how
@@ -252,6 +281,7 @@ pub fn parse(http: Option<u16>, body: &str) -> Option<GoogleError> {
             condition: GoogleCondition::LeakedCredential,
             http,
             code: status.map(str::to_string),
+            quota_scope: GoogleQuotaScope::Unknown,
         });
     }
 
@@ -266,11 +296,158 @@ pub fn parse(http: Option<u16>, body: &str) -> Option<GoogleError> {
         .or_else(|| http.and_then(http_condition))
         .unwrap_or(GoogleCondition::Unknown);
 
+    // The status strings are coarser than the details. `RESOURCE_EXHAUSTED` and a bare 429
+    // both read as a window that clears, which is why they stay a throttle on their own; but
+    // when the body's own quota identifier says `PerDay`, the allowance really is spent until
+    // midnight and retrying it is just a slower failure. Only the details may widen the
+    // condition, never the status.
+    let condition = if names_a_daily_quota(&error)
+        && matches!(
+            condition,
+            GoogleCondition::ShortWindowThrottle | GoogleCondition::Unknown
+        ) {
+        GoogleCondition::DailyQuota
+    } else {
+        condition
+    };
+
+    // Scope is only read where it can change a decision, and only from structure Google
+    // itself supplied. A body that names no scope stays `Unknown`, which retires one model
+    // rather than the pool.
+    let quota_scope = if condition == GoogleCondition::DailyQuota {
+        read_quota_scope(&error)
+    } else {
+        GoogleQuotaScope::Unknown
+    };
+
     Some(GoogleError {
         condition,
         http,
         code: error_code(code).or_else(|| status.map(str::to_string)),
+        quota_scope,
     })
+}
+
+/// Reads how much of the credential a `quota_exceeded` covers from Google's structured
+/// details.
+///
+/// The only trustworthy signals are explicit ones. A `quotaDimensions.model` names one
+/// model; a `quotaId` that says `PerProjectPerModel` names one model inside one project; a
+/// `quotaId`/`quotaMetric` that says `PerProject` without `PerModel` names the project. A
+/// feature-named quota is a feature. Anything else is unknown, and unknown is treated as
+/// narrow - never as project-wide - because blocking the pool on a guess is the failure this
+/// scope exists to prevent.
+fn read_quota_scope(error: &serde_json::Value) -> GoogleQuotaScope {
+    let Some(details) = error.get("details").and_then(serde_json::Value::as_array) else {
+        return GoogleQuotaScope::Unknown;
+    };
+    let mut saw_project = false;
+    let mut saw_feature = false;
+    for detail in details {
+        // ErrorInfo carries its facts in `metadata`; QuotaFailure in `violations`.
+        if let Some(metadata) = detail.get("metadata") {
+            if metadata
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                return GoogleQuotaScope::Model;
+            }
+            if let Some(limit) = metadata
+                .get("quota_limit")
+                .and_then(serde_json::Value::as_str)
+            {
+                match classify_quota_id(limit) {
+                    Some(GoogleQuotaScope::Model) => return GoogleQuotaScope::Model,
+                    Some(GoogleQuotaScope::Project) => saw_project = true,
+                    Some(GoogleQuotaScope::Feature) => saw_feature = true,
+                    _ => {}
+                }
+            }
+        }
+        let Some(violations) = detail
+            .get("violations")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for violation in violations {
+            if violation
+                .get("quotaDimensions")
+                .and_then(|dimensions| dimensions.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                return GoogleQuotaScope::Model;
+            }
+            for key in ["quotaId", "quotaMetric"] {
+                let Some(text) = violation.get(key).and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                match classify_quota_id(text) {
+                    Some(GoogleQuotaScope::Model) => return GoogleQuotaScope::Model,
+                    Some(GoogleQuotaScope::Project) => saw_project = true,
+                    Some(GoogleQuotaScope::Feature) => saw_feature = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if saw_project {
+        GoogleQuotaScope::Project
+    } else if saw_feature {
+        GoogleQuotaScope::Feature
+    } else {
+        GoogleQuotaScope::Unknown
+    }
+}
+
+/// Reads a quota identifier's spelling, which is how Google scopes it.
+/// Whether the body's own quota identifier names a per-day allowance.
+///
+/// This is the one signal that separates "spent until midnight" from "clears in a minute"
+/// when the transport only said `RESOURCE_EXHAUSTED` or 429.
+fn names_a_daily_quota(error: &serde_json::Value) -> bool {
+    let Some(details) = error.get("details").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    details.iter().any(|detail| {
+        let in_metadata = detail
+            .get("metadata")
+            .and_then(|metadata| metadata.get("quota_limit"))
+            .and_then(serde_json::Value::as_str);
+        let in_violations = detail
+            .get("violations")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|violation| {
+                ["quotaId", "quotaMetric"]
+                    .iter()
+                    .find_map(|key| violation.get(key).and_then(serde_json::Value::as_str))
+            });
+        in_metadata.into_iter().chain(in_violations).any(|text| {
+            let lowered = text.to_ascii_lowercase();
+            lowered.contains("perday") || lowered.contains("per_day")
+        })
+    })
+}
+
+fn classify_quota_id(text: &str) -> Option<GoogleQuotaScope> {
+    let lowered = text.to_ascii_lowercase();
+    // Narrowest fact first, because the identifiers nest: `PerProjectPerModel` names a model
+    // inside a project, and `PerProjectPerFeature` names a feature inside one. Reading the
+    // wider word first would widen every scope it appears in.
+    if lowered.contains("permodel") || lowered.contains("per_model") {
+        return Some(GoogleQuotaScope::Model);
+    }
+    if lowered.contains("feature") {
+        return Some(GoogleQuotaScope::Feature);
+    }
+    if lowered.contains("perproject") || lowered.contains("per_project") {
+        return Some(GoogleQuotaScope::Project);
+    }
+    None
 }
 
 /// The `error` object from any recognized envelope.
@@ -514,7 +691,88 @@ mod tests {
         .expect("decoded");
         assert_eq!(quota.condition, GoogleCondition::DailyQuota);
         assert!(!quota.recovery().retry_same_model);
-        assert!(quota.recovery().stop_candidate_list);
+        // No details, so no scope: retire this model, do not condemn the pool.
+        assert_eq!(quota.quota_scope, GoogleQuotaScope::Unknown);
+        assert!(!quota.recovery().stop_candidate_list);
+        assert!(quota.recovery().cool_down_model);
+    }
+
+    #[test]
+    fn a_quota_exhausted_answer_names_its_own_scope_or_none() {
+        // The two shapes that differ. A per-model quota must not disable the pool; only a
+        // positively project-wide one may, and this Free tier allocates RPD per model.
+        let model_scoped = parse(
+            Some(429),
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                  {"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                   "quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                   "quotaDimensions":{"location":"global","model":"gemini-3.6-flash"}}]}]}}"#,
+        )
+        .expect("decoded");
+        assert_eq!(model_scoped.quota_scope, GoogleQuotaScope::Model);
+        assert!(!model_scoped.recovery().stop_candidate_list);
+
+        let project_scoped = parse(
+            Some(429),
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                  {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier",
+                   "quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                   "quotaDimensions":{"location":"global"}}]}]}}"#,
+        )
+        .expect("decoded");
+        assert_eq!(project_scoped.quota_scope, GoogleQuotaScope::Project);
+        assert!(project_scoped.recovery().stop_candidate_list);
+
+        // A feature quota is narrower than the model's own request budget.
+        let feature = parse(
+            Some(429),
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                  {"quotaId":"GroundingRequestsPerDayPerProjectPerFeature"}]}]}}"#,
+        )
+        .expect("decoded");
+        assert_eq!(feature.quota_scope, GoogleQuotaScope::Feature);
+        assert!(!feature.recovery().stop_candidate_list);
+    }
+
+    #[test]
+    fn an_error_info_model_dimension_is_a_model_scope() {
+        // ErrorInfo carries the same fact in `metadata` rather than `violations`.
+        let error = parse(
+            Some(429),
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+                 "reason":"RATE_LIMIT_EXCEEDED","domain":"googleapis.com",
+                 "metadata":{"model":"gemini-3.8-flash"}}]}}"#,
+        )
+        .expect("decoded");
+        assert_eq!(error.quota_scope, GoogleQuotaScope::Model);
+        assert!(!error.recovery().stop_candidate_list);
+    }
+
+    #[test]
+    fn an_error_info_quota_limit_names_one_model_inside_one_project() {
+        // The shape generativelanguage actually sends for a spent Free-tier RPD: the limit
+        // id says `PerProjectPerModel`, so the project and the model are both named and the
+        // narrower one decides. Reading this as project-wide is exactly the bug that let a
+        // single exhausted Gemma condemn the whole Free pool.
+        let error = parse(
+            Some(429),
+            r#"{"error":{"code":429,"message":"quota","status":"RESOURCE_EXHAUSTED","details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+                 "reason":"RATE_LIMIT_EXCEEDED","domain":"googleapis.com",
+                 "metadata":{"quota_limit":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                             "quota_limit_value":"20",
+                             "quota_metric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                             "service":"generativelanguage.googleapis.com"}}]}}"#,
+        )
+        .expect("decoded");
+        assert_eq!(error.condition, GoogleCondition::DailyQuota);
+        assert_eq!(error.quota_scope, GoogleQuotaScope::Model);
+        assert!(!error.recovery().stop_candidate_list);
+        assert!(error.recovery().cool_down_model);
     }
 
     #[test]
@@ -545,7 +803,9 @@ mod tests {
         let body = "data: {\"event_type\":\"error\",\"error\":{\"code\":\"quota_exceeded\",\"message\":\"daily\"}}\n\n";
         let error = parse(None, body).expect("decoded");
         assert_eq!(error.condition, GoogleCondition::DailyQuota);
-        assert!(error.recovery().stop_candidate_list);
+        // Nothing in the body scoped it, so it retires the model -- not the pool.
+        assert!(!error.recovery().stop_candidate_list);
+        assert!(!error.recovery().retry_same_model);
     }
 
     #[test]

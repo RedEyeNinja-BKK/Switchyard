@@ -2299,6 +2299,26 @@ fn client_error(error: &LlmClientError) -> Response {
             "rate_limit_error",
             "minute_allowance_throttled",
         ),
+        // Distinguishable from the throttle above on purpose: no wait clears this, and the
+        // message says so rather than quoting an interval. 429 rather than 4xx-request
+        // because the caller's payload is not at fault and the same body may succeed on a
+        // route with a wider per-minute window.
+        LlmClientError::InputExceedsMinuteWindow {
+            model,
+            needed,
+            limit,
+            margin_permille,
+        } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "this request reserves about {needed} tokens for {model} at a \
+                 {margin_permille}/1000 admission margin, which is more than its {limit}-token \
+                 per-minute input budget allows; waiting will not help, and another candidate \
+                 with a wider window may serve it now"
+            ),
+            "rate_limit_error",
+            "minute_allowance_input_exceeds_window",
+        ),
         _ => server_error(error.to_string()),
     }
 }

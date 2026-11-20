@@ -786,6 +786,11 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         // within the minute, so a composite may cross to a sibling with headroom and the
         // caller is told to retry shortly rather than to wait for tomorrow.
         LlmClientError::MinuteAllowanceThrottled { .. } => FailureClass::RateLimited,
+        // Same family as a throttle for routing purposes — the leg cannot take this request
+        // right now — but not the same fact: it can never take it, so the route advances and
+        // a sibling with a wider window is the real answer. Neither the call nor the route
+        // ends.
+        LlmClientError::InputExceedsMinuteWindow { .. } => FailureClass::RateLimited,
         // The payload, not the leg, is the problem: nothing about another candidate makes
         // content that must not leave this deployment admissible.
         LlmClientError::PayloadNotCleared { .. } => FailureClass::Request,
@@ -858,6 +863,9 @@ fn google_failure_class(error: Option<&crate::google::GoogleError>) -> FailureCl
             }
         }
         C::ShortWindowThrottle => FailureClass::RateLimited,
+        // Not a rate: a spend meter is an account condition that no backoff changes, and
+        // calling it one would invite the retry the recovery already forbids.
+        C::SpendLimit => FailureClass::TemporarilyUnavailable,
         C::Capacity => FailureClass::TemporarilyUnavailable,
         C::ProviderFault => FailureClass::Server,
         C::ProviderDeadline => FailureClass::Timeout,
@@ -906,6 +914,10 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
             // A minute window regains room on its own, so this leg is worth returning to
             // later in the same call; the route may also reach a sibling with headroom now.
             | LlmClientError::MinuteAllowanceThrottled { .. }
+            // A request this leg's minute budget cannot hold at the deployment's margin is
+            // not a failure of the request or of the model: a sibling with a wider window
+            // is exactly what the Free pool provides, so the route crosses to it.
+            | LlmClientError::InputExceedsMinuteWindow { .. }
     ) {
         return Some(RoutingFallbackReason::Unavailable);
     }
@@ -1202,6 +1214,17 @@ pub struct CapabilityFacts {
     /// larger than a whole minute's budget cannot be served at all, however long the caller
     /// waits. `None` means only the context window applies.
     pub max_input_tokens: Option<u64>,
+    /// The most input one request may carry *after the admission margin*, when the target
+    /// declares a per-minute input window.
+    ///
+    /// The pre-dispatch counterpart of the send-path reservation. `max_input_tokens` is the
+    /// provider's own per-request ceiling; this is the smaller number the deployment will
+    /// actually admit, because a pre-dispatch estimate that lands just under a window can
+    /// still be charged above it. A request over this bound is not dispatched to this
+    /// target at all: the route advances to a candidate with a wider window rather than
+    /// spending eligibility on a request the governor will refuse or the provider will
+    /// overrun. `None` means the target declares no minute token window.
+    pub safe_input_tokens: Option<u64>,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.

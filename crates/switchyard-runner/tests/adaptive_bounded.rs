@@ -997,6 +997,15 @@ fn free_gemma(accepts_reasoning_control: bool) -> CapabilityFacts {
     }
 }
 
+/// The Gemma lane as the deployment admits it: 16,000 input TPM with a 1300 per-mille
+/// admission pad, so the largest estimate it takes is floor(16,000 * 1000 / 1300) = 12,307.
+fn free_gemma_padded() -> CapabilityFacts {
+    CapabilityFacts {
+        safe_input_tokens: Some(12_307),
+        ..free_gemma(true)
+    }
+}
+
 fn a_paid_leg() -> CapabilityFacts {
     CapabilityFacts {
         context_window: Some(262_144),
@@ -1342,4 +1351,69 @@ async fn a_spent_allowance_is_offered_after_a_leg_that_still_has_budget() {
 
     assert_eq!(calls_of(&calls, "gemma"), 1);
     assert_eq!(calls_of(&calls, "lite"), 0);
+}
+
+/// A request near Gemma's minute budget is refused before egress rather than dispatched on
+/// an optimistic estimate.
+///
+/// The routing half of the measured overrun. On 2026-11-21 a prompt the estimator placed at
+/// 15,202 tokens was admitted against Gemma's 16,000 input TPM and the provider charged
+/// 18,054 - 18.8 % above the estimate and 12.8 % above the window. With a 1300 per-mille
+/// admission pad the largest estimate Gemma may take is 12,307, and that bound is a hard
+/// filter, not a preference: the target is dropped from the candidate list, so no request
+/// leaves the process and the caller is told the honest reason.
+///
+/// The control is the same route without the bound: the identical request dispatches,
+/// which is what proves the bound - not the request size - is what stopped it.
+#[tokio::test]
+async fn a_near_limit_gemma_request_never_reaches_the_padded_window() {
+    // 9,000 words of "alpha " -> about 13,500 estimated tokens: above the padded Gemma
+    // ceiling of 12,307 and below its raw 16,000 window.
+    let padded_calls = Arc::new(AtomicUsize::new(0));
+    let (model, route) = leaf(
+        "gemma",
+        &padded_calls,
+        free_gemma_padded(),
+        ModelCapabilities::default(),
+        false,
+    );
+    let route = route.with_measured_selection(MeasuredSelector::new());
+    let runner = Runner::new(vec![(model.clone(), route)]);
+    let error = match runner
+        .execute_route(model.as_str(), long_request(9_000), None)
+        .await
+    {
+        Ok(_) => panic!("the padded window cannot admit this request"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        padded_calls.load(Ordering::SeqCst),
+        0,
+        "nothing may be dispatched when the deployment's own bound refuses the request"
+    );
+    assert!(
+        format!("{error}").contains("input_tokens_per_minute"),
+        "the refusal must name the minute input budget, got: {error}"
+    );
+
+    // Control: no admission bound on the same target, so the identical request dispatches.
+    let open_calls = Arc::new(AtomicUsize::new(0));
+    let (control_model, control_route) = leaf(
+        "gemma",
+        &open_calls,
+        free_gemma(true),
+        ModelCapabilities::default(),
+        false,
+    );
+    let control_route = control_route.with_measured_selection(MeasuredSelector::new());
+    let control_runner = Runner::new(vec![(control_model.clone(), control_route)]);
+    control_runner
+        .execute_route(control_model.as_str(), long_request(9_000), None)
+        .await
+        .expect("without the admission bound the request is dispatched");
+    assert_eq!(
+        open_calls.load(Ordering::SeqCst),
+        1,
+        "the control proves the bound is what moved the request"
+    );
 }

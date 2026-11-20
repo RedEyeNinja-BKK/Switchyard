@@ -642,6 +642,15 @@ impl Route {
                 binding = binding.or(Some("input_tokens_per_minute"));
                 continue;
             }
+            // The margin-adjusted bound is the same limit reported under the same name: a
+            // caller sees "this is why your request does not fit here", and which side of
+            // the margin it fell on is an operator concern, not a caller one.
+            if let Some(safe) = facts.safe_input_tokens
+                && required > safe
+            {
+                binding = binding.or(Some("input_tokens_per_minute"));
+                continue;
+            }
             return None;
         }
         binding
@@ -695,6 +704,16 @@ impl Route {
                     }
                     if let Some(ceiling) = facts.max_input_tokens
                         && required_tokens > ceiling
+                    {
+                        return false;
+                    }
+                    // The deployment's own admission bound: an estimate padded to the
+                    // admission margin must fit the target's minute window, or the send path
+                    // will refuse this candidate anyway. Filtering here is what makes the
+                    // refusal useful — the route advances to a sibling with a wider window
+                    // instead of discovering the refusal after it has spent eligibility.
+                    if let Some(safe) = facts.safe_input_tokens
+                        && required_tokens > safe
                     {
                         return false;
                     }

@@ -663,14 +663,21 @@ impl TranslatingLlmClient {
                         retry_after: Some(throttled.retry_after),
                     });
                 }
-                Err(crate::allowance::PacingError::ExceedsWindow { needed, limit }) => {
+                Err(crate::allowance::PacingError::ExceedsWindow {
+                    needed,
+                    limit,
+                    margin_permille,
+                }) => {
+                    // Its own classification, not a capability defect: this model could read
+                    // the input, the deployment's own minute budget cannot admit it at the
+                    // margin it insists on. A sibling with a wider window may serve the
+                    // request now, so the route advances instead of ending.
                     return Err(AttemptFailure {
-                        error: LlmClientError::UnsupportedFeature {
+                        error: LlmClientError::InputExceedsMinuteWindow {
                             model: model.clone(),
-                            feature: format!(
-                                "an input of about {needed} tokens exceeds the target's \
-                                 {limit}-token per-minute input budget, which no wait can change"
-                            ),
+                            needed,
+                            limit,
+                            margin_permille,
                         },
                         status: None,
                         retry_after: None,
@@ -769,6 +776,24 @@ impl TranslatingLlmClient {
                     });
                 }
             };
+            // The provider's own input count, fed straight back into the window that
+            // admitted this request. This is the only place the two are both in scope: the
+            // reservation lives here, and the response body is about to leave for the
+            // decoder. Doing it before returning matters — the very next request on this
+            // model reads this ledger, and an under-count left uncorrected is exactly how a
+            // minute window silently overruns its published budget.
+            //
+            // Parsed only for a paced target, so an unpaced one pays nothing. A body this
+            // cannot read leaves the conservative reservation in place: "no count" is not
+            // "no tokens".
+            if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref())
+                && let Some(reported) = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(crate::allowance::reported_input_tokens)
+            {
+                quota.reconcile(ticket, reported);
+            }
             metrics::record_upstream_attempt(Some(status.as_u16()));
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
@@ -907,6 +932,14 @@ impl TranslatingLlmClient {
             }
         };
 
+        // A delivered transport with an unusable result is not a successful call. Recorded
+        // here, where the decoded response exists and the wire status no longer does, so
+        // that"the model answered" and "the caller got something" stay separate facts. The
+        // response itself is returned unchanged: this is an observation, not a verdict that
+        // overrides a provider that legitimately returned no text.
+        if let Some(reason) = llm_response.as_agg().and_then(unusable_answer) {
+            metrics::record_incomplete_answer(reason);
+        }
         Ok(Response {
             llm_response,
             metadata,
@@ -1242,6 +1275,43 @@ fn rests_the_model(error: &LlmClientError) -> bool {
     }
 }
 
+/// Why an answered response carries nothing a caller can use, if that is the case.
+///
+/// `HTTP 200` says the provider accepted the request and answered it. It does not say the
+/// caller received an answer. The measured case is a Gemma reply whose entire output budget
+/// went to inline `<thought>` reasoning: `completion_tokens: 0`, empty content, no tool
+/// call, status 200. Treating that as a success is how a model looks healthy in transport
+/// telemetry while every caller gets nothing, and it is how a selector learns the wrong
+/// lesson about which leg serves a task.
+///
+/// Only the unambiguous shape is flagged: no text, no tool call, no refusal, and a reported
+/// output count of zero. A response with output tokens but no visible text is left alone —
+/// that is a reasoning- or format-level question this function cannot settle, and guessing
+/// would turn a diagnostic into a false accusation.
+fn unusable_answer(agg: &switchyard_protocol::llm::AggLlmResponse) -> Option<&'static str> {
+    use switchyard_protocol::llm::ContentBlock;
+
+    let has_content = agg.outputs.iter().any(|output| {
+        output.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            // A tool call is a usable answer: the caller acts on it. A refusal is an answer
+            // too - the model declined, which is information, not silence.
+            ContentBlock::ToolCall(_) | ContentBlock::Refusal { .. } => true,
+            _ => false,
+        })
+    });
+    if has_content {
+        return None;
+    }
+    match agg.usage.output_tokens {
+        Some(0) => Some("empty_answer_zero_completion"),
+        None => Some("empty_answer_no_usage"),
+        // Output was produced but none of it is visible: the model spent its budget on
+        // reasoning, which is a real and separate condition, not an empty answer.
+        Some(_) => Some("empty_answer_reasoning_only"),
+    }
+}
+
 fn is_transient_failure(error: &LlmClientError) -> bool {
     // Checked before the status table: 429 is retryable in general, but a daily
     // account cap is not a throttle that clears in a moment.
@@ -1260,6 +1330,9 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         // attempt would spend the room the next request needs. The route decides whether a
         // sibling has headroom; this call does not sleep into its own throttle.
         LlmClientError::MinuteAllowanceThrottled { .. } => false,
+        // No wait on this leg makes the request smaller, and resending it would spend the
+        // window on a request this code already knows it must refuse.
+        LlmClientError::InputExceedsMinuteWindow { .. } => false,
         // Retrying resends the same payload, which is the thing that was just refused.
         LlmClientError::PayloadNotCleared { .. } => false,
         // The feature is missing from the target, not from the attempt: sending it again,

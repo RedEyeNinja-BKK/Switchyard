@@ -116,6 +116,29 @@ pub enum LlmClientError {
         retry_after_secs: u64,
     },
 
+    /// This request can never fit the target's per-minute input budget.
+    ///
+    /// Distinct from a throttle: waiting cannot help, because the request alone, with the
+    /// deployment's uncertainty margin applied, is larger than a whole minute's allowance.
+    /// The leg is servable in general and a sibling with a wider window may take the
+    /// request now, so the route advances rather than ending. It is not a capability defect
+    /// either — this model could read the input if the deployment were not pacing it.
+    #[error(
+        "an input reserving about {needed} tokens at a {margin_permille}/1000 safety margin \
+         exceeds the {limit}-token per-minute input budget for {model}; another candidate \
+         with a wider window may serve this request"
+    )]
+    InputExceedsMinuteWindow {
+        /// Target whose minute window the request cannot fit.
+        model: ModelId,
+        /// The request's reservation after the margin.
+        needed: u64,
+        /// The whole window's input budget.
+        limit: u64,
+        /// The margin applied, in permille.
+        margin_permille: u32,
+    },
+
     /// The assembled payload contains content that must not leave the deployment.
     ///
     /// Raised at the last possible moment - over the exact JSON body about to be sent -

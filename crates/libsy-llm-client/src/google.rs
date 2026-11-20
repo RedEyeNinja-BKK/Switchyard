@@ -75,6 +75,17 @@ pub enum GoogleCondition {
     ShortWindowThrottle,
     /// The daily quota for this exact scope is spent and resets on the provider's clock.
     DailyQuota,
+    /// A **spend-based** rolling ten-minute limit, which is a paid-tier meter.
+    ///
+    /// Kept apart from [`Self::ShortWindowThrottle`] on purpose. Google publishes spend
+    /// limits as Tier 1 $10 / Tier 2 $200 / Tier 3 $200 per ten minutes and states them as
+    /// **Free: N/A**, so requests rejected on this condition cannot be a free-tier minute
+    /// window and must not be answered with a "clears in a minute" or a same-model retry.
+    /// It is only reached from structured evidence (a quota id or metric naming spend,
+    /// billing or credits); a bare `429 RESOURCE_EXHAUSTED` stays a short-window throttle,
+    /// because inferring a spend meter from the status alone would invent a paid-tier
+    /// condition the project may not have.
+    SpendLimit,
     /// Capacity: the model or service is briefly unable to serve.
     Capacity,
     /// The exact model id is not served — retired, renamed, or never existed.
@@ -182,6 +193,16 @@ impl GoogleError {
         match condition {
             C::ShortWindowThrottle => GoogleRecovery {
                 retry_same_model: true,
+                ..GoogleRecovery::INERT
+            },
+            // A paid spend meter does not clear on a backoff and does not promise a minute:
+            // its window is ten minutes and it may not apply to this project at all. Cool the
+            // model so the route can use a sibling, and never resend the same bytes into a
+            // meter that already refused them. The candidate list is deliberately NOT
+            // stopped: a spend cap on a paid tier says nothing about whether a free leg on
+            // the same project still serves.
+            C::SpendLimit => GoogleRecovery {
+                cool_down_model: true,
                 ..GoogleRecovery::INERT
             },
             // A spent daily quota does not clear on a backoff. Its SCOPE decides how much of
@@ -301,12 +322,23 @@ pub fn parse(http: Option<u16>, body: &str) -> Option<GoogleError> {
     // when the body's own quota identifier says `PerDay`, the allowance really is spent until
     // midnight and retrying it is just a slower failure. Only the details may widen the
     // condition, never the status.
+    // Structured evidence widens a coarse status; it never narrows one. A daily quota id
+    // makes a bare throttle a spent day; a spend/billing id makes it a paid meter. Both are
+    // read only from identifiers Google itself supplied, so the status alone can never
+    // manufacture either condition.
     let condition = if names_a_daily_quota(&error)
         && matches!(
             condition,
             GoogleCondition::ShortWindowThrottle | GoogleCondition::Unknown
         ) {
         GoogleCondition::DailyQuota
+    } else if names_a_spend_limit(&error)
+        && matches!(
+            condition,
+            GoogleCondition::ShortWindowThrottle | GoogleCondition::Unknown
+        )
+    {
+        GoogleCondition::SpendLimit
     } else {
         condition
     };
@@ -430,6 +462,58 @@ fn names_a_daily_quota(error: &serde_json::Value) -> bool {
             let lowered = text.to_ascii_lowercase();
             lowered.contains("perday") || lowered.contains("per_day")
         })
+    })
+}
+
+/// Whether the body's own quota identifiers name a **spend-based** limit.
+///
+/// Paid tiers meter spend over a rolling ten minutes; the free tier does not. The only
+/// evidence that proves a spend meter is an identifier Google wrote: a quota id, quota
+/// metric, or the namespaced reason naming spend, billing or credits. Message prose is not
+/// used, because a provider sentence can mention cost while reporting a token window.
+fn names_a_spend_limit(error: &serde_json::Value) -> bool {
+    let in_metadata = error
+        .get("metadata")
+        .and_then(|metadata| match metadata {
+            serde_json::Value::Object(fields) => Some(fields.values().cloned().collect::<Vec<_>>()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let in_details = error
+        .get("details")
+        .and_then(serde_json::Value::as_array)
+        .map(|details| details.to_vec())
+        .unwrap_or_default();
+    let mut texts: Vec<String> = Vec::new();
+    for value in in_metadata {
+        if let Some(text) = value.as_str() {
+            texts.push(text.to_string());
+        }
+    }
+    for detail in in_details {
+        for key in ["reason", "domain", "quotaId", "quotaMetric"] {
+            if let Some(text) = detail.get(key).and_then(serde_json::Value::as_str) {
+                texts.push(text.to_string());
+            }
+        }
+        if let Some(object) = detail
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+        {
+            texts.extend(
+                object
+                    .values()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+    }
+    texts.iter().any(|text| {
+        let lowered = text.to_ascii_lowercase();
+        lowered.contains("spend")
+            || lowered.contains("billing")
+            || lowered.contains("credits")
+            || lowered.contains("quota_cost")
     })
 }
 

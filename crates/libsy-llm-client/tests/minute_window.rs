@@ -93,15 +93,12 @@ fn client_for(
     )])?)
 }
 
-fn paced(
-    governor: &Arc<QuotaGovernor>,
-    model: &str,
-    limits: WindowLimits,
-) -> Arc<PacedQuota> {
+fn paced(governor: &Arc<QuotaGovernor>, model: &str, limits: WindowLimits) -> Arc<PacedQuota> {
     Arc::new(PacedQuota::new(
         Arc::clone(governor),
         GovernorKey::new(GROUP, ModelId::from(model), "generate"),
         limits,
+        switchyard_llm_client::AdmissionMargin::NONE,
     ))
 }
 
@@ -114,7 +111,7 @@ fn request() -> Request {
 
 fn long_request(model: &str, characters: usize) -> Request {
     Request {
-        llm_request: text_request(Some(model.to_string()), &"a".repeat(characters)),
+        llm_request: text_request(Some(model.to_string()), "a".repeat(characters)),
         ..Request::default()
     }
 }
@@ -304,8 +301,8 @@ async fn a_sibling_model_is_not_paced_out_by_another_models_use()
 /// A request refused by the daily budget must give its minute-window slot back: nothing
 /// reached the provider, and spending the window on it would burst the day's traffic.
 #[tokio::test]
-async fn a_daily_refusal_returns_its_minute_window_slot()
--> Result<(), Box<dyn Error + Send + Sync>> {
+async fn a_daily_refusal_returns_its_minute_window_slot() -> Result<(), Box<dyn Error + Send + Sync>>
+{
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))

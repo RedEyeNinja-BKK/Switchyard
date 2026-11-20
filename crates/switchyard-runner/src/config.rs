@@ -1377,9 +1377,15 @@ impl DeploymentConfig {
     /// it waits, and two targets naming one physical model in one quota group share one
     /// window, so stating different values would make whichever loaded first the real limit.
     fn validate_minute_windows(&self) -> RunnerResult<()> {
-        let mut declared: HashMap<(String, ModelId), (Option<u64>, Option<u64>, &str)> =
-            HashMap::new();
+        // Request rate, token rate, admission pad in per mille, and the target that stated
+        // them: one declared window, as compared across aliases of one physical model.
+        type DeclaredMinuteWindow<'a> = (Option<u64>, Option<u64>, u32, &'a str);
+        let mut declared: HashMap<(String, ModelId), DeclaredMinuteWindow<'_>> = HashMap::new();
         for (target_name, target) in &self.targets {
+            // Validate the pad for every target, not only paced ones: a margin naming no
+            // token window still means the author expected padding to happen, and skipping
+            // the check would let that mistake load and surface only as absent protection.
+            let margin = admission_margin(target, target_name)?;
             if target.requests_per_minute.is_none() && target.input_tokens_per_minute.is_none() {
                 continue;
             }
@@ -1390,6 +1396,17 @@ impl DeploymentConfig {
                 )));
             }
             if let Some(limit) = target.input_tokens_per_minute {
+                // The ceiling is judged at the margin, because that is the reservation the
+                // send path will compute. Checking the raw ceiling instead would admit a
+                // manifest whose stated ceiling the governor then refuses on every request —
+                // a window that looks configured and serves nothing.
+                let safe = switchyard_llm_client::WindowLimits {
+                    requests_per_minute: target.requests_per_minute,
+                    input_tokens_per_minute: target.input_tokens_per_minute,
+                }
+                .safe_input_ceiling(margin)
+                .unwrap_or(limit);
+                let margin_per_mille = margin.permille();
                 match target.max_input_tokens {
                     None => {
                         return Err(RunnerError::configuration(format!(
@@ -1406,6 +1423,18 @@ impl DeploymentConfig {
                              a whole window can never be admitted"
                         )));
                     }
+                    // Above the margin-adjusted ceiling but not above the raw window: this
+                    // would admit nothing the governor allows, so it is a configuration that
+                    // only pretends to be open past `safe`.
+                    Some(max_input) if max_input > safe => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares max_input_tokens {max_input}, but \
+                             at an admission_margin_permille of {margin_per_mille} per mille against \
+                             input_tokens_per_minute {limit} the largest estimate it can admit \
+                             is {safe}; lower max_input_tokens to {safe} or below, or lower the \
+                             margin"
+                        )));
+                    }
                     Some(_) => {}
                 }
             }
@@ -1416,14 +1445,15 @@ impl DeploymentConfig {
                 .unwrap_or_else(|| target.llm_client.clone());
             match declared.entry((group.clone(), target.id.clone())) {
                 std::collections::hash_map::Entry::Occupied(existing) => {
-                    let (first_rpm, first_tpm, first_name) = *existing.get();
+                    let (first_rpm, first_tpm, first_margin, first_name) = *existing.get();
                     if first_rpm != target.requests_per_minute
                         || first_tpm != target.input_tokens_per_minute
+                        || first_margin != margin.permille()
                     {
                         return Err(RunnerError::configuration(format!(
                             "targets {first_name} and {target_name} share model {} in quota \
-                             group {group} but declare different per-minute limits; one window \
-                             serves them both, so state it once",
+                             group {group} but declare different per-minute limits or \
+                             admission margins; one window serves them both, so state it once",
                             target.id
                         )));
                     }
@@ -1432,6 +1462,7 @@ impl DeploymentConfig {
                     slot.insert((
                         target.requests_per_minute,
                         target.input_tokens_per_minute,
+                        margin.permille(),
                         target_name.as_str(),
                     ));
                 }
@@ -2099,6 +2130,12 @@ impl DeploymentConfig {
                         // hold this request, before any provider is contacted.
                         context_window: target.context_window,
                         max_input_tokens: target.max_input_tokens,
+                        // The bound the deployment will actually admit: the declared ceiling
+                        // capped by what a margin-padded estimate can fit in the minute
+                        // window. Computed from the same arithmetic the send path uses, so
+                        // the filter and the governor cannot disagree about where a request
+                        // stops fitting.
+                        safe_input_tokens: safe_input_tokens(target),
                     },
                 );
             }
@@ -2670,6 +2707,22 @@ struct TargetConfig {
     /// discovering that at the send path would spend eligibility on a 429.
     #[serde(default)]
     input_tokens_per_minute: Option<u64>,
+    /// How much larger than its pre-dispatch estimate a request is assumed to be, in
+    /// thousandths, when it is reserved against `input_tokens_per_minute`.
+    ///
+    /// The estimate is characters over the outbound body divided by four, which measured
+    /// against the provider's own count has erred in both directions on real prompts. This
+    /// is the protective pad that keeps a near-limit request from being dispatched on a
+    /// number the provider will exceed: at 1300, a gemma request estimating 15,202 tokens
+    /// reserves 19,763 and is refused against a 16,000 window instead of being sent and
+    /// charged 18,054.
+    ///
+    /// Not a claim of accuracy. A value below 1000 is rejected at load, because a pad that
+    /// makes the reservation smaller than the estimate is an under-count by construction.
+    /// Omitted means 1000 — the estimate as stated — so a manifest that does not declare it
+    /// keeps the behaviour it had.
+    #[serde(default)]
+    admission_margin_permille: Option<u32>,
     /// The physical model's own request window, when the deployment knows it.
     ///
     /// A route's `context_window` is what callers are promised; this is what one backing
@@ -2787,7 +2840,59 @@ fn pacing_for(
         Arc::clone(governor),
         switchyard_llm_client::GovernorKey::new(group, target.id.clone(), "generate"),
         limits,
+        // Validation already rejected a pad below 1.0, so the fallback here is the
+        // no-pad default rather than an error: this function builds, it does not judge.
+        admission_margin_opt(target),
     )))
+}
+
+/// The configured admission pad, or no pad when the target declares none.
+fn admission_margin_opt(target: &TargetConfig) -> switchyard_llm_client::AdmissionMargin {
+    target
+        .admission_margin_permille
+        .and_then(switchyard_llm_client::AdmissionMargin::from_permille)
+        .unwrap_or(switchyard_llm_client::AdmissionMargin::NONE)
+}
+
+/// The most estimated input a target will admit, mirroring the send path's arithmetic.
+///
+/// `None` when the target declares no minute token window. Otherwise the smaller of the
+/// declared per-request ceiling and the largest estimate a margin-padded reservation can
+/// fit. A target that declares a window but no ceiling is already a load error, so the
+/// `max_input_tokens` arm is only for completeness.
+fn safe_input_tokens(target: &TargetConfig) -> Option<u64> {
+    let limits = switchyard_llm_client::WindowLimits {
+        requests_per_minute: target.requests_per_minute,
+        input_tokens_per_minute: target.input_tokens_per_minute,
+    };
+    let window = limits.safe_input_ceiling(admission_margin_opt(target))?;
+    Some(match target.max_input_tokens {
+        Some(ceiling) => ceiling.min(window),
+        None => window,
+    })
+}
+
+/// The admission pad, with load-time validation of the declared value.
+fn admission_margin(
+    target: &TargetConfig,
+    target_name: &str,
+) -> RunnerResult<switchyard_llm_client::AdmissionMargin> {
+    let Some(declared) = target.admission_margin_permille else {
+        return Ok(switchyard_llm_client::AdmissionMargin::NONE);
+    };
+    if target.input_tokens_per_minute.is_none() {
+        return Err(RunnerError::configuration(format!(
+            "target {target_name} declares admission_margin_permille {declared} without \
+             input_tokens_per_minute; the margin pads a token reservation, and there is no \
+             token window here to pad, so it would protect nothing"
+        )));
+    }
+    switchyard_llm_client::AdmissionMargin::from_permille(declared).ok_or_else(|| {
+        RunnerError::configuration(format!(
+            "target {target_name} declares admission_margin_permille {declared}; a margin below \
+             1000 would reserve less than the estimate, which is an under-count by construction"
+        ))
+    })
 }
 #[allow(clippy::too_many_arguments)]
 fn build_backend(
@@ -2913,6 +3018,146 @@ fn validate_value(label: &str, value: &str) -> RunnerResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Loads a deployment that must be refused, returning the refusal text.
+    ///
+    /// `Runner` has no `Debug` impl, so `expect_err` cannot be used; matching keeps the
+    /// failure honest - a successful load panics rather than being reported as a refusal.
+    fn refuse(source: &str) -> String {
+        match runner_from_toml(source) {
+            Ok(_) => panic!("deployment loaded but should have been refused"),
+            Err(error) => format!("{error}"),
+        }
+    }
+
+    /// A deployment whose paced lane declares a margin but no token window refuses to load.
+    ///
+    /// The margin pads a token reservation. A target with no `input_tokens_per_minute` has
+    /// nothing to pad, so the declaration states an intent the runtime cannot honour. This
+    /// was reachable only through the helper: the paced-target check ran first and skipped
+    /// unpaced targets before the margin was ever validated.
+    #[test]
+    fn a_margin_without_a_token_window_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("without input_tokens_per_minute"),
+            "refusal must name the missing window, got: {message}"
+        );
+        assert!(
+            message.contains("protect nothing"),
+            "refusal must say the margin protects nothing, got: {message}"
+        );
+    }
+
+    /// A margin below parity reserves less than the estimate, which is an under-count by
+    /// construction. It must be refused rather than silently clamped.
+    #[test]
+    fn a_margin_below_parity_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 900
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("below") && message.contains("1000"),
+            "refusal must name the parity floor, got: {message}"
+        );
+    }
+
+    /// The measured overrun, expressed as a manifest: a 16,000-token window padded by 1,300
+    /// per mille can admit at most 12,307 estimated tokens, so a 16,000-token ceiling is a
+    /// promise the governor would refuse on every large request.
+    #[test]
+    fn a_ceiling_above_the_padded_window_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 16000
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("12307"),
+            "refusal must state the derived ceiling 12307, got: {message}"
+        );
+    }
+
+    /// The honest form of the same lane loads: the ceiling is lowered to what the padded
+    /// window can actually admit.
+    #[test]
+    fn a_padded_lane_loads_at_its_derived_ceiling() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 12307
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        runner_from_toml(config).expect("the derived ceiling is admittable");
+    }
 
     /// Locality is the client's own declaration, not a cost class read from billing.
     ///
@@ -5602,7 +5847,10 @@ mod composition_closure_tests {
         )
         .validate_minute_windows()
         .expect_err("one window cannot have two limits");
-        assert!(error.to_string().contains("one window serves them both"), "{error}");
+        assert!(
+            error.to_string().contains("one window serves them both"),
+            "{error}"
+        );
 
         paced_config(
             "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\

@@ -1,0 +1,29 @@
+# Gemini capability staging fragment -- generated, do not hand-edit.
+# source crosswalk sha256: fd8acaf767c5265c1991f10047e035ac4258734b8609908ac58ce6a612ae7abd
+#
+# apply today: no
+# only 1 primitive(s) have an executable candidate; a composite needs two legs before reparenting the live composite buys anything, and emitting a primitive without it would give one provider-model quota a second route
+#
+# Only routes whose every candidate is wire-qualified are emitted. Held
+# primitives are recorded as comments with the gate that releases them, so
+# nothing here promises a capability the deployment cannot serve.
+
+# HELD [composites.smart_gemini] -- only 1 primitive(s) have an executable candidate; a composite needs two legs before reparenting the live composite buys anything, and emitting a primitive without it would give one provider-model quota a second route
+
+# HELD [routes.smart-gemini-bounded] -- no small-budget member is wire-qualified yet; emitting the route would claim a capability no target can serve
+#   releases when wire-qualified:
+#     direct-google-gemma-4-26b-a4b-it
+#     direct-google-gemma-4-31b-it
+
+# HELD [routes.smart-gemini-chat] -- emit gated on the composite: general free-project chat
+#   candidates available today:
+#     direct-google-gemini-3.5-flash-lite
+#     direct-google-gemini-3.1-flash-lite
+
+# HELD [routes.smart-gemini-long-context] -- every remaining member was already claimed by a more specific primitive; a second leg over the same models would spend one provider-model quota twice
+
+# HELD [routes.smart-gemini-vision] -- the deployed Gemini leaves declare vision = false; the two wire-qualified Lite models are not image-qualified in the deployment, so a vision primitive would promise what they refuse
+
+# HELD [routes.smart-gemini-antigravity] -- agent.run has no adapter; see adapter_requirement
+
+# HELD [routes.smart-gemini-live] -- session.live has no adapter; see adapter_requirement

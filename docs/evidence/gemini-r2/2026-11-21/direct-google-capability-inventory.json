@@ -1,0 +1,2338 @@
+{
+  "schema": 1,
+  "kind": "gemini-free-project-capability-inventory",
+  "generated_from": {
+    "crosswalk_sha256": "fd8acaf767c5265c1991f10047e035ac4258734b8609908ac58ce6a612ae7abd",
+    "owner_confirmed_date": "2026-11-21",
+    "project": "Default Gemini Project",
+    "tier": "Free",
+    "source_official_doc": "https://ai.google.dev/gemini-api/docs/rate-limits",
+    "current_switchyard_release": "20261120T181049Z-a5b9dffc7f198716-f0546288"
+  },
+  "totals": {
+    "models": 47,
+    "feature_quotas": 23,
+    "chat_capable": 17,
+    "routable_today": 2,
+    "held": 45,
+    "small_bounded_only": 2,
+    "by_state": {
+      "HELD_WIRE_UNQUALIFIED": 7,
+      "EXECUTABLE_AND_DEPLOYED": 2,
+      "HELD_NON_CHAT_TRANSPORT": 30,
+      "HELD_NATIVE_ID_UNRESOLVED": 4,
+      "HELD_ZERO_RPD_ALLOWANCE_UNSHOWN": 4
+    }
+  },
+  "invariants": {
+    "declared_models": 47,
+    "matches_crosswalk": true,
+    "declared_feature_rows": 23,
+    "feature_rows_match": true,
+    "native_ids_shared_between_rows": {},
+    "one_quota_counter_per_native_model": true
+  },
+  "models": [
+    {
+      "index": 1,
+      "display_name": "Gemini 3.6 Flash",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-3.6-flash",
+      "native_model_id_candidates": [
+        "gemini-3.6-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.6-flash",
+      "quota": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 3
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 53
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 23
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_WIRE_UNQUALIFIED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a cached native id. The transport exists but no call has proven the id, version mapping and serving behaviour on the wire.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Observed 1-day peak exceeds 20 RPD denominator; remaining unknown."
+    },
+    {
+      "index": 2,
+      "display_name": "Gemini 3.8 Flash",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-3.8-flash",
+      "native_model_id_candidates": [
+        "gemini-3.8-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-flash",
+      "quota": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 3
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 53
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 22
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_WIRE_UNQUALIFIED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a cached native id. The transport exists but no call has proven the id, version mapping and serving behaviour on the wire.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Observed 1-day peak exceeds 20 RPD denominator; remaining unknown."
+    },
+    {
+      "index": 3,
+      "display_name": "Gemini 3.5 Flash Lite",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-3.5-flash-lite",
+      "native_model_id_candidates": [
+        "gemini-3.5-flash-lite"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-flash-lite",
+      "quota": {
+        "rpm": {
+          "limit": 15,
+          "peak_usage_selected_1d": 6
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 591
+        },
+        "rpd": {
+          "limit": 500,
+          "peak_usage_selected_1d": 10
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "EXECUTABLE_AND_DEPLOYED",
+      "chat_capable": true,
+      "routable_today": true,
+      "small_bounded_only": false,
+      "adapter_requirement": null,
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Deployed live, no Google wire request yet."
+    },
+    {
+      "index": 4,
+      "display_name": "Gemini 3.1 Flash Lite",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-3.1-flash-lite",
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-lite"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.1-flash-lite",
+      "quota": {
+        "rpm": {
+          "limit": 15,
+          "peak_usage_selected_1d": 5
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 396
+        },
+        "rpd": {
+          "limit": 500,
+          "peak_usage_selected_1d": 12
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "EXECUTABLE_AND_DEPLOYED",
+      "chat_capable": true,
+      "routable_today": true,
+      "small_bounded_only": false,
+      "adapter_requirement": null,
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Deployed live, no Google wire request yet."
+    },
+    {
+      "index": 5,
+      "display_name": "Antigravity",
+      "category": "agent",
+      "operation_contract": "agent.run",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "antigravity-preview-09-2026",
+        "antigravity-preview-latest",
+        "antigravity-preview-05-2026"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": "direct-google-antigravity",
+      "quota": {
+        "rpm": {
+          "limit": 60,
+          "peak_usage_selected_1d": 1
+        },
+        "tpm": {
+          "limit": 100000,
+          "peak_usage_selected_1d": 5450
+        },
+        "rpd": {
+          "limit": 100,
+          "peak_usage_selected_1d": 3
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "managed-agent session API (agents.run) over an asynchronous task/session handle; not a chat completion. Needs an adapter that submits, polls and projects agent output into Switchyard's response shape.",
+      "capability_route_candidates": [
+        "smart-gemini-antigravity"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 6,
+      "display_name": "Deep Research Pro Preview",
+      "category": "agent",
+      "operation_contract": "agent.run",
+      "native_model_id": "deep-research-pro-preview-12-2025",
+      "native_model_id_candidates": [
+        "deep-research-pro-preview-12-2025"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "managed-agent session API (agents.run) over an asynchronous task/session handle; not a chat completion. Needs an adapter that submits, polls and projects agent output into Switchyard's response shape.",
+      "capability_route_candidates": [
+        "smart-gemini-antigravity"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 7,
+      "display_name": "Gemini 2 Flash",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": null,
+      "native_model_id_candidates": [],
+      "native_id_evidence": "NO_LISTING_MATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NATIVE_ID_UNRESOLVED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with no resolved native model id. A name must be observed, never derived from the display name.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 8,
+      "display_name": "Gemini 2 Flash Lite",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": null,
+      "native_model_id_candidates": [],
+      "native_id_evidence": "NO_LISTING_MATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NATIVE_ID_UNRESOLVED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with no resolved native model id. A name must be observed, never derived from the display name.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 9,
+      "display_name": "Computer Use Preview",
+      "category": "other",
+      "operation_contract": "unknown",
+      "native_model_id": "gemini-2.5-computer-use-preview-10-2025",
+      "native_model_id_candidates": [
+        "gemini-2.5-computer-use-preview-10-2025"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 131072,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "operation not identified in the evidence. It must be classified before any adapter work; routing it as chat would guess.",
+      "capability_route_candidates": [
+        "smart-gemini-other"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 10,
+      "display_name": "Gemini 2.5 Flash",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-2.5-flash",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash",
+      "quota": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_WIRE_UNQUALIFIED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a cached native id. The transport exists but no call has proven the id, version mapping and serving behaviour on the wire.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation."
+    },
+    {
+      "index": 11,
+      "display_name": "Nano Banana (Gemini 2.5 Flash Preview Image)",
+      "category": "image",
+      "operation_contract": "image.generate",
+      "native_model_id": "gemini-2.5-flash-image",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-image"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 32768,
+      "native_output_limit": 32768,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "image generation (responseModalities=IMAGE) returning image parts. Needs an image-payload response path and a size/aspect selector.",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 12,
+      "display_name": "Gemini 2.5 Flash Lite",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-2.5-flash-lite",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-lite"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash-lite",
+      "quota": {
+        "rpm": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_WIRE_UNQUALIFIED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a cached native id. The transport exists but no call has proven the id, version mapping and serving behaviour on the wire.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Earlier project wire probe returned 404; explicitly HELD."
+    },
+    {
+      "index": 13,
+      "display_name": "Gemini 2.5 Flash TTS",
+      "category": "tts",
+      "operation_contract": "audio.synthesize",
+      "native_model_id": "gemini-2.5-flash-preview-tts",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-preview-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 8192,
+      "native_output_limit": 16384,
+      "native_generation_methods": [
+        "countTokens",
+        "generateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash-preview-tts",
+      "quota": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "speech synthesis (generateContent with responseModalities=AUDIO) returning audio bytes rather than chat text. Needs an audio-payload response path and a voice/format selector.",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 14,
+      "display_name": "Gemini 2.5 Pro",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-2.5-pro",
+      "native_model_id_candidates": [
+        "gemini-2.5-pro"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_ZERO_RPD_ALLOWANCE_UNSHOWN",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a native id, but the project shows no request allowance for it. Retained because a zero observed peak is not proof of no allocation; not routable until an allowance is observed.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 15,
+      "display_name": "Gemini 2.5 Pro TTS",
+      "category": "tts",
+      "operation_contract": "audio.synthesize",
+      "native_model_id": "gemini-2.5-pro-preview-tts",
+      "native_model_id_candidates": [
+        "gemini-2.5-pro-preview-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 8192,
+      "native_output_limit": 16384,
+      "native_generation_methods": [
+        "countTokens",
+        "generateContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "speech synthesis (generateContent with responseModalities=AUDIO) returning audio bytes rather than chat text. Needs an audio-payload response path and a voice/format selector.",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 16,
+      "display_name": "Gemini 3 Flash",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3-flash-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": "direct-google-gemini-3-flash",
+      "quota": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NATIVE_ID_UNRESOLVED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with no resolved native model id. A name must be observed, never derived from the display name.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Cached listing version does not exactly match UI display version."
+    },
+    {
+      "index": 17,
+      "display_name": "Nano Banana Pro (Gemini 3 Pro Image)",
+      "category": "image",
+      "operation_contract": "image.generate",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3-pro-image",
+        "gemini-3-pro-image-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "image generation (responseModalities=IMAGE) returning image parts. Needs an image-payload response path and a size/aspect selector.",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 18,
+      "display_name": "Gemini 3.1 Pro",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-pro-preview-customtools"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NATIVE_ID_UNRESOLVED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with no resolved native model id. A name must be observed, never derived from the display name.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 19,
+      "display_name": "Nano Banana 2 (Gemini 3.1 Flash Image)",
+      "category": "image",
+      "operation_contract": "image.generate",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-image-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "image generation (responseModalities=IMAGE) returning image parts. Needs an image-payload response path and a size/aspect selector.",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 20,
+      "display_name": "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
+      "category": "image",
+      "operation_contract": "image.generate",
+      "native_model_id": "gemini-3.1-flash-lite-image",
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-lite-image"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 65536,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "image generation (responseModalities=IMAGE) returning image parts. Needs an image-payload response path and a size/aspect selector.",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 21,
+      "display_name": "Gemini 3.1 Flash TTS",
+      "category": "tts",
+      "operation_contract": "audio.synthesize",
+      "native_model_id": "gemini-3.1-flash-tts-preview",
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-tts-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 8192,
+      "native_output_limit": 16384,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.1-flash-tts-preview",
+      "quota": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "speech synthesis (generateContent with responseModalities=AUDIO) returning audio bytes rather than chat text. Needs an audio-payload response path and a voice/format selector.",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 22,
+      "display_name": "Gemini 3.5 Transcribe",
+      "category": "transcribe",
+      "operation_contract": "audio.transcribe",
+      "native_model_id": "gemini-3.5-transcribe",
+      "native_model_id_candidates": [
+        "gemini-3.5-transcribe"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 98304,
+      "native_output_limit": 32768,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-transcribe",
+      "quota": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 25,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "transcription (generateContent over an audio part) returning text and segment metadata. Needs an audio-input carrier and a transcription-shaped response, not a chat completion.",
+      "capability_route_candidates": [
+        "smart-gemini-transcribe"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 23,
+      "display_name": "Gemini 3.8 Flash Lite TTS",
+      "category": "tts",
+      "operation_contract": "audio.synthesize",
+      "native_model_id": "gemini-3.8-flash-lite-tts",
+      "native_model_id_candidates": [
+        "gemini-3.8-flash-lite-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 8192,
+      "native_output_limit": 16384,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-flash-lite-tts",
+      "quota": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "speech synthesis (generateContent with responseModalities=AUDIO) returning audio bytes rather than chat text. Needs an audio-payload response path and a voice/format selector.",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 24,
+      "display_name": "Gemini 3.8 Flash TTS",
+      "category": "tts",
+      "operation_contract": "audio.synthesize",
+      "native_model_id": "gemini-3.8-flash-tts",
+      "native_model_id_candidates": [
+        "gemini-3.8-flash-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 8192,
+      "native_output_limit": 16384,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-flash-tts",
+      "quota": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "speech synthesis (generateContent with responseModalities=AUDIO) returning audio bytes rather than chat text. Needs an audio-payload response path and a voice/format selector.",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 25,
+      "display_name": "Gemini 4 Argon",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-4-argon",
+      "native_model_id_candidates": [
+        "gemini-4-argon"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 32768,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_ZERO_RPD_ALLOWANCE_UNSHOWN",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a native id, but the project shows no request allowance for it. Retained because a zero observed peak is not proof of no allocation; not routable until an allowance is observed.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 26,
+      "display_name": "Gemini 4 Carbon",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-4-carbon",
+      "native_model_id_candidates": [
+        "gemini-4-carbon"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 32768,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_ZERO_RPD_ALLOWANCE_UNSHOWN",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a native id, but the project shows no request allowance for it. Retained because a zero observed peak is not proof of no allocation; not routable until an allowance is observed.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 27,
+      "display_name": "Gemini 4 Hydrogen",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-4-hydrogen",
+      "native_model_id_candidates": [
+        "gemini-4-hydrogen"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-4-hydrogen",
+      "quota": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_WIRE_UNQUALIFIED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a cached native id. The transport exists but no call has proven the id, version mapping and serving behaviour on the wire.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation."
+    },
+    {
+      "index": 28,
+      "display_name": "Gemini 4 Neon",
+      "category": "text",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemini-4-neon",
+      "native_model_id_candidates": [
+        "gemini-4-neon"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_ZERO_RPD_ALLOWANCE_UNSHOWN",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "chat.complete with a native id, but the project shows no request allowance for it. Retained because a zero observed peak is not proof of no allocation; not routable until an allowance is observed.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 29,
+      "display_name": "Gemini Decision 1",
+      "category": "decision",
+      "operation_contract": "decision.score",
+      "native_model_id": "gemini-decision-1",
+      "native_model_id_candidates": [
+        "gemini-decision-1"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 262144,
+      "native_output_limit": 1,
+      "native_generation_methods": [
+        "createDecision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-decision-1",
+      "quota": {
+        "rpm": {
+          "limit": 200,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 50000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "typed decision transport. Switchyard already has a dedicated decision wire family and a per-target decision_* configuration block; this row needs that transport bound to it, not a chat leaf.",
+      "capability_route_candidates": [
+        "smart-gemini-decision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 30,
+      "display_name": "Gemini Embedding 1",
+      "category": "embedding",
+      "operation_contract": "vector.embed",
+      "native_model_id": "gemini-embedding-001",
+      "native_model_id_candidates": [
+        "gemini-embedding-001"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 2048,
+      "native_output_limit": 1,
+      "native_generation_methods": [
+        "embedContent",
+        "countTextTokens",
+        "countTokens",
+        "asyncBatchEmbedContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-embedding-001",
+      "quota": {
+        "rpm": {
+          "limit": 100,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 30000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 1000,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "embedding endpoint (:embedContent / :batchEmbedContents) returning vectors. Switchyard has no embeddings surface for this deployment; needs a typed embedding route, not a chat leaf.",
+      "capability_route_candidates": [
+        "smart-gemini-embedding"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 31,
+      "display_name": "Gemini Embedding 2",
+      "category": "embedding",
+      "operation_contract": "vector.embed",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-embedding-2",
+        "gemini-embedding-2-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": "direct-google-gemini-embedding-2",
+      "quota": {
+        "rpm": {
+          "limit": 100,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 30000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 1000,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "embedding endpoint (:embedContent / :batchEmbedContents) returning vectors. Switchyard has no embeddings surface for this deployment; needs a typed embedding route, not a chat leaf.",
+      "capability_route_candidates": [
+        "smart-gemini-embedding"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 32,
+      "display_name": "Gemini Nano Banana 2.1",
+      "category": "image",
+      "operation_contract": "image.generate",
+      "native_model_id": "gemini-nano-banana-2.1",
+      "native_model_id_candidates": [
+        "gemini-nano-banana-2.1"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 65536,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "image generation (responseModalities=IMAGE) returning image parts. Needs an image-payload response path and a size/aspect selector.",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 33,
+      "display_name": "Gemini Omni 1.1 Flash",
+      "category": "multimodal_gen",
+      "operation_contract": "multimodal.generate",
+      "native_model_id": "gemini-omni-1.1-flash",
+      "native_model_id_candidates": [
+        "gemini-omni-1.1-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 131072,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "omni multimodal generation returning mixed-modality parts. Needs a multi-part response adapter with per-modality egress accounting.",
+      "capability_route_candidates": [
+        "smart-gemini-multimodal"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 34,
+      "display_name": "Gemini Omni 1.2 Flash",
+      "category": "multimodal_gen",
+      "operation_contract": "multimodal.generate",
+      "native_model_id": "gemini-omni-1.2-flash",
+      "native_model_id_candidates": [
+        "gemini-omni-1.2-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 131072,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "omni multimodal generation returning mixed-modality parts. Needs a multi-part response adapter with per-modality egress accounting.",
+      "capability_route_candidates": [
+        "smart-gemini-multimodal"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 35,
+      "display_name": "Gemini Robotics ER 2 Preview",
+      "category": "robotics",
+      "operation_contract": "robotics.perceive",
+      "native_model_id": "gemini-robotics-er-2-preview",
+      "native_model_id_candidates": [
+        "gemini-robotics-er-2-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 131072,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-robotics-er-2-preview",
+      "quota": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "robotics ER endpoint with embodied-action outputs. Needs a robotics adapter; the response is not text.",
+      "capability_route_candidates": [
+        "smart-gemini-robotics"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 36,
+      "display_name": "Gemma 4 26B",
+      "category": "other",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemma-4-26b-a4b-it",
+      "native_model_id_candidates": [
+        "gemma-4-26b-a4b-it"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 262144,
+      "native_output_limit": 32768,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemma-4-26b-a4b-it",
+      "quota": {
+        "rpm": {
+          "limit": 30,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 16000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 14400,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_WIRE_UNQUALIFIED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": true,
+      "adapter_requirement": "chat.complete with a cached native id. The transport exists but no call has proven the id, version mapping and serving behaviour on the wire.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation.",
+      "bounded_note": "per-minute input budget 16000 tokens qualifies this model for small bounded agent tasks only; a 256K prompt cannot be served within its own TPM allowance"
+    },
+    {
+      "index": 37,
+      "display_name": "Gemma 4 31B",
+      "category": "other",
+      "operation_contract": "chat.complete",
+      "native_model_id": "gemma-4-31b-it",
+      "native_model_id_candidates": [
+        "gemma-4-31b-it"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 262144,
+      "native_output_limit": 32768,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemma-4-31b-it",
+      "quota": {
+        "rpm": {
+          "limit": 30,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 16000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 14400,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_WIRE_UNQUALIFIED",
+      "chat_capable": true,
+      "routable_today": false,
+      "small_bounded_only": true,
+      "adapter_requirement": "chat.complete with a cached native id. The transport exists but no call has proven the id, version mapping and serving behaviour on the wire.",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation.",
+      "bounded_note": "per-minute input budget 16000 tokens qualifies this model for small bounded agent tasks only; a 256K prompt cannot be served within its own TPM allowance"
+    },
+    {
+      "index": 38,
+      "display_name": "Genie 4",
+      "category": "world",
+      "operation_contract": "world.generate",
+      "native_model_id": "genie-4",
+      "native_model_id_candidates": [
+        "genie-4"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "world-model generation producing interactive world state. Needs a bespoke adapter; no part of it fits a chat leaf.",
+      "capability_route_candidates": [
+        "smart-gemini-world"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 39,
+      "display_name": "Lyria 3 Clip",
+      "category": "music",
+      "operation_contract": "music.stream",
+      "native_model_id": "lyria-3-clip-preview",
+      "native_model_id_candidates": [
+        "lyria-3-clip-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "music generation endpoint returning an audio stream. Needs a streaming audio adapter with its own session lifetime.",
+      "capability_route_candidates": [
+        "smart-gemini-music-realtime"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 40,
+      "display_name": "Lyria 3 Pro",
+      "category": "music",
+      "operation_contract": "music.stream",
+      "native_model_id": "lyria-3-pro-preview",
+      "native_model_id_candidates": [
+        "lyria-3-pro-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "proposed_direct_contract_name": null,
+      "quota": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "music generation endpoint returning an audio stream. Needs a streaming audio adapter with its own session lifetime.",
+      "capability_route_candidates": [
+        "smart-gemini-music-realtime"
+      ],
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 41,
+      "display_name": "Lyria Realtime",
+      "category": "music",
+      "operation_contract": "music.stream",
+      "native_model_id": "lyria-realtime-exp",
+      "native_model_id_candidates": [
+        "lyria-realtime-exp"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 1048576,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "bidiGenerateMusic"
+      ],
+      "proposed_direct_contract_name": "direct-google-lyria-realtime-exp",
+      "quota": {
+        "rpm": {
+          "limit": 15,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": "-",
+          "peak_usage_selected_1d": "-"
+        },
+        "rpd": {
+          "limit": 1500,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "music generation endpoint returning an audio stream. Needs a streaming audio adapter with its own session lifetime.",
+      "capability_route_candidates": [
+        "smart-gemini-music-realtime"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 42,
+      "display_name": "Gemini 2.5 Flash Native Audio Dialog",
+      "category": "live",
+      "operation_contract": "session.live",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-native-audio-latest",
+        "gemini-2.5-flash-native-audio-preview-12-2025",
+        "gemini-2.5-flash-native-audio-preview-09-2025"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash-native-audio-dialog",
+      "quota": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 1000000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "bidirectional Live API session (BidiGenerateContent over a WebSocket). Needs a stateful streaming session adapter with audio in/out; a request/response leaf cannot carry it.",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 43,
+      "display_name": "Gemini 3 Flash Live",
+      "category": "live",
+      "operation_contract": "session.live",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-live-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "native_input_limit": null,
+      "native_output_limit": null,
+      "native_generation_methods": [],
+      "proposed_direct_contract_name": "direct-google-gemini-3-flash-live",
+      "quota": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 65000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "bidirectional Live API session (BidiGenerateContent over a WebSocket). Needs a stateful streaming session adapter with audio in/out; a request/response leaf cannot carry it.",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat. Cached listing version does not exactly match UI display version."
+    },
+    {
+      "index": 44,
+      "display_name": "Gemini 3.5 Live Translate",
+      "category": "live",
+      "operation_contract": "session.live",
+      "native_model_id": "gemini-3.5-live-translate-preview",
+      "native_model_id_candidates": [
+        "gemini-3.5-live-translate-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 16384,
+      "native_output_limit": 32768,
+      "native_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-live-translate-preview",
+      "quota": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 20000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "bidirectional Live API session (BidiGenerateContent over a WebSocket). Needs a stateful streaming session adapter with audio in/out; a request/response leaf cannot carry it.",
+      "capability_route_candidates": [
+        "smart-gemini-live-translate"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 45,
+      "display_name": "Gemini 3.5 Transcribe Live",
+      "category": "live",
+      "operation_contract": "session.live",
+      "native_model_id": "gemini-3.5-transcribe-live",
+      "native_model_id_candidates": [
+        "gemini-3.5-transcribe-live"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 131072,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-transcribe-live",
+      "quota": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 20000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "bidirectional Live API session (BidiGenerateContent over a WebSocket). Needs a stateful streaming session adapter with audio in/out; a request/response leaf cannot carry it.",
+      "capability_route_candidates": [
+        "smart-gemini-live-transcribe"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 46,
+      "display_name": "Gemini 3.8 Live",
+      "category": "live",
+      "operation_contract": "session.live",
+      "native_model_id": "gemini-3.8-live",
+      "native_model_id_candidates": [
+        "gemini-3.8-live"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 131072,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-live",
+      "quota": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 65000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "bidirectional Live API session (BidiGenerateContent over a WebSocket). Needs a stateful streaming session adapter with audio in/out; a request/response leaf cannot carry it.",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 47,
+      "display_name": "Gemini 3.8 Live Extended Thinking",
+      "category": "live",
+      "operation_contract": "session.live",
+      "native_model_id": "gemini-3.8-live-extended-thinking",
+      "native_model_id_candidates": [
+        "gemini-3.8-live-extended-thinking"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "native_input_limit": 131072,
+      "native_output_limit": 65536,
+      "native_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-live-extended-thinking",
+      "quota": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 65000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "state": "HELD_NON_CHAT_TRANSPORT",
+      "chat_capable": false,
+      "routable_today": false,
+      "small_bounded_only": false,
+      "adapter_requirement": "bidirectional Live API session (BidiGenerateContent over a WebSocket). Needs a stateful streaming session adapter with audio in/out; a request/response leaf cannot carry it.",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    }
+  ],
+  "feature_quotas": [
+    {
+      "index": 1,
+      "display_name": "Map grounding / Deep Research Pro Preview",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 2,
+      "display_name": "Map grounding / Gemini 2 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 3,
+      "display_name": "Map grounding / Computer Use Preview",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 4,
+      "display_name": "Map grounding / Gemini 2.5 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 5,
+      "display_name": "Map grounding / Gemini 2.5 Flash Lite",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 6,
+      "display_name": "Map grounding / Gemini 2.5 Pro",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 7,
+      "display_name": "Map grounding / Gemini 3 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 8,
+      "display_name": "Map grounding / Gemini 3.1 Pro",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 9,
+      "display_name": "Map grounding / Gemini 3.1 Flash Lite",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 10,
+      "display_name": "Map grounding / Gemini 3.1 Flash TTS",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 11,
+      "display_name": "Map grounding / Gemini 3.6 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 12,
+      "display_name": "Map grounding / Gemini 3.5 Flash Lite",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 13,
+      "display_name": "Map grounding / Gemini 3.5 Transcribe",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 14,
+      "display_name": "Map grounding / Gemini 3.8 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 15,
+      "display_name": "Map grounding / Gemini 4 Argon",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 16,
+      "display_name": "Map grounding / Gemini 4 Carbon",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 17,
+      "display_name": "Map grounding / Gemini 4 Hydrogen",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 18,
+      "display_name": "Map grounding / Gemini 4 Neon",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 19,
+      "display_name": "Map grounding / Gemini Robotics ER 2 Preview",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 20,
+      "display_name": "Search grounding / Gemini 2",
+      "rpd": {
+        "limit": 1500,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "FEATURE_QUOTA_PRESENT",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "Do not count this feature quota as an independent model request budget or infer unique pools from label."
+    },
+    {
+      "index": 21,
+      "display_name": "Search grounding / Gemini 2.5",
+      "rpd": {
+        "limit": 1500,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "FEATURE_QUOTA_PRESENT",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "Do not count this feature quota as an independent model request budget or infer unique pools from label."
+    },
+    {
+      "index": 22,
+      "display_name": "Search grounding / Gemini 3 and newer",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 23,
+      "display_name": "Search grounding / Default",
+      "rpd": {
+        "limit": 1500,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "FEATURE_QUOTA_PRESENT",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_TOOL_QUOTA_NOT_A_MODEL_ENDPOINT",
+      "notes": "Do not count this feature quota as an independent model request budget or infer unique pools from label."
+    }
+  ]
+}

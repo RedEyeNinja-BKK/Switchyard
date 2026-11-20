@@ -1,0 +1,2194 @@
+{
+  "schema": 1,
+  "kind": "owner-attested-complete-free-project-capability-crosswalk",
+  "owner_confirmed_date": "2026-11-21",
+  "project": "Default Gemini Project",
+  "tier": "Free",
+  "evidence_origin": "Owner pasted logged-in Google AI Studio model+tools rate-limit table in chat on 2026-11-21; values equal prior owner-transcribed 1 Day table pinned 2026-11-20.",
+  "source_dashboard_path": "docs/evidence/gemini-r1/2026-11-20/owner-ai-studio-rate-limits-1d.json",
+  "source_listed_models_path": "docs/evidence/gemini-r1/2026-11-20/models-listing-20261120.json (PR #53, cached model descriptions, not verification of latest serving)",
+  "source_official_doc": "https://ai.google.dev/gemini-api/docs/rate-limits",
+  "current_switchyard_release": "20261120T181049Z-a5b9dffc7f198716-f0546288",
+  "caution": [
+    "Positive finite RPD and Unlimited indicate a free-tier project quota slot allocated for this entry; zero usage numerator does not negate the allowance.",
+    "Quota allocation != credential/model serving today != Switchyard wire/adapter compatibility != route activated. Only two Lite chat directs currently deployed and neither has been Google-wire-tested.",
+    "x/y means displayed selected-window peak divided by quota LIMIT; x is not provider-day exact used and y-x is not verified remaining. 3.6 and 3.8 exceed denominator as displayed. Preserve both.",
+    "Unlimited RPD is not infinite throughput: TPM, session, protocol and provider service policies apply.",
+    "All direct_contract names except the two existing directs are PROPOSED NAMES/CONTRACTS, not active TOML routes; native ID unknown or ambiguous remains null. Never invent native wire IDs.",
+    "Different operations need typed transports: embeddings, Decision, Live, TTS, ASR, robotics, music and managed agents are not ordinary chat-completion leaves. Features are tools not model endpoints.",
+    "Same physical model reused in several primitives has ONE provider project-model quota; aliases/versions/grounding feature quotas cannot multiply it.",
+    "All Google Free egress requires trusted full-payload clearance; current signed class/scope/day header and regex scanning are not a reliable general privacy classifier; no arbitrary agent migration.",
+    "No live Google call, deployment, or merge is authorized by this evidence."
+  ],
+  "totals": {
+    "all_models": 47,
+    "finite_positive": 21,
+    "unlimited_rpd": 6,
+    "zero_rpd": 20,
+    "quota_present_total": 27,
+    "feature_rows": 23,
+    "feature_positive": 3,
+    "feature_zero": 20,
+    "live_direct_routes": 2
+  },
+  "models": [
+    {
+      "index": 1,
+      "display_name": "Gemini 3.6 Flash",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 3
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 53
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 23
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.6-flash",
+      "native_model_id_candidates": [
+        "gemini-3.6-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.6-flash",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Observed 1-day peak exceeds 20 RPD denominator; remaining unknown."
+    },
+    {
+      "index": 2,
+      "display_name": "Gemini 3.8 Flash",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 3
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 53
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 22
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.8-flash",
+      "native_model_id_candidates": [
+        "gemini-3.8-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-flash",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Observed 1-day peak exceeds 20 RPD denominator; remaining unknown."
+    },
+    {
+      "index": 3,
+      "display_name": "Gemini 3.5 Flash Lite",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 15,
+          "peak_usage_selected_1d": 6
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 591
+        },
+        "rpd": {
+          "limit": 500,
+          "peak_usage_selected_1d": 10
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.5-flash-lite",
+      "native_model_id_candidates": [
+        "gemini-3.5-flash-lite"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-flash-lite",
+      "direct_contract_is_executable": true,
+      "route_status": "LIVE_UNEXERCISED",
+      "qualification_notes": "Deployed live, no Google wire request yet."
+    },
+    {
+      "index": 4,
+      "display_name": "Gemini 3.1 Flash Lite",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 15,
+          "peak_usage_selected_1d": 5
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 396
+        },
+        "rpd": {
+          "limit": 500,
+          "peak_usage_selected_1d": 12
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.1-flash-lite",
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-lite"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.1-flash-lite",
+      "direct_contract_is_executable": true,
+      "route_status": "LIVE_UNEXERCISED",
+      "qualification_notes": "Deployed live, no Google wire request yet."
+    },
+    {
+      "index": 5,
+      "display_name": "Antigravity",
+      "ai_studio_category": "agent",
+      "quota_display": {
+        "rpm": {
+          "limit": 60,
+          "peak_usage_selected_1d": 1
+        },
+        "tpm": {
+          "limit": 100000,
+          "peak_usage_selected_1d": 5450
+        },
+        "rpd": {
+          "limit": 100,
+          "peak_usage_selected_1d": 3
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "antigravity-preview-09-2026",
+        "antigravity-preview-latest",
+        "antigravity-preview-05-2026"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "agent.run",
+      "capability_route_candidates": [
+        "smart-gemini-antigravity"
+      ],
+      "proposed_direct_contract_name": "direct-google-antigravity",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_ID_UNRESOLVED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 6,
+      "display_name": "Deep Research Pro Preview",
+      "ai_studio_category": "agent",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "deep-research-pro-preview-12-2025",
+      "native_model_id_candidates": [
+        "deep-research-pro-preview-12-2025"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "agent.run",
+      "capability_route_candidates": [
+        "smart-gemini-antigravity"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 7,
+      "display_name": "Gemini 2 Flash",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [],
+      "native_id_evidence": "NO_LISTING_MATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 8,
+      "display_name": "Gemini 2 Flash Lite",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [],
+      "native_id_evidence": "NO_LISTING_MATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 9,
+      "display_name": "Computer Use Preview",
+      "ai_studio_category": "other",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-2.5-computer-use-preview-10-2025",
+      "native_model_id_candidates": [
+        "gemini-2.5-computer-use-preview-10-2025"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 131072,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "unknown",
+      "capability_route_candidates": [
+        "smart-gemini-other"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 10,
+      "display_name": "Gemini 2.5 Flash",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-2.5-flash",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation."
+    },
+    {
+      "index": 11,
+      "display_name": "Nano Banana (Gemini 2.5 Flash Preview Image)",
+      "ai_studio_category": "image",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-2.5-flash-image",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-image"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 32768,
+      "cached_output_token_limit": 32768,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "image.generate",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 12,
+      "display_name": "Gemini 2.5 Flash Lite",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-2.5-flash-lite",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-lite"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash-lite",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Earlier project wire probe returned 404; explicitly HELD."
+    },
+    {
+      "index": 13,
+      "display_name": "Gemini 2.5 Flash TTS",
+      "ai_studio_category": "tts",
+      "quota_display": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-2.5-flash-preview-tts",
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-preview-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 8192,
+      "cached_output_token_limit": 16384,
+      "cached_supported_generation_methods": [
+        "countTokens",
+        "generateContent"
+      ],
+      "operation_contract": "audio.synthesize",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash-preview-tts",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 14,
+      "display_name": "Gemini 2.5 Pro",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-2.5-pro",
+      "native_model_id_candidates": [
+        "gemini-2.5-pro"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 15,
+      "display_name": "Gemini 2.5 Pro TTS",
+      "ai_studio_category": "tts",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-2.5-pro-preview-tts",
+      "native_model_id_candidates": [
+        "gemini-2.5-pro-preview-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 8192,
+      "cached_output_token_limit": 16384,
+      "cached_supported_generation_methods": [
+        "countTokens",
+        "generateContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "audio.synthesize",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 16,
+      "display_name": "Gemini 3 Flash",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3-flash-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3-flash",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_ID_UNRESOLVED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Cached listing version does not exactly match UI display version."
+    },
+    {
+      "index": 17,
+      "display_name": "Nano Banana Pro (Gemini 3 Pro Image)",
+      "ai_studio_category": "image",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3-pro-image",
+        "gemini-3-pro-image-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "image.generate",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 18,
+      "display_name": "Gemini 3.1 Pro",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-pro-preview-customtools"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 19,
+      "display_name": "Nano Banana 2 (Gemini 3.1 Flash Image)",
+      "ai_studio_category": "image",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-image-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "image.generate",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 20,
+      "display_name": "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
+      "ai_studio_category": "image",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-3.1-flash-lite-image",
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-lite-image"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 65536,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "image.generate",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 21,
+      "display_name": "Gemini 3.1 Flash TTS",
+      "ai_studio_category": "tts",
+      "quota_display": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.1-flash-tts-preview",
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-tts-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 8192,
+      "cached_output_token_limit": 16384,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "audio.synthesize",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.1-flash-tts-preview",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 22,
+      "display_name": "Gemini 3.5 Transcribe",
+      "ai_studio_category": "transcribe",
+      "quota_display": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 25,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.5-transcribe",
+      "native_model_id_candidates": [
+        "gemini-3.5-transcribe"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 98304,
+      "cached_output_token_limit": 32768,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "audio.transcribe",
+      "capability_route_candidates": [
+        "smart-gemini-transcribe"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-transcribe",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 23,
+      "display_name": "Gemini 3.8 Flash Lite TTS",
+      "ai_studio_category": "tts",
+      "quota_display": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.8-flash-lite-tts",
+      "native_model_id_candidates": [
+        "gemini-3.8-flash-lite-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 8192,
+      "cached_output_token_limit": 16384,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "audio.synthesize",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-flash-lite-tts",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 24,
+      "display_name": "Gemini 3.8 Flash TTS",
+      "ai_studio_category": "tts",
+      "quota_display": {
+        "rpm": {
+          "limit": 3,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-3.8-flash-tts",
+      "native_model_id_candidates": [
+        "gemini-3.8-flash-tts"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 8192,
+      "cached_output_token_limit": 16384,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "audio.synthesize",
+      "capability_route_candidates": [
+        "smart-gemini-tts"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-flash-tts",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 25,
+      "display_name": "Gemini 4 Argon",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-4-argon",
+      "native_model_id_candidates": [
+        "gemini-4-argon"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 32768,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 26,
+      "display_name": "Gemini 4 Carbon",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-4-carbon",
+      "native_model_id_candidates": [
+        "gemini-4-carbon"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 32768,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 27,
+      "display_name": "Gemini 4 Hydrogen",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-4-hydrogen",
+      "native_model_id_candidates": [
+        "gemini-4-hydrogen"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-4-hydrogen",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation."
+    },
+    {
+      "index": 28,
+      "display_name": "Gemini 4 Neon",
+      "ai_studio_category": "text",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-4-neon",
+      "native_model_id_candidates": [
+        "gemini-4-neon"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 29,
+      "display_name": "Gemini Decision 1",
+      "ai_studio_category": "decision",
+      "quota_display": {
+        "rpm": {
+          "limit": 200,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 50000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 10000,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-decision-1",
+      "native_model_id_candidates": [
+        "gemini-decision-1"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 262144,
+      "cached_output_token_limit": 1,
+      "cached_supported_generation_methods": [
+        "createDecision"
+      ],
+      "operation_contract": "decision.score",
+      "capability_route_candidates": [
+        "smart-gemini-decision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-decision-1",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 30,
+      "display_name": "Gemini Embedding 1",
+      "ai_studio_category": "embedding",
+      "quota_display": {
+        "rpm": {
+          "limit": 100,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 30000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 1000,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-embedding-001",
+      "native_model_id_candidates": [
+        "gemini-embedding-001"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 2048,
+      "cached_output_token_limit": 1,
+      "cached_supported_generation_methods": [
+        "embedContent",
+        "countTextTokens",
+        "countTokens",
+        "asyncBatchEmbedContent"
+      ],
+      "operation_contract": "vector.embed",
+      "capability_route_candidates": [
+        "smart-gemini-embedding"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-embedding-001",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 31,
+      "display_name": "Gemini Embedding 2",
+      "ai_studio_category": "embedding",
+      "quota_display": {
+        "rpm": {
+          "limit": 100,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 30000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 1000,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-embedding-2",
+        "gemini-embedding-2-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "vector.embed",
+      "capability_route_candidates": [
+        "smart-gemini-embedding"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-embedding-2",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_ID_UNRESOLVED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 32,
+      "display_name": "Gemini Nano Banana 2.1",
+      "ai_studio_category": "image",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-nano-banana-2.1",
+      "native_model_id_candidates": [
+        "gemini-nano-banana-2.1"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 65536,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "image.generate",
+      "capability_route_candidates": [
+        "smart-gemini-image"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 33,
+      "display_name": "Gemini Omni 1.1 Flash",
+      "ai_studio_category": "multimodal_gen",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-omni-1.1-flash",
+      "native_model_id_candidates": [
+        "gemini-omni-1.1-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 131072,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "multimodal.generate",
+      "capability_route_candidates": [
+        "smart-gemini-multimodal"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 34,
+      "display_name": "Gemini Omni 1.2 Flash",
+      "ai_studio_category": "multimodal_gen",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "gemini-omni-1.2-flash",
+      "native_model_id_candidates": [
+        "gemini-omni-1.2-flash"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 131072,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "multimodal.generate",
+      "capability_route_candidates": [
+        "smart-gemini-multimodal"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 35,
+      "display_name": "Gemini Robotics ER 2 Preview",
+      "ai_studio_category": "robotics",
+      "quota_display": {
+        "rpm": {
+          "limit": 5,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 250000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 20,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemini-robotics-er-2-preview",
+      "native_model_id_candidates": [
+        "gemini-robotics-er-2-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 131072,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens",
+        "createCachedContent",
+        "batchGenerateContent"
+      ],
+      "operation_contract": "robotics.perceive",
+      "capability_route_candidates": [
+        "smart-gemini-robotics"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-robotics-er-2-preview",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 36,
+      "display_name": "Gemma 4 26B",
+      "ai_studio_category": "other",
+      "quota_display": {
+        "rpm": {
+          "limit": 30,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 16000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 14400,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemma-4-26b-a4b-it",
+      "native_model_id_candidates": [
+        "gemma-4-26b-a4b-it"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 262144,
+      "cached_output_token_limit": 32768,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemma-4-26b-a4b-it",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation."
+    },
+    {
+      "index": 37,
+      "display_name": "Gemma 4 31B",
+      "ai_studio_category": "other",
+      "quota_display": {
+        "rpm": {
+          "limit": 30,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 16000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 14400,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "gemma-4-31b-it",
+      "native_model_id_candidates": [
+        "gemma-4-31b-it"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 262144,
+      "cached_output_token_limit": 32768,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "chat.complete",
+      "capability_route_candidates": [
+        "smart-gemini-chat",
+        "smart-gemini-bounded",
+        "smart-gemini-long-context",
+        "smart-gemini-vision"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemma-4-31b-it",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation."
+    },
+    {
+      "index": 38,
+      "display_name": "Genie 4",
+      "ai_studio_category": "world",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "genie-4",
+      "native_model_id_candidates": [
+        "genie-4"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "operation_contract": "world.generate",
+      "capability_route_candidates": [
+        "smart-gemini-world"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct."
+    },
+    {
+      "index": 39,
+      "display_name": "Lyria 3 Clip",
+      "ai_studio_category": "music",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "lyria-3-clip-preview",
+      "native_model_id_candidates": [
+        "lyria-3-clip-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "music.stream",
+      "capability_route_candidates": [
+        "smart-gemini-music-realtime"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 40,
+      "display_name": "Lyria 3 Pro",
+      "ai_studio_category": "music",
+      "quota_display": {
+        "rpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": 0,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "ZERO_RPD",
+      "native_model_id": "lyria-3-pro-preview",
+      "native_model_id_candidates": [
+        "lyria-3-pro-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "operation_contract": "music.stream",
+      "capability_route_candidates": [
+        "smart-gemini-music-realtime"
+      ],
+      "proposed_direct_contract_name": null,
+      "direct_contract_is_executable": false,
+      "route_status": "NO_QUOTA_IN_THIS_SNAPSHOT",
+      "qualification_notes": "0/0 project quota; inventory only, do not expose executable direct. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 41,
+      "display_name": "Lyria Realtime",
+      "ai_studio_category": "music",
+      "quota_display": {
+        "rpm": {
+          "limit": 15,
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": "-",
+          "peak_usage_selected_1d": "-"
+        },
+        "rpd": {
+          "limit": 1500,
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "POSITIVE_FINITE_RPD",
+      "native_model_id": "lyria-realtime-exp",
+      "native_model_id_candidates": [
+        "lyria-realtime-exp"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 1048576,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "bidiGenerateMusic"
+      ],
+      "operation_contract": "music.stream",
+      "capability_route_candidates": [
+        "smart-gemini-music-realtime"
+      ],
+      "proposed_direct_contract_name": "direct-google-lyria-realtime-exp",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires operation-specific request/response adapter; not generic chat fallback."
+    },
+    {
+      "index": 42,
+      "display_name": "Gemini 2.5 Flash Native Audio Dialog",
+      "ai_studio_category": "live",
+      "quota_display": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 1000000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-2.5-flash-native-audio-latest",
+        "gemini-2.5-flash-native-audio-preview-12-2025",
+        "gemini-2.5-flash-native-audio-preview-09-2025"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "session.live",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-2.5-flash-native-audio-dialog",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_ID_UNRESOLVED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 43,
+      "display_name": "Gemini 3 Flash Live",
+      "ai_studio_category": "live",
+      "quota_display": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 65000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "native_model_id": null,
+      "native_model_id_candidates": [
+        "gemini-3.1-flash-live-preview"
+      ],
+      "native_id_evidence": "AMBIGUOUS_OR_VERSION_MISMATCH",
+      "cached_input_token_limit": null,
+      "cached_output_token_limit": null,
+      "cached_supported_generation_methods": null,
+      "operation_contract": "session.live",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3-flash-live",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_ID_UNRESOLVED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat. Cached listing version does not exactly match UI display version."
+    },
+    {
+      "index": 44,
+      "display_name": "Gemini 3.5 Live Translate",
+      "ai_studio_category": "live",
+      "quota_display": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 20000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "native_model_id": "gemini-3.5-live-translate-preview",
+      "native_model_id_candidates": [
+        "gemini-3.5-live-translate-preview"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 16384,
+      "cached_output_token_limit": 32768,
+      "cached_supported_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "operation_contract": "session.live",
+      "capability_route_candidates": [
+        "smart-gemini-live-translate"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-live-translate-preview",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 45,
+      "display_name": "Gemini 3.5 Transcribe Live",
+      "ai_studio_category": "live",
+      "quota_display": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 20000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "native_model_id": "gemini-3.5-transcribe-live",
+      "native_model_id_candidates": [
+        "gemini-3.5-transcribe-live"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 131072,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "operation_contract": "session.live",
+      "capability_route_candidates": [
+        "smart-gemini-live-transcribe"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.5-transcribe-live",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 46,
+      "display_name": "Gemini 3.8 Live",
+      "ai_studio_category": "live",
+      "quota_display": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 65000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "native_model_id": "gemini-3.8-live",
+      "native_model_id_candidates": [
+        "gemini-3.8-live"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 131072,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "operation_contract": "session.live",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-live",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    },
+    {
+      "index": 47,
+      "display_name": "Gemini 3.8 Live Extended Thinking",
+      "ai_studio_category": "live",
+      "quota_display": {
+        "rpm": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        },
+        "tpm": {
+          "limit": 65000,
+          "peak_usage_selected_1d": 0
+        },
+        "rpd": {
+          "limit": "Unlimited",
+          "peak_usage_selected_1d": 0
+        }
+      },
+      "project_quota_status": "UNLIMITED_RPD",
+      "native_model_id": "gemini-3.8-live-extended-thinking",
+      "native_model_id_candidates": [
+        "gemini-3.8-live-extended-thinking"
+      ],
+      "native_id_evidence": "CACHED_PROJECT_MODELS_LISTING_20261120_UNTESTED_WIRE",
+      "cached_input_token_limit": 131072,
+      "cached_output_token_limit": 65536,
+      "cached_supported_generation_methods": [
+        "bidiGenerateContent"
+      ],
+      "operation_contract": "session.live",
+      "capability_route_candidates": [
+        "smart-gemini-live"
+      ],
+      "proposed_direct_contract_name": "direct-google-gemini-3.8-live-extended-thinking",
+      "direct_contract_is_executable": false,
+      "route_status": "QUOTA_PRESENT_HELD_NOT_WIRE_QUALIFIED",
+      "qualification_notes": "Native operation, model-version mapping and serving compatibility must be proven before executable direct creation. Requires WebSocket/stateful Live adapter; not openai_chat."
+    }
+  ],
+  "feature_quotas": [
+    {
+      "index": 1,
+      "display_name": "Map grounding / Deep Research Pro Preview",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 2,
+      "display_name": "Map grounding / Gemini 2 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 3,
+      "display_name": "Map grounding / Computer Use Preview",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 4,
+      "display_name": "Map grounding / Gemini 2.5 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 5,
+      "display_name": "Map grounding / Gemini 2.5 Flash Lite",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 6,
+      "display_name": "Map grounding / Gemini 2.5 Pro",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 7,
+      "display_name": "Map grounding / Gemini 3 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 8,
+      "display_name": "Map grounding / Gemini 3.1 Pro",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 9,
+      "display_name": "Map grounding / Gemini 3.1 Flash Lite",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 10,
+      "display_name": "Map grounding / Gemini 3.1 Flash TTS",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 11,
+      "display_name": "Map grounding / Gemini 3.6 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 12,
+      "display_name": "Map grounding / Gemini 3.5 Flash Lite",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 13,
+      "display_name": "Map grounding / Gemini 3.5 Transcribe",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 14,
+      "display_name": "Map grounding / Gemini 3.8 Flash",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 15,
+      "display_name": "Map grounding / Gemini 4 Argon",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 16,
+      "display_name": "Map grounding / Gemini 4 Carbon",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 17,
+      "display_name": "Map grounding / Gemini 4 Hydrogen",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 18,
+      "display_name": "Map grounding / Gemini 4 Neon",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 19,
+      "display_name": "Map grounding / Gemini Robotics ER 2 Preview",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "HELD_NO_GROUNDING_QUOTA",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 20,
+      "display_name": "Search grounding / Gemini 2",
+      "rpd": {
+        "limit": 1500,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "FEATURE_QUOTA_PRESENT",
+      "is_model_direct_route": false,
+      "routing_role": "OPTIONAL_TOOL_QUOTA_NOT_MODEL",
+      "notes": "Do not count this feature quota as an independent model request budget or infer unique pools from label."
+    },
+    {
+      "index": 21,
+      "display_name": "Search grounding / Gemini 2.5",
+      "rpd": {
+        "limit": 1500,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "FEATURE_QUOTA_PRESENT",
+      "is_model_direct_route": false,
+      "routing_role": "OPTIONAL_TOOL_QUOTA_NOT_MODEL",
+      "notes": "Do not count this feature quota as an independent model request budget or infer unique pools from label."
+    },
+    {
+      "index": 22,
+      "display_name": "Search grounding / Gemini 3 and newer",
+      "rpd": {
+        "limit": 0,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "ZERO_FEATURE_QUOTA",
+      "is_model_direct_route": false,
+      "routing_role": "OPTIONAL_TOOL_QUOTA_NOT_MODEL",
+      "notes": "No project feature allowance shown."
+    },
+    {
+      "index": 23,
+      "display_name": "Search grounding / Default",
+      "rpd": {
+        "limit": 1500,
+        "peak_usage_selected_1d": 0
+      },
+      "project_feature_status": "FEATURE_QUOTA_PRESENT",
+      "is_model_direct_route": false,
+      "routing_role": "OPTIONAL_TOOL_QUOTA_NOT_MODEL",
+      "notes": "Do not count this feature quota as an independent model request budget or infer unique pools from label."
+    }
+  ]
+}

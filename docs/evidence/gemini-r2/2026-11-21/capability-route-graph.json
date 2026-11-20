@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "kind": "gemini-free-project-capability-route-graph",
+  "quota_partition": {
+    "one_primitive_per_candidate": true,
+    "duplicates": [],
+    "unique_candidates": [
+      "direct-google-gemini-3.1-flash-lite",
+      "direct-google-gemini-3.5-flash-lite"
+    ]
+  },
+  "primitives": {
+    "smart-gemini-bounded": {
+      "purpose": "small bounded agent tasks only; every member is capped by its own per-minute input budget, so this primitive never advertises a long context",
+      "candidates_today": [],
+      "candidates_pending_wire_qualification": [
+        "direct-google-gemma-4-26b-a4b-it",
+        "direct-google-gemma-4-31b-it"
+      ],
+      "context_window": 16384,
+      "emittable": false,
+      "reason_not_emittable": "no small-budget member is wire-qualified yet; emitting the route would claim a capability no target can serve"
+    },
+    "smart-gemini-chat": {
+      "purpose": "general free-project chat",
+      "candidates_today": [
+        "direct-google-gemini-3.5-flash-lite",
+        "direct-google-gemini-3.1-flash-lite"
+      ],
+      "candidates_pending_wire_qualification": [
+        "direct-google-gemini-3.6-flash",
+        "direct-google-gemini-3.8-flash",
+        "direct-google-gemini-2.5-flash",
+        "direct-google-gemini-2.5-flash-lite",
+        "direct-google-gemini-4-hydrogen"
+      ],
+      "context_window": 1048576,
+      "emittable": true,
+      "reason_not_emittable": "no wire-qualified chat member remains unclaimed"
+    },
+    "smart-gemini-long-context": {
+      "purpose": "prompts sized against a million-token per-minute budget",
+      "candidates_today": [],
+      "candidates_pending_wire_qualification": [],
+      "context_window": 1048576,
+      "emittable": false,
+      "reason_not_emittable": "every remaining member was already claimed by a more specific primitive; a second leg over the same models would spend one provider-model quota twice"
+    },
+    "smart-gemini-vision": {
+      "purpose": "image-bearing free-project requests",
+      "candidates_today": [],
+      "candidates_pending_wire_qualification": [],
+      "context_window": 1048576,
+      "emittable": false,
+      "reason_not_emittable": "the deployed Gemini leaves declare vision = false; the two wire-qualified Lite models are not image-qualified in the deployment, so a vision primitive would promise what they refuse"
+    },
+    "smart-gemini-antigravity": {
+      "purpose": "managed agent runs",
+      "candidates_today": [],
+      "candidates_pending_wire_qualification": [],
+      "context_window": null,
+      "emittable": false,
+      "reason_not_emittable": "agent.run has no adapter; see adapter_requirement"
+    },
+    "smart-gemini-live": {
+      "purpose": "realtime sessions",
+      "candidates_today": [],
+      "candidates_pending_wire_qualification": [],
+      "context_window": null,
+      "emittable": false,
+      "reason_not_emittable": "session.live has no adapter; see adapter_requirement"
+    }
+  },
+  "composite": {
+    "smart_gemini": {
+      "children": [
+        "smart-gemini-chat"
+      ],
+      "context_window": 1048576,
+      "emittable": false,
+      "reason_not_emittable": "only 1 primitive(s) have an executable candidate; a composite needs two legs before reparenting the live composite buys anything, and emitting a primitive without it would give one provider-model quota a second route",
+      "note": "children must be routes, never other composites; a child that a request is not cleared for is dropped before dispatch, so an uncleared request falls through instead of being sent to Google"
+    }
+  },
+  "non_google_fallback": {
+    "chain": [
+      "smart-nt",
+      "luna-nt",
+      "deepseek-flash-nt"
+    ],
+    "note": "the egress gate already drops a Google leg for an uncleared request before dispatch; what the graph must guarantee is that the legs after it are strict non-training targets"
+  }
+}

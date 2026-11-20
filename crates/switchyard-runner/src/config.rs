@@ -106,6 +106,24 @@ pub(crate) struct DeploymentConfig {
     /// Ordered composites over complete child routes, by route name.
     #[serde(default)]
     pub(crate) composites: BTreeMap<String, CompositeRouteConfig>,
+    /// Where per-target daily request allowances keep their counters.
+    ///
+    /// Optional as a whole: a deployment with no `daily_request_limit` has no budget to
+    /// account for. Required as soon as one target declares a limit, because an allowance
+    /// whose counter cannot be written is a cap nobody is enforcing.
+    #[serde(default)]
+    quota: Option<QuotaConfig>,
+}
+
+/// Accounting for per-target daily request allowances.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QuotaConfig {
+    /// Directory holding one counter file per (llm client, model).
+    ///
+    /// Created if it does not exist. Verified writable at load, so a budget that cannot be
+    /// counted is a startup error rather than a silently unenforced cap.
+    pub(crate) state_dir: std::path::PathBuf,
 }
 
 /// A route composed of ordered whole child routes.
@@ -834,10 +852,104 @@ impl DeploymentConfig {
         Ok(runner)
     }
 
+    /// Builds one daily request allowance per (llm client, model) that declares a limit.
+    ///
+    /// Keyed exactly as the client is keyed - by model id within one client - so two
+    /// targets naming the same model share one counter rather than each believing it owns
+    /// the whole daily limit.
+    fn build_allowances(
+        &self,
+    ) -> RunnerResult<HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>>
+    {
+        let mut allowances = HashMap::new();
+        let mut limits: HashMap<(String, ModelId), (u64, &str)> = HashMap::new();
+        for (target_name, target) in &self.targets {
+            let Some(limit) = target.daily_request_limit else {
+                continue;
+            };
+            if limit == 0 {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} daily_request_limit must be at least 1"
+                )));
+            }
+            let key = (target.llm_client.clone(), target.id.clone());
+            match limits.entry(key) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let (first_limit, first_name) = existing.get();
+                    if *first_limit != limit {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} share model {} on llm client {} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
+                            target.id, target.llm_client
+                        )));
+                    }
+                    continue;
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((limit, target_name.as_str()));
+                }
+            }
+            let quota = self.quota.as_ref().ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
+                ))
+            })?;
+            allowances.insert(
+                (target.llm_client.clone(), target.id.clone()),
+                Arc::new(switchyard_llm_client::DailyRequestAllowance::new(
+                    target.llm_client.clone(),
+                    target.id.clone(),
+                    limit,
+                    switchyard_llm_client::allowance_path(
+                        &quota.state_dir,
+                        &target.llm_client,
+                        target.id.as_str(),
+                    ),
+                )),
+            );
+        }
+        if !allowances.is_empty() {
+            self.validate_quota_state_dir()?;
+        }
+        Ok(allowances)
+    }
+
+    /// Proves the allowance counter directory is usable now, not at the first request.
+    ///
+    /// Without this, a wrong path or ownership would leave the budget unenforced until a
+    /// request arrived - and then surface as a refused leg rather than as the configuration
+    /// error it is.
+    fn validate_quota_state_dir(&self) -> RunnerResult<()> {
+        let Some(quota) = self.quota.as_ref() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(&quota.state_dir).map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} cannot be created: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        let probe = quota.state_dir.join(".write-probe");
+        std::fs::write(&probe, b"switchyard quota state\n").map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} is not writable: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        std::fs::remove_file(&probe).map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} probe could not be removed: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        Ok(())
+    }
+
     fn build_clients(
         &self,
         provider_api_keys: &mut Vec<String>,
     ) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
+        // Built before the per-target backends so each one can carry its own budget.
+        let allowances = self.build_allowances()?;
         let mut models_by_client = self
             .llm_clients
             .keys()
@@ -854,6 +966,7 @@ impl DeploymentConfig {
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
                 None,
             )?;
             let (Backend::OpenAiChat(config)
@@ -905,6 +1018,9 @@ impl DeploymentConfig {
                     target.reasoning_policy,
                     target.reasoning_dialect,
                     target.cooldown_group.clone(),
+                    allowances
+                        .get(&(target.llm_client.clone(), target.id.clone()))
+                        .cloned(),
                 )?,
                 None,
             ));
@@ -1588,6 +1704,14 @@ impl DeploymentConfig {
                             MediaCarrier::Inline | MediaCarrier::Both
                         ),
                         no_tool_calling: target.tool_calling == Some(false),
+                        // Declared per credential and resolved to the target here, because
+                        // the pre-dispatch filter reads target facts. A provider that may
+                        // only receive cleared payloads makes every target behind that
+                        // credential egress-gated, including one addressed directly.
+                        requires_public_payload: self
+                            .llm_clients
+                            .get(&target.llm_client)
+                            .is_some_and(|client| client.requires_public_payload),
                     },
                 );
             }
@@ -1998,6 +2122,15 @@ struct LlmClientConfig {
     /// stays undeclared when the deployment does not state it.
     #[serde(default)]
     locality: Option<ClientLocality>,
+    /// Whether this client may only receive payloads a caller has cleared for it.
+    ///
+    /// A provider property, declared once per credential: a free tier that uses submitted
+    /// content to improve its products makes every request an egress event, and that is
+    /// true of every model behind the credential. Declaring it turns the pre-egress
+    /// admission gate on for the targets served here; omitting it leaves every existing
+    /// client unchanged.
+    #[serde(default)]
+    requires_public_payload: bool,
 }
 
 /// Where a client's traffic terminates.
@@ -2103,6 +2236,14 @@ struct TargetConfig {
     image_carrier: Option<MediaCarrier>,
     #[serde(default)]
     tool_calling: Option<bool>,
+    /// Requests this target may make per provider day, when the provider caps them.
+    ///
+    /// Stated on the target rather than the client because the cap is per model within one
+    /// project: two targets on one credential routinely have different daily budgets. A
+    /// declared limit must be accompanied by a `[quota]` state directory; a spent
+    /// allowance removes the target from consideration and the route advances.
+    #[serde(default)]
+    daily_request_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -2167,6 +2308,7 @@ fn build_backend(
     reasoning_policy: Option<ReasoningPolicy>,
     reasoning_dialect: ReasoningDialect,
     cooldown_group: Option<String>,
+    allowance: Option<Arc<switchyard_llm_client::DailyRequestAllowance>>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -2244,6 +2386,7 @@ fn build_backend(
         attempt_timeout: config.attempt_timeout_ms.map(Duration::from_millis),
         stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
         requires_list_input: config.requires_list_input,
+        allowance,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -4304,6 +4447,7 @@ confidence_threshold = 0.5
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
         )?;
 
         assert_eq!(
@@ -4346,6 +4490,7 @@ confidence_threshold = 0.5
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -4371,6 +4516,7 @@ confidence_threshold = 0.5
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
                 None,
             );
             if expected == Some(0) {

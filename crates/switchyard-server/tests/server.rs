@@ -766,6 +766,7 @@ fn random_state_with_retries(
         attempt_timeout: None,
         stream_idle_timeout: None,
         requires_list_input: false,
+        allowance: None,
     });
     let target_models = routes
         .iter()

@@ -240,6 +240,7 @@ fn escalating_route(
             no_remote_image: true,
             no_inline_image: true,
             no_tool_calling: false,
+            requires_public_payload: false,
         },
     )]));
     Route::new(

@@ -1456,6 +1456,27 @@ async fn handle_llm_request(
                 "state_conflict",
             );
         }
+        Err(RunnerError::PrivacyRefused { route, refusals }) => {
+            // The request is well formed and the deployment is behaving as declared: the
+            // payload is not cleared for a provider this deployment sends nothing uncleared
+            // to. A 4xx because the caller can fix it (clear the request, or address a route
+            // that may receive it), and because resending the same bytes cannot help.
+            let codes: Vec<&str> = refusals.iter().map(|refusal| refusal.as_str()).collect();
+            tracing::info!(
+                route = %route,
+                refusals = %codes.join(","),
+                "pre-egress admission refused the payload"
+            );
+            return error_response(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "route {route} refused the payload: {}. Clear the request for this provider or address a route that may receive it.",
+                    codes.join(", ")
+                ),
+                "invalid_request_error",
+                "privacy_refused",
+            );
+        }
         Err(error) => {
             if let RunnerError::Algorithm(LibsyError::ClientCall {
                 target,

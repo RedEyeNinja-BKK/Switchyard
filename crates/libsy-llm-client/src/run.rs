@@ -774,6 +774,14 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
     match source {
         LlmClientError::ContextWindowExceeded { .. } => FailureClass::ContextWindow,
         LlmClientError::Transport { .. } => FailureClass::Transport,
+        // A spent per-target daily allowance says this leg cannot serve until the
+        // provider day rolls over, while every other target keeps its own budget. That
+        // is "unavailable", not `AccountQuota`: the latter condemns the whole credential
+        // and would wrongly stop a composite from crossing to a child on another one.
+        LlmClientError::DailyRequestAllowanceExhausted { .. }
+        | LlmClientError::DailyRequestAllowanceUnavailable { .. } => {
+            FailureClass::TemporarilyUnavailable
+        }
         // A per-attempt expiry is a deadline that elapsed, so a whole-route
         // composite treats it exactly like an upstream 408.
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
@@ -827,6 +835,17 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     // only spends another request against a cap already known to be at zero.
     if is_account_wide_quota_exhausted(error) {
         return None;
+    }
+    // A target's OWN daily request allowance is a different fact from the account-wide
+    // cap above: the budget is per model within one project, so the other candidates on
+    // this deployment still have their own. The next candidate is therefore worth
+    // trying, and this leg costs nothing until the provider day rolls over.
+    if matches!(
+        source,
+        LlmClientError::DailyRequestAllowanceExhausted { .. }
+            | LlmClientError::DailyRequestAllowanceUnavailable { .. }
+    ) {
+        return Some(RoutingFallbackReason::Unavailable);
     }
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
@@ -1063,6 +1082,15 @@ pub struct CapabilityFacts {
     pub no_inline_image: bool,
     /// The backing deployment cannot accept tool definitions or calls.
     pub no_tool_calling: bool,
+    /// The backing deployment may only receive payloads a caller has cleared for it.
+    ///
+    /// A provider property, not a request-fit capability, kept beside them because this is
+    /// the one per-target fact set the pre-dispatch filter reads. A free provider tier that
+    /// uses submitted content to improve its products makes every payload an egress event,
+    /// so a target behind it is ineligible unless the request carries a clearance that this
+    /// deployment accepts. Defaults to `false`: only a deployment that states the
+    /// requirement gets the gate, so every existing target keeps the behaviour it had.
+    pub requires_public_payload: bool,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.
@@ -1855,6 +1883,7 @@ mod tests {
                         attempt_timeout: None,
                         stream_idle_timeout: None,
                         requires_list_input: false,
+                        allowance: None,
                     };
                     let backend = if responses {
                         Backend::OpenAiResponses(config)
@@ -2008,6 +2037,7 @@ mod tests {
                     attempt_timeout: None,
                     stream_idle_timeout: None,
                     requires_list_input: false,
+                    allowance: None,
                 }),
                 None,
             )])
@@ -2960,6 +2990,7 @@ mod tests {
                     attempt_timeout: None,
                     stream_idle_timeout: None,
                     requires_list_input: false,
+                    allowance: None,
                 })
             };
             TranslatingLlmClient::new(&[
@@ -3051,6 +3082,7 @@ mod tests {
                 attempt_timeout: None,
                 stream_idle_timeout: None,
                 requires_list_input: false,
+                allowance: None,
             })
         };
         let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
@@ -3214,6 +3246,7 @@ mod tests {
                 attempt_timeout: None,
                 stream_idle_timeout: None,
                 requires_list_input: false,
+                allowance: None,
             })
         };
         let client = Arc::new(

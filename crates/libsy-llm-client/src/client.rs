@@ -55,6 +55,10 @@ const NON_FORWARDABLE_HEADERS: &[&str] = &[
     "content-encoding",
     "accept-encoding",
     "expect",
+    // Switchyard's own pre-egress admission assertion. It governs whether the bytes may
+    // leave this deployment, so forwarding it would hand a provider a claim about our
+    // policy that it has no use for and no way to verify.
+    "x-switchyard-privacy-clearance",
 ];
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -602,6 +606,35 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
+        // Spent before the request leaves, at the one point every attempt passes
+        // through. A reservation is never refunded: an attempt that fails below may
+        // still have reached the provider, and refunding it would let a retrying
+        // client exceed the daily cap it is trying to respect.
+        if let Some(allowance) = backend.allowance() {
+            match allowance.try_reserve() {
+                Ok(()) => {}
+                Err(crate::allowance::ReserveError::Exhausted) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceExhausted {
+                            model: model.clone(),
+                            limit: allowance.limit(),
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+                Err(crate::allowance::ReserveError::Unusable(reason)) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceUnavailable {
+                            model: model.clone(),
+                            reason,
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+            }
+        }
         let client = if backend.is_forwarding_auth() {
             &self.forward_auth_client
         } else {
@@ -1106,6 +1139,10 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         LlmClientError::Transport { .. }
         | LlmClientError::Timeout { .. }
         | LlmClientError::AttemptTimeout { .. } => true,
+        // A daily allowance resets on the provider's clock, not on a backoff: retrying
+        // now would burn the next day's budget against an answer already known to be no.
+        LlmClientError::DailyRequestAllowanceExhausted { .. }
+        | LlmClientError::DailyRequestAllowanceUnavailable { .. } => false,
         LlmClientError::UpstreamHttp { status, body } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
                 return false;
@@ -1849,6 +1886,7 @@ mod tests {
             attempt_timeout: None,
             stream_idle_timeout: None,
             requires_list_input: false,
+            allowance: None,
         }
     }
 

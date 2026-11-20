@@ -255,6 +255,23 @@ pub enum RunnerError {
         model: String,
         capability: &'static str,
     },
+    /// Every candidate this route could use is one that may only receive cleared payloads,
+    /// and the pre-egress gate refused this request.
+    ///
+    /// The request is well-formed; the payload is not cleared for a provider this
+    /// deployment sends nothing uncleared to. Kept separate from
+    /// [`Self::UnsupportedCapability`] because the caller fixes it by clearing the
+    /// request, and separate from [`Self::Configuration`] because the deployment is
+    /// behaving exactly as declared. Reported as a 4xx: no retry of the same bytes can
+    /// change the answer.
+    #[error(
+        "route {route} refused the payload: {codes}",
+        codes = refusals.iter().map(|refusal| refusal.as_str()).collect::<Vec<_>>().join(", ")
+    )]
+    PrivacyRefused {
+        route: String,
+        refusals: Vec<crate::egress::Refusal>,
+    },
     #[error("caller format is incompatible with {} credentials", .0.as_str())]
     IncompatibleCallerFormat(CallerAuthKind),
     #[error("route has no compatible target for the auxiliary operation")]
@@ -499,12 +516,29 @@ impl Route {
         // so this adds no second fallback engine and issues no request to a target that
         // cannot answer it.
         let facts = self.clients.target_capabilities().clone();
+        // A target declaring `requires_public_payload` may only receive a payload that
+        // carries a current, well-formed clearance and passes local inspection. Decided
+        // here, once, and only when some candidate actually declares the requirement, so
+        // an ordinary route walks no payload. The result is per MODEL rather than per
+        // route, which is what makes a directly addressed gated leaf pass through the same
+        // gate as a composite child: it is the same filter either way.
+        let admission = facts
+            .values()
+            .any(|facts| facts.requires_public_payload)
+            .then(|| crate::egress::evaluate(&request));
+        let refused = admission.as_ref().filter(|admission| !admission.allowed());
         let raw = request
             .raw_request
             .clone()
             .unwrap_or(serde_json::Value::Null);
         let estimated_input_tokens = crate::request_fit::estimate_input_tokens(&raw);
         let eligibility = |model: &switchyard_protocol::ModelId| {
+            if let Some(facts) = facts.get(model)
+                && facts.requires_public_payload
+                && refused.is_some()
+            {
+                return false;
+            }
             match facts.get(model) {
                 Some(facts) => {
                     // An explicit `false` is a refusal; `None` would mean "undeclared",
@@ -580,6 +614,16 @@ impl Route {
                     .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Disabled),
             };
         if models.is_empty() {
+            // A refusal the gate caused is reported as itself, not as a capability the
+            // request lacks: the caller's correction is different (clear the request,
+            // rather than change what it asks for), and the gate's reasons are the only
+            // actionable description of why the bytes could not leave.
+            if let Some(admission) = refused {
+                return Err(RunnerError::PrivacyRefused {
+                    route: self.algorithm.name().to_string(),
+                    refusals: admission.refusals().to_vec(),
+                });
+            }
             // Nothing in this route can serve the request, which is the caller's request
             // rather than a deployment fault. The skipped targets get no provider call.
             // Name what the request needs, not what the route happens to lack: the route's

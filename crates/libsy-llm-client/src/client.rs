@@ -55,6 +55,10 @@ const NON_FORWARDABLE_HEADERS: &[&str] = &[
     "content-encoding",
     "accept-encoding",
     "expect",
+    // Switchyard's own pre-egress admission assertion. It governs whether the bytes may
+    // leave this deployment, so forwarding it would hand a provider a claim about our
+    // policy that it has no use for and no way to verify.
+    "x-switchyard-privacy-clearance",
 ];
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -602,6 +606,61 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
+        // Inspected before anything else happens: over the exact body this call is about
+        // to put on the wire, for a provider that may only receive a cleared payload.
+        // This is deliberately not the same check the router performs on the request. A
+        // codec adds fields, a translation layer injects instructions, and a preserved
+        // provider body may be replayed verbatim; only the assembled body shows all of
+        // it. A finding here is terminal, so it neither spends the daily allowance below
+        // nor advances to a candidate that would be handed the same payload.
+        if backend.requires_public_payload() {
+            let findings = crate::privacy::scan_json(body);
+            if !findings.is_empty() {
+                metrics::record_upstream_attempt(None);
+                let codes = findings
+                    .iter()
+                    .map(|finding| finding.code())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(AttemptFailure {
+                    error: LlmClientError::PayloadNotCleared {
+                        model: model.clone(),
+                        codes,
+                    },
+                    status: None,
+                    retry_after: None,
+                });
+            }
+        }
+        // Spent before the request leaves, at the one point every attempt passes
+        // through. A reservation is never refunded: an attempt that fails below may
+        // still have reached the provider, and refunding it would let a retrying
+        // client exceed the daily cap it is trying to respect.
+        if let Some(allowance) = backend.allowance() {
+            match allowance.try_reserve() {
+                Ok(()) => {}
+                Err(crate::allowance::ReserveError::Exhausted) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceExhausted {
+                            model: model.clone(),
+                            limit: allowance.limit(),
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+                Err(crate::allowance::ReserveError::Unusable(reason)) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceUnavailable {
+                            model: model.clone(),
+                            reason,
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+            }
+        }
         let client = if backend.is_forwarding_auth() {
             &self.forward_auth_client
         } else {
@@ -1017,6 +1076,26 @@ const BILLING_LIMIT_CODES: &[&str] = &[
     "insufficient_quota",
 ];
 
+/// The free-model daily allowance, spelled out in a message instead of the marker.
+///
+/// OpenRouter normally names this allowance in `error.metadata.limit_source`, but not
+/// always: measured 2026-11-19 the refusal arrived as
+/// `{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit
+/// exceeded: free-models-per-day-high-balance."}}` — a bare 429 with no metadata, on a
+/// paid-tier key with credit remaining. The sentence can only name the per-credential
+/// free-model allowance, so it belongs with the marker rather than in the retry loop.
+///
+/// Matched on the whole phrase and not on "rate limit exceeded": the per-minute
+/// spelling of the same sentence is a genuine throttle that must keep its retries.
+const FREE_MODEL_DAILY_MESSAGE: &str = "free-models-per-day";
+
+fn names_free_model_daily_cap(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
+        .is_some_and(|message| message.contains(FREE_MODEL_DAILY_MESSAGE))
+}
+
 fn is_documented_billing_limit(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1044,6 +1123,7 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
         StatusCode::TOO_MANY_REQUESTS => {
             limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
                 || is_documented_billing_limit(body)
+                || names_free_model_daily_cap(body)
         }
         // Insufficient credits: the account balance is the shared resource, so no
         // candidate on this credential can serve the request.
@@ -1085,6 +1165,12 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         LlmClientError::Transport { .. }
         | LlmClientError::Timeout { .. }
         | LlmClientError::AttemptTimeout { .. } => true,
+        // A daily allowance resets on the provider's clock, not on a backoff: retrying
+        // now would burn the next day's budget against an answer already known to be no.
+        LlmClientError::DailyRequestAllowanceExhausted { .. }
+        | LlmClientError::DailyRequestAllowanceUnavailable { .. } => false,
+        // Retrying resends the same payload, which is the thing that was just refused.
+        LlmClientError::PayloadNotCleared { .. } => false,
         LlmClientError::UpstreamHttp { status, body } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
                 return false;
@@ -1828,6 +1914,8 @@ mod tests {
             attempt_timeout: None,
             stream_idle_timeout: None,
             requires_list_input: false,
+            allowance: None,
+            requires_public_payload: false,
         }
     }
 
@@ -4111,6 +4199,57 @@ mod tests {
                 "a genuine rate limit must keep its retries: {body}"
             );
         }
+    }
+
+    /// The free-model daily allowance, when OpenRouter omits its usual marker.
+    ///
+    /// Measured 2026-11-19 against this deployment's own credential: a request for
+    /// `openrouter/free` answered
+    /// `{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit
+    /// exceeded: free-models-per-day-high-balance. "}}` — a plain 429 carrying no
+    /// `metadata` at all. The key was paid tier with credit remaining, so the only
+    /// resource that sentence can name is the per-credential free-model allowance every
+    /// free model on it shares. Without recognizing it the request walks the rest of the
+    /// ladder, spending one refused call per rung against an allowance already at zero.
+    ///
+    /// The control is the per-minute spelling of the same sentence: that is a genuine
+    /// throttle and must keep its retries, so the match cannot be "rate limit exceeded".
+    #[test]
+    fn an_unmarked_free_model_daily_cap_is_account_wide_but_a_per_minute_throttle_retries() {
+        let failure = |body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: body.to_string(),
+            },
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            retry_after: None,
+        };
+
+        // The recorded body, trimmed only of the provider's trailing space.
+        let measured = failure(
+            r#"{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit exceeded: free-models-per-day-high-balance."}}"#,
+        );
+        assert!(
+            is_account_wide_quota(&measured.error),
+            "the free-model daily allowance is shared by every candidate on the credential"
+        );
+        assert!(
+            !measured.is_retryable(),
+            "a daily allowance cannot clear on the next attempt"
+        );
+
+        // A throttle on the same status keeps recovering.
+        let per_minute = failure(
+            r#"{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit exceeded: free-models-per-min."}}"#,
+        );
+        assert!(
+            !is_account_wide_quota(&per_minute.error),
+            "a per-minute throttle is not the daily allowance"
+        );
+        assert!(
+            per_minute.is_retryable(),
+            "a per-minute throttle must keep its retries"
+        );
     }
 
     #[test]

@@ -111,6 +111,21 @@ pub struct HttpBackendConfig {
     /// `Input must be a list`. Only meaningful for a Responses backend; other formats ignore
     /// it. Defaults to false so every existing provider keeps the compact encoding.
     pub requires_list_input: bool,
+    /// The target's own daily request allowance, when the provider caps requests per day.
+    ///
+    /// Held here because one HTTP attempt is the granularity the provider counts in, and
+    /// [`TranslatingLlmClient`](crate::TranslatingLlmClient) reserves at exactly that point.
+    /// Shared across every backend of one target, so a model reachable over two wire
+    /// formats still draws on one budget.
+    pub allowance: Option<std::sync::Arc<crate::allowance::DailyRequestAllowance>>,
+    /// Whether this provider may only receive a payload cleared as public.
+    ///
+    /// Declared on the client because it is a fact about the provider - a free tier that
+    /// uses submitted content to improve its products makes every request an egress
+    /// event - and one client serves many models. When set,
+    /// [`TranslatingLlmClient`](crate::TranslatingLlmClient) inspects the assembled wire
+    /// body before sending it, which is the only check that sees exactly what leaves.
+    pub requires_public_payload: bool,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -130,6 +145,11 @@ impl fmt::Debug for HttpBackendConfig {
             .field("timeout", &self.timeout)
             .field("attempt_timeout", &self.attempt_timeout)
             .field("stream_idle_timeout", &self.stream_idle_timeout)
+            .field(
+                "daily_request_limit",
+                &self.allowance.as_ref().map(|a| a.limit()),
+            )
+            .field("requires_public_payload", &self.requires_public_payload)
             .finish()
     }
 }
@@ -383,6 +403,16 @@ impl Backend {
         self.config().failure_cooldown
     }
 
+    /// The target's daily request allowance, when it declares one.
+    pub fn allowance(&self) -> Option<&crate::allowance::DailyRequestAllowance> {
+        self.config().allowance.as_deref()
+    }
+
+    /// Whether the provider may only receive a payload cleared as public.
+    pub fn requires_public_payload(&self) -> bool {
+        self.config().requires_public_payload
+    }
+
     /// The cooldown group this backend belongs to, when its targets share one.
     pub fn cooldown_group(&self) -> Option<&str> {
         self.config().cooldown_group.as_deref()
@@ -518,6 +548,8 @@ mod tests {
             attempt_timeout: None,
             stream_idle_timeout: None,
             requires_list_input: false,
+            allowance: None,
+            requires_public_payload: false,
         }
     }
 

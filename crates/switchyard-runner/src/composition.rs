@@ -34,6 +34,8 @@ use crate::{Route, RunOutput, Runner, RunnerError, request_fit};
 pub struct CompositeSpec {
     /// Child routes in preference order.
     pub children: Vec<String>,
+    /// When the parent may move on to the next child.
+    pub cross_on: crate::config::CompositeCrossPolicy,
 }
 
 /// What a composite did for one request.
@@ -244,6 +246,9 @@ impl Runner {
                     .unwrap_or(&serde_json::Value::Null),
             ) {
                 children.push((child_name.clone(), ChildOutcome::Skipped { capability }));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
                 continue;
             }
 
@@ -261,6 +266,9 @@ impl Runner {
                         capability: "context_window",
                     },
                 ));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
                 continue;
             }
 
@@ -321,11 +329,22 @@ impl Runner {
                     // names no credential this deployment resolves (a forwarded caller's
                     // 401, or a slug no route owns), and then plain class policy
                     // decides.
-                    let crossable = class.allows_cross_route()
-                        || matches!(
-                            block.as_ref().map(|block| &block.kind),
-                            Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
-                        );
+                    //
+                    // A composite that states `cross_on = "credential_block"` narrows
+                    // this to the block alone, because its children share one credential
+                    // and the question is which SCOPE that credential still serves. An
+                    // ordinary rate limit, a timeout or a provider fault carries no block
+                    // and then crosses nowhere.
+                    let crossable = match spec.cross_on {
+                        crate::config::CompositeCrossPolicy::FailureClass => {
+                            class.allows_cross_route()
+                                || matches!(
+                                    block.as_ref().map(|block| &block.kind),
+                                    Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
+                                )
+                        }
+                        crate::config::CompositeCrossPolicy::CredentialBlock => block.is_some(),
+                    };
                     if !crossable {
                         // Terminal for the parent. Surfacing the child's own error keeps a
                         // contract, policy or credential fault visible instead of letting a
@@ -352,13 +371,21 @@ impl Runner {
             }
         }
 
-        // Nothing answered. If no child was even eligible, the request itself asks for
-        // something no child can serve, which is the caller's problem rather than a
-        // deployment fault.
-        if let Some(capability) = children.iter().find_map(|(_, outcome)| match outcome {
-            ChildOutcome::Skipped { capability } => Some(*capability),
-            _ => None,
-        }) {
+        // Nothing answered, and the reason depends on whether anything was asked. A child
+        // is only contacted when it was eligible, so a recorded failure proves the request
+        // reached a provider: the answer is that failure, not the capability some other
+        // child happened to lack. Reporting the skip instead would name the wrong cause --
+        // a request an eligible child actually refused would read as unroutable, which is
+        // the opposite diagnosis for the caller.
+        let contacted = children
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, ChildOutcome::Failed { .. }));
+        if !contacted
+            && let Some(capability) = children.iter().find_map(|(_, outcome)| match outcome {
+                ChildOutcome::Skipped { capability } => Some(*capability),
+                _ => None,
+            })
+        {
             return Err(RunnerError::unsupported_capability(
                 parent_route,
                 capability,
@@ -456,6 +483,26 @@ impl Runner {
             kind,
             target: slug,
         })
+    }
+
+    /// Whether an eligibility skip may advance to the next child.
+    ///
+    /// Eligibility is a fact about the request — it needs vision, it does not fit this
+    /// window — and not a statement about any credential. Under the historical policy the
+    /// parent simply moves on to a child that can serve it, and that stays true.
+    ///
+    /// A composite that states `cross_on = "credential_block"` admits exactly ONE reason
+    /// to reach a later child: the provider said the earlier child's credential scope is
+    /// gone. Reaching a later child because the request was ineligible would spend that
+    /// child's account for a reason the policy does not name, so the skip is terminal for
+    /// the parent. The caller still gets the truthful diagnosis: the end-of-loop reporting
+    /// names the missing capability when nothing was called, and the child's own failure
+    /// when something was.
+    fn eligibility_advances(&self, spec: &CompositeSpec) -> bool {
+        !matches!(
+            spec.cross_on,
+            crate::config::CompositeCrossPolicy::CredentialBlock
+        )
     }
 
     /// Whether this child would only spend a call on a credential already blocked.

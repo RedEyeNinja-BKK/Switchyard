@@ -1639,11 +1639,28 @@ fn encode_responses_content(
                     part
                 }
                 MediaSource::Base64 { media_type, data } => {
-                    let mut video = json!({"data": data});
-                    if let Some(media_type) = media_type {
-                        video["media_type"] = Value::String(media_type.clone());
+                    // Measured against the provider's own Responses endpoint: it accepts a
+                    // video part ONLY as `input_video` with a string `video_url`, and answers
+                    // `video: {data, media_type}` with 400 "Invalid Responses API request"
+                    // (invalid_union, expected string). A `data:` URI is the same bytes in the
+                    // one shape that is accepted, so inline bytes survive translation instead
+                    // of being rejected upstream. Without a media type there is no faithful
+                    // URI, and inventing one would mislabel the payload, so the bytes are
+                    // reported as text and a lossy diagnostic is recorded -- the same choice
+                    // the image encoder makes.
+                    match media_type {
+                        Some(media_type) => {
+                            json!({"type": "input_video", "video_url": format!("data:{media_type};base64,{data}")})
+                        }
+                        None => {
+                            push_lossy(
+                                diagnostics,
+                                policy,
+                                "Responses codec could not map inline video without a media type",
+                            )?;
+                            json!({"type": "input_text", "text": format!("video: {} bytes", data.len())})
+                        }
                     }
-                    json!({"type": "input_video", "video": video})
                 }
             }),
             ContentBlock::File { source } => match responses_file_part(source) {

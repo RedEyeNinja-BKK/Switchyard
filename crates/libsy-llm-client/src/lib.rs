@@ -20,6 +20,7 @@ pub mod allowance;
 pub mod backend;
 pub mod client;
 pub mod error;
+pub mod google;
 pub mod metrics;
 mod observability;
 mod observation;

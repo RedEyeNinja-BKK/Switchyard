@@ -1118,6 +1118,11 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
             limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
                 || is_documented_billing_limit(body)
                 || names_free_model_daily_cap(body)
+                // Google returns two different 429s. `quota_exceeded` is the daily one, and
+                // every candidate behind the same project draws on it; `rate_limit_exceeded`
+                // is a window that clears and is retried instead.
+                || crate::google::parse(Some(status.as_u16()), body)
+                    .is_some_and(|error| error.condition == crate::google::GoogleCondition::DailyQuota)
         }
         // Insufficient credits: the account balance is the shared resource, so no
         // candidate on this credential can serve the request.
@@ -1167,6 +1172,14 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         LlmClientError::PayloadNotCleared { .. } => false,
         LlmClientError::UpstreamHttp { status, body } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
+                return false;
+            }
+            // A provider that names its condition decides whether the same bytes go out
+            // again. Google distinguishes a window throttle from a spent daily quota on the
+            // same status, and a policy block from an outage on the same 400.
+            if crate::google::parse(Some(status.as_u16()), body)
+                .is_some_and(|error| !error.recovery().retry_same_model)
+            {
                 return false;
             }
             metrics::is_retryable_http_status(status.as_u16())
@@ -1907,6 +1920,50 @@ mod tests {
     use super::*;
     use crate::backend::HttpBackendConfig;
     use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
+
+    /// Google's two 429s must not be collapsed: one clears, the other waits for the day.
+    #[test]
+    fn a_google_daily_quota_is_not_retried_but_its_window_throttle_is() {
+        let error = |status: u16, body: &str| LlmClientError::UpstreamHttp {
+            status: StatusCode::from_u16(status).expect("status"),
+            body: body.to_string(),
+        };
+
+        let throttle = error(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow"}}"#,
+        );
+        assert!(is_transient_failure(&throttle));
+        assert!(!is_account_wide_quota(&throttle));
+
+        let quota = error(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily"}}"#,
+        );
+        assert!(!is_transient_failure(&quota));
+        assert!(is_account_wide_quota(&quota));
+
+        // A daily quota is still a daily quota when it arrives behind a 5xx: the code, not
+        // the status, says the allowance is spent, so no retry may follow it.
+        let quota_behind_5xx = error(
+            503,
+            r#"{"error":{"code":"quota_exceeded","message":"daily quota"}}"#,
+        );
+        assert!(!is_transient_failure(&quota_behind_5xx));
+
+        // A content block is a 400 that must not be resent, and it is not a quota.
+        let blocked = error(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert!(!is_transient_failure(&blocked));
+        assert!(!is_account_wide_quota(&blocked));
+
+        // The other providers' contracts are untouched by the Google decoder.
+        let openrouter = error(
+            429,
+            r#"{"error":{"code":402,"message":"credits","metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#,
+        );
+        assert!(!is_transient_failure(&openrouter));
+        assert!(is_account_wide_quota(&openrouter));
+    }
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {

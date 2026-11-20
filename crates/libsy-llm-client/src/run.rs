@@ -790,6 +790,15 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
         LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
         LlmClientError::UpstreamHttp { status, body } => match *status {
+            // Google names its condition in the body, and the name decides more than the
+            // status: a 429 is a throttle or a spent daily quota, a 400 is an adapter defect
+            // or a content block. Diagnosis stays a pure mapping; what may be retried or
+            // routed around is decided by the recovery this module derives.
+            _ if crate::google::parse(Some(status.as_u16()), body).is_some() => {
+                google_failure_class(
+                    crate::google::parse(Some(status.as_u16()), body).map(|error| error.condition),
+                )
+            }
             StatusCode::NOT_FOUND if is_retired_model(source) => FailureClass::ModelRetired,
             StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
             StatusCode::REQUEST_TIMEOUT => FailureClass::Timeout,
@@ -816,6 +825,35 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
             _ => FailureClass::Other,
         },
         _ => FailureClass::Other,
+    }
+}
+
+/// The failure class a decoded Google condition belongs to.
+///
+/// These map onto the classes the route already understands rather than adding a parallel
+/// vocabulary: a daily quota is the same fact as any other account-wide cap, and a content
+/// block is the same fact as any other provider-policy refusal.
+fn google_failure_class(condition: Option<crate::google::GoogleCondition>) -> FailureClass {
+    use crate::google::GoogleCondition as C;
+    match condition {
+        Some(C::DailyQuota) => FailureClass::AccountQuota,
+        Some(C::ShortWindowThrottle) => FailureClass::RateLimited,
+        Some(C::Capacity) => FailureClass::TemporarilyUnavailable,
+        Some(C::ProviderFault) => FailureClass::Server,
+        Some(C::ProviderDeadline) => FailureClass::Timeout,
+        Some(C::ModelNotFound) => FailureClass::ModelRetired,
+        Some(C::Unauthenticated | C::PermissionDenied | C::LeakedCredential) => FailureClass::Auth,
+        Some(C::ContentBlocked(_)) => FailureClass::ProviderPolicy,
+        Some(
+            C::ResourceNotFound
+            | C::InvalidRequest
+            | C::UnsupportedOperation
+            | C::Conflict
+            | C::Aborted
+            | C::MalformedTool
+            | C::IncompleteOutput,
+        ) => FailureClass::Request,
+        Some(C::ClientCancelled | C::Unknown) | None => FailureClass::Other,
     }
 }
 
@@ -849,6 +887,15 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
             | LlmClientError::DailyRequestAllowanceUnavailable { .. }
     ) {
         return Some(RoutingFallbackReason::Unavailable);
+    }
+    // A condition Google names as being about the request - a policy block, a malformed tool
+    // call, an unsupported parameter - is an answer, and handing it to another provider would
+    // be an attempt to evade that answer rather than to serve the caller.
+    if let LlmClientError::UpstreamHttp { status, body } = source
+        && crate::google::parse(Some(status.as_u16()), body)
+            .is_some_and(|error| error.recovery().keep_outcome)
+    {
+        return None;
     }
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
@@ -1527,6 +1574,73 @@ mod tests {
 
     use crate::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
     use switchyard_protocol::Category;
+
+    /// Google names its condition in the body, and the name decides the route's response.
+    ///
+    /// The two 429s are the point: a window throttle may be retried or stepped past, while a
+    /// spent daily quota stops the candidate list because every candidate behind the same
+    /// project draws on it. A policy block is an outcome about the request, so it is neither
+    /// an outage nor a reason to hand the same prompt to a more permissive provider.
+    #[test]
+    fn a_google_condition_decides_the_failure_class() {
+        let call = |status: u16, body: &str| {
+            LibsyError::client_call(
+                "gemini",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::from_u16(status).expect("status"),
+                    body: body.to_string(),
+                },
+            )
+        };
+
+        let throttle = call(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow"}}"#,
+        );
+        assert_eq!(failure_class(&throttle), FailureClass::RateLimited);
+        assert!(fallback_reason(&throttle).is_some());
+
+        let quota = call(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily"}}"#,
+        );
+        assert_eq!(failure_class(&quota), FailureClass::AccountQuota);
+        assert!(
+            fallback_reason(&quota).is_none(),
+            "another candidate draws on the same project quota"
+        );
+
+        // Capacity, in the measured list-wrapped 31B shape.
+        let capacity = call(
+            503,
+            r#"[{"error":{"code":503,"status":"UNAVAILABLE","message":"high demand"}}]"#,
+        );
+        assert_eq!(
+            failure_class(&capacity),
+            FailureClass::TemporarilyUnavailable
+        );
+        assert!(fallback_reason(&capacity).is_some());
+
+        let blocked = call(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert_eq!(failure_class(&blocked), FailureClass::ProviderPolicy);
+        assert!(fallback_reason(&blocked).is_none());
+
+        // A denied permission is scoped to the credential and must not become a hop.
+        let denied = call(
+            403,
+            r#"{"error":{"code":"permission_denied","message":"no access"}}"#,
+        );
+        assert_eq!(failure_class(&denied), FailureClass::Auth);
+        assert!(fallback_reason(&denied).is_none());
+
+        // A slug that is not served may be routed around; a missing asset may not.
+        let missing_model = call(
+            404,
+            r#"{"error":{"code":"model_not_found","message":"gone"}}"#,
+        );
+        assert_eq!(failure_class(&missing_model), FailureClass::ModelRetired);
+        assert!(fallback_reason(&missing_model).is_some());
+    }
 
     /// The free-model allowance covers the provider's free-model ROUTER too.
     ///

@@ -88,3 +88,43 @@ Additional source reviewed directly: **[Google's official Gemini API troubleshoo
 - Separate **provider error diagnosis** from **routing decision**: Google says exponential backoff for transient conditions, but it does not authorize retries, provider switching or spending money on the user's behalf. Switchyard decides based on the owner's privacy and economy contract.
 - Incorporate this error handling in active PR #46's R3 measured Gemma fixes, then reuse for the **entire 26-actionable Free-tier portfolio** by API family, not 26 bespoke error handlers. Antigravity remains deferred; Stephen `ST_Route` expansion remains future private Agent Stack Issue #58.
 - **No calls, deploys or merges are authorized by this document.** Current R1, rollback anchor, strict-NT consumers and Turnstone primary stay unchanged. Deliver a focused code change, offline tests, and one production-ready staged readback; ask for the next owner GO separately, not another documentation/research cycle.
+
+## Implementation record - what is now enforced in code
+
+`crates/libsy-llm-client/src/google.rs` is the one decoder. It recognizes the four envelopes
+(Interactions buffered, Interactions streaming `event_type:"error"` after HTTP 200, native
+gRPC-style `status`, and the OpenAI-compatible object including the measured list-wrapped
+503) and reduces them to one `GoogleCondition`. It only *diagnoses*: every actionable field
+lives in `GoogleRecovery`, which the existing declassifier and route read.
+
+Wiring, all inside mechanisms that already existed - no second router:
+
+| seam | behaviour |
+| --- | --- |
+| `client.rs::is_account_wide_quota` | Google `quota_exceeded` is account-wide, so the candidate list stops; `rate_limit_exceeded` is not. |
+| `client.rs::is_transient_failure` | A condition whose `retry_same_model` is false is not resent, whatever the status says. This is what keeps a daily quota that arrives behind a 5xx from being retried. |
+| `run.rs::failure_class` | Conditions map onto the existing classes: `DailyQuota → AccountQuota`, `ShortWindowThrottle → RateLimited`, `Capacity → TemporarilyUnavailable`, `ContentBlocked → ProviderPolicy`, `ModelNotFound → ModelRetired`, credential codes → `Auth`, structural codes → `Request`. |
+| `run.rs::fallback_reason` | A condition with `keep_outcome` is not routed around. A policy block, a malformed tool call or a cancelled call is an answer; handing it to another provider would be evading it. |
+
+Deliberate conservatism, all of it test-pinned:
+
+- bare `RESOURCE_EXHAUSTED` on 429 stays a **window throttle** - promoting it to a daily
+  quota would stop every candidate until midnight on a condition that clears in a minute;
+- an unmapped subtype falls back to the HTTP status, and an unmapped status stays `Unknown`
+  with no permissions granted;
+- recognition requires positive Google evidence (uppercase gRPC status, `google.rpc.` detail
+  type, a documented snake_case code, or the leaked-key sentence), so OpenRouter's
+  `limit_source` / masked `server_error` contracts and DeepSeek's body keep their existing
+  classification. That separation is itself a test.
+- `Retry-After` is parsed and capped by `capped_retry_after`; a date-form value is ignored
+  rather than guessed at. Switchyard speaks REST to Google, so there is no SDK retry layer
+  underneath to multiply the attempt budget.
+
+Offline coverage (no network in any of these): the decoder's twelve unit tests cover both
+429 codes, the list-wrapped 503, the SSE error event, model-vs-resource 404, policy blocks,
+malformed tool calls, the leaked-key sentence, the conservative fallbacks and the
+other-provider regression guard. Two declassification tests assert the same conditions
+through `is_transient_failure` / `is_account_wide_quota` and through
+`failure_class` / `fallback_reason`. Four mutants - the account-wide clause, the
+retry-same-model gate, the class mapping and the keep-outcome arm - were each removed in turn
+and each turned a named test red.

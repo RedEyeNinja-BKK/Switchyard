@@ -84,6 +84,22 @@ max_input_tokens = 250000
 '''
 
 GEMMA_TARGETS = '''
+# The 31B answers 503 while it spins up, and the lane's default failure cooldown is five
+# seconds -- short enough to spend the whole free-minute budget re-asking a model that is
+# still starting. It therefore gets its own client entry, identical to the shared one except
+# for the cooldown, rather than a group: `cooldown_group` would make a capacity fact about
+# the large model cool the small one down with it, and the small one is this lane's default.
+# The daily counter is still shared, because it is the same project and the same allowance.
+[llm_clients.google_gemma_31b]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+requires_public_payload = true
+quota_group = "google-ai-studio-free"
+max_retries = 0
+failure_cooldown_ms = 300000
+
 # Gemma 4, added for bounded tasks. Native ids from the owner's AI Studio listing; the
 # serving receipt is what `smart-gemini-bounded` exists to collect, so nothing else depends
 # on them yet.
@@ -96,7 +112,7 @@ GEMMA_TARGETS = '''
 # an observed balance -- see the note on the Lite targets above.
 [targets."direct-google-gemma-4-31b-it"]
 id = "gemma-4-31b-it"
-llm_client = "google_gemini"
+llm_client = "google_gemma_31b"
 vision = false
 video = false
 context_window = 262144
@@ -156,10 +172,17 @@ video = false
 # behaviour out of reach. Both targets sit on one credential at one price, so reordering
 # them cannot move cost -- it only moves success rate and latency.
 #
-# What decided the order today is the model names, not evidence. The first few observations
-# will replace that: `selection = "measured"` reorders only after a candidate has at least
-# three observations, and it never adds, drops or resurrects one. A physical or payload
-# refusal is still final because it is applied before selection.
+# The default is the 26B, and the reason is structural rather than a measurement: it is an
+# A4B mixture with roughly 4B active parameters per token against the 31B's 31B, so for the
+# same request it moves far fewer weights. On a free tier whose binding constraint is tokens
+# per minute, that is the difference between finishing inside the minute and being refused
+# for the rest of it. The 31B stays as the escalation step, where a caller has already asked
+# for something the small model's quality did not settle.
+#
+# `selection = "measured"` reorders only after a candidate has at least three observations,
+# and it never adds, drops or resurrects one. A physical or payload refusal is still final
+# because it is applied before selection. Until those observations exist the order above is
+# what serves, so it is chosen on the argument, not on the model names.
 #
 # context_window = 262144 is the composite promise and it is checked at load against the
 # widest target below it, so it cannot drift into a claim no target serves. The 16,000-token
@@ -168,8 +191,8 @@ video = false
 [routes."smart-gemini-bounded"]
 id = "smart-gemini-bounded"
 type = "passthrough"
-target = "direct-google-gemma-4-31b-it"
-candidates = ["direct-google-gemma-4-26b-a4b-it"]
+target = "direct-google-gemma-4-26b-a4b-it"
+candidates = ["direct-google-gemma-4-31b-it"]
 selection = "measured"
 context_window = 262144
 tool_calling = false
@@ -234,7 +257,9 @@ def verify(candidate: str, live: str) -> dict:
             failures.append(f"{name}: max_input_tokens is {target.get('max_input_tokens')!r}")
         if target.get("daily_request_limit") != rpd:
             failures.append(f"{name}: daily_request_limit is {target.get('daily_request_limit')!r}")
-        if target.get("llm_client") != "google_gemini":
+        # The 31B carries its own client entry for a longer capacity cooldown; both still
+        # point at the same gated AI Studio project and share its daily counter.
+        if target.get("llm_client") not in {"google_gemini", "google_gemma_31b"}:
             failures.append(f"{name}: not on the gated Google client")
 
     for name, ceiling in (
@@ -255,9 +280,12 @@ def verify(candidate: str, live: str) -> dict:
     if bounded.get("context_window") != 262144:
         failures.append("smart-gemini-bounded over- or under-states its window")
     children = [bounded.get("target"), *bounded.get("candidates", [])]
+    # 26B first: it is the A4B default, and the 31B is the escalation step. The order is
+    # checked here because it is the one decision in this file that a reader cannot verify
+    # from a hash.
     if children != [
-        "direct-google-gemma-4-31b-it",
         "direct-google-gemma-4-26b-a4b-it",
+        "direct-google-gemma-4-31b-it",
     ]:
         failures.append(f"smart-gemini-bounded candidates are {children!r}")
 

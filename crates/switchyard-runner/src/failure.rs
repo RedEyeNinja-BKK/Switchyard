@@ -100,12 +100,14 @@ impl RunnerError {
                 None,
                 None,
             ),
-            // A capability no eligible route can satisfy, and a conflicting provider state
-            // claim, are both decided against the request rather than the deployment.
+            // A capability no eligible route can satisfy, a conflicting provider state
+            // claim, and a pre-egress refusal are all decided against the request rather
+            // than the deployment: the caller can change what it sends or how it clears it.
             Self::UnknownRouteModel(_)
             | Self::IncompatibleCallerFormat(_)
             | Self::AuxiliaryUnsupported
             | Self::UnsupportedCapability { .. }
+            | Self::PrivacyRefused { .. }
             | Self::StateConflict(_) => summary(
                 RouteErrorKind::InvalidRequest,
                 RouteErrorPhase::BeforeResponse,

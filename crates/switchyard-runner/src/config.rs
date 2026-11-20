@@ -23,8 +23,9 @@ use switchyard_protocol::{
 };
 
 use crate::{
-    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError, capability, decision_executor, decision_transport,
+    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, MediaCarrier,
+    ModelCapabilities, Route, Runner, RunnerError, capability, decision_executor,
+    decision_transport,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -105,6 +106,53 @@ pub(crate) struct DeploymentConfig {
     /// Ordered composites over complete child routes, by route name.
     #[serde(default)]
     pub(crate) composites: BTreeMap<String, CompositeRouteConfig>,
+    /// Where per-target daily request allowances keep their counters.
+    ///
+    /// Optional as a whole: a deployment with no `daily_request_limit` has no budget to
+    /// account for. Required as soon as one target declares a limit, because an allowance
+    /// whose counter cannot be written is a cap nobody is enforcing.
+    #[serde(default)]
+    quota: Option<QuotaConfig>,
+    /// Admission for providers that may only receive a payload cleared as public.
+    ///
+    /// Optional, but required as soon as one `llm_client` declares
+    /// `requires_public_payload`: without a key nothing can authenticate a clearance, so a
+    /// gated client would be permanently unservable and the mistake would surface as every
+    /// request refused rather than as the configuration error it is.
+    #[serde(default)]
+    privacy: Option<PrivacyConfig>,
+}
+
+/// Admission for providers that may only receive a payload cleared as public.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivacyConfig {
+    /// Environment variable holding the clearance key.
+    ///
+    /// The value is the shared secret a caller signs its clearance with. It is read once at
+    /// load and never printed: the configuration's own `Debug` reports only whether a key
+    /// was found.
+    pub(crate) clearance_key_env: String,
+}
+
+impl std::fmt::Debug for PrivacyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivacyConfig")
+            .field("clearance_key_env", &self.clearance_key_env)
+            .finish()
+    }
+}
+
+/// Accounting for per-target daily request allowances.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QuotaConfig {
+    /// Directory holding one counter file per (llm client, model).
+    ///
+    /// Created if it does not exist. Verified writable at load, so a budget that cannot be
+    /// counted is a startup error rather than a silently unenforced cap.
+    pub(crate) state_dir: std::path::PathBuf,
 }
 
 /// A route composed of ordered whole child routes.
@@ -117,6 +165,16 @@ pub(crate) struct DeploymentConfig {
 pub(crate) struct CompositeRouteConfig {
     /// Child route names in preference order.
     pub(crate) children: Vec<String>,
+    /// When this composite may try its next child.
+    ///
+    /// Defaults to the historical failure-class rule, which is right for a composite whose
+    /// children sit on different credentials. A composite whose children share one
+    /// credential has a different question to answer: whether the *scope* the failed child
+    /// used is exhausted while the next child's scope is not. `credential_block` says that
+    /// and nothing more, so an ordinary rate limit, a timeout or a provider fault cannot
+    /// spend a paid call.
+    #[serde(default)]
+    pub(crate) cross_on: CompositeCrossPolicy,
     /// Certified context this composite guarantees, as an explicit policy promise.
     ///
     /// Stated rather than derived: a composite whose first child accepts a million tokens
@@ -132,6 +190,43 @@ pub(crate) struct CompositeRouteConfig {
     /// Whether any child can accept video input. Stated, never inferred from `vision`.
     #[serde(default)]
     pub(crate) video: Option<bool>,
+    /// Which video carriers any child can accept, when the composite claims video.
+    ///
+    /// Same reasoning as the route field: a composite resolves before its children, so a
+    /// carrier it cannot back would advertise a medium and then skip every child.
+    #[serde(default)]
+    pub(crate) video_carrier: Option<MediaCarrier>,
+    /// Which image carriers any child can accept, when the composite claims vision.
+    #[serde(default)]
+    pub(crate) image_carrier: Option<MediaCarrier>,
+}
+
+/// When a whole-route composite may try its next child.
+///
+/// The two answers differ in what they treat as evidence. `failure_class` asks whether the
+/// failure looks recoverable somewhere else, which is the right question when children sit
+/// on different credentials. `credential_block` asks whether the failure named a
+/// credential-scoped resource as out, which is the right question when children share one
+/// credential and the later child's *scope* is what differs.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositeCrossPolicy {
+    /// Cross on any failure class that says another complete route might answer.
+    ///
+    /// This is the historical rule and stays the default, so an existing composite's
+    /// behaviour does not change because a new policy became available.
+    #[default]
+    FailureClass,
+    /// Cross only when the failed child reported a credential-level block AND a later
+    /// child on that credential still has a servable scope.
+    ///
+    /// A block is what the provider said about the credential, not what the request
+    /// looked like: the free-model daily allowance reported exhausted is a block, while a
+    /// 20-per-minute throttle, a timeout, a transport fault or a per-model refusal is not.
+    /// A later child on a different credential is unaffected by any block and is judged on
+    /// its own failure. A whole-credential exhaustion or a rejected key blocks every child
+    /// on that credential, so no later child is called and the child's own error surfaces.
+    CredentialBlock,
 }
 
 /// One explicitly ordered decision lane.
@@ -173,6 +268,15 @@ struct RouteConfig {
     reasoning: Option<bool>,
     vision: Option<bool>,
     video: Option<bool>,
+    /// Which video carriers this route admits, when it claims video.
+    ///
+    /// A route promise, not a target fact: the target says what one endpoint can serve and
+    /// this says what the route lets through. They are intersected at load, so a route that
+    /// promises both carriers over an inline-only target is a configuration error rather
+    /// than a request that fails at the provider.
+    video_carrier: Option<MediaCarrier>,
+    /// Which image carriers this route admits, when it claims vision.
+    image_carrier: Option<MediaCarrier>,
     /// Reasoning policy for this route. Applies on top of the target's factual policy.
     route_reasoning_policy: Option<RouteReasoningPolicy>,
     /// Whether this route's reasoning policy is applied on a best-effort basis.
@@ -254,6 +358,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
         let video = take_optional(&mut table, "video")?;
+        let video_carrier = take_optional::<MediaCarrier, _>(&mut table, "video_carrier")?;
+        let image_carrier = take_optional::<MediaCarrier, _>(&mut table, "image_carrier")?;
         let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
         let route_reasoning_policy_best_effort: Option<bool> =
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
@@ -268,6 +374,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
             reasoning,
             vision,
             video,
+            video_carrier,
+            image_carrier,
             route_reasoning_policy,
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
@@ -305,6 +413,12 @@ impl RouteConfig {
             reasoning: self.reasoning,
             vision: self.vision,
             video: self.video,
+            // A route that claims a medium without naming carriers means every carrier, so
+            // a caller reading `/v1/models` and a request carrying either form agree.
+            video_carrier: (self.video == Some(true))
+                .then(|| self.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+            image_carrier: (self.vision == Some(true))
+                .then(|| self.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
         }
     }
 
@@ -318,6 +432,69 @@ impl RouteConfig {
 }
 
 impl DeploymentConfig {
+    /// The media capabilities a composite actually guarantees.
+    ///
+    /// A composite can serve a request only through one of its children, so what it can
+    /// promise is what the children between them accept. When the parent states a medium or
+    /// a carrier it keeps its word (an explicit `false` is a policy cap, not an omission),
+    /// and when it states nothing the answer is derived from the children:
+    ///
+    /// * a medium is claimed only when some child declares it -- an undeclared child is not
+    ///   evidence that it reads images, so derivation never invents a claim;
+    /// * a carrier is the union over the children that admit the medium, so a composite over
+    ///   inline-only children advertises inline and a mixed set advertises both.
+    ///
+    /// Deriving rather than hand-editing every parent is what keeps the declaration honest
+    /// when a child's carrier narrows: the parent follows, and
+    /// `validate_composite_media_claims` still refuses an explicit claim no child keeps.
+    fn composite_capabilities(
+        &self,
+        composite: &CompositeRouteConfig,
+    ) -> crate::ModelCapabilities {
+        let children: Vec<crate::ModelCapabilities> = composite
+            .children
+            .iter()
+            .filter_map(|child| self.routes.get(child))
+            .map(RouteConfig::capabilities)
+            .collect();
+        let serves =
+            |medium: fn(&crate::ModelCapabilities) -> Option<bool>| {
+                children.iter().any(|caps| medium(caps) == Some(true))
+            };
+        let carrier_union = |medium: fn(&crate::ModelCapabilities) -> Option<bool>,
+                             carrier: fn(&crate::ModelCapabilities) -> Option<MediaCarrier>| {
+            children
+                .iter()
+                .filter(|caps| medium(caps) == Some(true))
+                .map(|caps| carrier(caps).unwrap_or(MediaCarrier::DEFAULT))
+                .reduce(MediaCarrier::union)
+        };
+        let video = composite.video.unwrap_or_else(|| serves(|caps| caps.video));
+        let vision = composite.vision.unwrap_or_else(|| serves(|caps| caps.vision));
+        crate::ModelCapabilities {
+            context_window: composite.context_window,
+            tool_calling: composite.tool_calling,
+            reasoning: composite.reasoning,
+            vision: Some(vision),
+            video: Some(video),
+            // A stated carrier is a policy narrowing; otherwise the union of the children's
+            // carriers, never the permissive default, so the parent cannot advertise a
+            // carrier nothing below it serves.
+            video_carrier: video.then(|| {
+                composite.video_carrier.or_else(|| {
+                    carrier_union(|caps| caps.video, |caps| caps.video_carrier)
+                })
+                .unwrap_or(MediaCarrier::DEFAULT)
+            }),
+            image_carrier: vision.then(|| {
+                composite.image_carrier.or_else(|| {
+                    carrier_union(|caps| caps.vision, |caps| caps.image_carrier)
+                })
+                .unwrap_or(MediaCarrier::DEFAULT)
+            }),
+        }
+    }
+
     fn decision_target(&self, name: &str) -> Option<DecisionTarget> {
         let target = self.targets.get(name)?;
         let client = self.llm_clients.get(&target.llm_client)?;
@@ -403,6 +580,9 @@ impl DeploymentConfig {
         }
 
         let facts = self.deployment_facts();
+        // Resolved once, before any route is built, so a gated deployment that cannot
+        // authenticate a clearance fails at load instead of refusing every request later.
+        let clearance_key = self.build_clearance_key()?;
 
         let mut route_names_by_id = HashMap::new();
         for (route_name, config) in &self.routes {
@@ -465,7 +645,7 @@ impl DeploymentConfig {
         let fallback_base_url = self.fallback_base_url()?;
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
-        self.validate_composite_video_claims()?;
+        self.validate_composite_media_claims()?;
         self.validate_video_transport()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
@@ -660,7 +840,9 @@ impl DeploymentConfig {
                 config.escalation_max_input_tokens,
                 escalation_model,
             )
-            .with_target_credentials(target_credentials(config, &self.targets));
+            .with_target_credentials(target_credentials(config, &self.targets))
+            .with_locality(route_locality(config, &self.targets, &self.llm_clients))
+            .with_clearance_key(clearance_key.clone());
             routes.push((config.id.clone(), route));
         }
         // The default logical decision lane. Every configured decision target in
@@ -682,15 +864,10 @@ impl DeploymentConfig {
         // resolving a route cannot tell whether it is a leaf or a composite.
         for (name, composite) in &self.composites {
             runner = runner.with_composite(name.clone(), composite.children.clone());
+            runner = runner.with_composite_cross_policy(name.clone(), composite.cross_on);
             runner = runner.with_composite_capabilities(
                 name.clone(),
-                crate::ModelCapabilities {
-                    context_window: composite.context_window,
-                    tool_calling: composite.tool_calling,
-                    reasoning: composite.reasoning,
-                    vision: composite.vision,
-                    video: composite.video,
-                },
+                self.composite_capabilities(composite),
             );
         }
 
@@ -708,10 +885,154 @@ impl DeploymentConfig {
         Ok(runner)
     }
 
+    /// The key that authenticates a caller's privacy clearance.
+    ///
+    /// Required exactly when some `llm_client` declares `requires_public_payload`. Without
+    /// it nothing can authenticate a clearance, so every request to that client would be
+    /// refused: a startup error is the only honest way to report that.
+    fn build_clearance_key(&self) -> RunnerResult<Arc<crate::egress::ClearanceKey>> {
+        let gated: Vec<&str> = self
+            .llm_clients
+            .iter()
+            .filter(|(_, client)| client.requires_public_payload)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let Some(privacy) = self.privacy.as_ref() else {
+            if gated.is_empty() {
+                return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
+            }
+            return Err(RunnerError::configuration(format!(
+                "llm clients {} declare requires_public_payload but the deployment configures no [privacy] clearance_key_env; a clearance cannot be authenticated without a key, so every request to them would be refused",
+                gated.join(", ")
+            )));
+        };
+        if gated.is_empty() {
+            return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
+        }
+        let secret = std::env::var(&privacy.clearance_key_env).map_err(|_| {
+            RunnerError::configuration(format!(
+                "[privacy] clearance_key_env names {}, which is not set; llm clients {} require a public payload, so the key is required",
+                privacy.clearance_key_env,
+                gated.join(", ")
+            ))
+        })?;
+        if secret.trim().is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "[privacy] clearance_key_env names {}, which is empty; llm clients {} require a public payload, so the key is required",
+                privacy.clearance_key_env,
+                gated.join(", ")
+            )));
+        }
+        Ok(Arc::new(crate::egress::ClearanceKey::new(
+            secret.into_bytes(),
+        )))
+    }
+
+    /// Builds one daily request allowance per (quota group, model) that declares a limit.
+    ///
+    /// Keyed by the client's declared quota group rather than by the client's name, because
+    /// the provider caps requests per project: two clients that name the same project are
+    /// one budget, and keying them apart would hand the deployment twice the allowance it
+    /// actually has. A client that declares no group is its own group, which leaves a
+    /// single-client deployment unchanged.
+    fn build_allowances(
+        &self,
+    ) -> RunnerResult<HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>>
+    {
+        let mut allowances = HashMap::new();
+        let mut limits: HashMap<(String, ModelId), (u64, &str)> = HashMap::new();
+        for (target_name, target) in &self.targets {
+            let Some(limit) = target.daily_request_limit else {
+                continue;
+            };
+            if limit == 0 {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} daily_request_limit must be at least 1"
+                )));
+            }
+            let group = self
+                .llm_clients
+                .get(&target.llm_client)
+                .and_then(|client| client.quota_group.clone())
+                .unwrap_or_else(|| target.llm_client.clone());
+            let key = (group.clone(), target.id.clone());
+            match limits.entry(key) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let (first_limit, first_name) = existing.get();
+                    if *first_limit != limit {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} share model {} in quota group {group} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
+                            target.id
+                        )));
+                    }
+                    continue;
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((limit, target_name.as_str()));
+                }
+            }
+            let quota = self.quota.as_ref().ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
+                ))
+            })?;
+            allowances.insert(
+                (group.clone(), target.id.clone()),
+                Arc::new(switchyard_llm_client::DailyRequestAllowance::new(
+                    group.clone(),
+                    target.id.clone(),
+                    limit,
+                    switchyard_llm_client::allowance_path(
+                        &quota.state_dir,
+                        &group,
+                        target.id.as_str(),
+                    ),
+                )),
+            );
+        }
+        if !allowances.is_empty() {
+            self.validate_quota_state_dir()?;
+        }
+        Ok(allowances)
+    }
+
+    /// Proves the allowance counter directory is usable now, not at the first request.
+    ///
+    /// Without this, a wrong path or ownership would leave the budget unenforced until a
+    /// request arrived - and then surface as a refused leg rather than as the configuration
+    /// error it is.
+    fn validate_quota_state_dir(&self) -> RunnerResult<()> {
+        let Some(quota) = self.quota.as_ref() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(&quota.state_dir).map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} cannot be created: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        let probe = quota.state_dir.join(".write-probe");
+        std::fs::write(&probe, b"switchyard quota state\n").map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} is not writable: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        std::fs::remove_file(&probe).map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} probe could not be removed: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        Ok(())
+    }
+
     fn build_clients(
         &self,
         provider_api_keys: &mut Vec<String>,
     ) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
+        // Built before the per-target backends so each one can carry its own budget.
+        let allowances = self.build_allowances()?;
         let mut models_by_client = self
             .llm_clients
             .keys()
@@ -728,6 +1049,7 @@ impl DeploymentConfig {
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
                 None,
             )?;
             let (Backend::OpenAiChat(config)
@@ -779,6 +1101,15 @@ impl DeploymentConfig {
                     target.reasoning_policy,
                     target.reasoning_dialect,
                     target.cooldown_group.clone(),
+                    allowances
+                        .get(&(
+                            client_config
+                                .quota_group
+                                .clone()
+                                .unwrap_or_else(|| target.llm_client.clone()),
+                            target.id.clone(),
+                        ))
+                        .cloned(),
                 )?,
                 None,
             ));
@@ -862,6 +1193,22 @@ impl DeploymentConfig {
     /// targets: a route may deliberately be narrower than its widest target.
     fn validate_route_capability_claims(&self) -> RunnerResult<()> {
         for (route_name, route) in &self.routes {
+            // A carrier without its medium would be a silently inert field: `capabilities()`
+            // only reports a carrier for a medium the route actually claims, so a route
+            // writing `video_carrier` without `video = true` would read as configured and do
+            // nothing. Refuse it rather than accept a no-op.
+            if route.video_carrier.is_some() && route.video != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares video_carrier without video = true; a carrier \
+                     is a narrowing of a medium the route must first claim"
+                )));
+            }
+            if route.image_carrier.is_some() && route.vision != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares image_carrier without vision = true; a carrier \
+                     is a narrowing of a medium the route must first claim"
+                )));
+            }
             let capabilities = route.capabilities();
             let mut names: Vec<&str> = route.routing_target_names().into_iter().collect();
             names.sort_unstable();
@@ -890,30 +1237,192 @@ impl DeploymentConfig {
                          supports it; declare a target that does, or stop claiming it"
                     )));
                 }
+                // A carrier claim is a promise about a specific transport, and every carrier
+                // the route advertises must be backed by some target below it. "Both" is two
+                // promises: a target that only fetches URLs does not keep the inline half,
+                // so a route advertising both over inline-only targets would send a caller
+                // into a refusal the advertisement said could not happen.
+                let claimed_carrier = match label {
+                    "vision" => capabilities.image_carrier,
+                    "video" => capabilities.video_carrier,
+                    _ => None,
+                };
+                if let Some(claimed) = claimed_carrier {
+                    let missing: Vec<MediaCarrier> = claimed
+                        .carriers()
+                        .iter()
+                        .copied()
+                        .filter(|need| {
+                            !names.iter().any(|name| {
+                                let Some(target) = self.targets.get(*name) else {
+                                    return false;
+                                };
+                                // A target that refuses the medium serves none of its
+                                // carriers, whatever its carrier field says.
+                                let admits_medium = match label {
+                                    "vision" => target.vision != Some(false),
+                                    _ => target.video == Some(true),
+                                };
+                                // An undeclared carrier on an admitted medium means both,
+                                // exactly as it does on a route.
+                                let served = match label {
+                                    "vision" => target.image_carrier,
+                                    _ => target.video_carrier,
+                                }
+                                .unwrap_or(MediaCarrier::Both);
+                                admits_medium && served.includes(*need)
+                            })
+                        })
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares {label} carrier {claimed:?} but no \
+                             target serves {missing:?}; declare a target that does, or narrow \
+                             the route's carrier"
+                        )));
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// Checks that a composite claiming video has a child that can serve it.
+    /// Checks a composite's effective media claim against the children that must keep it.
     ///
-    /// A composite is registered with its own declared capabilities and is resolved
-    /// before its children, so a claim nothing below it can keep would advertise video to
-    /// callers and then skip every child at request time.
-    fn validate_composite_video_claims(&self) -> RunnerResult<()> {
+    /// A composite is resolved before its children and reports its own guarantee, so a claim
+    /// nothing below it can keep would advertise a medium and then skip every child at
+    /// request time. The claim checked here is the *effective* one -- a stated value, or the
+    /// value derived from the children when the parent states nothing -- so a derived claim
+    /// is held to the same standard as a hand-written one.
+    ///
+    /// Two failures are refused and one is only reported:
+    ///
+    /// * a carrier stated without the medium it narrows, which would otherwise be silently
+    ///   inert;
+    /// * an effective claim no child can keep (an explicit over-claim);
+    /// * a parent that states *less* than its children serve (an explicit under-claim). That
+    ///   is safe -- nothing false is advertised -- so it is warned about rather than refused,
+    ///   and naming it at load is what stops a narrowed child from leaving a stale parent
+    ///   promise behind unnoticed.
+    fn validate_composite_media_claims(&self) -> RunnerResult<()> {
         for (name, composite) in &self.composites {
-            if composite.video != Some(true) {
-                continue;
+            let children: Vec<crate::ModelCapabilities> = composite
+                .children
+                .iter()
+                .filter_map(|child| self.routes.get(child))
+                .map(RouteConfig::capabilities)
+                .collect();
+            let effective = self.composite_capabilities(composite);
+            let claims = [
+                (
+                    "vision",
+                    composite.vision,
+                    composite.image_carrier,
+                    effective.vision,
+                    effective.image_carrier,
+                ),
+                (
+                    "video",
+                    composite.video,
+                    composite.video_carrier,
+                    effective.video,
+                    effective.video_carrier,
+                ),
+            ];
+            for (label, stated_medium, stated_carrier, effective_medium, effective_carrier) in
+                claims
+            {
+                // A stated carrier narrows a medium that is *served*, whether it was stated
+                // or derived. Reading the raw statement here would refuse a narrowing over a
+                // derived medium, which is a normal thing to write once children are the
+                // source of the capability.
+                if stated_carrier.is_some() && effective_medium != Some(true) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} states a {label} carrier but does not serve \
+                         {label}; a carrier narrows a medium, so state {label} = true beside a \
+                         child that serves it, or drop the carrier"
+                    )));
+                }
+                let serving = |caps: &crate::ModelCapabilities| match label {
+                    "vision" => caps.vision == Some(true),
+                    _ => caps.video == Some(true),
+                };
+                let child_carrier = |caps: &crate::ModelCapabilities| match label {
+                    "vision" => caps.image_carrier.unwrap_or(MediaCarrier::DEFAULT),
+                    _ => caps.video_carrier.unwrap_or(MediaCarrier::DEFAULT),
+                };
+                let Some(claimed) = effective_medium
+                    .filter(|medium| *medium)
+                    .and(effective_carrier)
+                else {
+                    continue;
+                };
+                if !children.iter().any(serving) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} declares {label} = true but none of its \
+                         children does; declare a child that does, or stop claiming it"
+                    )));
+                }
+                let missing: Vec<MediaCarrier> = claimed
+                    .carriers()
+                    .iter()
+                    .copied()
+                    .filter(|need| {
+                        !children
+                            .iter()
+                            .any(|caps| serving(caps) && child_carrier(caps).includes(*need))
+                    })
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} declares {label} carrier {claimed:?} but no \
+                         child serves {missing:?}; declare a child that does, or narrow the \
+                         composite's carrier"
+                    )));
+                }
+                // Report, do not refuse: an explicit promise narrower than what the children
+                // serve is safe, but it is the shape that goes stale when a child changes.
+                if stated_medium == Some(false)
+                    || stated_carrier.is_some_and(|stated| stated != claimed)
+                {
+                    let available = children
+                        .iter()
+                        .filter(|caps| serving(caps))
+                        .map(child_carrier)
+                        .reduce(MediaCarrier::union);
+                    if let Some(available) = available.filter(|available| *available != claimed) {
+                        tracing::warn!(
+                            "composite route {name} states {label} = {stated_medium:?} carrier \
+                             {stated_carrier:?} but its children serve {available:?}; the parent \
+                             refuses media a child could serve. Omit the statement to derive it \
+                             from the children."
+                        );
+                    }
+                }
             }
-            let supported = composite.children.iter().any(|child| {
-                self.routes
-                    .get(child)
-                    .is_some_and(|route| route.capabilities().video == Some(true))
-            });
-            if !supported {
+        }
+        Ok(())
+    }
+
+    /// Checks that every declared carrier is backed by the medium it narrows.
+    ///
+    /// A video declaration without a carrier is the ambiguity this change removes: the
+    /// provider may answer an inline video and 404 a URL, and nothing in the manifest would
+    /// say which. Requiring the carrier turns that into a load error instead of a
+    /// caller-visible 404 at request time. An image carrier is the mirror case and needs the
+    /// vision claim it narrows.
+    fn validate_target_carriers(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if target.video == Some(true) && target.video_carrier.is_none() {
                 return Err(RunnerError::configuration(format!(
-                    "composite route {name} declares video = true but none of its children \
-                     does; declare a child that does, or stop claiming it"
+                    "target {target_name} declares video = true but no video_carrier; state \
+                     which of \"inline\" / \"remote\" / \"both\" it serves"
+                )));
+            }
+            if target.image_carrier.is_some() && target.vision != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares image_carrier without vision = true; \
+                     a carrier is a narrowing of a medium it must first claim"
                 )));
             }
         }
@@ -928,6 +1437,9 @@ impl DeploymentConfig {
     /// of the video. Refusing at load makes that a configuration error rather than a
     /// silent conversion at request time.
     fn validate_video_transport(&self) -> RunnerResult<()> {
+        // Carrier declarations are checked for EVERY target, not only the video ones: an
+        // image carrier is a real narrowing on a target that may declare no video at all.
+        self.validate_target_carriers()?;
         for (target_name, target) in &self.targets {
             if target.video != Some(true) {
                 continue;
@@ -1260,7 +1772,35 @@ impl DeploymentConfig {
                         // Video is never inferred: a target that does not state support is
                         // treated as unable to receive it.
                         no_video: target.video != Some(true),
+                        // A target that declares video without carriers means both, so an
+                        // older manifest keeps the behaviour it had before carriers existed.
+                        no_remote_video: !matches!(
+                            target.video_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Remote | MediaCarrier::Both
+                        ),
+                        no_inline_video: !matches!(
+                            target.video_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Inline | MediaCarrier::Both
+                        ),
+                        // Images carry the same distinction and the same default: a target
+                        // that declares vision without carriers means both.
+                        no_remote_image: !matches!(
+                            target.image_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Remote | MediaCarrier::Both
+                        ),
+                        no_inline_image: !matches!(
+                            target.image_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Inline | MediaCarrier::Both
+                        ),
                         no_tool_calling: target.tool_calling == Some(false),
+                        // Declared per credential and resolved to the target here, because
+                        // the pre-dispatch filter reads target facts. A provider that may
+                        // only receive cleared payloads makes every target behind that
+                        // credential egress-gated, including one addressed directly.
+                        requires_public_payload: self
+                            .llm_clients
+                            .get(&target.llm_client)
+                            .is_some_and(|client| client.requires_public_payload),
                     },
                 );
             }
@@ -1515,6 +2055,55 @@ fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
         .unwrap_or(3)
 }
 
+/// Resolves a route's locality from the billing its targets' clients declare.
+///
+/// The answer is the fact the configuration states, not an inference from a name, a slug
+/// or a base URL. A single leg whose client states no billing makes the whole answer
+/// `Unknown`: one unstated leg is enough that "this never leaves the building" could be
+/// false, and calling it external instead would be a guess presented as a fact.
+fn route_locality(
+    route: &RouteConfig,
+    targets: &BTreeMap<String, TargetConfig>,
+    clients: &BTreeMap<String, LlmClientConfig>,
+) -> crate::route::Locality {
+    use crate::route::Locality;
+
+    let mut legs = 0usize;
+    let mut saw_local = false;
+    let mut saw_external = false;
+    for name in route.routing_target_names() {
+        let Some(target) = targets.get(name) else {
+            continue;
+        };
+        let Some(client) = clients.get(&target.llm_client) else {
+            return Locality::Unknown;
+        };
+        legs += 1;
+        // A declared locality is authoritative. Undeclared falls back to a `local`
+        // billing, which states the same fact for an operator-hosted client; any other
+        // undeclared combination stays unknown rather than being given a cost class it
+        // did not claim, because a subscription credential is still an external provider.
+        match client.locality {
+            Some(crate::config::ClientLocality::Local) => saw_local = true,
+            Some(crate::config::ClientLocality::External) => saw_external = true,
+            None => match client.billing {
+                Some(BillingKind::Local) => saw_local = true,
+                Some(BillingKind::Metered | BillingKind::Subscription) | None => {
+                    return Locality::Unknown;
+                }
+            },
+        }
+    }
+
+    match (legs, saw_local, saw_external) {
+        (0, _, _) => Locality::Unknown,
+        (_, true, false) => Locality::Local,
+        (_, false, true) => Locality::Upstream,
+        (_, true, true) => Locality::Mixed,
+        (_, false, false) => Locality::Unknown,
+    }
+}
+
 /// Resolves each target model id to the `llm_client` credential that serves it.
 ///
 /// Whole-route composition uses this identity to decide whether a credential-level
@@ -1613,6 +2202,44 @@ struct LlmClientConfig {
     /// provider never made.
     #[serde(default)]
     billing: Option<BillingKind>,
+    /// Where requests sent to this client are transported, as the deployment declares it.
+    ///
+    /// Deliberately separate from `billing`. That field classifies cost for the economics
+    /// surface, and a subscription credential is still an external provider; deriving an
+    /// egress claim from it would let an economics label decide whether a payload leaves
+    /// the operator's infrastructure. Locality answers that second question on its own and
+    /// stays undeclared when the deployment does not state it.
+    #[serde(default)]
+    locality: Option<ClientLocality>,
+    /// The provider-side quota group every model served here draws on.
+    ///
+    /// A provider caps requests per *project*, and several clients can name the same
+    /// project - a second base URL, a different wire format, a second model list. Naming
+    /// the group here makes the counters meet: two clients declaring the same group share
+    /// one counter per model instead of each believing it owns the whole daily budget.
+    /// Defaults to the client's own name, which keeps a single-client deployment exactly
+    /// as it was.
+    #[serde(default)]
+    quota_group: Option<String>,
+    /// Whether this client may only receive payloads a caller has cleared for it.
+    ///
+    /// A provider property, declared once per credential: a free tier that uses submitted
+    /// content to improve its products makes every request an egress event, and that is
+    /// true of every model behind the credential. Declaring it turns the pre-egress
+    /// admission gate on for the targets served here; omitting it leaves every existing
+    /// client unchanged.
+    #[serde(default)]
+    requires_public_payload: bool,
+}
+
+/// Where a client's traffic terminates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientLocality {
+    /// The operator's own deployment: requests never leave operator infrastructure.
+    Local,
+    /// A third-party provider reached over the public network.
+    External,
 }
 
 /// How a client's usage is billed.
@@ -1691,8 +2318,31 @@ struct TargetConfig {
     /// video, and on this deployment it does not. Omitted means "cannot".
     #[serde(default)]
     video: Option<bool>,
+    /// Which video carriers this deployment accepts, when it accepts video at all.
+    ///
+    /// Required whenever `video` is `true`. A provider can list video among a model's input
+    /// modalities and still refuse to fetch a URL for it: the free Nemotron endpoint answers
+    /// an inline `data:` video and 404s `video_url` with "No endpoints found that support
+    /// video URLs". Declaring `video = true` without this field leaves the same ambiguity
+    /// the boolean has, so the load refuses it rather than guessing a carrier.
+    #[serde(default)]
+    video_carrier: Option<MediaCarrier>,
+    /// Which image carriers this deployment accepts, when it accepts images at all.
+    ///
+    /// The image counterpart of `video_carrier`, and optional for the same historical reason
+    /// `vision` is: a deployment that predates carriers declares images and means both.
+    #[serde(default)]
+    image_carrier: Option<MediaCarrier>,
     #[serde(default)]
     tool_calling: Option<bool>,
+    /// Requests this target may make per provider day, when the provider caps them.
+    ///
+    /// Stated on the target rather than the client because the cap is per model within one
+    /// project: two targets on one credential routinely have different daily budgets. A
+    /// declared limit must be accompanied by a `[quota]` state directory; a spent
+    /// allowance removes the target from consideration and the route advances.
+    #[serde(default)]
+    daily_request_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1757,6 +2407,7 @@ fn build_backend(
     reasoning_policy: Option<ReasoningPolicy>,
     reasoning_dialect: ReasoningDialect,
     cooldown_group: Option<String>,
+    allowance: Option<Arc<switchyard_llm_client::DailyRequestAllowance>>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -1834,6 +2485,8 @@ fn build_backend(
         attempt_timeout: config.attempt_timeout_ms.map(Duration::from_millis),
         stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
         requires_list_input: config.requires_list_input,
+        allowance,
+        requires_public_payload: config.requires_public_payload,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -1864,6 +2517,75 @@ fn validate_value(label: &str, value: &str) -> RunnerResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Locality is the client's own declaration, not a cost class read from billing.
+    ///
+    /// A subscription credential is still an external provider, so `billing` cannot answer
+    /// this question. An undeclared client stays unknown rather than being given the
+    /// answer its billing field implies.
+    #[test]
+    fn route_locality_comes_from_the_declared_transport() {
+        let base = r#"
+schema_version = 1
+
+[llm_clients.ext]
+format = "openai_responses"
+base_url = "https://provider.test/v1"
+locality = "external"
+
+[targets.ext-a]
+id = "vendor/ext-a"
+llm_client = "ext"
+
+[routes.remote]
+id = "remote"
+type = "passthrough"
+target = "ext-a"
+candidates = []
+
+[llm_clients.mine]
+format = "openai_responses"
+base_url = "http://host.test:8446/v1"
+billing = "local"
+
+[targets.mine-a]
+id = "vendor/mine-a"
+llm_client = "mine"
+
+[routes.here]
+id = "here"
+type = "passthrough"
+target = "mine-a"
+candidates = []
+
+[llm_clients.undeclared]
+format = "openai_responses"
+base_url = "https://other.test/v1"
+billing = "subscription"
+
+[targets.undeclared-a]
+id = "vendor/undeclared-a"
+llm_client = "undeclared"
+
+[routes.unknown]
+id = "unknown"
+type = "passthrough"
+target = "undeclared-a"
+candidates = []
+"#;
+        let runner = crate::Runner::from_toml(base).expect("deployment builds");
+        let by_id = runner
+            .models()
+            .map(|model| (model.id.as_str().to_string(), model.locality))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_id["remote"], crate::route::Locality::Upstream);
+        assert_eq!(by_id["here"], crate::route::Locality::Local);
+        assert_eq!(
+            by_id["unknown"],
+            crate::route::Locality::Unknown,
+            "a subscription credential alone states no locality"
+        );
+    }
 
     #[test]
     fn route_presentation_fields_are_split_from_the_algorithm() {
@@ -2166,6 +2888,212 @@ new = ["send_message"]
                 .any(|model| model.id.as_str() == "switchyard/hier")
         );
         Ok(())
+    }
+
+    /// Two leaves whose carriers differ, a text-only leaf, and composites over each.
+    /// The composites state nothing about media: what they advertise must come from the
+    /// children, except where a test deliberately states a policy cap.
+    fn composite_media_config(extra: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.inline]
+id = "inline/model"
+llm_client = "responses"
+vision = true
+image_carrier = "inline"
+video = true
+video_carrier = "inline"
+
+[targets.both]
+id = "both/model"
+llm_client = "responses"
+vision = true
+video = true
+video_carrier = "both"
+
+[targets.text]
+id = "text/model"
+llm_client = "primary"
+
+[routes.child_inline]
+id = "child-inline"
+type = "passthrough"
+target = "inline"
+vision = true
+image_carrier = "inline"
+video = true
+video_carrier = "inline"
+
+[routes.child_both]
+id = "child-both"
+type = "passthrough"
+target = "both"
+vision = true
+video = true
+video_carrier = "both"
+
+[routes.child_text]
+id = "child-text"
+type = "passthrough"
+target = "text"
+
+[composites.tier_inline]
+children = ["child_inline"]
+
+[composites.tier_mixed]
+children = ["child_inline", "child_both"]
+
+[composites.tier_text]
+children = ["child_text"]
+
+[composites.tier_bounded]
+children = ["child_inline"]
+
+{extra}
+"#
+        )
+    }
+
+    fn composite_media(runner: &Runner, name: &str) -> crate::ModelCapabilities {
+        runner
+            .route_capabilities(name)
+            .unwrap_or_else(|| panic!("composite {name} is not registered"))
+    }
+
+    #[test]
+    fn a_composite_derives_video_and_carrier_from_its_only_child() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_inline");
+        assert_eq!(media.video, Some(true));
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        assert_eq!(media.vision, Some(true));
+        assert_eq!(media.image_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn a_mixed_composite_derives_the_union_of_child_carriers() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_mixed");
+        // Inline + Both is Both: a request on either carrier has a child that serves it.
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Both));
+        assert_eq!(media.image_carrier, Some(MediaCarrier::Both));
+        Ok(())
+    }
+
+    #[test]
+    fn a_composite_over_text_only_children_claims_no_video() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_text");
+        // Derived, never invented: no child declares video, so the composite refuses it
+        // locally instead of offering a medium every child would skip.
+        assert_eq!(media.video, Some(false));
+        assert_eq!(media.video_carrier, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_bounded_lane_derives_independently_from_its_own_child() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        // A bounded composite's children are different routes; its declaration must be read
+        // from those children, not inherited from the unbounded twin.
+        let media = composite_media(&runner, "tier_bounded");
+        assert_eq!(media.video, Some(true));
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_video_false_stays_a_policy_cap() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(
+            "[composites.capped]\nchildren = [\"child_both\"]\nvideo = false\n",
+        ))?;
+        let media = composite_media(&runner, "capped");
+        assert_eq!(media.video, Some(false));
+        assert_eq!(media.video_carrier, None);
+        Ok(())
+    }
+
+    #[test]
+    fn video_true_without_a_carrier_derives_the_union_not_the_permissive_default(
+    ) -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(
+            "[composites.stated]\nchildren = [\"child_inline\"]\nvideo = true\n",
+        ))?;
+        let media = composite_media(&runner, "stated");
+        // The old default would have been Both, advertising a remote carrier that no child
+        // below the composite serves.
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn a_composite_cannot_advertise_a_carrier_no_child_serves() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.overclaim]\nchildren = [\"child_inline\"]\nvideo = true\n\
+             video_carrier = \"both\"\n",
+        ))
+        .err()
+        .expect("an explicit both claim over inline-only children must be refused");
+        let text = error.to_string();
+        assert!(text.contains("overclaim"), "{text}");
+        assert!(text.contains("Remote"), "{text}");
+    }
+
+    #[test]
+    fn a_composite_cannot_state_a_carrier_without_the_medium_it_narrows() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.inert]\nchildren = [\"child_inline\"]\nvideo = false\n\
+             video_carrier = \"inline\"\n",
+        ))
+        .err()
+        .expect("a carrier on a composite that refuses the medium must be refused");
+        let text = error.to_string();
+        assert!(text.contains("inert"), "{text}");
+    }
+
+    #[test]
+    fn a_stated_carrier_narrows_a_derived_medium() {
+        // The medium is not stated; it is derived from the one inline-only child. Narrowing
+        // it to what that child serves is not inert, so it must load.
+        runner_from_toml(&composite_media_config(
+            "[composites.narrowed]\nchildren = [\"child_inline\"]\n\
+             video_carrier = \"inline\"\n",
+        ))
+        .expect("a carrier matching the derived capability must load");
+
+        // The same shape with a carrier no child serves must still be refused, naming the
+        // carrier that is missing rather than the (unstated) medium.
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.widened]\nchildren = [\"child_inline\"]\n\
+             video_carrier = \"both\"\n",
+        ))
+        .err()
+        .expect("a derived medium cannot be widened past its children");
+        let text = error.to_string();
+        assert!(text.contains("widened"), "{text}");
+        assert!(text.contains("Remote"), "{text}");
+    }
+
+    #[test]
+    fn a_composite_claiming_video_over_text_only_children_is_refused() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.hollow]\nchildren = [\"child_text\"]\nvideo = true\n",
+        ))
+        .err()
+        .expect("a video claim no child can keep must be refused");
+        let text = error.to_string();
+        assert!(text.contains("hollow"), "{text}");
     }
 
     #[test]
@@ -3303,7 +4231,7 @@ confidence_threshold = 0.5
     fn video_declaration_requires_a_responses_client() -> RunnerResult<()> {
         let configured = VALID_CONFIG.replacen(
             "id = \"classifier/model\"",
-            "id = \"classifier/model\"\nvideo = true",
+            "id = \"classifier/model\"\nvideo = true\nvideo_carrier = \"both\"",
             1,
         );
         let message = match runner_from_toml(&configured) {
@@ -3342,7 +4270,7 @@ confidence_threshold = 0.5
         let configured = VALID_CONFIG
             .replacen(
                 "id = \"strong/model\"",
-                "id = \"strong/model\"\nvideo = true",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"both\"",
                 1,
             )
             .replacen(
@@ -3356,6 +4284,201 @@ confidence_threshold = 0.5
             .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
         let capabilities = route.capabilities();
         assert_eq!(capabilities.video, Some(true));
+        Ok(())
+    }
+
+    /// A video declaration must say which carrier it serves.
+    ///
+    /// Without it the manifest cannot express the one distinction that matters: the free
+    /// Nemotron endpoint answers an inline video and 404s a URL, and `video = true` alone
+    /// would admit the request that then fails at the provider.
+    #[test]
+    fn a_video_target_must_state_its_carrier() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"strong/model\"",
+            "id = \"strong/model\"\nvideo = true",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "video without a carrier was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("no video_carrier"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// An image carrier is a narrowing of a medium the target must first claim.
+    #[test]
+    fn an_image_carrier_needs_a_vision_claim() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"strong/model\"",
+            "id = \"strong/model\"\nimage_carrier = \"inline\"",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "carrier without vision was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("image_carrier without vision"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A carrier on a route that claims no medium is an inert field, so the load refuses it.
+    #[test]
+    fn a_carrier_without_its_medium_is_refused() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "targets = [\"strong\", \"weak\"]",
+            "targets = [\"strong\", \"weak\"]\nvideo_carrier = \"inline\"",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("inert carrier was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("video_carrier without video = true"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// "Both" is two promises, and a route that advertises it needs targets for each half.
+    ///
+    /// The previous shape of this check accepted any claim while one target served *a*
+    /// carrier, so a route advertising both over an inline-only target still told callers a
+    /// remote URL would work. Every half of the claim is now required separately.
+    #[test]
+    fn a_route_advertising_both_carriers_needs_both_served() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("unserved carrier was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Both") && message.contains("Remote"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A target that refuses the medium does not serve any of its carriers.
+    ///
+    /// The carrier field defaults to "both" when absent, so reading it without first asking
+    /// whether the target admits the medium at all would let a vision-refusing target keep a
+    /// route's vision promise alive.
+    #[test]
+    fn a_target_refusing_the_medium_serves_no_carrier() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvision = true\nimage_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "id = \"weak/model\"",
+                "id = \"weak/model\"\nvision = false",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvision = true",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("refusing target was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Both"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A route may not promise a carrier no target of that route serves.
+    ///
+    /// This is the carrier counterpart of "video = true with no video target": the promise
+    /// would be advertised and then refused at request time. Both targets here are narrowed,
+    /// so a route asking for the other carrier has nothing behind it.
+    #[test]
+    fn a_route_may_not_promise_a_carrier_no_target_serves() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "id = \"weak/model\"",
+                "id = \"weak/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true\nvideo_carrier = \"remote\"",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "unsupported carrier was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Remote") && message.contains("no target serves"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// The same manifest is accepted once the route asks only for the carrier its targets
+    /// serve, which is the case this change exists to make expressible.
+    #[test]
+    fn an_inline_carrier_is_accepted_when_a_target_serves_it() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            );
+        let runner = runner_from_toml(&configured)?;
+        let route = runner
+            .route("switchyard/random")
+            .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
+        let capabilities = route.capabilities();
+        assert_eq!(capabilities.video, Some(true));
+        assert_eq!(capabilities.video_carrier, Some(MediaCarrier::Inline));
         Ok(())
     }
 
@@ -3384,7 +4507,7 @@ confidence_threshold = 0.5
             VALID_CONFIG
                 .replacen(
                     "id = \"strong/model\"",
-                    "id = \"strong/model\"\nvideo = true",
+                    "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"both\"",
                     1
                 )
                 .replacen(
@@ -3424,6 +4547,7 @@ confidence_threshold = 0.5
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
         )?;
 
         assert_eq!(
@@ -3466,6 +4590,7 @@ confidence_threshold = 0.5
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -3491,6 +4616,7 @@ confidence_threshold = 0.5
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
                 None,
             );
             if expected == Some(0) {

@@ -313,3 +313,37 @@ the deployed binary's behaviour prove; it may have contained other uncommitted
 - Route-level `vision` and `video` are not represented in the capability manifest,
   so the release gate cannot notice a wrong modality claim. That remains true even
   though these particular claims are right.
+
+## Gemini free-project capability inventory
+
+`gemini_capability_inventory.py` turns an owner-attested AI Studio crosswalk into
+three documents: a full inventory, a capability route graph, and a staging
+fragment. `gemini_capability_verify.py` re-derives the proof matrix from those
+documents; `test_gemini_capability_inventory.py` carries one negative control per
+check. All three are stdlib-only and run on a host with no pytest.
+
+```sh
+python3 scripts/deploy/switchyard/gemini_capability_inventory.py \
+  --crosswalk <crosswalk.json> --out-dir <dir>
+python3 scripts/deploy/switchyard/gemini_capability_verify.py \
+  --inventory <dir>/direct-google-capability-inventory.json \
+  --graph <dir>/capability-route-graph.json \
+  --fragment <dir>/gemini-r2-routes.staged.toml \
+  --crosswalk <crosswalk.json>
+python3 scripts/deploy/switchyard/test_gemini_capability_inventory.py
+```
+
+Three rules are enforced rather than described:
+
+- `chat.complete` is the only operation that maps to a chat leaf; every other
+  operation is held with a concrete adapter requirement.
+- one provider-model quota is reachable through at most one route leg.
+- the fragment is emitted only when the composite has at least two executable
+  legs, because a primitive emitted alone is a second route to a quota the
+  deployment already reaches.
+
+The generator writes `apply today:` into the fragment header and refuses to emit
+a document that violates either rule, so a future edit cannot drift the staging
+document away from its own verdict.
+
+Current result and the release proposal: `docs/evidence/gemini-r2/2026-11-21/`.

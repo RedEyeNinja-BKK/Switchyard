@@ -10,9 +10,9 @@
 //! both places. A capability mismatch found here is a routing fact, not a failure: the
 //! route simply was not eligible.
 
-use crate::ModelCapabilities;
+use crate::{MediaCarrier, ModelCapabilities};
 use serde_json::Value;
-use switchyard_protocol::{ContentBlock, LlmRequest};
+use switchyard_protocol::{ContentBlock, LlmRequest, MediaSource};
 
 /// Return the first explicitly disabled capability used by decoded or preserved input.
 /// Forwarding can retain provider JSON fields that decoding omits.
@@ -80,6 +80,11 @@ pub fn unsupported_capability(
 /// `vision` is a declaration about images and says nothing about video: a target that
 /// accepts images need not accept video, and the providers behind the two differ. Audio
 /// has no declaration at all, so no route can admit it.
+///
+/// When video is declared, the carrier is checked as well: an endpoint that reads inline
+/// media but cannot fetch a URL must not receive a `video_url` part, or the provider answers
+/// the request with a 404 the caller cannot act on. A route that declares video without a
+/// carrier means both, which is what a deployment written before carriers existed intends.
 fn unsupported_media(
     capabilities: ModelCapabilities,
     request: &LlmRequest,
@@ -88,10 +93,272 @@ fn unsupported_media(
     if request_media(request, body, &|medium| medium == "audio").is_some() {
         return Some("audio");
     }
-    if capabilities.video == Some(true) {
-        return None;
+    // Each medium's carrier is checked against that medium's own blocks. Narrowing video
+    // must not disturb an image request the same endpoint serves, so the two never read
+    // each other's parts: `image_url` is not a video carrier fact and `video_url` is not an
+    // image one.
+    if let Some(carrier) = capabilities.image_carrier
+        && !carrier.admits_remote()
+        && request_image_is_remote(request, body)
+    {
+        return Some("image_carrier");
     }
-    request_media(request, body, &|medium| medium == "video")
+    if let Some(carrier) = capabilities.image_carrier
+        && !carrier.admits_inline()
+        && request_image_is_inline(request, body)
+    {
+        return Some("image_carrier");
+    }
+    if capabilities.video != Some(true) {
+        return request_media(request, body, &|medium| medium == "video");
+    }
+    let carrier = capabilities.video_carrier.unwrap_or(MediaCarrier::Both);
+    if !carrier.admits_remote() && request_video_is_remote(request, body) {
+        return Some("video_carrier");
+    }
+    if !carrier.admits_inline() && request_video_is_inline(request, body) {
+        return Some("video_carrier");
+    }
+    None
+}
+
+/// Whether this request's IMAGE is supplied as a URL the provider must fetch.
+fn request_image_is_remote(request: &LlmRequest, body: &Value) -> bool {
+    // An `image_url` part is the carrier wrapper for BOTH forms: the decoder keeps a
+    // `data:` URL inside `ImageSource::Url`, so the test is the URL itself, not the
+    // variant. Classifying by variant would refuse every image an inline-only endpoint
+    // actually serves.
+    image_blocks(request).any(|block| match block {
+        ContentBlock::Image {
+            source: switchyard_protocol::ImageSource::Url { url, .. },
+        } => !is_data_url(url),
+        ContentBlock::Image {
+            source: switchyard_protocol::ImageSource::Base64 { .. },
+        } => false,
+        _ => false,
+    }) || preserved_image_is_remote(body)
+}
+
+/// Whether this request's IMAGE is supplied inline, as base64 bytes or a `data:` URL.
+fn request_image_is_inline(request: &LlmRequest, body: &Value) -> bool {
+    image_blocks(request).any(|block| match block {
+        ContentBlock::Image {
+            source: switchyard_protocol::ImageSource::Base64 { .. },
+        } => true,
+        ContentBlock::Image {
+            source: switchyard_protocol::ImageSource::Url { url, .. },
+        } => is_data_url(url),
+        _ => false,
+    }) || preserved_image_is_inline(body)
+}
+
+/// Every decoded image block, including one nested in tool-result content.
+fn image_blocks(request: &LlmRequest) -> impl Iterator<Item = &ContentBlock> {
+    fn walk<'a>(content: &'a [ContentBlock], out: &mut Vec<&'a ContentBlock>) {
+        for block in content {
+            match block {
+                ContentBlock::Image { .. } => out.push(block),
+                ContentBlock::ToolResult(result) => walk(&result.content, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out: Vec<&ContentBlock> = Vec::new();
+    for content in request
+        .instructions
+        .iter()
+        .map(|instruction| instruction.content.as_slice())
+        .chain(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_slice()),
+        )
+    {
+        walk(content, &mut out);
+    }
+    out.into_iter()
+}
+
+/// The image-shaped discriminators of a preserved body.
+fn preserved_image_blocks(body: &Value) -> impl Iterator<Item = &Value> {
+    preserved_shaped_blocks(body, &["input_image", "image_url", "computer_screenshot"])
+}
+
+/// Whether a preserved body's image is a URL the provider must fetch.
+fn preserved_image_is_remote(body: &Value) -> bool {
+    preserved_image_blocks(body).any(|block| {
+        let Some(object) = block.as_object() else {
+            return false;
+        };
+        match object.get("image_url") {
+            Some(Value::String(url)) => !is_data_url(url),
+            Some(Value::Object(nested)) => nested
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| !is_data_url(url)),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a preserved body's image is inline bytes or a `data:` URL.
+fn preserved_image_is_inline(body: &Value) -> bool {
+    preserved_image_blocks(body).any(|block| {
+        let Some(object) = block.as_object() else {
+            return false;
+        };
+        object
+            .get("image_url")
+            .map(|value| match value {
+                Value::String(url) => is_data_url(url),
+                Value::Object(nested) => nested
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_data_url),
+                _ => false,
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Whether this request's video is supplied as a URL the provider must fetch.
+///
+/// Only `ContentBlock::Video` counts: the question is which carrier a *video* takes, and an
+/// image part is a separate capability the endpoint may serve on either carrier.
+fn request_video_is_remote(request: &LlmRequest, body: &Value) -> bool {
+    video_blocks(request).any(|block| match block {
+        ContentBlock::Video {
+            source: MediaSource::Url { url, .. },
+        } => !is_data_url(url),
+        ContentBlock::Video {
+            source: MediaSource::Base64 { .. },
+        } => false,
+        _ => false,
+    }) || preserved_video_is_remote(body)
+}
+
+/// Whether this request's video is supplied inline, as base64 bytes or a `data:` URL.
+fn request_video_is_inline(request: &LlmRequest, body: &Value) -> bool {
+    video_blocks(request).any(|block| match block {
+        ContentBlock::Video {
+            source: MediaSource::Base64 { .. },
+        } => true,
+        ContentBlock::Video {
+            source: MediaSource::Url { url, .. },
+        } => is_data_url(url),
+        _ => false,
+    }) || preserved_video_is_inline(body)
+}
+
+/// Every decoded video block, including one nested in tool-result content.
+fn video_blocks(request: &LlmRequest) -> impl Iterator<Item = &ContentBlock> {
+    fn walk<'a>(content: &'a [ContentBlock], out: &mut Vec<&'a ContentBlock>) {
+        for block in content {
+            match block {
+                ContentBlock::Video { .. } => out.push(block),
+                ContentBlock::ToolResult(result) => walk(&result.content, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out: Vec<&ContentBlock> = Vec::new();
+    for content in request
+        .instructions
+        .iter()
+        .map(|instruction| instruction.content.as_slice())
+        .chain(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_slice()),
+        )
+    {
+        walk(content, &mut out);
+    }
+    out.into_iter()
+}
+
+/// Whether a URL is an inline `data:` payload rather than a fetch target.
+fn is_data_url(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    bytes.len() >= 5 && bytes[..5].eq_ignore_ascii_case(b"data:")
+}
+
+/// The video-shaped discriminators of a preserved body, read from the same roots the
+/// admission walk uses so the two cannot disagree about what the request carries.
+fn preserved_video_blocks(body: &Value) -> impl Iterator<Item = &Value> {
+    preserved_shaped_blocks(body, &["input_video", "video_url", "video"])
+}
+
+/// Objects in a preserved body whose `type` is one of `kinds`, from the roots the admission
+/// walk reads. One walker for both media, so a change to where media hides cannot make the
+/// image check and the video check disagree.
+fn preserved_shaped_blocks<'a>(body: &'a Value, kinds: &[&str]) -> impl Iterator<Item = &'a Value> {
+    let mut pending: Vec<&'a Value> = ["messages", "input", "system"]
+        .iter()
+        .filter_map(|key| body.get(*key))
+        .collect();
+    let mut found: Vec<&'a Value> = Vec::new();
+    while let Some(value) = pending.pop() {
+        if let Some(items) = value.as_array() {
+            pending.extend(items);
+            continue;
+        }
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kinds.contains(&kind))
+        {
+            found.push(value);
+        }
+        if let Some(content) = object.get("content") {
+            pending.push(content);
+        }
+    }
+    found.into_iter()
+}
+
+/// Whether a preserved body's video is a URL the provider must fetch.
+fn preserved_video_is_remote(body: &Value) -> bool {
+    preserved_video_blocks(body).any(|block| {
+        let Some(object) = block.as_object() else {
+            return false;
+        };
+        match object.get("video_url") {
+            Some(Value::String(url)) => !is_data_url(url),
+            Some(Value::Object(nested)) => nested
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| !is_data_url(url)),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a preserved body's video is inline bytes or a `data:` URL.
+fn preserved_video_is_inline(body: &Value) -> bool {
+    preserved_video_blocks(body).any(|block| {
+        let Some(object) = block.as_object() else {
+            return false;
+        };
+        if let Some(url) = object.get("video_url").and_then(Value::as_str) {
+            return is_data_url(url);
+        }
+        object
+            .get("video")
+            .and_then(Value::as_object)
+            .is_some_and(|video| {
+                video.get("data").is_some()
+                    || video
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_data_url)
+            })
+    })
 }
 
 /// Whether the request carries video.
@@ -103,6 +370,163 @@ pub fn requires_video(request: &LlmRequest, body: &Value) -> bool {
     request_media(request, body, &|medium| medium == "video").is_some()
 }
 
+/// A video part the OpenAI Responses wire cannot carry, described for the caller.
+///
+/// Measured against the provider's own `/responses` endpoint: video is accepted only as
+/// `{"type":"input_video","video_url":"<https URL or data: URI>"}` with a STRING
+/// `video_url`. The Chat spelling (`video_url` as an object) and inline bytes under
+/// `video` are each answered `400 invalid_prompt` ("invalid_union, expected string").
+///
+/// This matters here because a same-format request is forwarded verbatim, by design, so a
+/// caller's unsupported part reaches the provider unchanged and comes back as an opaque
+/// upstream error. Detecting it before dispatch turns that into an accurate local refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoPartShape {
+    /// The `type` the caller used, quoted back so the message names what was sent.
+    pub part_type: String,
+    /// What was wrong with that part, in the caller's vocabulary.
+    pub detail: &'static str,
+}
+
+/// Rewrites video parts on the Responses surface into the one spelling the provider accepts.
+///
+/// The accepted spelling is `{"type":"input_video","video_url":"<https URL or data: URI>"}`
+/// with a string. A caller may reasonably send the Chat spelling instead -- `video_url` as
+/// the part type, or `video_url` as an object -- and Turnstone's own Responses client does
+/// exactly that. Refusing those would make video unreachable from the client rather than
+/// from the provider, so the shape is translated instead: only the spelling changes, and a
+/// caller-supplied media type rides along rather than being dropped.
+///
+/// Shapes that cannot be mapped faithfully (no URL, no bytes) are left untouched for
+/// [`unsupported_responses_video_part`] to refuse with a reason.
+pub fn normalize_responses_video_parts(body: &mut Value) -> usize {
+    fn data_uri(media_type: Option<&str>, data: &str) -> Option<String> {
+        media_type.map(|media_type| format!("data:{media_type};base64,{data}"))
+    }
+
+    fn normalize_part(part: &mut Value) -> bool {
+        let Some(object) = part.as_object_mut() else {
+            return false;
+        };
+        let part_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if part_type != "input_video" && part_type != "video_url" {
+            return false;
+        }
+        // `video_url` as an object: either a URL wrapper or the same shape Chat uses.
+        if let Some(Value::Object(nested)) = object.get("video_url").cloned() {
+            if let Some(url) = nested.get("url").and_then(Value::as_str).map(str::to_string) {
+                object.insert("type".to_string(), Value::String("input_video".to_string()));
+                object.insert("video_url".to_string(), Value::String(url));
+                if let Some(media_type) = nested.get("media_type").and_then(Value::as_str)
+                    && !object.contains_key("media_type")
+                {
+                    object.insert(
+                        "media_type".to_string(),
+                        Value::String(media_type.to_string()),
+                    );
+                }
+                return true;
+            }
+            if let Some(uri) = nested
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(|data| data_uri(nested.get("media_type").and_then(Value::as_str), data))
+            {
+                object.insert("type".to_string(), Value::String("input_video".to_string()));
+                object.insert("video_url".to_string(), Value::String(uri));
+                return true;
+            }
+        }
+        // Inline bytes under `video`, which is how the Chat decoder spells them.
+        if let Some(uri) = object
+            .get("video")
+            .and_then(Value::as_object)
+            .and_then(|video| {
+                video
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .and_then(|data| data_uri(video.get("media_type").and_then(Value::as_str), data))
+            })
+        {
+            object.insert("type".to_string(), Value::String("input_video".to_string()));
+            object.insert("video_url".to_string(), Value::String(uri));
+            object.remove("video");
+            return true;
+        }
+        // Already a string URL under the right type: only the type may still need fixing.
+        if part_type == "video_url"
+            && object.get("video_url").and_then(Value::as_str).is_some()
+        {
+            object.insert("type".to_string(), Value::String("input_video".to_string()));
+            return true;
+        }
+        false
+    }
+
+    let Some(input) = body.get_mut("input") else {
+        return 0;
+    };
+    let mut rewritten = 0;
+    let items: Vec<&mut Value> = match input {
+        Value::Array(items) => items.iter_mut().collect(),
+        other => vec![other],
+    };
+    for item in items {
+        if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+            for part in content.iter_mut() {
+                rewritten += usize::from(normalize_part(part));
+            }
+            continue;
+        }
+        // A part may also appear directly as an input item.
+        rewritten += usize::from(normalize_part(item));
+    }
+    rewritten
+}
+
+/// The first video part in a Responses body that the provider cannot parse, if any.
+///
+/// Only the shapes that were measured to fail are refused; a part already in the accepted
+/// spelling, or one carrying a provider `file_id` this deployment cannot verify, is left
+/// alone rather than guessed at.
+pub fn unsupported_responses_video_part(body: &Value) -> Option<VideoPartShape> {
+    preserved_shaped_blocks(body, &["input_video", "video_url", "video"]).find_map(|block| {
+        let object = block.as_object()?;
+        let part_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if part_type != "input_video" {
+            return Some(VideoPartShape {
+                part_type,
+                detail: "this surface accepts video only as an `input_video` part",
+            });
+        }
+        match object.get("video_url") {
+            Some(Value::String(_)) => None,
+            Some(_) => Some(VideoPartShape {
+                part_type,
+                detail: "`video_url` must be a string here, not an object",
+            }),
+            None if object.get("file_id").and_then(Value::as_str).is_some() => None,
+            None if object.contains_key("video") => Some(VideoPartShape {
+                part_type,
+                detail: "inline bytes belong in a `data:` URI supplied as the string `video_url`",
+            }),
+            None => Some(VideoPartShape {
+                part_type,
+                detail: "the part carries no `video_url`",
+            }),
+        }
+    })
+}
+
+/// Whether a content slice holds a media block supplied as a URL.
 fn request_media(
     request: &LlmRequest,
     body: &Value,
@@ -715,6 +1139,172 @@ mod tests {
         Ok(())
     }
 
+    /// An endpoint that reads inline video but cannot fetch a URL must refuse the URL.
+    ///
+    /// This is the measured shape of the free Nemotron endpoint: 200 for a `data:` video,
+    /// 404 "No endpoints found that support video URLs". A route that declared `video = true`
+    /// with no carrier would have admitted both.
+    #[test]
+    fn an_inline_only_carrier_refuses_a_remote_video() -> TestResult {
+        let inline = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video": {"data": "AAAA", "media_type": "video/mp4"}}
+        ]}]});
+        let remote = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+        ]}]});
+        let inline_only = ModelCapabilities {
+            video: Some(true),
+            video_carrier: Some(MediaCarrier::Inline),
+            ..Default::default()
+        };
+        for (body, expected) in [(inline, None), (remote, Some("video_carrier"))] {
+            let request = decode_request(OpenAiResponses, &body)?;
+            assert_eq!(
+                unsupported_capability(inline_only, &request, &body),
+                expected,
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A remote-only carrier is the mirror case: inline bytes are refused, a URL is not.
+    #[test]
+    fn a_remote_only_carrier_refuses_inline_video() -> TestResult {
+        let inline = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video": {"data": "AAAA", "media_type": "video/mp4"}}
+        ]}]});
+        let remote = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+        ]}]});
+        let remote_only = ModelCapabilities {
+            video: Some(true),
+            video_carrier: Some(MediaCarrier::Remote),
+            ..Default::default()
+        };
+        for (body, expected) in [(inline, Some("video_carrier")), (remote, None)] {
+            let request = decode_request(OpenAiResponses, &body)?;
+            assert_eq!(
+                unsupported_capability(remote_only, &request, &body),
+                expected,
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Narrowing video must not touch an image request: the carriers are read per medium.
+    #[test]
+    fn a_narrow_video_carrier_leaves_images_alone() -> TestResult {
+        let image = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.test/cat.jpg"}
+        ]}]});
+        let capabilities = ModelCapabilities {
+            vision: Some(true),
+            video: Some(true),
+            video_carrier: Some(MediaCarrier::Inline),
+            ..Default::default()
+        };
+        let request = decode_request(OpenAiResponses, &image)?;
+        assert_eq!(
+            unsupported_capability(capabilities, &request, &image),
+            None,
+            "a video carrier must not constrain images: {image}"
+        );
+        Ok(())
+    }
+
+    /// The image carrier is checked against images only, and the other way round.
+    #[test]
+    fn a_narrow_image_carrier_refuses_a_remote_image_only() -> TestResult {
+        let remote_image = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.test/cat.jpg"}
+        ]}]});
+        let inline_image = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        ]}]});
+        let video = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+        ]}]});
+        let inline_images = ModelCapabilities {
+            vision: Some(true),
+            image_carrier: Some(MediaCarrier::Inline),
+            // Video is declared with both carriers so the last case proves the image
+            // narrowing does not reach it, rather than being refused for want of video.
+            video: Some(true),
+            ..Default::default()
+        };
+        for (body, expected) in [
+            (remote_image, Some("image_carrier")),
+            (inline_image, None),
+            (video, None),
+        ] {
+            let request = decode_request(OpenAiResponses, &body)?;
+            assert_eq!(
+                unsupported_capability(inline_images, &request, &body),
+                expected,
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The image mirror of the video case: a remote-only image carrier refuses inline bytes.
+    ///
+    /// This is the half the video tests do not reach, and it was a genuine gap: deleting the
+    /// inline-image check left the suite green.
+    #[test]
+    fn a_remote_only_image_carrier_refuses_inline_images() -> TestResult {
+        let inline = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        ]}]});
+        let remote = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.test/cat.jpg"}
+        ]}]});
+        let remote_only = ModelCapabilities {
+            vision: Some(true),
+            image_carrier: Some(MediaCarrier::Remote),
+            ..Default::default()
+        };
+        for (body, expected) in [(inline, Some("image_carrier")), (remote, None)] {
+            let request = decode_request(OpenAiResponses, &body)?;
+            assert_eq!(
+                unsupported_capability(remote_only, &request, &body),
+                expected,
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A route declaring no carrier means both, so the historical manifest is unchanged.
+    #[test]
+    fn an_undeclared_carrier_admits_either_form() -> TestResult {
+        for body in [
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_video", "video_url": "https://example.test/clip.mp4"}
+            ]}]}),
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_video", "video": {"data": "AAAA", "media_type": "video/mp4"}}
+            ]}]}),
+        ] {
+            let request = decode_request(OpenAiResponses, &body)?;
+            assert_eq!(
+                unsupported_capability(
+                    ModelCapabilities {
+                        video: Some(true),
+                        ..Default::default()
+                    },
+                    &request,
+                    &body
+                ),
+                None,
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
     /// Video survives the decode/encode round trip into the provider spelling.
     #[test]
     fn video_round_trips_to_the_responses_part() -> TestResult {
@@ -731,5 +1321,151 @@ mod tests {
         assert_eq!(parts[0]["type"], "input_video");
         assert_eq!(parts[0]["video_url"], "https://example.test/clip.mp4");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod video_part_shape_tests {
+    use super::unsupported_responses_video_part;
+    use serde_json::json;
+
+    /// The one accepted spelling: `input_video` with a string `video_url`, either a URL or
+    /// a `data:` URI. Measured against the live provider endpoint, which rejects the
+    /// object form with 400 and this one with 200.
+    #[test]
+    fn the_accepted_spellings_are_not_flagged() {
+        for video_url in [
+            "https://example.test/clip.mp4",
+            "data:video/mp4;base64,AAAA",
+        ] {
+            let body = json!({"input": [{"role": "user", "content": [
+                {"type": "input_video", "video_url": video_url},
+                {"type": "input_text", "text": "describe"}
+            ]}]});
+            assert!(
+                unsupported_responses_video_part(&body).is_none(),
+                "{video_url} is the accepted shape"
+            );
+        }
+        // A file reference is the provider's own alternative to inline bytes.
+        let body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "file_id": "file-123"}
+        ]}]});
+        assert!(unsupported_responses_video_part(&body).is_none());
+    }
+
+    /// The object form is what the provider answers with 400, so it must be refused here
+    /// with a reason a caller can act on rather than forwarded into an opaque error.
+    #[test]
+    fn the_object_form_is_refused_with_its_reason() {
+        for (body, expected) in [
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video", "video_url": {"url": "https://example.test/clip.mp4"}}
+                ]}]}),
+                "`video_url` must be a string here, not an object",
+            ),
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video", "video": {"media_type": "video/mp4", "data": "AAAA"}}
+                ]}]}),
+                "inline bytes belong in a `data:` URI supplied as the string `video_url`",
+            ),
+            // A `video_url` part that carries a URL is normalized before this predicate
+            // runs, so what is left for this branch is the part with no video payload at all.
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "video_url"}
+                ]}]}),
+                "this surface accepts video only as an `input_video` part",
+            ),
+            (
+                json!({"input": [{"role": "user", "content": [
+                    {"type": "input_video"}
+                ]}]}),
+                "the part carries no `video_url`",
+            ),
+        ] {
+            let shape = unsupported_responses_video_part(&body)
+                .unwrap_or_else(|| panic!("{body} must be refused"));
+            assert_eq!(shape.detail, expected, "{body}");
+        }
+    }
+
+    /// Only video is the guard's business: images, audio and files keep their own paths,
+    /// and a text-only body must stay untouched.
+    #[test]
+    fn non_video_content_is_never_flagged() {
+        let body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.test/a.png"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+            {"type": "input_file", "file_id": "file-1"},
+            {"type": "input_text", "text": "describe"}
+        ]}]});
+        assert!(unsupported_responses_video_part(&body).is_none());
+        assert!(unsupported_responses_video_part(&json!({"input": "hello"})).is_none());
+    }
+
+    /// The Chat spelling is what several clients send on the Responses surface. Translating
+    /// the spelling is what makes video reachable; the media type must ride along.
+    #[test]
+    fn the_chat_spelling_is_translated_into_the_accepted_part() {
+        let mut body = json!({"input": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4",
+                                                "media_type": "video/mp4"}}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 1);
+        let part = &body["input"][0]["content"][0];
+        assert_eq!(part["type"], "input_video");
+        assert_eq!(part["video_url"], "https://example.test/clip.mp4");
+        assert_eq!(part["media_type"], "video/mp4");
+        assert!(unsupported_responses_video_part(&body).is_none());
+    }
+
+    #[test]
+    fn inline_bytes_become_a_data_uri_under_the_accepted_type() {
+        let mut body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video": {"media_type": "video/mp4", "data": "AAAA"}}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 1);
+        let part = &body["input"][0]["content"][0];
+        assert_eq!(part["type"], "input_video");
+        assert_eq!(part["video_url"], "data:video/mp4;base64,AAAA");
+        assert!(part.get("video").is_none(), "the object spelling is dropped");
+        assert!(unsupported_responses_video_part(&body).is_none());
+    }
+
+    /// A correct part is left byte-identical, and running the pass twice changes nothing:
+    /// ingress must not rewrite a body that is already what the provider accepts.
+    #[test]
+    fn the_accepted_shape_is_untouched_and_the_pass_is_idempotent() {
+        let original = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "data:video/mp4;base64,AAAA"},
+            {"type": "input_text", "text": "describe"},
+            {"type": "input_image", "image_url": "https://example.test/a.png"}
+        ]}]});
+        let mut body = original.clone();
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 0);
+        assert_eq!(body, original);
+        // And a body the pass did rewrite settles: a second pass finds nothing to do.
+        let mut rewritten = json!({"input": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": "https://example.test/clip.mp4"}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut rewritten), 1);
+        assert_eq!(super::normalize_responses_video_parts(&mut rewritten), 0);
+    }
+
+    /// Nothing is invented for a part that carries no payload: it is left exactly as sent so
+    /// the caller gets the accurate refusal rather than a silently emptied part.
+    #[test]
+    fn an_unmappable_part_is_left_for_the_refusal() {
+        let mut body = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video"}
+        ]}]});
+        assert_eq!(super::normalize_responses_video_parts(&mut body), 0);
+        assert_eq!(body, json!({"input": [{"role": "user", "content": [
+            {"type": "input_video"}
+        ]}]}));
+        assert!(unsupported_responses_video_part(&body).is_some());
     }
 }

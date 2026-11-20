@@ -48,10 +48,15 @@ pub struct Lane {
 }
 
 /// Borrowed model metadata returned while listing routes.
+#[derive(Clone, Copy)]
 pub struct ModelInfo<'a> {
     pub id: &'a ModelId,
     pub algorithm: &'a str,
     pub capabilities: ModelCapabilities,
+    /// The reasoning policy this route imposes, independent of what its target accepts.
+    pub reasoning_policy: crate::config::RouteReasoningPolicy,
+    /// Where this route's work is performed, as declared by its clients' billing.
+    pub locality: crate::route::Locality,
 }
 
 /// Fully resolved routing decision.
@@ -175,6 +180,8 @@ impl Runner {
             id,
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
+            reasoning_policy: route.route_reasoning_policy(),
+            locality: route.locality(),
         })
     }
 
@@ -277,8 +284,35 @@ impl Runner {
     pub fn with_composite(mut self, route_id: impl Into<String>, children: Vec<String>) -> Self {
         self.composites.insert(
             route_id.into(),
-            crate::composition::CompositeSpec { children },
+            crate::composition::CompositeSpec {
+                children,
+                cross_on: crate::config::CompositeCrossPolicy::default(),
+            },
         );
+        self
+    }
+
+    /// Declares when a composite may move on to its next child.
+    ///
+    /// Applied separately from registration so the historical default needs no argument
+    /// and a deployment that wants the narrower rule states it explicitly.
+    ///
+    /// Panics when no composite with that id is registered. A silent no-op would leave the
+    /// historical `failure_class` rule in place, which for a composite whose children share
+    /// one credential is exactly the defect this policy exists to remove: a plain throttle
+    /// would spend a paid call. A misordered registration is a programming error, so it
+    /// fails at startup rather than routing wrongly at runtime.
+    pub fn with_composite_cross_policy(
+        mut self,
+        route_id: impl Into<String>,
+        cross_on: crate::config::CompositeCrossPolicy,
+    ) -> Self {
+        let route_id = route_id.into();
+        let spec = self
+            .composites
+            .get_mut(&route_id)
+            .unwrap_or_else(|| panic!("cross policy set for unregistered composite {route_id:?}"));
+        spec.cross_on = cross_on;
         self
     }
 
@@ -422,5 +456,28 @@ impl Runner {
         self.decision_lanes
             .values()
             .find(|lane| crate::decision_transport::lane_serves(&lane.types, request))
+    }
+}
+
+#[cfg(test)]
+mod cross_policy_tests {
+    use super::*;
+    use crate::config::CompositeCrossPolicy;
+
+    /// A policy set on a composite that was never registered must fail loudly.
+    ///
+    /// The registration loop pairs `with_composite` with this call, so reaching this arm
+    /// means the two drifted apart. Accepting it silently would leave the historical
+    /// `failure_class` rule in place, and for a composite whose children share one
+    /// credential that rule spends a paid call on an ordinary throttle.
+    #[test]
+    #[should_panic(expected = "cross policy set for unregistered composite")]
+    fn cross_policy_for_an_unregistered_composite_panics() {
+        if let Err(err) = std::panic::catch_unwind(|| {
+            Runner::new(Vec::new())
+                .with_composite_cross_policy("absent", CompositeCrossPolicy::CredentialBlock)
+        }) {
+            std::panic::resume_unwind(err);
+        }
     }
 }

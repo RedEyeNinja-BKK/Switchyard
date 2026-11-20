@@ -17,11 +17,13 @@ publish = ["crates-io"]
 prefill-router = ["dep:prefill-router"]
 
 [dependencies]
+hmac = "0.12"
 libsy = { package = "switchyard-libsy", path = "../libsy", version = "0.3.0" }
 prefill-router = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 switchyard-llm-client.workspace = true
 switchyard-protocol.workspace = true
 strum_macros.workspace = true
@@ -33,7 +35,9 @@ switchyard-translation.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+hmac = "0.12"
 http.workspace = true
 futures-util.workspace = true
+sha2 = "0.10"
 tokio.workspace = true
 wiremock = "0.6"

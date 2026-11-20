@@ -69,6 +69,7 @@ fn client_for(
         stream_idle_timeout: None,
         requires_list_input: false,
         allowance,
+        requires_public_payload: false,
     };
     Ok(TranslatingLlmClient::new(&[ModelConfig::new(
         "gpt",

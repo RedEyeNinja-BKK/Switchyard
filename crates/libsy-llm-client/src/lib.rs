@@ -23,6 +23,7 @@ pub mod error;
 pub mod metrics;
 mod observability;
 mod observation;
+pub mod privacy;
 pub mod raw;
 pub mod run;
 

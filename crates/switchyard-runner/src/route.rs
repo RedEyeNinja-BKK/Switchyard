@@ -334,6 +334,12 @@ pub struct Route {
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
     models: Arc<RuntimeModels>,
+    /// The secret that authenticates a caller's permission to publish a payload.
+    ///
+    /// Carried on the route rather than read from the environment at request time, so the
+    /// decision uses exactly the key the deployment was loaded with. Defaults to a key
+    /// that authenticates nothing.
+    clearance_key: Arc<crate::egress::ClearanceKey>,
     /// The `llm_client` credential each target model id is served by, resolved at load.
     ///
     /// A whole-route composite needs this to decide whether a child that just reported
@@ -378,8 +384,18 @@ impl Route {
             responses_auxiliary_target,
             decision_targets,
             models: Arc::new(models),
+            clearance_key: Arc::new(crate::egress::ClearanceKey::refusing()),
             target_credentials: std::collections::HashMap::new(),
         }
+    }
+
+    /// Records the key used to authenticate a caller's privacy clearance.
+    ///
+    /// Set once at load from `[privacy] clearance_key_env`. A route left without one
+    /// refuses every gated payload rather than admitting it.
+    pub fn with_clearance_key(mut self, key: Arc<crate::egress::ClearanceKey>) -> Self {
+        self.clearance_key = key;
+        self
     }
 
     /// Records the `llm_client` credential serving each target model id.
@@ -525,7 +541,7 @@ impl Route {
         let admission = facts
             .values()
             .any(|facts| facts.requires_public_payload)
-            .then(|| crate::egress::evaluate(&request));
+            .then(|| crate::egress::evaluate(&request, &self.clearance_key));
         let refused = admission.as_ref().filter(|admission| !admission.allowed());
         let raw = request
             .raw_request

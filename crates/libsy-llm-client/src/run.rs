@@ -782,6 +782,9 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => {
             FailureClass::TemporarilyUnavailable
         }
+        // The payload, not the leg, is the problem: nothing about another candidate makes
+        // content that must not leave this deployment admissible.
+        LlmClientError::PayloadNotCleared { .. } => FailureClass::Request,
         // A per-attempt expiry is a deadline that elapsed, so a whole-route
         // composite treats it exactly like an upstream 408.
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
@@ -1884,6 +1887,7 @@ mod tests {
                         stream_idle_timeout: None,
                         requires_list_input: false,
                         allowance: None,
+                        requires_public_payload: false,
                     };
                     let backend = if responses {
                         Backend::OpenAiResponses(config)
@@ -2038,6 +2042,7 @@ mod tests {
                     stream_idle_timeout: None,
                     requires_list_input: false,
                     allowance: None,
+                    requires_public_payload: false,
                 }),
                 None,
             )])
@@ -2991,6 +2996,7 @@ mod tests {
                     stream_idle_timeout: None,
                     requires_list_input: false,
                     allowance: None,
+                    requires_public_payload: false,
                 })
             };
             TranslatingLlmClient::new(&[
@@ -3083,6 +3089,7 @@ mod tests {
                 stream_idle_timeout: None,
                 requires_list_input: false,
                 allowance: None,
+                requires_public_payload: false,
             })
         };
         let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
@@ -3247,6 +3254,7 @@ mod tests {
                 stream_idle_timeout: None,
                 requires_list_input: false,
                 allowance: None,
+                requires_public_payload: false,
             })
         };
         let client = Arc::new(

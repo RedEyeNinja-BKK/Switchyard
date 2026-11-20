@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use libsy::RuntimeModels;
@@ -42,33 +42,52 @@ impl RoutedLlmClient for CountingClient {
     }
 }
 
-/// The Pacific civil date of the current provider day, as the clearance header spells it.
+/// The deployment's clearance key in these tests.
+const TEST_KEY: &[u8] = b"switchyard-egress-admission-test-key";
+
+fn clearance_key() -> Arc<switchyard_runner::egress::ClearanceKey> {
+    Arc::new(switchyard_runner::egress::ClearanceKey::new(TEST_KEY))
+}
+
+/// The environment variable the configuration in these tests names.
+const KEY_ENV: &str = "SWITCHYARD_TEST_CLEARANCE_KEY";
+
+/// Publishes [`TEST_KEY`] under [`KEY_ENV`] once, before any configuration reads it.
+fn install_clearance_key() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: test-only. This variable is read exclusively by the configuration
+        // builds in this test binary, and this runs before the first of them.
+        unsafe {
+            std::env::set_var(KEY_ENV, String::from_utf8_lossy(TEST_KEY).to_string());
+        }
+    });
+}
+
+/// Signs a clearance prefix the way a caller holding the key would.
+fn sign(prefix: &str) -> String {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(TEST_KEY).expect("any key length");
+    mac.update(prefix.as_bytes());
+    let signature: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{prefix};mac={signature}")
+}
+
+/// A correctly signed clearance for today, in the shape the documentation describes.
 ///
-/// Derived here independently of the parser under test: the gate is only useful if a
-/// caller following the documentation can produce a value it accepts.
+/// The calendar comes from the deployment's own provider-day arithmetic, which is tested
+/// against the daylight-saving transitions where it is defined. The gate is still only
+/// useful if a caller following the documentation can produce a value it accepts, so this
+/// builds the header from the public surface rather than from the parser under test.
 fn today_header() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock is after the epoch")
-        .as_secs();
-    let days = ((seconds - 8 * 3_600) / 86_400) as i64;
-    // Days since the epoch → civil date (Howard Hinnant's civil_from_days).
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("v1;class=public;scope=assembled;day={year:04}-{month:02}-{day:02}")
+    let day = switchyard_llm_client::allowance::provider_day(SystemTime::now());
+    let label = switchyard_llm_client::allowance::provider_day_label(day);
+    sign(&format!("v1;class=public;scope=assembled;day={label}"))
 }
 
 fn request_with_clearance(clearance: Option<&str>, text: &str) -> Request {
@@ -152,6 +171,7 @@ fn route_over(targets: &[(&str, bool)], calls: &[Arc<AtomicUsize>]) -> Route {
         None,
         None,
     )
+    .with_clearance_key(clearance_key())
 }
 
 /// A directly addressed gated target refuses an uncleared payload and is never contacted.
@@ -300,7 +320,10 @@ async fn a_stale_clearance_is_refused() {
     let route = route_over(&[("gemini", true)], &[Arc::clone(&calls)]);
     let error = match route
         .execute(
-            request_with_clearance(Some("v1;class=public;scope=assembled;day=2020-01-01"), "hi"),
+            request_with_clearance(
+                Some(&sign("v1;class=public;scope=assembled;day=2020-01-01")),
+                "hi",
+            ),
             None,
         )
         .await
@@ -326,7 +349,7 @@ async fn a_stale_clearance_is_refused() {
 #[test]
 fn a_caller_following_the_documented_format_is_admitted() {
     let request = request_with_clearance(Some(&today_header()), "summarise this");
-    let admission = switchyard_runner::egress::evaluate(&request);
+    let admission = switchyard_runner::egress::evaluate(&request, &clearance_key());
     assert!(admission.allowed(), "{:?}", admission.refusals());
 }
 
@@ -358,6 +381,9 @@ type = "passthrough"
 target = "gemini"
 candidates = []
 {extra}
+
+[privacy]
+clearance_key_env = "{KEY_ENV}"
 "#
     )
 }
@@ -394,6 +420,7 @@ async fn a_client_declaration_gates_its_target_end_to_end() {
         .mount(&server)
         .await;
 
+    install_clearance_key();
     let runner = switchyard_runner::Runner::from_toml(&gated_toml(&server.uri(), ""))
         .expect("the deployment parses");
 
@@ -435,6 +462,7 @@ async fn a_client_declaration_gates_its_target_end_to_end() {
 /// silently not enforced.
 #[test]
 fn a_daily_limit_without_a_state_directory_is_refused() {
+    install_clearance_key();
     let toml = gated_toml("http://127.0.0.1:1", "").replace(
         "llm_client = \"google\"",
         "llm_client = \"google\"\ndaily_request_limit = 20",
@@ -452,6 +480,7 @@ fn a_daily_limit_without_a_state_directory_is_refused() {
 /// A zero limit would refuse every request forever, which is never what a deployment means.
 #[test]
 fn a_zero_daily_limit_is_refused() {
+    install_clearance_key();
     let directory = scratch_dir("zero");
     let toml = gated_toml(
         "http://127.0.0.1:1",
@@ -474,6 +503,7 @@ fn a_zero_daily_limit_is_refused() {
 /// load rather than at the first request.
 #[test]
 fn a_declared_limit_creates_and_probes_its_state_directory() {
+    install_clearance_key();
     let directory = scratch_dir("probe");
     assert!(!directory.exists());
     let toml = gated_toml(

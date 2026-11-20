@@ -113,6 +113,35 @@ pub(crate) struct DeploymentConfig {
     /// whose counter cannot be written is a cap nobody is enforcing.
     #[serde(default)]
     quota: Option<QuotaConfig>,
+    /// Admission for providers that may only receive a payload cleared as public.
+    ///
+    /// Optional, but required as soon as one `llm_client` declares
+    /// `requires_public_payload`: without a key nothing can authenticate a clearance, so a
+    /// gated client would be permanently unservable and the mistake would surface as every
+    /// request refused rather than as the configuration error it is.
+    #[serde(default)]
+    privacy: Option<PrivacyConfig>,
+}
+
+/// Admission for providers that may only receive a payload cleared as public.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivacyConfig {
+    /// Environment variable holding the clearance key.
+    ///
+    /// The value is the shared secret a caller signs its clearance with. It is read once at
+    /// load and never printed: the configuration's own `Debug` reports only whether a key
+    /// was found.
+    pub(crate) clearance_key_env: String,
+}
+
+impl std::fmt::Debug for PrivacyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivacyConfig")
+            .field("clearance_key_env", &self.clearance_key_env)
+            .finish()
+    }
 }
 
 /// Accounting for per-target daily request allowances.
@@ -551,6 +580,9 @@ impl DeploymentConfig {
         }
 
         let facts = self.deployment_facts();
+        // Resolved once, before any route is built, so a gated deployment that cannot
+        // authenticate a clearance fails at load instead of refusing every request later.
+        let clearance_key = self.build_clearance_key()?;
 
         let mut route_names_by_id = HashMap::new();
         for (route_name, config) in &self.routes {
@@ -809,7 +841,8 @@ impl DeploymentConfig {
                 escalation_model,
             )
             .with_target_credentials(target_credentials(config, &self.targets))
-            .with_locality(route_locality(config, &self.targets, &self.llm_clients));
+            .with_locality(route_locality(config, &self.targets, &self.llm_clients))
+            .with_clearance_key(clearance_key.clone());
             routes.push((config.id.clone(), route));
         }
         // The default logical decision lane. Every configured decision target in
@@ -852,11 +885,56 @@ impl DeploymentConfig {
         Ok(runner)
     }
 
-    /// Builds one daily request allowance per (llm client, model) that declares a limit.
+    /// The key that authenticates a caller's privacy clearance.
     ///
-    /// Keyed exactly as the client is keyed - by model id within one client - so two
-    /// targets naming the same model share one counter rather than each believing it owns
-    /// the whole daily limit.
+    /// Required exactly when some `llm_client` declares `requires_public_payload`. Without
+    /// it nothing can authenticate a clearance, so every request to that client would be
+    /// refused: a startup error is the only honest way to report that.
+    fn build_clearance_key(&self) -> RunnerResult<Arc<crate::egress::ClearanceKey>> {
+        let gated: Vec<&str> = self
+            .llm_clients
+            .iter()
+            .filter(|(_, client)| client.requires_public_payload)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let Some(privacy) = self.privacy.as_ref() else {
+            if gated.is_empty() {
+                return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
+            }
+            return Err(RunnerError::configuration(format!(
+                "llm clients {} declare requires_public_payload but the deployment configures no [privacy] clearance_key_env; a clearance cannot be authenticated without a key, so every request to them would be refused",
+                gated.join(", ")
+            )));
+        };
+        if gated.is_empty() {
+            return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
+        }
+        let secret = std::env::var(&privacy.clearance_key_env).map_err(|_| {
+            RunnerError::configuration(format!(
+                "[privacy] clearance_key_env names {}, which is not set; llm clients {} require a public payload, so the key is required",
+                privacy.clearance_key_env,
+                gated.join(", ")
+            ))
+        })?;
+        if secret.trim().is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "[privacy] clearance_key_env names {}, which is empty; llm clients {} require a public payload, so the key is required",
+                privacy.clearance_key_env,
+                gated.join(", ")
+            )));
+        }
+        Ok(Arc::new(crate::egress::ClearanceKey::new(
+            secret.into_bytes(),
+        )))
+    }
+
+    /// Builds one daily request allowance per (quota group, model) that declares a limit.
+    ///
+    /// Keyed by the client's declared quota group rather than by the client's name, because
+    /// the provider caps requests per project: two clients that name the same project are
+    /// one budget, and keying them apart would hand the deployment twice the allowance it
+    /// actually has. A client that declares no group is its own group, which leaves a
+    /// single-client deployment unchanged.
     fn build_allowances(
         &self,
     ) -> RunnerResult<HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>>
@@ -872,14 +950,19 @@ impl DeploymentConfig {
                     "target {target_name} daily_request_limit must be at least 1"
                 )));
             }
-            let key = (target.llm_client.clone(), target.id.clone());
+            let group = self
+                .llm_clients
+                .get(&target.llm_client)
+                .and_then(|client| client.quota_group.clone())
+                .unwrap_or_else(|| target.llm_client.clone());
+            let key = (group.clone(), target.id.clone());
             match limits.entry(key) {
                 std::collections::hash_map::Entry::Occupied(existing) => {
                     let (first_limit, first_name) = existing.get();
                     if *first_limit != limit {
                         return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} share model {} on llm client {} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
-                            target.id, target.llm_client
+                            "targets {first_name} and {target_name} share model {} in quota group {group} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
+                            target.id
                         )));
                     }
                     continue;
@@ -894,14 +977,14 @@ impl DeploymentConfig {
                 ))
             })?;
             allowances.insert(
-                (target.llm_client.clone(), target.id.clone()),
+                (group.clone(), target.id.clone()),
                 Arc::new(switchyard_llm_client::DailyRequestAllowance::new(
-                    target.llm_client.clone(),
+                    group.clone(),
                     target.id.clone(),
                     limit,
                     switchyard_llm_client::allowance_path(
                         &quota.state_dir,
-                        &target.llm_client,
+                        &group,
                         target.id.as_str(),
                     ),
                 )),
@@ -1019,7 +1102,13 @@ impl DeploymentConfig {
                     target.reasoning_dialect,
                     target.cooldown_group.clone(),
                     allowances
-                        .get(&(target.llm_client.clone(), target.id.clone()))
+                        .get(&(
+                            client_config
+                                .quota_group
+                                .clone()
+                                .unwrap_or_else(|| target.llm_client.clone()),
+                            target.id.clone(),
+                        ))
                         .cloned(),
                 )?,
                 None,
@@ -2122,6 +2211,16 @@ struct LlmClientConfig {
     /// stays undeclared when the deployment does not state it.
     #[serde(default)]
     locality: Option<ClientLocality>,
+    /// The provider-side quota group every model served here draws on.
+    ///
+    /// A provider caps requests per *project*, and several clients can name the same
+    /// project - a second base URL, a different wire format, a second model list. Naming
+    /// the group here makes the counters meet: two clients declaring the same group share
+    /// one counter per model instead of each believing it owns the whole daily budget.
+    /// Defaults to the client's own name, which keeps a single-client deployment exactly
+    /// as it was.
+    #[serde(default)]
+    quota_group: Option<String>,
     /// Whether this client may only receive payloads a caller has cleared for it.
     ///
     /// A provider property, declared once per credential: a free tier that uses submitted
@@ -2387,6 +2486,7 @@ fn build_backend(
         stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
         requires_list_input: config.requires_list_input,
         allowance,
+        requires_public_payload: config.requires_public_payload,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),

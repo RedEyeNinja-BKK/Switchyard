@@ -97,6 +97,20 @@ pub enum LlmClientError {
         reason: String,
     },
 
+    /// The assembled payload contains content that must not leave the deployment.
+    ///
+    /// Raised at the last possible moment - over the exact JSON body about to be sent -
+    /// for a provider that may only receive a payload cleared as public. It is terminal
+    /// for the route rather than a fallback reason: another candidate would be handed the
+    /// same payload, so advancing would leak what this check just found.
+    #[error("payload for {model} carries content that must not leave this deployment: {codes}")]
+    PayloadNotCleared {
+        /// Target the payload was assembled for.
+        model: ModelId,
+        /// The finding codes, comma separated, without the matched values.
+        codes: String,
+    },
+
     /// The upstream could not be reached or the request could not be sent.
     #[error("upstream transport error: {source}")]
     Transport {

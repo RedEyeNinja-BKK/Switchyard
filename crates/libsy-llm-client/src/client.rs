@@ -606,6 +606,32 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
+        // Inspected before anything else happens: over the exact body this call is about
+        // to put on the wire, for a provider that may only receive a cleared payload.
+        // This is deliberately not the same check the router performs on the request. A
+        // codec adds fields, a translation layer injects instructions, and a preserved
+        // provider body may be replayed verbatim; only the assembled body shows all of
+        // it. A finding here is terminal, so it neither spends the daily allowance below
+        // nor advances to a candidate that would be handed the same payload.
+        if backend.requires_public_payload() {
+            let findings = crate::privacy::scan_json(body);
+            if !findings.is_empty() {
+                metrics::record_upstream_attempt(None);
+                let codes = findings
+                    .iter()
+                    .map(|finding| finding.code())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(AttemptFailure {
+                    error: LlmClientError::PayloadNotCleared {
+                        model: model.clone(),
+                        codes,
+                    },
+                    status: None,
+                    retry_after: None,
+                });
+            }
+        }
         // Spent before the request leaves, at the one point every attempt passes
         // through. A reservation is never refunded: an attempt that fails below may
         // still have reached the provider, and refunding it would let a retrying
@@ -1143,6 +1169,8 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         // now would burn the next day's budget against an answer already known to be no.
         LlmClientError::DailyRequestAllowanceExhausted { .. }
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => false,
+        // Retrying resends the same payload, which is the thing that was just refused.
+        LlmClientError::PayloadNotCleared { .. } => false,
         LlmClientError::UpstreamHttp { status, body } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
                 return false;
@@ -1887,6 +1915,7 @@ mod tests {
             stream_idle_timeout: None,
             requires_list_input: false,
             allowance: None,
+            requires_public_payload: false,
         }
     }
 

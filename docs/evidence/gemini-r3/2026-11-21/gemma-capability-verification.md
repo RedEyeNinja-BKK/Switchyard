@@ -1,0 +1,80 @@
+# Gemma 4 — direct capability verification, 2026-11-21
+
+Measured, not read. Production key on `switchyard-vm`, read from the deployment's own env
+file inside the host so it never left it. Endpoint: `https://generativelanguage.googleapis.com/v1beta/openai`.
+
+**Spend: 25 chat requests and 2 model listings.** Every request was small (`max_tokens` ≤ 400,
+prompts ≤ 60 tokens). No 15K or 262K probe was run, per the standing instruction; the TPM
+question is settled by the rate limiter, not by burning quota.
+
+## Matrix
+
+| capability | `gemma-4-26b-a4b-it` | `gemma-4-31b-it` |
+| --- | --- | --- |
+| listed in `/models` | yes | yes |
+| text completion | 200, ~2.5 s | 200, 18–55 s, 503 on most attempts |
+| `tools` + `tool_choice:"auto"` | 200, `finish_reason:"tool_calls"`, 1 call, `{"location":"Bangkok"}` | 200 on attempt 3 (~18 s), same shape |
+| tool round-trip with stripped call (id/type/function only) | 200, correct answer | not run |
+| `response_format:{"type":"json_object"}` | 200, but content is `<thought>…</thought>{…}` → not parseable | same |
+| `response_format:{"type":"json_schema",…}` | not run | 200, clean JSON, no thought block |
+| `reasoning_effort:"none"` | not run | **400** `INVALID_ARGUMENT "Thinking budget is not supported for this model."` |
+
+Raw receipts in `live-probe/`. One record per request, including the failures.
+
+## The three shapes that change the implementation
+
+### 1. Thinking arrives inline in `content`
+
+```
+content: "<thought>The user is asking for a single-word reply… </thought>ready"
+extra_content: {"google": {"thought": true}}
+usage: {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 71}
+```
+
+`completion_tokens` **excludes** the thought; `total_tokens` includes it. There is no
+`completion_tokens_details`, and `reasoning_tokens` is absent, so the only way to count
+thinking tokens is `total − prompt − completion` (62 in the example above).
+
+Consequence: Switchyard's extraction reads `reasoning_content` / `reasoning` only, so a Gemma
+reply is currently returned with its internal monologue as visible answer text. That is a
+defect of the lane, not a preference.
+
+### 2. Tool calls carry a thought signature that turns out not to be required
+
+```json
+{"id": "call_1338…", "type": "function",
+ "function": {"name": "get_weather", "arguments": "{\"location\":\"Bangkok\"}"},
+ "extra_content": {"google": {"thought_signature": "EiYKJGUyNDgzMGE3…"}}}
+```
+
+The round-trip was run both ways. Sending the assistant turn back with only
+`id`/`type`/`function` — the shape Switchyard's Chat translation produces — returned 200 and
+the model answered from the tool result. This differs from Gemini 2.x, where a missing
+signature is a 400. The verbatim attempt that would have proved the converse returned 503, so
+the only claim made here is the positive one: **the stripped round-trip works.**
+
+### 3. `json_object` and `json_schema` are not the same tool
+
+`json_object` constrains nothing: the model still emits a thought block first, so the body is
+not parseable JSON. `json_schema` produced `{"a": 1, "b": 2}` and no thought block at all.
+For structured output on this family, `json_schema` is the usable mode and `json_object` is
+not.
+
+## Capacity, which is not a capability
+
+31B answered 1 of 5 attempts, taking 18.3 s when it did, and returned
+`503 UNAVAILABLE "This model is currently experiencing high demand"` otherwise. Every 503 was
+`finish_reason`-less and body-wrapped in a list. 26B answered every attempt in 2–5 s.
+
+So 31B is not unqualified — it is *capacity-starved and slow*. Three consequences:
+the bounded route must order 26B first, a 503 must cross to the next leg rather than being
+retried in place, and a comparison run has to record 503s as their own outcome instead of
+folding them into failure or latency.
+
+## What the docs actually say
+
+`aistudio.google.com/llms.txt` and `docs/models.md` contain **zero** mentions of Gemma. The
+function-calling, structured-output and thinking pages document Gemini models only. Gemma's
+support on the OpenAI-compatible surface is therefore **undocumented by the vendor** — the
+matrix above is the only evidence that exists for it, which is why it is recorded request by
+request.

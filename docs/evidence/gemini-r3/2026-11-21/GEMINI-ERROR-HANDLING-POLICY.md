@@ -101,7 +101,7 @@ Wiring, all inside mechanisms that already existed - no second router:
 
 | seam | behaviour |
 | --- | --- |
-| `client.rs::is_account_wide_quota` | Google `quota_exceeded` is account-wide, so the candidate list stops; `rate_limit_exceeded` is not. |
+| `client.rs::is_account_wide_quota` | SUPERSEDED 2026-11-21: a Google `quota_exceeded` is account-wide **only** when the body positively scopes the quota to the project; a per-model or unscoped one retires just that model. `rate_limit_exceeded` is still not account-wide. |
 | `client.rs::is_transient_failure` | A condition whose `retry_same_model` is false is not resent, whatever the status says. This is what keeps a daily quota that arrives behind a 5xx from being retried. |
 | `run.rs::failure_class` | Conditions map onto the existing classes: `DailyQuota → AccountQuota`, `ShortWindowThrottle → RateLimited`, `Capacity → TemporarilyUnavailable`, `ContentBlocked → ProviderPolicy`, `ModelNotFound → ModelRetired`, credential codes → `Auth`, structural codes → `Request`. |
 | `run.rs::fallback_reason` | A condition with `keep_outcome` is not routed around. A policy block, a malformed tool call or a cancelled call is an answer; handing it to another provider would be evading it. |

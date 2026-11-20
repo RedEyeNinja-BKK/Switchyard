@@ -113,3 +113,66 @@ leaves and `smart-gemini-bounded` added, nothing removed). Three mutants - buffe
 disabled, stream filter disabled, end-of-stream refusal disabled - each turned a named test
 red; the control case (same body, no marker declared) stayed green, which is what shows the
 marker is the switch and not a global strip.
+
+
+## CORRECTION 2026-11-21 (post-`fd8c61c4`) - the leak had three more channels
+
+The paragraph above says the moved thinking "survives as a reasoning block for a caller that
+wants it". **That is withdrawn.** It survives as a reasoning block, and a reasoning block is
+not private: the chat encoder writes it back out as `reasoning_content`, so the monologue
+reached the caller through a second field while the answer looked clean. Removing the text
+from `content` alone was cosmetic.
+
+Three channels were found and closed, each with its own mutant:
+
+| channel | how the text escaped | closure |
+|---|---|---|
+| `reasoning_content` | the split rebuilt the thought as a `Reasoning` block | the split discards it; a marker-declaring target emits no reasoning field at all |
+| retained stream frame | every decoded event carried the raw upstream frame, and the stream encoder replays a frame in preference to the normalized chunks | a marker-declaring stream yields events with **no** preservation (an absent one, not a `Null` one - the encoder replays whatever is present) |
+| exact preserved body | the buffered decoder captured the source body for byte-exact replay, and the encoder prefers it over the IR | a marker-declaring target is not eligible for response preservation, which is the only gate that also covers the serving layer, where the reply is re-encoded in the caller's format and the target's policy is out of scope |
+
+The tests now judge the **encoded wire**, not the IR: the label text appears in neither
+`content` nor `reasoning_content`, and survives in no block at all. Four mutants - capture
+re-enabled, frame retained, split rebuilt as a reasoning block, stream delta forwarding
+reasoning - each turned a named test red by name.
+
+## Quota scope: one spent model does not condemn the pool
+
+A spent Free-tier daily quota was treated as account-wide from the code alone, so the first
+429 from one model stopped the candidate list. Google allocates RPD **per model** (20/day
+Flash, 500/day Flash-Lite, 14.4K Gemma) plus separate feature quotas, so an unscoped
+`quota_exceeded` proves an allowance is spent without proving which one.
+
+Scope is now read from the structure the body supplies - a `model` dimension or a
+`PerProjectPerModel` id is a model; `PerProject` without `PerModel` is the project; a
+feature-named quota is a feature; anything else stays `Unknown` and is never promoted to
+project-wide. Only a positively project-wide quota may stop the candidate list. The details
+may also widen a bare `RESOURCE_EXHAUSTED` to a daily quota when the quota id says `PerDay`;
+the status string alone still may not.
+
+Regression: two models on one project, the first answering `quota_exceeded` per model, the
+second serving - and, as the contrast, a project-scoped quota stopping the list after one
+call. Restoring the old code-only classification turns that test red.
+
+## Owner-supplied facts recorded
+
+- The AI Studio panel cells (`3.6 Flash 23/20`, `3.8 Flash 22/20`) are a **selected-window
+  peak**, not a verified remaining or exhausted balance. Nothing in this lane treats them as
+  live quota.
+- Google's own guidance is that `/responses` is not offered natively: a caller wanting that
+  wire format must go through a translation proxy or Google's native SDK. Switchyard is
+  already such a proxy, and the `google-genai` SDK is the reference for the canonical field
+  mapping if that lane is built.
+
+## Lane ordering and health
+
+`smart-gemini-bounded` now leads with the 26B: it is an A4B mixture with roughly 4B active
+parameters per token against the 31B's 31B, so it moves far fewer weights per request, which
+is what matters against a tokens-per-minute allowance. The 31B is the escalation step and
+gets its own `llm_client` entry with `failure_cooldown_ms = 300000` and no `cooldown_group` -
+a capacity fact about the large model must not cool the lane's default down with it. The
+daily counter stays shared because it is one project and one allowance.
+
+Receipts: `switchyard-translation` 67, `switchyard-llm-client` 163 + 4 + 18,
+`switchyard-runner` 208, clippy `-D warnings` clean; regenerated manifest 49 -> 52 routes and
+`--dry-run` rc=0 on the new binary.

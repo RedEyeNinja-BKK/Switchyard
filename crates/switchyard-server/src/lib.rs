@@ -1467,6 +1467,17 @@ async fn handle_llm_request(
                 "video_carrier" => {
                     "video supplied on that carrier (every candidate serves the other form)"
                 }
+                // A caller-supplied effort the provider refuses is not silently stripped:
+                // saying so is the difference between the caller changing the request and the
+                // caller believing an effort was applied that never left the router.
+                "unsupported_reasoning_effort" => {
+                    "a reasoning_effort the model accepts (every candidate refuses the one \
+                     requested, and dropping it would run a different reasoning mode)"
+                }
+                "output_budget_below_thinking_floor" => {
+                    "a larger max_output_tokens (this model cannot answer before its thinking \
+                     has used that budget)"
+                }
                 other => other,
             };
             return error_response(

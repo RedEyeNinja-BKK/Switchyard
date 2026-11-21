@@ -2117,6 +2117,11 @@ impl DeploymentConfig {
                         // output reservation states the smallest reservation it can answer
                         // within, so a smaller one is skipped instead of attempted.
                         min_output_tokens: target.min_output_tokens,
+                        // The same declaration the send boundary uses to strip a value the
+                        // provider refuses. Carried here so a candidate can be judged
+                        // ineligible BEFORE the call when the caller is the one who asked
+                        // for that value, instead of being sent and silently altered.
+                        unsupported_reasoning_effort: target.unsupported_reasoning_effort.clone(),
                     },
                 );
             }
@@ -6160,6 +6165,7 @@ video = false
 free_tier = true
 omit_body_fields = ["store", "metadata", "prompt_cache_key"]
 unsupported_reasoning_effort = ["none"]
+min_output_tokens = 600
 
 [targets."direct-google-gemma-4-26b-a4b-it"]
 id = "gemma-4-26b-a4b-it"
@@ -6607,6 +6613,45 @@ selection = "measured"
             None,
             "a pool with live legs is not itself held"
         );
+    }
+
+    /// The output floor is declared where it was measured, and nowhere else.
+    ///
+    /// `gemini-3-flash-preview` answered HTTP 500 with an empty completion at an 8-token
+    /// reservation and normally at 600, so 600 is the smallest reservation observed to work
+    /// and is the one declared. The Gemma pair keeps its own measured 512. Every other free
+    /// leg declares no floor: adding one there would refuse requests that currently succeed,
+    /// which no measurement supports.
+    #[test]
+    fn the_output_floor_is_declared_where_it_was_measured() {
+        let config = parsed();
+        assert_eq!(
+            config.targets["direct-google-gemini-3-flash"].min_output_tokens,
+            Some(600),
+            "3-flash needs the measured reservation, or an 8-token call becomes a 500"
+        );
+        for gemma in [
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert_eq!(
+                config.targets[gemma].min_output_tokens,
+                Some(512),
+                "{gemma}'s measured floor must survive untouched"
+            );
+        }
+        for unmeasured in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+        ] {
+            assert_eq!(
+                config.targets[unmeasured].min_output_tokens, None,
+                "{unmeasured} has no measured floor; inventing one would refuse working requests"
+            );
+        }
     }
 
     /// A held model serves nothing, so it declares no budget at all: zero is refused at load

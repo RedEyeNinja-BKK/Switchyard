@@ -18,7 +18,7 @@
 //! [`ClientRouter`] sends native Responses state back to its provider; for Chat or Anthropic
 //! targets it retains the canonical history needed to materialize the continuation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1151,7 +1151,11 @@ struct ClientRouting {
 }
 
 /// The request requirements a candidate target is checked against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+///
+/// Cloned rather than copied because the refusal list is owned configuration: a set of
+/// provider-specific strings that cannot live in a `Copy` type. Nothing here is mutated
+/// after the deployment is built, so the clone is cheap enough to be the only cost.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CapabilityFacts {
     /// The backing deployment cannot accept image input.
     pub no_vision: bool,
@@ -1226,15 +1230,27 @@ pub struct CapabilityFacts {
     pub safe_input_tokens: Option<u64>,
     /// The smallest output reservation this target can answer within.
     ///
-    /// Set only for a target whose reasoning is charged against the caller's output budget
-    /// (a `hosted_reasoning = "thought_tag"` upstream). Such a target must fit both its
-    /// thinking and its answer inside `max_output_tokens`; below this reservation it cannot
-    /// produce an answer at all, and dispatching it spends a provider request to discover a
-    /// fact the deployment already knows. A request under the floor is therefore ineligible
-    /// rather than attempted, which is also what keeps a caller's tiny reservation from
-    /// being recorded as a failure of the model. `None` means no floor is declared, which is
-    /// every target that counts its reasoning as output or does not reason at all.
+    /// Set for a target whose reasoning is charged against the caller's output budget, and
+    /// for one that simply cannot answer before a larger reservation — Google's
+    /// `gemini-3-flash-preview` answers HTTP 500 with an empty completion at an 8-token
+    /// reservation and normally at 600, with no `hosted_reasoning` declaration to explain
+    /// it. Such a target must fit both its thinking and its answer inside
+    /// `max_output_tokens`; below this reservation it cannot produce an answer at all, and
+    /// dispatching it spends a provider request to discover a fact the deployment already
+    /// knows. A request under the floor is therefore ineligible rather than attempted, which
+    /// is also what keeps a caller's tiny reservation from being recorded as a failure of the
+    /// model. `None` means no floor is declared, which is every target that counts its
+    /// reasoning as output or does not reason at all.
     pub min_output_tokens: Option<u64>,
+    /// Reasoning-effort values the provider refuses on this wire.
+    ///
+    /// A caller who names one of these has stated a requirement the target cannot honour.
+    /// Such a candidate is ineligible rather than merely stripped: dropping the value would
+    /// leave the provider's native default running, and reporting the call as though the
+    /// requested effort had been applied would describe a request nobody made. Values the
+    /// deployment itself injected are not read from here — those are the deployment's to
+    /// correct, and are still dropped at the send boundary.
+    pub unsupported_reasoning_effort: BTreeSet<String>,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.

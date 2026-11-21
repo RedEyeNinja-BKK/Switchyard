@@ -707,6 +707,15 @@ impl Route {
                 binding = binding.or(Some("output_budget_below_thinking_floor"));
                 continue;
             }
+            // Mirrors the dispatch filter's reading of a caller-supplied effort the provider
+            // refuses, so a composite treats this child as unable to hold the request rather
+            // than as a child that failed.
+            if let Some(effort) = request.llm_request.reasoning.effort.as_deref()
+                && facts.unsupported_reasoning_effort.contains(effort)
+            {
+                binding = binding.or(Some("unsupported_reasoning_effort"));
+                continue;
+            }
             return None;
         }
         binding
@@ -791,6 +800,21 @@ impl Route {
             ) && reservation < floor
             {
                 return Err("output_budget_below_thinking_floor");
+            }
+            // The caller's own reasoning effort is a requirement, not a hint. When the
+            // provider refuses that exact value the request cannot be honoured here, and
+            // stripping it would leave the provider's native default running while the
+            // response implied the caller's choice had been applied. Skipping the candidate
+            // lets an aggregate route advance to a leg that accepts the value; a directly
+            // addressed leaf then refuses with this name, before any request is sent.
+            //
+            // Only the caller's normalized field is read. An effort this deployment injected
+            // from route or target configuration is not a caller requirement, and is still
+            // dropped at the send boundary where it was introduced.
+            if let Some(effort) = request.llm_request.reasoning.effort.as_deref()
+                && facts.unsupported_reasoning_effort.contains(effort)
+            {
+                return Err("unsupported_reasoning_effort");
             }
             // An explicit `false` is a refusal; `None` would mean "undeclared",
             // which the predicate treats as permitted, so the flag must be carried

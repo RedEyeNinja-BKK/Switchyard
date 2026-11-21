@@ -16,7 +16,7 @@
 //! Every stub here counts its calls, because "the leg was skipped" and "the leg answered and
 //! was ignored" are different claims and only the first one is a privacy guarantee.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -958,7 +958,7 @@ fn recording_pool(
     let facts: HashMap<ModelId, CapabilityFacts> = targets
         .iter()
         .zip(legs.iter())
-        .map(|((_, model), (_, facts, _))| (model.clone(), *facts))
+        .map(|((_, model), (_, facts, _))| (model.clone(), facts.clone()))
         .collect();
     let allowances: HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>> = targets
         .iter()
@@ -1777,4 +1777,237 @@ async fn a_directly_addressed_leaf_names_the_thinking_floor_it_cannot_meet() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(model.as_str(), "thinking");
+}
+
+// ---------------------------------------------------------------------------
+// The measured floor on a model that does not declare hosted_reasoning
+// ---------------------------------------------------------------------------
+
+/// `direct-google-gemini-3-flash` answered HTTP 500 with an empty completion at an 8-token
+/// reservation and normally at 600. 600 is the smallest reservation observed to work, so it
+/// is the declared floor; the true boundary was not bisected and is not claimed.
+fn measured_floor_600() -> CapabilityFacts {
+    CapabilityFacts {
+        min_output_tokens: Some(600),
+        ..open()
+    }
+}
+
+#[tokio::test]
+async fn a_leaf_declaring_the_measured_floor_skips_a_tiny_reservation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = leaf(
+        "three-flash",
+        &calls,
+        measured_floor_600(),
+        ModelCapabilities::default(),
+        false,
+    );
+
+    let error = match route.execute(reservation(8), None).await {
+        Ok(_) => panic!("an 8-token reservation is the measured failure and must not be sent"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error}").contains("output_budget_below_thinking_floor"),
+        "the refusal must name the binding limit, got: {error}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// The control: at the measured floor the same leg is dispatched. A floor applied to every
+/// reservation would pass the test above and silently disable the target.
+#[tokio::test]
+async fn a_leaf_declaring_the_measured_floor_dispatches_at_the_floor() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = leaf(
+        "three-flash",
+        &calls,
+        measured_floor_600(),
+        ModelCapabilities::default(),
+        false,
+    );
+
+    route
+        .execute(reservation(600), None)
+        .await
+        .expect("the measured passing reservation must be dispatched");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The caller's reasoning effort is a requirement; the deployment's is not
+// ---------------------------------------------------------------------------
+
+/// A target whose provider answers HTTP 400 to `reasoning_effort: none`, as every Google
+/// chat target does, while accepting the graded values.
+fn refusing_none() -> CapabilityFacts {
+    CapabilityFacts {
+        unsupported_reasoning_effort: BTreeSet::from(["none".to_string()]),
+        ..open()
+    }
+}
+
+fn with_caller_effort(mut request: Request, effort: Option<&str>) -> Request {
+    request.llm_request.reasoning.effort = effort.map(str::to_string);
+    request
+}
+
+/// When the caller is the one who asked for a refused value, the leg is ineligible and still
+/// no request is sent. Stripping the value instead would leave the provider's native
+/// reasoning running while the caller believed `none` had been applied.
+#[tokio::test]
+async fn a_caller_supplied_refused_effort_makes_the_leaf_ineligible() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = leaf(
+        "google",
+        &calls,
+        refusing_none(),
+        ModelCapabilities::default(),
+        false,
+    );
+
+    let error = match route
+        .execute(with_caller_effort(request("hello"), Some("none")), None)
+        .await
+    {
+        Ok(_) => panic!("a refused caller-supplied effort must not be dispatched"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error}").contains("unsupported_reasoning_effort"),
+        "the refusal must name the refused control, got: {error}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// The discriminator for the test above: the same target, the same refused value in its
+/// declaration, but no caller-supplied effort. A deployment-injected value is the
+/// deployment's to correct, so the leg stays eligible - if this failed, the gate would be
+/// reading the target's declaration instead of the caller's request.
+#[tokio::test]
+async fn a_deployment_injected_refused_effort_does_not_make_the_leaf_ineligible() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = leaf(
+        "google",
+        &calls,
+        refusing_none(),
+        ModelCapabilities::default(),
+        false,
+    );
+
+    route
+        .execute(with_caller_effort(request("hello"), None), None)
+        .await
+        .expect("a request that asks for nothing must not be refused for a value it lacks");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Only the refused values exclude: a graded effort the provider serves is dispatched.
+#[tokio::test]
+async fn a_caller_supplied_accepted_effort_is_dispatched() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = leaf(
+        "google",
+        &calls,
+        refusing_none(),
+        ModelCapabilities::default(),
+        false,
+    );
+
+    route
+        .execute(with_caller_effort(request("hello"), Some("low")), None)
+        .await
+        .expect("low is served by this wire and must reach it");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Inside a composite the leg that cannot honour the caller's effort is skipped, and the
+/// sibling answers. This is the escape hatch that makes a strict `none` usable at all, and
+/// the reason the refusal is a candidate gate rather than a request-level error: refusing the
+/// request outright would deny the caller a leg that can actually honour it.
+#[tokio::test]
+async fn a_caller_supplied_refused_effort_crosses_to_a_sibling_that_accepts_it() {
+    let google_calls = Arc::new(AtomicUsize::new(0));
+    let nt_calls = Arc::new(AtomicUsize::new(0));
+    let runner = Runner::new(vec![
+        leaf(
+            "google",
+            &google_calls,
+            refusing_none(),
+            ModelCapabilities::default(),
+            false,
+        ),
+        leaf("nt", &nt_calls, open(), ModelCapabilities::default(), false),
+    ])
+    .with_composite(
+        "strict-none".to_string(),
+        vec!["google".to_string(), "nt".to_string()],
+    );
+
+    runner
+        .execute_route(
+            "strict-none",
+            with_caller_effort(request("hello"), Some("none")),
+            None,
+        )
+        .await
+        .expect("the sibling honours the requested effort");
+    assert_eq!(
+        google_calls.load(Ordering::SeqCst),
+        0,
+        "the leg that would strip the value must not be asked"
+    );
+    assert_eq!(nt_calls.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------
+// A free leg's health and fallback, offline
+// ---------------------------------------------------------------------------
+
+/// The free Lite leg that serves the small-request path is still in the ladder and still
+/// crosses when it fails.
+///
+/// This is deliberately an offline shape rather than a provider probe: it asserts the
+/// arrangement the deployment relies on - 3.1-flash-lite is offered, it is asked first, and a
+/// failure on it hands the request to the next free leg without ending the route. A probe
+/// would additionally spend the free budget to learn what the router already guarantees.
+#[tokio::test]
+async fn a_failing_flash_lite_leg_still_crosses_to_the_next_free_leg() {
+    let lite_calls = Arc::new(AtomicUsize::new(0));
+    let next_calls = Arc::new(AtomicUsize::new(0));
+    let runner = Runner::new(vec![
+        leaf(
+            "gemini-3.1-flash-lite",
+            &lite_calls,
+            open(),
+            ModelCapabilities::default(),
+            true,
+        ),
+        leaf(
+            "gemini-3.5-flash-lite",
+            &next_calls,
+            open(),
+            ModelCapabilities::default(),
+            false,
+        ),
+    ])
+    .with_composite(
+        "free-ladder".to_string(),
+        vec![
+            "gemini-3.1-flash-lite".to_string(),
+            "gemini-3.5-flash-lite".to_string(),
+        ],
+    );
+
+    runner
+        .execute_route("free-ladder", request("hello"), None)
+        .await
+        .expect("the next free leg answers after the first one fails");
+    assert_eq!(
+        lite_calls.load(Ordering::SeqCst),
+        1,
+        "the failing leg is tried, not skipped pre-emptively"
+    );
+    assert_eq!(next_calls.load(Ordering::SeqCst), 1);
 }

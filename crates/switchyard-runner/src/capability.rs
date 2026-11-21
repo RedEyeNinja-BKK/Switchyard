@@ -35,6 +35,13 @@ pub struct CapabilityClientConfig {
     /// Deadline for one call, in seconds. Unset is the client's own default.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Task type this lane embeds for, sent as the provider's own field.
+    ///
+    /// Only `google_embed_content` has this field. It changes the vectors a query is
+    /// mapped to, so it is part of the capability's vector space and a contract id must
+    /// change with it.
+    #[serde(default)]
+    pub task_type: Option<String>,
 }
 
 impl CapabilityClientConfig {
@@ -64,6 +71,56 @@ pub enum CapabilityFormat {
     OpenaiEmbeddings,
     /// Cohere/Jina-compatible reranking over `POST /rerank`.
     CohereJinaRerank,
+    /// Google `POST /v1beta/models/{model}:embedContent`.
+    ///
+    /// One content per request: the endpoint has no bulk form, so a batch is a bounded
+    /// fan-out of single-input calls rather than one wide request.
+    GoogleEmbedContent,
+}
+
+/// The header a capability credential is presented under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityAuth {
+    /// `Authorization: Bearer <key>`.
+    Bearer,
+    /// `x-goog-api-key: <key>`.
+    GoogleApiKey,
+}
+
+impl CapabilityFormat {
+    /// Whether this format produces embedding vectors.
+    pub fn serves_embeddings(self) -> bool {
+        matches!(self, Self::OpenaiEmbeddings | Self::GoogleEmbedContent)
+    }
+
+    /// Whether this format produces rerank scores.
+    pub fn serves_rerank(self) -> bool {
+        matches!(self, Self::CohereJinaRerank)
+    }
+
+    /// How this format's credential is presented.
+    ///
+    /// The header is a property of the wire, not a preference: Google reads its key from
+    /// `x-goog-api-key` and a bearer token there is an authentication failure that looks
+    /// like a bad credential.
+    pub fn auth(self) -> CapabilityAuth {
+        match self {
+            Self::GoogleEmbedContent => CapabilityAuth::GoogleApiKey,
+            Self::OpenaiEmbeddings | Self::CohereJinaRerank => CapabilityAuth::Bearer,
+        }
+    }
+
+    /// Default request path, when the client declares none.
+    ///
+    /// Google names the model inside the path, so this is the one format whose default
+    /// path depends on the configured model.
+    pub fn default_path(self, model: &str) -> String {
+        match self {
+            Self::OpenaiEmbeddings => "/v1/embeddings".to_string(),
+            Self::CohereJinaRerank => "/v1/rerank".to_string(),
+            Self::GoogleEmbedContent => format!("/v1beta/models/{model}:embedContent"),
+        }
+    }
 }
 
 /// A caller-visible capability: which endpoint serves it, under which contract.
@@ -102,6 +159,13 @@ pub struct CapabilityConfig {
     /// Longest query text one rerank request may carry, in characters.
     #[serde(default)]
     pub max_query_chars: Option<u32>,
+    /// Input-token limit of one embedding input, as the provider publishes it.
+    ///
+    /// Required for `google_embed_content`. The surface enforces a byte budget derived
+    /// from it, because a provider token limit can only be bounded locally through a
+    /// quantity that is provably at least as large as the token count.
+    #[serde(default)]
+    pub max_input_tokens: Option<u32>,
 }
 
 /// Configured capability endpoints and the capabilities that name them.
@@ -140,6 +204,29 @@ impl CapabilityDeployment {
                         ));
                     }
                 }
+                CapabilityFormat::GoogleEmbedContent => {
+                    if capability.dimensions.is_none() {
+                        return Err(format!(
+                            "capability {name} serves an embedding endpoint and must declare dimensions"
+                        ));
+                    }
+                    if capability.contract.is_none() {
+                        return Err(format!(
+                            "capability {name} serves an embedding endpoint and must declare contract, \
+                             because vectors from different engines are not comparable"
+                        ));
+                    }
+                    // Google publishes a 2,048-token input limit on this model. Without the
+                    // number, the surface could only truncate silently or send and hope,
+                    // and both are worse than refusing the configuration.
+                    if capability.max_input_tokens.is_none() {
+                        return Err(format!(
+                            "capability {name} serves a google embedding endpoint and must declare \
+                             max_input_tokens, because an input longer than the model's limit must be \
+                             refused rather than truncated"
+                        ));
+                    }
+                }
                 CapabilityFormat::CohereJinaRerank => {
                     if capability.max_candidates.is_none() {
                         return Err(format!(
@@ -155,6 +242,16 @@ impl CapabilityDeployment {
                         ));
                     }
                 }
+            }
+
+            // A task type is a Google wire field. Declaring it on a client that has no
+            // such field would read as a configured behaviour the deployment does not
+            // have, so it is refused instead of ignored.
+            if client.task_type.is_some() && client.format != CapabilityFormat::GoogleEmbedContent {
+                return Err(format!(
+                    "capability client {client_name} declares task_type, which only \
+                     google_embed_content sends"
+                ));
             }
         }
 
@@ -329,6 +426,7 @@ dimensions = 1024
             endpoint_path: Some("/v1/rerank".to_string()),
             api_key_env: None,
             timeout_seconds: None,
+            task_type: None,
         };
         assert_eq!(client.url("/rerank"), "https://service.test/v1/rerank");
 
@@ -376,6 +474,10 @@ pub struct ResolvedCapability {
     pub max_doc_chars: Option<u32>,
     /// Longest query text, in characters, for reranking.
     pub max_query_chars: Option<u32>,
+    /// Task type sent as the provider's own field, for Google embedding.
+    pub task_type: Option<String>,
+    /// Provider-published input-token limit of one embedding input.
+    pub max_input_tokens: Option<u32>,
 }
 
 /// Resolves configuration into the serving form, so dispatch never re-reads config.
@@ -385,17 +487,14 @@ pub fn resolve(deployment: &CapabilityDeployment) -> BTreeMap<String, ResolvedCa
         .iter()
         .filter_map(|(name, capability)| {
             let client = deployment.clients.get(&capability.target)?;
-            let default_path = match client.format {
-                CapabilityFormat::OpenaiEmbeddings => "/v1/embeddings",
-                CapabilityFormat::CohereJinaRerank => "/v1/rerank",
-            };
+            let default_path = client.format.default_path(&client.model);
             Some((
                 capability.id.clone(),
                 ResolvedCapability {
                     id: capability.id.clone(),
                     client: name.clone(),
                     format: client.format,
-                    url: client.url(default_path),
+                    url: client.url(&default_path),
                     model: client.model.clone(),
                     api_key_env: client.api_key_env.clone(),
                     timeout_seconds: client.timeout_seconds,
@@ -407,6 +506,8 @@ pub fn resolve(deployment: &CapabilityDeployment) -> BTreeMap<String, ResolvedCa
                     top_n: capability.top_n,
                     max_doc_chars: capability.max_doc_chars,
                     max_query_chars: capability.max_query_chars,
+                    task_type: client.task_type.clone(),
+                    max_input_tokens: capability.max_input_tokens,
                 },
             ))
         })
@@ -527,5 +628,114 @@ dimensions = 8
         let resolved = resolve(&deployment);
         assert!(resolved.contains_key("space"));
         assert!(!resolved.contains_key("dangling"));
+    }
+}
+
+#[cfg(test)]
+mod google_embedding_tests {
+    use super::*;
+
+    const SOURCE: &str = r#"
+[clients.google]
+format = "google_embed_content"
+base_url = "https://generativelanguage.googleapis.com/"
+model = "gemini-embedding-001"
+task_type = "RETRIEVAL_DOCUMENT"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+
+[capabilities.gem]
+id = "switchyard-embedding-google"
+target = "google"
+contract = "google-embedding-001:v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 2048
+"#;
+
+    fn deployment() -> CapabilityDeployment {
+        let deployment: CapabilityDeployment = toml::from_str(SOURCE).expect("fixture parses");
+        deployment.validate().expect("fixture is valid");
+        deployment
+    }
+
+    /// Google names the model in the path, so the default path is a function of the
+    /// configured model rather than a constant. A bare `/v1beta/embedContent` would 404.
+    #[test]
+    fn the_default_path_names_the_model_and_the_method() {
+        let resolved = resolve(&deployment());
+        assert_eq!(
+            resolved["switchyard-embedding-google"].url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+        );
+    }
+
+    /// The task type changes the vectors a text is mapped to, so it is part of the vector
+    /// space and must survive into dispatch; dropping it would silently serve a different
+    /// space than the contract id claims.
+    #[test]
+    fn dispatch_carries_the_task_type_and_the_input_limit() {
+        let resolved = resolve(&deployment());
+        let capability = &resolved["switchyard-embedding-google"];
+        assert_eq!(capability.task_type.as_deref(), Some("RETRIEVAL_DOCUMENT"));
+        assert_eq!(capability.max_input_tokens, Some(2048));
+        assert_eq!(capability.format.auth(), CapabilityAuth::GoogleApiKey);
+    }
+
+    /// Without the published input limit the surface could only truncate silently or
+    /// send and hope, so the configuration is refused rather than guessed.
+    #[test]
+    fn a_google_capability_must_declare_its_input_token_limit() {
+        let source = SOURCE.replace("max_input_tokens = 2048\n", "");
+        let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("an undeclared input limit must not load")
+                .contains("max_input_tokens")
+        );
+    }
+
+    /// `task_type` is a Google wire field. Accepting it on another client would describe
+    /// behaviour the deployment does not have.
+    #[test]
+    fn a_task_type_on_another_wire_is_refused_rather_than_ignored() {
+        let source = SOURCE.replace(
+            "format = \"google_embed_content\"",
+            "format = \"openai_embeddings\"",
+        );
+        let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("an inert field must not load")
+                .contains("task_type")
+        );
+    }
+
+    /// The transport identity is a property of the wire: Google rejects a bearer token.
+    #[test]
+    fn only_the_google_wire_presents_its_key_as_a_google_key() {
+        assert_eq!(
+            CapabilityFormat::GoogleEmbedContent.auth(),
+            CapabilityAuth::GoogleApiKey
+        );
+        assert_eq!(
+            CapabilityFormat::OpenaiEmbeddings.auth(),
+            CapabilityAuth::Bearer
+        );
+        assert_eq!(
+            CapabilityFormat::CohereJinaRerank.auth(),
+            CapabilityAuth::Bearer
+        );
+    }
+
+    /// The two serving surfaces must stay disjoint, or a rerank call could reach an
+    /// embedding engine.
+    #[test]
+    fn google_serves_embeddings_and_not_rerank() {
+        assert!(CapabilityFormat::GoogleEmbedContent.serves_embeddings());
+        assert!(!CapabilityFormat::GoogleEmbedContent.serves_rerank());
+        assert!(!CapabilityFormat::CohereJinaRerank.serves_embeddings());
     }
 }

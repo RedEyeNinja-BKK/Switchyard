@@ -58,7 +58,7 @@ pub(crate) async fn embeddings(
     let Some(capability) = state.runner.capability(&request.model) else {
         return unknown_capability(&request.model, &state.capability_ids);
     };
-    if capability.format != CapabilityFormat::OpenaiEmbeddings {
+    if !capability.format.serves_embeddings() {
         return contract_error(
             StatusCode::BAD_REQUEST,
             format!("capability {} does not serve embeddings", capability.id),
@@ -81,6 +81,12 @@ pub(crate) async fn embeddings(
                 capability.id
             ),
         );
+    }
+
+    // Google has no bulk embed form, so a batch is a fan-out of single-content calls and
+    // the surface has to assemble the answer. Everything else forwards the batch whole.
+    if capability.format == CapabilityFormat::GoogleEmbedContent {
+        return google_embed(&state, capability, &request.input).await;
     }
 
     // The engine names its own model; the public capability id is a Switchyard id and
@@ -193,6 +199,148 @@ pub(crate) async fn rerank(
     forward(&state, capability, payload, None).await
 }
 
+/// Embeds a batch through Google's single-content endpoint.
+///
+/// Google has no bulk form, so the batch is a bounded fan-out of one call per input. The
+/// caller still sends and receives one OpenAI-shaped batch: a caller should not need a
+/// second client path because one engine answers one content at a time, and `index` is
+/// where that difference must not leak.
+///
+/// A failed input fails the whole batch. Returning the vectors that succeeded would hand
+/// back a shorter result set whose indexes no longer line up with the caller's inputs.
+async fn google_embed(
+    state: &ServerState,
+    capability: &ResolvedCapability,
+    input: &[String],
+) -> Response {
+    for (index, text) in input.iter().enumerate() {
+        if text.is_empty() {
+            return contract_error(StatusCode::BAD_REQUEST, format!("input[{index}] is empty"));
+        }
+        // A token's surface form is at least one byte, so a byte count is an upper bound
+        // on the token count. Bounding bytes therefore guarantees the model's token limit
+        // is never exceeded. It is conservative: text that would have fitted may be
+        // refused, which is the only sound direction when the tokenizer is not local.
+        if let Some(limit) = capability.max_input_tokens
+            && text.len() > limit as usize
+        {
+            return contract_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "input[{index}] is {} bytes but capability {} accepts at most {limit} \
+                     (its input-token limit)",
+                    text.len(),
+                    capability.id
+                ),
+            );
+        }
+    }
+
+    let client = match state.capability_http(capability.timeout_seconds) {
+        Ok(client) => client,
+        Err(message) => return contract_error(StatusCode::BAD_GATEWAY, message),
+    };
+    let credential = match &capability.api_key_env {
+        None => None,
+        Some(variable) => match std::env::var(variable) {
+            Ok(value) if !value.trim().is_empty() => Some(value),
+            _ => return upstream_contract_error(capability, "credential unavailable"),
+        },
+    };
+
+    let mut vectors = Vec::with_capacity(input.len());
+    for (index, text) in input.iter().enumerate() {
+        let mut payload = json!({
+            "model": format!("models/{}", capability.model),
+            "content": {"parts": [{"text": text}]},
+        });
+        if let Some(task_type) = &capability.task_type {
+            payload["task_type"] = json!(task_type);
+        }
+        let mut builder = client.post(&capability.url).json(&payload);
+        if let Some(credential) = &credential {
+            // Google reads its key from this header; a bearer token here is an
+            // authentication failure that looks like a bad credential.
+            builder = builder.header("x-goog-api-key", credential);
+        }
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return contract_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("capability {} is unreachable: {}", capability.id, error),
+                );
+            }
+        };
+        let status =
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let body = response.bytes().await.unwrap_or_default();
+        if !status.is_success() {
+            // The engine's own status and message travel back: a 429 stays a 429, and the
+            // caller learns which input it was, which the engine cannot say.
+            return error_body(
+                status,
+                format!(
+                    "capability {} input[{index}] failed: {}",
+                    capability.id,
+                    String::from_utf8_lossy(&body)
+                ),
+                "upstream_error",
+            );
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+            return upstream_contract_error(capability, "upstream returned non-JSON success");
+        };
+        let Some(values) = value["embedding"]["values"].as_array() else {
+            return upstream_contract_error(capability, "embedding.values missing");
+        };
+        if let Some(dimensions) = capability.dimensions
+            && values.len() != dimensions as usize
+        {
+            return upstream_contract_error(capability, "embedding dimension mismatch");
+        }
+        if values
+            .iter()
+            .any(|number| number.as_f64().is_none_or(|n| !n.is_finite()))
+        {
+            return upstream_contract_error(capability, "embedding value is not a finite number");
+        }
+        vectors.push(Value::Array(values.clone()));
+    }
+
+    let data: Vec<Value> = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            json!({"object": "embedding", "index": index, "embedding": embedding})
+        })
+        .collect();
+    let body = json!({"object": "list", "model": capability.model, "data": data});
+    (StatusCode::OK, verified_headers(capability), Json(body)).into_response()
+}
+
+/// The headers that attest to a verified successful embedding response.
+///
+/// They are only ever attached to vectors this surface actually received and checked, so
+/// an upstream error cannot carry a contract the caller never got.
+fn verified_headers(capability: &ResolvedCapability) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(contract) = &capability.contract {
+        headers.insert(
+            "x-switchyard-embedding-contract",
+            contract
+                .parse()
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
+        );
+    }
+    if let Some(dimensions) = capability.dimensions
+        && let Ok(value) = dimensions.to_string().parse()
+    {
+        headers.insert("x-switchyard-embedding-dimensions", value);
+    }
+    headers
+}
+
 /// Forwards a capability request to its engine and returns the engine's own response.
 ///
 /// The response is passed through rather than reshaped: embedding vectors and rerank
@@ -244,22 +392,11 @@ async fn forward(
             }
             // The contract travels back only with verified successful vectors;
             // on an upstream error it must never attest to an absent embedding.
-            let mut headers = axum::http::HeaderMap::new();
-            if status.is_success() {
-                if let Some(contract) = &capability.contract {
-                    headers.insert(
-                        "x-switchyard-embedding-contract",
-                        contract
-                            .parse()
-                            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown")),
-                    );
-                }
-                if let Some(dimensions) = capability.dimensions
-                    && let Ok(value) = dimensions.to_string().parse()
-                {
-                    headers.insert("x-switchyard-embedding-dimensions", value);
-                }
-            }
+            let headers = if status.is_success() {
+                verified_headers(capability)
+            } else {
+                axum::http::HeaderMap::new()
+            };
             (status, headers, body).into_response()
         }
         Err(error) => contract_error(

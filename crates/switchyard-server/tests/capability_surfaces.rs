@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use switchyard_runner::Runner;
 use tower::ServiceExt;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn serve(config: &str) -> axum::Router {
@@ -636,5 +636,171 @@ async fn a_missing_capability_credential_fails_closed_without_an_upstream_call()
         engine.received_requests().await.unwrap_or_default().len(),
         0,
         "an unauthenticated call must not be attempted"
+    );
+}
+
+/// A Google embedding capability. Google has no bulk embed endpoint: one content per
+/// request, named in the path, authenticated with `x-goog-api-key`.
+fn google_config(engine: &str, max_input_tokens: u32) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.google]
+format = "google_embed_content"
+base_url = "{engine}"
+model = "gemini-embedding-001"
+task_type = "RETRIEVAL_DOCUMENT"
+api_key_env = "SWITCHYARD_TEST_GOOGLE_KEY"
+
+[capabilities.gem]
+id = "switchyard-embedding-google"
+target = "google"
+contract = "google-embedding-001:v1"
+dimensions = 3
+normalization = "L2"
+max_batch = 8
+max_input_tokens = {max_input_tokens}
+"#
+    )
+}
+
+/// A caller sends one OpenAI-shaped batch; Google answers one content at a time. The
+/// surface must therefore fan out and reassemble in input order, or the caller receives
+/// vectors whose `index` no longer means what it says.
+#[tokio::test]
+async fn a_google_embedding_capability_assembles_one_response_from_one_call_per_input() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    for (text, values) in [
+        ("alpha", json!([0.1, 0.2, 0.3])),
+        ("beta", json!([0.4, 0.5, 0.6])),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-001:embedContent"))
+            .and(header("x-goog-api-key", "test-key"))
+            .and(body_partial_json(json!({
+                "model": "models/gemini-embedding-001",
+                "content": {"parts": [{"text": text}]},
+                "task_type": "RETRIEVAL_DOCUMENT",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"embedding": {"values": values}})),
+            )
+            .expect(1)
+            .mount(&engine)
+            .await;
+    }
+
+    let router = serve(&google_config(&engine.uri(), 2048)).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let value: Value = serde_json::from_slice(&body).expect("response is json");
+    assert_eq!(value["data"][0]["index"], json!(0));
+    assert_eq!(value["data"][0]["embedding"], json!([0.1, 0.2, 0.3]));
+    assert_eq!(value["data"][1]["index"], json!(1));
+    assert_eq!(value["data"][1]["embedding"], json!([0.4, 0.5, 0.6]));
+    assert_eq!(
+        headers
+            .get("x-switchyard-embedding-contract")
+            .and_then(|value| value.to_str().ok()),
+        Some("google-embedding-001:v1"),
+        "the response must say which space produced the vectors"
+    );
+}
+
+/// A token count cannot be computed here, but a token never covers less than one byte,
+/// so bytes bound tokens from above. The refusal must happen before the wire, and must
+/// say which input and which limit, because "too long" is not actionable.
+#[tokio::test]
+async fn a_google_capability_refuses_an_input_past_its_token_limit_without_calling_the_engine() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    // Nothing is mounted: a leaked call would answer 404 and be visible below.
+    let router = serve(&google_config(&engine.uri(), 16)).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google", "input": ["ok", "a".repeat(17)]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("input[1]"), "{text}");
+    assert!(text.contains("16"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "an over-limit input must not reach the engine"
+    );
+}
+
+/// Returning the vectors that succeeded would hand back a shorter, silently re-indexed
+/// batch. A partial batch is a failed batch, and it must not carry the contract header,
+/// which would otherwise attest to a vector space the caller did not fully receive.
+#[tokio::test]
+async fn a_google_capability_returns_no_vectors_when_one_input_fails() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"content": {"parts": [{"text": "alpha"}]}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": [0.1, 0.2, 0.3]}})),
+        )
+        .mount(&engine)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"content": {"parts": [{"text": "beta"}]}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(json!({"error": {"message": "backend exploded"}})),
+        )
+        .mount(&engine)
+        .await;
+
+    let router = serve(&google_config(&engine.uri(), 2048)).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("input[1]"), "{text}");
+    assert!(text.contains("backend exploded"), "{text}");
+    assert!(
+        !text.contains("\"embedding\""),
+        "a failed batch must not carry vectors: {text}"
+    );
+    assert!(
+        headers.get("x-switchyard-embedding-contract").is_none(),
+        "the contract must not be attested on a failed batch"
     );
 }

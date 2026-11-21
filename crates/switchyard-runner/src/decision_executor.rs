@@ -202,27 +202,30 @@ async fn send(candidate: &DecisionCandidate, body: Value) -> Result<Value, Decis
             reason: "client_unavailable",
             retryable: false,
         })?;
-    let response = client
-        .post(&candidate.url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| {
-            // A transport failure or deadline is exactly the evidence that the next
-            // backend should be tried.
-            let retryable = error.is_timeout() || error.is_connect() || error.is_request();
-            DecisionFailure::Serving {
-                reason: if error.is_timeout() {
-                    "timeout"
-                } else if error.is_connect() {
-                    "connect"
-                } else {
-                    "transport"
-                },
-                retryable,
-            }
-        })?;
+    // Google reads its key from `x-goog-api-key`; every other decision backend takes a
+    // bearer token. Sending the wrong one is an authentication failure that looks like a
+    // credential problem, so the header is chosen from the transport rather than guessed.
+    let shell = client.post(&candidate.url);
+    let shell = if candidate.transport.uses_google_api_key() {
+        shell.header("x-goog-api-key", api_key)
+    } else {
+        shell.bearer_auth(api_key)
+    };
+    let response = shell.json(&body).send().await.map_err(|error| {
+        // A transport failure or deadline is exactly the evidence that the next
+        // backend should be tried.
+        let retryable = error.is_timeout() || error.is_connect() || error.is_request();
+        DecisionFailure::Serving {
+            reason: if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            },
+            retryable,
+        }
+    })?;
     let status = response.status();
     let payload = response
         .json::<Value>()

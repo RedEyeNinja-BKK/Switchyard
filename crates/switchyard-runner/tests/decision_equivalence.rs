@@ -20,7 +20,7 @@ use switchyard_runner::decision_executor::{
 use switchyard_runner::decision_transport::{
     DecisionTransport, StateForms, SupportedTypes, parse_response,
 };
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn noul_request(state: Value) -> DecisionRequest {
@@ -677,4 +677,140 @@ targets = ["z-span", "a-local"]
         .await
         .expect("served");
     assert_eq!(outcome.served_by, "z-span");
+}
+
+/// A Google decision backend must be called the way Google documents it: the key in
+/// `x-goog-api-key` (not a bearer token), the shared input under `input`, and the yes/no
+/// criteria keys spelled out. Asserted on the received request, because a decoder that is
+/// happy with a body Google would reject proves nothing.
+#[tokio::test]
+async fn a_google_decision_call_uses_googles_wire() {
+    const KEY: &str = "GOOGLE_DECISION_TEST_KEY";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/decisions"))
+        .and(header("x-goog-api-key", KEY))
+        .and(body_partial_json(json!({
+            "model": "gemini-decision-1",
+            "input": "plain",
+            "questions": {
+                "risk": {
+                    "type": "noul",
+                    "criteria": {"true_description": "yes", "false_description": "no"}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.87, "confidence": 0.93}},
+            "usage": {
+                "total_input_tokens": 12,
+                "input_tokens_by_modality": [{"modality": "text", "tokens": 12}],
+                "total_output_tokens": 0,
+                "total_tokens": 12
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let resolver = DecisionResolver {
+        candidates: vec![DecisionCandidate {
+            name: "google-decision".into(),
+            model: "gemini-decision-1".into(),
+            transport: DecisionTransport::GoogleDecisions,
+            url: format!("{}/v1beta/decisions", server.uri()),
+            api_key: Some(KEY.into()),
+            api_key_env: Some("SWITCHYARD_GEMINI_API_KEY".into()),
+            supported_types: SupportedTypes::ALL,
+            state_forms: StateForms::ALL,
+        }],
+    };
+    let outcome = resolve_and_serve(&resolver, &noul_request(json!("plain")))
+        .await
+        .expect("the google backend answers");
+    assert_eq!(outcome.served_by, "google-decision");
+    assert!(
+        matches!(
+            outcome.response.answers["risk"].value,
+            DecisionValue::Boolean(_)
+        ),
+        "a noul answer decodes to a boolean estimate"
+    );
+
+    let requests = server.received_requests().await.expect("requests recorded");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "a bearer token is not how Google authenticates this call"
+    );
+}
+
+/// The Google transport must be reachable from configuration by its serde name, and the
+/// resolver it produces must carry the Google path and authentication. A transport that
+/// only exists in code is not a capability.
+#[tokio::test]
+async fn a_google_decision_target_loads_from_configuration() {
+    const KEY: &str = "TEST_GOOGLE_DECISION_KEY";
+    const VALUE: &str = "configured-value";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/decisions"))
+        .and(header("x-goog-api-key", VALUE))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {"risk": {"type": "noul", "noul": 0.42, "confidence": 0.8}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "google"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[targets.gemini-decision]
+id = "gemini-decision-1"
+llm_client = "google"
+decision_transport = "google_decisions"
+decision_base_url = "{remote}"
+decision_api_key_env = "{KEY}"
+
+[decision_lanes.default]
+targets = ["gemini-decision"]
+"#,
+        remote = server.uri()
+    );
+    unsafe { std::env::set_var(KEY, VALUE) };
+    let runner = Runner::from_toml(&config).expect("deployment builds");
+    let request = noul_request(json!("plain"));
+    let lane = runner
+        .lane_for_request(&request)
+        .expect("the configured lane serves the request");
+    assert_eq!(lane.resolver.candidates.len(), 1);
+    assert_eq!(
+        lane.resolver.candidates[0].transport,
+        DecisionTransport::GoogleDecisions
+    );
+    assert_eq!(
+        lane.resolver.candidates[0].url,
+        format!("{}/v1beta/decisions", server.uri()),
+        "the transport supplies its own path when the target names none"
+    );
+
+    let outcome = resolve_and_serve(&lane.resolver, &request)
+        .await
+        .expect("served");
+    assert_eq!(outcome.served_by, "gemini-decision");
 }

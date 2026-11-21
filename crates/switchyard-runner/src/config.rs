@@ -917,10 +917,17 @@ impl DeploymentConfig {
             .with_fallback_url(fallback_base_url)
             .with_provider_api_keys(provider_api_keys)
             .with_deployment_facts(facts)
-            .with_capabilities(capability::resolve(&capability::CapabilityDeployment {
-                clients: self.capability_clients.clone(),
-                capabilities: self.capabilities.clone(),
-            }));
+            .with_capabilities(
+                capability::resolve_with_budget(
+                    &capability::CapabilityDeployment {
+                        clients: self.capability_clients.clone(),
+                        capabilities: self.capabilities.clone(),
+                    },
+                    Some(&governor),
+                    self.quota.as_ref().map(|quota| quota.state_dir.as_path()),
+                )
+                .map_err(RunnerError::configuration)?,
+            );
         self.validate_decision_lanes()?;
         // Composites are registered as named routes, so lookup is uniform: a caller
         // resolving a route cannot tell whether it is a leaf or a composite.

@@ -13,8 +13,22 @@
 //! id travels with the client and is reported to callers rather than inferred.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 
 use serde::Deserialize;
+use switchyard_llm_client::{
+    DailyRequestAllowance, GovernorKey, PacedQuota, QuotaGovernor, WindowLimits, allowance_path,
+};
+
+/// Widest vector `gemini-embedding-2` can produce.
+pub const GEMINI_EMBEDDING_V2_MAX_DIMENSIONS: u32 = 3072;
+
+/// Narrowest vector `gemini-embedding-2` can produce.
+pub const GEMINI_EMBEDDING_V2_MIN_DIMENSIONS: u32 = 128;
+
+/// Input-token limit `gemini-embedding-2` publishes.
+pub const GEMINI_EMBEDDING_V2_INPUT_TOKENS: u32 = 8192;
 
 /// One specialized capability endpoint.
 #[derive(Clone, Debug, Deserialize)]
@@ -42,6 +56,29 @@ pub struct CapabilityClientConfig {
     /// change with it.
     #[serde(default)]
     pub task_type: Option<String>,
+    /// Provider-side project whose counters this client's calls are charged to.
+    ///
+    /// The provider caps requests per project and physical model, so two clients that name
+    /// one project and one model are one budget. Unset means this client is its own group,
+    /// which keeps a single-client deployment unchanged.
+    #[serde(default)]
+    pub quota_group: Option<String>,
+    /// Requests permitted per provider day for this client's physical model.
+    ///
+    /// Enforced as one counter per (quota group, model), persisted under `[quota]
+    /// state_dir`, so every capability and alias of the model draws on one budget. A
+    /// bounded fan-out spends one unit per physical call, not one per caller request.
+    #[serde(default)]
+    pub daily_request_limit: Option<u64>,
+    /// Physical calls permitted per rolling minute for this client's model.
+    #[serde(default)]
+    pub requests_per_minute: Option<u64>,
+    /// Input tokens permitted per rolling minute for this client's model.
+    ///
+    /// An embedding call reserves its input's byte count, which is an upper bound on its
+    /// token count, so the window is never over-spent by an estimate that undercounts.
+    #[serde(default)]
+    pub input_tokens_per_minute: Option<u64>,
 }
 
 impl CapabilityClientConfig {
@@ -73,9 +110,20 @@ pub enum CapabilityFormat {
     CohereJinaRerank,
     /// Google `POST /v1beta/models/{model}:embedContent`.
     ///
-    /// One content per request: the endpoint has no bulk form, so a batch is a bounded
-    /// fan-out of single-input calls rather than one wide request.
+    /// This adapter sends one content per request. The synchronous
+    /// `:batchEmbedContents` form also exists and takes a `requests` array, but its
+    /// availability on a Free-tier project and its response shape are not qualified here,
+    /// so a caller's batch is a bounded fan-out of single-content calls rather than one
+    /// wide request. "No bulk form" is not a statement about Google's API.
     GoogleEmbedContent,
+    /// Google `:embedContent` as `gemini-embedding-2` speaks it.
+    ///
+    /// A different codec, not a version bump: output width is a request field
+    /// (`output_dimensionality`, 128..=3072) rather than a fixed property of the model,
+    /// `task_type` is unsupported so a task has to travel as a text prefix, the input limit
+    /// is 8,192 tokens, and vectors below full width are auto-normalised by the model.
+    /// Vectors from this dialect are not comparable with `google_embed_content` output.
+    GoogleEmbedContentV2,
 }
 
 /// The header a capability credential is presented under.
@@ -90,7 +138,10 @@ pub enum CapabilityAuth {
 impl CapabilityFormat {
     /// Whether this format produces embedding vectors.
     pub fn serves_embeddings(self) -> bool {
-        matches!(self, Self::OpenaiEmbeddings | Self::GoogleEmbedContent)
+        matches!(
+            self,
+            Self::OpenaiEmbeddings | Self::GoogleEmbedContent | Self::GoogleEmbedContentV2
+        )
     }
 
     /// Whether this format produces rerank scores.
@@ -105,7 +156,7 @@ impl CapabilityFormat {
     /// like a bad credential.
     pub fn auth(self) -> CapabilityAuth {
         match self {
-            Self::GoogleEmbedContent => CapabilityAuth::GoogleApiKey,
+            Self::GoogleEmbedContent | Self::GoogleEmbedContentV2 => CapabilityAuth::GoogleApiKey,
             Self::OpenaiEmbeddings | Self::CohereJinaRerank => CapabilityAuth::Bearer,
         }
     }
@@ -119,6 +170,7 @@ impl CapabilityFormat {
             Self::OpenaiEmbeddings => "/v1/embeddings".to_string(),
             Self::CohereJinaRerank => "/v1/rerank".to_string(),
             Self::GoogleEmbedContent => format!("/v1beta/models/{model}:embedContent"),
+            Self::GoogleEmbedContentV2 => format!("/v1beta/models/{model}:embedContent"),
         }
     }
 }
@@ -145,8 +197,20 @@ pub struct CapabilityConfig {
     #[serde(default)]
     pub normalization: Option<String>,
     /// Largest batch one request may carry.
+    ///
+    /// For a Google embedding capability this is a physical-call budget, not a payload
+    /// limit: one caller batch becomes this many upstream requests at most.
     #[serde(default)]
     pub max_batch: Option<u32>,
+    /// Instruction prefix prepended to every input, for a task-specific space.
+    ///
+    /// `gemini-embedding-2` has no `task_type` field, so a retrieval task travels as text
+    /// in front of the input. Because the prefix changes the vectors, it is part of the
+    /// value space and must be declared here — beside the contract it belongs to — rather
+    /// than chosen per request. The value is used verbatim: no separator is invented,
+    /// so the operator writes the exact prefix the model's documentation prescribes.
+    #[serde(default)]
+    pub task_prefix: Option<String>,
     /// Largest candidate set one rerank request may carry.
     #[serde(default)]
     pub max_candidates: Option<u32>,
@@ -166,6 +230,15 @@ pub struct CapabilityConfig {
     /// quantity that is provably at least as large as the token count.
     #[serde(default)]
     pub max_input_tokens: Option<u32>,
+    /// Evidence that keeps this capability out of dispatch, quoted from the provider.
+    ///
+    /// Present means held: the declaration, its contract and its limits are kept and
+    /// validated, but the capability is not resolved, so no caller can name it and no
+    /// request can reach the engine. A held capability is inventory, not a fallback — the
+    /// same rule a held target follows, for the same reason: quietly serving something else
+    /// would hand back vectors from a space nobody asked for.
+    #[serde(default)]
+    pub held: Option<String>,
 }
 
 /// Configured capability endpoints and the capabilities that name them.
@@ -185,6 +258,12 @@ impl CapabilityDeployment {
     pub fn validate(&self) -> Result<(), String> {
         for (name, capability) in &self.capabilities {
             let client_name = &capability.target;
+            if capability.held.as_deref().is_some_and(str::is_empty) {
+                return Err(format!(
+                    "capability {name} declares an empty held reason; state the evidence that \
+                     keeps it out of dispatch, or omit the field to serve it"
+                ));
+            }
             let Some(client) = self.clients.get(client_name) else {
                 return Err(format!(
                     "capability {name} references unknown capability client {client_name}"
@@ -227,6 +306,57 @@ impl CapabilityDeployment {
                         ));
                     }
                 }
+                CapabilityFormat::GoogleEmbedContentV2 => {
+                    if capability.contract.is_none() {
+                        return Err(format!(
+                            "capability {name} serves an embedding endpoint and must declare contract, \
+                             because vectors from different engines are not comparable"
+                        ));
+                    }
+                    // This model's width is a request field, so the declaration is the
+                    // output_dimensionality actually sent. Outside the model's range the
+                    // engine would refuse every call, and a width the caller was promised
+                    // but never received is worse than a load failure.
+                    let Some(dimensions) = capability.dimensions else {
+                        return Err(format!(
+                            "capability {name} serves a gemini-embedding-2 endpoint and must declare \
+                             dimensions, which is the output_dimensionality sent with every call"
+                        ));
+                    };
+                    if !(GEMINI_EMBEDDING_V2_MIN_DIMENSIONS..=GEMINI_EMBEDDING_V2_MAX_DIMENSIONS)
+                        .contains(&dimensions)
+                    {
+                        return Err(format!(
+                            "capability {name} declares dimensions {dimensions}, outside the \
+                             {GEMINI_EMBEDDING_V2_MIN_DIMENSIONS}..={GEMINI_EMBEDDING_V2_MAX_DIMENSIONS} \
+                             range gemini-embedding-2 accepts"
+                        ));
+                    }
+                    // Vectors below full width are normalised by the model. Declaring it
+                    // is how the surface knows to check the norm it actually receives;
+                    // leaving it undeclared would make the value space a claim nobody
+                    // verified.
+                    if capability.normalization.is_none() {
+                        return Err(format!(
+                            "capability {name} serves a gemini-embedding-2 endpoint and must declare \
+                             normalization, so the received vectors can be checked against it"
+                        ));
+                    }
+                    let Some(max_input_tokens) = capability.max_input_tokens else {
+                        return Err(format!(
+                            "capability {name} serves a gemini-embedding-2 endpoint and must declare \
+                             max_input_tokens, because an input past the model's limit must be refused \
+                             rather than truncated"
+                        ));
+                    };
+                    if max_input_tokens > GEMINI_EMBEDDING_V2_INPUT_TOKENS {
+                        return Err(format!(
+                            "capability {name} declares max_input_tokens {max_input_tokens}, above the \
+                             {GEMINI_EMBEDDING_V2_INPUT_TOKENS}-token limit of gemini-embedding-2; a \
+                             declared limit above the model's own promises input the engine will refuse"
+                        ));
+                    }
+                }
                 CapabilityFormat::CohereJinaRerank => {
                     if capability.max_candidates.is_none() {
                         return Err(format!(
@@ -244,14 +374,58 @@ impl CapabilityDeployment {
                 }
             }
 
+            // A task prefix is text the model reads, so it is configuration for one wire
+            // only. On any other capability it would silently change nothing while
+            // appearing to define the space.
+            if capability.task_prefix.is_some()
+                && client.format != CapabilityFormat::GoogleEmbedContentV2
+            {
+                return Err(format!(
+                    "capability {name} declares task_prefix, which only google_embed_content_v2 \
+                     consumes; this client's wire has no prefix slot, so the value would be inert"
+                ));
+            }
+            if capability.task_prefix.as_deref().is_some_and(str::is_empty) {
+                return Err(format!(
+                    "capability {name} declares an empty task_prefix; state the exact instruction \
+                     text, or omit the field for the model's generic space"
+                ));
+            }
+
             // A task type is a Google wire field. Declaring it on a client that has no
             // such field would read as a configured behaviour the deployment does not
             // have, so it is refused instead of ignored.
+            // The embedding-2 wire has no task_type: the task travels in the text. A
+            // declaration here would be sent nowhere and would read as a configured
+            // behaviour the deployment does not have.
+            if client.task_type.is_some() && client.format == CapabilityFormat::GoogleEmbedContentV2
+            {
+                return Err(format!(
+                    "capability client {client_name} declares task_type, which gemini-embedding-2 \
+                     does not accept; declare the task as task_prefix on the capability instead"
+                ));
+            }
             if client.task_type.is_some() && client.format != CapabilityFormat::GoogleEmbedContent {
                 return Err(format!(
                     "capability client {client_name} declares task_type, which only \
                      google_embed_content sends"
                 ));
+            }
+
+            // A zero budget is a refusal of every call, which is never what an operator
+            // meant to write. Stated once, at load, rather than discovered as a permanent
+            // 429 on the first request.
+            for (field, value) in [
+                ("daily_request_limit", client.daily_request_limit),
+                ("requests_per_minute", client.requests_per_minute),
+                ("input_tokens_per_minute", client.input_tokens_per_minute),
+            ] {
+                if value == Some(0) {
+                    return Err(format!(
+                        "capability client {client_name} declares {field} = 0, which would refuse \
+                         every call"
+                    ));
+                }
             }
         }
 
@@ -427,6 +601,10 @@ dimensions = 1024
             api_key_env: None,
             timeout_seconds: None,
             task_type: None,
+            quota_group: None,
+            daily_request_limit: None,
+            requests_per_minute: None,
+            input_tokens_per_minute: None,
         };
         assert_eq!(client.url("/rerank"), "https://service.test/v1/rerank");
 
@@ -476,42 +654,153 @@ pub struct ResolvedCapability {
     pub max_query_chars: Option<u32>,
     /// Task type sent as the provider's own field, for Google embedding.
     pub task_type: Option<String>,
+    /// Instruction text prepended to every input, for a prefix-defined space.
+    pub task_prefix: Option<String>,
     /// Provider-published input-token limit of one embedding input.
     pub max_input_tokens: Option<u32>,
+    /// The budgets this capability's physical calls are charged to.
+    ///
+    /// `None` when the client declares none, which is the unchanged behaviour of a
+    /// deployment that does not budget its capability calls.
+    pub budget: Option<Arc<CapabilityBudget>>,
+}
+
+/// The budgets one capability's physical calls draw on.
+///
+/// Both are keyed by the provider's own identity — quota group and physical model — not by
+/// the caller-visible capability id, so two capabilities over one model share one counter.
+/// The feature axis keeps an embedding call from spending the minute window a chat
+/// generation on the same model would use: the provider counts them separately, and a
+/// fan-out of N physical calls must not silently consume N chat slots.
+#[derive(Debug)]
+pub struct CapabilityBudget {
+    /// Persistent per-provider-day request counter, when a daily limit is declared.
+    pub allowance: Option<Arc<DailyRequestAllowance>>,
+    /// Rolling per-minute request and input-token window, when it declares either.
+    pub pacing: Option<Arc<PacedQuota>>,
 }
 
 /// Resolves configuration into the serving form, so dispatch never re-reads config.
+///
+/// Unbudgeted resolution: the caller declares no limits, so dispatch is not paced. Used by
+/// tests and by any embedding of the runner that does not build a deployment.
 pub fn resolve(deployment: &CapabilityDeployment) -> BTreeMap<String, ResolvedCapability> {
-    deployment
-        .capabilities
-        .iter()
-        .filter_map(|(name, capability)| {
-            let client = deployment.clients.get(&capability.target)?;
-            let default_path = client.format.default_path(&client.model);
-            Some((
-                capability.id.clone(),
-                ResolvedCapability {
-                    id: capability.id.clone(),
-                    client: name.clone(),
-                    format: client.format,
-                    url: client.url(&default_path),
-                    model: client.model.clone(),
-                    api_key_env: client.api_key_env.clone(),
-                    timeout_seconds: client.timeout_seconds,
-                    contract: capability.contract.clone(),
-                    dimensions: capability.dimensions,
-                    normalization: capability.normalization.clone(),
-                    max_batch: capability.max_batch,
-                    max_candidates: capability.max_candidates,
-                    top_n: capability.top_n,
-                    max_doc_chars: capability.max_doc_chars,
-                    max_query_chars: capability.max_query_chars,
-                    task_type: client.task_type.clone(),
-                    max_input_tokens: capability.max_input_tokens,
-                },
-            ))
-        })
-        .collect()
+    resolve_with_budget(deployment, None, None)
+        .expect("a deployment that declares no capability budget cannot fail to resolve")
+}
+
+/// Resolves configuration into the serving form and binds each capability's declared
+/// budget.
+///
+/// `governor` is the deployment's one minute-window governor, shared with the completion
+/// routes so an embedding call and a generation on the same project draw on the same
+/// ledger. `quota_state_dir` is where a daily counter is persisted; a client that declares
+/// `daily_request_limit` without it is refused rather than left uncounted, because a
+/// budget that is never written cannot be enforced.
+pub fn resolve_with_budget(
+    deployment: &CapabilityDeployment,
+    governor: Option<&Arc<QuotaGovernor>>,
+    quota_state_dir: Option<&Path>,
+) -> Result<BTreeMap<String, ResolvedCapability>, String> {
+    let mut resolved = BTreeMap::new();
+    for (name, capability) in &deployment.capabilities {
+        // A held capability keeps its declaration but leaves dispatch entirely, so its id
+        // cannot be named by a caller and cannot appear in discovery.
+        if capability.held.is_some() {
+            continue;
+        }
+        let Some(client) = deployment.clients.get(&capability.target) else {
+            // An unresolvable capability is absent rather than empty: a surface that
+            // reported an empty capability would answer for a space it cannot serve.
+            continue;
+        };
+        let default_path = client.format.default_path(&client.model);
+        let budget = capability_budget(name, client, governor, quota_state_dir)?;
+        resolved.insert(
+            capability.id.clone(),
+            ResolvedCapability {
+                id: capability.id.clone(),
+                client: name.clone(),
+                format: client.format,
+                url: client.url(&default_path),
+                model: client.model.clone(),
+                api_key_env: client.api_key_env.clone(),
+                timeout_seconds: client.timeout_seconds,
+                contract: capability.contract.clone(),
+                dimensions: capability.dimensions,
+                normalization: capability.normalization.clone(),
+                max_batch: capability.max_batch,
+                max_candidates: capability.max_candidates,
+                top_n: capability.top_n,
+                max_doc_chars: capability.max_doc_chars,
+                max_query_chars: capability.max_query_chars,
+                task_type: client.task_type.clone(),
+                task_prefix: capability.task_prefix.clone(),
+                max_input_tokens: capability.max_input_tokens,
+                budget,
+            },
+        );
+    }
+    Ok(resolved)
+}
+
+/// The budget one capability draws on, from its client's declarations.
+fn capability_budget(
+    capability_name: &str,
+    client: &CapabilityClientConfig,
+    governor: Option<&Arc<QuotaGovernor>>,
+    quota_state_dir: Option<&Path>,
+) -> Result<Option<Arc<CapabilityBudget>>, String> {
+    let group = client
+        .quota_group
+        .clone()
+        .unwrap_or_else(|| capability_name.to_string());
+    let allowance = match client.daily_request_limit {
+        None => None,
+        Some(limit) => {
+            let state_dir = quota_state_dir.ok_or_else(|| {
+                format!(
+                    "capability {capability_name} declares daily_request_limit but the deployment \
+                     configures no [quota] state_dir; a daily budget has to be counted to be \
+                     enforced"
+                )
+            })?;
+            Some(Arc::new(DailyRequestAllowance::new(
+                group.clone(),
+                switchyard_protocol::ModelId::new(client.model.clone()),
+                limit,
+                allowance_path(state_dir, &group, &client.model),
+            )))
+        }
+    };
+    let limits = WindowLimits {
+        requests_per_minute: client.requests_per_minute,
+        input_tokens_per_minute: client.input_tokens_per_minute,
+    };
+    let pacing = if limits.is_unlimited() {
+        None
+    } else {
+        let governor = governor.ok_or_else(|| {
+            format!(
+                "capability {capability_name} declares a per-minute budget, which needs the \
+                 deployment's quota governor"
+            )
+        })?;
+        Some(Arc::new(PacedQuota::new(
+            Arc::clone(governor),
+            GovernorKey::new(
+                group,
+                switchyard_protocol::ModelId::new(client.model.clone()),
+                "embed",
+            ),
+            limits,
+            switchyard_llm_client::AdmissionMargin::NONE,
+        )))
+    };
+    if allowance.is_none() && pacing.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(CapabilityBudget { allowance, pacing })))
 }
 
 #[cfg(test)]
@@ -737,5 +1026,280 @@ max_input_tokens = 2048
         assert!(CapabilityFormat::GoogleEmbedContent.serves_embeddings());
         assert!(!CapabilityFormat::GoogleEmbedContent.serves_rerank());
         assert!(!CapabilityFormat::CohereJinaRerank.serves_embeddings());
+    }
+}
+
+#[cfg(test)]
+mod gemini_embedding_2_tests {
+    use super::*;
+
+    const SOURCE: &str = r#"
+[clients.google2]
+format = "google_embed_content_v2"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-embedding-2"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+
+[capabilities.gem2]
+id = "switchyard-embedding-google2"
+target = "google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 768
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+task_prefix = "task: search result | query: "
+"#;
+
+    fn validated(source: &str) -> CapabilityDeployment {
+        let deployment: CapabilityDeployment = toml::from_str(source).expect("fixture parses");
+        deployment.validate().expect("fixture is valid");
+        deployment
+    }
+
+    /// Width is a request field on this model, so a declaration outside the model's range
+    /// would be sent and refused on every call.
+    #[test]
+    fn a_width_outside_the_model_range_is_refused() {
+        for width in ["4", "4096"] {
+            let source = SOURCE.replace("dimensions = 768", &format!("dimensions = {width}"));
+            let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
+            assert!(
+                deployment
+                    .validate()
+                    .expect_err("an out-of-range width must not load")
+                    .contains("outside")
+            );
+        }
+    }
+
+    /// The normalization is checked against the vectors actually received, so it has to be
+    /// declared; and the input limit cannot exceed the model's own.
+    #[test]
+    fn the_normalization_and_input_limit_are_required_and_bounded() {
+        let no_normalization = SOURCE.replace("normalization = \"L2\"\n", "");
+        let deployment: CapabilityDeployment = toml::from_str(&no_normalization).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("undeclared normalization must not load")
+                .contains("normalization")
+        );
+
+        let above_model = SOURCE.replace("max_input_tokens = 8192", "max_input_tokens = 9000");
+        let deployment: CapabilityDeployment = toml::from_str(&above_model).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("a limit above the model's own must not load")
+                .contains("8192")
+        );
+    }
+
+    /// This model has no `task_type`, so a task travels as a prefix. Declaring the wrong one
+    /// of the two would describe a wire the deployment does not speak.
+    #[test]
+    fn the_task_travels_as_a_prefix_and_never_as_a_task_type() {
+        let with_task_type = SOURCE.replace(
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"",
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"\ntask_type = \"RETRIEVAL_DOCUMENT\"",
+        );
+        let deployment: CapabilityDeployment = toml::from_str(&with_task_type).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("task_type must be refused on this wire")
+                .contains("task_prefix")
+        );
+    }
+
+    /// A prefix on a wire with no prefix slot would change nothing while appearing to define
+    /// the space.
+    #[test]
+    fn a_prefix_is_refused_on_a_wire_that_has_no_prefix_slot() {
+        let source = SOURCE
+            .replace("google_embed_content_v2", "google_embed_content")
+            .replace(
+                "task_prefix = \"task: search result | query: \"\n",
+                "task_prefix = \"task: search result | query: \"\n",
+            );
+        let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("an inert prefix must not load")
+                .contains("task_prefix")
+        );
+    }
+
+    /// An empty prefix is a declaration with no content: either the generic space (omit it)
+    /// or the exact instruction text.
+    #[test]
+    fn an_empty_prefix_is_refused() {
+        let source = SOURCE.replace(
+            "task_prefix = \"task: search result | query: \"",
+            "task_prefix = \"\"",
+        );
+        let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("an empty prefix must not load")
+                .contains("empty task_prefix")
+        );
+    }
+
+    /// A zero budget refuses every call, which is never an intended configuration.
+    #[test]
+    fn a_zero_budget_is_refused() {
+        let source = SOURCE.replace(
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"",
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"\ndaily_request_limit = 0",
+        );
+        let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("a zero budget must not load")
+                .contains("refuse every call")
+        );
+    }
+
+    /// Dispatch must carry the prefix, the width as declared, and the model's own path.
+    #[test]
+    fn dispatch_carries_the_prefix_and_names_the_model_in_the_path() {
+        let resolved = resolve(&validated(SOURCE));
+        let capability = &resolved["switchyard-embedding-google2"];
+        assert_eq!(
+            capability.task_prefix.as_deref(),
+            Some("task: search result | query: ")
+        );
+        assert_eq!(capability.dimensions, Some(768));
+        assert_eq!(capability.task_type, None);
+        assert_eq!(
+            capability.url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent"
+        );
+        assert!(capability.budget.is_none(), "no limit was declared");
+    }
+
+    /// The counter is the provider's unit: project plus physical model. Two capabilities over
+    /// one model must therefore land on one file, not two.
+    #[test]
+    fn a_budget_is_keyed_by_quota_group_and_physical_model() {
+        let source = format!(
+            "{SOURCE}\n[capabilities.gem2b]\nid = \"switchyard-embedding-google2-b\"\ntarget = \
+             \"google2\"\ncontract = \"google-embedding-space:gemini-embedding-2-v1-b\"\n\
+             dimensions = 768\nnormalization = \"L2\"\nmax_input_tokens = 8192\n"
+        );
+
+        let limited = source.replace(
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"",
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"\nquota_group = \"google-free\"\n\
+             daily_request_limit = 20\nrequests_per_minute = 6",
+        );
+        let deployment = validated(&limited);
+        let governor = Arc::new(QuotaGovernor::new());
+        let state_dir = std::env::temp_dir().join(format!(
+            "switchyard-capability-budget-{}",
+            std::process::id()
+        ));
+        let resolved = resolve_with_budget(&deployment, Some(&governor), Some(state_dir.as_path()))
+            .expect("budgeted resolution");
+
+        let a = resolved["switchyard-embedding-google2"]
+            .budget
+            .as_ref()
+            .expect("first capability is budgeted");
+        let b = resolved["switchyard-embedding-google2-b"]
+            .budget
+            .as_ref()
+            .expect("second capability is budgeted");
+        let allowance_a = a.allowance.as_ref().expect("daily limit declared");
+        let allowance_b = b.allowance.as_ref().expect("daily limit declared");
+        assert_eq!(allowance_a.group(), "google-free");
+        assert_eq!(allowance_a.model().as_str(), "gemini-embedding-2");
+        assert_eq!(
+            allowance_a.limit(),
+            allowance_b.limit(),
+            "one model, one budget"
+        );
+        assert_eq!(
+            allowance_a.remaining(),
+            allowance_b.remaining(),
+            "both read the same counter"
+        );
+        let pacing = a.pacing.as_ref().expect("minute window declared");
+        assert_eq!(pacing.key().feature(), "embed");
+        assert_eq!(pacing.key().group(), "google-free");
+    }
+
+    /// A daily budget with nowhere to persist it would be uncountable, and uncounted caps are
+    /// not caps.
+    #[test]
+    fn a_daily_limit_without_a_state_dir_is_refused() {
+        let source = SOURCE.replace(
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"",
+            "api_key_env = \"SWITCHYARD_GEMINI_API_KEY\"\ndaily_request_limit = 20",
+        );
+        let deployment = validated(&source);
+        let governor = Arc::new(QuotaGovernor::new());
+        assert!(
+            resolve_with_budget(&deployment, Some(&governor), None)
+                .expect_err("uncountable budget must be refused")
+                .contains("state_dir")
+        );
+    }
+}
+
+#[cfg(test)]
+mod held_capability_tests {
+    use super::*;
+
+    const SOURCE: &str = r#"
+[clients.google2]
+format = "google_embed_content_v2"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-embedding-2"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+
+[capabilities.gem2]
+id = "gemini-embedding-2"
+target = "google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+held = "response format not yet qualified against the project key"
+"#;
+
+    /// Held keeps the declaration and its validation, and takes the capability out of the
+    /// serving form entirely: a surface that resolved it would answer for a space nobody
+    /// qualified.
+    #[test]
+    fn a_held_capability_is_validated_but_never_resolved() {
+        let deployment: CapabilityDeployment = toml::from_str(SOURCE).expect("fixture parses");
+        deployment
+            .validate()
+            .expect("a held capability is still checked");
+        assert!(resolve(&deployment).is_empty());
+    }
+
+    /// Omitting the field is the whole difference between held and serving, so an empty
+    /// value - which reads as held while saying nothing - is refused.
+    #[test]
+    fn an_empty_held_reason_is_refused() {
+        let source = SOURCE.replace(
+            "held = \"response format not yet qualified against the project key\"",
+            "held = \"\"",
+        );
+        let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
+        assert!(
+            deployment
+                .validate()
+                .expect_err("an empty hold reason must not load")
+                .contains("empty held reason")
+        );
     }
 }

@@ -804,3 +804,292 @@ async fn a_google_capability_returns_no_vectors_when_one_input_fails() {
         "the contract must not be attested on a failed batch"
     );
 }
+
+/// `gemini-embedding-2` speaks a different codec: width is a request field and a task is a
+/// text prefix rather than a `task_type`. The caller's contract is unchanged.
+fn gemini2_config(engine: &str, dims: u32, prefix: &str, extra_client: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.google2]
+format = "google_embed_content_v2"
+base_url = "{engine}"
+model = "gemini-embedding-2"
+api_key_env = "SWITCHYARD_TEST_GOOGLE2_KEY"
+{extra_client}
+
+[capabilities.gem2]
+id = "switchyard-embedding-google2"
+target = "google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = {dims}
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+{task_prefix}
+"#,
+        task_prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("task_prefix = \"{prefix}\"")
+        }
+    )
+}
+
+fn unit_vector(dims: usize, scale: f64) -> Value {
+    let each = 1.0 / (dims as f64).sqrt();
+    json!(vec![each * scale; dims])
+}
+
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_sends_the_prefix_and_the_requested_width() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    for text in ["alpha", "beta"] {
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-2:embedContent"))
+            .and(header("x-goog-api-key", "test-key"))
+            .and(body_partial_json(json!({
+                "model": "models/gemini-embedding-2",
+                "content": {"parts": [{"text": format!("task: search result | query: {text}")}]},
+                "output_dimensionality": 128,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"embedding": {"values": unit_vector(128, 1.0)}})),
+            )
+            .expect(1)
+            .mount(&engine)
+            .await;
+    }
+
+    let router = serve(&gemini2_config(
+        &engine.uri(),
+        128,
+        "task: search result | query: ",
+        "",
+    ))
+    .await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let value: Value = serde_json::from_slice(&body).expect("response is json");
+    assert_eq!(value["data"][0]["index"], json!(0));
+    assert_eq!(value["data"][1]["index"], json!(1));
+    assert_eq!(
+        headers
+            .get("x-switchyard-embedding-contract")
+            .and_then(|value| value.to_str().ok()),
+        Some("google-embedding-space:gemini-embedding-2-v1")
+    );
+}
+
+/// The prefix is sent with the text, so it counts against the model's input limit. A budget
+/// that ignored it would let an over-limit request reach the engine.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_counts_the_prefix_against_the_input_limit() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    let mut config = gemini2_config(&engine.uri(), 128, "task: x | query: ", "");
+    config = config.replace("max_input_tokens = 8192", "max_input_tokens = 17");
+    let router = serve(&config).await;
+    // 26-byte prefix + a 10-byte text is over 17 bytes even though the text alone is not.
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["0123456789"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("input[0]"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "an over-limit input must not reach the engine"
+    );
+}
+
+/// Width is negotiated per call, so a vector of a different width is not the vector the
+/// contract promises. Returning it would make the caller's index silently wrong.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_refuses_a_vector_at_the_wrong_width() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(127, 1.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let router = serve(&gemini2_config(&engine.uri(), 128, "", "")).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(String::from_utf8_lossy(&body).contains("dimension"));
+    assert!(
+        headers.get("x-switchyard-embedding-contract").is_none(),
+        "a refused vector must not be attested to the caller"
+    );
+}
+
+/// A declared normalization is a claim about the value space. If the engine's vector is not
+/// unit length, the contract is not what the caller was promised.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_refuses_a_vector_that_is_not_normalised() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(128, 10.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let router = serve(&gemini2_config(&engine.uri(), 128, "", "")).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        String::from_utf8_lossy(&body).contains("L2-normalised"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// A fan-out makes one provider request per input, so the budget must be charged per
+/// physical call. With one request authorised, the second input must not be sent.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_charges_the_daily_budget_per_physical_call() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(128, 1.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let state =
+        std::env::temp_dir().join(format!("switchyard-gemini2-budget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    let config = format!(
+        "{}\n[quota]\nstate_dir = \"{}\"\n",
+        gemini2_config(&engine.uri(), 128, "", "daily_request_limit = 1"),
+        state.display()
+    );
+    let router = serve(&config).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("daily request allowance"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the spent budget authorised exactly one physical call"
+    );
+}
+
+/// A minute window is taken before the call as well, so a caller cannot fan one request out
+/// into a burst the provider would refuse.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_charges_the_minute_window_per_physical_call() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(128, 1.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let router = serve(&gemini2_config(
+        &engine.uri(),
+        128,
+        "",
+        "requests_per_minute = 1",
+    ))
+    .await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        String::from_utf8_lossy(&body).contains("per-minute requests_per_minute"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        1
+    );
+}
+
+/// A held capability is inventory, not a fallback: naming it must fail locally, name what is
+/// actually available, and reach no engine.
+#[tokio::test]
+async fn a_held_capability_is_refused_locally_with_no_egress() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    let config = format!(
+        "{gemini2_config}\nheld = \"not qualified: response shape unobserved\"\n",
+        gemini2_config = gemini2_config(&engine.uri(), 128, "", "")
+    );
+    let router = serve(&config).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("No capability registered"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "a held capability must never reach its engine"
+    );
+}

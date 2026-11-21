@@ -1476,6 +1476,18 @@ async fn handle_llm_request(
                 "unsupported_capability",
             );
         }
+        Err(RunnerError::Held { model, reason }) => {
+            // The alias is declared, so this is not an unknown model, and no change to the
+            // request would help, so it is not a capability refusal either. The provider
+            // withdrew the model; say that, in its own words, and always answer locally —
+            // a held target never reaches a provider and is never replaced by a live one.
+            return error_response(
+                StatusCode::GONE,
+                format!("model {model:?} is held and cannot serve: {reason}"),
+                "invalid_request_error",
+                "model_held",
+            );
+        }
         Err(RunnerError::StateConflict(message)) => {
             return error_response(
                 StatusCode::CONFLICT,
@@ -2471,7 +2483,7 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
     Json(model_list_payload(
         state
             .runner
-            .models()
+            .advertised_models()
             .map(|model| (model.id.as_str(), model)),
     ))
 }

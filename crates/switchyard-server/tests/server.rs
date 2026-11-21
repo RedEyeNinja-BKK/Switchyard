@@ -756,6 +756,7 @@ fn random_state_with_retries(
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         omit_body_fields: BTreeSet::new(),
+        unsupported_reasoning_effort: BTreeSet::new(),
         reasoning_effort: None,
         reasoning_policy: None,
         reasoning_dialect: ReasoningDialect::default(),
@@ -3299,6 +3300,78 @@ target = "openai"
     assert!(error.contains("[REDACTED]"));
     assert!(!error.contains("codex-login-token"));
 
+    Ok(())
+}
+
+/// A held model is refused locally, is not advertised, and never reaches an upstream.
+///
+/// The manifest points every target at an unusable address on purpose: if the refusal were
+/// reached after dispatch, the response would be a transport failure rather than the held
+/// status, so the asserted status is itself the evidence that nothing was called.
+#[tokio::test]
+async fn a_held_model_is_refused_before_any_upstream_call() -> TestResult {
+    const REASON: &str = "Google answers HTTP 404: this model is no longer available to new users.";
+    let toml = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "http://127.0.0.1:1/v1"
+
+[targets.live]
+id = "live/model"
+llm_client = "primary"
+
+[targets.retired]
+id = "retired/model"
+llm_client = "primary"
+held = "Google answers HTTP 404: this model is no longer available to new users."
+
+[routes.live]
+id = "switchyard/live"
+type = "passthrough"
+target = "live"
+
+[routes.held]
+id = "switchyard/held"
+type = "passthrough"
+target = "retired"
+"#;
+    let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(toml)?)?);
+
+    let catalogue = send(&app, "GET", "/v1/models", None).await?;
+    assert_eq!(catalogue.status, StatusCode::OK);
+    let pool = catalogue.json()?["model_pool"].clone();
+    assert_eq!(
+        pool,
+        json!(["switchyard/live"]),
+        "only the serving alias may be advertised"
+    );
+
+    let refused = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/held",
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+    )
+    .await?;
+    assert_eq!(
+        refused.status,
+        StatusCode::GONE,
+        "a held alias must be refused without a dispatch"
+    );
+    let body = refused.json()?;
+    assert_eq!(body["error"]["code"], "model_held");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("the error carries a message");
+    assert!(
+        message.contains(REASON),
+        "the refusal must quote the recorded evidence: {message}"
+    );
     Ok(())
 }
 

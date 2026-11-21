@@ -30,8 +30,8 @@ pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_err
 pub use libsy::RuntimeModels;
 pub use provider_key_redactor::ProviderKeyRedactor;
 pub use route::{
-    AuxiliaryTarget, CallerAuthKind, Locality, MediaCarrier, ModelCapabilities, Route, RunOutput,
-    RunnerError,
+    AuxiliaryTarget, CallerAuthKind, HeldRoute, Locality, MediaCarrier, ModelCapabilities, Route,
+    RunOutput, RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};
 pub use selection::MeasuredSelector;

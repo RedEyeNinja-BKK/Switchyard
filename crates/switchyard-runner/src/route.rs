@@ -327,6 +327,15 @@ pub enum RunnerError {
         model: String,
         capability: &'static str,
     },
+    /// A route that exists but is deliberately held out of service.
+    ///
+    /// Distinct from an unknown model — the alias is declared and documented, so a caller
+    /// resolving it is not making a mistake — and distinct from an unsupported capability,
+    /// where changing the request could help. Here the provider withdrew the model: the
+    /// refusal is terminal, carries the provider's own evidence, and never substitutes a
+    /// live model for the one that was asked for.
+    #[error("model {model:?} is held and cannot serve: {reason}")]
+    Held { model: String, reason: String },
     #[error("caller format is incompatible with {} credentials", .0.as_str())]
     IncompatibleCallerFormat(CallerAuthKind),
     #[error("route has no compatible target for the auxiliary operation")]
@@ -407,6 +416,22 @@ pub struct Route {
     /// has to read the same counters the dispatch gate reserves against. Empty when the
     /// route was built without them (tests, or a deployment with no daily limits).
     daily_allowances: Arc<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>,
+    /// Set when every completion target of this route is held, naming the alias the caller
+    /// asked for and the recorded reason. A held route keeps its registration so the refusal
+    /// can be specific, but it serves nothing and is not advertised.
+    held: Option<HeldRoute>,
+}
+
+/// A route whose targets are all held out of service, with the evidence for holding it.
+#[derive(Clone, Debug)]
+pub struct HeldRoute {
+    /// The first configured completion target, which is the name the caller's alias maps to.
+    ///
+    /// Stored rather than derived because a held route's candidate set is empty by
+    /// construction: there is no first model left to read at request time.
+    pub model: String,
+    /// The provider's own evidence, forwarded verbatim to the caller.
+    pub reason: String,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -447,6 +472,7 @@ impl Route {
             target_credentials: std::collections::HashMap::new(),
             selector: None,
             daily_allowances: Arc::new(HashMap::new()),
+            held: None,
         }
     }
 
@@ -552,6 +578,26 @@ impl Route {
     pub fn with_locality(mut self, locality: Locality) -> Self {
         self.locality = locality;
         self
+    }
+
+    /// Marks every completion target of this route as held, with the reason to report.
+    ///
+    /// The route stays registered so an alias that used to work keeps a specific refusal
+    /// instead of becoming an unknown model; it serves nothing, because the candidate set
+    /// handed to the algorithm has already had the held targets removed at load.
+    pub fn with_held(mut self, held: HeldRoute) -> Self {
+        self.held = Some(held);
+        self
+    }
+
+    /// The holding record, when this route has no servable target left.
+    pub fn held(&self) -> Option<&HeldRoute> {
+        self.held.as_ref()
+    }
+
+    /// Why this route is held, when it is.
+    pub fn held_reason(&self) -> Option<&str> {
+        self.held.as_ref().map(|held| held.reason.as_str())
     }
 
     /// Returns where this route's work is performed.
@@ -671,6 +717,16 @@ impl Route {
         request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
+        // A held route has no servable target at all, so the refusal is decided before any
+        // request shaping: nothing is inspected, planned or dispatched. Reported here rather
+        // than as an ineligible candidate so the caller gets the provider's evidence instead
+        // of "requires ...", which would imply the request could be changed to fit.
+        if let Some(held) = &self.held {
+            return Err(RunnerError::Held {
+                model: held.model.clone(),
+                reason: held.reason.clone(),
+            });
+        }
         // Ordered candidates are filtered by what each target can actually serve, before any
         // provider is contacted. Declared order is preserved among the survivors, and the
         // native execution, retry, cooldown and fallback machinery still decides among them,
@@ -1041,6 +1097,12 @@ impl Route {
 
     /// Completes routing-time calls without serving a post-routing completion.
     pub async fn decide(&self, request: Request) -> Result<RoutingOutcome, RunnerError> {
+        if let Some(held) = &self.held {
+            return Err(RunnerError::Held {
+                model: held.model.clone(),
+                reason: held.reason.clone(),
+            });
+        }
         switchyard_llm_client::decide(
             Arc::clone(&self.algorithm),
             self.clients.clone(),

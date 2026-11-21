@@ -24,7 +24,7 @@ use switchyard_protocol::{
 use switchyard_translation::HostedReasoningMarker;
 
 use crate::{
-    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, MediaCarrier,
+    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, HeldRoute, MediaCarrier,
     ModelCapabilities, Route, Runner, RunnerError, capability, decision_executor,
     decision_transport,
 };
@@ -840,6 +840,23 @@ impl DeploymentConfig {
             if let Some(subagent) = names.subagent {
                 models = models.with_subagent(resolve_category_models(subagent, &targets)?);
             }
+            // Held targets keep their declaration, credential and facts, but they leave the
+            // candidate set here — before any algorithm is handed it — so no selection rule
+            // and no fallback walk can reach one, and no request spends a provider call on a
+            // model the provider has withdrawn. Filtering the model set rather than each
+            // algorithm's configuration is what makes this true for every algorithm: the
+            // dispatch path reads candidates from here and nowhere else.
+            let held_models: BTreeSet<ModelId> = config
+                .callable_target_names()
+                .into_iter()
+                .filter_map(|name| self.targets.get(name))
+                .filter(|target| target.held.is_some())
+                .map(|target| target.id.clone())
+                .collect();
+            if !held_models.is_empty() {
+                models = models.filtered(&|model| !held_models.contains(model));
+            }
+            let held = self.route_held(config, &held_models);
             let route = Route::new(
                 algorithm,
                 route_clients,
@@ -875,6 +892,10 @@ impl DeploymentConfig {
                     .collect::<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>(
                     ),
             ));
+            let route = match held {
+                Some(held) => route.with_held(held),
+                None => route,
+            };
             // A measured route ranks candidates only after it has evidence, and shares that
             // evidence with every other measured route so real work is not isolated to one
             // alias.
@@ -1142,6 +1163,42 @@ impl DeploymentConfig {
             .iter()
             .map(|(name, config)| (name.clone(), config.id.clone()))
             .collect()
+    }
+
+    /// The holding record for a route whose every completion target is held.
+    ///
+    /// A route with at least one live candidate is not held: the live ones serve, and the
+    /// held ones were already removed from its candidate set. Only a route with nothing left
+    /// to call is registered as held, which is what keeps the refusal specific instead of
+    /// letting the caller's alias fall through to the unknown-model path.
+    fn route_held(
+        &self,
+        config: &RouteConfig,
+        held_models: &BTreeSet<ModelId>,
+    ) -> Option<HeldRoute> {
+        if held_models.is_empty() {
+            return None;
+        }
+        let names = config.routing_target_names();
+        if names.is_empty() {
+            return None;
+        }
+        let all_held = names.iter().all(|name| {
+            self.targets
+                .get(*name)
+                .is_some_and(|target| target.held.is_some())
+        });
+        if !all_held {
+            return None;
+        }
+        let first = self.targets.get(names[0])?;
+        Some(HeldRoute {
+            // Named by configuration, not by the model id: it is the alias the manifest
+            // declares and the caller reads, and it survives in the message even though the
+            // dispatch set no longer contains it.
+            model: names[0].to_string(),
+            reason: first.held.clone()?,
+        })
     }
 
     /// Builds the decision resolver for a route, from its configured targets in order.
@@ -2696,6 +2753,21 @@ struct TargetConfig {
     /// floor, which is every target outside this shape.
     #[serde(default)]
     min_output_tokens: Option<u64>,
+    /// Why this target is held out of service, stated as the provider's own evidence.
+    ///
+    /// A held target keeps its place in the inventory — the declaration, its credential and
+    /// its facts stay readable — but it is removed from every route's candidate set at load,
+    /// so no request is ever dispatched to it and no `/v1/models` entry advertises it. It is
+    /// not retired: retiring would delete the record of what was measured and would make the
+    /// alias indistinguishable from a typo.
+    ///
+    /// The value is the reason the caller is shown, so it must be a fact rather than a
+    /// judgement: for a model the provider has withdrawn, the provider's own sentence. Held
+    /// is deliberately not a fallback: a held target must never be replaced by a live model,
+    /// because the caller asked for this one and a silent substitution would answer a
+    /// different question.
+    #[serde(default)]
+    held: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -3368,6 +3440,154 @@ type = "plan_execute"
 capable_target = "strong"
 efficient_target = "weak"
 "#;
+
+    /// The provider's own sentence, repeated verbatim in the refusal.
+    const HELD_REASON: &str = "This model is no longer available to new users.";
+
+    /// A deployment with one held target reached three ways: as a route's whole candidate
+    /// set, as an extra candidate, and as the head target with a live fallback behind it.
+    ///
+    /// The live target is declared once so the three routes differ only in where the held
+    /// one sits — that is the variable these tests are about.
+    const HELD_CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.live]
+id = "live/model"
+llm_client = "primary"
+
+[targets.retired]
+id = "retired/model"
+llm_client = "primary"
+held = "This model is no longer available to new users."
+
+[routes.held_only]
+id = "switchyard/held-only"
+type = "passthrough"
+target = "retired"
+
+[routes.held_as_candidate]
+id = "switchyard/held-as-candidate"
+type = "passthrough"
+target = "live"
+candidates = ["retired"]
+
+[routes.held_as_head]
+id = "switchyard/held-as-head"
+type = "passthrough"
+target = "retired"
+candidates = ["live"]
+
+[routes.live_only]
+id = "switchyard/live-only"
+type = "passthrough"
+target = "live"
+"#;
+
+    /// A held target must not fail the load.
+    ///
+    /// Holding is a service decision about a model that exists in the manifest, so the
+    /// declaration, its credential and its facts all still have to parse. Refusing the
+    /// deployment here would turn a deliberate hold into an outage.
+    #[test]
+    fn a_held_target_still_loads_and_keeps_its_record() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        let route = runner
+            .route("switchyard/held-only")
+            .expect("a held route keeps its registration");
+        assert_eq!(route.held_reason(), Some(HELD_REASON));
+        assert!(
+            route.models().models_for(&Category::Any).is_empty(),
+            "no candidate may remain when every target is held"
+        );
+        Ok(())
+    }
+
+    /// A held target leaves the candidate list without condemning the route that named it.
+    ///
+    /// Both positions are covered because they are filtered by the same set but reached by
+    /// different code: a candidate is one entry in an ordered list, while the head target is
+    /// the entry the algorithm would otherwise always offer first.
+    #[test]
+    fn a_held_candidate_leaves_the_list_without_holding_the_route() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        for name in ["switchyard/held-as-candidate", "switchyard/held-as-head"] {
+            let route = runner.route(name).expect("route is registered");
+            assert_eq!(
+                route.held_reason(),
+                None,
+                "{name} still has a live target and must keep serving"
+            );
+            assert_eq!(
+                route.models().models_for(&Category::Any),
+                vec![ModelId::from("live/model")],
+                "{name} must offer only the live target"
+            );
+        }
+        Ok(())
+    }
+
+    /// The catalogue promises answers; the inventory records what is declared.
+    ///
+    /// Both are asserted together because either one alone would pass under the wrong
+    /// behaviour: dropping the route from both lists would look like a correct retirement,
+    /// and leaving it in both would look like an untouched inventory.
+    #[test]
+    fn the_catalogue_drops_a_held_route_while_the_inventory_keeps_it() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        let advertised: Vec<&str> = runner
+            .advertised_models()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(
+            !advertised.contains(&"switchyard/held-only"),
+            "a route that can only refuse must not be advertised: {advertised:?}"
+        );
+        for name in [
+            "switchyard/held-as-candidate",
+            "switchyard/held-as-head",
+            "switchyard/live-only",
+        ] {
+            assert!(
+                advertised.contains(&name),
+                "{name} serves and must stay advertised: {advertised:?}"
+            );
+        }
+        let inventory: Vec<&str> = runner.models().map(|model| model.id.as_str()).collect();
+        assert!(
+            inventory.contains(&"switchyard/held-only"),
+            "the declaration stays readable for diagnostics: {inventory:?}"
+        );
+        Ok(())
+    }
+
+    /// The refusal names the held alias and quotes the provider, before any request work.
+    ///
+    /// Executed with a default request on purpose: a held route has nothing to dispatch, so
+    /// the decision must not depend on the request being well formed. A refusal that had to
+    /// read the payload could not be trusted to stay free of provider calls.
+    #[tokio::test]
+    async fn a_held_route_refuses_locally_with_the_providers_evidence() {
+        let runner = runner_from_toml(HELD_CONFIG).expect("fixture loads");
+        let route = runner
+            .route("switchyard/held-only")
+            .expect("route is registered");
+        match route
+            .execute(switchyard_protocol::Request::default(), None)
+            .await
+        {
+            Err(RunnerError::Held { model, reason }) => {
+                assert_eq!(model, "retired", "the refusal names the alias asked for");
+                assert_eq!(reason, HELD_REASON, "the provider's evidence is forwarded");
+            }
+            Err(other) => panic!("expected Held, got {other:?}"),
+            Ok(_) => panic!("a held route must never produce a response"),
+        }
+    }
 
     #[test]
     fn public_runner_from_toml_builds_a_deployment() -> RunnerResult<()> {
@@ -5930,6 +6150,7 @@ video = false
 free_tier = true
 omit_body_fields = ["store", "metadata", "prompt_cache_key"]
 unsupported_reasoning_effort = ["none"]
+held = "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21)."
 
 [targets."direct-google-gemini-3-flash"]
 id = "gemini-3-flash-preview"
@@ -6128,7 +6349,23 @@ tool_calling = true
 reasoning = true
 vision = true
 video = false
+
+# Mirrors the live pool shape: a held target named as an inner candidate. Nothing about
+# this route should change except that the dead leg is never offered.
+[routes.pool_with_held]
+id = "switchyard/pool-with-held"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-2.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+]
+selection = "measured"
 "#;
+
+    /// The provider's sentence, repeated from the manifest so the assertions compare the
+    /// refusal a caller would actually see rather than a second hand-written copy.
+    const HELD_2_5_REASON: &str = "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21).";
 
     /// The fixture with `dir` as its allowance state directory.
     ///
@@ -6171,7 +6408,6 @@ video = false
             ("direct-google-gemini-3.6-flash", "gemini-3.6-flash"),
             ("direct-google-gemini-3.8-flash", "gemini-3.8-flash"),
             ("direct-google-gemini-4-hydrogen", "gemini-4-hydrogen"),
-            ("direct-google-gemini-2.5-flash-lite", "gemini-2.5-flash-lite"),
             // The catalogued id is the preview name; the route name is the stable one.
             ("direct-google-gemini-3-flash", "gemini-3-flash-preview"),
             ("direct-google-gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it"),
@@ -6221,6 +6457,42 @@ video = false
                 "{held} is a catalogue record and must not claim reasoning"
             );
         }
+
+        // Only the withdrawn 2.5 record is held out of service. The 3-flash record is a
+        // catalogue entry for a model that does answer, so it must stay advertised: holding
+        // it would take a working alias out of the catalogue for the wrong reason.
+        let withheld = runner
+            .route("direct-google-gemini-2.5-flash-lite")
+            .expect("the held route keeps its registration");
+        assert_eq!(
+            withheld.held_reason(),
+            Some(HELD_2_5_REASON),
+            "the hold must carry the provider's evidence, not a placeholder"
+        );
+        assert!(
+            withheld.models().all_models().is_empty(),
+            "a held route must offer no candidate"
+        );
+        assert_eq!(
+            runner
+                .route("direct-google-gemini-3-flash")
+                .expect("3-flash route exists")
+                .held_reason(),
+            None,
+            "3-flash serves and must not be held"
+        );
+        let advertised: Vec<&str> = runner
+            .advertised_models()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(
+            !advertised.contains(&"direct-google-gemini-2.5-flash-lite"),
+            "a held route must not be advertised: {advertised:?}"
+        );
+        assert!(
+            advertised.contains(&"direct-google-gemini-3-flash"),
+            "a serving route must stay advertised: {advertised:?}"
+        );
     }
 
     /// The declared order is the whole point: eight free Gemini legs, then the two paid NT
@@ -6307,6 +6579,34 @@ video = false
                 "{free} must be declared free"
             );
         }
+    }
+
+    /// A held leg inside a measured pool is never offered, and the pool keeps serving.
+    ///
+    /// This is the live shape: `smart_gemini` and `smart-nt` name a target in their candidate
+    /// list that the provider has since withdrawn. Removing it from the declared list would
+    /// hide the measurement; leaving it in without a hold would spend one dispatch per request
+    /// on a 404. Filtering at load is the third option, and the one asserted here.
+    #[test]
+    fn a_held_leg_leaves_a_measured_pool_without_emptying_it() {
+        let runner = runner();
+        let route = runner
+            .route("switchyard/pool-with-held")
+            .expect("the pool exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite".to_string(),
+                "gemini-3.1-flash-lite".to_string()
+            ],
+            "the held leg must be absent and the declared order otherwise preserved"
+        );
+        assert_eq!(
+            route.held_reason(),
+            None,
+            "a pool with live legs is not itself held"
+        );
     }
 
     /// A held model serves nothing, so it declares no budget at all: zero is refused at load

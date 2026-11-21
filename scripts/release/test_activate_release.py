@@ -760,6 +760,143 @@ def test_a_candidate_missing_economics_is_refused_before_production_changes(box,
     assert box.live_bytes() == before
 
 
+def _capability_pair(box, tmp_path, *, keep_economics):
+    """A deployed baseline and a candidate manifest that lost one family.
+
+    Everything about the candidate is self-consistent: it describes its own
+    binary, and it simply does not carry that family any more. Only the
+    cross-release comparison against the DEPLOYED manifest can see that.
+
+    `keep_economics` decides whether the economics subsystem survives. Losing a
+    family and losing a whole subsystem are two different events to the gate, so
+    both shapes are needed to state the rule.
+    """
+    import json
+
+    def families(names, subsystem):
+        return {name: {"instrument": name.replace("_total", "").replace("_", "."),
+                       "kind": "gauge", "kind_basis": "source",
+                       "subsystem": subsystem, "class": "present_only_in_deployed"}
+                for name in names}
+
+    deployed = {
+        "contract_version": 1,
+        "build": {"commit": "a" * 40, "binary_sha256": "0" * 64},
+        "families": {**families(["switchyard_economics_provider_balance",
+                                 "switchyard_economics_provider_cost"], "economics"),
+                     **families(["switchyard_build_info"], "telemetry")},
+        "subsystems": {"economics": ["switchyard_economics_provider_balance",
+                                     "switchyard_economics_provider_cost"],
+                       "telemetry": ["switchyard_build_info"]},
+    }
+    binary, bsha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    kept = ["switchyard_economics_provider_cost"] if keep_economics else []
+    candidate = {
+        "contract_version": 1,
+        "build": {"commit": "b" * 40, "binary_sha256": bsha},
+        "families": {**families(kept, "economics"),
+                     **families(["switchyard_build_info"], "telemetry")},
+        "subsystems": ({"economics": kept, "telemetry": ["switchyard_build_info"]}
+                       if keep_economics else
+                       {"telemetry": ["switchyard_build_info"]}),
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(deployed))
+    caps = tmp_path / "candidate-caps.json"
+    caps.write_text(json.dumps(candidate))
+    return binary, baseline, caps
+
+
+def test_an_approved_removal_is_accepted_and_an_unapproved_one_is_refused(tmp_path):
+    """Approval has to be per family and carry a reason; silence is not consent."""
+    import json
+
+    tool = os.path.join(os.path.dirname(SCRIPT), "capability_contract.py")
+    binary, baseline, caps = _capability_pair(_box(tmp_path), tmp_path,
+                                              keep_economics=True)
+
+    def preflight(*extra):
+        return subprocess.run(
+            [sys.executable, tool, "preflight", "--binary", binary,
+             "--manifest", str(caps), "--baseline", str(baseline), *extra],
+            capture_output=True, text=True)
+
+    refused = preflight()
+    assert refused.returncode == 7, refused.stdout + refused.stderr
+    assert "switchyard_economics_provider_balance" in refused.stdout
+    assert "UNAPPROVED" in refused.stdout
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text(json.dumps({"removed": {
+        "switchyard_economics_provider_balance":
+            "the provider balance gauge was retired with the economics module"}}))
+    accepted = preflight("--approvals", str(approvals))
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert "APPROVED" in accepted.stdout
+
+    # An approval for a different family must not cover this one.
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text(json.dumps({"removed": {"switchyard_something_else_total": "x"}}))
+    still_refused = preflight("--approvals", str(elsewhere))
+    assert still_refused.returncode == 7, still_refused.stdout + still_refused.stderr
+
+    # Losing every family in a subsystem is a second, separate event: the
+    # families alone do not cover it, because a subsystem that vanished takes its
+    # whole capability surface with it.
+    binary, baseline, caps = _capability_pair(_box(tmp_path), tmp_path,
+                                              keep_economics=False)
+    both = tmp_path / "both.json"
+    both.write_text(json.dumps({"removed": {
+        "switchyard_economics_provider_balance": "retired",
+        "switchyard_economics_provider_cost": "retired"}}))
+    lost_subsystem = preflight("--approvals", str(both))
+    assert lost_subsystem.returncode == 7, lost_subsystem.stdout + lost_subsystem.stderr
+    assert "subsystems that disappeared entirely" in lost_subsystem.stdout
+
+    with_subsystem = tmp_path / "with-subsystem.json"
+    with_subsystem.write_text(json.dumps({"removed": {
+        "switchyard_economics_provider_balance": "retired",
+        "switchyard_economics_provider_cost": "retired",
+        "economics": "the module was removed, so its subsystem went with it"}}))
+    whole = preflight("--approvals", str(with_subsystem))
+    assert whole.returncode == 0, whole.stdout + whole.stderr
+
+
+def test_the_deploy_wrapper_passes_the_approvals_file_to_the_gate(box, tmp_path):
+    """The flag has to reach the tool, not merely be accepted by the parser."""
+    import json
+
+    baseline = adopted(box)
+    with open(os.path.join(box.releases, baseline, "capabilities.json"), "w") as fh:
+        json.dump({"families": {}}, fh)
+
+    recorded = os.path.join(box.root, "gate-argv.txt")
+    stub = os.path.join(box.root, "capability_stub.py")
+    with open(stub, "w") as fh:
+        fh.write("import sys\n")
+        fh.write(f"open({recorded!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n")
+        fh.write("sys.exit(0)\n")
+    os.chmod(stub, 0o644)
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text(json.dumps({"removed": {"switchyard_old_total": "retired"}}))
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    caps = tmp_path / "caps.json"
+    caps.write_text("{}")
+
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", str(caps),
+                     "--capability-approvals", str(approvals),
+                     CAPABILITY_TOOL=stub)
+    assert result.returncode == 0, result.stdout + result.stderr
+    with open(recorded) as fh:
+        argv = fh.read()
+    assert "--approvals" in argv, argv
+    assert str(approvals) in argv, argv
+
+
 # ---------------------------------------------------------------------------
 # standalone runner
 #

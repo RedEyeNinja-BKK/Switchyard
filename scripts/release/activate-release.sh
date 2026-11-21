@@ -446,7 +446,7 @@ validate_candidate() {
 }
 
 capability_gate() {
-  local binary=$1 caps=$2 baseline=$3
+  local binary=$1 caps=$2 baseline=$3 approvals=${4:-}
 
   # Once a release line has a baseline, the gate is part of deploying to it: a
   # candidate that arrives without its own manifest cannot be compared, and
@@ -473,8 +473,18 @@ capability_gate() {
     return 1
   fi
   [ -f "$caps" ] || { say "capability manifest $caps not found"; return 1; }
-  python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
-    --baseline "$baseline"
+  # An approval is not a bypass: it names the family and the reason, and the tool
+  # still refuses any removal that is not in the file. Without a file every
+  # removal is unapproved, which is the default.
+  if [ -n "$approvals" ]; then
+    [ -f "$approvals" ] || { say "capability approvals $approvals not found"; return 1; }
+    say "approvals: $approvals"
+    python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
+      --baseline "$baseline" --approvals "$approvals"
+  else
+    python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
+      --baseline "$baseline"
+  fi
 }
 
 post_verify() {
@@ -493,11 +503,12 @@ post_verify() {
 # ---------------------------------------------------------------------- deploy
 cmd_deploy() {
   local m_src="" m_want="" b_src="" b_want="" label="" caps="" commit="" branch="" dirty=false
-  local basis="build-session" promote=0
+  local cap_approvals="" basis="build-session" promote=0
   while [ $# -gt 0 ]; do
     case $1 in
       --label) label=$2; shift 2 ;;
       --capabilities) caps=$2; shift 2 ;;
+      --capability-approvals) cap_approvals=$2; shift 2 ;;
       --source-commit) commit=$2; shift 2 ;;
       --source-branch) branch=$2; shift 2 ;;
       --source-dirty) dirty=true; shift ;;
@@ -548,7 +559,7 @@ cmd_deploy() {
   say "candidate validates"
 
   say "capability gate"
-  if ! capability_gate "$b_src" "$caps" "$prev_dir/capabilities.json"; then
+  if ! capability_gate "$b_src" "$caps" "$prev_dir/capabilities.json" "$cap_approvals"; then
     die "capability gate refused this candidate; production untouched"
   fi
 

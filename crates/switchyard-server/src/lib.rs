@@ -2710,10 +2710,16 @@ fn render_startup_banner_art(color: bool) -> String {
 }
 
 fn dry_run_summary(state: &ServerState) -> String {
-    format!(
-        "server OK: {}",
-        state.models().collect::<Vec<_>>().join(", ")
-    )
+    // The inventory keeps a held alias, and this banner reads the inventory, so the hold is
+    // named here. Otherwise a validation read would list an alias that can only answer with
+    // a refusal as one of the routes the process just accepted.
+    let models = state.models().map(|model| {
+        match state.runner.route(model).and_then(|route| route.held()) {
+            Some(_) => format!("{model} (held)"),
+            None => model.to_string(),
+        }
+    });
+    format!("server OK: {}", models.collect::<Vec<_>>().join(", "))
 }
 
 fn url_for_addr(scheme: &'static str, addr: SocketAddr) -> String {

@@ -3375,6 +3375,115 @@ target = "retired"
     Ok(())
 }
 
+/// Fails if any key on a surface names a reasoning effort, which would be a claim that one
+/// was applied.
+fn assert_no_effort_claim(value: &Value, surface: &str) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                assert!(
+                    !key.contains("effort"),
+                    "{surface} claims a reasoning effort under {key}"
+                );
+                assert_no_effort_claim(child, surface);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_effort_claim(item, surface);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A deployment-injected effort the provider refuses must leave the wire, and nothing may
+/// report it as applied: not the upstream body, not the routing record, not the decision
+/// record, not the response. The caller did not ask for it, so the honest reading is "not
+/// sent", which is exactly what these surfaces are checked for.
+#[tokio::test]
+async fn a_stripped_injected_effort_is_not_reported_as_honoured_anywhere() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let directory = tempfile::tempdir()?;
+    let log_path = directory.path().join("routing.jsonl");
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{}"
+
+[targets.model]
+id = "model/a"
+llm_client = "upstream"
+reasoning_effort = "none"
+unsupported_reasoning_effort = ["none"]
+
+[routes.model]
+id = "switchyard/model"
+type = "passthrough"
+target = "model"
+"#,
+        upstream.base_url
+    ))?
+    .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let calls = upstream.calls.lock().await;
+    let body = calls
+        .first()
+        .ok_or("the upstream was never called")?
+        .clone();
+    drop(calls);
+    assert_eq!(
+        body.get("reasoning_effort"),
+        None,
+        "a refused effort must not reach the wire: {body}"
+    );
+    assert_eq!(
+        body.get("reasoning"),
+        None,
+        "a refused effort must not reach the wire nested either: {body}"
+    );
+    assert_no_effort_claim(&body, "the upstream request body");
+
+    let response_body = response.json()?;
+    assert_no_effort_claim(&response_body, "the response body");
+
+    let attempts = std::fs::read_to_string(&log_path)?;
+    for line in attempts.lines() {
+        assert_no_effort_claim(&serde_json::from_str(line)?, "the routing record");
+    }
+    let decisions = std::fs::read_to_string(log_path.with_extension("decisions.jsonl"))?;
+    let decision: Value = serde_json::from_str(
+        decisions
+            .lines()
+            .next()
+            .ok_or("the decision record was not written")?,
+    )?;
+    assert_eq!(decision["outcome"], "served");
+    assert_eq!(
+        decision["skipped"],
+        json!({}),
+        "an injected effort the provider refuses must not be reported as an exclusion: {decision}"
+    );
+    assert_no_effort_claim(&decision, "the decision record");
+    Ok(())
+}
+
 #[tokio::test]
 async fn routes_dispatch_and_discovery_endpoints_are_stable() -> TestResult {
     let (upstream, app) = test_app(&[

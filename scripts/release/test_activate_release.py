@@ -70,6 +70,13 @@ class Sandbox:
                      f'  cp {self.state}/good {self.state}/healthy\n'
                      f'fi\n')
         os.chmod(self.restart_sh, 0o755)
+        # The unit is asked which EnvironmentFiles it reads. A sandbox has none, and
+        # the answer must not depend on whether the host happens to run a unit with
+        # this name: a real reply here would make the result host-dependent.
+        self.no_systemctl = os.path.join(root, "systemctl-none")
+        with open(self.no_systemctl, "w") as fh:
+            fh.write("#!/bin/bash\nexit 0\n")
+        os.chmod(self.no_systemctl, 0o755)
 
     def env(self, **overrides):
         env = {
@@ -84,6 +91,7 @@ class Sandbox:
             "HEALTH_ATTEMPTS": "4",
             "ENV_FILE_1": self.env1,
             "ENV_FILE_2": os.path.join(self.root, "absent.env"),
+            "SYSTEMCTL": self.no_systemctl,
             "MANIFEST_GROUP": "root",
             "VALIDATOR": VALIDATOR,
             "METRICS_URL": "http://127.0.0.1:9/metrics",
@@ -95,6 +103,31 @@ class Sandbox:
     def run(self, *args, **overrides):
         return subprocess.run(["bash", SCRIPT, *args], env=self.env(**overrides),
                               capture_output=True, text=True)
+
+    def write_env_file(self, name, assignments):
+        path = os.path.join(self.root, name)
+        with open(path, "w") as fh:
+            for key, value in assignments.items():
+                fh.write(f"{key}={value}\n")
+        return path
+
+    def write_systemctl(self, name, output, markers=True):
+        """A stub for `systemctl show -p EnvironmentFiles --value`.
+
+        `markers=True` reproduces current systemd, one `PATH (ignore_errors=no)` per
+        line; `markers=False` reproduces the older single-line form. Both shapes are
+        in the wild, so both are tested.
+        """
+        path = os.path.join(self.root, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/bash\n")
+            if markers:
+                for item in output:
+                    fh.write(f'printf \'%s\\n\' "{item} (ignore_errors=no)"\n')
+            else:
+                fh.write(f'echo "{" ".join(output)}"\n')
+        os.chmod(path, 0o755)
+        return path
 
     def write_candidate(self, name, body):
         path = os.path.join(self.root, name)
@@ -262,6 +295,83 @@ def test_a_candidate_that_fails_its_own_validation_is_refused(box):
     assert result.returncode == 1
     assert "does not validate" in result.stderr
     assert box.live_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# which environment the candidate is validated under
+#
+# The unit declares its EnvironmentFiles. This script used to know two of them by
+# name, which was correct until a third was added as a drop-in -- at which point a
+# candidate that needed only that third file was refused, with a message naming a
+# variable the operator could see on disk. The unit is asked instead; these four
+# cases hold that behaviour in place.
+# ---------------------------------------------------------------------------
+
+
+def _three_file_setup(box):
+    """Three env files, and a candidate that loads only when the third is read."""
+    files = (
+        box.write_env_file("one.env", {"FIRST_FILE_KEY": "one"}),
+        box.write_env_file("two.env", {"SECOND_FILE_KEY": "two"}),
+        box.write_env_file("three.env", {"THIRD_FILE_KEY": "from-the-third-file"}),
+    )
+    candidate, csha = box.write_candidate(
+        "candidate",
+        "#!/bin/bash\n"
+        '[ "${THIRD_FILE_KEY:-}" = "from-the-third-file" ] || exit 3\n'
+        'echo "server OK: fixture"\n')
+    manifest, msha = box.write_manifest("candidate.toml")
+    return files, (candidate, csha, manifest, msha)
+
+
+def test_the_candidate_is_validated_under_every_environment_file_the_unit_declares(box):
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-three", files)
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_unit_file_this_script_never_heard_of_is_not_skipped(box):
+    """The negative control for the case above.
+
+    Same candidate, same first two files; the stub now reports only those two. The
+    candidate must be refused -- which is what proves the pass came from the third
+    file being read, not from validation being toothless.
+    """
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    before = box.live_bytes()
+    systemctl = box.write_systemctl("systemctl-two", files[:2])
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 1
+    assert "does not validate" in result.stderr
+    assert box.live_bytes() == before
+
+
+def test_the_older_single_line_environment_file_list_is_read_too(box):
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-old", files, markers=False)
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_release_record_names_every_file_it_was_validated_under(box):
+    """The record is what an auditor reads; it must not name a subset."""
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _three_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-three", files)
+    box.mark_good(candidate)
+    assert box.run("deploy", manifest, msha, candidate, csha,
+                   SYSTEMCTL=systemctl).returncode == 0
+    text = open(os.path.join(box.releases, box.current(), "release.json")).read()
+    for path in files:
+        assert path in text, f"{path} must be recorded"
+        assert sha256(path) in text, f"{path} must be recorded by hash"
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +868,143 @@ def test_a_candidate_missing_economics_is_refused_before_production_changes(box,
     assert result.returncode == 1, result.stdout + result.stderr
     assert "capability gate refused" in result.stderr
     assert box.live_bytes() == before
+
+
+def _capability_pair(box, tmp_path, *, keep_economics):
+    """A deployed baseline and a candidate manifest that lost one family.
+
+    Everything about the candidate is self-consistent: it describes its own
+    binary, and it simply does not carry that family any more. Only the
+    cross-release comparison against the DEPLOYED manifest can see that.
+
+    `keep_economics` decides whether the economics subsystem survives. Losing a
+    family and losing a whole subsystem are two different events to the gate, so
+    both shapes are needed to state the rule.
+    """
+    import json
+
+    def families(names, subsystem):
+        return {name: {"instrument": name.replace("_total", "").replace("_", "."),
+                       "kind": "gauge", "kind_basis": "source",
+                       "subsystem": subsystem, "class": "present_only_in_deployed"}
+                for name in names}
+
+    deployed = {
+        "contract_version": 1,
+        "build": {"commit": "a" * 40, "binary_sha256": "0" * 64},
+        "families": {**families(["switchyard_economics_provider_balance",
+                                 "switchyard_economics_provider_cost"], "economics"),
+                     **families(["switchyard_build_info"], "telemetry")},
+        "subsystems": {"economics": ["switchyard_economics_provider_balance",
+                                     "switchyard_economics_provider_cost"],
+                       "telemetry": ["switchyard_build_info"]},
+    }
+    binary, bsha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    kept = ["switchyard_economics_provider_cost"] if keep_economics else []
+    candidate = {
+        "contract_version": 1,
+        "build": {"commit": "b" * 40, "binary_sha256": bsha},
+        "families": {**families(kept, "economics"),
+                     **families(["switchyard_build_info"], "telemetry")},
+        "subsystems": ({"economics": kept, "telemetry": ["switchyard_build_info"]}
+                       if keep_economics else
+                       {"telemetry": ["switchyard_build_info"]}),
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(deployed))
+    caps = tmp_path / "candidate-caps.json"
+    caps.write_text(json.dumps(candidate))
+    return binary, baseline, caps
+
+
+def test_an_approved_removal_is_accepted_and_an_unapproved_one_is_refused(tmp_path):
+    """Approval has to be per family and carry a reason; silence is not consent."""
+    import json
+
+    tool = os.path.join(os.path.dirname(SCRIPT), "capability_contract.py")
+    binary, baseline, caps = _capability_pair(_box(tmp_path), tmp_path,
+                                              keep_economics=True)
+
+    def preflight(*extra):
+        return subprocess.run(
+            [sys.executable, tool, "preflight", "--binary", binary,
+             "--manifest", str(caps), "--baseline", str(baseline), *extra],
+            capture_output=True, text=True)
+
+    refused = preflight()
+    assert refused.returncode == 7, refused.stdout + refused.stderr
+    assert "switchyard_economics_provider_balance" in refused.stdout
+    assert "UNAPPROVED" in refused.stdout
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text(json.dumps({"removed": {
+        "switchyard_economics_provider_balance":
+            "the provider balance gauge was retired with the economics module"}}))
+    accepted = preflight("--approvals", str(approvals))
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert "APPROVED" in accepted.stdout
+
+    # An approval for a different family must not cover this one.
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text(json.dumps({"removed": {"switchyard_something_else_total": "x"}}))
+    still_refused = preflight("--approvals", str(elsewhere))
+    assert still_refused.returncode == 7, still_refused.stdout + still_refused.stderr
+
+    # Losing every family in a subsystem is a second, separate event: the
+    # families alone do not cover it, because a subsystem that vanished takes its
+    # whole capability surface with it.
+    binary, baseline, caps = _capability_pair(_box(tmp_path), tmp_path,
+                                              keep_economics=False)
+    both = tmp_path / "both.json"
+    both.write_text(json.dumps({"removed": {
+        "switchyard_economics_provider_balance": "retired",
+        "switchyard_economics_provider_cost": "retired"}}))
+    lost_subsystem = preflight("--approvals", str(both))
+    assert lost_subsystem.returncode == 7, lost_subsystem.stdout + lost_subsystem.stderr
+    assert "subsystems that disappeared entirely" in lost_subsystem.stdout
+
+    with_subsystem = tmp_path / "with-subsystem.json"
+    with_subsystem.write_text(json.dumps({"removed": {
+        "switchyard_economics_provider_balance": "retired",
+        "switchyard_economics_provider_cost": "retired",
+        "economics": "the module was removed, so its subsystem went with it"}}))
+    whole = preflight("--approvals", str(with_subsystem))
+    assert whole.returncode == 0, whole.stdout + whole.stderr
+
+
+def test_the_deploy_wrapper_passes_the_approvals_file_to_the_gate(box, tmp_path):
+    """The flag has to reach the tool, not merely be accepted by the parser."""
+    import json
+
+    baseline = adopted(box)
+    with open(os.path.join(box.releases, baseline, "capabilities.json"), "w") as fh:
+        json.dump({"families": {}}, fh)
+
+    recorded = os.path.join(box.root, "gate-argv.txt")
+    stub = os.path.join(box.root, "capability_stub.py")
+    with open(stub, "w") as fh:
+        fh.write("import sys\n")
+        fh.write(f"open({recorded!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n")
+        fh.write("sys.exit(0)\n")
+    os.chmod(stub, 0o644)
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text(json.dumps({"removed": {"switchyard_old_total": "retired"}}))
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("candidate.toml")
+    caps = tmp_path / "caps.json"
+    caps.write_text("{}")
+
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", str(caps),
+                     "--capability-approvals", str(approvals),
+                     CAPABILITY_TOOL=stub)
+    assert result.returncode == 0, result.stdout + result.stderr
+    with open(recorded) as fh:
+        argv = fh.read()
+    assert "--approvals" in argv, argv
+    assert str(approvals) in argv, argv
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,15 @@ pub struct StreamTranslationState {
 
     pub(crate) reasoning_block_index: Option<usize>,
     pub(crate) reasoning_block_started: bool,
+
+    /// Inline hosted reasoning marker for this stream, when the target states one.
+    pub hosted_reasoning: Option<crate::codecs::openai_chat::HostedReasoningMarker>,
+    /// Buffered splitter for that marker, in the same lifetime as the stream.
+    ///
+    /// Not serialised: it is a cursor over bytes already consumed, so a replayed state
+    /// would resume mid-block with no way to tell which half it had.
+    #[serde(skip)]
+    pub thought_filter: crate::codecs::openai_chat::ThoughtStreamFilter,
 }
 
 // One Responses reasoning output item under construction by the encoder.

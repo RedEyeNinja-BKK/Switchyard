@@ -20,18 +20,25 @@ pub mod allowance;
 pub mod backend;
 pub mod client;
 pub mod error;
+pub mod google;
 pub mod metrics;
 mod observability;
 mod observation;
-pub mod privacy;
 pub mod raw;
 pub mod run;
 
-pub use allowance::{DailyRequestAllowance, ReserveError, allowance_path};
+pub use allowance::{
+    AdmissionMargin, DailyRequestAllowance, GovernorKey, PacedQuota, PacingError, PacingScope,
+    PacingTicket, QuotaGovernor, ReserveError, Throttled, WindowLimits, allowance_path,
+    estimate_input_tokens, reported_input_tokens,
+};
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
-pub use observation::{LlmCallObservation, RunObservation, RunObserver};
+pub use observation::{
+    AttemptTrace, CandidateTrace, LlmCallObservation, RunObservation, RunObserver, SelectionTrace,
+    library_outcome_code, outcome_code,
+};
 pub use raw::RawResponse;
 pub use run::{
     CapabilityFacts, ClientRouter, CredentialBlock, CredentialBlockKind, FailureClass,

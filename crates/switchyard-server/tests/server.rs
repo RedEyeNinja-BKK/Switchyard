@@ -767,7 +767,8 @@ fn random_state_with_retries(
         stream_idle_timeout: None,
         requires_list_input: false,
         allowance: None,
-        requires_public_payload: false,
+        pacing: None,
+        hosted_reasoning: None,
     });
     let target_models = routes
         .iter()
@@ -3740,7 +3741,11 @@ watcher = {{ id = "watcher", type = "passthrough", target = "shared", vision = t
     );
 
     let calls = upstream.calls.lock().await;
-    assert_eq!(calls.len(), 1, "the request must reach the upstream exactly once");
+    assert_eq!(
+        calls.len(),
+        1,
+        "the request must reach the upstream exactly once"
+    );
     let parts = calls[0]["input"][0]["content"]
         .as_array()
         .expect("upstream body should carry input content");

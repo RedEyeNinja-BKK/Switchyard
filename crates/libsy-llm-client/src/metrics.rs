@@ -106,6 +106,24 @@ pub(crate) fn record_retry_recovered() {
         .add(1, &[]);
 }
 
+/// Records an answered request that produced no usable answer.
+///
+/// Transport health and task success are different facts and must not share a counter. An
+/// HTTP 200 whose content is empty, whose tool-call list is empty, and whose completion
+/// count is zero is a *delivered transport* with an *unusable result* — the shape a model
+/// produces when its whole output budget went to inline reasoning. Counting that as success
+/// would teach a selector that the model answers when the caller received nothing.
+///
+/// Emitted beside `switchyard.upstream_attempts`, never instead of it: a run of these with
+/// healthy attempt metrics is a model/quality problem, and the same run with failing
+/// attempts is a transport problem.
+pub(crate) fn record_incomplete_answer(reason: &'static str) {
+    global::meter("switchyard")
+        .u64_counter("switchyard.incomplete_answers")
+        .build()
+        .add(1, &[KeyValue::new("reason", reason)]);
+}
+
 /// Records the time needed to produce the routing outcome, including classifier calls,
 /// target resolution, request rewrites, and decision publishing.
 pub(crate) fn record_routing_overhead(algorithm: &str, overhead: Duration) {

@@ -386,6 +386,12 @@ async fn call_one(
             .ok()
             .and_then(|response| response.llm_response.as_agg())
             .map(|response| response.usage.clone()),
+        // Naming how the call ended is what lets a caller distinguish an empty answer
+        // from a timeout without reading a message. Value-free by construction.
+        outcome: result
+            .as_ref()
+            .err()
+            .map(crate::observation::library_outcome_code),
     });
     result
 }
@@ -782,14 +788,32 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => {
             FailureClass::TemporarilyUnavailable
         }
-        // The payload, not the leg, is the problem: nothing about another candidate makes
-        // content that must not leave this deployment admissible.
-        LlmClientError::PayloadNotCleared { .. } => FailureClass::Request,
+        // A full minute window is a throttle, not an outage: the leg is servable again
+        // within the minute, so a composite may cross to a sibling with headroom and the
+        // caller is told to retry shortly rather than to wait for tomorrow.
+        LlmClientError::MinuteAllowanceThrottled { .. } => FailureClass::RateLimited,
+        // Same family as a throttle for routing purposes — the leg cannot take this request
+        // right now — but not the same fact: it can never take it, so the route advances and
+        // a sibling with a wider window is the real answer. Neither the call nor the route
+        // ends.
+        LlmClientError::InputExceedsMinuteWindow { .. } => FailureClass::RateLimited,
+        // The feature is missing from the wire format the route selected, so it is a fact
+        // about the request as routed rather than an upstream fault. Classified as a request
+        // fault, which stops the route: a sibling on the same Chat wire format cannot honour
+        // it either, and the candidate that could is reached by a different route.
+        LlmClientError::UnsupportedFeature { .. } => FailureClass::Request,
         // A per-attempt expiry is a deadline that elapsed, so a whole-route
         // composite treats it exactly like an upstream 408.
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
         LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
         LlmClientError::UpstreamHttp { status, body } => match *status {
+            // Google names its condition in the body, and the name decides more than the
+            // status: a 429 is a throttle or a spent daily quota, a 400 is an adapter defect
+            // or a content block. Diagnosis stays a pure mapping; what may be retried or
+            // routed around is decided by the recovery this module derives.
+            _ if crate::google::parse(Some(status.as_u16()), body).is_some() => {
+                google_failure_class(crate::google::parse(Some(status.as_u16()), body).as_ref())
+            }
             StatusCode::NOT_FOUND if is_retired_model(source) => FailureClass::ModelRetired,
             StatusCode::TOO_MANY_REQUESTS => FailureClass::RateLimited,
             StatusCode::REQUEST_TIMEOUT => FailureClass::Timeout,
@@ -816,6 +840,49 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
             _ => FailureClass::Other,
         },
         _ => FailureClass::Other,
+    }
+}
+
+/// The failure class a decoded Google condition belongs to.
+///
+/// These map onto the classes the route already understands rather than adding a parallel
+/// vocabulary: a daily quota is the same fact as any other account-wide cap, and a content
+/// block is the same fact as any other provider-policy refusal.
+fn google_failure_class(error: Option<&crate::google::GoogleError>) -> FailureClass {
+    use crate::google::GoogleCondition as C;
+    let Some(error) = error else {
+        return FailureClass::Other;
+    };
+    match error.condition {
+        // `AccountQuota` means "every candidate behind this credential is out", so it is
+        // reserved for a scope Google positively identified as project-wide. A model-scoped
+        // daily quota retires one target and leaves its siblings servable, which is what
+        // `TemporarilyUnavailable` already means for a spent per-target allowance.
+        C::DailyQuota => {
+            if error.recovery().stop_candidate_list {
+                FailureClass::AccountQuota
+            } else {
+                FailureClass::TemporarilyUnavailable
+            }
+        }
+        C::ShortWindowThrottle => FailureClass::RateLimited,
+        // Not a rate: a spend meter is an account condition that no backoff changes, and
+        // calling it one would invite the retry the recovery already forbids.
+        C::SpendLimit => FailureClass::TemporarilyUnavailable,
+        C::Capacity => FailureClass::TemporarilyUnavailable,
+        C::ProviderFault => FailureClass::Server,
+        C::ProviderDeadline => FailureClass::Timeout,
+        C::ModelNotFound => FailureClass::ModelRetired,
+        C::Unauthenticated | C::PermissionDenied | C::LeakedCredential => FailureClass::Auth,
+        C::ContentBlocked(_) => FailureClass::ProviderPolicy,
+        C::ResourceNotFound
+        | C::InvalidRequest
+        | C::UnsupportedOperation
+        | C::Conflict
+        | C::Aborted
+        | C::MalformedTool
+        | C::IncompleteOutput => FailureClass::Request,
+        C::ClientCancelled | C::Unknown => FailureClass::Other,
     }
 }
 
@@ -847,11 +914,39 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         source,
         LlmClientError::DailyRequestAllowanceExhausted { .. }
             | LlmClientError::DailyRequestAllowanceUnavailable { .. }
+            // A minute window regains room on its own, so this leg is worth returning to
+            // later in the same call; the route may also reach a sibling with headroom now.
+            | LlmClientError::MinuteAllowanceThrottled { .. }
+            // A request this leg's minute budget cannot hold at the deployment's margin is
+            // not a failure of the request or of the model: a sibling with a wider window
+            // is exactly what the Free pool provides, so the route crosses to it.
+            | LlmClientError::InputExceedsMinuteWindow { .. }
     ) {
         return Some(RoutingFallbackReason::Unavailable);
     }
+    // A condition Google names decides how much of the route it takes with it. A scope that
+    // stops the whole candidate list ends the route, and an outcome about the request - a
+    // policy block, a malformed tool call - is an answer, so handing it to another provider
+    // would be evading it rather than serving the caller. A quota scoped to one model is
+    // neither: its siblings on the same credential still have their own budget.
+    if let LlmClientError::UpstreamHttp { status, body } = source
+        && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
+    {
+        let recovery = google.recovery();
+        if recovery.stop_candidate_list || recovery.keep_outcome {
+            return None;
+        }
+        if google.condition == crate::google::GoogleCondition::DailyQuota {
+            return Some(RoutingFallbackReason::Unavailable);
+        }
+    }
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
+        // The model answered with nothing usable. That is a fact about this leg, not about
+        // the request, and a sibling is exactly what a free pool provides. Measured
+        // 2026-11-21: hosted Gemma 4 26B spent its whole output budget on inline reasoning
+        // and the route returned 500 although another candidate could have answered.
+        LlmClientError::EmptyAnswer { .. } => Some(RoutingFallbackReason::Unavailable),
         // Pre-commit expiry: this attempt returned no response at all, so another
         // candidate loses nothing. `Timeout` is deliberately absent: it means the
         // overall lifetime elapsed or a delivered stream stopped, and routing
@@ -1085,15 +1180,61 @@ pub struct CapabilityFacts {
     pub no_inline_image: bool,
     /// The backing deployment cannot accept tool definitions or calls.
     pub no_tool_calling: bool,
-    /// The backing deployment may only receive payloads a caller has cleared for it.
+    /// The backing deployment cannot carry a caller's explicit reasoning control.
     ///
-    /// A provider property, not a request-fit capability, kept beside them because this is
-    /// the one per-target fact set the pre-dispatch filter reads. A free provider tier that
-    /// uses submitted content to improve its products makes every payload an egress event,
-    /// so a target behind it is ineligible unless the request carries a clearance that this
-    /// deployment accepts. Defaults to `false`: only a deployment that states the
-    /// requirement gets the gate, so every existing target keeps the behaviour it had.
-    pub requires_public_payload: bool,
+    /// Measured per family rather than inferred: a hosted free model can think natively and
+    /// still reject the control that asks it not to (Google's hosted Gemma answers HTTP 400
+    /// to `reasoning_effort: none`). A request that carries such a control is not sent to a
+    /// target that states this, because forwarding it would either fail the call or silently
+    /// enforce something the deployment never agreed to. Defaults to `false`, so a target
+    /// that states nothing keeps the behaviour it had.
+    pub no_reasoning_control: bool,
+    /// Whether the provider charges nothing for a request here within a declared allowance.
+    ///
+    /// A selection fact, not an economics one: it decides that a paid request may never be
+    /// chosen ahead of an eligible free one. Defaults to `false`, which is the conservative
+    /// answer - an undeclared target is never promoted above a target that states it is free.
+    pub free_tier: bool,
+    /// The physical model's own request window: input tokens plus the output it can emit.
+    ///
+    /// Distinct from the route's advertised `context_window`, which is a promise made to
+    /// callers before any target is chosen. A route aggregating several physical models may
+    /// advertise the widest of them; a request is only dispatched to a target that can
+    /// actually hold it. `None` means the deployment has not stated a physical window, and
+    /// the target stays eligible on this axis — which is what every pre-existing target
+    /// does.
+    pub context_window: Option<u64>,
+    /// The most input one request may carry at this target, when a provider caps it below
+    /// the model's own window.
+    ///
+    /// A per-request fit ceiling, not a rate. It exists for a model whose per-minute input
+    /// budget is smaller than its context window — the free hosted Gemma models accept a
+    /// 262,144-token window but allocate 16,000 input tokens per minute — because a request
+    /// larger than a whole minute's budget cannot be served at all, however long the caller
+    /// waits. `None` means only the context window applies.
+    pub max_input_tokens: Option<u64>,
+    /// The most input one request may carry *after the admission margin*, when the target
+    /// declares a per-minute input window.
+    ///
+    /// The pre-dispatch counterpart of the send-path reservation. `max_input_tokens` is the
+    /// provider's own per-request ceiling; this is the smaller number the deployment will
+    /// actually admit, because a pre-dispatch estimate that lands just under a window can
+    /// still be charged above it. A request over this bound is not dispatched to this
+    /// target at all: the route advances to a candidate with a wider window rather than
+    /// spending eligibility on a request the governor will refuse or the provider will
+    /// overrun. `None` means the target declares no minute token window.
+    pub safe_input_tokens: Option<u64>,
+    /// The smallest output reservation this target can answer within.
+    ///
+    /// Set only for a target whose reasoning is charged against the caller's output budget
+    /// (a `hosted_reasoning = "thought_tag"` upstream). Such a target must fit both its
+    /// thinking and its answer inside `max_output_tokens`; below this reservation it cannot
+    /// produce an answer at all, and dispatching it spends a provider request to discover a
+    /// fact the deployment already knows. A request under the floor is therefore ineligible
+    /// rather than attempted, which is also what keeps a caller's tiny reservation from
+    /// being recorded as a failure of the model. `None` means no floor is declared, which is
+    /// every target that counts its reasoning as output or does not reason at all.
+    pub min_output_tokens: Option<u64>,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.
@@ -1510,6 +1651,89 @@ mod tests {
     use crate::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
     use switchyard_protocol::Category;
 
+    /// Google names its condition in the body, and the name decides the route's response.
+    ///
+    /// The two 429s are the point: a window throttle may be retried or stepped past, while a
+    /// spent daily quota stops the candidate list because every candidate behind the same
+    /// project draws on it. A policy block is an outcome about the request, so it is neither
+    /// an outage nor a reason to hand the same prompt to a more permissive provider.
+    #[test]
+    fn a_google_condition_decides_the_failure_class() {
+        let call = |status: u16, body: &str| {
+            LibsyError::client_call(
+                "gemini",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::from_u16(status).expect("status"),
+                    body: body.to_string(),
+                },
+            )
+        };
+
+        let throttle = call(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow"}}"#,
+        );
+        assert_eq!(failure_class(&throttle), FailureClass::RateLimited);
+        assert!(fallback_reason(&throttle).is_some());
+
+        // A model-scoped daily quota retires one leg; its siblings still have budget, so the
+        // route must be able to move on rather than ending on evidence that never said the
+        // project was out.
+        let model_quota = call(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily"}}"#,
+        );
+        assert_eq!(
+            failure_class(&model_quota),
+            FailureClass::TemporarilyUnavailable
+        );
+        assert!(fallback_reason(&model_quota).is_some());
+
+        // A positively project-wide quota is the opposite fact.
+        let project_quota = call(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                  {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier"}]}]}}"#,
+        );
+        assert_eq!(failure_class(&project_quota), FailureClass::AccountQuota);
+        assert!(
+            fallback_reason(&project_quota).is_none(),
+            "a project-wide quota is shared by every candidate"
+        );
+
+        // Capacity, in the measured list-wrapped 31B shape.
+        let capacity = call(
+            503,
+            r#"[{"error":{"code":503,"status":"UNAVAILABLE","message":"high demand"}}]"#,
+        );
+        assert_eq!(
+            failure_class(&capacity),
+            FailureClass::TemporarilyUnavailable
+        );
+        assert!(fallback_reason(&capacity).is_some());
+
+        let blocked = call(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert_eq!(failure_class(&blocked), FailureClass::ProviderPolicy);
+        assert!(fallback_reason(&blocked).is_none());
+
+        // A denied permission is scoped to the credential and must not become a hop.
+        let denied = call(
+            403,
+            r#"{"error":{"code":"permission_denied","message":"no access"}}"#,
+        );
+        assert_eq!(failure_class(&denied), FailureClass::Auth);
+        assert!(fallback_reason(&denied).is_none());
+
+        // A slug that is not served may be routed around; a missing asset may not.
+        let missing_model = call(
+            404,
+            r#"{"error":{"code":"model_not_found","message":"gone"}}"#,
+        );
+        assert_eq!(failure_class(&missing_model), FailureClass::ModelRetired);
+        assert!(fallback_reason(&missing_model).is_some());
+    }
+
     /// The free-model allowance covers the provider's free-model ROUTER too.
     ///
     /// The router spends the same account-wide allowance but its slug carries no `:free`
@@ -1607,6 +1831,7 @@ mod tests {
         ServerError,
         StreamSuccess,
         MidStreamError,
+        EmptyAnswer,
     }
 
     struct CandidateClient {
@@ -1652,6 +1877,10 @@ mod tests {
                             "response did not finish within the overall budget",
                         )
                         .into(),
+                    }),
+                    FirstOutcome::EmptyAnswer => Err(LlmClientError::EmptyAnswer {
+                        model,
+                        reason: "empty_answer_zero_completion",
                     }),
                     FirstOutcome::StreamSuccess => Ok(stream_response(vec![
                         LlmResponseChunk::TextDelta {
@@ -1811,6 +2040,7 @@ mod tests {
                     is_success: true,
                     duration: std::time::Duration::ZERO,
                     usage: None,
+                    outcome: None,
                 })
                 .into(),
         )));
@@ -1876,6 +2106,7 @@ mod tests {
                         extra_headers: BTreeMap::new(),
                         extra_body: BTreeMap::from([("store".to_string(), json!(store))]),
                         omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
                         reasoning_effort: None,
                         reasoning_policy: None,
                         reasoning_dialect: ReasoningDialect::default(),
@@ -1887,7 +2118,8 @@ mod tests {
                         stream_idle_timeout: None,
                         requires_list_input: false,
                         allowance: None,
-                        requires_public_payload: false,
+                        pacing: None,
+                        hosted_reasoning: None,
                     };
                     let backend = if responses {
                         Backend::OpenAiResponses(config)
@@ -2031,6 +2263,7 @@ mod tests {
                     extra_headers: BTreeMap::new(),
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
                     reasoning_effort: None,
                     reasoning_policy: None,
                     reasoning_dialect: ReasoningDialect::default(),
@@ -2042,7 +2275,8 @@ mod tests {
                     stream_idle_timeout: None,
                     requires_list_input: false,
                     allowance: None,
-                    requires_public_payload: false,
+                    pacing: None,
+                    hosted_reasoning: None,
                 }),
                 None,
             )])
@@ -2917,6 +3151,24 @@ mod tests {
         Ok(())
     }
 
+    /// Measured 2026-11-21 on the live deployment: `smart-nt` selected hosted Gemma 4 26B,
+    /// which spent its entire output budget on inline reasoning and returned
+    /// `completion_tokens: 0` with no content. Before this, the route ended with a 500 even
+    /// though `gpt-6-luna` was configured and idle. An empty answer is a fact about the leg,
+    /// so the route must reach the sibling.
+    #[tokio::test]
+    async fn an_empty_answer_falls_back_to_the_next_candidate() -> Result<()> {
+        let (client, result) = run_candidates(FirstOutcome::EmptyAnswer).await;
+        let (_, response) = result.expect("an empty answer must not end the route");
+        assert_eq!(
+            &*client.calls.lock(),
+            &[ModelId::from("weak"), "strong".into()],
+            "the sibling must be asked after an empty answer"
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_pre_commit_attempt_timeout_falls_back_but_a_committed_timeout_does_not() -> Result<()>
     {
@@ -2985,6 +3237,7 @@ mod tests {
                     extra_headers: BTreeMap::new(),
                     extra_body: BTreeMap::new(),
                     omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
                     reasoning_effort: None,
                     reasoning_policy: None,
                     reasoning_dialect: ReasoningDialect::default(),
@@ -2996,7 +3249,8 @@ mod tests {
                     stream_idle_timeout: None,
                     requires_list_input: false,
                     allowance: None,
-                    requires_public_payload: false,
+                    pacing: None,
+                    hosted_reasoning: None,
                 })
             };
             TranslatingLlmClient::new(&[
@@ -3078,6 +3332,7 @@ mod tests {
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
                 reasoning_effort: None,
                 reasoning_policy: None,
                 reasoning_dialect: ReasoningDialect::default(),
@@ -3089,7 +3344,8 @@ mod tests {
                 stream_idle_timeout: None,
                 requires_list_input: false,
                 allowance: None,
-                requires_public_payload: false,
+                pacing: None,
+                hosted_reasoning: None,
             })
         };
         let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
@@ -3170,6 +3426,137 @@ mod tests {
         Ok(())
     }
 
+    /// One exhausted Free-tier model must not condemn its siblings on the same credential.
+    ///
+    /// This is the whole point of reading the quota's scope instead of its status: Google
+    /// allocates Free-tier RPD per model, so `gemini-3.6-flash` spending its 20 requests
+    /// says nothing about the Gemma leaf behind the same project key. Before the scope was
+    /// read, the first 429 became `AccountQuota` and the pool stopped - one model's spent
+    /// allowance silently retired every other Free capability on the credential.
+    #[tokio::test]
+    async fn one_spent_gemini_quota_retires_its_model_and_not_the_free_pool() -> Result<()> {
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        // The two 429 bodies the AI Studio surface really sends: the same `quota_exceeded`
+        // code, differing only in whether the quota id names a model.
+        const MODEL_SCOPED: &str = r#"{"error":{"code":429,"message":"quota",
+            "status":"RESOURCE_EXHAUSTED","details":[
+              {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED",
+               "domain":"googleapis.com","metadata":{
+                 "quota_limit":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                 "quota_limit_value":"20",
+                 "quota_metric":"generativelanguage.googleapis.com/generate_content_free_tier_requests"}},
+              {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                 {"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                  "quotaDimensions":{"location":"global","model":"gemini-3.6-flash"}}]}]}}"#;
+        const PROJECT_SCOPED: &str = r#"{"error":{"code":429,"message":"quota",
+            "status":"RESOURCE_EXHAUSTED","details":[
+              {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                 {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier",
+                  "quotaDimensions":{"location":"global"}}]}]}}"#;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                observed.lock().push(model.clone());
+                match model.as_str() {
+                    "spent-flash" => ResponseTemplate::new(429).set_body_string(MODEL_SCOPED),
+                    "spent-project" => ResponseTemplate::new(429).set_body_string(PROJECT_SCOPED),
+                    _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "answer",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {}
+                    })),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let build = || {
+            Backend::OpenAiChat(HttpBackendConfig {
+                base_url: format!("{}/v1", server.uri()),
+                api_key: None,
+                forward_auth: false,
+                extra_headers: BTreeMap::new(),
+                extra_body: BTreeMap::new(),
+                omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
+                reasoning_effort: None,
+                reasoning_policy: None,
+                reasoning_dialect: ReasoningDialect::default(),
+                max_retries: 0,
+                failure_cooldown: std::time::Duration::from_secs(60),
+                // No group: the sibling shares the credential but not a pool-wide verdict.
+                cooldown_group: None,
+                timeout: None,
+                attempt_timeout: None,
+                stream_idle_timeout: None,
+                requires_list_input: false,
+                allowance: None,
+                pacing: None,
+                hosted_reasoning: None,
+            })
+        };
+        let client = |names: &[&str]| {
+            let models: Vec<ModelConfig> = names
+                .iter()
+                .map(|name| ModelConfig::new(*name, build(), None))
+                .collect();
+            TranslatingLlmClient::new(&models)
+                .map(Arc::new)
+                .map_err(|error| LibsyError::external("building test client", error))
+        };
+        let attempt = async |client: Arc<TranslatingLlmClient>, names: &[&str]| {
+            let outcome = run(
+                Arc::new(CandidateAlgorithm {}),
+                ClientRouter::single(client),
+                request(),
+                to_category_map(names),
+                None,
+            )
+            .await;
+            let calls: Vec<String> = std::mem::take(&mut *calls.lock());
+            (outcome, calls)
+        };
+
+        // A per-model quota retires that model and the sibling serves the request.
+        let per_model = client(&["spent-flash", "gemma-4-31b-it"])?;
+        let (outcome, seen) = attempt(per_model, &["spent-flash", "gemma-4-31b-it"]).await;
+        let (_, response) = outcome.expect("the healthy sibling answers");
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("gemma-4-31b-it"),
+            "the fallback model is the one that answered"
+        );
+        assert_eq!(
+            seen,
+            ["spent-flash", "gemma-4-31b-it"],
+            "a model-scoped quota must not stop the candidate list"
+        );
+
+        // Contrast: a positively project-wide quota still stops the pool after one call.
+        let project = client(&["spent-project", "gemma-4-31b-it"])?;
+        let (outcome, seen) = attempt(project, &["spent-project", "gemma-4-31b-it"]).await;
+        assert!(
+            outcome.is_err(),
+            "a project-wide quota leaves no candidate to serve"
+        );
+        assert_eq!(
+            seen,
+            ["spent-project"],
+            "a project-wide quota stops the list without a second call"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn streams_are_outside_the_candidate_fallback_boundary() -> Result<()> {
         // Receiving a stream handle is a successful call and ends candidate selection.
@@ -3243,6 +3630,7 @@ mod tests {
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
                 reasoning_effort: None,
                 reasoning_policy: None,
                 reasoning_dialect: ReasoningDialect::default(),
@@ -3254,7 +3642,8 @@ mod tests {
                 stream_idle_timeout: None,
                 requires_list_input: false,
                 allowance: None,
-                requires_public_payload: false,
+                pacing: None,
+                hosted_reasoning: None,
             })
         };
         let client = Arc::new(

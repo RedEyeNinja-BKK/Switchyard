@@ -107,7 +107,6 @@ impl RunnerError {
             | Self::IncompatibleCallerFormat(_)
             | Self::AuxiliaryUnsupported
             | Self::UnsupportedCapability { .. }
-            | Self::PrivacyRefused { .. }
             | Self::StateConflict(_) => summary(
                 RouteErrorKind::InvalidRequest,
                 RouteErrorPhase::BeforeResponse,

@@ -3,14 +3,17 @@
 
 //! One configured algorithm and the clients that serve its targets.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
 use libsy::{Algorithm, LibsyError, RoutingOutcome, RuntimeModels};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
 use switchyard_llm_client::{
-    AuxiliaryOperation, ClientRouter, RunObservation, RunObserver, TranslatingLlmClient,
+    AttemptTrace, AuxiliaryOperation, CandidateTrace, ClientRouter, RunObservation, RunObserver,
+    SelectionTrace, TranslatingLlmClient,
 };
 use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat};
 use thiserror::Error;
@@ -163,6 +166,75 @@ impl MediaCarrier {
 /// `None` is not "unstated": it is the case where the target refuses video, expressed either
 /// as `no_video` or as both carrier facts at once. Returning a carrier there would name a
 /// transport the target cannot use, and the caller's video boolean already refuses it.
+/// What one model must be able to hold for this request: the input it carries plus the
+/// output the caller reserved.
+///
+/// A window that fits the input but not the reservation rejects the request upstream after
+/// the target was already chosen, so the fit is judged on the whole need. Both the
+/// per-candidate filter and the composite's pre-check read this, so the two cannot disagree
+/// about whether a request fits.
+fn required_tokens(request: &Request) -> u64 {
+    let raw = request
+        .raw_request
+        .as_ref()
+        .unwrap_or(&serde_json::Value::Null);
+    let input = crate::request_fit::estimate_input_tokens(raw);
+    request
+        .llm_request
+        .output
+        .max_output_tokens
+        .map_or(input, |reservation| input.saturating_add(reservation))
+}
+
+/// Hands the route's decision record to whichever observer the caller supplied.
+///
+/// Cloning only when someone is listening keeps the cost of the record to the routes that
+/// are actually being watched.
+fn emit_selection(observer: Option<&RunObserver>, trace: &SelectionTrace) {
+    if let Some(observer) = observer {
+        observer(RunObservation::Selection(Box::new(trace.clone())));
+    }
+}
+
+/// Wraps `inner` so every completed call is also appended to `attempts`.
+///
+/// The attempt list is built from the same observations the metrics are recorded from, so a
+/// dispatch that produced no line in the routing log still appears here with its outcome
+/// code - which is the difference between "no attempt" and "an attempt that failed".
+fn recording_observer(
+    attempts: Arc<Mutex<Vec<AttemptTrace>>>,
+    inner: Option<RunObserver>,
+) -> RunObserver {
+    Arc::new(move |observation: RunObservation| {
+        let call = match &observation {
+            RunObservation::LlmCall(call) => Some(("routing", call)),
+            RunObservation::AnswerCall(call) => Some(("answer", call)),
+            _ => None,
+        };
+        if let Some((phase, call)) = call {
+            attempts.lock().push(AttemptTrace {
+                model: call.selected_model.to_string(),
+                phase,
+                outcome: call.outcome.unwrap_or("served"),
+                duration_ms: u64::try_from(call.duration.as_millis()).unwrap_or(u64::MAX),
+                prompt_tokens: call
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.input_tokens)
+                    .unwrap_or(0),
+                completion_tokens: call
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens)
+                    .unwrap_or(0),
+            });
+        }
+        if let Some(inner) = inner.as_ref() {
+            inner(observation);
+        }
+    })
+}
+
 fn carrier_from_facts(facts: &switchyard_llm_client::CapabilityFacts) -> Option<MediaCarrier> {
     if facts.no_video {
         return None;
@@ -255,23 +327,6 @@ pub enum RunnerError {
         model: String,
         capability: &'static str,
     },
-    /// Every candidate this route could use is one that may only receive cleared payloads,
-    /// and the pre-egress gate refused this request.
-    ///
-    /// The request is well-formed; the payload is not cleared for a provider this
-    /// deployment sends nothing uncleared to. Kept separate from
-    /// [`Self::UnsupportedCapability`] because the caller fixes it by clearing the
-    /// request, and separate from [`Self::Configuration`] because the deployment is
-    /// behaving exactly as declared. Reported as a 4xx: no retry of the same bytes can
-    /// change the answer.
-    #[error(
-        "route {route} refused the payload: {codes}",
-        codes = refusals.iter().map(|refusal| refusal.as_str()).collect::<Vec<_>>().join(", ")
-    )]
-    PrivacyRefused {
-        route: String,
-        refusals: Vec<crate::egress::Refusal>,
-    },
     #[error("caller format is incompatible with {} credentials", .0.as_str())]
     IncompatibleCallerFormat(CallerAuthKind),
     #[error("route has no compatible target for the auxiliary operation")]
@@ -334,12 +389,6 @@ pub struct Route {
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
     models: Arc<RuntimeModels>,
-    /// The secret that authenticates a caller's permission to publish a payload.
-    ///
-    /// Carried on the route rather than read from the environment at request time, so the
-    /// decision uses exactly the key the deployment was loaded with. Defaults to a key
-    /// that authenticates nothing.
-    clearance_key: Arc<crate::egress::ClearanceKey>,
     /// The `llm_client` credential each target model id is served by, resolved at load.
     ///
     /// A whole-route composite needs this to decide whether a child that just reported
@@ -347,6 +396,17 @@ pub struct Route {
     /// names a target slug, not the credential, so the credential identity has to come
     /// from configuration. Empty when the route was built without one (tests).
     target_credentials: std::collections::HashMap<ModelId, String>,
+    /// Ordering among candidates that already survived every hard gate.
+    ///
+    /// `None` keeps declared order, which is what every route did before the option
+    /// existed, so a route that does not opt in is untouched by this machinery.
+    selector: Option<Arc<crate::selection::MeasuredSelector>>,
+    /// The daily request allowance serving each target model id.
+    ///
+    /// Selection prefer the candidate with the most requests left in its own budget, so it
+    /// has to read the same counters the dispatch gate reserves against. Empty when the
+    /// route was built without them (tests, or a deployment with no daily limits).
+    daily_allowances: Arc<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -384,17 +444,33 @@ impl Route {
             responses_auxiliary_target,
             decision_targets,
             models: Arc::new(models),
-            clearance_key: Arc::new(crate::egress::ClearanceKey::refusing()),
             target_credentials: std::collections::HashMap::new(),
+            selector: None,
+            daily_allowances: Arc::new(HashMap::new()),
         }
     }
 
-    /// Records the key used to authenticate a caller's privacy clearance.
+    /// Enables measured ordering among the candidates this route has already admitted.
     ///
-    /// Set once at load from `[privacy] clearance_key_env`. A route left without one
-    /// refuses every gated payload rather than admitting it.
-    pub fn with_clearance_key(mut self, key: Arc<crate::egress::ClearanceKey>) -> Self {
-        self.clearance_key = key;
+    /// Set at load from the route's `selection` policy. Without it the route walks its
+    /// declared order, unchanged.
+    pub fn with_measured_selection(
+        mut self,
+        selector: Arc<crate::selection::MeasuredSelector>,
+    ) -> Self {
+        self.selector = Some(selector);
+        self
+    }
+
+    /// Records the daily request allowance behind each target model id.
+    ///
+    /// Selection and dispatch must read one budget: a candidate is offered later only
+    /// because the same counter that will reserve the request says it has room.
+    pub fn with_daily_allowances(
+        mut self,
+        allowances: Arc<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>,
+    ) -> Self {
+        self.daily_allowances = allowances;
         self
     }
 
@@ -521,6 +597,75 @@ impl Route {
         self.clients.continuation_owner(request)
     }
 
+    /// Whether this route would refuse the request before contacting any provider.
+    ///
+    /// Always `false` now: the egress gate and its clearance scheme are removed, so no
+    /// request is ever refused here. The method stays because a composite asks the question
+    /// of every child and the answer is still a routing input - it is simply no longer a
+    /// refusal. Keeping the seam means a future caller-facing gate has one place to appear,
+    /// and keeps the composite's skip path exercised rather than deleted.
+    pub fn payload_refused(&self, _request: &Request) -> bool {
+        false
+    }
+
+    /// Whether no candidate of this route can hold the request, and why.
+    ///
+    /// The physical counterpart of [`Self::payload_refused`]: a composite needs to know
+    /// before the call, because a child that cannot fit the request is ineligible rather
+    /// than failing. Without it the child's own `UnsupportedCapability` error ends the
+    /// whole composite — the request never reaches a wider sibling — which is precisely
+    /// the case an aggregate route exists to handle.
+    ///
+    /// Returns the binding limit's name, or `None` when at least one candidate fits or when
+    /// a candidate states no limits at all. A target that states nothing is unconstrained,
+    /// not zero.
+    pub fn physical_ineligibility(&self, request: &Request) -> Option<&'static str> {
+        let facts = self.clients.target_capabilities();
+        let candidates = self.models.all_models();
+        if candidates.is_empty() {
+            return None;
+        }
+        let required = required_tokens(request);
+        let mut binding: Option<&'static str> = None;
+        for model in &candidates {
+            let facts = facts.get(model)?;
+            if let Some(window) = facts.context_window
+                && required > window
+            {
+                binding = Some("context_window");
+                continue;
+            }
+            if let Some(ceiling) = facts.max_input_tokens
+                && required > ceiling
+            {
+                binding = binding.or(Some("input_tokens_per_minute"));
+                continue;
+            }
+            // The margin-adjusted bound is the same limit reported under the same name: a
+            // caller sees "this is why your request does not fit here", and which side of
+            // the margin it fell on is an operator concern, not a caller one.
+            if let Some(safe) = facts.safe_input_tokens
+                && required > safe
+            {
+                binding = binding.or(Some("input_tokens_per_minute"));
+                continue;
+            }
+            // The same floor the pre-dispatch filter applies, named here as well so a
+            // composite treats it as this child being unable to hold the request rather
+            // than as a child that failed.
+            if let (Some(floor), Some(reservation)) = (
+                facts.min_output_tokens,
+                request.llm_request.output.max_output_tokens,
+            ) && reservation < floor
+            {
+                binding = binding.or(Some("output_budget_below_thinking_floor"));
+                continue;
+            }
+            return None;
+        }
+        binding
+    }
+
     pub async fn execute(
         &self,
         request: Request,
@@ -532,60 +677,149 @@ impl Route {
         // so this adds no second fallback engine and issues no request to a target that
         // cannot answer it.
         let facts = self.clients.target_capabilities().clone();
-        // A target declaring `requires_public_payload` may only receive a payload that
-        // carries a current, well-formed clearance and passes local inspection. Decided
-        // here, once, and only when some candidate actually declares the requirement, so
-        // an ordinary route walks no payload. The result is per MODEL rather than per
-        // route, which is what makes a directly addressed gated leaf pass through the same
-        // gate as a composite child: it is the same filter either way.
-        let admission = facts
-            .values()
-            .any(|facts| facts.requires_public_payload)
-            .then(|| crate::egress::evaluate(&request, &self.clearance_key));
-        let refused = admission.as_ref().filter(|admission| !admission.allowed());
+        // The egress gate and its clearance scheme are removed. Every candidate is judged
+        // only on whether it can physically serve the request; no payload is inspected and
+        // nothing is refused for its content.
         let raw = request
             .raw_request
             .clone()
             .unwrap_or(serde_json::Value::Null);
         let estimated_input_tokens = crate::request_fit::estimate_input_tokens(&raw);
-        let eligibility = |model: &switchyard_protocol::ModelId| {
-            if let Some(facts) = facts.get(model)
-                && facts.requires_public_payload
-                && refused.is_some()
-            {
-                return false;
-            }
-            match facts.get(model) {
-                Some(facts) => {
-                    // An explicit `false` is a refusal; `None` would mean "undeclared",
-                    // which the predicate treats as permitted, so the flag must be carried
-                    // as a concrete boolean.
-                    let capabilities = crate::ModelCapabilities {
-                        vision: Some(!facts.no_vision),
-                        tool_calling: Some(!facts.no_tool_calling),
-                        // Carried as a concrete boolean like the other facts, so an
-                        // undeclared target is treated as video-incapable here.
-                        video: Some(!facts.no_video),
-                        // A target is video-capable at all only if some carrier survives;
-                        // otherwise the boolean above already refuses it and naming a
-                        // carrier would read as a capability it does not have.
-                        video_carrier: carrier_from_facts(facts),
-                        image_carrier: image_carrier_from_facts(facts),
-                        ..crate::ModelCapabilities::default()
-                    };
-                    crate::request_fit::unsupported_capability(
-                        capabilities,
-                        &request.llm_request,
-                        &raw,
-                    )
-                    .is_none()
-                }
+        let required_tokens = required_tokens(&request);
+        // Every hard gate returns a stable code rather than a bare `false`, so a candidate
+        // that was never contacted can still say why. The codes are a closed vocabulary:
+        // they name a rule, never a payload. `unsupported_capability` already answers with
+        // one ("vision", "tool_calling", "video", "reasoning", "image_carrier", ...).
+        let verdict = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
+            let Some(facts) = facts.get(model) else {
                 // Uncharacterised rather than incapable: permitted, except for video,
                 // which no target may receive without stating that it can read it.
-                None => !crate::request_fit::requires_video(&request.llm_request, &raw),
+                return if crate::request_fit::requires_video(&request.llm_request, &raw) {
+                    Err("video_requires_declaration")
+                } else {
+                    Ok(())
+                };
+            };
+            // Physical fit, judged on facts the deployment states about one backing
+            // model. A request that cannot fit is not a request the target should be
+            // asked to refuse: the route advances instead, which is what makes an
+            // aggregate window honest across models of different sizes.
+            if let Some(window) = facts.context_window
+                && required_tokens > window
+            {
+                return Err("context_window");
+            }
+            if let Some(ceiling) = facts.max_input_tokens
+                && required_tokens > ceiling
+            {
+                return Err("max_input_tokens");
+            }
+            // The deployment's own admission bound: an estimate padded to the
+            // admission margin must fit the target's minute window, or the send path
+            // will refuse this candidate anyway. Filtering here is what makes the
+            // refusal useful — the route advances to a sibling with a wider window
+            // instead of discovering the refusal after it has spent eligibility.
+            if let Some(safe) = facts.safe_input_tokens
+                && required_tokens > safe
+            {
+                return Err("minute_window_too_small");
+            }
+            // A target whose own reasoning is charged against the caller's output
+            // reservation cannot answer under a smaller reservation: the thinking runs out
+            // of budget before the answer starts. Skipping it costs nothing and spares the
+            // provider a request whose outcome the deployment can already predict, while
+            // the sibling that counts reasoning as output stays eligible.
+            if let (Some(floor), Some(reservation)) = (
+                facts.min_output_tokens,
+                request.llm_request.output.max_output_tokens,
+            ) && reservation < floor
+            {
+                return Err("output_budget_below_thinking_floor");
+            }
+            // An explicit `false` is a refusal; `None` would mean "undeclared",
+            // which the predicate treats as permitted, so the flag must be carried
+            // as a concrete boolean.
+            let capabilities = crate::ModelCapabilities {
+                vision: Some(!facts.no_vision),
+                tool_calling: Some(!facts.no_tool_calling),
+                // A target that cannot carry a caller's reasoning control must not
+                // be handed one: the wire would either reject it or silently enforce
+                // something the deployment never agreed to. The route advances to a
+                // leg that can carry it, and a directly addressed leaf refuses.
+                reasoning: Some(!facts.no_reasoning_control),
+                // Carried as a concrete boolean like the other facts, so an
+                // undeclared target is treated as video-incapable here.
+                video: Some(!facts.no_video),
+                // A target is video-capable at all only if some carrier survives;
+                // otherwise the boolean above already refuses it and naming a
+                // carrier would read as a capability it does not have.
+                video_carrier: carrier_from_facts(facts),
+                image_carrier: image_carrier_from_facts(facts),
+                ..crate::ModelCapabilities::default()
+            };
+            match crate::request_fit::unsupported_capability(
+                capabilities,
+                &request.llm_request,
+                &raw,
+            ) {
+                Some(capability) => Err(capability),
+                None => Ok(()),
             }
         };
-        let models = self.models.filtered(&eligibility);
+        let considered = self.models.all_models();
+        let verdicts: Vec<Result<(), &'static str>> = considered.iter().map(&verdict).collect();
+        let models = self.models.filtered(&|model| verdict(model).is_ok());
+        // Among candidates that survived every hard gate, a route may prefer what this
+        // deployment has actually observed. This reorders one already-admitted list and
+        // cannot add, drop or resurrect a candidate, so a privacy, capability, fit or
+        // quota refusal is still final.
+        let demand = crate::selection::Demand {
+            required_tokens,
+            needs_tools: crate::request_fit::wants_tools(&request.llm_request, &raw),
+        };
+        // Scores are kept even when no selector is configured, so a report can still name
+        // each candidate's tier and remaining budget. Only the reorder depends on the
+        // selector being present.
+        let mut scores: Vec<crate::selection::CandidateScore> = Vec::new();
+        let models = match self.selector.as_ref() {
+            Some(selector) => {
+                let candidates: Vec<crate::selection::Candidate> = models
+                    .all_models()
+                    .into_iter()
+                    .map(|model| {
+                        let facts = facts.get(&model);
+                        crate::selection::Candidate {
+                            tier: if facts.is_some_and(|facts| facts.free_tier) {
+                                crate::selection::CostTier::Free
+                            } else {
+                                crate::selection::CostTier::Paid
+                            },
+                            remaining_today: self
+                                .daily_allowances
+                                .get(&model)
+                                .map(|allowance| allowance.remaining()),
+                            max_input_tokens: facts.and_then(|facts| facts.max_input_tokens),
+                            context_window: facts.and_then(|facts| facts.context_window),
+                            model,
+                        }
+                    })
+                    .collect();
+                let declared = self.models.all_models();
+                scores = selector.explain(&candidates, demand, &declared);
+                let ordered: Vec<switchyard_protocol::ModelId> =
+                    scores.iter().map(|score| score.model.clone()).collect();
+                let unchanged = candidates
+                    .iter()
+                    .zip(ordered.iter())
+                    .all(|(candidate, model)| &candidate.model == model);
+                if unchanged {
+                    models
+                } else {
+                    models.reordered(&ordered)
+                }
+            }
+            None => models,
+        };
         // Under context pressure the declared escalation leg is offered first, before any
         // provider is contacted. This reorders one list; it does not add a second
         // escalation engine, and the native retry, cooldown and fallback machinery still
@@ -600,6 +834,7 @@ impl Route {
             self.under_context_pressure(estimated_input_tokens)
                 && models.contains(escalation_target)
         });
+        let promoted = promotion.cloned();
         let models = match promotion {
             Some(escalation_target) => {
                 if let Some(observer) = observer.as_ref() {
@@ -629,17 +864,71 @@ impl Route {
                 RouteReasoningPolicy::None => request
                     .with_route_reasoning_policy(switchyard_protocol::ReasoningPolicy::Disabled),
             };
+        // The decision record is built here, before any exit, so a request refused before a
+        // single provider was contacted can still say which candidate failed which rule.
+        // Every field is a code, a count or a position: no prompt text, no provider id.
+        let dispatched = models.all_models();
+        let scores: HashMap<switchyard_protocol::ModelId, crate::selection::CandidateScore> =
+            scores
+                .into_iter()
+                .map(|score| (score.model.clone(), score))
+                .collect();
+        let rank_of: HashMap<switchyard_protocol::ModelId, u32> = dispatched
+            .iter()
+            .enumerate()
+            .map(|(rank, model)| (model.clone(), rank as u32))
+            .collect();
+        let mut trace = SelectionTrace {
+            algorithm: self.algorithm.name().to_string(),
+            considered: considered.iter().map(ToString::to_string).collect(),
+            candidates: considered
+                .iter()
+                .zip(verdicts.iter())
+                .map(|(model, verdict)| {
+                    let facts = facts.get(model);
+                    let score = scores.get(model);
+                    // The selector's own figures win where it ran; without a selector the
+                    // record still names the tier and the pressure the gates judged by,
+                    // rather than reporting a zero it never measured.
+                    let free = score
+                        .map(|score| score.tier == crate::selection::CostTier::Free)
+                        .or_else(|| facts.map(|facts| facts.free_tier))
+                        .unwrap_or(false);
+                    CandidateTrace {
+                        model: model.to_string(),
+                        eligible: verdict.is_ok(),
+                        exclusion: verdict.err(),
+                        tier: if free { "free" } else { "paid" },
+                        rank: rank_of.get(model).copied(),
+                        remaining_today: score.and_then(|score| score.remaining_today),
+                        pressure_permille: score.map_or_else(
+                            || {
+                                crate::selection::pressure_permille(
+                                    demand.required_tokens(),
+                                    facts.and_then(|facts| {
+                                        facts.max_input_tokens.or(facts.context_window)
+                                    }),
+                                )
+                            },
+                            |score| score.pressure_permille,
+                        ),
+                        demotion: score.and_then(|score| score.demotion),
+                    }
+                })
+                .collect(),
+            dispatched: dispatched.iter().map(ToString::to_string).collect(),
+            attempts: Vec::new(),
+            served: None,
+            outcome: "no_eligible_candidate",
+            demand_tokens: demand.required_tokens(),
+            estimated_input_tokens,
+            promotion: promoted.map(|model| model.to_string()),
+        };
         if models.is_empty() {
-            // A refusal the gate caused is reported as itself, not as a capability the
-            // request lacks: the caller's correction is different (clear the request,
-            // rather than change what it asks for), and the gate's reasons are the only
-            // actionable description of why the bytes could not leave.
-            if let Some(admission) = refused {
-                return Err(RunnerError::PrivacyRefused {
-                    route: self.algorithm.name().to_string(),
-                    refusals: admission.refusals().to_vec(),
-                });
-            }
+            // Nothing was dispatched, so the record is the whole story: exclusion codes and
+            // an empty attempt list. Emitted before either refusal so the caller and the
+            // routing log name the same reason.
+            emit_selection(observer.as_ref(), &trace);
             // Nothing in this route can serve the request, which is the caller's request
             // rather than a deployment fault. The skipped targets get no provider call.
             // Name what the request needs, not what the route happens to lack: the route's
@@ -673,23 +962,80 @@ impl Route {
                         &raw,
                     )
                 })
+                // A request that fits every capability and still found nothing was excluded
+                // on size. Naming the binding limit is the difference between a caller who
+                // knows to send less and one who reads "ineligible" and retries the same
+                // payload: the physical gate is the only other reason a candidate drops out,
+                // and it is reported only when no candidate fits at all.
+                .or_else(|| self.physical_ineligibility(&request))
                 .unwrap_or("an eligible route");
             return Err(RunnerError::unsupported_capability(
                 self.algorithm.name(),
                 capability,
             ));
         }
-        let (selected_model, response) = switchyard_llm_client::run(
+        // The measurement rides on the observation the run already emits, so no separate
+        // timing path exists to disagree with the recorded one.
+        //
+        // The caller's observer is kept separately: the run consumes its own copy down into
+        // the algorithm, and the selection record must be emitted after the terminal attempt
+        // has been observed, or it would report a dispatch with no outcomes.
+        let report = observer.clone();
+        let attempts: Arc<Mutex<Vec<AttemptTrace>>> = Arc::new(Mutex::new(Vec::new()));
+        let observer = Some(recording_observer(
+            Arc::clone(&attempts),
+            self.selecting_observer(observer),
+        ));
+        let result = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
             request,
             Arc::new(models),
             observer,
         )
-        .await?;
+        .await;
+        {
+            trace.attempts = attempts.lock().clone();
+            match &result {
+                Ok((selected_model, _)) => {
+                    // Name the model that answered, not the one the algorithm picked first.
+                    // A 5xx or an empty answer on the first candidate makes the run fall
+                    // through to the next, and reporting the first would credit a model that
+                    // answered nothing -- measured 2026-11-21, six `smart-nt` records named
+                    // `gemma-4-31b-it` as served while `gemini-3.x-flash-lite` answered.
+                    trace.served = trace
+                        .attempts
+                        .iter()
+                        .rev()
+                        .find(|attempt| attempt.outcome == "served")
+                        .map(|attempt| attempt.model.clone())
+                        .or_else(|| Some(selected_model.to_string()));
+                    trace.outcome = "served";
+                }
+                // Every candidate was eligible and at least one was dispatched, so an error
+                // here is a deployment fault rather than a request the route could not fit.
+                Err(_) => trace.outcome = "failed",
+            }
+        }
+        emit_selection(report.as_ref(), &trace);
+        let (selected_model, response) = result?;
         Ok(RunOutput {
             selected_model,
             response,
+        })
+    }
+
+    /// Composes the route's own observer in front of the caller's, when this route measures.
+    fn selecting_observer(&self, observer: Option<RunObserver>) -> Option<RunObserver> {
+        let Some(selector) = self.selector.as_ref().map(Arc::clone) else {
+            return observer;
+        };
+        Some(match observer {
+            Some(observer) => Arc::new(move |observation: RunObservation| {
+                selector.observe(&observation);
+                observer(observation);
+            }),
+            None => Arc::new(move |observation: RunObservation| selector.observe(&observation)),
         })
     }
 

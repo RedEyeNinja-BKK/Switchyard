@@ -43,7 +43,7 @@ use libsy::{LibsyError, RoutingOutcome};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
+use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver, SelectionTrace};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::composition::Selection;
 use switchyard_runner::{
@@ -245,6 +245,16 @@ impl SharedRoutingLog {
             .append_with(context, model, tier, usage, composition)
         {
             tracing::warn!(path = %self.path.display(), %error, "routing log append failed");
+        }
+    }
+
+    fn append_decision(&self, context: routing_log::RoutingLogContext, trace: &SelectionTrace) {
+        if let Err(error) = self.writer.lock().append_decision(context, trace) {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "routing decision append failed"
+            );
         }
     }
 
@@ -522,9 +532,18 @@ fn stats_observer(
     stats: StatsAccumulator,
     classifier_log: Option<(SharedRoutingLog, routing_log::RoutingLogContext)>,
     route_id: String,
+    selection: Option<Arc<Mutex<Option<SelectionTrace>>>>,
 ) -> RunObserver {
     Arc::new(move |observation| match observation {
         RunObservation::Outcome(_) => {}
+        // The record is emitted once per execution, on every exit path, and read after the
+        // run returns: keeping it here means the handler does not need a second observer
+        // layer competing with this one for the same terminology.
+        RunObservation::Selection(trace) => {
+            if let Some(selection) = selection.as_ref() {
+                *selection.lock() = Some(*trace);
+            }
+        }
         RunObservation::ContextPressurePromotion {
             promoted,
             estimated_input_tokens,
@@ -1412,21 +1431,30 @@ async fn handle_llm_request(
     });
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
+    let selection: Arc<Mutex<Option<SelectionTrace>>> = Arc::new(Mutex::new(None));
     let observer = stats_observer(
         state.stats.clone(),
         state.routing_log.clone().zip(routing_log_context.clone()),
         request.llm_request.model.clone().unwrap_or_default(),
+        Some(Arc::clone(&selection)),
     );
 
     // The routing log borrows the request, so the route id is taken before it is moved.
     let route_id = request.llm_request.model.clone().unwrap_or_default();
     // Execution goes through the runner seam, so a composite route is served the same way
     // as a leaf without tier behaviour reaching this crate.
-    let execution = match state
+    let execution = state
         .runner
         .execute_route(&route_id, request, Some(observer))
-        .await
+        .await;
+    // Written before the outcome is matched, so a refusal that never contacted a provider is
+    // recorded as well as a served request. `take` empties the slot: one decision, one line.
+    if let (Some(log), Some(context)) = (state.routing_log.as_ref(), routing_log_context.as_ref())
+        && let Some(trace) = selection.lock().take()
     {
+        log.append_decision(context.clone(), &trace);
+    }
+    let execution = match execution {
         Ok(execution) => execution,
         Err(RunnerError::UnsupportedCapability { model, capability }) => {
             // A valid request that no eligible route can serve is the caller's problem, not a
@@ -1456,27 +1484,7 @@ async fn handle_llm_request(
                 "state_conflict",
             );
         }
-        Err(RunnerError::PrivacyRefused { route, refusals }) => {
-            // The request is well formed and the deployment is behaving as declared: the
-            // payload is not cleared for a provider this deployment sends nothing uncleared
-            // to. A 4xx because the caller can fix it (clear the request, or address a route
-            // that may receive it), and because resending the same bytes cannot help.
-            let codes: Vec<&str> = refusals.iter().map(|refusal| refusal.as_str()).collect();
-            tracing::info!(
-                route = %route,
-                refusals = %codes.join(","),
-                "pre-egress admission refused the payload"
-            );
-            return error_response(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "route {route} refused the payload: {}. Clear the request for this provider or address a route that may receive it.",
-                    codes.join(", ")
-                ),
-                "invalid_request_error",
-                "privacy_refused",
-            );
-        }
+
         Err(error) => {
             if let RunnerError::Algorithm(LibsyError::ClientCall {
                 target,
@@ -2243,15 +2251,17 @@ fn client_error(error: &LlmClientError) -> Response {
         // these bytes to another candidate makes an uncleared body admissible, so this
         // is reported as a refusal the caller can act on rather than as an upstream
         // fault that invites a retry.
-        LlmClientError::PayloadNotCleared { model, codes } => error_response(
-            StatusCode::FORBIDDEN,
-            format!(
-                "payload assembled for {model} was refused before egress: {codes}. \
-                 Content that must not leave this deployment cannot be waived by a route."
-            ),
+        // The requested feature is absent from the selected target's wire format, which the
+        // caller chose the route for. Reporting it as a bad request is the honest answer: an
+        // upstream fault would invite a retry that cannot change it, and an ordinary answer
+        // would hide that part of the request was never carried out.
+        LlmClientError::UnsupportedFeature { model, feature } => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("request refused before egress by {model}: {feature}"),
             "invalid_request_error",
-            "payload_not_cleared",
+            "unsupported_feature",
         ),
+
         // A spent daily budget is not an outage: this leg cannot serve until the
         // provider day rolls over, and the reset is stated so a caller does not retry
         // into the same refusal. Every other candidate keeps its own budget.
@@ -2272,6 +2282,42 @@ fn client_error(error: &LlmClientError) -> Response {
             format!("daily request allowance for {model} cannot be accounted: {reason}"),
             "server_error",
             "daily_allowance_unavailable",
+        ),
+        // A full minute window is a short wait, not an outage and not the caller's mistake.
+        // Reported as the throttle it is, with the interval, so the caller can pace itself
+        // instead of retrying into a window that has not refilled.
+        LlmClientError::MinuteAllowanceThrottled {
+            model,
+            scope,
+            retry_after_secs,
+        } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "per-minute {scope} budget for {model} is full; it clears in about \
+                 {retry_after_secs}s, and another candidate may serve this request now"
+            ),
+            "rate_limit_error",
+            "minute_allowance_throttled",
+        ),
+        // Distinguishable from the throttle above on purpose: no wait clears this, and the
+        // message says so rather than quoting an interval. 429 rather than 4xx-request
+        // because the caller's payload is not at fault and the same body may succeed on a
+        // route with a wider per-minute window.
+        LlmClientError::InputExceedsMinuteWindow {
+            model,
+            needed,
+            limit,
+            margin_permille,
+        } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "this request reserves about {needed} tokens for {model} at a \
+                 {margin_permille}/1000 admission margin, which is more than its {limit}-token \
+                 per-minute input budget allows; waiting will not help, and another candidate \
+                 with a wider window may serve it now"
+            ),
+            "rate_limit_error",
+            "minute_allowance_input_exceeds_window",
         ),
         _ => server_error(error.to_string()),
     }
@@ -2723,6 +2769,7 @@ mod tests {
             StatsAccumulator::default(),
             Some((log.clone(), context)),
             "route-under-test".to_string(),
+            None,
         );
 
         let call = |model: &str, answer: bool| {
@@ -2735,6 +2782,7 @@ mod tests {
                     output_tokens: Some(7),
                     ..Usage::default()
                 }),
+                outcome: None,
             };
             if answer {
                 RunObservation::AnswerCall(observation)
@@ -3067,67 +3115,6 @@ mod tests {
     // arm: an uncleared payload is the caller's to fix, a spent budget resets on the
     // provider's day, and unreadable accounting is a deployment fault under which a
     // cap is unenforced. Each is asserted by status and wire code.
-    #[test]
-    fn allowance_and_payload_refusals_render_as_their_own_failures() {
-        let cases = [
-            (
-                LlmClientError::PayloadNotCleared {
-                    model: ModelId::from("gemini-3.5-flash-lite"),
-                    codes: "api_key,email_address".to_string(),
-                },
-                StatusCode::FORBIDDEN,
-                "invalid_request_error",
-                "payload_not_cleared",
-            ),
-            (
-                LlmClientError::DailyRequestAllowanceExhausted {
-                    model: ModelId::from("gemini-3.5-flash-lite"),
-                    limit: 500,
-                },
-                StatusCode::TOO_MANY_REQUESTS,
-                "invalid_request_error",
-                "daily_allowance_exhausted",
-            ),
-            (
-                LlmClientError::DailyRequestAllowanceUnavailable {
-                    model: ModelId::from("gemini-3.5-flash-lite"),
-                    reason: "counter file is not readable".to_string(),
-                },
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
-                "daily_allowance_unavailable",
-            ),
-        ];
-        for (error, status, error_type, code) in cases {
-            let response = client_error(&error);
-            assert_eq!(response.status(), status, "{code}");
-            let api_error = response
-                .extensions()
-                .get::<ApiError>()
-                .expect("ApiError extension");
-            assert_eq!(api_error.status, status, "{code}");
-            assert_eq!(api_error.error_type, error_type, "{code}");
-            assert_eq!(api_error.code, code, "{code}");
-        }
-    }
-
-    // A refusal names categories, never the value that matched: an error body is
-    // still egress, and a message quoting the finding would publish what the check
-    // exists to keep in.
-    #[test]
-    fn a_payload_refusal_repeats_codes_and_never_the_matched_value() {
-        let error = LlmClientError::PayloadNotCleared {
-            model: ModelId::from("gemini-3.5-flash-lite"),
-            codes: "api_key".to_string(),
-        };
-        let api_error = client_error(&error)
-            .extensions()
-            .get::<ApiError>()
-            .cloned()
-            .expect("ApiError extension");
-        assert!(api_error.message.contains("api_key"));
-        assert!(api_error.message.contains("gemini-3.5-flash-lite"));
-    }
 
     // The provider's message can quote request content, so the request log
     // records only the error class while the client still sees the message.

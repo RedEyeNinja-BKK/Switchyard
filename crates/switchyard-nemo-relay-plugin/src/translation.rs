@@ -44,6 +44,9 @@ fn policy() -> TranslationPolicy {
         },
         preservation: PreservationPolicy::InMemory,
         target_capabilities: TargetCapabilities::default(),
+        // The relay carries no provider-specific response shaping: a marker belongs to the
+        // upstream that emits it, and this plugin is not that upstream.
+        hosted_reasoning: None,
     }
 }
 

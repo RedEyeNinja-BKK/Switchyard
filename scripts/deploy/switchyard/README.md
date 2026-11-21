@@ -73,13 +73,20 @@ release adopted from what is already running can never be attested.
 
 All paths and commands can be overridden by environment variable
 (`LIVE_BIN`, `LIVE_MANIFEST`, `RELEASE_ROOT`, `RESTART_CMD`, `HEALTH_CMD`,
-`VALIDATE_CMD`, `CAPABILITY_TOOL`, `ENV_FILE_1`, `ENV_FILE_2`, `MANIFEST_GROUP`).
+`VALIDATE_CMD`, `CAPABILITY_TOOL`, `ENV_FILE_1`, `ENV_FILE_2`, `ENV_FILES`,
+`SYSTEMCTL`, `MANIFEST_GROUP`).
 Those seams exist so the failure paths can be tested without touching production.
+
+The candidate is validated under the environment the **unit** declares, read from
+`systemctl show -p EnvironmentFiles`. A credential added as a drop-in is therefore
+picked up without changing this script; `ENV_FILE_1`/`ENV_FILE_2` are the fallback
+when the unit cannot be queried, and `ENV_FILES` overrides both.
 
 `test_release_recovery.py` was removed with the installer it exercised. Its cases
 are covered, and in more detail, by `scripts/release/test_activate_release.py`
-(26 acceptance tests: deploy, rollback, promote, verify, adopt, retention, the
-capability gate, the validation gate, attestation, pointer independence). That
+(30 acceptance tests: deploy, rollback, promote, verify, adopt, retention, the
+capability gate, the validation gate, the environment the candidate is validated
+under, attestation, pointer independence). That
 harness also defaulted to a `/var/tmp` scratch path and contained no
 pytest-collectable tests, so it never ran in CI.
 

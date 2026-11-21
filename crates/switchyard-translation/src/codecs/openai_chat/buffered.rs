@@ -313,6 +313,20 @@ impl FormatCodec for OpenAiChatCodec {
                     "$.choices[0].message.content",
                 )?,
             };
+            if let Some(marker) = _policy.hosted_reasoning {
+                // The upstream put its reasoning in the visible message. Move it to a
+                // reasoning block before anything downstream can read it as the answer:
+                // `content` is what a caller displays, so the split has to happen here
+                // rather than in a presentation layer that may not exist.
+                content = split_hosted_reasoning_blocks(marker, content).map_err(|leak| {
+                    crate::TranslationError::InvalidValue {
+                        path: "$.choices[0].message.content".to_string(),
+                        message: format!(
+                            "response text carried a malformed inline reasoning block: {leak}"
+                        ),
+                    }
+                })?;
+            }
             prepend_openai_reasoning_blocks(&mut content, &message);
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -518,6 +532,41 @@ pub(crate) fn role_from_openai(role: Option<&str>, path: &str) -> Result<Role> {
 }
 
 /// Decodes OpenAI-style content into normalized content blocks.
+/// Moves an inline hosted reasoning block out of the visible text, and discards it.
+///
+/// Each text block is split with the shared factory, so the buffered path and the streaming
+/// path agree on what a block is. A message that fails the split is an error: emitting the
+/// text unchanged would leak the monologue, and emitting only the part before the failure
+/// would truncate an answer without saying so.
+///
+/// The reasoning is dropped rather than rebuilt as a `Reasoning` block. A reasoning block is
+/// not private: the chat encoder writes it back out as `reasoning_content`, so carrying the
+/// monologue there would hand it to the caller through a second field while the answer looked
+/// clean. Text the model marked as its own thinking is internal to the target that declared
+/// the marker, and the provider's own `reasoning_content` field is the only reasoning this
+/// translation passes through.
+fn split_hosted_reasoning_blocks(
+    marker: crate::codecs::openai_chat::HostedReasoningMarker,
+    content: Vec<ContentBlock>,
+) -> std::result::Result<Vec<ContentBlock>, crate::codecs::openai_chat::ThoughtLeak> {
+    let _ = marker;
+    let mut rebuilt = Vec::with_capacity(content.len());
+    for block in content {
+        match block {
+            ContentBlock::Text { text } => {
+                let split = crate::codecs::openai_chat::split_hosted_reasoning(&text)?;
+                if !split.answer.is_empty() {
+                    rebuilt.push(ContentBlock::Text {
+                        text: split.answer.to_string(),
+                    });
+                }
+            }
+            other => rebuilt.push(other),
+        }
+    }
+    Ok(rebuilt)
+}
+
 pub(crate) fn decode_openai_content(
     content: &Value,
     provider: WireFormat,

@@ -25,6 +25,8 @@ pub use switchyard_protocol::stream::{
 };
 pub use switchyard_protocol::{format, llm};
 
+pub use codecs::openai_chat::{HostedReasoningMarker, ThoughtLeak};
+pub use codecs::responses::{UnsupportedResponsesFeature, unsupported_feature};
 pub use diagnostic::*;
 pub use engine::*;
 pub use error::*;

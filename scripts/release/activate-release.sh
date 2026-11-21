@@ -63,11 +63,22 @@ METRICS_URL=${METRICS_URL:-http://127.0.0.1:4000/metrics}
 HEALTH_CMD=${HEALTH_CMD:-}
 RESTART_CMD=${RESTART_CMD:-systemctl restart "$UNIT"}
 HEALTH_ATTEMPTS=${HEALTH_ATTEMPTS:-80}
-# The two environment files the unit reads. Their CONTENTS are never copied: the
+# The environment files the unit reads. Their CONTENTS are never copied: the
 # release records a hash so the configuration is identifiable without the secret
 # leaving its file.
+#
+# The UNIT is the authority for which files those are, not this script. A release
+# is validated under the environment the service will get, so a credential added
+# as a drop-in -- a third EnvironmentFile, a fourth -- needs no change here. A
+# hand-maintained list drifts the moment that happens, and it drifts silently: the
+# missing file is only noticed when a variable from it is required, at which point
+# the candidate is refused for a reason that names the variable and not the cause.
+# ENV_FILE_1/ENV_FILE_2 stay as the fallback for a host whose unit cannot be
+# queried, which is also what the acceptance tests use; ENV_FILES overrides both.
 ENV_FILE_1=${ENV_FILE_1:-/etc/switchyard/secrets/providers.env}
 ENV_FILE_2=${ENV_FILE_2:-/var/lib/switchyard/oauth/switchyard-openai.env}
+ENV_FILES=${ENV_FILES:-}
+SYSTEMCTL=${SYSTEMCTL:-systemctl}
 MANIFEST_GROUP=${MANIFEST_GROUP:-switchyard}
 RELEASE_ROOT=${RELEASE_ROOT:-/var/lib/switchyard/releases}
 RETAIN=${RETAIN:-5}
@@ -210,11 +221,55 @@ release_id() {
     "$(printf '%s' "$1" | cut -c1-16)" "$(printf '%s' "$2" | cut -c1-8)"
 }
 
+# One resolved path per line: exactly the EnvironmentFiles systemd hands the
+# process, in the order it reads them (a later file wins on a duplicate key, which
+# is why the order is preserved rather than sorted).
+#
+# Two output shapes have to be read. systemd >= 247 prints one
+# "PATH (ignore_errors=no)" per file; older releases print every path on a single
+# line. Both are handled here, and a token that is not an absolute path is dropped
+# rather than passed on: a truncated or quoted path would otherwise reach the
+# validator as a file it silently finds missing.
+environment_files() {
+  local raw line path
+  if [ -n "$ENV_FILES" ]; then
+    printf '%s\n' $ENV_FILES
+    return 0
+  fi
+  raw=$("$SYSTEMCTL" show -p EnvironmentFiles --value "$UNIT" 2>/dev/null || true)
+  if [ -n "$raw" ]; then
+    while IFS= read -r line; do
+      line=${line%% (ignore_errors=*}
+      # systemd quotes a path that contains a space. Take the quoted value whole:
+      # word splitting here would cut it in half and hand the validator a path
+      # that is not the file.
+      case $line in
+        \"*\")
+          path=${line#\"}
+          path=${path%%\"*}
+          printf '%s\n' "$path"
+          continue
+          ;;
+      esac
+      for path in $line; do
+        path=${path#\"}
+        path=${path%\"}
+        case $path in
+          /*) printf '%s\n' "$path" ;;
+        esac
+      done
+    done <<< "$raw"
+    return 0
+  fi
+  printf '%s\n' "$ENV_FILE_1" "$ENV_FILE_2"
+}
+
 # Records the release being replaced and installation, without the secret. A hash
 # identifies a configuration; the file keeps the secret.
 env_identity_json() {
   local path out="" entry
-  for path in "$ENV_FILE_1" "$ENV_FILE_2"; do
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
     if [ -f "$path" ]; then
       entry=$(printf '{"path":"%s","sha256":"%s","bytes":%s,"mode":"%s","owner":"%s","group":"%s"}' \
         "$path" "$(sha "$path")" "$(stat -c %s "$path")" "$(stat -c %a "$path")" \
@@ -223,7 +278,7 @@ env_identity_json() {
       entry=$(printf '{"path":"%s","present":false}' "$path")
     fi
     out=${out:+$out,}$entry
-  done
+  done < <(environment_files)
   printf '[%s]' "$out"
 }
 
@@ -431,22 +486,31 @@ list_release_ids() {
 #      before they reach a log, and its full output goes to a 0600 file under the
 #      release root for the operator, not to the terminal.
 validate_candidate() {
-  local binary=$1 manifest=$2 log=$3
+  local binary=$1 manifest=$2 log=$3 path
+  local -a env_args=()
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    env_args+=(--env-file "$path")
+  done < <(environment_files)
+  # Never validate under an environment this script could not enumerate: an empty
+  # list would run the candidate with no credentials at all and refuse a release
+  # for a reason that has nothing to do with the candidate.
+  [ "${#env_args[@]}" -gt 0 ] || die "no environment files resolved for $UNIT"
   if [ -n "$VALIDATE_CMD" ]; then
     # Testing seam: the real check would need a working binary and real keys. The
     # override runs with the same parsed environment so an injected failure still
     # exercises the same path.
     "$VALIDATOR" --binary "$binary" --manifest "$manifest" \
-      --env-file "$ENV_FILE_1" --env-file "$ENV_FILE_2" \
+      ${env_args[@]+"${env_args[@]}"} \
       --command "$VALIDATE_CMD" --log "$log"
     return
   fi
   "$VALIDATOR" --binary "$binary" --manifest "$manifest" \
-    --env-file "$ENV_FILE_1" --env-file "$ENV_FILE_2" --log "$log"
+    ${env_args[@]+"${env_args[@]}"} --log "$log"
 }
 
 capability_gate() {
-  local binary=$1 caps=$2 baseline=$3
+  local binary=$1 caps=$2 baseline=$3 approvals=${4:-}
 
   # Once a release line has a baseline, the gate is part of deploying to it: a
   # candidate that arrives without its own manifest cannot be compared, and
@@ -473,8 +537,18 @@ capability_gate() {
     return 1
   fi
   [ -f "$caps" ] || { say "capability manifest $caps not found"; return 1; }
-  python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
-    --baseline "$baseline"
+  # An approval is not a bypass: it names the family and the reason, and the tool
+  # still refuses any removal that is not in the file. Without a file every
+  # removal is unapproved, which is the default.
+  if [ -n "$approvals" ]; then
+    [ -f "$approvals" ] || { say "capability approvals $approvals not found"; return 1; }
+    say "approvals: $approvals"
+    python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
+      --baseline "$baseline" --approvals "$approvals"
+  else
+    python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
+      --baseline "$baseline"
+  fi
 }
 
 post_verify() {
@@ -493,11 +567,12 @@ post_verify() {
 # ---------------------------------------------------------------------- deploy
 cmd_deploy() {
   local m_src="" m_want="" b_src="" b_want="" label="" caps="" commit="" branch="" dirty=false
-  local basis="build-session" promote=0
+  local cap_approvals="" basis="build-session" promote=0
   while [ $# -gt 0 ]; do
     case $1 in
       --label) label=$2; shift 2 ;;
       --capabilities) caps=$2; shift 2 ;;
+      --capability-approvals) cap_approvals=$2; shift 2 ;;
       --source-commit) commit=$2; shift 2 ;;
       --source-branch) branch=$2; shift 2 ;;
       --source-dirty) dirty=true; shift ;;
@@ -548,7 +623,7 @@ cmd_deploy() {
   say "candidate validates"
 
   say "capability gate"
-  if ! capability_gate "$b_src" "$caps" "$prev_dir/capabilities.json"; then
+  if ! capability_gate "$b_src" "$caps" "$prev_dir/capabilities.json" "$cap_approvals"; then
     die "capability gate refused this candidate; production untouched"
   fi
 

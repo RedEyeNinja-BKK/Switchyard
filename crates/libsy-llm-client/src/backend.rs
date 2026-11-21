@@ -66,6 +66,16 @@ pub struct HttpBackendConfig {
     /// so a target can reinstate one deliberately. For providers that reject an otherwise
     /// standard field (e.g. an internal API that 400s on `max_output_tokens`).
     pub omit_body_fields: BTreeSet<String>,
+    /// Reasoning-effort values this provider rejects outright.
+    ///
+    /// A provider may accept part of the effort vocabulary and refuse the rest: Google's
+    /// OpenAI-compatibility surface answers `minimal`/`low`/`medium`/`high` and rejects
+    /// `none` with HTTP 400 `INVALID_ARGUMENT` (measured 2026-11-21 on
+    /// `gemini-3.5-flash-lite`). A no-thinking caller sends exactly `none`, so the value is
+    /// dropped at the target instead of being forwarded to a provider that refuses it.
+    /// Dropping leaves the provider's own default, which is the only other outcome available
+    /// on that wire. Empty means every value is forwarded, which is every other target.
+    pub unsupported_reasoning_effort: BTreeSet<String>,
     /// Reasoning effort forced on every request to this backend, replacing whatever the caller
     /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
     /// Anthropic has no equivalent and rejects the setting at configuration time.
@@ -146,6 +156,10 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
             .field("omit_body_fields", &self.omit_body_fields)
+            .field(
+                "unsupported_reasoning_effort",
+                &self.unsupported_reasoning_effort,
+            )
             .field("reasoning_effort", &self.reasoning_effort)
             .field("reasoning_policy", &self.reasoning_policy)
             .field("reasoning_dialect", &self.reasoning_dialect)
@@ -388,6 +402,11 @@ impl Backend {
         &self.config().omit_body_fields
     }
 
+    /// Reasoning-effort values this provider refuses, which are therefore never sent.
+    pub fn unsupported_reasoning_effort(&self) -> &BTreeSet<String> {
+        &self.config().unsupported_reasoning_effort
+    }
+
     /// Reasoning effort forced on outbound requests, if the target configures one.
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.config().reasoning_effort.as_deref()
@@ -556,6 +575,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
             reasoning_effort: None,
             reasoning_policy: None,
             reasoning_dialect: ReasoningDialect::default(),

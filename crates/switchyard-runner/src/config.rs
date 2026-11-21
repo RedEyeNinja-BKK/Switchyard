@@ -614,11 +614,12 @@ impl DeploymentConfig {
                     if first.reasoning_effort != target.reasoning_effort
                         || first.extra_body != target.extra_body
                         || first.omit_body_fields != target.omit_body_fields
+                        || first.unsupported_reasoning_effort != target.unsupported_reasoning_effort
                         || first.reasoning_policy != target.reasoning_policy
                         || first.reasoning_dialect != target.reasoning_dialect
                     {
                         return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields; one target per model id is kept, so give each its own model id or llm client",
+                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, omit_body_fields, or unsupported_reasoning_effort; one target per model id is kept, so give each its own model id or llm client",
                             target.id, target.llm_client
                         )));
                     }
@@ -1042,6 +1043,7 @@ impl DeploymentConfig {
                 client_config,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 None,
                 None,
                 ReasoningDialect::default(),
@@ -1103,6 +1105,7 @@ impl DeploymentConfig {
                     client_config,
                     &target.extra_body,
                     &target.omit_body_fields,
+                    &target.unsupported_reasoning_effort,
                     target.reasoning_effort.clone(),
                     target.reasoning_policy,
                     target.reasoning_dialect,
@@ -2513,6 +2516,15 @@ struct TargetConfig {
     /// For providers that reject an otherwise standard field.
     #[serde(default)]
     omit_body_fields: BTreeSet<String>,
+    /// Reasoning-effort values this target's provider refuses outright.
+    ///
+    /// The effort vocabulary is not portable: Google's OpenAI-compatibility surface accepts
+    /// `minimal`/`low`/`medium`/`high` and answers HTTP 400 `INVALID_ARGUMENT` to `none`
+    /// (measured 2026-11-21 on `gemini-3.5-flash-lite`), and a no-thinking consumer sends
+    /// exactly `none`. A value named here is removed at the target instead of being forwarded,
+    /// which leaves the provider's own default. Unset forwards every value.
+    #[serde(default)]
+    unsupported_reasoning_effort: BTreeSet<String>,
     system_prompt: Option<String>,
     /// Reasoning effort forced on every request to this target, replacing the caller's value.
     /// Only meaningful on `openai_chat` and `openai_responses` clients.
@@ -2824,6 +2836,7 @@ fn build_backend(
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
     omit_body_fields: &BTreeSet<String>,
+    unsupported_reasoning_effort: &BTreeSet<String>,
     reasoning_effort: Option<String>,
     reasoning_policy: Option<ReasoningPolicy>,
     reasoning_dialect: ReasoningDialect,
@@ -2898,6 +2911,7 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         omit_body_fields: omit_body_fields.clone(),
+        unsupported_reasoning_effort: unsupported_reasoning_effort.clone(),
         reasoning_effort,
         reasoning_policy,
         reasoning_dialect,
@@ -4467,7 +4481,7 @@ max_query_chars = 512
         assert!(
             error_message(&conflicting)
                 .contains(
-                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields",
+                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, omit_body_fields, or unsupported_reasoning_effort",
             ),
             "{}",
             error_message(&conflicting)
@@ -5202,6 +5216,7 @@ confidence_threshold = 0.5
             client,
             &target.extra_body,
             &target.omit_body_fields,
+            &target.unsupported_reasoning_effort,
             None,
             None,
             ReasoningDialect::default(),
@@ -5247,6 +5262,7 @@ confidence_threshold = 0.5
             client,
             &target.extra_body,
             &target.omit_body_fields,
+            &target.unsupported_reasoning_effort,
             None,
             None,
             ReasoningDialect::default(),
@@ -5275,6 +5291,7 @@ confidence_threshold = 0.5
                 "test",
                 &config,
                 &BTreeMap::new(),
+                &BTreeSet::new(),
                 &BTreeSet::new(),
                 None,
                 None,
@@ -5796,5 +5813,576 @@ mod composition_closure_tests {
         )
         .validate_minute_windows()
         .expect("per-model windows are independent");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch A: the remaining Google chat models, and the order of a free lane
+// ---------------------------------------------------------------------------
+
+/// A Gemini free-tier deployment carrying every Google chat target, plus the two paid NT
+/// legs the live `smart-nt` route actually falls back to.
+///
+/// The paid targets are present on purpose. A fixture with free legs only cannot say anything
+/// about whether a free leg precedes a paid one, which is the property that had to change.
+/// No credential is declared: these tests exercise ordering, capability declaration and
+/// tariff facts, and a client that reads no environment keeps the suite hermetic.
+#[cfg(test)]
+mod batch_a_tests {
+    use super::*;
+
+    const MANIFEST: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "__STATE_DIR__"
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+quota_group = "google-ai-studio-free"
+max_retries = 0
+
+[llm_clients.openai_nt]
+format = "openai_responses"
+base_url = "https://api.openai.test/v1"
+
+[llm_clients.deepseek_nt]
+format = "openai_responses"
+base_url = "https://api.deepseek.test/v1"
+
+[targets."direct-google-gemini-3.5-flash-lite"]
+id = "gemini-3.5-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 500
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.1-flash-lite"]
+id = "gemini-3.1-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 500
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.6-flash"]
+id = "gemini-3.6-flash"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.8-flash"]
+id = "gemini-3.8-flash"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-4-hydrogen"]
+id = "gemini-4-hydrogen"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-2.5-flash-lite"]
+id = "gemini-2.5-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+free_tier = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3-flash"]
+id = "gemini-3-flash-preview"
+llm_client = "google"
+vision = false
+video = false
+free_tier = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemma-4-26b-a4b-it"]
+id = "gemma-4-26b-a4b-it"
+llm_client = "google"
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 1300
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemma-4-31b-it"]
+id = "gemma-4-31b-it"
+llm_client = "google"
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 1300
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets.openai-gpt-6-luna-nt]
+id = "gpt-6-luna"
+llm_client = "openai_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[targets.deepseek-deepseek-flash-nt]
+id = "deepseek-flash"
+llm_client = "deepseek_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[routes."direct-google-gemini-3.5-flash-lite"]
+id = "direct-google-gemini-3.5-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.1-flash-lite"]
+id = "direct-google-gemini-3.1-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.1-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.6-flash"]
+id = "direct-google-gemini-3.6-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.6-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.8-flash"]
+id = "direct-google-gemini-3.8-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.8-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-4-hydrogen"]
+id = "direct-google-gemini-4-hydrogen"
+type = "passthrough"
+target = "direct-google-gemini-4-hydrogen"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-2.5-flash-lite"]
+id = "direct-google-gemini-2.5-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-2.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemini-3-flash"]
+id = "direct-google-gemini-3-flash"
+type = "passthrough"
+target = "direct-google-gemini-3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemma-4-26b-a4b-it"]
+id = "direct-google-gemma-4-26b-a4b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-26b-a4b-it"
+candidates = []
+context_window = 262144
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemma-4-31b-it"]
+id = "direct-google-gemma-4-31b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-31b-it"
+candidates = []
+context_window = 262144
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes.smart_gemini]
+id = "smart_gemini"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-4-hydrogen",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+]
+selection = "measured"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes.smart-nt]
+id = "smart-nt"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-4-hydrogen",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+    "openai-gpt-6-luna-nt",
+    "deepseek-deepseek-flash-nt",
+]
+selection = "measured"
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+"#;
+
+    /// The fixture with `dir` as its allowance state directory.
+    ///
+    /// Every load writes and removes a probe file in that directory, so parallel tests must
+    /// not share one: two probes racing is reported as an unusable quota directory.
+    fn fixture(dir: &str) -> String {
+        MANIFEST.replace("__STATE_DIR__", dir)
+    }
+
+    fn runner() -> Runner {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = format!("/tmp/switchyard-quota-batch-a-{n}");
+        Runner::from_toml(&fixture(&dir)).expect("the fixture deployment loads")
+    }
+
+    fn parsed() -> DeploymentConfig {
+        toml::from_str(&fixture("/tmp/switchyard-quota-batch-a-parse"))
+            .expect("the fixture parses as a deployment config")
+    }
+
+    fn ordered_ids(route: &Route) -> Vec<String> {
+        route
+            .models()
+            .all_models()
+            .iter()
+            .map(|model| model.as_str().to_owned())
+            .collect()
+    }
+
+    /// Every Google chat target the owner's dossier names is loadable in one deployment, and
+    /// the two held records are catalogued without claiming a capability they cannot serve.
+    #[test]
+    fn every_google_chat_target_loads_in_one_deployment() {
+        let runner = runner();
+
+        for (name, model) in [
+            ("direct-google-gemini-3.5-flash-lite", "gemini-3.5-flash-lite"),
+            ("direct-google-gemini-3.1-flash-lite", "gemini-3.1-flash-lite"),
+            ("direct-google-gemini-3.6-flash", "gemini-3.6-flash"),
+            ("direct-google-gemini-3.8-flash", "gemini-3.8-flash"),
+            ("direct-google-gemini-4-hydrogen", "gemini-4-hydrogen"),
+            ("direct-google-gemini-2.5-flash-lite", "gemini-2.5-flash-lite"),
+            // The catalogued id is the preview name; the route name is the stable one.
+            ("direct-google-gemini-3-flash", "gemini-3-flash-preview"),
+            ("direct-google-gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it"),
+            ("direct-google-gemma-4-31b-it", "gemma-4-31b-it"),
+        ] {
+            let Some(route) = runner.route(name) else {
+                panic!("{name} route is missing from the deployment")
+            };
+            assert_eq!(
+                route.first_target_slug(),
+                model,
+                "{name} must resolve to its model id"
+            );
+        }
+
+        for serving in [
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+        ] {
+            let capabilities = runner.route_capabilities(serving).expect("capabilities");
+            assert_eq!(
+                capabilities.tool_calling,
+                Some(true),
+                "{serving} must advertise tool_calling"
+            );
+            assert_eq!(
+                capabilities.reasoning,
+                Some(true),
+                "{serving} must advertise reasoning"
+            );
+        }
+
+        for held in [
+            "direct-google-gemini-2.5-flash-lite",
+            "direct-google-gemini-3-flash",
+        ] {
+            let capabilities = runner.route_capabilities(held).expect("capabilities");
+            assert_ne!(
+                capabilities.tool_calling,
+                Some(true),
+                "{held} is a catalogue record and must not claim tool_calling"
+            );
+            assert_ne!(
+                capabilities.reasoning,
+                Some(true),
+                "{held} is a catalogue record and must not claim reasoning"
+            );
+        }
+    }
+
+    /// The declared order is the whole point: eight free Gemini legs, then the two paid NT
+    /// legs. Selection may demote a free leg on measurement, but the tariff is part of the
+    /// sort key, so no paid leg can be ordered ahead of an eligible free one.
+    #[test]
+    fn smart_nt_declares_eight_free_legs_before_the_paid_fallbacks() {
+        let runner = runner();
+        let route = runner.route("smart-nt").expect("smart-nt exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-4-hydrogen",
+                "gemma-4-26b-a4b-it",
+                "gemma-4-31b-it",
+                "gpt-6-luna",
+                "deepseek-flash",
+            ],
+            "smart-nt must declare every free Gemini leg before the paid NT legs"
+        );
+
+        // The tariff is a per-target fact (`free_tier`), not the `:free` slug convention that
+        // `all_targets_free` reads, so the structural claim is asserted on the declarations.
+        let config = parsed();
+        for free in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert!(
+                config.targets[free].free_tier,
+                "{free} must be declared free, or selection may order a paid leg ahead of it"
+            );
+        }
+        for paid in ["openai-gpt-6-luna-nt", "deepseek-deepseek-flash-nt"] {
+            assert!(
+                !config.targets[paid].free_tier,
+                "{paid} is metered and must stay behind the free tier"
+            );
+        }
+    }
+
+    /// `smart_gemini` is the same pool without the paid fallbacks, so it is genuinely free
+    /// end to end and can be offered where spending a paid call is not acceptable.
+    #[test]
+    fn smart_gemini_carries_every_gemini_leg_and_no_paid_leg() {
+        let runner = runner();
+        let route = runner.route("smart_gemini").expect("smart_gemini exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-4-hydrogen",
+                "gemma-4-26b-a4b-it",
+                "gemma-4-31b-it",
+            ]
+        );
+        // Every leg is in the free allowance, so this alias never spends a paid call.
+        let config = parsed();
+        for free in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert!(
+                config.targets[free].free_tier,
+                "{free} must be declared free"
+            );
+        }
+    }
+
+    /// A held model serves nothing, so it declares no budget at all: zero is refused at load
+    /// ("must be at least 1"), and a fabricated limit would claim an allowance nobody metered.
+    #[test]
+    fn held_models_declare_no_daily_budget_and_serve_nothing() {
+        let config = parsed();
+
+        for held in [
+            "direct-google-gemini-2.5-flash-lite",
+            "direct-google-gemini-3-flash",
+        ] {
+            let target = config
+                .targets
+                .get(held)
+                .expect("the held record is catalogued");
+            assert_eq!(
+                target.daily_request_limit, None,
+                "{held} must not declare a daily budget"
+            );
+        }
+
+        for serving in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            let target = config
+                .targets
+                .get(serving)
+                .expect("the serving target is declared");
+            assert!(
+                target.daily_request_limit.is_some_and(|limit| limit >= 1),
+                "{serving} must declare a real daily budget"
+            );
+            assert!(target.free_tier, "{serving} is served inside a free allowance");
+        }
+    }
+
+    /// The measured provider refusal is a declaration, not a code branch, so it has to be on
+    /// every Google target: a no-thinking consumer sends `none` and the provider answers 400.
+    #[test]
+    fn the_refused_effort_value_is_declared_on_every_google_target() {
+        let config = parsed();
+        let none = BTreeSet::from(["none".to_string()]);
+
+        for name in config
+            .targets
+            .keys()
+            .filter(|name| name.starts_with("direct-google-"))
+        {
+            assert_eq!(
+                config.targets[name].unsupported_reasoning_effort, none,
+                "{name} must declare that its provider refuses effort `none`"
+            );
+            assert_eq!(
+                config.targets[name].omit_body_fields,
+                BTreeSet::from([
+                    "metadata".to_string(),
+                    "prompt_cache_key".to_string(),
+                    "store".to_string(),
+                ]),
+                "{name} must drop the Responses-only fields Google rejects"
+            );
+        }
+
+        // A target on a wire that accepts `none` keeps every value, so the declaration is
+        // scoped to the provider that needs it rather than applied fleet-wide.
+        assert!(
+            config.targets["openai-gpt-6-luna-nt"]
+                .unsupported_reasoning_effort
+                .is_empty()
+        );
     }
 }

@@ -420,6 +420,10 @@ impl TranslatingLlmClient {
                 }
             }
         }
+        // The provider's refusal list has the final word: after every override, a value the
+        // provider rejects is removed rather than forwarded. Removing it leaves the provider's
+        // own default, which is the only other outcome that wire allows.
+        drop_unsupported_reasoning_effort(&mut body, backend.unsupported_reasoning_effort());
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -1925,6 +1929,39 @@ fn apply_reasoning_policy(body: &mut Value, backend: &Backend) {
     }
 }
 
+// Removes a reasoning-effort value the provider is known to refuse.
+//
+// The effort rides under two spellings depending on the wire, so both are inspected: a Chat
+// body carries a flat `reasoning_effort`, a Responses body nests it under `reasoning.effort`.
+// Only the effort key is touched, so an unrelated sibling (`reasoning.summary`, for example)
+// survives; an emptied `reasoning` object is removed rather than left as `{}`.
+fn drop_unsupported_reasoning_effort(body: &mut Value, unsupported: &BTreeSet<String>) {
+    if unsupported.is_empty() {
+        return;
+    }
+    let Value::Object(object) = body else {
+        return;
+    };
+    if let Some(Value::String(effort)) = object.get("reasoning_effort")
+        && unsupported.contains(effort)
+    {
+        object.remove("reasoning_effort");
+    }
+    let emptied = if let Some(Value::Object(reasoning)) = object.get_mut("reasoning") {
+        if let Some(Value::String(effort)) = reasoning.get("effort")
+            && unsupported.contains(effort)
+        {
+            reasoning.remove("effort");
+        }
+        reasoning.is_empty()
+    } else {
+        false
+    };
+    if emptied {
+        object.remove("reasoning");
+    }
+}
+
 // Applies target defaults without overriding fields supplied by the caller.
 fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     let Value::Object(object) = body else {
@@ -2219,6 +2256,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
             reasoning_effort: None,
             reasoning_policy: None,
             reasoning_dialect: ReasoningDialect::default(),
@@ -2351,6 +2389,28 @@ mod tests {
         let mut backend = config(base_url);
         backend.omit_body_fields = omit_body_fields;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn chat_map_with_unsupported_effort(
+        base_url: &str,
+        unsupported: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.unsupported_reasoning_effort = unsupported;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn responses_map_with_unsupported_effort(
+        base_url: &str,
+        unsupported: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.unsupported_reasoning_effort = unsupported;
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
     }
 
     fn chat_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {
@@ -3782,6 +3842,153 @@ mod tests {
                 None,
                 Some(&ModelId::from("gpt")),
                 WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // Google's OpenAI-compatibility surface answers HTTP 400 to `reasoning_effort: "none"`
+    // while accepting the graded values, and a no-thinking caller sends exactly `none`.
+    // The declared refusal is what keeps that caller's request from becoming a 400.
+    #[tokio::test]
+    async fn a_refused_effort_value_is_never_sent_on_the_chat_wire()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                body.get("reasoning_effort").is_none()
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none"
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // The refusal is a value list, not a switch: a graded effort the provider accepts still
+    // reaches the wire, so declaring `none` unsupported does not silently disable control.
+    #[tokio::test]
+    async fn an_accepted_effort_value_still_reaches_the_chat_wire()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "reasoning_effort": "high"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // A Responses body nests the effort under `reasoning`, beside fields the caller may have
+    // set. Only the refused `effort` key is removed; an unrelated sibling such as `summary`
+    // survives, and `reasoning` is not left behind as an empty object.
+    #[tokio::test]
+    async fn a_refused_effort_value_is_dropped_without_disturbing_its_siblings()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let reasoning = body.get("reasoning");
+                reasoning
+                    .and_then(|value| value.get("effort"))
+                    .is_none()
+                    && reasoning.and_then(|value| value.get("summary"))
+                        == Some(&json!("auto"))
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "input": "hi",
+            "reasoning": {"effort": "none", "summary": "auto"}
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
             )
             .await?;
         Ok(())

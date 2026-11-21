@@ -63,6 +63,7 @@ fn backend(
         extra_headers: Default::default(),
         extra_body: Default::default(),
         omit_body_fields: Default::default(),
+        unsupported_reasoning_effort: Default::default(),
         reasoning_effort: None,
         reasoning_policy: None,
         reasoning_dialect: Default::default(),

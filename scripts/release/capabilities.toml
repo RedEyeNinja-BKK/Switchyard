@@ -212,6 +212,12 @@ subsystem = "routing"
 class = "event_driven"
 trigger = "serve one request"
 
+[families."switchyard.incomplete_answers"]
+subsystem = "routing"
+class = "event_driven"
+trigger = "serve one request whose answer is empty with zero completion tokens"
+note = "Counts responses that returned a success status but carried no usable answer, labelled by reason. Absence means every served answer was usable, not that the counter is missing."
+
 [families."switchyard.llm_call_duration_ms"]
 subsystem = "routing"
 class = "event_driven"

@@ -55,9 +55,8 @@ const NON_FORWARDABLE_HEADERS: &[&str] = &[
     "content-encoding",
     "accept-encoding",
     "expect",
-    // Switchyard's own pre-egress admission assertion. It governs whether the bytes may
-    // leave this deployment, so forwarding it would hand a provider a claim about our
-    // policy that it has no use for and no way to verify.
+    // The pre-egress admission assertion header is gone with the gate. Nothing is stripped
+    // for policy reasons any more; this list is transport hygiene only.
     "x-switchyard-privacy-clearance",
 ];
 
@@ -614,32 +613,8 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
-        // Inspected before anything else happens: over the exact body this call is about
-        // to put on the wire, for a provider that may only receive a cleared payload.
-        // This is deliberately not the same check the router performs on the request. A
-        // codec adds fields, a translation layer injects instructions, and a preserved
-        // provider body may be replayed verbatim; only the assembled body shows all of
-        // it. A finding here is terminal, so it neither spends the daily allowance below
-        // nor advances to a candidate that would be handed the same payload.
-        if backend.requires_public_payload() {
-            let findings = crate::privacy::scan_json(body);
-            if !findings.is_empty() {
-                metrics::record_upstream_attempt(None);
-                let codes = findings
-                    .iter()
-                    .map(|finding| finding.code())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                return Err(AttemptFailure {
-                    error: LlmClientError::PayloadNotCleared {
-                        model: model.clone(),
-                        codes,
-                    },
-                    status: None,
-                    retry_after: None,
-                });
-            }
-        }
+        // The payload is sent as assembled. The egress gate that used to inspect this body
+        // here is removed: nothing about a request's content stops it reaching a provider.
         // Paced before the daily budget, because the two refusals mean different things and
         // only one of them is reversible. A minute window has room again shortly, so a
         // request refused here should not spend a unit of the day's budget; the reservation
@@ -869,6 +844,10 @@ impl TranslatingLlmClient {
             })?;
         llm_request.model = Some(model_id.to_string());
 
+        // A caller that asked for zero output gets an empty answer by request, not by
+        // failure. Captured here because the request is moved into the send below.
+        let wants_no_output = llm_request.output.max_output_tokens == Some(0);
+
         let orig_format = metadata.as_ref().and_then(|m| m.wire_format);
         let wire_format = orig_format.unwrap_or(
             self.model_to_config
@@ -934,11 +913,41 @@ impl TranslatingLlmClient {
 
         // A delivered transport with an unusable result is not a successful call. Recorded
         // here, where the decoded response exists and the wire status no longer does, so
-        // that"the model answered" and "the caller got something" stay separate facts. The
-        // response itself is returned unchanged: this is an observation, not a verdict that
-        // overrides a provider that legitimately returned no text.
-        if let Some(reason) = llm_response.as_agg().and_then(unusable_answer) {
+        // that"the model answered" and "the caller got something" stay separate facts.
+        //
+        // The route then advances rather than returning the non-answer. A candidate that
+        // answered with nothing has not served the request, and this layer knows it while
+        // the caller does not; handing back an empty 200 is how a leg that never works keeps
+        // being selected. Measured 2026-11-21: measured selection kept choosing a free Gemma
+        // leg that returned `completion_tokens: 0` because an empty reply was recorded as a
+        // success. The one caller that legitimately wants no output asks for zero tokens, and
+        // that request is left alone.
+        // The policy is read for one fact: whether this target declares that it writes
+        // reasoning inline. That is what makes a token total above input-plus-output mean
+        // thinking rather than a provider accounting quirk.
+        let hosted_thinking = translation_policy(backend).hosted_reasoning.is_some();
+        if let Some(reason) = llm_response
+            .as_agg()
+            .and_then(|agg| unusable_answer(agg, hosted_thinking))
+        {
             metrics::record_incomplete_answer(reason);
+            // Two shapes are refused: a reported output count of zero, and a reply whose
+            // whole output was hidden reasoning on a target declared to charge it against
+            // the caller's reservation. A provider that reports no usage has told us
+            // nothing about its output, and a reply with output tokens but no visible text
+            // is a reasoning- or format-level question; convicting either would turn a
+            // diagnostic into a false accusation. The caller that legitimately wants no
+            // output asks for zero tokens, and that request is left alone.
+            let unanswered = matches!(
+                reason,
+                "empty_answer_zero_completion" | "empty_answer_thinking_only"
+            );
+            if unanswered && !wants_no_output {
+                return Err(LlmClientError::EmptyAnswer {
+                    model: model_id,
+                    reason,
+                });
+            }
         }
         Ok(Response {
             llm_response,
@@ -1284,11 +1293,25 @@ fn rests_the_model(error: &LlmClientError) -> bool {
 /// telemetry while every caller gets nothing, and it is how a selector learns the wrong
 /// lesson about which leg serves a task.
 ///
-/// Only the unambiguous shape is flagged: no text, no tool call, no refusal, and a reported
-/// output count of zero. A response with output tokens but no visible text is left alone —
+/// Only the unambiguous shape is flagged: no text, no tool call, no refusal, and no output
+/// the caller can use. A response with output tokens but no visible text is left alone —
 /// that is a reasoning- or format-level question this function cannot settle, and guessing
 /// would turn a diagnostic into a false accusation.
-fn unusable_answer(agg: &switchyard_protocol::llm::AggLlmResponse) -> Option<&'static str> {
+///
+/// The one provider-specific certainty is `hosted_thinking`: a target that declares it writes
+/// reasoning inline *and* charges that reasoning against the caller's output reservation. Its
+/// reply can therefore contain thinking only, and its own `completion_tokens` reads `0`
+/// because the provider does not count reasoning as output. Measured 2026-11-21 on Gemma 4
+/// 26B: `finish_reason: length`, `completion_tokens: 0`, `total_tokens` 499 against a
+/// 438-token prompt — 61 tokens of thinking and no answer. Classifying that as
+/// "the provider produced nothing" is wrong twice over: it blames the leg for a budget that
+/// the caller set, and it hides the only fact that would let an operator act on it. The
+/// hidden count is taken from the usage block rather than assumed, so a provider that reports
+/// no totals keeps the older, quieter classification.
+fn unusable_answer(
+    agg: &switchyard_protocol::llm::AggLlmResponse,
+    hosted_thinking: bool,
+) -> Option<&'static str> {
     use switchyard_protocol::llm::ContentBlock;
 
     let has_content = agg.outputs.iter().any(|output| {
@@ -1303,6 +1326,9 @@ fn unusable_answer(agg: &switchyard_protocol::llm::AggLlmResponse) -> Option<&'s
     if has_content {
         return None;
     }
+    if hosted_thinking && hidden_output_tokens(&agg.usage) > 0 {
+        return Some("empty_answer_thinking_only");
+    }
     match agg.usage.output_tokens {
         Some(0) => Some("empty_answer_zero_completion"),
         None => Some("empty_answer_no_usage"),
@@ -1310,6 +1336,29 @@ fn unusable_answer(agg: &switchyard_protocol::llm::AggLlmResponse) -> Option<&'s
         // reasoning, which is a real and separate condition, not an empty answer.
         Some(_) => Some("empty_answer_reasoning_only"),
     }
+}
+
+/// Tokens the provider produced that it did not count as output and did not show.
+///
+/// For a target that hides its reasoning this is the thinking the reply contains. Taken from
+/// the provider's own totals, so an upstream that reports nothing reports zero here rather
+/// than a guess: `total - input - output`, saturating, with the cache details subtracted from
+/// the input side because the codec normalises input to its non-cached component.
+fn hidden_output_tokens(usage: &switchyard_protocol::llm::Usage) -> u64 {
+    let Some(total) = usage.total_tokens else {
+        return 0;
+    };
+    let cache = usage.cache.as_deref();
+    let input = usage.input_tokens.unwrap_or(0)
+        + cache
+            .and_then(|cache| cache.cached_input_tokens)
+            .unwrap_or(0)
+        + cache
+            .and_then(|cache| cache.cache_creation_input_tokens)
+            .unwrap_or(0);
+    total
+        .saturating_sub(input)
+        .saturating_sub(usage.output_tokens.unwrap_or(0))
 }
 
 fn is_transient_failure(error: &LlmClientError) -> bool {
@@ -1333,8 +1382,9 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         // No wait on this leg makes the request smaller, and resending it would spend the
         // window on a request this code already knows it must refuse.
         LlmClientError::InputExceedsMinuteWindow { .. } => false,
-        // Retrying resends the same payload, which is the thing that was just refused.
-        LlmClientError::PayloadNotCleared { .. } => false,
+        // The model answered with nothing. The same budget on the same model produces the
+        // same non-answer, so this call does not retry in place; the route advances.
+        LlmClientError::EmptyAnswer { .. } => false,
         // The feature is missing from the target, not from the attempt: sending it again,
         // or to a sibling on the same wire format, cannot add it.
         LlmClientError::UnsupportedFeature { .. } => false,
@@ -2181,7 +2231,6 @@ mod tests {
             requires_list_input: false,
             allowance: None,
             pacing: None,
-            requires_public_payload: false,
             hosted_reasoning: None,
         }
     }
@@ -3156,6 +3205,265 @@ mod tests {
             )
             .await?;
         // The body_partial_json matcher asserts the upstream saw model "gpt".
+        Ok(())
+    }
+
+    /// Measured 2026-11-21 against hosted Gemma 4 26B through `smart-nt`: an output budget
+    /// went entirely to inline `<thought>` reasoning, so the reply was `completion_tokens: 0`
+    /// with no content and `finish_reason: length` while the wire said 200. The route returned
+    /// that empty body to the caller even though a sibling candidate could answer. An empty
+    /// answer is not a served request: it must advance.
+    ///
+    /// Replayed against a target that does *not* declare inline reasoning. That is the older
+    /// classification and it must not move: without a declaration, a token total above input
+    /// plus output is a provider accounting quirk, not evidence of hidden thinking. The
+    /// declared-reasoning case is the test that follows.
+    #[tokio::test]
+    async fn a_reply_that_spent_its_budget_on_reasoning_advances_rather_than_returning_empty()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 225, "completion_tokens": 0, "total_tokens": 1123}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(900);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("an empty answer must not be reported as a successful call");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        // The route may advance, but this call must not resend the same budget: the same
+        // model produces the same non-answer, so a retry only spends the window again.
+        assert!(
+            !is_transient_failure(&error),
+            "an empty answer must advance, not retry in place"
+        );
+        Ok(())
+    }
+
+    /// The measured Gemma shape, replayed against a target that *does* declare inline
+    /// reasoning: `completion_tokens: 0`, no content, and a total that exceeds prompt plus
+    /// completion. The difference is a fact the deployment did not have before — the model
+    /// produced tokens, they were thinking, and the caller's reservation was too small to
+    /// hold both. `empty_answer_zero_completion` would blame the leg; this says what happened.
+    #[tokio::test]
+    async fn a_thought_only_reply_on_a_hosted_reasoning_target_is_named_rather_than_blamed()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                // 438 prompt + 0 counted completion + 61 of thinking = 499, the measured
+                // 64-token-reservation row.
+                "usage": {"prompt_tokens": 438, "completion_tokens": 0, "total_tokens": 499}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_thinking_only");
+        // Same advance-not-retry rule as any empty answer: nothing about the next attempt on
+        // this budget changes the fact that the thinking alone filled it.
+        assert!(!is_transient_failure(&error));
+        Ok(())
+    }
+
+    /// A hosted-reasoning target that reports no totals has told us nothing about what it
+    /// produced. The invisible-token count must come from the provider's own numbers, so this
+    /// keeps the quieter classification rather than inventing thinking out of a missing field.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_without_totals_keeps_the_quieter_classification()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        Ok(())
+    }
+
+    /// The declaration alone must not be enough: a target that hides reasoning still has to
+    /// show spare tokens in its own totals. Here prompt plus completion accounts for the
+    /// whole total, so nothing was produced off the books and the reply is simply empty.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_whose_totals_account_for_every_token_is_not_thinking()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        Ok(())
+    }
+
+    /// A hosted-reasoning target that does answer is a success, thinking or not. The new
+    /// classification must not start refusing replies that carry visible text.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_that_answers_is_still_a_success()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "<thought>two plus two</thought>four"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 438, "completion_tokens": 32, "total_tokens": 675}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(512);
+
+        let response = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert!(
+            completion_text(&agg).contains("four"),
+            "the visible answer must survive: {:?}",
+            agg.outputs
+        );
+        Ok(())
+    }
+
+    /// The one caller that legitimately wants no output asks for zero tokens. Refusing that
+    /// as a failure would turn a deliberate probe into an error.
+    #[tokio::test]
+    async fn a_caller_that_asks_for_zero_output_is_not_an_empty_answer()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(0);
+
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await?;
         Ok(())
     }
 

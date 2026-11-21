@@ -139,18 +139,24 @@ pub enum LlmClientError {
         margin_permille: u32,
     },
 
-    /// The assembled payload contains content that must not leave the deployment.
+    /// The provider answered the request but produced no usable reply.
     ///
-    /// Raised at the last possible moment - over the exact JSON body about to be sent -
-    /// for a provider that may only receive a payload cleared as public. It is terminal
-    /// for the route rather than a fallback reason: another candidate would be handed the
-    /// same payload, so advancing would leak what this check just found.
-    #[error("payload for {model} carries content that must not leave this deployment: {codes}")]
-    PayloadNotCleared {
-        /// Target the payload was assembled for.
+    /// `HTTP 200` records that the request was accepted and answered; it does not record that
+    /// the caller received anything. Measured 2026-11-21 against hosted Gemma 4 26B: a
+    /// 900-token output budget went entirely to inline `<thought>` reasoning, so the reply
+    /// carried `completion_tokens: 0` and no content while the wire reported success, and the
+    /// caller was handed an empty answer although a sibling candidate could have served it.
+    ///
+    /// The route advances rather than retrying in place: the same model under the same budget
+    /// produces the same non-answer, so a retry spends the window and returns nothing again.
+    #[error(
+        "{model} returned no usable answer ({reason}); another candidate may serve this request"
+    )]
+    EmptyAnswer {
+        /// Model whose reply carried no content.
         model: ModelId,
-        /// The finding codes, comma separated, without the matched values.
-        codes: String,
+        /// Which empty shape was observed.
+        reason: &'static str,
     },
 
     /// The caller asked for a feature the selected target's wire format cannot carry.

@@ -114,7 +114,7 @@ impl Candidate {
     ///
     /// The per-request ceiling is the number that binds when both are declared: a model can
     /// hold 262,144 tokens and still accept only 16,000 of them in one minute.
-    fn ceiling(&self) -> Option<u64> {
+    pub fn ceiling(&self) -> Option<u64> {
         self.max_input_tokens.or(self.context_window)
     }
 
@@ -123,15 +123,22 @@ impl Candidate {
     /// A target that states no ceiling claims no pressure: the deployment has not said what
     /// would be tight, so this module cannot invent a limit for it.
     fn pressure_per_mille(&self, demand: Demand) -> u64 {
-        let Some(ceiling) = self.ceiling().filter(|ceiling| *ceiling > 0) else {
-            return 0;
-        };
-        let required = demand.required_tokens();
-        required
-            .saturating_mul(1000)
-            .saturating_div(ceiling)
-            .min(u64::MAX / 1000)
+        pressure_permille(demand.required_tokens(), self.ceiling())
     }
+}
+
+/// The share of `ceiling` that `required_tokens` would claim, in thousandths.
+///
+/// Public because the selection trace reports the figure the comparator actually ranked
+/// by: computing it twice would let the explanation disagree with the decision.
+pub fn pressure_permille(required_tokens: u64, ceiling: Option<u64>) -> u64 {
+    let Some(ceiling) = ceiling.filter(|ceiling| *ceiling > 0) else {
+        return 0;
+    };
+    required_tokens
+        .saturating_mul(1000)
+        .saturating_div(ceiling)
+        .min(u64::MAX / 1000)
 }
 
 /// What the request will ask of whichever candidate serves it.
@@ -145,7 +152,10 @@ pub struct Demand {
 
 impl Demand {
     /// The tokens this conversation is budgeted against a candidate's ceiling.
-    fn required_tokens(self) -> u64 {
+    ///
+    /// Public because the selection trace reports the same budget the comparator ranked
+    /// against, including the tool-turn growth factor.
+    pub fn required_tokens(self) -> u64 {
         if self.needs_tools {
             self.required_tokens.saturating_mul(TOOL_TURN_GROWTH)
         } else {
@@ -160,13 +170,23 @@ struct Evidence {
     calls: u32,
     successes: u32,
     latency_ms: f64,
+    /// Calls that returned no usable answer at all.
+    ///
+    /// Counted separately from a generic failure because it is not noise: the same model
+    /// under the same budget reproduces the same non-answer, so a single observation is
+    /// enough to stop preferring it. Measured 2026-11-21: hosted Gemma 4 26B spent a
+    /// 900-token budget on inline reasoning and answered with nothing on every attempt.
+    empty_answers: u32,
 }
 
 impl Evidence {
-    fn record(&mut self, success: bool, latency_ms: f64) {
+    fn record(&mut self, success: bool, latency_ms: f64, empty_answer: bool) {
         self.calls = self.calls.saturating_add(1);
         if success {
             self.successes = self.successes.saturating_add(1);
+        }
+        if empty_answer {
+            self.empty_answers = self.empty_answers.saturating_add(1);
         }
         self.latency_ms = if self.calls == 1 {
             latency_ms
@@ -197,6 +217,46 @@ impl Evidence {
     fn latency_millis(&self) -> u64 {
         self.latency_ms.max(0.0) as u64
     }
+
+    /// Whether this target has already answered with nothing at least once.
+    ///
+    /// Unlike [`Self::is_unhealthy`] this needs no minimum sample: an empty answer is a
+    /// measured, repeatable outcome, not one unlucky request.
+    fn has_empty_answer(&self) -> bool {
+        self.empty_answers > 0
+    }
+}
+
+/// The ranking facts for one candidate, in dispatch order.
+///
+/// Every field is a fact the comparator actually used, so a report built from these can
+/// state why a candidate ended up where it did rather than describing the manifest.
+#[derive(Clone, Debug)]
+pub struct CandidateScore {
+    /// The candidate.
+    pub model: ModelId,
+    /// Cost tier - the first and strongest component.
+    pub tier: CostTier,
+    /// Its own daily allowance is spent.
+    pub exhausted: bool,
+    /// It has been observed returning no usable answer.
+    pub empty_answer: bool,
+    /// It has been measured failing more often than completing.
+    pub unhealthy: bool,
+    /// One conversation would claim more than half its per-request ceiling.
+    pub over_pressure: bool,
+    /// Requests its own daily budget still permits, when declared.
+    pub remaining_today: Option<u64>,
+    /// Thousandths of its ceiling this conversation claims.
+    pub pressure_permille: u64,
+    /// Measured latency, once there is a sample.
+    pub latency_ms: Option<u64>,
+    /// Where the manifest declared it.
+    pub declared_position: usize,
+    /// Where it was actually dispatched.
+    pub rank: usize,
+    /// The first component explaining a fall below `declared_position`.
+    pub demotion: Option<&'static str>,
 }
 
 /// Process-wide record of how each physical target has actually behaved.
@@ -221,13 +281,31 @@ impl MeasuredSelector {
             RunObservation::LlmCall(call) | RunObservation::AnswerCall(call) => call,
             RunObservation::Outcome(_)
             | RunObservation::RoutingOverhead(_)
-            | RunObservation::ContextPressurePromotion { .. } => return,
+            | RunObservation::ContextPressurePromotion { .. }
+            | RunObservation::Selection(_) => return,
         };
         let mut evidence = self.evidence.lock();
         evidence
             .entry(call.selected_model.clone())
             .or_default()
-            .record(call.is_success, call.duration.as_secs_f64() * 1000.0);
+            .record(
+                call.is_success,
+                call.duration.as_secs_f64() * 1000.0,
+                // The client reports `empty_answer*` codes for a reply that carried no
+                // usable content, which is the one failure this layer can act on
+                // immediately rather than waiting for a sample. `empty_answer_thinking` is
+                // excluded on purpose: on a target that charges its own reasoning against
+                // the caller's output reservation, that reply is a fact about the request's
+                // budget, not about the model's health. Counting it demoted a working Gemma
+                // leg out of every later request - including the 2,048-token judge calls it
+                // answers in two to eight seconds - because two sixteen-token probes had
+                // spent their whole budget on thinking (measured 2026-11-21: six demotions
+                // from `empty_answers`). The pre-dispatch floor keeps that request shape
+                // away from the leg instead.
+                call.outcome.is_some_and(|code| {
+                    code.starts_with("empty_answer") && code != "empty_answer_thinking"
+                }),
+            );
     }
 
     /// Orders `candidates` best-first, keeping `declared` order for everything the policy
@@ -244,6 +322,26 @@ impl MeasuredSelector {
         if candidates.len() < 2 {
             return None;
         }
+        let scored = self.explain(candidates, demand, declared);
+        let ordered: Vec<ModelId> = scored.into_iter().map(|score| score.model).collect();
+        let unchanged = ordered
+            .iter()
+            .zip(candidates.iter())
+            .all(|(left, right)| left == &right.model);
+        (!unchanged).then_some(ordered)
+    }
+
+    /// The same ordering [`Self::order`] applies, returned with the facts that produced it.
+    ///
+    /// `order` is expressed through this so the order that is dispatched and the order
+    /// that is reported cannot drift apart: there is one comparator, and this exposes
+    /// its inputs rather than re-deriving them.
+    pub fn explain(
+        &self,
+        candidates: &[Candidate],
+        demand: Demand,
+        declared: &[ModelId],
+    ) -> Vec<CandidateScore> {
         let evidence = self.evidence.lock();
         let position = |model: &ModelId| {
             declared
@@ -255,39 +353,75 @@ impl MeasuredSelector {
         // tier, exhausted, unhealthy, over-pressure, remaining budget, pressure, latency,
         // and finally the manifest's own order. Tier first is what makes "paid never
         // overtakes eligible free" a property of the shape rather than of the weights.
-        let key = |candidate: &Candidate| {
+        let build = |candidate: &Candidate, index: usize| {
             let observed = evidence.get(&candidate.model).copied().unwrap_or_default();
             let remaining = candidate.remaining_today.unwrap_or(u64::MAX);
             let pressure = candidate.pressure_per_mille(demand);
-            (
+            let score = CandidateScore {
+                model: candidate.model.clone(),
+                tier: candidate.tier,
+                exhausted: candidate.remaining_today == Some(0),
+                empty_answer: observed.has_empty_answer(),
+                unhealthy: observed.is_unhealthy(),
+                over_pressure: pressure > PRESSURE_CEILING_PER_MILLE,
+                remaining_today: candidate.remaining_today,
+                pressure_permille: pressure,
+                latency_ms: observed.is_measured().then(|| observed.latency_millis()),
+                declared_position: index,
+                rank: 0,
+                demotion: None,
+            };
+            let key = (
                 candidate.tier,
-                u8::from(candidate.remaining_today == Some(0)),
-                u8::from(observed.is_unhealthy()),
-                u8::from(pressure > PRESSURE_CEILING_PER_MILLE),
+                u8::from(score.exhausted),
+                // An empty answer outranks a generic unhealthy sample: it is a measured
+                // non-answer, so it moves a candidate down on the first observation
+                // rather than only after `MIN_OBSERVATIONS` failures.
+                u8::from(score.empty_answer),
+                u8::from(score.unhealthy),
+                u8::from(score.over_pressure),
                 u64::MAX - remaining,
                 pressure,
                 // An unmeasured candidate is not "infinitely fast": it has no latency
                 // evidence at all, so it keeps the declared tie-break instead of winning
                 // the latency key against a candidate that was actually measured.
-                if observed.is_measured() {
-                    observed.latency_millis()
-                } else {
-                    u64::MAX
-                },
+                score.latency_ms.unwrap_or(u64::MAX),
                 position(&candidate.model),
-            )
+            );
+            (key, score)
         };
-        let mut ordered: Vec<Candidate> = candidates.to_vec();
-        ordered.sort_by_key(key);
-        let ordered: Vec<ModelId> = ordered
-            .into_iter()
-            .map(|candidate| candidate.model)
-            .collect();
-        let unchanged = ordered
+        let mut ranked: Vec<(_, CandidateScore)> = candidates
             .iter()
-            .zip(candidates.iter())
-            .all(|(left, right)| left == &right.model);
-        (!unchanged).then_some(ordered)
+            .enumerate()
+            .map(|(index, candidate)| build(candidate, index))
+            .collect();
+        ranked.sort_by_key(|(key, _)| *key);
+        ranked
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (_, mut score))| {
+                score.rank = rank;
+                // A candidate that fell below where the manifest declared it gets the
+                // first component that explains the fall. `None` means it did not move
+                // down, so nothing is claimed about it.
+                if rank > score.declared_position {
+                    score.demotion = Some(if score.exhausted {
+                        "daily_allowance_exhausted"
+                    } else if score.empty_answer {
+                        "empty_answers"
+                    } else if score.unhealthy {
+                        "unhealthy"
+                    } else if score.over_pressure {
+                        "over_pressure"
+                    } else if score.latency_ms.is_some() {
+                        "latency"
+                    } else {
+                        "lower_daily_budget"
+                    });
+                }
+                score
+            })
+            .collect()
     }
 
     /// The measured evidence for one model, for tests and diagnostics.
@@ -311,6 +445,7 @@ mod tests {
             is_success: success,
             duration: Duration::from_millis(millis),
             usage: None,
+            outcome: None,
         })
     }
 
@@ -513,5 +648,50 @@ mod tests {
         let candidates = vec![paid("a"), paid("b")];
         let declared = models(&["a", "b"]);
         assert_eq!(selector.order(&candidates, small(), &declared), None);
+    }
+
+    /// One observation that ended without a usable answer, tagged with its trace code.
+    fn unanswered(model: &str, code: &'static str) -> RunObservation {
+        RunObservation::AnswerCall(LlmCallObservation {
+            selected_model: ModelId::from(model),
+            is_success: false,
+            duration: Duration::from_millis(10),
+            usage: None,
+            outcome: Some(code),
+        })
+    }
+
+    /// A reply whose whole output was hidden reasoning must not count against the leg.
+    ///
+    /// The pre-dispatch floor is what keeps that request shape away from the target; if the
+    /// selector also convicted the target, one sixteen-token probe would remove a leg that
+    /// answers the 2,048-token judge calls. One observation isolates the rule: at that
+    /// sample size `unhealthy` cannot fire, so the empty-answer rule is the only demoter in
+    /// play and the order staying put is the rule's doing.
+    #[test]
+    fn a_thinking_only_answer_is_not_evidence_against_the_leg() {
+        let selector = MeasuredSelector::new();
+        selector.observe(&unanswered("a", "empty_answer_thinking"));
+        let candidates = vec![paid("a"), paid("b")];
+        assert_eq!(
+            selector.order(&candidates, small(), &models(&["a", "b"])),
+            None,
+            "a budget-shaped non-answer must not demote the model that ran out of budget"
+        );
+    }
+
+    /// The masking partner for the test above: the identical observation, carrying the
+    /// ordinary empty-answer code, still demotes immediately. Without this, a selector that
+    /// ignored empty answers altogether would also pass.
+    #[test]
+    fn an_ordinary_empty_answer_still_demotes_immediately() {
+        let selector = MeasuredSelector::new();
+        selector.observe(&unanswered("a", "empty_answer"));
+        let candidates = vec![paid("a"), paid("b")];
+        assert_eq!(
+            selector.order(&candidates, small(), &models(&["a", "b"])),
+            Some(models(&["b", "a"])),
+            "a leg that answered with nothing is still the wrong first choice"
+        );
     }
 }

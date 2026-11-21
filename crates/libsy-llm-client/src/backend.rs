@@ -126,14 +126,6 @@ pub struct HttpBackendConfig {
     /// than "wait for tomorrow". Shared by every alias of one physical model, because the
     /// provider counts per model within a project and not per alias.
     pub pacing: Option<std::sync::Arc<crate::allowance::PacedQuota>>,
-    /// Whether this provider may only receive a payload cleared as public.
-    ///
-    /// Declared on the client because it is a fact about the provider - a free tier that
-    /// uses submitted content to improve its products makes every request an egress
-    /// event - and one client serves many models. When set,
-    /// [`TranslatingLlmClient`](crate::TranslatingLlmClient) inspects the assembled wire
-    /// body before sending it, which is the only check that sees exactly what leaves.
-    pub requires_public_payload: bool,
     /// The upstream writes its reasoning inline in the visible message, behind this marker.
     ///
     /// A provider property, declared once per client: Google's hosted Gemma endpoints on the
@@ -167,7 +159,6 @@ impl fmt::Debug for HttpBackendConfig {
                 &self.allowance.as_ref().map(|a| a.limit()),
             )
             .field("minute_limits", &self.pacing.as_ref().map(|p| p.limits()))
-            .field("requires_public_payload", &self.requires_public_payload)
             .field("hosted_reasoning", &self.hosted_reasoning)
             .finish()
     }
@@ -433,10 +424,6 @@ impl Backend {
     }
 
     /// Whether the provider may only receive a payload cleared as public.
-    pub fn requires_public_payload(&self) -> bool {
-        self.config().requires_public_payload
-    }
-
     /// The marker an upstream uses when it writes reasoning inline in the message.
     ///
     /// `None` means the upstream's text is already only the answer.
@@ -581,7 +568,6 @@ mod tests {
             requires_list_input: false,
             allowance: None,
             pacing: None,
-            requires_public_payload: false,
             hosted_reasoning: None,
         }
     }

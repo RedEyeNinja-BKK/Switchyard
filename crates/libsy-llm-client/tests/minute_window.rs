@@ -75,7 +75,6 @@ fn backend(
         requires_list_input: false,
         allowance,
         pacing,
-        requires_public_payload: false,
         hosted_reasoning: None,
     })
 }

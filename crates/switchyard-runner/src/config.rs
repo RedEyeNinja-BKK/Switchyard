@@ -114,35 +114,6 @@ pub(crate) struct DeploymentConfig {
     /// whose counter cannot be written is a cap nobody is enforcing.
     #[serde(default)]
     quota: Option<QuotaConfig>,
-    /// Admission for providers that may only receive a payload cleared as public.
-    ///
-    /// Optional, but required as soon as one `llm_client` declares
-    /// `requires_public_payload`: without a key nothing can authenticate a clearance, so a
-    /// gated client would be permanently unservable and the mistake would surface as every
-    /// request refused rather than as the configuration error it is.
-    #[serde(default)]
-    privacy: Option<PrivacyConfig>,
-}
-
-/// Admission for providers that may only receive a payload cleared as public.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PrivacyConfig {
-    /// Environment variable holding the clearance key.
-    ///
-    /// The value is the shared secret a caller signs its clearance with. It is read once at
-    /// load and never printed: the configuration's own `Debug` reports only whether a key
-    /// was found.
-    pub(crate) clearance_key_env: String,
-}
-
-impl std::fmt::Debug for PrivacyConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PrivacyConfig")
-            .field("clearance_key_env", &self.clearance_key_env)
-            .finish()
-    }
 }
 
 /// Accounting for per-target daily request allowances.
@@ -610,8 +581,6 @@ impl DeploymentConfig {
 
         let facts = self.deployment_facts();
         // Resolved once, before any route is built, so a gated deployment that cannot
-        // authenticate a clearance fails at load instead of refusing every request later.
-        let clearance_key = self.build_clearance_key()?;
 
         let mut route_names_by_id = HashMap::new();
         for (route_name, config) in &self.routes {
@@ -887,7 +856,6 @@ impl DeploymentConfig {
             )
             .with_target_credentials(target_credentials(config, &self.targets))
             .with_locality(route_locality(config, &self.targets, &self.llm_clients))
-            .with_clearance_key(clearance_key.clone())
             .with_daily_allowances(Arc::new(
                 config
                     .routing_target_names()
@@ -953,49 +921,6 @@ impl DeploymentConfig {
             runner = runner.with_decision_lane_composition(name, children);
         }
         Ok(runner)
-    }
-
-    /// The key that authenticates a caller's privacy clearance.
-    ///
-    /// Required exactly when some `llm_client` declares `requires_public_payload`. Without
-    /// it nothing can authenticate a clearance, so every request to that client would be
-    /// refused: a startup error is the only honest way to report that.
-    fn build_clearance_key(&self) -> RunnerResult<Arc<crate::egress::ClearanceKey>> {
-        let gated: Vec<&str> = self
-            .llm_clients
-            .iter()
-            .filter(|(_, client)| client.requires_public_payload)
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let Some(privacy) = self.privacy.as_ref() else {
-            if gated.is_empty() {
-                return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
-            }
-            return Err(RunnerError::configuration(format!(
-                "llm clients {} declare requires_public_payload but the deployment configures no [privacy] clearance_key_env; a clearance cannot be authenticated without a key, so every request to them would be refused",
-                gated.join(", ")
-            )));
-        };
-        if gated.is_empty() {
-            return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
-        }
-        let secret = std::env::var(&privacy.clearance_key_env).map_err(|_| {
-            RunnerError::configuration(format!(
-                "[privacy] clearance_key_env names {}, which is not set; llm clients {} require a public payload, so the key is required",
-                privacy.clearance_key_env,
-                gated.join(", ")
-            ))
-        })?;
-        if secret.trim().is_empty() {
-            return Err(RunnerError::configuration(format!(
-                "[privacy] clearance_key_env names {}, which is empty; llm clients {} require a public payload, so the key is required",
-                privacy.clearance_key_env,
-                gated.join(", ")
-            )));
-        }
-        Ok(Arc::new(crate::egress::ClearanceKey::new(
-            secret.into_bytes(),
-        )))
     }
 
     /// Builds one daily request allowance per (quota group, model) that declares a limit.
@@ -2117,14 +2042,6 @@ impl DeploymentConfig {
                         // Stated per target so selection can order a free candidate ahead of
                         // a metered one without inferring cost from a provider name.
                         free_tier: target.free_tier,
-                        // Declared per credential and resolved to the target here, because
-                        // the pre-dispatch filter reads target facts. A provider that may
-                        // only receive cleared payloads makes every target behind that
-                        // credential egress-gated, including one addressed directly.
-                        requires_public_payload: self
-                            .llm_clients
-                            .get(&target.llm_client)
-                            .is_some_and(|client| client.requires_public_payload),
                         // The physical window and the per-request input ceiling travel as
                         // facts so the pre-dispatch filter can drop a target that cannot
                         // hold this request, before any provider is contacted.
@@ -2136,6 +2053,10 @@ impl DeploymentConfig {
                         // the filter and the governor cannot disagree about where a request
                         // stops fitting.
                         safe_input_tokens: safe_input_tokens(target),
+                        // A target that charges its own reasoning against the caller's
+                        // output reservation states the smallest reservation it can answer
+                        // within, so a smaller one is skipped instead of attempted.
+                        min_output_tokens: target.min_output_tokens,
                     },
                 );
             }
@@ -2556,15 +2477,6 @@ struct LlmClientConfig {
     /// as it was.
     #[serde(default)]
     quota_group: Option<String>,
-    /// Whether this client may only receive payloads a caller has cleared for it.
-    ///
-    /// A provider property, declared once per credential: a free tier that uses submitted
-    /// content to improve its products makes every request an egress event, and that is
-    /// true of every model behind the credential. Declaring it turns the pre-egress
-    /// admission gate on for the targets served here; omitting it leaves every existing
-    /// client unchanged.
-    #[serde(default)]
-    requires_public_payload: bool,
 }
 
 /// Where a client's traffic terminates.
@@ -2760,6 +2672,18 @@ struct TargetConfig {
     /// never overridden. Unset keeps the previous behaviour, where control is permitted.
     #[serde(default)]
     accepts_reasoning_control: Option<bool>,
+    /// The smallest output reservation this target can produce an answer within.
+    ///
+    /// Set only for a target whose reasoning is charged against the caller's
+    /// `max_output_tokens` — Google's hosted Gemma writes `<thought>` inline and stops when
+    /// the budget runs out mid-thought, so at a small reservation it answers with thinking
+    /// only (measured 2026-11-21: 61–328 thinking tokens for prompts of 49–438 tokens, and
+    /// zero visible text once the budget fell below the thought). A request whose output
+    /// reservation is below this floor is not dispatched here: the route keeps the candidate
+    /// list honest and spends the provider request on a leg that can answer. Unset means no
+    /// floor, which is every target outside this shape.
+    #[serde(default)]
+    min_output_tokens: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -2986,7 +2910,6 @@ fn build_backend(
         requires_list_input: config.requires_list_input,
         allowance,
         pacing,
-        requires_public_payload: config.requires_public_payload,
         hosted_reasoning,
     };
     let backend = match config.format {

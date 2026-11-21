@@ -70,7 +70,6 @@ fn client_for(
         requires_list_input: false,
         allowance,
         pacing: None,
-        requires_public_payload: false,
         hosted_reasoning: None,
     };
     Ok(TranslatingLlmClient::new(&[ModelConfig::new(

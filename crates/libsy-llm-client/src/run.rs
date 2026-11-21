@@ -386,6 +386,12 @@ async fn call_one(
             .ok()
             .and_then(|response| response.llm_response.as_agg())
             .map(|response| response.usage.clone()),
+        // Naming how the call ended is what lets a caller distinguish an empty answer
+        // from a timeout without reading a message. Value-free by construction.
+        outcome: result
+            .as_ref()
+            .err()
+            .map(crate::observation::library_outcome_code),
     });
     result
 }
@@ -791,9 +797,6 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         // a sibling with a wider window is the real answer. Neither the call nor the route
         // ends.
         LlmClientError::InputExceedsMinuteWindow { .. } => FailureClass::RateLimited,
-        // The payload, not the leg, is the problem: nothing about another candidate makes
-        // content that must not leave this deployment admissible.
-        LlmClientError::PayloadNotCleared { .. } => FailureClass::Request,
         // The feature is missing from the wire format the route selected, so it is a fact
         // about the request as routed rather than an upstream fault. Classified as a request
         // fault, which stops the route: a sibling on the same Chat wire format cannot honour
@@ -939,6 +942,11 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     }
     match source {
         LlmClientError::ContextWindowExceeded { .. } => Some(RoutingFallbackReason::ContextWindow),
+        // The model answered with nothing usable. That is a fact about this leg, not about
+        // the request, and a sibling is exactly what a free pool provides. Measured
+        // 2026-11-21: hosted Gemma 4 26B spent its whole output budget on inline reasoning
+        // and the route returned 500 although another candidate could have answered.
+        LlmClientError::EmptyAnswer { .. } => Some(RoutingFallbackReason::Unavailable),
         // Pre-commit expiry: this attempt returned no response at all, so another
         // candidate loses nothing. `Timeout` is deliberately absent: it means the
         // overall lifetime elapsed or a delivered stream stopped, and routing
@@ -1187,15 +1195,6 @@ pub struct CapabilityFacts {
     /// chosen ahead of an eligible free one. Defaults to `false`, which is the conservative
     /// answer - an undeclared target is never promoted above a target that states it is free.
     pub free_tier: bool,
-    /// The backing deployment may only receive payloads a caller has cleared for it.
-    ///
-    /// A provider property, not a request-fit capability, kept beside them because this is
-    /// the one per-target fact set the pre-dispatch filter reads. A free provider tier that
-    /// uses submitted content to improve its products makes every payload an egress event,
-    /// so a target behind it is ineligible unless the request carries a clearance that this
-    /// deployment accepts. Defaults to `false`: only a deployment that states the
-    /// requirement gets the gate, so every existing target keeps the behaviour it had.
-    pub requires_public_payload: bool,
     /// The physical model's own request window: input tokens plus the output it can emit.
     ///
     /// Distinct from the route's advertised `context_window`, which is a promise made to
@@ -1225,6 +1224,17 @@ pub struct CapabilityFacts {
     /// spending eligibility on a request the governor will refuse or the provider will
     /// overrun. `None` means the target declares no minute token window.
     pub safe_input_tokens: Option<u64>,
+    /// The smallest output reservation this target can answer within.
+    ///
+    /// Set only for a target whose reasoning is charged against the caller's output budget
+    /// (a `hosted_reasoning = "thought_tag"` upstream). Such a target must fit both its
+    /// thinking and its answer inside `max_output_tokens`; below this reservation it cannot
+    /// produce an answer at all, and dispatching it spends a provider request to discover a
+    /// fact the deployment already knows. A request under the floor is therefore ineligible
+    /// rather than attempted, which is also what keeps a caller's tiny reservation from
+    /// being recorded as a failure of the model. `None` means no floor is declared, which is
+    /// every target that counts its reasoning as output or does not reason at all.
+    pub min_output_tokens: Option<u64>,
 }
 
 /// Serves one decision call and returns the answer, or a classified failure.
@@ -1821,6 +1831,7 @@ mod tests {
         ServerError,
         StreamSuccess,
         MidStreamError,
+        EmptyAnswer,
     }
 
     struct CandidateClient {
@@ -1866,6 +1877,10 @@ mod tests {
                             "response did not finish within the overall budget",
                         )
                         .into(),
+                    }),
+                    FirstOutcome::EmptyAnswer => Err(LlmClientError::EmptyAnswer {
+                        model,
+                        reason: "empty_answer_zero_completion",
                     }),
                     FirstOutcome::StreamSuccess => Ok(stream_response(vec![
                         LlmResponseChunk::TextDelta {
@@ -2025,6 +2040,7 @@ mod tests {
                     is_success: true,
                     duration: std::time::Duration::ZERO,
                     usage: None,
+                    outcome: None,
                 })
                 .into(),
         )));
@@ -2102,7 +2118,6 @@ mod tests {
                         requires_list_input: false,
                         allowance: None,
                         pacing: None,
-                        requires_public_payload: false,
                         hosted_reasoning: None,
                     };
                     let backend = if responses {
@@ -2259,7 +2274,6 @@ mod tests {
                     requires_list_input: false,
                     allowance: None,
                     pacing: None,
-                    requires_public_payload: false,
                     hosted_reasoning: None,
                 }),
                 None,
@@ -3135,6 +3149,24 @@ mod tests {
         Ok(())
     }
 
+    /// Measured 2026-11-21 on the live deployment: `smart-nt` selected hosted Gemma 4 26B,
+    /// which spent its entire output budget on inline reasoning and returned
+    /// `completion_tokens: 0` with no content. Before this, the route ended with a 500 even
+    /// though `gpt-6-luna` was configured and idle. An empty answer is a fact about the leg,
+    /// so the route must reach the sibling.
+    #[tokio::test]
+    async fn an_empty_answer_falls_back_to_the_next_candidate() -> Result<()> {
+        let (client, result) = run_candidates(FirstOutcome::EmptyAnswer).await;
+        let (_, response) = result.expect("an empty answer must not end the route");
+        assert_eq!(
+            &*client.calls.lock(),
+            &[ModelId::from("weak"), "strong".into()],
+            "the sibling must be asked after an empty answer"
+        );
+        assert_eq!(response.served_model().map(ModelId::as_str), Some("strong"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_pre_commit_attempt_timeout_falls_back_but_a_committed_timeout_does_not() -> Result<()>
     {
@@ -3215,7 +3247,6 @@ mod tests {
                     requires_list_input: false,
                     allowance: None,
                     pacing: None,
-                    requires_public_payload: false,
                     hosted_reasoning: None,
                 })
             };
@@ -3310,7 +3341,6 @@ mod tests {
                 requires_list_input: false,
                 allowance: None,
                 pacing: None,
-                requires_public_payload: false,
                 hosted_reasoning: None,
             })
         };
@@ -3466,7 +3496,6 @@ mod tests {
                 requires_list_input: false,
                 allowance: None,
                 pacing: None,
-                requires_public_payload: false,
                 hosted_reasoning: None,
             })
         };
@@ -3608,7 +3637,6 @@ mod tests {
                 requires_list_input: false,
                 allowance: None,
                 pacing: None,
-                requires_public_payload: false,
                 hosted_reasoning: None,
             })
         };

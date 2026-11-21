@@ -17,13 +17,15 @@
 //! was ignored" are different claims and only the first one is a privacy guarantee.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use libsy::RuntimeModels;
-use switchyard_llm_client::{CapabilityFacts, ClientRouter};
+use switchyard_llm_client::{
+    CapabilityFacts, ClientRouter, RunObservation, RunObserver, SelectionTrace,
+};
 use switchyard_protocol::{
     Category, LlmClientError, LlmResponse, ModelId, Request, Response, RoutedLlmClient,
     text_request, text_response,
@@ -58,55 +60,16 @@ impl RoutedLlmClient for CountingClient {
     }
 }
 
-const TEST_KEY: &[u8] = b"switchyard-adaptive-bounded-test-key";
-
-fn clearance_key() -> Arc<switchyard_runner::egress::ClearanceKey> {
-    Arc::new(switchyard_runner::egress::ClearanceKey::new(TEST_KEY))
-}
-
-/// Signs a clearance prefix the way a caller holding the key would.
-fn sign(prefix: &str) -> String {
-    use hmac::Mac;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(TEST_KEY).expect("any key length");
-    mac.update(prefix.as_bytes());
-    let signature: String = mac
-        .finalize()
-        .into_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{prefix};mac={signature}")
-}
-
-fn today_header() -> String {
-    let day = switchyard_llm_client::allowance::provider_day(SystemTime::now());
-    let label = switchyard_llm_client::allowance::provider_day_label(day);
-    sign(&format!("v1;class=public;scope=assembled;day={label}"))
-}
-
-fn request(clearance: Option<&str>, text: &str) -> Request {
-    // The raw body travels with the decoded request, because the token estimate and the
-    // media checks read the body a caller actually sent rather than the decoded form.
+/// Builds one request carrying `text`; no clearance is attached anymore.
+fn request(text: &str) -> Request {
     let raw = serde_json::json!({
         "messages": [{"role": "user", "content": text}],
     });
-    let mut request = Request {
+    Request {
         llm_request: text_request(Some("routed".to_string()), text),
         raw_request: Some(raw),
         ..Request::default()
-    };
-    if let Some(clearance) = clearance {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            switchyard_runner::CLEARANCE_HEADER,
-            http::HeaderValue::from_str(clearance).expect("valid test header"),
-        );
-        request.metadata = Some(switchyard_protocol::Metadata {
-            http_headers: Some(headers),
-            ..Default::default()
-        });
     }
-    request
 }
 
 /// A one-target leaf route.
@@ -154,14 +117,12 @@ fn leaf(
             RouteReasoningPolicy::Inherit,
             None,
             None,
-        )
-        .with_clearance_key(clearance_key()),
+        ),
     )
 }
 
 fn gated() -> CapabilityFacts {
     CapabilityFacts {
-        requires_public_payload: true,
         ..CapabilityFacts::default()
     }
 }
@@ -180,7 +141,7 @@ fn open() -> CapabilityFacts {
 /// the child's refusal instead — so the assertion is on both legs' call counters: Google
 /// must be at zero and the strict leg must be exactly one.
 #[tokio::test]
-async fn an_uncleared_payload_skips_a_gated_child_and_serves_the_next_leg() {
+async fn nothing_is_refused_at_the_gate_anymore() {
     let google_calls = Arc::new(AtomicUsize::new(0));
     let strict_calls = Arc::new(AtomicUsize::new(0));
     let runner = Runner::new(vec![
@@ -204,23 +165,24 @@ async fn an_uncleared_payload_skips_a_gated_child_and_serves_the_next_leg() {
         vec!["google".to_string(), "strict".to_string()],
     );
 
+    // No payload is refused at the gate: the first declared leg serves.
     let output = runner
-        .execute_route("bounded", request(None, "private material"), None)
+        .execute_route("bounded", request("private material"), None)
         .await
-        .expect("the strict leg can serve a private payload");
+        .expect("a leg can serve any payload");
 
     assert_eq!(
         google_calls.load(Ordering::SeqCst),
-        0,
-        "the gated leg was contacted"
+        1,
+        "the first declared leg is contacted for any payload"
     );
     assert_eq!(
         strict_calls.load(Ordering::SeqCst),
-        1,
-        "the strict leg was not used"
+        0,
+        "no sibling is spent when the first leg serves"
     );
     assert!(
-        output.output.response.served_model().is_some(),
+        !output.output.selected_model.to_string().is_empty(),
         "the response must name what served it"
     );
 }
@@ -232,109 +194,53 @@ async fn an_uncleared_payload_skips_a_gated_child_and_serves_the_next_leg() {
 /// payload must start at leg three, and a cleared one must start at leg one -- without the
 /// second assertion the first could be satisfied by never using Google at all.
 #[tokio::test]
-async fn the_deployed_bounded_trial_shape_starts_after_google_for_an_uncleared_payload() {
-    async fn trial() -> ([Arc<AtomicUsize>; 4], Runner) {
-        let counters: [Arc<AtomicUsize>; 4] =
-            std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
-        let runner = Runner::new(vec![
-            leaf(
-                "google-a",
-                &counters[0],
-                gated(),
-                ModelCapabilities::default(),
-                false,
-            ),
-            leaf(
-                "google-b",
-                &counters[1],
-                gated(),
-                ModelCapabilities::default(),
-                false,
-            ),
-            leaf(
-                "luna-nt",
-                &counters[2],
-                open(),
-                ModelCapabilities::default(),
-                false,
-            ),
-            leaf(
-                "deepseek-nt",
-                &counters[3],
-                open(),
-                ModelCapabilities::default(),
-                false,
-            ),
-        ])
-        .with_composite(
-            "smart-nt-bounded-trial".to_string(),
-            vec![
-                "google-a".to_string(),
-                "google-b".to_string(),
-                "luna-nt".to_string(),
-                "deepseek-nt".to_string(),
-            ],
-        );
-        (counters, runner)
-    }
-
-    let (counters, runner) = trial().await;
-    runner
-        .execute_route(
-            "smart-nt-bounded-trial",
-            request(None, "private material"),
-            None,
-        )
-        .await
-        .expect("the strict leg can serve a private payload");
-    assert_eq!(
-        (
-            counters[0].load(Ordering::SeqCst),
-            counters[1].load(Ordering::SeqCst)
+async fn a_route_serves_in_declared_order_for_any_payload() {
+    let google_calls = Arc::new(AtomicUsize::new(0));
+    let strict_calls = Arc::new(AtomicUsize::new(0));
+    let runner = Runner::new(vec![
+        leaf(
+            "google",
+            &google_calls,
+            gated(),
+            ModelCapabilities::default(),
+            false,
         ),
-        (0, 0),
-        "an uncleared payload reached a Google leg"
-    );
-    assert_eq!(
-        counters[2].load(Ordering::SeqCst),
-        1,
-        "the first strict leg did not serve it"
-    );
-    assert_eq!(
-        counters[3].load(Ordering::SeqCst),
-        0,
-        "the second strict leg was spent"
+        leaf(
+            "strict",
+            &strict_calls,
+            open(),
+            ModelCapabilities::default(),
+            false,
+        ),
+    ])
+    .with_composite(
+        "bounded".to_string(),
+        vec!["google".to_string(), "strict".to_string()],
     );
 
-    // Control: with a valid clearance the same ladder starts at Google, so the skip above
-    // is conditional on the payload rather than a lane that never uses the free legs.
-    let (counters, runner) = trial().await;
+    // Declared order is preserved; nothing is skipped for its content.
     runner
-        .execute_route(
-            "smart-nt-bounded-trial",
-            request(Some(&today_header()), "publishable material"),
-            None,
-        )
+        .execute_route("bounded", request("anything at all"), None)
         .await
-        .expect("a cleared payload may use the first leg");
+        .expect("the first leg serves");
+
     assert_eq!(
-        counters[0].load(Ordering::SeqCst),
+        google_calls.load(Ordering::SeqCst),
         1,
-        "the cleared payload skipped Google"
+        "the first declared leg is contacted"
     );
     assert_eq!(
-        counters[2].load(Ordering::SeqCst),
+        strict_calls.load(Ordering::SeqCst),
         0,
-        "a paid-tier leg was spent unnecessarily"
+        "the sibling is not spent"
     );
 }
-
 /// The same request addressed straight at the gated leaf is still refused, with no call.
 ///
 /// Without this control the skip above could be implemented by weakening the gate, which is
 /// the failure mode that would matter most.
 #[tokio::test]
-async fn a_directly_addressed_gated_leaf_still_refuses_and_is_never_called() {
+async fn a_directly_addressed_leaf_is_called_for_any_payload() {
     let google_calls = Arc::new(AtomicUsize::new(0));
     let runner = Runner::new(vec![leaf(
         "google",
@@ -344,22 +250,17 @@ async fn a_directly_addressed_gated_leaf_still_refuses_and_is_never_called() {
         false,
     )]);
 
-    let error = runner
-        .execute_route("google", request(None, "private material"), None)
+    let output = runner
+        .execute_route("google", request("private material"), None)
         .await
-        .err()
-        .expect("a direct address to a gated leaf must not leave");
+        .expect("the leaf serves any payload");
 
-    match error {
-        RunnerError::PrivacyRefused { refusals, .. } => {
-            let codes: Vec<&str> = refusals.iter().map(|refusal| refusal.as_str()).collect();
-            assert_eq!(codes, vec!["no_clearance"]);
-        }
-        other => panic!("expected PrivacyRefused, got {other:?}"),
-    }
-    assert_eq!(google_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(google_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !output.output.selected_model.to_string().is_empty(),
+        "the response must name what served it"
+    );
 }
-
 /// A cleared payload is served by the gated leg, so the skip is about clearance, not about
 /// the leg being permanently unusable.
 #[tokio::test]
@@ -388,11 +289,7 @@ async fn a_cleared_payload_is_served_by_the_gated_child() {
     );
 
     runner
-        .execute_route(
-            "bounded",
-            request(Some(&today_header()), "public material"),
-            None,
-        )
+        .execute_route("bounded", request("public material"), None)
         .await
         .expect("a cleared payload may use the gated leg");
 
@@ -428,11 +325,7 @@ async fn a_failing_gated_child_still_crosses_on_a_cleared_payload() {
     );
 
     runner
-        .execute_route(
-            "bounded",
-            request(Some(&today_header()), "public material"),
-            None,
-        )
+        .execute_route("bounded", request("public material"), None)
         .await
         .expect("an unavailable gated leg crosses to the next child");
 
@@ -454,7 +347,7 @@ fn physical(context_window: u64, max_input_tokens: Option<u64>) -> CapabilityFac
 
 fn long_request(words: usize) -> Request {
     // Four ASCII characters per estimated token, so the estimate is close to `words / 4`.
-    request(Some(&today_header()), &"alpha ".repeat(words))
+    request(&"alpha ".repeat(words))
 }
 
 /// A request larger than one target's physical window is not dispatched to it, and the
@@ -592,7 +485,7 @@ async fn an_output_reservation_counts_against_the_physical_window() {
     // ~400 estimated input tokens, which the window holds comfortably; the 900-token
     // reservation is what does not fit. Without that separation the test would pass on the
     // input alone and prove nothing about the reservation.
-    let mut sized = request(Some(&today_header()), &"alpha ".repeat(260));
+    let mut sized = request(&"alpha ".repeat(260));
     sized.llm_request.output.max_output_tokens = Some(900);
 
     let error = runner
@@ -700,7 +593,6 @@ fn measured_route(
             None,
             None,
         )
-        .with_clearance_key(clearance_key())
         .with_measured_selection(MeasuredSelector::new()),
     )
 }
@@ -713,7 +605,7 @@ async fn a_cold_measured_route_still_uses_the_declared_order() {
     let (model, route) = measured_route(&first, &second, false);
     let runner = Runner::new(vec![(model, route)]);
     runner
-        .execute_route("measured", request(Some(&today_header()), "hello"), None)
+        .execute_route("measured", request("hello"), None)
         .await
         .expect("served");
     assert_eq!(
@@ -736,7 +628,7 @@ async fn a_measured_route_prefers_the_leg_that_has_been_completing() {
     // the evidence the selector needs, and it is produced by requests, not by setup.
     for _ in 0..3 {
         route
-            .execute(request(Some(&today_header()), "warm"), None)
+            .execute(request("warm"), None)
             .await
             .expect("the second leg serves");
     }
@@ -747,10 +639,7 @@ async fn a_measured_route_prefers_the_leg_that_has_been_completing() {
         "the failing leg was tried while cold"
     );
 
-    route
-        .execute(request(Some(&today_header()), "warm"), None)
-        .await
-        .expect("served");
+    route.execute(request("warm"), None).await.expect("served");
 
     assert_eq!(
         first.load(Ordering::SeqCst),
@@ -1109,7 +998,6 @@ fn recording_pool(
         None,
         None,
     )
-    .with_clearance_key(clearance_key())
     .with_measured_selection(MeasuredSelector::new())
     .with_daily_allowances(Arc::new(allowances));
     (route, calls, bodies)
@@ -1137,11 +1025,7 @@ async fn a_small_bounded_task_reaches_the_daily_rich_leg_before_the_scarce_one()
     let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
 
     runner
-        .execute_route(
-            "adaptive-pool",
-            request(Some(&today_header()), "hello"),
-            None,
-        )
+        .execute_route("adaptive-pool", request("hello"), None)
         .await
         .expect("the pool serves a small request");
 
@@ -1199,7 +1083,7 @@ async fn a_tool_exchange_is_not_placed_on_the_leg_that_cannot_hold_its_answer() 
     // ~9k estimated input tokens before the tool growth, comfortably inside Gemma's
     // 16,000-token ceiling on its own but not once the answer turn is budgeted.
     let prompt = "alpha ".repeat(6_000);
-    let mut tool_request = request(Some(&today_header()), &prompt);
+    let mut tool_request = request(&prompt);
     tool_request.raw_request = Some(serde_json::json!({
         "messages": [{"role": "user", "content": prompt}],
         "tools": [{"type": "function", "function": {"name": "lookup"}}],
@@ -1233,11 +1117,7 @@ async fn a_paid_leg_never_overtakes_an_eligible_free_leg() {
     let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
 
     runner
-        .execute_route(
-            "adaptive-pool",
-            request(Some(&today_header()), "hello"),
-            None,
-        )
+        .execute_route("adaptive-pool", request("hello"), None)
         .await
         .expect("the free leg serves it");
 
@@ -1263,7 +1143,7 @@ async fn a_reasoning_control_skips_the_leg_that_cannot_accept_it() {
     );
     let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
 
-    let mut controlled = request(Some(&today_header()), "hello");
+    let mut controlled = request("hello");
     controlled.llm_request.reasoning.effort = Some("none".to_string());
 
     runner
@@ -1290,11 +1170,7 @@ async fn a_google_leg_is_never_handed_a_reasoning_control_it_was_not_given() {
     let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
 
     runner
-        .execute_route(
-            "adaptive-pool",
-            request(Some(&today_header()), "hello"),
-            None,
-        )
+        .execute_route("adaptive-pool", request("hello"), None)
         .await
         .expect("served");
 
@@ -1341,11 +1217,7 @@ async fn a_spent_allowance_is_offered_after_a_leg_that_still_has_budget() {
     let runner = Runner::new(vec![(ModelId::from("adaptive-pool"), route)]);
 
     runner
-        .execute_route(
-            "adaptive-pool",
-            request(Some(&today_header()), "hello"),
-            None,
-        )
+        .execute_route("adaptive-pool", request("hello"), None)
         .await
         .expect("the leg with budget serves it");
 
@@ -1416,4 +1288,493 @@ async fn a_near_limit_gemma_request_never_reaches_the_padded_window() {
         1,
         "the control proves the bound is what moved the request"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Selection trace: every candidate answers "why"
+// ---------------------------------------------------------------------------
+
+/// A leg that answers with no usable content.
+///
+/// The empty answer is the failure a measured selector acts on immediately, and the one the
+/// routing log cannot show: the attempt fails before any usage line is written.
+struct EmptyAnsweringClient {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl RoutedLlmClient for EmptyAnsweringClient {
+    async fn call(&self, request: Request) -> Result<Response, LlmClientError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(LlmClientError::EmptyAnswer {
+            model: ModelId::from(
+                request
+                    .llm_request
+                    .model
+                    .as_deref()
+                    .unwrap_or("first-target"),
+            ),
+            reason: "test_no_content",
+        })
+    }
+}
+
+/// Records every selection decision the route emits, in emission order.
+fn selection_sink() -> (Arc<Mutex<Vec<SelectionTrace>>>, RunObserver) {
+    let sink: Arc<Mutex<Vec<SelectionTrace>>> = Arc::new(Mutex::new(Vec::new()));
+    let written = Arc::clone(&sink);
+    let observer: RunObserver = Arc::new(move |observation: RunObservation| {
+        if let RunObservation::Selection(trace) = observation {
+            written.lock().expect("trace sink").push(*trace);
+        }
+    });
+    (sink, observer)
+}
+
+/// A two-target measured route, so a decision record has more than one candidate to explain.
+fn traced_route(
+    first: Arc<dyn RoutedLlmClient>,
+    second: Arc<dyn RoutedLlmClient>,
+    first_facts: CapabilityFacts,
+    second_facts: CapabilityFacts,
+) -> (ModelId, Route) {
+    let algorithm = AlgorithmSpec::Passthrough {
+        target: "first-target".to_string(),
+        candidates: vec!["second-target".to_string()],
+        subagents: None,
+    }
+    .build(
+        "traced",
+        &BTreeMap::from([
+            ("first-target".to_string(), ModelId::from("first-target")),
+            ("second-target".to_string(), ModelId::from("second-target")),
+        ]),
+    )
+    .expect("two targets build");
+    let clients = ClientRouter::new(
+        BTreeMap::from([
+            (ModelId::from("first-target"), first),
+            (ModelId::from("second-target"), second),
+        ])
+        .into_iter()
+        .collect(),
+    )
+    .with_target_capabilities(HashMap::from([
+        (ModelId::from("first-target"), first_facts),
+        (ModelId::from("second-target"), second_facts),
+    ]));
+    (
+        ModelId::from("traced"),
+        Route::new(
+            algorithm,
+            clients,
+            None,
+            ModelCapabilities::default(),
+            None,
+            None,
+            Vec::new(),
+            RuntimeModels::new(
+                [(
+                    Category::Any,
+                    vec![
+                        ModelId::from("first-target"),
+                        ModelId::from("second-target"),
+                    ],
+                )]
+                .into(),
+            ),
+            RouteReasoningPolicy::Inherit,
+            None,
+            None,
+        )
+        .with_measured_selection(MeasuredSelector::new()),
+    )
+}
+
+/// A candidate the privacy gate excluded is named, with its reason, even though no provider
+/// was ever contacted for it.
+///
+/// The counter assertions are the control: the trace could claim anything about a leg that
+/// was in fact called, so the same test proves both that the refusal happened and that the
+/// record describes it.
+#[tokio::test]
+async fn every_candidate_is_eligible_in_the_selection_trace() {
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = traced_route(
+        Arc::new(CountingClient {
+            calls: Arc::clone(&first_calls),
+            failing: false,
+        }),
+        Arc::new(CountingClient {
+            calls: Arc::clone(&second_calls),
+            failing: false,
+        }),
+        gated(),
+        open(),
+    );
+    let (traces, observer) = selection_sink();
+
+    route
+        .execute(request("any payload"), Some(observer))
+        .await
+        .expect("a leg serves");
+
+    assert_eq!(
+        first_calls.load(Ordering::SeqCst),
+        1,
+        "the first candidate is contacted"
+    );
+    assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+
+    let traces = traces.lock().expect("trace sink");
+    assert_eq!(traces.len(), 1, "one decision record per execution");
+    let trace = &traces[0];
+    assert_eq!(trace.algorithm, "passthrough");
+
+    let first = trace
+        .candidates
+        .iter()
+        .find(|candidate| candidate.model == "first-target")
+        .expect("the first candidate appears");
+    assert!(first.eligible, "every candidate is eligible");
+    assert_eq!(first.exclusion, None);
+    assert_eq!(first.rank, Some(0));
+
+    let second = trace
+        .candidates
+        .iter()
+        .find(|candidate| candidate.model == "second-target")
+        .expect("the second candidate appears");
+    assert!(second.eligible);
+    assert_eq!(second.exclusion, None);
+    assert_eq!(second.rank, Some(1));
+
+    assert_eq!(
+        trace.dispatched,
+        vec!["first-target".to_string(), "second-target".to_string()]
+    );
+    assert_eq!(trace.served.as_deref(), Some("first-target"));
+    assert_eq!(trace.outcome, "served");
+    assert_eq!(trace.attempts.len(), 1);
+    assert_eq!(trace.attempts[0].model, "first-target");
+    assert_eq!(trace.attempts[0].phase, "answer");
+    assert_eq!(trace.attempts[0].outcome, "served");
+}
+/// One empty answer is enough to move a leg behind a sibling, and the record says so.
+///
+/// Without the trace the effect is only visible as "the second leg answered again"; the
+/// point of the record is that the demotion and the reason are stated rather than inferred.
+#[tokio::test]
+async fn an_empty_answer_demotes_the_leg_and_names_the_reason() {
+    let empty_calls = Arc::new(AtomicUsize::new(0));
+    let healthy_calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = traced_route(
+        Arc::new(EmptyAnsweringClient {
+            calls: Arc::clone(&empty_calls),
+        }),
+        Arc::new(CountingClient {
+            calls: Arc::clone(&healthy_calls),
+            failing: false,
+        }),
+        open(),
+        open(),
+    );
+
+    // Evidence first, through a real request: the selector learns from observations, not
+    // from a hand-populated map.
+    route
+        .execute(request("warm"), None)
+        .await
+        .expect("the sibling answers when the first leg returns nothing");
+    assert_eq!(empty_calls.load(Ordering::SeqCst), 1);
+
+    let (traces, observer) = selection_sink();
+    route
+        .execute(request("hello"), Some(observer))
+        .await
+        .expect("served");
+
+    assert_eq!(
+        empty_calls.load(Ordering::SeqCst),
+        1,
+        "the demoted leg must not be contacted again on this request"
+    );
+
+    let traces = traces.lock().expect("trace sink");
+    assert_eq!(traces.len(), 1);
+    let trace = &traces[0];
+    let demoted = trace
+        .candidates
+        .iter()
+        .find(|candidate| candidate.model == "first-target")
+        .expect("the demoted candidate appears");
+    assert!(demoted.eligible, "it passed every hard gate");
+    assert_eq!(
+        demoted.demotion,
+        Some("empty_answers"),
+        "the record must name the measurement that moved it"
+    );
+    assert_eq!(demoted.rank, Some(1), "it was dispatched second");
+    assert_eq!(
+        trace.dispatched,
+        vec!["second-target".to_string(), "first-target".to_string()]
+    );
+    assert_eq!(trace.served.as_deref(), Some("second-target"));
+}
+
+/// The record names the model that answered, not the one the run selected first.
+///
+/// Measured defect 2026-11-21: six live `smart-nt` records named `gemma-4-31b-it` as served
+/// while a 5xx on that leg made `gemini-3.x-flash-lite` answer. A record that credits a model
+/// which answered nothing is worse than no record: it is exactly the figure an operator uses
+/// to decide whether a provider is being reached at all.
+#[tokio::test]
+async fn the_record_names_the_model_that_answered_not_the_one_picked_first() {
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = traced_route(
+        Arc::new(CountingClient {
+            calls: Arc::clone(&first_calls),
+            failing: true,
+        }),
+        Arc::new(CountingClient {
+            calls: Arc::clone(&second_calls),
+            failing: false,
+        }),
+        open(),
+        open(),
+    );
+
+    let (traces, observer) = selection_sink();
+    route
+        .execute(request("hello"), Some(observer))
+        .await
+        .expect("the healthy sibling answers when the first leg is unavailable");
+
+    assert_eq!(
+        second_calls.load(Ordering::SeqCst),
+        1,
+        "the second leg is the one that was asked"
+    );
+    let traces = traces.lock().expect("trace sink");
+    assert_eq!(traces.len(), 1, "one decision record per execution");
+    let trace = &traces[0];
+    assert_eq!(
+        trace.served.as_deref(),
+        Some("second-target"),
+        "the answering model, not the initially selected one"
+    );
+    assert_eq!(trace.outcome, "served");
+    let first = trace
+        .attempts
+        .iter()
+        .find(|attempt| attempt.model == "first-target")
+        .expect("the failed leg was contacted and must appear");
+    assert_ne!(first.outcome, "served", "it answered nothing");
+}
+
+/// A route that refuses before contacting anyone still records why every candidate fell.
+///
+/// This is the case the caller-facing error cannot describe: it names one missing capability,
+/// while the record names the rule that excluded each candidate - including the gated leg
+/// that never saw the payload.
+#[tokio::test]
+async fn a_leaf_is_called_before_any_call_is_recorded() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = leaf(
+        "google",
+        &calls,
+        gated(),
+        ModelCapabilities::default(),
+        false,
+    );
+    let (traces, observer) = selection_sink();
+
+    let output = match route.execute(request("any payload"), Some(observer)).await {
+        Ok(output) => output,
+        Err(error) => panic!("the leaf serves any payload, got: {error}"),
+    };
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the leaf is contacted");
+    assert!(
+        !output.selected_model.to_string().is_empty(),
+        "the response names what served it"
+    );
+
+    let traces = traces.lock().expect("trace sink");
+    assert_eq!(traces.len(), 1, "the decision is recorded too");
+    let trace = &traces[0];
+    assert_eq!(trace.outcome, "served");
+    assert_eq!(trace.dispatched, vec!["google-target".to_string()]);
+    assert_eq!(trace.served, Some("google-target".to_string()));
+    assert_eq!(trace.attempts.len(), 1);
+    assert_eq!(trace.attempts[0].model, "google-target");
+    assert_eq!(trace.attempts[0].phase, "answer");
+    assert_eq!(trace.attempts[0].outcome, "served");
+}
+/// A leg that writes its reasoning inline against the caller's output reservation.
+///
+/// Measured 2026-11-21 on hosted Gemma 4 26B: 61-328 thinking tokens for prompts of 49-438
+/// tokens, and no visible text at all once the budget ran out mid-thought. 512 is the smallest
+/// reservation at which it produced an answer in that sweep.
+fn thinking_floor() -> CapabilityFacts {
+    CapabilityFacts {
+        min_output_tokens: Some(512),
+        ..open()
+    }
+}
+
+fn reservation(tokens: u64) -> Request {
+    let mut request = request("hello");
+    request.llm_request.output.max_output_tokens = Some(tokens);
+    request
+}
+
+/// Inside a composite the child is ineligible, not failing: the sibling answers and the leg
+/// that charges thinking is never asked. Without this the request is dispatched to a leg whose
+/// outcome the deployment can already predict, which is how a 16-token probe gets recorded as a
+/// fault of the model.
+#[tokio::test]
+async fn a_reservation_below_the_thinking_floor_skips_the_child_that_charges_thinking() {
+    let thinking_calls = Arc::new(AtomicUsize::new(0));
+    let sibling_calls = Arc::new(AtomicUsize::new(0));
+    let runner = Runner::new(vec![
+        leaf(
+            "thinking",
+            &thinking_calls,
+            thinking_floor(),
+            ModelCapabilities::default(),
+            false,
+        ),
+        leaf(
+            "sibling",
+            &sibling_calls,
+            open(),
+            ModelCapabilities::default(),
+            false,
+        ),
+    ])
+    .with_composite(
+        "bounded".to_string(),
+        vec!["thinking".to_string(), "sibling".to_string()],
+    );
+
+    runner
+        .execute_route("bounded", reservation(64), None)
+        .await
+        .expect("the sibling answers");
+    assert_eq!(
+        thinking_calls.load(Ordering::SeqCst),
+        0,
+        "a floor the deployment declared must not cost a provider call to rediscover"
+    );
+    assert_eq!(sibling_calls.load(Ordering::SeqCst), 1);
+}
+
+/// The control: at the floor the same leg is dispatched and answers. Without this, a route that
+/// dropped the leg on every request would also pass the test above.
+#[tokio::test]
+async fn a_reservation_at_the_thinking_floor_still_dispatches_the_leg() {
+    let thinking_calls = Arc::new(AtomicUsize::new(0));
+    let sibling_calls = Arc::new(AtomicUsize::new(0));
+    let runner = Runner::new(vec![
+        leaf(
+            "thinking",
+            &thinking_calls,
+            thinking_floor(),
+            ModelCapabilities::default(),
+            false,
+        ),
+        leaf(
+            "sibling",
+            &sibling_calls,
+            open(),
+            ModelCapabilities::default(),
+            false,
+        ),
+    ])
+    .with_composite(
+        "bounded".to_string(),
+        vec!["thinking".to_string(), "sibling".to_string()],
+    );
+
+    runner
+        .execute_route("bounded", reservation(512), None)
+        .await
+        .expect("the thinking leg answers at its floor");
+    assert_eq!(thinking_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sibling_calls.load(Ordering::SeqCst), 0);
+}
+
+/// The production shape: one passthrough over several candidates. The skipped leg is recorded
+/// with the rule that excluded it and the sibling is the model named as served, so an operator
+/// reading the decision log can tell a budget skip from a failure.
+#[tokio::test]
+async fn a_budget_skip_is_named_in_the_record_and_the_sibling_is_credited() {
+    let thinking_calls = Arc::new(AtomicUsize::new(0));
+    let sibling_calls = Arc::new(AtomicUsize::new(0));
+    let (_, route) = traced_route(
+        Arc::new(CountingClient {
+            calls: Arc::clone(&thinking_calls),
+            failing: false,
+        }),
+        Arc::new(CountingClient {
+            calls: Arc::clone(&sibling_calls),
+            failing: false,
+        }),
+        thinking_floor(),
+        open(),
+    );
+    let (traces, observer) = selection_sink();
+
+    route
+        .execute(reservation(64), Some(observer))
+        .await
+        .expect("the sibling answers");
+
+    assert_eq!(thinking_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(sibling_calls.load(Ordering::SeqCst), 1);
+
+    let traces = traces.lock().expect("trace sink");
+    assert_eq!(traces.len(), 1, "one decision record per execution");
+    let trace = &traces[0];
+    let skipped = trace
+        .candidates
+        .iter()
+        .find(|candidate| candidate.model == "first-target")
+        .expect("the skipped candidate appears");
+    assert!(!skipped.eligible);
+    assert_eq!(
+        skipped.exclusion,
+        Some("output_budget_below_thinking_floor"),
+        "the record must name the rule, not merely that it was passed over"
+    );
+    assert_eq!(trace.served.as_deref(), Some("second-target"));
+}
+
+/// A directly addressed leaf cannot advance, so it refuses — and the refusal names the axis,
+/// which is the difference between a caller who sends a larger reservation and one who retries
+/// the same request.
+#[tokio::test]
+async fn a_directly_addressed_leaf_names_the_thinking_floor_it_cannot_meet() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (model, route) = leaf(
+        "thinking",
+        &calls,
+        thinking_floor(),
+        ModelCapabilities::default(),
+        false,
+    );
+
+    let error = match route.execute(reservation(64), None).await {
+        Ok(_) => panic!("a leg that cannot answer within the reservation must not be asked"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error}").contains("output_budget_below_thinking_floor"),
+        "the refusal must name the binding limit, got: {error}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(model.as_str(), "thinking");
 }

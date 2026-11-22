@@ -75,8 +75,12 @@ impl DecisionSkip {
                  a kind that none supports is refused before any provider is called"
             }
             Self::UnsupportedState => {
-                "no configured decision backend accepts this `state` shape; this lane takes a \
-                 structured state (an array of typed content blocks), not a bare string"
+                // Deliberately names neither form as THE form: a lane may require a bare
+                // string or structured typed blocks, and stating one of them as the rule
+                // told callers on the other lane the exact opposite of what to send.
+                "no configured decision backend accepts this `state` shape; a decision backend \
+                 declares whether it takes a bare string context or structured typed blocks, \
+                 and this request is not the form its lane declares"
             }
             Self::Contract => {
                 "the request does not fit the decision wire contract: question ids, option and \
@@ -1538,5 +1542,29 @@ mod tests {
             .contains("resets"),
             "a quota refusal must say when it recovers"
         );
+    }
+
+    /// Measured 2026-11-22: the state-shape refusal named ONE form as the rule, so a
+    /// caller on a plain_string-only lane was told to send typed blocks and a caller on
+    /// the structured-only lane was told the reverse. The text must state that the lane
+    /// declares its form, and must not prescribe either form unconditionally.
+    #[test]
+    fn the_state_shape_refusal_does_not_prescribe_one_form() {
+        let message = DecisionFailure::Refused(DecisionSkip::UnsupportedState).message();
+        assert!(message.contains("`state`"), "{message}");
+        assert!(
+            message.contains("declares"),
+            "the refusal must point at the lane's declaration: {message}"
+        );
+        for prescription in [
+            "takes a structured state",
+            "not a bare string",
+            "must be an array",
+        ] {
+            assert!(
+                !message.contains(prescription),
+                "the refusal prescribes one form ({prescription}): {message}"
+            );
+        }
     }
 }

@@ -134,4 +134,41 @@ Status as of 2026-11-22T06:30Z; items 1–3 are annotated rather than rewritten.
   is a floor used for minute-window admission, and it is reported beside the provider's own count
   (`x-switchyard-estimated-tokens` / `x-switchyard-provider-prompt-tokens`). If a later scene pushes
   the lane near its 250,000 input TPM, a floor is the wrong number to admit on. The implementation is
-  not reopened for this.
+  not reopened for this. Tracked as issue **#47**, which carries the measurement, the scope and the
+  explicit non-goals.
+
+## Environment coverage addendum — 2026-11-22T06:30Z
+
+The release record written at 05:59:57Z named two environment files because that is all the installer
+knew how to name. The unit has always declared four. This addendum records the full set **as
+discovered now**, and is deliberately an addendum: `release.json` is the record of what was installed,
+and editing it after the fact would make it claim the deploying process knew something it did not.
+
+```
+switchyard-neutral-green.service reads 4 environment file(s), in read order:
+  required e2bc20e1f4b02625061c448cffa30c6427382d127c831e3ecfebde90bd02ff06  providers.env
+  required 9c12dbb4efb04c6c31c21e608d789de85e7bd8bebadcbe6b19d2360b8c4c7653  switchyard-openai.env
+  required 5607e54a1996f645f7715d0ed17e240bb8d4ea09690f393f72307ecba6bf8449  gemini.env
+  required 24710b8ed21ef7f831e557f1e6f7609898b11de7321e2c6a787c31837d0da97c  stephen.env
+```
+
+Order matters and is preserved: a variable declared in two files resolves to the later one. All four
+are `ignore_errors=no`, so the service would refuse to start if any were absent.
+
+The discriminating check was run against the same candidate bytes the release carries
+(`7952200d…`, manifest `9215e541…`): with only the first two files the validator refuses with
+`google_gemini could not read api_key_env SWITCHYARD_GEMINI_API_KEY`; with the four above it returns
+`candidate validates: server OK` at rc=0. That is the defect in one pair of runs, and it is what the
+new installer reproduces by construction rather than by an operator spelling four paths.
+
+### Installer as installed
+
+| Field | Value |
+|---|---|
+| `activate-release.sh` | `8e3aa7d6adb75440743fc97fe119efa2beddec054db63129857dbe5afa899513` |
+| `release_validate.py` | `f096927d41685c10a8153480fea775db85e31642f47aca126cfb30a608054af8` |
+| Previous copies kept | `activate-release.sh.bak-514226c6`, `release_validate.py.bak-f4589df6` |
+| Source | commit `63191cd5`, branch `feat/gemini-r3-adaptive-bounded-live` |
+
+The data plane was not touched by that change: no restart, no release, `CURRENT` and
+`LAST-KNOWN-GOOD` both still `20261122T055957Z-7952200d6583170b-53fd9a84`.

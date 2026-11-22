@@ -139,7 +139,7 @@ def apply(text: str) -> str:
     insert_at_table_end(lines, "llm_clients.openrouter_stephen", _fragment("stephen-clients.toml"))
 
     # 2/3. Targets and the route, immediately before the [quota] table that closes the file.
-    insert_before_header(lines, "quota", _targets_fragment() + "\n" + _route_fragment() + "\n")
+    insert_before_header(lines, "quota", _targets_fragment() + "\n" + _route_fragment() + "\n" + _fragment("stephen-leaves.toml") + "\n")
 
     # 4. ST_Free becomes the unified pool.
     start, end = apply_batch_a.section_span(lines, ST_FREE)
@@ -196,8 +196,26 @@ def _assert_scope(before: str, after: str) -> None:
         raise apply_batch_a.EditError(f"pool members are {sorted(grouped)}, expected only {QUALIFIED}")
 
     added_routes = set(new["routes"]) - set(old["routes"])
-    if added_routes != {GEMINI_GROUP}:
+    expected_direct = {
+        f"direct-google-stephen-{key}" for key in (
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
+            "gemini-3.8-flash",
+            "gemini-4-hydrogen",
+            "gemma-4-26b-a4b-it",
+            "gemma-4-31b-it",
+        )
+    }
+    if added_routes != {GEMINI_GROUP} | expected_direct:
         raise apply_batch_a.EditError(f"route delta is {sorted(added_routes)}")
+    for direct in expected_direct:
+        block = new["routes"][direct]
+        if block.get("type") != "passthrough" or not block.get("target", "").startswith("stephen-google-"):
+            raise apply_batch_a.EditError(f"{direct}: bad Stephen direct target binding")
+    if any("gemini-2.5-" in route for route in added_routes):
+        raise apply_batch_a.EditError("retired Gemini 2.5 must not be generated")
 
     for name in set(old["targets"]):
         if old["targets"][name] != new["targets"][name]:

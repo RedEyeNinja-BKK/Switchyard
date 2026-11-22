@@ -148,3 +148,74 @@ A candidate binary built before the rebase could not even parse the deployed man
 (`unknown field max_session_audio_bytes`). That failure is why `verify_no_live_regression.py`
 exists: a batch verifier that only compares its own two files cannot see a section another
 workstream added to production after the snapshot was taken.
+
+---
+
+# Batch F1/F2 - the terminal leg, and held 404 clutter
+
+The converged charter requires `smart-nt` to rank a provider-neutral primary pool and to
+reach DeepSeek Flash NT **only** when the primary pool is provably unavailable. Before this
+batch DeepSeek was an ordinary candidate: it could serve whenever it happened to rank first,
+and one 429 on a Gemini leg could hand the request to a metered leg while six healthy free
+legs were still ranked.
+
+## Engine change (F2)
+
+The terminal leg is a separate model set on the route, never merged into the candidate list:
+
+| Addition | Where | Why |
+|---|---|---|
+| `Route::terminal` + `with_terminal_fallback` | `crates/switchyard-runner/src/route.rs` | the ranking machinery cannot see a leg it must not rank |
+| `authorize_terminal(capable, dispatchable, attempts, credential_of)` | `route.rs` | the entire policy in one testable function |
+| `SelectionTrace::{terminal, terminal_crossed, terminal_reason}` | `crates/libsy-llm-client/src/observation.rs` | the decision record names the leg, the crossing and the claim |
+| `RouteConfig::terminal_fallback` + load validation | `crates/switchyard-runner/src/config.rs` | unknown, held, duplicated or also-a-candidate legs are startup errors |
+| `RouteConfig::served_target_names` | `config.rs` | facts, credentials, allowances and prompt policy now cover the leg the route can actually call |
+
+`authorize_terminal` answers with `primary_pool_blocked` (every capable leg is covered by a
+credential block, nothing was dispatched) or `primary_pool_exhausted` (every dispatched
+capable leg failed on capacity and every unattempted capable leg is explained by a `401`,
+`402` or `429` proved on its credential in this run). It answers `None` - refuse - for a
+request nothing could serve, for a `403`/`400`/`empty_answer`/`timeout`/`context_window`
+failure, and for any unattempted capable leg on a live or unattributable credential.
+
+Two gates are kept distinct on purpose: `capability_gate` asks whether a target could serve
+the request at all, `verdict` adds whether it is allowed right now. Without the split,
+"blocked" and "incapable" collapse and a paid leg is spent on a request nobody could serve.
+
+A credential-scoped stop in `call_first_available` (`crates/libsy-llm-client/src/run.rs`)
+now skips to the first later candidate on a *different* credential, because a pool lists one
+provider's models together and stopping at "the next candidate" re-called the same spent
+account.
+
+## Manifest change (F1)
+
+| Edit | Object | From | To |
+|---|---|---|---|
+| Terminal leg | `smart-nt` | `deepseek-deepseek-flash-nt` listed as a candidate | `terminal_fallback = ["deepseek-deepseek-flash-nt"]` |
+| Held clutter | `smart-nt`, `smart_gemini` | `direct-google-gemini-2.5-flash` candidate | removed (Google answers 404; the target record stays held) |
+| Stale comment | `smart_gemini` | claimed 3.6/3.8 were absent | states what the route actually lists |
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `apply_batch_f1.py` | line-anchored editor over the reviewed manifest; refuses a moved baseline; `--verify` re-parses and compares every untouched route |
+| `mutants_batch_f1.py` | 6 mutants + a positive control; each must change observable behaviour |
+
+## Run
+
+```sh
+python3 apply_batch_f1.py routes.toml candidate.toml
+python3 apply_batch_f1.py --verify routes.toml candidate.toml
+python3 mutants_batch_f1.py routes.toml
+```
+
+Edits are line-anchored rather than re-serialised: the manifest carries the reasoning for
+each leg in comments, and a TOML writer would delete it.
+
+## Status
+
+Source and tests pass; the manifest is staged, not deployed. The deployed binary cannot
+parse the candidate manifest (`unknown variant 'peer'`), so binary and manifest must land
+together with a whole rollback. Dry-run against `routes-batch-f1.toml` with the unit's four
+EnvironmentFiles is outstanding.

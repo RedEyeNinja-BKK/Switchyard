@@ -20,7 +20,7 @@ use switchyard_protocol::{LlmClientError, ModelId, Request, Response, WireFormat
 use thiserror::Error;
 
 use crate::DecisionTarget;
-use crate::config::RouteReasoningPolicy;
+use crate::config::{RouteReasoningPolicy, TerminalPolicy};
 
 /// Where a route's work is actually performed.
 ///
@@ -277,7 +277,10 @@ fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrie
 /// * `capable` - targets the deployment says could serve this request at all;
 /// * `dispatchable` - of those, the ones no credential block excludes right now;
 /// * `attempts` - every upstream call this request actually made;
-/// * `credential_of` - the credential that serves a target, when configuration says.
+/// * `policy` - which evidence this route accepts as "the pool cannot serve this";
+/// * `credential_of` - the credential that serves a target, when configuration says;
+/// * `quota_blocked` - whether a block excludes a target because its allowance is spent,
+///   rather than because the credential was rejected.
 ///
 /// Returns `None` when the pool's unavailability is not provable, which is the safe
 /// answer: the caller gets the primary error instead of a paid escalation.
@@ -285,7 +288,9 @@ pub(crate) fn authorize_terminal(
     capable: &[ModelId],
     dispatchable: &HashSet<ModelId>,
     attempts: &[AttemptTrace],
+    policy: TerminalPolicy,
     credential_of: impl Fn(&ModelId) -> Option<String>,
+    quota_blocked: impl Fn(&ModelId) -> bool,
 ) -> Option<&'static str> {
     // Nothing in the pool could serve this request even with unlimited capacity, so
     // "exhausted" would be a different claim from the true one. Refuse.
@@ -294,7 +299,13 @@ pub(crate) fn authorize_terminal(
     }
     if dispatchable.is_empty() {
         // Every capable leg is covered by a credential block, so the pool is provably out
-        // of capacity without a single request being made.
+        // of capacity without a single request being made. A route that escalates only on
+        // quota evidence has to say which block it is trusting: a rejected credential and
+        // a spent allowance are both "blocked", but only the second is the claim this
+        // route's terminal leg exists for.
+        if policy == TerminalPolicy::QuotaOnly && !capable.iter().all(quota_blocked) {
+            return None;
+        }
         return Some("primary_pool_blocked");
     }
     let primary_attempts: Vec<&AttemptTrace> = attempts
@@ -309,7 +320,7 @@ pub(crate) fn authorize_terminal(
     // terminal leg out: retrying it elsewhere would fail again, with a bill attached.
     if !primary_attempts
         .iter()
-        .all(|attempt| is_capacity_outcome(attempt.outcome))
+        .all(|attempt| is_capacity_outcome(attempt.outcome, policy))
     {
         return None;
     }
@@ -318,13 +329,18 @@ pub(crate) fn authorize_terminal(
         .map(|attempt| attempt.model.as_str())
         .collect();
     // A capable leg can only be left unattempted if the candidate walk stopped early, and
-    // the walk stops early only on a credential-scoped failure (a 401 or a scope-wide 429).
-    // A timeout is not in `is_capacity_outcome`, so it is already excluded above. Any
-    // unattempted leg must therefore be explained by a credential this request already
-    // proved dead. Anything else is a gap in coverage, not exhaustion.
+    // the walk stops early only on a credential-scoped failure. A timeout is not in
+    // `is_capacity_outcome`, so it is already excluded above. Any unattempted leg must
+    // therefore be explained by a credential this request already proved dead. Anything
+    // else is a gap in coverage, not exhaustion. Which failures may prove that follows the
+    // same policy as above: `http_429` is both credential-scoped and quota evidence, while a
+    // rejected key is credential-scoped but says nothing about the allowance.
     let dead: HashSet<String> = primary_attempts
         .iter()
-        .filter(|attempt| is_credential_scope_outcome(attempt.outcome))
+        .filter(|attempt| {
+            is_credential_scope_outcome(attempt.outcome)
+                && is_capacity_outcome(attempt.outcome, policy)
+        })
         .filter_map(|attempt| credential_of(&ModelId::from(attempt.model.as_str())))
         .collect();
     for model in capable.iter().filter(|model| dispatchable.contains(*model)) {
@@ -348,29 +364,46 @@ pub(crate) fn authorize_terminal(
 /// `context_window` (a request-fit fact, not a capacity one), `http_403` and `http_400`
 /// (answers about the request or the account's permissions), `empty_answer` (a quality
 /// fact about one model), and every translation or configuration fault.
-fn is_capacity_outcome(outcome: &str) -> bool {
-    matches!(
-        outcome,
-        "daily_allowance_exhausted"
-            | "daily_allowance_unavailable"
-            | "minute_window"
-            | "minute_window_too_small"
-            | "http_401"
-            | "http_402"
-            | "http_429"
-            | "http_5xx"
-            | "transport"
-            | "unavailable"
-            | "attempt_timeout"
-    )
+fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
+    match policy {
+        TerminalPolicy::Capacity => matches!(
+            outcome,
+            "daily_allowance_exhausted"
+                | "daily_allowance_unavailable"
+                | "minute_window"
+                | "minute_window_too_small"
+                | "http_401"
+                | "http_402"
+                | "http_429"
+                | "http_5xx"
+                | "transport"
+                | "unavailable"
+                | "attempt_timeout"
+        ),
+        // A quota-only route spends its terminal leg on allowance exhaustion or a rate
+        // throttle, and on nothing else. `daily_allowance_unavailable` is an accounting
+        // fault rather than a measured exhaustion; `minute_window_too_small` is a
+        // request-fit fact; 5xx/transport/timeout say the deployment could not reach the
+        // pool, and 401/402 say the credential or its balance was refused. None of those
+        // is evidence that the free allowance ran out, which is the only claim this
+        // policy lets the terminal leg be spent on.
+        TerminalPolicy::QuotaOnly => matches!(
+            outcome,
+            "daily_allowance_exhausted" | "minute_window" | "http_429"
+        ),
+    }
 }
 
 /// Whether an attempt's outcome says the CREDENTIAL is unusable, rather than the request.
 ///
 /// Only used to explain why a capable leg was never called. The candidate walk stops early
-/// only on these two classes, so an unattempted leg here shares a credential the walk
+/// only on these classes, so an unattempted leg here shares a credential the walk
 /// already proved dead. A plain per-model 429 never stops the walk — it falls through to the
 /// next candidate — so any 429 that leaves a leg unattempted is scope-wide by construction.
+///
+/// Which of these count as *evidence for this route* is decided by the policy when the set
+/// is built: a rejected key stops the walk just as effectively as a spent allowance, but it
+/// is not a spent allowance, so it must not explain a skipped leg on a quota-only route.
 fn is_credential_scope_outcome(outcome: &str) -> bool {
     matches!(outcome, "http_401" | "http_402" | "http_429")
 }
@@ -543,6 +576,9 @@ pub struct Route {
     /// serve whenever the pool was busy. It is dispatched as its own list, under its own
     /// exhaustion gate, so "this provider is tired" cannot buy it a request.
     terminal: Option<Arc<RuntimeModels>>,
+    /// Which evidence may spend `terminal`. Configuration sets this per route; the default
+    /// is the historical capacity rule, so a route that names no policy behaves as before.
+    terminal_policy: TerminalPolicy,
 }
 
 /// A route whose targets are all held out of service, with the evidence for holding it.
@@ -598,6 +634,7 @@ impl Route {
             held: None,
             pool_groups: None,
             terminal: None,
+            terminal_policy: TerminalPolicy::default(),
         }
     }
 
@@ -610,6 +647,16 @@ impl Route {
     /// reached only when none of them can answer.
     pub fn with_terminal_fallback(mut self, terminal: RuntimeModels) -> Self {
         self.terminal = Some(Arc::new(terminal));
+        self
+    }
+
+    /// Selects which evidence may spend this route's terminal leg.
+    ///
+    /// Only meaningful beside `with_terminal_fallback`; configuration refuses the policy
+    /// without a leg to govern. Set per route so a lane whose fallback is a metered
+    /// last resort can be narrower than a lane whose fallback is an ordinary peer.
+    pub fn with_terminal_policy(mut self, policy: TerminalPolicy) -> Self {
+        self.terminal_policy = policy;
         self
     }
 
@@ -638,9 +685,39 @@ impl Route {
         capable: &[ModelId],
         dispatchable: &HashSet<ModelId>,
         attempts: &[AttemptTrace],
+        blocks: &[switchyard_llm_client::CredentialBlock],
     ) -> Option<&'static str> {
-        authorize_terminal(capable, dispatchable, attempts, |model| {
-            self.target_credential(model).map(str::to_string)
+        authorize_terminal(
+            capable,
+            dispatchable,
+            attempts,
+            self.terminal_policy,
+            |model| self.target_credential(model).map(str::to_string),
+            |model| self.quota_blocked(model, blocks),
+        )
+    }
+
+    /// Whether a quota-scoped block covers `model`.
+    ///
+    /// A block that says an allowance is spent is exhaustion evidence. A block that says the
+    /// credential was rejected is not: the allowance may be untouched, and reading the two as
+    /// one is how a wrong key would buy a metered request.
+    fn quota_blocked(
+        &self,
+        model: &ModelId,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> bool {
+        let Some(credential) = self.target_credentials.get(model).map(String::as_str) else {
+            return false;
+        };
+        blocks.iter().any(|block| {
+            block.blocks(credential, model.as_str())
+                && matches!(
+                    block.kind,
+                    switchyard_llm_client::CredentialBlockKind::FreeQuota
+                        | switchyard_llm_client::CredentialBlockKind::ModelQuota
+                        | switchyard_llm_client::CredentialBlockKind::WholeQuota
+                )
         })
     }
 
@@ -1423,7 +1500,7 @@ impl Route {
             // refusal, or a request that never fit is not that claim.
             let recorded = attempts.lock().clone();
             let authorization =
-                self.terminal_authorization(&capable_legs, &dispatchable_legs, &recorded);
+                self.terminal_authorization(&capable_legs, &dispatchable_legs, &recorded, blocks);
             if let Some(reason) = authorization {
                 let servable = terminal.filtered(&|model| terminal_servable.contains(model));
                 if !servable.is_empty() {
@@ -1627,6 +1704,7 @@ mod carrier_tests {
 #[cfg(test)]
 mod terminal_authorization_tests {
     use super::{AttemptTrace, HashSet, ModelId, authorize_terminal};
+    use crate::config::TerminalPolicy;
     use std::collections::HashMap;
 
     fn legs(ids: &[(&str, &str)]) -> (Vec<ModelId>, HashMap<ModelId, String>) {
@@ -1655,13 +1733,55 @@ mod terminal_authorization_tests {
         models.iter().cloned().collect()
     }
 
+    /// The historical route shape: every capacity *or availability* fault may escalate.
+    fn authorize(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+    ) -> Option<&'static str> {
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::Capacity,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+        )
+    }
+
+    /// The narrowed shape: only quota evidence may escalate.
+    fn authorize_quota_only(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+    ) -> Option<&'static str> {
+        authorize_quota_only_with_blocks(models, dispatchable, attempts, credentials, |_| false)
+    }
+
+    fn authorize_quota_only_with_blocks(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+        quota_blocked: impl Fn(&ModelId) -> bool,
+    ) -> Option<&'static str> {
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::QuotaOnly,
+            |model| credentials.get(model).cloned(),
+            quota_blocked,
+        )
+    }
+
     #[test]
     fn nothing_capable_never_authorizes() {
         let (models, credentials) = legs(&[("a", "A")]);
         assert_eq!(
-            authorize_terminal(&[], &dispatchable(&models), &[], |m| credentials
-                .get(m)
-                .cloned()),
+            authorize(&[], &dispatchable(&models), &[], &credentials),
             None
         );
     }
@@ -1670,9 +1790,7 @@ mod terminal_authorization_tests {
     fn every_capable_leg_blocked_is_a_blocked_pool() {
         let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
         assert_eq!(
-            authorize_terminal(&models, &HashSet::new(), &[], |m| credentials
-                .get(m)
-                .cloned()),
+            authorize(&models, &HashSet::new(), &[], &credentials),
             Some("primary_pool_blocked")
         );
     }
@@ -1682,9 +1800,7 @@ mod terminal_authorization_tests {
         let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
         let attempts = vec![attempt("a", "http_429")];
         assert_eq!(
-            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
-                .get(m)
-                .cloned()),
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
             Some("primary_pool_exhausted")
         );
     }
@@ -1694,22 +1810,24 @@ mod terminal_authorization_tests {
         let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
         let attempts = vec![attempt("a", "http_429")];
         assert_eq!(
-            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
-                .get(m)
-                .cloned()),
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
             None
         );
     }
 
     #[test]
     fn a_request_fault_never_authorizes() {
-        for outcome in ["http_403", "http_400", "empty_answer", "timeout", "context_window"] {
+        for outcome in [
+            "http_403",
+            "http_400",
+            "empty_answer",
+            "timeout",
+            "context_window",
+        ] {
             let (models, credentials) = legs(&[("a", "A")]);
             let attempts = vec![attempt("a", outcome)];
             assert_eq!(
-                authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
-                    .get(m)
-                    .cloned()),
+                authorize(&models, &dispatchable(&models), &attempts, &credentials),
                 None,
                 "outcome {outcome} must not authorize the terminal leg"
             );
@@ -1721,9 +1839,7 @@ mod terminal_authorization_tests {
         let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
         let attempts = vec![attempt("a", "http_429"), attempt("b", "http_403")];
         assert_eq!(
-            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
-                .get(m)
-                .cloned()),
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
             None
         );
     }
@@ -1734,7 +1850,7 @@ mod terminal_authorization_tests {
         let (models, _) = legs(&[("a", "A"), ("b", "A")]);
         let attempts = vec![attempt("a", "http_429")];
         assert_eq!(
-            authorize_terminal(&models, &dispatchable(&models), &attempts, |_| None),
+            authorize(&models, &dispatchable(&models), &attempts, &HashMap::new()),
             None
         );
     }
@@ -1742,11 +1858,12 @@ mod terminal_authorization_tests {
     #[test]
     fn every_leg_attempted_and_capacity_failed_is_exhaustion() {
         let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
-        let attempts = vec![attempt("a", "http_429"), attempt("b", "daily_allowance_exhausted")];
+        let attempts = vec![
+            attempt("a", "http_429"),
+            attempt("b", "daily_allowance_exhausted"),
+        ];
         assert_eq!(
-            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
-                .get(m)
-                .cloned()),
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
             Some("primary_pool_exhausted")
         );
     }
@@ -1756,10 +1873,132 @@ mod terminal_authorization_tests {
         let (models, credentials) = legs(&[("a", "A")]);
         let attempts = vec![attempt("other", "http_429")];
         assert_eq!(
-            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
-                .get(m)
-                .cloned()),
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
             None
+        );
+    }
+
+    #[test]
+    fn a_quota_only_route_escalates_on_both_legs_being_throttled() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429"), attempt("b", "http_429")];
+        assert_eq!(
+            authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    #[test]
+    fn a_quota_only_route_escalates_on_allowance_exhaustion_and_a_throttle() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![
+            attempt("a", "daily_allowance_exhausted"),
+            attempt("b", "http_429"),
+        ];
+        assert_eq!(
+            authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    #[test]
+    fn a_quota_only_route_escalates_on_a_scope_wide_throttle() {
+        // One 429 stops the walk only when it is scope-wide, so the sibling it left
+        // unattempted is explained by the throttle rather than by a gap in coverage.
+        let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// The discriminator for the whole change: a route that escalates on quota evidence
+    /// must not spend its terminal leg on the failures the historical rule would accept.
+    #[test]
+    fn a_quota_only_route_refuses_the_failures_the_capacity_rule_accepts() {
+        for outcome in [
+            "http_5xx",
+            "transport",
+            "unavailable",
+            "attempt_timeout",
+            "http_401",
+            "http_402",
+            "daily_allowance_unavailable",
+            "minute_window_too_small",
+        ] {
+            let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+            let attempts = vec![attempt("a", outcome), attempt("b", outcome)];
+            assert_eq!(
+                authorize(&models, &dispatchable(&models), &attempts, &credentials),
+                Some("primary_pool_exhausted"),
+                "the capacity rule still escalates on {outcome}"
+            );
+            assert_eq!(
+                authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
+                None,
+                "outcome {outcome} must not spend a quota-only route's terminal leg"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quota_only_route_refuses_a_mixed_server_error_and_quota() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_5xx"), attempt("b", "http_429")];
+        assert_eq!(
+            authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
+            None,
+            "one leg's outage is not evidence that the allowance ran out"
+        );
+    }
+
+    #[test]
+    fn a_quota_only_route_refuses_a_skipped_leg_on_a_live_credential() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
+            None
+        );
+    }
+
+    #[test]
+    fn a_quota_only_blocked_pool_needs_a_quota_scoped_block() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
+        assert_eq!(
+            authorize_quota_only_with_blocks(&models, &HashSet::new(), &[], &credentials, |_| true,),
+            Some("primary_pool_blocked")
+        );
+        // One leg covered by a rejected-credential block rather than a spent allowance.
+        assert_eq!(
+            authorize_quota_only_with_blocks(
+                &models,
+                &HashSet::new(),
+                &[],
+                &credentials,
+                |model| model.as_str() == "a",
+            ),
+            None,
+            "a rejected credential is not a spent allowance"
+        );
+    }
+
+    #[test]
+    fn the_capacity_rule_does_not_consult_block_kinds() {
+        // The default policy's blocked-pool branch is unchanged: it asks whether the pool is
+        // blocked, not why.
+        let (models, credentials) = legs(&[("a", "A")]);
+        assert_eq!(
+            authorize_terminal(
+                &models,
+                &HashSet::new(),
+                &[],
+                TerminalPolicy::Capacity,
+                |model| credentials.get(model).cloned(),
+                |_| false,
+            ),
+            Some("primary_pool_blocked")
         );
     }
 }

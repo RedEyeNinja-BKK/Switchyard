@@ -285,6 +285,14 @@ struct RouteConfig {
     /// exhaustion rule is the only way to reach it. A terminal target therefore must not also
     /// appear among the candidates.
     terminal_fallback: Option<Vec<String>>,
+    /// Which evidence may spend `terminal_fallback`.
+    ///
+    /// Absent keeps the historical rule, so no route changes behaviour because this option
+    /// exists. Declared, it is a statement about money: a lane whose terminal leg exists for
+    /// one kind of failure must not be able to spend it on another. Declaring a policy with
+    /// no terminal leg is refused rather than ignored, because a policy that governs nothing
+    /// reads as a guarantee it cannot provide.
+    terminal_policy: Option<TerminalPolicy>,
     /// Target this route prefers once it is under context pressure.
     ///
     /// Named rather than inferred: a target's context window is not a fact this config
@@ -334,6 +342,27 @@ pub enum SelectionPolicy {
     /// still decided by declared tariff, never by position: a `Peer` pool excludes every
     /// candidate that is not stated free before it ranks anything.
     Peer,
+}
+
+/// Which evidence may spend a route's declared terminal fallback.
+///
+/// A terminal leg exists so that one specific kind of failure does not become the caller's
+/// problem. Which kind is a policy decision, and it is not the same decision for every lane:
+/// a provider-neutral pool escalates on "nothing in this pool can answer right now", while a
+/// lane built to work inside a free allowance escalates only when that allowance is spent.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPolicy {
+    /// Any capacity or availability failure of the whole pool, or a pool wholly covered by a
+    /// credential block. The historical rule; every route that declares no policy keeps it.
+    #[default]
+    Capacity,
+    /// Quota evidence only: the terminal leg is spent when the primary pool is demonstrably
+    /// out of allowance or throttled, and never on an outage, a timeout, a transport fault or
+    /// a credential/permission failure. Those say the deployment cannot reach the pool, not
+    /// that the pool's free allowance ran out, and the terminal leg is reserved for the
+    /// second case.
+    QuotaOnly,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -399,6 +428,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let pool_groups = take_optional(&mut table, "pool_groups")?;
         let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
+        let terminal_policy = take_optional(&mut table, "terminal_policy")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
         let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -417,6 +447,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             escalation_max_input_tokens,
             pool_groups,
             terminal_fallback,
+            terminal_policy,
             escalation_target,
             selection: selection.unwrap_or_default(),
             algorithm,
@@ -997,7 +1028,9 @@ impl DeploymentConfig {
                 None => route,
             };
             let route = match terminal {
-                Some(terminal) => route.with_terminal_fallback(terminal),
+                Some(terminal) => route
+                    .with_terminal_fallback(terminal)
+                    .with_terminal_policy(config.terminal_policy.unwrap_or_default()),
                 None => route,
             };
             // A measured route ranks candidates only after it has evidence, and shares that
@@ -1168,6 +1201,12 @@ impl DeploymentConfig {
         config: &RouteConfig,
     ) -> RunnerResult<Vec<ModelId>> {
         let Some(names) = &config.terminal_fallback else {
+            if config.terminal_policy.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares terminal_policy but no terminal_fallback; a \
+                     policy that governs no leg would read as a guarantee it cannot provide"
+                )));
+            }
             return Ok(Vec::new());
         };
         if names.is_empty() {
@@ -6215,6 +6254,69 @@ advisor_target = "advisor"
             "advisor_target = \"advisor\"\nmax_reviews = 0",
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
+    }
+
+    /// A route may narrow what may spend its terminal leg without changing anything else.
+    ///
+    /// The policy is a statement about money, so it has to be loadable on exactly the route
+    /// that needs it and nowhere else: the default stays the historical capacity rule.
+    const JUDGE_CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[llm_clients.neutral]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.gemma]
+id = "google/gemma-4-26b"
+llm_client = "google"
+free_tier = true
+
+[targets.luna]
+id = "openai/luna-nt"
+llm_client = "neutral"
+
+[routes.judge]
+id = "smart-judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+terminal_fallback = ["luna"]
+terminal_policy = "quota_only"
+"#;
+
+    #[test]
+    fn a_quota_only_terminal_policy_loads_on_its_own_route() -> RunnerResult<()> {
+        let runner = runner_from_toml(JUDGE_CONFIG)?;
+        assert!(runner.route("smart-judge").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_policy_without_a_terminal_leg_is_refused() {
+        let invalid = JUDGE_CONFIG.replace(
+            "terminal_fallback = [\"luna\"]\nterminal_policy = \"quota_only\"",
+            "terminal_policy = \"quota_only\"",
+        );
+        let message = error_message(&invalid);
+        assert!(
+            message.contains("terminal_policy but no terminal_fallback"),
+            "the refusal names the two declarations: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_terminal_policy_is_refused() {
+        let invalid = JUDGE_CONFIG.replace("quota_only", "cheapest");
+        let message = error_message(&invalid);
+        assert!(
+            message.contains("unknown variant `cheapest`"),
+            "a policy must be one of the declared ones: {message}"
+        );
     }
 }
 

@@ -99,12 +99,21 @@ def _carriers(route_name: str, route: dict, target: dict, medium: str, errors: l
         errors.append(f"CARRIER_WITH_DISABLED_MEDIUM {route_name} {field}")
 
 
-def analyze(doc: dict, advertised: set[str] | dict | None = None) -> dict:
+def canonical_google_cards() -> dict:
+    """Existing upstream model-spec source, never a runtime admission substitute."""
+    path = HERE / "gemini-suite" / "canonical-google-model-capabilities-20261123.json"
+    return json.loads(path.read_text())["models"]
+
+
+def analyze(doc: dict, advertised: set[str] | dict | None = None,
+            canonical: dict | None = None) -> dict:
     names = _direct_names(doc)
     listed = set(advertised) if advertised is not None else None
     live_entries = advertised if isinstance(advertised, dict) else None
     rows = []
     errors: list[str] = []
+    documented_gaps: list[str] = []
+    canonical = canonical or {}
     for name in names:
         try:
             route, target_name, target = _one_target(doc, name)
@@ -171,6 +180,27 @@ def analyze(doc: dict, advertised: set[str] | dict | None = None) -> dict:
             issues.append(f"CONTEXT_OVERCLAIM {name}: route {route_window} > target {target_window}")
         if type(input_ceiling) is int and type(target_window) is int and input_ceiling > target_window:
             issues.append(f"INPUT_CAP_OVERCLAIM {name}: input {input_ceiling} > target context {target_window}")
+        upstream = canonical.get(target["id"])
+        upstream_input = upstream.get("model_input", {}) if upstream else {}
+        upstream_output = upstream.get("model_output", {}) if upstream else {}
+        # A vendor supports an input and the current route refuses it. That
+        # is NOT a claim that the vendor model is incapable; it is an actionable
+        # admission gap. Video/audio can require a different native wire.
+        for medium, field in (("image", "vision"), ("video", "video")):
+            documented = upstream_input.get(medium)
+            if documented in ("DOCUMENTED", "DOCUMENTED_INPUT") and (
+                route.get(field) is not True or target.get(field) is not True
+            ):
+                documented_gaps.append(
+                    f"UPSTREAM_{medium.upper()}_NOT_ADMITTED {name} model={target['id']} "
+                    f"wire={client.get('format', 'NOT_CONFIGURED')}; "
+                    "qualify the exact provider transport before changing admission"
+                )
+        if upstream_input.get("audio") == "DOCUMENTED":
+            documented_gaps.append(
+                f"UPSTREAM_AUDIO_NOT_ADMITTED {name}: existing Switchyard audio ingress "
+                "refuses audio regardless of Google upstream model support"
+            )
         row = {
             "route": name,
             "target": target_name,
@@ -211,6 +241,10 @@ def analyze(doc: dict, advertised: set[str] | dict | None = None) -> dict:
                 "pdf": "NOT_A_STANDALONE_ROUTE_ADMISSION_FLAG",
             },
             "output_generation": "NOT_A_CHAT_DIRECT_CAPABILITY",
+            "upstream_model_input": upstream_input or "NO_GOOGLE_SPEC_FOR_THIS_MODEL",
+            "upstream_model_output": upstream_output or "NO_GOOGLE_SPEC_FOR_THIS_MODEL",
+            "upstream_modality_source": (upstream.get("modality_source", "NOT_SPECIFIED")
+                                         if upstream else "NON_GOOGLE_QUALIFICATION_SEPARATE"),
             "state": "QUALIFIED_DECLARATIONS" if not issues else "EXECUTION_METADATA_BLOCKED",
             "problems": issues,
         }
@@ -230,6 +264,7 @@ def analyze(doc: dict, advertised: set[str] | dict | None = None) -> dict:
         if a["quota_group"] == b["quota_group"] or a["credential_env_name"] == b["credential_env_name"]:
             errors.append(f"GOOGLE_ACCOUNT_BOUNDARY_BROKEN {model}")
     return {"direct_count": len(names), "routes": rows, "failures": errors,
+            "upstream_vs_admission_gaps": documented_gaps,
             "status": "PASS" if not errors else "REFUSED"}
 
 
@@ -256,7 +291,7 @@ def main(argv=None) -> int:
     try:
         doc = tomllib.loads(a.manifest.read_text())
         advertised = _model_entries(json.loads(a.models.read_text())) if a.models else None
-        report = analyze(doc, advertised)
+        report = analyze(doc, advertised, canonical_google_cards())
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 3
@@ -268,6 +303,8 @@ def main(argv=None) -> int:
               f"failures={len(report['failures'])}")
         for err in report["failures"]:
             print(f"REFUSED {err}")
+        for gap in report["upstream_vs_admission_gaps"]:
+            print(f"NONADMITTED_DOCUMENTED_INPUT {gap}")
     return 0 if report["status"] == "PASS" else 3
 
 

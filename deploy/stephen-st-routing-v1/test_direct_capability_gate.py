@@ -61,6 +61,27 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result["direct_count"], 3)
         self.assertNotIn("?", str(result))
 
+    def test_upstream_google_modalities_remain_visible_without_falsely_enabling_route(self):
+        d = fixture()
+        spec = {"gemini-3.6-flash": {
+            "model_input": {"image": "DOCUMENTED", "video": "DOCUMENTED_INPUT",
+                            "audio": "DOCUMENTED"},
+            "model_output": {"text": "DOCUMENTED"},
+            "modality_source": "GOOGLE_MODEL_CARD",
+        }}
+        result = gate.analyze(d, canonical=spec)
+        self.assertEqual(result["status"], "PASS")
+        self.assertIn("UPSTREAM_IMAGE_NOT_ADMITTED",
+                      str(result["upstream_vs_admission_gaps"]))
+        self.assertIn("UPSTREAM_VIDEO_NOT_ADMITTED",
+                      str(result["upstream_vs_admission_gaps"]))
+        self.assertIn("UPSTREAM_AUDIO_NOT_ADMITTED",
+                      str(result["upstream_vs_admission_gaps"]))
+        route = next(row for row in result["routes"]
+                     if row["route"] == "direct-google-stephen-gemini-3.6-flash")
+        self.assertIs(route["route_capabilities"]["vision"], False)
+        self.assertEqual(route["upstream_model_input"]["image"], "DOCUMENTED")
+
     def test_missing_route_vision_fails(self):
         d = fixture()
         d["routes"]["direct-openrouter-nemotron-vl"].pop("vision")

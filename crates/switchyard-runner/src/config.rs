@@ -2350,6 +2350,11 @@ impl DeploymentConfig {
             }
         }
         let router = router.with_target_capabilities(facts);
+        // The credential each target draws on travels with the router as well, so a
+        // failure is attributed to the target that actually failed rather than to the
+        // route's first target. A mixed-provider free pool is exactly the case where
+        // those two differ.
+        let router = router.with_target_credentials(target_credentials(route, &self.targets));
 
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.

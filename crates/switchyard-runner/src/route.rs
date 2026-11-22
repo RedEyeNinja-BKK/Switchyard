@@ -565,6 +565,53 @@ impl Route {
         self.models.first_model()
     }
 
+    /// The target models a set of credential blocks still leaves servable.
+    ///
+    /// Judged per target, on the credential that target actually draws on. A mixed-provider
+    /// route has targets on more than one credential, so "the route's credential" is not a
+    /// fact: a block on one provider's account must leave every peer on another provider
+    /// servable, and a block on one model's own budget must leave its siblings servable.
+    ///
+    /// A target with no resolved credential is left servable, because a block that cannot be
+    /// attributed to it is not evidence against it.
+    pub fn servable_after_blocks(
+        &self,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> Vec<ModelId> {
+        self.models
+            .all_models()
+            .into_iter()
+            .filter(|model| !self.target_is_blocked(model, blocks))
+            .collect()
+    }
+
+    /// Whether any block covers `model`, on the credential that model draws on.
+    pub fn target_is_blocked(
+        &self,
+        model: &ModelId,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> bool {
+        let Some(credential) = self.target_credentials.get(model).map(String::as_str) else {
+            return false;
+        };
+        blocks
+            .iter()
+            .any(|block| block.blocks(credential, model.as_str()))
+    }
+
+    /// The exclusion code for the first block covering `model`, for the decision record.
+    fn block_exclusion(
+        &self,
+        model: &ModelId,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> Option<&'static str> {
+        let credential = self.target_credentials.get(model).map(String::as_str)?;
+        blocks
+            .iter()
+            .find(|block| block.blocks(credential, model.as_str()))
+            .map(switchyard_llm_client::CredentialBlock::exclusion_code)
+    }
+
     /// The provider slug of the first target model id, when one exists.
     pub fn first_target_slug(&self) -> &str {
         self.first_target_model()
@@ -782,6 +829,22 @@ impl Route {
         request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
+        self.execute_with_blocks(request, observer, &[]).await
+    }
+
+    /// Execute with credential blocks carried in from the surrounding composite.
+    ///
+    /// A block excludes the candidates it covers and nothing else: the survivors still
+    /// compete in the same order, under the same gates. That is what lets one provider's
+    /// exhausted account or one model's spent budget leave its peers in the pool instead of
+    /// condemning the whole child — which is the mixed-credential defect this parameter
+    /// exists to remove.
+    pub async fn execute_with_blocks(
+        &self,
+        request: Request,
+        observer: Option<RunObserver>,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> Result<RunOutput, RunnerError> {
         // A held route has no servable target at all, so the refusal is decided before any
         // request shaping: nothing is inspected, planned or dispatched. Reported here rather
         // than as an ineligible candidate so the caller gets the provider's evidence instead
@@ -819,6 +882,14 @@ impl Route {
         // the same reason: an undeclared tariff is not evidence of free entitlement.
         let pool_members_only_free = self.is_peer_pool();
         let verdict = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
+            // A candidate covered by a block carried in from the composite is excluded
+            // before it can be ranked or dispatched. Judged on this target's own credential,
+            // so a block on one provider's account or one model's budget never reaches a
+            // peer that is still healthy, and never becomes a paid escalation either: a
+            // paid leg is only reached by the composite's own crossing policy.
+            if let Some(code) = self.block_exclusion(model, blocks) {
+                return Err(code);
+            }
             let Some(facts) = facts.get(model) else {
                 // Uncharacterised rather than incapable: permitted, except for video,
                 // which no target may receive without stating that it can read it.

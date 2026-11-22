@@ -308,12 +308,19 @@ impl Runner {
                 continue;
             }
 
-            // A child drawing on a credential a previous child already exhausted or had
-            // rejected is skipped before its first provider call. Every target in the
-            // child shares one `llm_client`, so a block that covers one covers all; a
-            // child that names no credential is left in place rather than guessed at.
-            if let Some(blocked) = self.blocked_by_credential(route, &credential_blocks) {
-                children.push((child_name.clone(), blocked));
+            // A child is skipped only when credential blocks leave NONE of its targets
+            // servable. Judged per target, because a child's candidates may span providers:
+            // a block on one provider's account must leave every peer on another provider
+            // servable, and a block on one model's own daily budget must leave its siblings
+            // servable. The survivors are handed to the child below, where they compete in
+            // the same order under the same gates.
+            if route.first_target_model().is_some()
+                && route.servable_after_blocks(&credential_blocks).is_empty()
+            {
+                children.push((
+                    child_name.clone(),
+                    self.credential_skip(route, &credential_blocks),
+                ));
                 continue;
             }
 
@@ -321,7 +328,10 @@ impl Runner {
             // prepared for its provider is deliberately dropped, so a child cannot inherit
             // another child's model, body or reasoning fields.
             let child_request = request.clone();
-            match route.execute(child_request, observer.clone()).await {
+            match route
+                .execute_with_blocks(child_request, observer.clone(), &credential_blocks)
+                .await
+            {
                 Ok(output) => {
                     // The response names the candidate that actually served it, which is not
                     // always the one the child selected: after the child's own fallback a later
@@ -371,6 +381,12 @@ impl Runner {
                     // and the question is which SCOPE that credential still serves. An
                     // ordinary rate limit, a timeout or a provider fault carries no block
                     // and then crosses nowhere.
+                    //
+                    // The scope, not the mere presence, decides: a per-model daily budget
+                    // is a block, but spending the paid leg to work around one model's own
+                    // allocation is a cost the owner did not authorize. `crosses_to_paid`
+                    // keeps that one fail-closed while the whole-credential scopes still
+                    // reach the paid leg.
                     let crossable = match spec.cross_on {
                         crate::config::CompositeCrossPolicy::FailureClass => {
                             class.allows_cross_route()
@@ -379,7 +395,9 @@ impl Runner {
                                     Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
                                 )
                         }
-                        crate::config::CompositeCrossPolicy::CredentialBlock => block.is_some(),
+                        crate::config::CompositeCrossPolicy::CredentialBlock => {
+                            block.as_ref().is_some_and(|block| block.crosses_to_paid())
+                        }
                     };
                     if !crossable {
                         // Terminal for the parent. Surfacing the child's own error keeps a
@@ -541,50 +559,28 @@ impl Runner {
         )
     }
 
-    /// Whether this child would only spend a call on a credential already blocked.
+    /// The skip to report when blocks leave a child with no servable target.
     ///
-    /// Every target in the child shares one `llm_client`, so the credential resolved
-    /// for its first target is the child's credential. A free-scope block (`:free`
-    /// slugs exhausted) skips the child only when every servable target is free: a
-    /// child with a paid candidate still has a servable leg on the same credential.
-    /// A whole-quota or unauthorized block skips the child outright.
-    fn blocked_by_credential(
+    /// The reason names the block that covered the child's first target, which is the
+    /// candidate a call would have gone to. `servable_after_blocks` has already established
+    /// that every target is covered, so a child with targets always yields a reason; the
+    /// fallback exists only so the outcome is never silent.
+    fn credential_skip(
         &self,
         route: &Route,
         blocks: &[switchyard_llm_client::CredentialBlock],
-    ) -> Option<ChildOutcome> {
-        let credential = self.child_credential(route)?;
-        for block in blocks {
-            if matches!(
-                block.kind,
-                switchyard_llm_client::CredentialBlockKind::FreeQuota
-            ) && !route.all_targets_free()
-            {
-                continue;
-            }
-            if (*block).blocks(&credential, route.first_target_slug()) {
-                return Some(ChildOutcome::Skipped {
-                    capability: match block.kind {
-                        switchyard_llm_client::CredentialBlockKind::FreeQuota => "credential_quota",
-                        switchyard_llm_client::CredentialBlockKind::WholeQuota => {
-                            "credential_quota"
-                        }
-                        switchyard_llm_client::CredentialBlockKind::Unauthorized => {
-                            "credential_unauthorized"
-                        }
-                    },
-                });
-            }
-        }
-        None
-    }
-
-    /// The `llm_client` credential serving this child's targets, when known.
-    fn child_credential(&self, route: &Route) -> Option<String> {
-        route
+    ) -> ChildOutcome {
+        let capability = route
             .first_target_model()
-            .and_then(|model| route.target_credential(&model))
-            .map(str::to_string)
+            .and_then(|model| {
+                let credential = route.target_credential(&model)?;
+                blocks
+                    .iter()
+                    .find(|block| block.blocks(credential, model.as_str()))
+            })
+            .map(switchyard_llm_client::CredentialBlock::exclusion_code)
+            .unwrap_or("credential_quota");
+        ChildOutcome::Skipped { capability }
     }
 }
 

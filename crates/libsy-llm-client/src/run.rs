@@ -265,15 +265,33 @@ async fn call_first_available(
                 );
                 return Err(error);
             }
-            Err(error) => match fallback_reason(&error) {
-                Some(reason) => tracing::info!(
-                    from = %target,
-                    to = %models[index + 1],
-                    reason = reason.as_str(),
-                    "model call failed; trying next candidate"
-                ),
-                None => return Err(error),
-            },
+            Err(error) => {
+                // A statement about the credential that produced this failure says
+                // nothing about a candidate on a DIFFERENT credential. A free pool spans
+                // providers, so a rejected Google key or an exhausted OpenRouter
+                // allowance must not end the pool while a healthy peer remains. Within
+                // one credential the stop still applies: that is the check above.
+                let next = &models[index + 1];
+                let from = clients.credential_for(target);
+                let crosses_credential = from.is_some() && from != clients.credential_for(next);
+                match fallback_reason(&error) {
+                    Some(reason) => tracing::info!(
+                        from = %target,
+                        to = %next,
+                        reason = reason.as_str(),
+                        "model call failed; trying next candidate"
+                    ),
+                    None if crosses_credential && credential_scoped_stop(&error) => {
+                        tracing::info!(
+                            from = %target,
+                            to = %next,
+                            reason = "credential_scope",
+                            "credential-scoped failure; a peer on another credential may serve"
+                        );
+                    }
+                    None => return Err(error),
+                }
+            }
         }
     }
     Err(LibsyError::NoTargets)
@@ -602,6 +620,47 @@ fn is_account_wide_quota_exhausted(error: &LibsyError) -> bool {
     crate::client::is_account_wide_quota(source)
 }
 
+/// Whether this failure is a statement about the credential that produced it.
+///
+/// Such a failure ends the candidates sharing that credential and says nothing about any
+/// other. It is what makes a free pool spanning two providers usable: one account running
+/// out of allowance, or one key being rejected, must not condemn a peer billed to a
+/// different account.
+///
+/// Deliberately excludes outcomes that are about the REQUEST — a policy refusal, a
+/// malformed tool call, an unsupported feature — because handing those to another provider
+/// would be evading the answer rather than serving the caller. Those keep their existing
+/// terminal behaviour.
+fn credential_scoped_stop(error: &LibsyError) -> bool {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return false;
+    };
+    // A rejected or revoked key.
+    if matches!(
+        source,
+        LlmClientError::UpstreamHttp {
+            status: StatusCode::UNAUTHORIZED,
+            ..
+        }
+    ) {
+        return true;
+    }
+    // The allowance the retry loop already treats as account-wide: a free-tier daily cap,
+    // an exhausted balance, a project-wide Google daily quota.
+    if crate::client::is_account_wide_quota(source) {
+        return true;
+    }
+    // Google names the scope of its own stops, so its verdict decides: a stop that keeps
+    // the outcome is about the request and stays terminal.
+    if let LlmClientError::UpstreamHttp { status, body } = source
+        && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
+    {
+        let recovery = google.recovery();
+        return recovery.stop_candidate_list && !recovery.keep_outcome;
+    }
+    false
+}
+
 /// The scope of an exhausted allowance: which models on the credential it blocks.
 ///
 /// `openrouter_free_tier_daily` is an allowance over `:free` slugs only — a paid slug
@@ -650,6 +709,15 @@ pub enum CredentialBlockKind {
     /// slugs: paid slugs on the same credential draw on the account balance, not this
     /// allowance, and remain servable.
     FreeQuota,
+    /// One exact model's own daily allowance is spent. Blocks that target only.
+    ///
+    /// Google allocates `generate_content_free_tier_requests` per model inside the
+    /// project, so a spent model is not a spent project. Collapsing this into
+    /// [`Self::FreeQuota`] would be wrong twice over: that kind keys on a `:free` slug
+    /// spelling Google does not use, and it would take a sibling model's budget with it.
+    /// It must not become [`Self::WholeQuota`] either, which is reserved for a scope the
+    /// provider positively identified as project-wide.
+    ModelQuota,
     /// The credential's whole allowance is gone (an exhausted balance, or a cap the
     /// error body does not scope to free slugs). Blocks every slug on the credential.
     WholeQuota,
@@ -674,7 +742,42 @@ impl CredentialBlock {
         }
         match self.kind {
             CredentialBlockKind::FreeQuota => is_free_scope(target),
+            // The slug that reported the exhaustion, and nothing else on the credential.
+            CredentialBlockKind::ModelQuota => target == self.target,
             CredentialBlockKind::WholeQuota | CredentialBlockKind::Unauthorized => true,
+        }
+    }
+
+    /// The stable exclusion code a route or composite reports for this block.
+    ///
+    /// A closed vocabulary, so a caller-facing decision record can say why a candidate
+    /// was never contacted without exposing provider text.
+    pub fn exclusion_code(&self) -> &'static str {
+        match self.kind {
+            CredentialBlockKind::FreeQuota | CredentialBlockKind::WholeQuota => "credential_quota",
+            // Kept distinct so a decision record can tell a per-model budget from the
+            // credential's whole allowance: the two retirements are different sizes, and
+            // only the second one authorizes a paid crossing.
+            CredentialBlockKind::ModelQuota => "credential_model_quota",
+            CredentialBlockKind::Unauthorized => "credential_unauthorized",
+        }
+    }
+
+    /// Whether this block justifies spending a paid leg on the same request.
+    ///
+    /// A composite's crossing policy is the owner's money decision, so it is narrower
+    /// than "a block exists". Only a scope the provider positively stated as the whole
+    /// credential — the free allowance for every model, the account balance, or a
+    /// rejected key — makes another leg the only way to answer. A per-model budget is
+    /// not that: the model is out until its own day rolls over, but the project is not
+    /// spent, and paying to work around one model's daily allocation is a cost the owner
+    /// did not authorize. Such a request fails closed instead.
+    pub fn crosses_to_paid(&self) -> bool {
+        match self.kind {
+            CredentialBlockKind::FreeQuota
+            | CredentialBlockKind::WholeQuota
+            | CredentialBlockKind::Unauthorized => true,
+            CredentialBlockKind::ModelQuota => false,
         }
     }
 }
@@ -790,6 +893,25 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
         return None;
     };
     let target = target.as_str().to_string();
+    // Google states the scope of a daily quota, so its two scopes are different facts and
+    // must not be collapsed. `is_account_wide_quota` only reports the project-wide case,
+    // which would leave a per-model exhaustion both unrecorded and fatal to a mixed pool:
+    // unrecorded because no block is produced, fatal because a composite with
+    // `cross_on = "credential_block"` treats "no block" as terminal and returns.
+    if let LlmClientError::UpstreamHttp { status, body } = source
+        && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
+        && google.condition == crate::google::GoogleCondition::DailyQuota
+    {
+        let kind = match google.quota_scope {
+            // Positively project-wide: every model behind the project shares the budget.
+            crate::google::GoogleQuotaScope::Project => CredentialBlockKind::WholeQuota,
+            // Per-model, per-feature, or a scope the body never named. Only the exact
+            // reporting target is retired; an unproven scope is never promoted to
+            // project-wide, which is what the owner's per-model RPD allocation needs.
+            _ => CredentialBlockKind::ModelQuota,
+        };
+        return Some((kind, target));
+    }
     // Account-wide quota first: a 429 with the free-tier marker is a quota, not a
     // throttle, and its scope decides how much of the credential is blocked.
     if crate::client::is_account_wide_quota(source) {
@@ -1235,6 +1357,13 @@ struct ClientRouting {
     /// target that cannot see an image is never called for one. A target absent from this
     /// map is treated as uncharacterised rather than incapable.
     target_capabilities: HashMap<ModelId, CapabilityFacts>,
+    /// The credential (`llm_client`) each target draws on, keyed by model id.
+    ///
+    /// A mixed-provider route has targets on more than one credential, so "the credential
+    /// this call failed on" cannot be read off the route. It is looked up per target, and
+    /// only here: a target absent from this map makes a failure unattributable, and an
+    /// unattributable block condemns nothing rather than guessing.
+    target_credentials: HashMap<ModelId, String>,
 }
 
 /// The request requirements a candidate target is checked against.
@@ -1374,6 +1503,30 @@ impl ClientRouter {
         self
     }
 
+    /// Declares which `llm_client` credential serves each target model.
+    ///
+    /// A mixed-provider route has targets on more than one credential, so the credential a
+    /// failure belongs to cannot be read off the route: it is a property of the target that
+    /// actually failed. Resolved once here, from configuration, so neither a composite nor a
+    /// route has to infer credential identity from a wire error.
+    pub fn with_target_credentials(mut self, credentials: HashMap<ModelId, String>) -> Self {
+        let routing =
+            Arc::get_mut(&mut self.inner).expect("client router is not yet shared when configured");
+        routing.target_credentials = credentials;
+        self
+    }
+
+    /// The credential this router was told serves `model`, when it was told anything.
+    ///
+    /// `None` makes a block unattributable rather than guessed at: a failure whose target
+    /// resolves to no configured credential must not condemn one.
+    pub fn credential_for(&self, model: &ModelId) -> Option<&str> {
+        self.inner
+            .target_credentials
+            .get(model)
+            .map(String::as_str)
+    }
+
     /// Supplies the host that fulfils routing-time decision calls.
     ///
     /// Without one, a decision call is answered as unsupported.
@@ -1439,6 +1592,7 @@ impl ClientRouter {
                 track_provider_state: spans_providers,
                 decision_handler: None,
                 target_capabilities: HashMap::new(),
+                target_credentials: HashMap::new(),
             }),
         }
     }
@@ -1458,6 +1612,7 @@ impl ClientRouter {
                 track_provider_state: false,
                 decision_handler: None,
                 target_capabilities: HashMap::new(),
+                target_credentials: HashMap::new(),
             }),
         }
     }

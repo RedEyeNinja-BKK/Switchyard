@@ -45,6 +45,13 @@ import sys
 # Long enough to describe a load failure, short enough not to become a dump.
 DETAIL_LINES = 12
 
+# The unit whose EnvironmentFiles are discovered when none are named. There is one
+# Switchyard service on the host and its drop-ins are part of the unit, so asking
+# systemd is the only complete answer: this script used to require the caller to
+# enumerate the files, and the two it was told about were fewer than the four the
+# unit really reads.
+DEFAULT_UNIT = "switchyard-neutral-green.service"
+
 # Patterns that are secret-shaped even when the value did not come from an
 # environment file we parsed. A config error may print a key it read from
 # somewhere else, and the log should not carry it further.
@@ -114,6 +121,51 @@ def parse_environment_file(path: str) -> dict[str, str]:
     return env
 
 
+def discover_environment_files(unit: str) -> list[str]:
+    """The EnvironmentFiles systemd says this unit reads, in read order.
+
+    A candidate validated under an empty environment is worse than one that was
+    never validated: the binary loads, the report says so, and the environment the
+    checks describe is one the service will never have. So the default is to ask
+    systemd, and to refuse when it cannot answer rather than fall back to no
+    files at all.
+
+    Two output shapes have to be read, because systemd changed: newer releases
+    print one "PATH (ignore_errors=no)" per line, older ones print every path on
+    one line. A quoted path is taken whole -- word-splitting it would hand the
+    validator half a path that then reads as missing.
+    """
+    try:
+        completed = subprocess.run(
+            ["systemctl", "show", "-p", "EnvironmentFiles", "--value", unit],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"cannot ask systemd for the EnvironmentFiles of {unit}: {exc}") from exc
+    if completed.returncode != 0:
+        raise ValueError(f"systemctl could not resolve {unit}")
+
+    files: list[str] = []
+    for line in (completed.stdout or "").splitlines():
+        line = line.split(" (ignore_errors=", 1)[0].strip()
+        while line:
+            if line[0] == '"':
+                end = line.find('"', 1)
+                if end < 0:
+                    raise ValueError(f"unbalanced quote in EnvironmentFiles of {unit}")
+                files.append(line[1:end])
+                line = line[end + 1:].strip()
+            else:
+                token, _, line = line.partition(" ")
+                files.append(token)
+                line = line.strip()
+    if not files:
+        raise ValueError(
+            f"{unit} declares no EnvironmentFiles, or systemd was not asked; "
+            "refusing to validate under an environment the service will not get")
+    return files
+
+
 def scrub(text: str, secrets: list[str]) -> str:
     for value in secrets:
         if len(value) >= 6:
@@ -128,7 +180,13 @@ def main(argv: list[str]) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--env-file", action="append", default=[])
+    parser.add_argument("--env-file", action="append", default=[],
+                        help="environment file the unit reads, in read order; "
+                             "omit to discover them from the unit"),
+    parser.add_argument("--unit", default=os.environ.get("SWITCHYARD_UNIT",
+                                                          DEFAULT_UNIT),
+                        help=f"unit whose EnvironmentFiles are discovered "
+                             f"(default {DEFAULT_UNIT})"),
     parser.add_argument("--command", default=None,
                         help="testing seam: run this command instead of the binary")
     parser.add_argument("--log", default=None, help="where to write full detail")
@@ -140,7 +198,11 @@ def main(argv: list[str]) -> int:
 
     env: dict[str, str] = {}
     try:
-        for path in args.env_file:
+        paths = list(args.env_file) or discover_environment_files(args.unit)
+        if not args.env_file:
+            print(f"environment from {args.unit}: {len(paths)} file(s), in read order",
+                  file=sys.stderr)
+        for path in paths:
             env.update(parse_environment_file(path))
     except ValueError as exc:
         print(f"FAILED: {exc}", file=sys.stderr)

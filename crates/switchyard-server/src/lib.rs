@@ -624,6 +624,11 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/decisions", post(decision_surface::decisions))
         .route("/v1/embeddings", post(capability_surfaces::embeddings))
         .route("/v1/rerank", post(capability_surfaces::rerank))
+        .route("/v1/audio/speech", post(capability_surfaces::speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(capability_surfaces::transcriptions),
+        )
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route(
             "/v1/responses/input_tokens",

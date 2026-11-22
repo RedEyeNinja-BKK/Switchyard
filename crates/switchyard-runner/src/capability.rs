@@ -30,6 +30,20 @@ pub const GEMINI_EMBEDDING_V2_MIN_DIMENSIONS: u32 = 128;
 /// Input-token limit `gemini-embedding-2` publishes.
 pub const GEMINI_EMBEDDING_V2_INPUT_TOKENS: u32 = 8192;
 
+/// Whether a string is shaped like a prebuilt voice name.
+///
+/// The catalogue belongs to the provider, so this checks shape only: a non-empty
+/// letters/digits/hyphen/underscore token. An unknown but well-formed name travels to the
+/// engine and comes back as the engine's own error, which is more truthful than a locally
+/// invented list that would refuse a voice the provider has added.
+pub fn is_voice_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// One specialized capability endpoint.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +138,21 @@ pub enum CapabilityFormat {
     /// is 8,192 tokens, and vectors below full width are auto-normalised by the model.
     /// Vectors from this dialect are not comparable with `google_embed_content` output.
     GoogleEmbedContentV2,
+    /// Google `:generateContent` asked for an AUDIO modality: speech synthesis.
+    ///
+    /// Not a chat lane with a different output type. The request carries the text and a
+    /// voice, the response carries one `inlineData` blob of raw PCM, and a TTS model has its
+    /// own tiny request budget (three per minute, ten per day on this Free project). Serving
+    /// it as chat text — or falling back to a chat model when it is unavailable — would spend
+    /// the wrong quota and hand back something the caller did not ask for.
+    GoogleSpeech,
+    /// Google `:generateContent` that reads inline audio and answers text.
+    ///
+    /// The audio is a typed payload (container + bytes), not a chat attachment, so the
+    /// container is part of the contract: the surface parses it to bound duration and token
+    /// cost, and refuses a container it cannot measure rather than forwarding an unbounded
+    /// request.
+    GoogleTranscribe,
 }
 
 /// The header a capability credential is presented under.
@@ -144,6 +173,16 @@ impl CapabilityFormat {
         )
     }
 
+    /// Whether this format synthesises speech from text.
+    pub fn serves_speech(self) -> bool {
+        matches!(self, Self::GoogleSpeech)
+    }
+
+    /// Whether this format transcribes audio into text.
+    pub fn serves_transcription(self) -> bool {
+        matches!(self, Self::GoogleTranscribe)
+    }
+
     /// Whether this format produces rerank scores.
     pub fn serves_rerank(self) -> bool {
         matches!(self, Self::CohereJinaRerank)
@@ -156,7 +195,10 @@ impl CapabilityFormat {
     /// like a bad credential.
     pub fn auth(self) -> CapabilityAuth {
         match self {
-            Self::GoogleEmbedContent | Self::GoogleEmbedContentV2 => CapabilityAuth::GoogleApiKey,
+            Self::GoogleEmbedContent
+            | Self::GoogleEmbedContentV2
+            | Self::GoogleSpeech
+            | Self::GoogleTranscribe => CapabilityAuth::GoogleApiKey,
             Self::OpenaiEmbeddings | Self::CohereJinaRerank => CapabilityAuth::Bearer,
         }
     }
@@ -171,6 +213,9 @@ impl CapabilityFormat {
             Self::CohereJinaRerank => "/v1/rerank".to_string(),
             Self::GoogleEmbedContent => format!("/v1beta/models/{model}:embedContent"),
             Self::GoogleEmbedContentV2 => format!("/v1beta/models/{model}:embedContent"),
+            Self::GoogleSpeech | Self::GoogleTranscribe => {
+                format!("/v1beta/models/{model}:generateContent")
+            }
         }
     }
 }
@@ -230,6 +275,41 @@ pub struct CapabilityConfig {
     /// quantity that is provably at least as large as the token count.
     #[serde(default)]
     pub max_input_tokens: Option<u32>,
+    /// Voice a speech capability speaks in when the caller names none.
+    ///
+    /// A prebuilt Google voice name, passed through verbatim. The surface validates its
+    /// shape, not the catalogue: the provider is the authority on which names exist, and an
+    /// unknown name comes back as the provider's own error rather than a guessed list.
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Output audio container a speech capability serves: `wav` or `pcm`.
+    ///
+    /// The engine returns raw PCM; `wav` is that same PCM with a RIFF header this surface
+    /// writes. Compressed containers are refused because producing them would require an
+    /// encoder that is not part of this deployment, and mislabelling PCM as `mp3` would be
+    /// worse than refusing.
+    #[serde(default)]
+    pub audio_format: Option<String>,
+    /// Sample rate of the engine's audio output, in hertz.
+    ///
+    /// Declared so the surface can check the rate the provider reports in its
+    /// `inlineData` MIME type against what the caller is promised. A WAV header written at
+    /// the wrong rate plays back at the wrong speed, so this is verified rather than assumed.
+    #[serde(default)]
+    pub audio_sample_rate: Option<u32>,
+    /// Longest audio one transcription request may carry, in seconds.
+    ///
+    /// Audio tokens are proportional to duration, so duration is what the per-minute token
+    /// budget is spent in. It is parsed from the container rather than estimated from size:
+    /// a size bound would admit hours of low-bitrate audio.
+    #[serde(default)]
+    pub max_audio_seconds: Option<u32>,
+    /// Largest audio payload one transcription request may carry, in raw bytes.
+    ///
+    /// Separate from the duration bound: this is the provider's inline-request ceiling, and
+    /// an over-size body is refused before it is base64-encoded and sent.
+    #[serde(default)]
+    pub max_audio_bytes: Option<u64>,
     /// Evidence that keeps this capability out of dispatch, quoted from the provider.
     ///
     /// Present means held: the declaration, its contract and its limits are kept and
@@ -357,6 +437,90 @@ impl CapabilityDeployment {
                         ));
                     }
                 }
+                CapabilityFormat::GoogleSpeech => {
+                    let Some(max_input_tokens) = capability.max_input_tokens else {
+                        return Err(format!(
+                            "capability {name} serves a speech endpoint and must declare \
+                             max_input_tokens, because text past the model's input limit has to be \
+                             refused rather than truncated mid-sentence"
+                        ));
+                    };
+                    if max_input_tokens == 0 {
+                        return Err(format!(
+                            "capability {name} declares max_input_tokens = 0, which would refuse \
+                             every request"
+                        ));
+                    }
+                    let Some(voice) = capability.voice.as_deref() else {
+                        return Err(format!(
+                            "capability {name} serves a speech endpoint and must declare a default \
+                             voice, because a request that names none would otherwise have one \
+                             invented for it"
+                        ));
+                    };
+                    if !is_voice_name(voice) {
+                        return Err(format!(
+                            "capability {name} declares voice {voice:?}, which is not a voice name \
+                             (letters, digits, hyphen or underscore)"
+                        ));
+                    }
+                    match capability.audio_format.as_deref() {
+                        Some("wav") | Some("pcm") => {}
+                        Some(other) => {
+                            return Err(format!(
+                                "capability {name} declares audio_format {other:?}; this surface \
+                                 produces wav and pcm only, because any other container would need \
+                                 an encoder it does not ship"
+                            ));
+                        }
+                        None => {
+                            return Err(format!(
+                                "capability {name} serves a speech endpoint and must declare \
+                                 audio_format (wav or pcm)"
+                            ));
+                        }
+                    }
+                    match capability.audio_sample_rate {
+                        Some(0) => {
+                            return Err(format!(
+                                "capability {name} declares audio_sample_rate = 0, which would \
+                                 produce a WAV container with no timing"
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(format!(
+                                "capability {name} serves a speech endpoint and must declare \
+                                 audio_sample_rate, so the rate the provider reports can be checked \
+                                 against the one the caller is promised"
+                            ));
+                        }
+                    }
+                }
+                CapabilityFormat::GoogleTranscribe => {
+                    // The instruction is part of the contract: without it the model is asked
+                    // to "do something" with audio, and different callers would silently get
+                    // different behaviour from the same capability id.
+                    if capability.task_prefix.as_deref().is_none_or(str::is_empty) {
+                        return Err(format!(
+                            "capability {name} serves a transcription endpoint and must declare \
+                             task_prefix, the instruction sent with every recording"
+                        ));
+                    }
+                    if capability.max_audio_seconds.is_none() {
+                        return Err(format!(
+                            "capability {name} serves a transcription endpoint and must declare \
+                             max_audio_seconds, because audio tokens are proportional to duration \
+                             and an unbounded input would spend a budget nobody can plan for"
+                        ));
+                    }
+                    if capability.max_audio_bytes.is_none() {
+                        return Err(format!(
+                            "capability {name} serves a transcription endpoint and must declare \
+                             max_audio_bytes, the provider's inline request ceiling"
+                        ));
+                    }
+                }
                 CapabilityFormat::CohereJinaRerank => {
                     if capability.max_candidates.is_none() {
                         return Err(format!(
@@ -378,17 +542,69 @@ impl CapabilityDeployment {
             // only. On any other capability it would silently change nothing while
             // appearing to define the space.
             if capability.task_prefix.is_some()
-                && client.format != CapabilityFormat::GoogleEmbedContentV2
+                && !matches!(
+                    client.format,
+                    CapabilityFormat::GoogleEmbedContentV2 | CapabilityFormat::GoogleTranscribe
+                )
             {
                 return Err(format!(
                     "capability {name} declares task_prefix, which only google_embed_content_v2 \
-                     consumes; this client's wire has no prefix slot, so the value would be inert"
+                     and google_transcribe consume; this client's wire has no slot for it, so the \
+                     value would be inert"
                 ));
             }
             if capability.task_prefix.as_deref().is_some_and(str::is_empty) {
                 return Err(format!(
                     "capability {name} declares an empty task_prefix; state the exact instruction \
                      text, or omit the field for the model's generic space"
+                ));
+            }
+
+            // Speech and transcription configuration on a lane that cannot speak or listen
+            // would read as a capability the deployment does not have, so each field is
+            // refused on a wire with no slot for it rather than silently ignored.
+            if client.format != CapabilityFormat::GoogleSpeech {
+                for (field, present) in [
+                    ("voice", capability.voice.is_some()),
+                    ("audio_format", capability.audio_format.is_some()),
+                    ("audio_sample_rate", capability.audio_sample_rate.is_some()),
+                ] {
+                    if present {
+                        return Err(format!(
+                            "capability {name} declares {field}, which only google_speech \
+                             consumes; this client's wire does not synthesise audio, so the value \
+                             would be inert"
+                        ));
+                    }
+                }
+            }
+            if client.format != CapabilityFormat::GoogleTranscribe {
+                for (field, present) in [
+                    ("max_audio_seconds", capability.max_audio_seconds.is_some()),
+                    ("max_audio_bytes", capability.max_audio_bytes.is_some()),
+                ] {
+                    if present {
+                        return Err(format!(
+                            "capability {name} declares {field}, which only google_transcribe \
+                             consumes; this client's wire does not accept audio, so the value \
+                             would be inert"
+                        ));
+                    }
+                }
+            }
+            // An audio lane is not a vector space. A width or normalization here would
+            // describe an embedding contract the lane never produces.
+            if matches!(
+                client.format,
+                CapabilityFormat::GoogleSpeech | CapabilityFormat::GoogleTranscribe
+            ) && (capability.dimensions.is_some()
+                || capability.normalization.is_some()
+                || capability.max_batch.is_some())
+            {
+                return Err(format!(
+                    "capability {name} serves an audio endpoint and declares embedding fields \
+                     (dimensions, normalization or max_batch), which describe a vector contract \
+                     this lane does not produce"
                 ));
             }
 
@@ -658,6 +874,16 @@ pub struct ResolvedCapability {
     pub task_prefix: Option<String>,
     /// Provider-published input-token limit of one embedding input.
     pub max_input_tokens: Option<u32>,
+    /// Default voice a speech capability speaks in.
+    pub voice: Option<String>,
+    /// Output audio container a speech capability serves (`wav` or `pcm`).
+    pub audio_format: Option<String>,
+    /// Sample rate of the engine's audio output, in hertz.
+    pub audio_sample_rate: Option<u32>,
+    /// Longest audio one transcription request may carry, in seconds.
+    pub max_audio_seconds: Option<u32>,
+    /// Largest audio payload one transcription request may carry, in raw bytes.
+    pub max_audio_bytes: Option<u64>,
     /// The budgets this capability's physical calls are charged to.
     ///
     /// `None` when the client declares none, which is the unchanged behaviour of a
@@ -737,6 +963,11 @@ pub fn resolve_with_budget(
                 task_type: client.task_type.clone(),
                 task_prefix: capability.task_prefix.clone(),
                 max_input_tokens: capability.max_input_tokens,
+                voice: capability.voice.clone(),
+                audio_format: capability.audio_format.clone(),
+                audio_sample_rate: capability.audio_sample_rate,
+                max_audio_seconds: capability.max_audio_seconds,
+                max_audio_bytes: capability.max_audio_bytes,
                 budget,
             },
         );
@@ -1117,12 +1348,7 @@ task_prefix = "task: search result | query: "
     /// the space.
     #[test]
     fn a_prefix_is_refused_on_a_wire_that_has_no_prefix_slot() {
-        let source = SOURCE
-            .replace("google_embed_content_v2", "google_embed_content")
-            .replace(
-                "task_prefix = \"task: search result | query: \"\n",
-                "task_prefix = \"task: search result | query: \"\n",
-            );
+        let source = SOURCE.replace("google_embed_content_v2", "google_embed_content");
         let deployment: CapabilityDeployment = toml::from_str(&source).expect("parses");
         assert!(
             deployment
@@ -1300,6 +1526,204 @@ held = "response format not yet qualified against the project key"
                 .validate()
                 .expect_err("an empty hold reason must not load")
                 .contains("empty held reason")
+        );
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    const SPEECH_CLIENT: &str = r#"
+[clients.tts]
+format = "google_speech"
+base_url = "https://generativelanguage.test"
+model = "gemini-2.5-flash-preview-tts"
+"#;
+
+    const TRANSCRIBE_CLIENT: &str = r#"
+[clients.asr]
+format = "google_transcribe"
+base_url = "https://generativelanguage.test"
+model = "gemini-3.5-transcribe"
+"#;
+
+    const COMPLETE_SPEECH: &str = r#"
+[capabilities.speak]
+id = "speak"
+target = "tts"
+voice = "Kore"
+audio_format = "wav"
+audio_sample_rate = 24000
+max_input_tokens = 8192
+"#;
+
+    const COMPLETE_TRANSCRIBE: &str = r#"
+[capabilities.listen]
+id = "listen"
+target = "asr"
+task_prefix = "Transcribe this recording verbatim."
+max_input_tokens = 98304
+max_audio_seconds = 300
+max_audio_bytes = 15728640
+"#;
+
+    fn deployment(source: &str) -> CapabilityDeployment {
+        toml::from_str(source).expect("capability fixture parses")
+    }
+
+    fn refusal(source: &str) -> String {
+        deployment(source)
+            .validate()
+            .expect_err("fixture must be refused")
+    }
+
+    #[test]
+    fn a_complete_speech_capability_validates() {
+        let source = format!("{SPEECH_CLIENT}{COMPLETE_SPEECH}");
+        let parsed = deployment(&source);
+        parsed.validate().expect("complete speech lane is valid");
+        let resolved = resolve(&parsed);
+        let capability = resolved.get("speak").expect("resolved");
+        assert_eq!(capability.voice.as_deref(), Some("Kore"));
+        assert_eq!(capability.audio_format.as_deref(), Some("wav"));
+        assert_eq!(capability.audio_sample_rate, Some(24_000));
+        assert!(capability.format.serves_speech());
+        assert_eq!(
+            capability.url,
+            "https://generativelanguage.test/v1beta/models/gemini-2.5-flash-preview-tts:generateContent"
+        );
+    }
+
+    #[test]
+    fn a_speech_lane_must_declare_its_voice_container_rate_and_input_limit() {
+        for (drop_line, expected) in [
+            ("voice = \"Kore\"\n", "must declare a default voice"),
+            ("audio_format = \"wav\"\n", "must declare audio_format"),
+            (
+                "audio_sample_rate = 24000\n",
+                "must declare audio_sample_rate",
+            ),
+            ("max_input_tokens = 8192\n", "must declare max_input_tokens"),
+        ] {
+            let capability = COMPLETE_SPEECH.replace(drop_line, "");
+            let refused = refusal(&format!("{SPEECH_CLIENT}{capability}"));
+            assert!(refused.contains(expected), "{refused}");
+        }
+    }
+
+    /// The engine returns PCM. A container this surface would have to encode is refused at
+    /// load rather than mislabelled at response time.
+    #[test]
+    fn a_speech_lane_refuses_a_container_it_cannot_produce() {
+        let capability =
+            COMPLETE_SPEECH.replace("audio_format = \"wav\"", "audio_format = \"mp3\"");
+        let refused = refusal(&format!("{SPEECH_CLIENT}{capability}"));
+        assert!(refused.contains("produces wav and pcm only"), "{refused}");
+    }
+
+    /// A declared rate of zero is present but meaningless: the container it would produce has
+    /// no timing, so it is refused by name rather than written.
+    #[test]
+    fn a_speech_lane_refuses_a_zero_sample_rate() {
+        let capability =
+            COMPLETE_SPEECH.replace("audio_sample_rate = 24000", "audio_sample_rate = 0");
+        let refused = refusal(&format!("{SPEECH_CLIENT}{capability}"));
+        assert!(refused.contains("no timing"), "{refused}");
+    }
+
+    #[test]
+    fn a_complete_transcription_capability_validates() {
+        let source = format!("{TRANSCRIBE_CLIENT}{COMPLETE_TRANSCRIBE}");
+        let parsed = deployment(&source);
+        parsed
+            .validate()
+            .expect("complete transcription lane is valid");
+        let resolved = resolve(&parsed);
+        let capability = resolved.get("listen").expect("resolved");
+        assert_eq!(capability.max_audio_seconds, Some(300));
+        assert_eq!(capability.max_audio_bytes, Some(15_728_640));
+        assert!(capability.format.serves_transcription());
+        assert_eq!(
+            capability.url,
+            "https://generativelanguage.test/v1beta/models/gemini-3.5-transcribe:generateContent"
+        );
+    }
+
+    #[test]
+    fn a_transcription_lane_must_declare_its_instruction_and_bounds() {
+        for (drop_line, expected) in [
+            (
+                "task_prefix = \"Transcribe this recording verbatim.\"\n",
+                "must declare task_prefix",
+            ),
+            (
+                "max_audio_seconds = 300\n",
+                "must declare max_audio_seconds",
+            ),
+            (
+                "max_audio_bytes = 15728640\n",
+                "must declare max_audio_bytes",
+            ),
+        ] {
+            let capability = COMPLETE_TRANSCRIBE.replace(drop_line, "");
+            let refused = refusal(&format!("{TRANSCRIBE_CLIENT}{capability}"));
+            assert!(refused.contains(expected), "{refused}");
+        }
+    }
+
+    /// Each new field is refused on a wire that has no slot for it, so a deployment cannot
+    /// read as a capability it does not have.
+    #[test]
+    fn audio_fields_are_refused_on_a_lane_that_cannot_use_them() {
+        let embedding_with_voice = "[clients.embed]\nformat = \"openai_embeddings\"\nbase_url = \"https://engine.test\"\nmodel = \"e\"\n\
+             \n[capabilities.space]\nid = \"space\"\ntarget = \"embed\"\ncontract = \"space:v1\"\ndimensions = 1024\nvoice = \"Kore\"\n";
+        assert!(
+            refusal(embedding_with_voice).contains("only google_speech consumes"),
+            "{}",
+            refusal(embedding_with_voice)
+        );
+
+        let embedding_with_audio_bound = "[clients.embed]\nformat = \"openai_embeddings\"\nbase_url = \"https://engine.test\"\nmodel = \"e\"\n\
+             \n[capabilities.space]\nid = \"space\"\ntarget = \"embed\"\ncontract = \"space:v1\"\ndimensions = 1024\nmax_audio_seconds = 60\n";
+        assert!(
+            refusal(embedding_with_audio_bound).contains("only google_transcribe consumes"),
+            "{}",
+            refusal(embedding_with_audio_bound)
+        );
+
+        let speech_with_dimensions = COMPLETE_SPEECH.replace(
+            "voice = \"Kore\"\n",
+            "voice = \"Kore\"\ndimensions = 1024\n",
+        );
+        assert!(
+            refusal(&format!("{SPEECH_CLIENT}{speech_with_dimensions}"))
+                .contains("describe a vector contract this lane does not produce"),
+            "{}",
+            refusal(&format!("{SPEECH_CLIENT}{speech_with_dimensions}"))
+        );
+    }
+
+    #[test]
+    fn a_voice_name_is_a_token_not_a_sentence() {
+        assert!(is_voice_name("Kore"));
+        assert!(is_voice_name("en-US-Chirp3-HD-Achernar"));
+        assert!(!is_voice_name(""));
+        assert!(!is_voice_name("Kore please"));
+        assert!(!is_voice_name("Kore;drop"));
+    }
+
+    #[test]
+    fn audio_lanes_do_not_serve_embeddings_and_vice_versa() {
+        assert!(!CapabilityFormat::GoogleSpeech.serves_embeddings());
+        assert!(!CapabilityFormat::GoogleTranscribe.serves_embeddings());
+        assert!(!CapabilityFormat::GoogleSpeech.serves_transcription());
+        assert!(!CapabilityFormat::GoogleTranscribe.serves_speech());
+        assert!(CapabilityFormat::GoogleSpeech.serves_speech());
+        assert!(CapabilityFormat::GoogleTranscribe.serves_transcription());
+        assert_eq!(
+            CapabilityFormat::GoogleSpeech.auth(),
+            CapabilityAuth::GoogleApiKey
         );
     }
 }

@@ -22,11 +22,12 @@ prefill-router = ["switchyard-runner/prefill-router"]
 [dependencies]
 async-stream.workspace = true
 async-trait.workspace = true
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64.workspace = true
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 clap = { version = "4", features = ["derive", "env"] }
+futures.workspace = true
 futures-util.workspace = true
 http.workspace = true
 libsy = { package = "switchyard-libsy", path = "../libsy", version = "0.3.0" }
@@ -43,6 +44,8 @@ switchyard-protocol.workspace = true
 switchyard-runner.workspace = true
 serde_json.workspace = true
 switchyard-translation.workspace = true
+tokio-tungstenite.workspace = true
+tungstenite.workspace = true
 humantime = "2.4"
 tokio.workspace = true
 tracing.workspace = true

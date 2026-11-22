@@ -4,6 +4,7 @@
 //! Rust HTTP server for libsy algorithms.
 
 mod capability_surfaces;
+mod live_surface;
 pub mod config;
 pub mod decision_surface;
 pub mod economics;
@@ -630,6 +631,10 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
             post(capability_surfaces::transcriptions),
         )
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
+        .route(
+            "/v1/live/{capability}",
+            get(live_surface::live_websocket),
+        )
         .route(
             "/v1/responses/input_tokens",
             post(openai_responses_input_tokens),

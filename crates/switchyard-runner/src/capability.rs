@@ -30,6 +30,9 @@ pub const GEMINI_EMBEDDING_V2_MIN_DIMENSIONS: u32 = 128;
 /// Input-token limit `gemini-embedding-2` publishes.
 pub const GEMINI_EMBEDDING_V2_INPUT_TOKENS: u32 = 8192;
 
+/// Maximum thinking budget Google's Live API accepts, in tokens.
+pub const GEMINI_LIVE_MAX_THINKING_BUDGET: u32 = 32768;
+
 /// Whether a string is shaped like a prebuilt voice name.
 ///
 /// The catalogue belongs to the provider, so this checks shape only: a non-empty
@@ -153,6 +156,17 @@ pub enum CapabilityFormat {
     /// cost, and refuses a container it cannot measure rather than forwarding an unbounded
     /// request.
     GoogleTranscribe,
+    /// Google's stateful bidirectional Live API (`BidiGenerateContent`) over WebSocket.
+    ///
+    /// Not a stateless HTTP generateContent call: the first message over the connection must
+    /// be a `BidiGenerateContentSetup`, and both sides stream JSON frames until one side
+    /// closes. The credential travels in the WebSocket URL as a `key=` query parameter, so it
+    /// is never rendered into client-visible request bodies or logs.
+    ///
+    /// Model-specific fields (response modalities, thinking config, system instruction) are
+    /// declared per capability so the setup message is built locally and the caller cannot
+    /// override them.
+    GoogleLive,
 }
 
 /// The header a capability credential is presented under.
@@ -190,15 +204,17 @@ impl CapabilityFormat {
 
     /// How this format's credential is presented.
     ///
-    /// The header is a property of the wire, not a preference: Google reads its key from
-    /// `x-goog-api-key` and a bearer token there is an authentication failure that looks
-    /// like a bad credential.
+    /// The credential is a property of the wire, not a preference: Google reads its Live key
+    /// from the WebSocket URL's `key=` query parameter, and its HTTP surfaces from
+    /// `x-goog-api-key`; a bearer token on either wire is an authentication failure that
+    /// looks like a bad credential.
     pub fn auth(self) -> CapabilityAuth {
         match self {
             Self::GoogleEmbedContent
             | Self::GoogleEmbedContentV2
             | Self::GoogleSpeech
-            | Self::GoogleTranscribe => CapabilityAuth::GoogleApiKey,
+            | Self::GoogleTranscribe
+            | Self::GoogleLive => CapabilityAuth::GoogleApiKey,
             Self::OpenaiEmbeddings | Self::CohereJinaRerank => CapabilityAuth::Bearer,
         }
     }
@@ -215,6 +231,12 @@ impl CapabilityFormat {
             Self::GoogleEmbedContentV2 => format!("/v1beta/models/{model}:embedContent"),
             Self::GoogleSpeech | Self::GoogleTranscribe => {
                 format!("/v1beta/models/{model}:generateContent")
+            }
+            Self::GoogleLive => {
+                // The Live WebSocket endpoint is not an HTTP path: it names the generative
+                // service method and carries the credential as a query parameter. The surface
+                // builds the full wss:// URL from base_url, this path and the live key.
+                format!("/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
             }
         }
     }
@@ -319,6 +341,23 @@ pub struct CapabilityConfig {
     /// would hand back vectors from a space nobody asked for.
     #[serde(default)]
     pub held: Option<String>,
+    /// The response modalities this Live capability produces.
+    ///
+    /// Declared once per capability so the setup message is built locally and the caller
+    /// cannot ask for a modality this deployment does not serve.
+    #[serde(default)]
+    pub response_modalities: Option<Vec<String>>,
+    /// System instruction prepended to every session, part of the capability's contract.
+    ///
+    /// Travels verbatim in the setup message; no separator is invented.
+    #[serde(default)]
+    pub system_instruction: Option<String>,
+    /// Thinking budget for Live variants that expose it (Extended Thinking).
+    ///
+    /// `None` means the model's native default; `Some(0)` means disabled. A budget above the
+    /// model's published maximum is refused at load rather than sent to fail on every call.
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
 }
 
 /// Configured capability endpoints and the capabilities that name them.
@@ -533,6 +572,46 @@ impl CapabilityDeployment {
                     {
                         return Err(format!(
                             "capability {name} top_n {top_n} exceeds max_candidates {max_candidates}"
+                        ));
+                    }
+                }
+                CapabilityFormat::GoogleLive => {
+                    // A Live session is stateful and typed: the setup message is built from
+                    // the capability declaration, not per-request, so every field that shapes
+                    // the session must be declared here and never overridden by a caller.
+                    let Some(modalities) = &capability.response_modalities else {
+                        return Err(format!(
+                            "capability {name} serves a Live endpoint and must declare \
+                             response_modalities, the output types this session produces"
+                        ));
+                    };
+                    if modalities.is_empty() {
+                        return Err(format!(
+                            "capability {name} declares an empty response_modalities list; \
+                             name at least one output modality"
+                        ));
+                    }
+                    for modality in modalities {
+                        if !matches!(modality.as_str(), "AUDIO" | "TEXT") {
+                            return Err(format!(
+                                "capability {name} declares response_modality {modality:?}, \
+                                 but a Live session only serves AUDIO or TEXT"
+                            ));
+                        }
+                    }
+                    if let Some(budget) = capability.thinking_budget {
+                        if budget > GEMINI_LIVE_MAX_THINKING_BUDGET {
+                            return Err(format!(
+                                "capability {name} declares thinking budget {budget}, above the \
+                                 {GEMINI_LIVE_MAX_THINKING_BUDGET}-token maximum; a budget the \
+                                 model rejects would fail every session"
+                            ));
+                        }
+                    }
+                    if capability.system_instruction.as_deref().is_some_and(str::is_empty) {
+                        return Err(format!(
+                            "capability {name} declares an empty system_instruction; state the \
+                             exact instruction text, or omit the field"
                         ));
                     }
                 }
@@ -889,6 +968,15 @@ pub struct ResolvedCapability {
     /// `None` when the client declares none, which is the unchanged behaviour of a
     /// deployment that does not budget its capability calls.
     pub budget: Option<Arc<CapabilityBudget>>,
+    /// The output modalities this Live session serves (`AUDIO`, `TEXT`, or both).
+    ///
+    /// Declared per capability so the setup message is built locally and the caller cannot
+    /// request a modality this deployment does not serve.
+    pub response_modalities: Option<Vec<String>>,
+    /// System instruction that shapes every session, part of the capability's contract.
+    pub system_instruction: Option<String>,
+    /// Thinking budget for Extended Thinking variants, in tokens.
+    pub thinking_budget: Option<u32>,
 }
 
 /// The budgets one capability's physical calls draw on.
@@ -969,6 +1057,9 @@ pub fn resolve_with_budget(
                 max_audio_seconds: capability.max_audio_seconds,
                 max_audio_bytes: capability.max_audio_bytes,
                 budget,
+                response_modalities: capability.response_modalities.clone(),
+                system_instruction: capability.system_instruction.clone(),
+                thinking_budget: capability.thinking_budget,
             },
         );
     }
@@ -1725,5 +1816,104 @@ max_audio_bytes = 15728640
             CapabilityFormat::GoogleSpeech.auth(),
             CapabilityAuth::GoogleApiKey
         );
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    const LIVE_CLIENT: &str = r#"
+[clients.live]
+format = "google_live"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.8-live"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+"#;
+
+    const COMPLETE_LIVE: &str = r#"
+[capabilities.live]
+id = "live"
+target = "live"
+response_modalities = ["AUDIO", "TEXT"]
+system_instruction = "You are a helpful assistant."
+thinking_budget = 1024
+"#;
+
+    fn deployment(source: &str) -> CapabilityDeployment {
+        toml::from_str(source).expect("capability fixture parses")
+    }
+
+    #[test]
+    fn a_complete_live_capability_validates() {
+        let source = format!("{LIVE_CLIENT}{COMPLETE_LIVE}");
+        let parsed = deployment(&source);
+        parsed.validate().expect("complete Live lane is valid");
+        let resolved = resolve(&parsed);
+        let capability = resolved.get("live").expect("resolved");
+        assert_eq!(
+            capability.response_modalities.as_deref(),
+            Some(&["AUDIO".to_string(), "TEXT".to_string()][..])
+        );
+        assert_eq!(
+            capability.system_instruction.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+        assert_eq!(capability.thinking_budget, Some(1024));
+        assert!(capability.format.serves_embeddings() == false);
+        assert_eq!(
+            capability.url,
+            "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        );
+    }
+
+    #[test]
+    fn a_live_capability_must_declare_response_modalities() {
+        let without = COMPLETE_LIVE.replace("response_modalities = [\"AUDIO\", \"TEXT\"]\n", "");
+        let refused = refusal(&format!("{LIVE_CLIENT}{without}"));
+        assert!(refused.contains("must declare response_modalities"), "{refused}");
+    }
+
+    #[test]
+    fn an_empty_modality_list_is_refused() {
+        let without = COMPLETE_LIVE.replace(
+            "response_modalities = [\"AUDIO\", \"TEXT\"]",
+            "response_modalities = []",
+        );
+        let refused = refusal(&format!("{LIVE_CLIENT}{without}"));
+        assert!(refused.contains("empty response_modalities list"), "{refused}");
+    }
+
+    #[test]
+    fn an_unknown_modality_is_refused() {
+        let without = COMPLETE_LIVE.replace(
+            "response_modalities = [\"AUDIO\", \"TEXT\"]",
+            "response_modalities = [\"VIDEO\"]",
+        );
+        let refused = refusal(&format!("{LIVE_CLIENT}{without}"));
+        assert!(refused.contains("only serves AUDIO or TEXT"), "{refused}");
+    }
+
+    #[test]
+    fn a_thinking_budget_above_the_maximum_is_refused() {
+        let too_big = COMPLETE_LIVE.replace("thinking_budget = 1024", "thinking_budget = 65536");
+        let refused = refusal(&format!("{LIVE_CLIENT}{too_big}"));
+        assert!(refused.contains("above the"), "{refused}");
+    }
+
+    #[test]
+    fn an_empty_system_instruction_is_refused() {
+        let without = COMPLETE_LIVE.replace(
+            "system_instruction = \"You are a helpful assistant.\"\n",
+            "system_instruction = \"\"\n",
+        );
+        let refused = refusal(&format!("{LIVE_CLIENT}{without}"));
+        assert!(refused.contains("empty system_instruction"), "{refused}");
+    }
+
+    fn refusal(source: &str) -> String {
+        deployment(source)
+            .validate()
+            .expect_err("fixture must be refused")
     }
 }

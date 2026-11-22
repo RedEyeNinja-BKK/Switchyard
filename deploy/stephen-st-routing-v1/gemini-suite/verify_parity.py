@@ -33,7 +33,26 @@ from pathlib import Path
 import project
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_MANIFEST = Path("/var/tmp/st1/live3-routes-53fd9a84.toml")
+# The deployed manifest must be RESOLVED from the release store, never a literal
+# epoch path. A hardcoded /var/tmp capture silently graded release 53fd9a84 long
+# after production had moved on, so every run reported drift that did not exist
+# (and would have missed drift that did). Fail closed when it cannot be resolved.
+RELEASE_STORE = Path("/var/lib/switchyard/releases")
+
+
+def resolve_current_manifest() -> Path:
+    current = RELEASE_STORE / "CURRENT"
+    try:
+        release = current.resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve {current}: {error}. Pass --manifest with the deployed "
+            "routes.toml; a verifier must never grade a guessed or stale capture."
+        ) from error
+    manifest = release / "routes.toml"
+    if not manifest.is_file():
+        raise SystemExit(f"{manifest} is not a readable manifest")
+    return manifest
 
 # A profile may state these about an account; it may not state anything about a model.
 PROFILE_MODEL_FACT_KEYS = {
@@ -291,10 +310,18 @@ def check_no_duplicated_facts(owner: dict, stephen: dict) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="deployed routes.toml; defaults to the release store CURRENT",
+    )
     parser.add_argument("--expected-capture-hash", default=None)
     parser.add_argument("--json", action="store_true")
     arguments = parser.parse_args()
+    if arguments.manifest is None:
+        arguments.manifest = resolve_current_manifest()
+    print(f"manifest: {arguments.manifest}", file=sys.stderr)
 
     cat = project.catalogue()
     owner = project.profile("owner")

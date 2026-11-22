@@ -22,7 +22,27 @@ HERE = Path(__file__).resolve().parent
 # The baseline this suite verifies against. It moved from 53fd9a84 to e008aa96 when the
 # catalogue was re-anchored to the deployed bytes, and a mutation harness that names the
 # wrong baseline would report every mutation as CAUGHT for the wrong reason (P7 failing).
-MANIFEST = Path(os.environ.get("PARITY_MANIFEST", "/var/tmp/c5/live-e008aa96.toml"))
+# Same rule as verify_parity: resolve the deployed release, never a literal epoch
+# capture. A harness naming a stale baseline reports every mutation CAUGHT for the
+# wrong reason (P7 failing on the baseline, not on the mutation).
+def _resolve_manifest() -> Path:
+    explicit = os.environ.get("PARITY_MANIFEST")
+    if explicit:
+        return Path(explicit)
+    current = Path("/var/lib/switchyard/releases/CURRENT") / "routes.toml"
+    if not current.is_file():
+        raise SystemExit(
+            f"{current} is absent. Set PARITY_MANIFEST to the deployed routes.toml; "
+            "mutation controls must never grade a guessed baseline."
+        )
+    return current
+
+
+MANIFEST = _resolve_manifest()
+# Deliberately NOT derived from MANIFEST: this is the release the catalogue says it
+# was captured from, asserted independently so a mutation of catalogue.provenance is
+# caught. The manifest under test is usually a DERIVED candidate (today: the 2.5
+# removal), so its hash legitimately differs.
 EXPECTED_HASH = os.environ.get("PARITY_HASH", "e008aa96")
 OUT_DIR = Path(os.environ.get("PARITY_OUT", "/var/tmp/c5/parity-out"))
 BACKUP = Path("/var/tmp/st1/work/mut-backup-parity")

@@ -110,6 +110,51 @@ def remove_only(text: str) -> tuple[str, list[str]]:
     return out, sorted(f"{kind}.{name}" for kind, name in wanted)
 
 
+# Two comments in the deployed manifest describe the retired pair as still present
+# ("their target records stay held", "its target carries `held`"). Deleting the
+# tables without them leaves the live configuration asserting something false, so
+# they are corrected too -- by exact anchor, and the run FAILS if either anchor is
+# missing rather than silently skipping. No other comment is touched.
+STALE_COMMENTS = [
+    (
+        "# Complete pool, in preference order. The 2.5 models are absent: Google\n"
+        "# answers 404 for them in this project, so listing them would put a\n"
+        "# known-dead leg in the ordering; their target records stay held so the\n"
+        "# hold remains auditable. 3.6-flash and 3.8-flash are listed and are NOT\n"
+        "# held: the previous comment claimed the opposite of what this route does.\n",
+        "# Complete pool, in preference order. The 2.5 models are absent: Google\n"
+        "# answers 404 for them in this project, so listing them would put a\n"
+        "# known-dead leg in the ordering. Their models, targets and direct routes\n"
+        "# were removed entirely on 2026-11-23 by owner order, so no held record\n"
+        "# remains to audit. 3.6-flash and 3.8-flash are listed and are NOT held:\n"
+        "# the previous comment claimed the opposite of what this route does.\n",
+    ),
+    (
+        "# Capability flags are copied from each model's owner-side route, so a model\n"
+        "# declares the same tool/vision/video/reasoning support on either account.\n"
+        "# The 2.5 pair stays unadvertised: its target carries `held`, which the route\n"
+        "# does not override.\n",
+        "# Capability flags are copied from each model's owner-side route, so a model\n"
+        "# declares the same tool/vision/video/reasoning support on either account.\n"
+        "# The 2.5 pair is absent, not held: its routes and targets were removed on\n"
+        "# 2026-11-23 by owner order.\n",
+    ),
+]
+
+
+def correct_stale_comments(text: str) -> str:
+    for old, new in STALE_COMMENTS:
+        found = text.count(old)
+        if found != 1:
+            raise ValueError(
+                f"stale-comment anchor matched {found} time(s), expected exactly 1: "
+                f"{old.splitlines()[0]!r}; refusing rather than leaving a false "
+                "statement in the live manifest"
+            )
+        text = text.replace(old, new)
+    return text
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
@@ -122,6 +167,7 @@ def main() -> int:
     try:
         original = args.baseline.read_text()
         out, removed = remove_only(original)
+        out = correct_stale_comments(out)
     except (ValueError, OSError, KeyError, tomllib.TOMLDecodeError) as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 3

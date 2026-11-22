@@ -869,7 +869,7 @@ const GEMMA_INPUT_CEILING: u64 = 16_000;
 
 fn free_lite() -> CapabilityFacts {
     CapabilityFacts {
-        free_tier: true,
+        tariff: switchyard_llm_client::Tariff::Free,
         context_window: Some(1_048_576),
         max_input_tokens: Some(LITE_INPUT_CEILING),
         ..CapabilityFacts::default()
@@ -878,7 +878,7 @@ fn free_lite() -> CapabilityFacts {
 
 fn free_gemma(accepts_reasoning_control: bool) -> CapabilityFacts {
     CapabilityFacts {
-        free_tier: true,
+        tariff: switchyard_llm_client::Tariff::Free,
         context_window: Some(262_144),
         max_input_tokens: Some(GEMMA_INPUT_CEILING),
         no_reasoning_control: !accepts_reasoning_control,

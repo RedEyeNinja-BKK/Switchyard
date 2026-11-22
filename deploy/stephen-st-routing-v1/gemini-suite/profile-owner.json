@@ -1,0 +1,136 @@
+{
+  "schema": 1,
+  "profile": "owner",
+  "account": {
+    "owner": "global/owner",
+    "credential_env": "SWITCHYARD_GEMINI_API_KEY",
+    "quota_group": "google-ai-studio-free",
+    "note": "One AI Studio project serves every Gemini and Gemma target below, so the quota group is named once and shared; a second client on the same project must join it rather than believe it owns the whole budget."
+  },
+  "clients": [
+    {
+      "name": "google_gemini",
+      "api_key_env": "SWITCHYARD_GEMINI_API_KEY",
+      "quota_group": "google-ai-studio-free",
+      "max_retries": 0
+    },
+    {
+      "name": "google_gemma_31b",
+      "api_key_env": "SWITCHYARD_GEMINI_API_KEY",
+      "quota_group": "google-ai-studio-free",
+      "max_retries": 0,
+      "failure_cooldown_ms": 300000,
+      "why_dedicated": "gemma-4-31b-it spins up with a 503; a 5s default cooldown would spend the free minute re-asking a model that is still starting. The cooldown is per model, not per credential."
+    }
+  ],
+  "client_for": {
+    "gemini-3.5-flash-lite": "google_gemini",
+    "gemini-3.1-flash-lite": "google_gemini",
+    "gemini-3.6-flash": "google_gemini",
+    "gemini-3.8-flash": "google_gemini",
+    "gemini-4-hydrogen": "google_gemini",
+    "gemma-4-26b-a4b-it": "google_gemini",
+    "gemma-4-31b-it": "google_gemma_31b",
+    "gemini-3-flash-preview": "google_gemini",
+    "gemini-2.5-flash": "google_gemini",
+    "gemini-2.5-flash-lite": "google_gemini",
+    "gemini-decision-1": "google_gemini"
+  },
+  "state": {
+    "gemini-3.5-flash-lite": {
+      "qualification": "serving",
+      "evidence": "deployed R6 pool member; serving receipts in docs/evidence/gemini-r3/2026-11-21"
+    },
+    "gemini-3.1-flash-lite": {
+      "qualification": "serving",
+      "evidence": "deployed R6 pool member"
+    },
+    "gemini-3.6-flash": {
+      "qualification": "serving",
+      "evidence": "deployed R6 pool member; 20-RPD row"
+    },
+    "gemini-3.8-flash": {
+      "qualification": "serving",
+      "evidence": "deployed R6 pool member; 20-RPD row"
+    },
+    "gemini-4-hydrogen": {
+      "qualification": "serving",
+      "evidence": "deployed R6 pool member; 20-RPD row"
+    },
+    "gemma-4-26b-a4b-it": {
+      "qualification": "serving",
+      "evidence": "deployed R6 pool member"
+    },
+    "gemma-4-31b-it": {
+      "qualification": "serving",
+      "evidence": "deployed R6 pool member"
+    },
+    "gemini-3-flash-preview": {
+      "qualification": "serving",
+      "evidence": "deployed leaf, not a pool member"
+    },
+    "gemini-2.5-flash": {
+      "qualification": "held"
+    },
+    "gemini-2.5-flash-lite": {
+      "qualification": "held"
+    },
+    "gemini-decision-1": {
+      "qualification": "serving",
+      "evidence": "typed-decision lane, not a chat route"
+    }
+  },
+  "chat_routes": [
+    {
+      "name": "smart_gemini",
+      "kind": "passthrough",
+      "target": "gemini-3.5-flash-lite",
+      "candidates": [
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.8-flash",
+        "gemini-2.5-flash",
+        "gemini-4-hydrogen",
+        "gemma-4-26b-a4b-it",
+        "gemma-4-31b-it"
+      ],
+      "selection": "measured",
+      "context_window": 1048576,
+      "tool_calling": true,
+      "reasoning": true,
+      "vision": false,
+      "video": false,
+      "policy": "MEASURED: the pool orders by this deployment's own observations (completion, then latency) once a candidate has enough of them, so a replacement model is adopted without a config change. Ordering is a cost and quality decision over one credential at one price, which is why it is a passthrough rather than a composite."
+    },
+    {
+      "name": "smart-gemini-chat",
+      "kind": "passthrough",
+      "target": "gemini-3.5-flash-lite",
+      "candidates": [
+        "gemini-3.1-flash-lite"
+      ],
+      "selection": "measured",
+      "context_window": 1048576,
+      "tool_calling": true,
+      "reasoning": true,
+      "vision": false,
+      "video": false,
+      "policy": "The two Lite leaves as one capability group; the pair is a latency decision, not a cost one."
+    },
+    {
+      "name": "smart-gemini-bounded",
+      "kind": "passthrough",
+      "target": "gemma-4-26b-a4b-it",
+      "candidates": [
+        "gemma-4-31b-it"
+      ],
+      "selection": "measured",
+      "context_window": 262144,
+      "tool_calling": false,
+      "reasoning": false,
+      "vision": false,
+      "video": false,
+      "policy": "MEASURED over the two Gemmas. The 26B is the default on structure (A4B mixture, far fewer active parameters per token), the 31B is the escalation step."
+    }
+  ]
+}

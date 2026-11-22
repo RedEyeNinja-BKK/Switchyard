@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "profile": "stephen",
+  "account": {
+    "owner": "stephen",
+    "credential_env": "SWITCHYARD_GEMINI_STEPHEN_API_KEY",
+    "quota_group": "google-ai-studio-free-stephen",
+    "note": "A separate AI Studio project. Its daily allowance and its quota counters are its own: joining the owner's quota group would let one account's spending pace the other's, and merging counters would enforce a cap neither provider applied.",
+    "allowance_basis": "Published per-model free-tier rows from the owner's AI Studio record, applied as rate CEILINGS. They are not a measurement of this project's remaining allowance, and a measured receipt for this account may lower them: allowance fields are account facts, so overriding one here is a profile edit and never a parity failure."
+  },
+  "clients": [
+    {
+      "name": "google_gemini_stephen",
+      "api_key_env": "SWITCHYARD_GEMINI_STEPHEN_API_KEY",
+      "quota_group": "google-ai-studio-free-stephen",
+      "max_retries": 0
+    },
+    {
+      "name": "google_gemma_31b_stephen",
+      "api_key_env": "SWITCHYARD_GEMINI_STEPHEN_API_KEY",
+      "quota_group": "google-ai-studio-free-stephen",
+      "max_retries": 0,
+      "failure_cooldown_ms": 300000,
+      "why_dedicated": "The same model fact the owner profile records: the 31B spins up with a 503, so the cooldown must be per model rather than inherited from a shared client."
+    }
+  ],
+  "client_for": {
+    "gemini-3.5-flash-lite": "google_gemini_stephen",
+    "gemini-3.1-flash-lite": "google_gemini_stephen",
+    "gemini-3.6-flash": "google_gemini_stephen",
+    "gemini-3.8-flash": "google_gemini_stephen",
+    "gemini-4-hydrogen": "google_gemini_stephen",
+    "gemma-4-26b-a4b-it": "google_gemini_stephen",
+    "gemma-4-31b-it": "google_gemma_31b_stephen",
+    "gemini-3-flash-preview": "google_gemini_stephen",
+    "gemini-2.5-flash": "google_gemini_stephen",
+    "gemini-2.5-flash-lite": "google_gemini_stephen",
+    "gemini-decision-1": "google_gemini_stephen"
+  },
+  "state": {
+    "gemini-3.5-flash-lite": {
+      "qualification": "unverified",
+      "reason": "No serving receipt exists under this project. The key is a root-only systemd credential, so the receipt needs one root-run measurement; until then the target must not enter a served pool."
+    },
+    "gemini-3.1-flash-lite": {
+      "qualification": "unverified",
+      "reason": "No serving receipt under this project."
+    },
+    "gemini-3.6-flash": {
+      "qualification": "unverified",
+      "reason": "No serving receipt under this project."
+    },
+    "gemini-3.8-flash": {
+      "qualification": "unverified",
+      "reason": "No serving receipt under this project."
+    },
+    "gemini-4-hydrogen": {
+      "qualification": "unverified",
+      "reason": "No serving receipt under this project."
+    },
+    "gemma-4-26b-a4b-it": {
+      "qualification": "unverified",
+      "reason": "No serving receipt under this project."
+    },
+    "gemma-4-31b-it": {
+      "qualification": "unverified",
+      "reason": "No serving receipt under this project."
+    },
+    "gemini-3-flash-preview": {
+      "qualification": "unverified",
+      "reason": "No serving receipt under this project."
+    },
+    "gemini-2.5-flash": {
+      "qualification": "held",
+      "reason": "Retired by the provider for new users (the catalogue's shared fact): a different project does not un-retire a model."
+    },
+    "gemini-2.5-flash-lite": {
+      "qualification": "held",
+      "reason": "Retired by the provider for new users (the catalogue's shared fact): a different project does not un-retire a model."
+    },
+    "gemini-decision-1": {
+      "qualification": "unverified",
+      "reason": "Typed-decision lane; not part of the chat pool and not deployed for this account."
+    }
+  },
+  "chat_routes": [
+    {
+      "name": "ST_Gemini_Free",
+      "kind": "staged",
+      "pool_group": "ST_Gemini_Free",
+      "selection": "peer",
+      "members": [
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.8-flash",
+        "gemini-4-hydrogen",
+        "gemma-4-26b-a4b-it",
+        "gemma-4-31b-it"
+      ],
+      "context_window": 262144,
+      "tool_calling": true,
+      "reasoning": true,
+      "vision": false,
+      "video": false,
+      "policy": "PEER: this account's free suite is one pool of interchangeable leaves ranked by declared facts, and its members join ST_Free beside the OpenRouter free leaves. Stephen's selection is peer over OR+Gemini, NOT the owner's measured-over-one-credential policy: the two policies answer different questions and neither is copied from the other."
+    }
+  ],
+  "pool_delta": {
+    "route": "ST_Free",
+    "add_group": "ST_Gemini_Free",
+    "add_candidates": [
+      "gemini-3.5-flash-lite",
+      "gemini-3.1-flash-lite",
+      "gemini-3.6-flash",
+      "gemini-3.8-flash",
+      "gemini-4-hydrogen",
+      "gemma-4-26b-a4b-it",
+      "gemma-4-31b-it"
+    ],
+    "effect": "ST_Free becomes the unified free pool: pool_groups = [\"ST_OR_Free\", \"ST_Gemini_Free\"] and the Gemini leaves join its candidate list. Applied only for members whose qualification is `serving`; `unverified` and `held` members are emitted as staged records and excluded from the candidate list."
+  }
+}

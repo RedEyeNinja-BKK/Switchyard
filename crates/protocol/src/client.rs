@@ -97,18 +97,80 @@ pub enum LlmClientError {
         reason: String,
     },
 
-    /// The assembled payload contains content that must not leave the deployment.
+    /// The target's own per-minute budget has no room for this request yet.
     ///
-    /// Raised at the last possible moment - over the exact JSON body about to be sent -
-    /// for a provider that may only receive a payload cleared as public. It is terminal
-    /// for the route rather than a fallback reason: another candidate would be handed the
-    /// same payload, so advancing would leak what this check just found.
-    #[error("payload for {model} carries content that must not leave this deployment: {codes}")]
-    PayloadNotCleared {
-        /// Target the payload was assembled for.
+    /// A different fact from both the daily allowance above and an account-wide cap: the
+    /// window refills within a minute, so the leg is still servable and the route may advance
+    /// to a candidate with minute headroom. It must not be retried on the same leg inside one
+    /// call — that would spend the very window the next request needs, which is how a single
+    /// throttle becomes a burst against a provider whose whole point is the minute.
+    #[error(
+        "per-minute {scope} budget for {model} is full; it clears in about {retry_after_secs}s"
+    )]
+    MinuteAllowanceThrottled {
+        /// Target whose minute window is full.
         model: ModelId,
-        /// The finding codes, comma separated, without the matched values.
-        codes: String,
+        /// Which limit refused: `requests_per_minute` or `input_tokens_per_minute`.
+        scope: String,
+        /// Seconds until the window has room for this request.
+        retry_after_secs: u64,
+    },
+
+    /// This request can never fit the target's per-minute input budget.
+    ///
+    /// Distinct from a throttle: waiting cannot help, because the request alone, with the
+    /// deployment's uncertainty margin applied, is larger than a whole minute's allowance.
+    /// The leg is servable in general and a sibling with a wider window may take the
+    /// request now, so the route advances rather than ending. It is not a capability defect
+    /// either — this model could read the input if the deployment were not pacing it.
+    #[error(
+        "an input reserving about {needed} tokens at a {margin_permille}/1000 safety margin \
+         exceeds the {limit}-token per-minute input budget for {model}; another candidate \
+         with a wider window may serve this request"
+    )]
+    InputExceedsMinuteWindow {
+        /// Target whose minute window the request cannot fit.
+        model: ModelId,
+        /// The request's reservation after the margin.
+        needed: u64,
+        /// The whole window's input budget.
+        limit: u64,
+        /// The margin applied, in permille.
+        margin_permille: u32,
+    },
+
+    /// The provider answered the request but produced no usable reply.
+    ///
+    /// `HTTP 200` records that the request was accepted and answered; it does not record that
+    /// the caller received anything. Measured 2026-11-21 against hosted Gemma 4 26B: a
+    /// 900-token output budget went entirely to inline `<thought>` reasoning, so the reply
+    /// carried `completion_tokens: 0` and no content while the wire reported success, and the
+    /// caller was handed an empty answer although a sibling candidate could have served it.
+    ///
+    /// The route advances rather than retrying in place: the same model under the same budget
+    /// produces the same non-answer, so a retry spends the window and returns nothing again.
+    #[error(
+        "{model} returned no usable answer ({reason}); another candidate may serve this request"
+    )]
+    EmptyAnswer {
+        /// Model whose reply carried no content.
+        model: ModelId,
+        /// Which empty shape was observed.
+        reason: &'static str,
+    },
+
+    /// The caller asked for a feature the selected target's wire format cannot carry.
+    ///
+    /// Raised before the request is assembled, so nothing is sent. Terminal for the route
+    /// for the same reason a privacy finding is: every candidate on a Chat wire format
+    /// would have to answer without the feature too, so advancing would hand the caller a
+    /// plausible answer to a request that was never really made.
+    #[error("request for {model} needs a feature this target cannot serve: {feature}")]
+    UnsupportedFeature {
+        /// Target the request would have been sent to.
+        model: ModelId,
+        /// The feature and why this target cannot serve it.
+        feature: String,
     },
 
     /// The upstream could not be reached or the request could not be sent.

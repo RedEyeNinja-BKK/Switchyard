@@ -185,6 +185,26 @@ impl Runner {
         })
     }
 
+    /// The routes a catalogue may advertise: every registered leaf except a held one.
+    ///
+    /// `models()` stays the full inventory, because diagnostics and economics want to see a
+    /// held target and the alias that still resolves to it. Advertising is the narrower
+    /// question: an entry here is a promise that a caller can get an answer from that name,
+    /// and a held route can only answer with a refusal. So the catalogue lists what serves,
+    /// while the declaration and its evidence stay readable everywhere else.
+    pub fn advertised_models(&self) -> impl Iterator<Item = ModelInfo<'_>> {
+        self.routes
+            .iter()
+            .filter(|(_, route)| route.held().is_none())
+            .map(|(id, route)| ModelInfo {
+                id,
+                algorithm: route.algorithm_name(),
+                capabilities: route.capabilities(),
+                reasoning_policy: route.route_reasoning_policy(),
+                locality: route.locality(),
+            })
+    }
+
     /// Registers the configuration facts an economics surface needs.
     pub(crate) fn with_deployment_facts(mut self, facts: crate::facts::DeploymentFacts) -> Self {
         self.deployment_facts = facts;

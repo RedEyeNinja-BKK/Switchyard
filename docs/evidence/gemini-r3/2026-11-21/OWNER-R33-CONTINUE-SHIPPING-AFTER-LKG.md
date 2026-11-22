@@ -1,0 +1,72 @@
+> **URGENT OWNER SCREENSHOT + RATE-LIMIT CORRECTION (2026-11-21):** [Gemma 26B 18.05K/16K TPM overrun, no Free-tier 10-minute spend reset, and precise governor follow-up](https://github.com/RedEyeNinja-BKK/Switchyard/blob/feat/gemini-r3-adaptive-bounded/docs/evidence/gemini-r3/2026-11-21/OWNER-GEMMA-TPM-OVERRUN-AND-SPEND-RESET.md) @ `07e1e4dc`. Official Google [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) explicitly list **spend-based 10-minute limits: Free N/A; Tier1 $10; Tier2/Tier3 $200**. This is not the Gemini Free TPM reset. User screenshot is **one-day peak**, with Gemma 26B red at **18.05K/16K**; this correlates with provider `prompt_tokens=18054` vs Switchyard estimate `15202`. Do not promise 10-minute reset or call `chars/4` hard token admission. For near-limit Gemma requests use a conservative uncertainty margin, *selective* exact counting or another eligible Free model/refusal, and reconcile usage against the minute window. 200 with empty content is not task success. Source + offline fixes should ship **alongside** the remaining six chat and 16 typed services, not replace their implementation. R3.2 remains LKG; no new calls or deploy authorized by this note.
+
+# Owner midstream directive — R3.2 LKG, complete all 26 Free-tier contracts, optimize Switchyard
+2026-11-21 · controlling *follow-on* implementation direction for active PR #46 / Agent Stack Issue #35.
+**Do not create a new research workstream. Do not alter current production by reading this document.**
+
+## 0. Lock in the actual proven state
+
+Owner/Turnstone host readback reports **CURRENT = LAST-KNOWN-GOOD** `20261120T222915Z-5d8c6562f5a73ef9-308e046d`; live `/etc/switchyard/routes.toml` SHA256 `308e046d…7a9`, binary `5d8c6562f5a73ef9…4bde82`, MainPID `390211`, NRestarts `0`, health OK, **54 served routes**, all four Google chat targets minute-paced. This is an *observed release receipt*, not a claim the assistant independently logged into the host. Treat it as baseline for all future stages; **never roll back to R3.1's transposed window** as if it were good. Release corrections and true source evidence: [PR #46 comment 7052191907](https://github.com/RedEyeNinja-BKK/Switchyard/pull/46#issuecomment-7052191907), [R3.2 receipt 7052233130](https://github.com/RedEyeNinja-BKK/Switchyard/pull/46#issuecomment-7052233130), [append-only R3.1/R3.2 pacing receipt](R3.1-PACING-RECEIPT.md). PR #46 source currently `08a1dce8` and is still draft; distinguish repo head, artifact hash and live release.
+
+**Corrected quotas (owner-authenticated Google AI Studio project):**
+
+| physical model | RPM | input TPM | RPD |
+|---|---:|---:|---:|
+| `gemma-4-26b-a4b-it` | 30 | 16,000 | 14,400 |
+| `gemma-4-31b-it` | 30 | 16,000 | 14,400 |
+| `gemini-3.5-flash-lite` | 15 | 250,000 | 500 |
+| `gemini-3.1-flash-lite` | 15 | 250,000 | 500 |
+
+RPM/TPM are separate minute constraints; RPD is legitimately spendable across the provider day. In R3.1, transposed 7/15 RPM and 14,400 TPM were wrong. Require **source-keyed numerical assertions** in staging (model ID, RPM, input TPM, RPD), not only shape assertions. Never confuse seven-day UI peak usage with live remaining.
+
+**What the discriminating R3.2 canary proves:** request estimated 15,202 was admitted by corrected 16,000 local window and reached Gemma 26B, HTTP 200, 1.88 s. Provider reported **18,054 actual prompt tokens**, and **empty answer with `completion_tokens=0`** (the response consumed its `max_tokens=16` budget in native thinking). It proves *pre-egress admission and upstream service*, **not successful task completion**, not a hard TPM guarantee, and not 26B text quality. Earlier unsigned 403 proves only privacy refusal. **10 of the previous 12 permitted Google upstream attempts are already spent.** Do not silently reset that authorization or start an open-ended probe suite.
+
+## 1. Fast, safe token-accounting correction — do not stop family delivery
+
+R3.2's 60-second RPM reservation is meaningful; input TPM based on `chars/4` is **soft**, with measured error in both directions (~24% overcount on one prompt and ~16% undercount on another). Do not claim a hard token bound; model/media/tokenizer variability may exceed those two samples.
+
+**Smallest practical response, in the existing governor:**
+- For Gemma and all future tight-TPM targets, temporarily reserve **estimated input × a conservative configurable uncertainty factor** (e.g. 1.25–1.30, ceiling-rounded); account separately for extra tool-result turns and encoding overhead. This is a protection margin, **not proof of true token equivalence**. Do not hardcode a universal `chars/4` rule for audio, images, PDFs or Live.
+- If a **native local/tokenizer** or the project's existing qualified `countTokens` method is available, design **selective exact preflight for borderline/high-risk requests only**, with deadline and quota/call-budget transparency; do *not* add an extra remote Google call to every short task or claim countTokens is quota-free. For a prompt whose estimated+margin cannot fit a 16K Gemma minute, prefer a compatible wide-TPM Lite leg or pace, never dispatch on optimistic raw estimate.
+- On a successful provider answer, reconcile local minute reservations using `usage.prompt_tokens` where reported: if actual > reserved, debit the difference against the remaining minute headroom **before accepting further same-model sends**; if exact usage missing/ambiguous, keep conservative reservation and label it estimated. Do not retroactively claim the original overrun was prevented. Do not refund a request that may have reached Google. A restart in-process can lose minute history: retain the documented caveat and optionally add simple warm-start restraint instead of adding disk writes on every task.
+- For **actual task success**, `HTTP 200` with empty content and no useful tool output is a **model/task failure or incomplete result**, not a successful bounded answer. This must feed measured task outcome separately from provider transport health. Preserve native Google thinking; assign enough output budget for thinking+answer without inventing unsupported `reasoning_effort:none` controls. Keep all hosted Gemma hidden thoughts out of caller-visible body, SSE, tool and logs.
+- Add a handful of offline tests for the two measured estimates, quota reservation correction, no spill to paid solely due to a momentary minute hold, and empty-answer quality attribution. Do not hold the entire capability program hostage to achieving mathematical tokenizer exactness on every call.
+
+## 2. Next shipment = six outstanding chat model contracts, **not another inventory**
+
+Already researched in the [full authenticated Free tier inventory](https://github.com/RedEyeNinja-BKK/Switchyard/blob/feat/gemini-r2-capability-inventory-20261121/docs/evidence/gemini-r2/2026-11-21/direct-google-capability-inventory.json), [27-entry ship queue](https://github.com/RedEyeNinja-BKK/Switchyard/blob/feat/gemini-r2-capability-inventory-20261121/docs/evidence/gemini-r2/2026-11-21/research-and-ship-queue-20261121.md) and [owner controlling all capabilities dossier](OWNER-CONTROLLING-ALL-FREE-CAPABILITIES.md):
+
+| chat leaf | native ID evidence | RPM / input TPM / RPD | shipping status requirement |
+|---|---|---|---|
+| Gemini 3.6 Flash | `gemini-3.6-flash` | 5 / 250K / 20 | candidate record with actual tools/JSON/context declarations; canary before marking served |
+| Gemini 3.8 Flash | `gemini-3.8-flash` | 5 / 250K / 20 | likewise; 23/20 and 22/20 are **7-day peaks**, not remaining balance |
+| Gemini 2.5 Flash | `gemini-2.5-flash` | 5 / 250K / 20 | version-appropriate thinking/tool defaults and same transport qualified |
+| Gemini 2.5 Flash Lite | `gemini-2.5-flash-lite` | 10 / 250K / 20 | **prior project 404**: mark HELD pending exact serving; no blind retry storm |
+| Gemini 3 Flash | UI row; candidate `gemini-3-flash-preview`, exact active mapping unresolved | 5 / 250K / 20 | HELD on exact-ID map; no fabricated serving |
+| Gemini 4 Hydrogen | `gemini-4-hydrogen` | 5 / 250K / 20 | candidate record, protocol/media tools guarded, tiny proof before active |
+
+Use the **existing chat adapter**, capability metadata and shared RPM/TPM/RPD ledger; do not create six bespoke provider transports. Stage direct leaf definitions and capability-specific groups, explicitly separating `configured`, `serving_verified`, `held`, and `unsupported`. Do not let a held model block the models already serving. Add a model to `smart_gemini` and `smart-nt` only once exact operation, privacy gate, tools/JSON/context and short-window economics are truthfully backed; no Gemini reasoning-disabling knobs. Use the owner's next narrowly authorized wire budget, not assumptions about the remaining two calls. Give a reversible **chat expansion release candidate** with host hash/capability diff and one GO decision rather than a broad probe plan.
+
+## 3. Deliver the typed *other 16* services as reusable families, not fake chat
+
+A full Free-tier portfolio is **26 actionable entries**: the four R3 chat + six next chat + **sixteen typed-service model variants**. Antigravity remains owner-deferred and 20 zero-RPD model rows remain inventory-only. Use existing source specs; engineering creates adapters/tests, not another internet research expedition. All typed service endpoints **share the same physical-model/account/feature quota and privacy/economy admission** as other routes, and export **real capability metadata** to Switchyard's selector and `/v1/models` or dedicated discovery API.
+
+**Recommended shipping order** (optimized for useful production, not catalogue order):
+1. **Decision + embeddings:** `gemini-decision-1` native `createDecision` (200 RPM/50K TPM/10K RPD), plus `gemini-embedding-001` and documented stable `gemini-embedding-2` via `embedContent` (100 RPM/30K TPM/1K RPD each). Use the existing Switchyard Decision lane and typed embeddings client. **Never merge embeddings into the current 1024-d local Qwen vector space without separate index/dimension agreement.**
+2. **Speech TTS (4) + asynchronous transcription (1):** native `generateContent` AUDIO output, actual voice/codec/size/latency limits, and native audio-input transcription. Quotas **TTS 3 RPM/10K TPM/10 RPD per model**, transcription **3 RPM/10K TPM/25 RPD**. Group under distinct typed `smart-gemini-tts` and `smart-gemini-transcribe`, not text completions.
+3. **Live sessions (6) + realtime music (1):** actual Google `BidiGenerateContent` / Lyria `bidiGenerateMusic` via a bounded WebSocket/session adapter, cancellation, concurrency, session-duration/media limits and in-band error handling; `Unlimited` daily does not mean unrestricted TPM or sessions. Reuse one WebSocket transport rather than forcing it through `reqwest` chat. Do not duplicate audio outputs after a committed stream error.
+4. **Robotics ER2 (1):** specialized embodied/visual input and typed outputs with privacy/capability restrictions; **5 RPM/250K TPM/20 RPD** and do not pretend ordinary chat models satisfy robotics tasks.
+
+Each typed group requires the exact wire contract from the dossier, offline protocol fixtures and one owner-approved tiny serving proof before calling the leaf live-qualified. Add useful typed results to selection/telemetry. **`smart_gemini` is the chat-facing alias; the entire suite belongs in a shared Google capability registry + `smart-gemini-*` typed routes**, not hidden behind chat completions.
+
+## 4. Make Switchyard's selector demonstrably intelligent
+
+The selector at R3 sorts cost tier, exhaustion, measured unreliability, >50% input pressure, **absolute remaining RPD**, then pressure/latency, then declared order. This can make 14.4K RPD Gemma dominate Lite for reasons unrelated to the task. Next small selector revision: strict privacy/economic tier first; genuine typed operation and modality/tool/JSON/context fit; **remaining minute allowance and normalized quota scarcity** rather than absolute RPD; observed *useful task success* and latency/503 health; safe bounded exploration. Don't let paid move ahead of eligible Free for speed. Report per-task chosen physical model and reason (redacted, no prompt/thought content) and compare real bounded tasks against Luna/DeepSeek/local alternatives **without spending unapproved paid tests**. A success is a correct usable text/tool/media result, not HTTP 200 or a frame delivered.
+
+**503 cooldown:** Current source already contains `rests_the_model` separated from same-model retry in `client.rs` and `failure_cooldown_ms=300000` on a separate 31B client; do not undo/rewrite that. Turnstone reports a remaining *operational* masking/cooldown problem. Reproduce the exact **26B→31B** condition, check model identity/cooldown key/route preference using already captured 503 fixtures, then fix minimally **if demonstrably broken**. The R3.1 receipt proves a 26B 503 followed by cooldown refusal; it does not by itself prove the 31B-specific path works end-to-end. Preserve model-only cooldown and allow the healthy sibling.
+
+## 5. What happens after all 26 contracts are shipping
+
+The Gemini project is **a means to optimize our whole Switchyard**, not the end state. Continue with real-world routing comparisons and safely apply validated improvements to the owner's existing Luna, DeepSeek, local 3070/3090 and other `smart-*` routes: capability-aware task selection, actual performance/quality and available capacity, privacy/data-use boundaries, minute/day economics, continuation affinity, health, coherent fallback and reliable telemetry. This is **not permission to automatically rewrite existing routes** before review. Revisit Stephen's independent remote OpenClaw `ST_Route` only when the owner reopens parked Issue #58. Avoid Antigravity and unused zero-RPD models.
+
+**Operator handoff:** keep R3.2 LKG healthy and untouched; implement next chat/typed family code in current PR or a small linked PR, prepare hash-verified opt-in artifacts and minimal wire authorization; report production evidence and the next exact GO. Do not spend remaining Google pilot attempts on tests that do not establish task usefulness. No unauthorized external calls, paid comparisons, merge, prod restarts or consumer repoints from this document.

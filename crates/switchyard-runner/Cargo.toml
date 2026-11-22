@@ -19,6 +19,7 @@ prefill-router = ["dep:prefill-router"]
 [dependencies]
 hmac = "0.12"
 libsy = { package = "switchyard-libsy", path = "../libsy", version = "0.3.0" }
+parking_lot.workspace = true
 prefill-router = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true

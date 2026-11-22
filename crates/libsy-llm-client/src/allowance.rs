@@ -59,10 +59,12 @@
 //! a reason naming the fault, which the caller reports and routes around, rather than
 //! spending budget nobody is counting.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use switchyard_protocol::ModelId;
 
@@ -282,6 +284,62 @@ impl DailyRequestAllowance {
         Ok(())
     }
 
+    /// Whether both of this allowance's files can be used *by this process*, without
+    /// changing anything.
+    ///
+    /// Answers the question a directory probe cannot: the directory may be writable while a
+    /// counter left behind by a different account is not. Files that are present are opened
+    /// exactly as a real call will, so an unreadable counter is a configuration error with a
+    /// remedy in the message rather than a 503 discovered by the first caller.
+    ///
+    /// **Absent files are not a fault and are not created here.** Creation belongs to the
+    /// account that spends: the first reservation creates the directory, the lock and the
+    /// counter as the process that will own them. Doing it at load looks equivalent and is
+    /// not - a deployment preflight runs the same loader as root, so a load-time create
+    /// leaves root-owned files under a unit that runs as its own user, and the first request
+    /// then fails with a permission error that reads like a provider fault. A dry run must
+    /// be able to validate a fresh deployment without leaving any state behind.
+    pub fn check_usable(&self) -> Result<(), String> {
+        for path in [self.path.clone(), self.lock_path()] {
+            match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(_) => {}
+                // Nothing exists yet: the first reservation creates both files, as the
+                // account that will spend them.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(self.explain(&path, &error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// A refusal that names the file, its owner and the one command that fixes it.
+    ///
+    /// The ownership case is not hypothetical: a deployment path that runs as root creates
+    /// these files under a unit that runs as another account, and the first caller then
+    /// fails with a bare `Permission denied` that reads like a provider fault.
+    fn explain(&self, path: &Path, error: &std::io::Error) -> String {
+        let owner = std::fs::metadata(path).ok().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            format!("{}:{}", metadata.uid(), metadata.gid())
+        });
+        match owner {
+            Some(owner) if error.kind() == std::io::ErrorKind::PermissionDenied => format!(
+                "{} (owner {owner}) cannot be opened read-write by this process: {error}; the \
+                 accounting files must belong to the account the service runs as, for example \
+                 `chown -R <service-user>:<service-group> {}`",
+                path.display(),
+                self.path.parent().unwrap_or(Path::new(".")).display(),
+            ),
+            Some(owner) => format!("{} (owner {owner}) is unusable: {error}", path.display()),
+            None => format!("{} is unusable: {error}", path.display()),
+        }
+    }
+
+    /// The counter file this allowance persists at.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The counter's lock file, beside the counter it guards.
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension("json.lock")
@@ -481,6 +539,624 @@ fn fnv1a(value: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// Length of one pacing window.
+///
+/// A minute is what the providers that publish window limits publish them over. It is a
+/// sliding window, not a fixed clock minute: a fixed boundary would let a deployment send
+/// a full window either side of it, doubling the burst the limit exists to prevent.
+const WINDOW: Duration = Duration::from_secs(60);
+
+/// A provider's per-minute pacing limits for one model.
+///
+/// Both axes are optional and independent: a model may cap requests, input tokens, or both.
+/// Tokens are counted on the request side only — output is not known before the call, and
+/// the provider's own input budget is what this mirrors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowLimits {
+    /// Requests permitted in any rolling minute.
+    pub requests_per_minute: Option<u64>,
+    /// Input tokens permitted in any rolling minute.
+    pub input_tokens_per_minute: Option<u64>,
+}
+
+impl WindowLimits {
+    /// No window limits: nothing is recorded and nothing is refused.
+    pub const fn unlimited() -> Self {
+        Self {
+            requests_per_minute: None,
+            input_tokens_per_minute: None,
+        }
+    }
+
+    /// Whether this declares no limit at all.
+    pub fn is_unlimited(&self) -> bool {
+        self.requests_per_minute.is_none() && self.input_tokens_per_minute.is_none()
+    }
+
+    /// The largest *raw estimate* whose margin-adjusted reservation still fits the window.
+    ///
+    /// The inverse of [`AdmissionMargin::apply`]: `apply(estimate) <= limit` holds exactly
+    /// when `estimate <= floor(limit * 1000 / permille)`. The pre-dispatch filter uses this
+    /// so a request it admits is one the send path will also admit, without the filter
+    /// needing to know the margin arithmetic.
+    pub fn safe_input_ceiling(&self, margin: AdmissionMargin) -> Option<u64> {
+        self.input_tokens_per_minute.map(|limit| {
+            u64::try_from(u128::from(limit) * 1_000 / u128::from(margin.permille()))
+                .unwrap_or(u64::MAX)
+        })
+    }
+}
+
+/// How much larger than its estimate a request is assumed to be before it is dispatched.
+///
+/// The estimate is characters over the outbound JSON divided by four: a shape, not a
+/// measurement. Two measurements of that estimator disagreed in both directions on real
+/// prompts (an over-count of about 24 % and an under-count of about 16 %), so no fixed
+/// accuracy figure is claimed here — the margin is a protective pad an operator
+/// configures, not a proven bound and not a substitute for counting.
+///
+/// It exists because the failure it prevents is asymmetric. Reserving too little lets a
+/// provider charge more input tokens in one minute than its published window allows, which
+/// is a real overrun against a real account; reserving too much only refuses a request
+/// slightly early, and the route can hand it to a sibling with a wider window. Only values
+/// at or above 1.0 are constructible, so the pad can never become an under-count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AdmissionMargin(u32);
+
+impl AdmissionMargin {
+    /// No pad: the estimate is reserved as stated. The default for every target that does
+    /// not declare one, so pre-existing manifests behave exactly as they did.
+    pub const NONE: Self = Self(1_000);
+
+    /// A pad of `permille` thousandths, or `None` below 1.0.
+    pub const fn from_permille(permille: u32) -> Option<Self> {
+        if permille < 1_000 {
+            None
+        } else {
+            Some(Self(permille))
+        }
+    }
+
+    /// The pad in thousandths.
+    pub const fn permille(self) -> u32 {
+        self.0
+    }
+
+    /// The reservation for `estimate`: the estimate scaled up and rounded up.
+    ///
+    /// Rounded up because a fractional token is a token the provider counts, and because
+    /// rounding down would silently undo part of the pad on every request.
+    pub fn apply(self, estimate: u64) -> u64 {
+        let scaled = u128::from(estimate) * u128::from(self.0);
+        let rounded = scaled.div_ceil(1_000);
+        u64::try_from(rounded).unwrap_or(u64::MAX).max(1)
+    }
+
+    /// The wider of two pads.
+    #[must_use]
+    pub fn widest(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+}
+
+/// Identity of one paced budget.
+///
+/// The provider counts per project and physical model, so the key is exactly that and not
+/// the alias: `smart-nt`, `smart_gemini` and a direct leaf address to the same model must
+/// draw on one window, or each alias would be handed the full allowance. `feature` keeps a
+/// second family on the same model (an embedding call on a chat model, say) from spending
+/// the chat window unless the deployment says they share it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GovernorKey {
+    group: String,
+    model: ModelId,
+    feature: &'static str,
+}
+
+impl GovernorKey {
+    /// The paced budget for `model` in `group`, on the `feature` axis.
+    pub fn new(group: impl Into<String>, model: ModelId, feature: &'static str) -> Self {
+        Self {
+            group: group.into(),
+            model,
+            feature,
+        }
+    }
+
+    /// The quota group (provider project) this budget belongs to.
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+
+    /// The physical model this budget belongs to.
+    pub fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    /// The feature axis this budget belongs to.
+    pub fn feature(&self) -> &'static str {
+        self.feature
+    }
+}
+
+/// A granted minute-window reservation.
+///
+/// Returned so the caller can release it if the request never reaches the provider — the
+/// daily allowance refusing afterwards is the case that matters, because spending a window
+/// slot for a request that was never sent would turn a paced-out day into a burst.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PacingTicket {
+    key: GovernorKey,
+    sequence: u64,
+}
+
+/// Which limit refused a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacingScope {
+    /// The rolling request count.
+    Requests,
+    /// The rolling input-token count.
+    InputTokens,
+}
+
+impl PacingScope {
+    /// Stable label for logs and error bodies.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requests => "requests_per_minute",
+            Self::InputTokens => "input_tokens_per_minute",
+        }
+    }
+}
+
+/// A window with no room right now, and when it next will have room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Throttled {
+    /// The limit that refused.
+    pub scope: PacingScope,
+    /// How long until enough of the window has expired to admit this request.
+    pub retry_after: Duration,
+}
+
+/// Why a minute-window reservation could not be granted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacingError {
+    /// The window is full now but refills shortly: route elsewhere or report the interval.
+    Throttled(Throttled),
+    /// The request alone is larger than a whole window's input budget, so waiting cannot
+    /// help. A deployment that declares `input_tokens_per_minute` must also declare a
+    /// per-request ceiling the same request fits under its margin; configuration validation
+    /// enforces that, and this variant is the defensive answer if a call arrives over it
+    /// anyway - or if a learned ratio has since widened the pad past the declared ceiling.
+    ExceedsWindow {
+        /// The request's reservation after the margin.
+        needed: u64,
+        /// The whole window's input budget.
+        limit: u64,
+        /// The margin the reservation was computed with, in permille.
+        margin_permille: u32,
+    },
+}
+
+/// Tracks rolling per-minute spend per [`GovernorKey`].
+///
+/// One instance is shared by every backend of a deployment, which is what makes the
+/// accounting cross-alias: two aliases of one physical model resolve to the same key and so
+/// to the same ledger. The state is in-process and deliberately not persisted — a window is
+/// a minute wide, and a restart is not a thing a provider's per-minute counter refunds, so
+/// the only cost of forgetting is that a restart may under-count for the remainder of the
+/// current window. Persisting it would add a lock and a disk write to every request to
+/// protect a value that expires in under a minute.
+#[derive(Debug, Default)]
+pub struct QuotaGovernor {
+    ledgers: Mutex<HashMap<GovernorKey, Ledger>>,
+}
+
+#[derive(Debug, Default)]
+struct Ledger {
+    spends: VecDeque<Spend>,
+    next_sequence: u64,
+    /// The largest ratio of provider-reported input tokens to the raw estimate this budget
+    /// has ever shown, in permille, floored at 1.0.
+    ///
+    /// Learned rather than declared, and never decreased: each provider answer that reports
+    /// its own prompt count is evidence about how the estimator behaves on this model, and
+    /// the next request should be reserved at the worst ratio seen rather than at the pad
+    /// the operator guessed before any traffic existed. A ratio below 1.0 is discarded
+    /// because it only appears when the estimate over-counted, and an over-count needs no
+    /// protection.
+    observed_ratio: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Spend {
+    sequence: u64,
+    at: SystemTime,
+    /// What this request holds against the window: the margin-adjusted reservation, raised
+    /// in place if the provider reports more.
+    tokens: u64,
+    /// The raw estimate the reservation came from, kept so a reported actual is compared
+    /// against the estimate rather than against the pad, which would hide the estimator's
+    /// own error.
+    estimated: u64,
+}
+
+impl QuotaGovernor {
+    /// An empty governor.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserves one request of `input_tokens` against `key`'s window, on the real clock.
+    pub fn reserve(
+        &self,
+        key: &GovernorKey,
+        limits: WindowLimits,
+        input_tokens: u64,
+    ) -> Result<Option<PacingTicket>, PacingError> {
+        self.reserve_at(key, limits, input_tokens, SystemTime::now())
+    }
+
+    /// [`Self::reserve_with_margin`], on the real clock.
+    pub fn reserve_with_margin(
+        &self,
+        key: &GovernorKey,
+        limits: WindowLimits,
+        margin: AdmissionMargin,
+        input_tokens: u64,
+    ) -> Result<Option<PacingTicket>, PacingError> {
+        self.reserve_with_margin_at(key, limits, margin, input_tokens, SystemTime::now())
+    }
+
+    /// [`Self::reserve`] against an explicit clock, for tests and replays.
+    pub fn reserve_at(
+        &self,
+        key: &GovernorKey,
+        limits: WindowLimits,
+        input_tokens: u64,
+        now: SystemTime,
+    ) -> Result<Option<PacingTicket>, PacingError> {
+        self.reserve_with_margin_at(key, limits, AdmissionMargin::NONE, input_tokens, now)
+    }
+
+    /// [`Self::reserve_with_margin`] against an explicit clock, for tests and replays.
+    ///
+    /// The reservation is the estimate scaled by whichever is wider - the operator's pad or
+    /// the worst ratio this model has actually reported. That ordering matters: a pad chosen
+    /// before any traffic cannot know that one model's tokenizer runs 19 % above
+    /// characters/4, and the learned ratio supplies what the declaration could not.
+    pub fn reserve_with_margin_at(
+        &self,
+        key: &GovernorKey,
+        limits: WindowLimits,
+        margin: AdmissionMargin,
+        input_tokens: u64,
+        now: SystemTime,
+    ) -> Result<Option<PacingTicket>, PacingError> {
+        if limits.is_unlimited() {
+            return Ok(None);
+        }
+        let mut ledgers = self.ledgers.lock().unwrap_or_else(PoisonError::into_inner);
+        let ledger = ledgers.entry(key.clone()).or_default();
+        let effective = margin.widest(AdmissionMargin(ledger.observed_ratio.max(1_000)));
+        let reserved = effective.apply(input_tokens);
+        if let Some(limit) = limits.input_tokens_per_minute
+            && reserved > limit
+        {
+            return Err(PacingError::ExceedsWindow {
+                needed: reserved,
+                limit,
+                margin_permille: effective.permille(),
+            });
+        }
+        let cutoff = now.checked_sub(WINDOW).unwrap_or(UNIX_EPOCH);
+        while ledger
+            .spends
+            .front()
+            .is_some_and(|spend| spend.at <= cutoff)
+        {
+            ledger.spends.pop_front();
+        }
+
+        // Both axes are evaluated before anything is recorded: a request refused for one
+        // reason must not have consumed room on the other.
+        let mut refused: Option<Throttled> = None;
+        if let Some(limit) = limits.requests_per_minute {
+            let used = u64::try_from(ledger.spends.len()).unwrap_or(u64::MAX);
+            if used >= limit
+                && let Some(front) = ledger.spends.front()
+            {
+                refused = Some(Throttled {
+                    scope: PacingScope::Requests,
+                    retry_after: (front.at + WINDOW).duration_since(now).unwrap_or_default(),
+                });
+            }
+        }
+        if let Some(limit) = limits.input_tokens_per_minute {
+            let outstanding = ledger
+                .spends
+                .iter()
+                .fold(0_u64, |total, spend| total.saturating_add(spend.tokens));
+            if outstanding.saturating_add(reserved) > limit {
+                let mut remaining = outstanding;
+                let mut retry_after = WINDOW;
+                for spend in &ledger.spends {
+                    remaining = remaining.saturating_sub(spend.tokens);
+                    if remaining.saturating_add(reserved) <= limit {
+                        retry_after = (spend.at + WINDOW).duration_since(now).unwrap_or_default();
+                        break;
+                    }
+                }
+                // When both axes refuse, report the one that clears last: that is the wait
+                // the caller actually faces.
+                if refused.is_none_or(|existing| retry_after > existing.retry_after) {
+                    refused = Some(Throttled {
+                        scope: PacingScope::InputTokens,
+                        retry_after,
+                    });
+                }
+            }
+        }
+        if let Some(throttled) = refused {
+            return Err(PacingError::Throttled(throttled));
+        }
+
+        ledger.next_sequence += 1;
+        let sequence = ledger.next_sequence;
+        ledger.spends.push_back(Spend {
+            sequence,
+            at: now,
+            tokens: reserved,
+            estimated: input_tokens,
+        });
+        Ok(Some(PacingTicket {
+            key: key.clone(),
+            sequence,
+        }))
+    }
+
+    /// Returns a granted reservation that never reached the provider.
+    ///
+    /// Only correct before the request is sent. An attempt that left the process keeps its
+    /// slot, for the same reason a daily reservation is never refunded: the provider may
+    /// have counted it.
+    pub fn release(&self, ticket: &PacingTicket) {
+        let mut ledgers = self.ledgers.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(ledger) = ledgers.get_mut(&ticket.key) {
+            ledger
+                .spends
+                .retain(|spend| spend.sequence != ticket.sequence);
+        }
+    }
+
+    /// Charges a sent request with what the provider says it actually read.
+    ///
+    /// Called once per answered request, with `usage.prompt_tokens` (or the provider's
+    /// equivalent) from the response. Two things happen, and only ever upward:
+    ///
+    /// - The request's own slot rises to the reported count if that is larger than what was
+    ///   reserved. The extra tokens are spent from this window now rather than discovered as
+    ///   an overrun by the provider's meter later, which is the point: the next request on
+    ///   this model must see less headroom than the estimate implied.
+    /// - The ledger's learned ratio rises to cover this sample, so the next reservation on
+    ///   this model is padded to the worst observed under-count instead of waiting for an
+    ///   operator to guess a pad.
+    ///
+    /// Nothing is ever reduced. A request that reached the provider spent what it spent, and
+    /// a reported count below the reservation is an over-count that needs no correction -
+    /// refunding it would let a burst of short prompts buy back room a long one already used.
+    pub fn reconcile(&self, ticket: &PacingTicket, actual_tokens: u64) {
+        if actual_tokens == 0 {
+            return;
+        }
+        let mut ledgers = self.ledgers.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(ledger) = ledgers.get_mut(&ticket.key) else {
+            return;
+        };
+        let mut raised_ratio: Option<u32> = None;
+        if let Some(spend) = ledger
+            .spends
+            .iter_mut()
+            .find(|spend| spend.sequence == ticket.sequence)
+        {
+            spend.tokens = spend.tokens.max(actual_tokens);
+            if spend.estimated > 0 {
+                let ratio = u128::from(actual_tokens) * 1_000 / u128::from(spend.estimated);
+                let ratio = u32::try_from(ratio).unwrap_or(u32::MAX).max(1_000);
+                if ratio > ledger.observed_ratio {
+                    raised_ratio = Some(ratio);
+                }
+            }
+        }
+        if let Some(ratio) = raised_ratio {
+            ledger.observed_ratio = ratio;
+        }
+    }
+
+    /// The worst provider-reported input ratio this budget has observed, in permille.
+    ///
+    /// 1000 until a provider reports a count larger than the estimate. Reported so an
+    /// operator can see what the estimator is actually doing on one model instead of
+    /// reasoning from two unrelated samples.
+    pub fn observed_ratio(&self, key: &GovernorKey) -> u32 {
+        let ledgers = self.ledgers.lock().unwrap_or_else(PoisonError::into_inner);
+        ledgers
+            .get(key)
+            .map_or(1_000, |ledger| ledger.observed_ratio.max(1_000))
+    }
+
+    /// The window's current spend for `key`, for reporting and tests.
+    pub fn used(&self, key: &GovernorKey, now: SystemTime) -> (u64, u64) {
+        let mut ledgers = self.ledgers.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(ledger) = ledgers.get_mut(key) else {
+            return (0, 0);
+        };
+        let cutoff = now.checked_sub(WINDOW).unwrap_or(UNIX_EPOCH);
+        while ledger
+            .spends
+            .front()
+            .is_some_and(|spend| spend.at <= cutoff)
+        {
+            ledger.spends.pop_front();
+        }
+        let requests = u64::try_from(ledger.spends.len()).unwrap_or(u64::MAX);
+        let tokens = ledger
+            .spends
+            .iter()
+            .fold(0_u64, |total, spend| total.saturating_add(spend.tokens));
+        (requests, tokens)
+    }
+}
+
+/// One target's paced budget: the shared governor, the key it bills to, and the limits.
+///
+/// Carried by the backend because one HTTP attempt is the granularity the provider counts
+/// in, and the send path is the one place every candidate passes through.
+#[derive(Debug)]
+pub struct PacedQuota {
+    governor: std::sync::Arc<QuotaGovernor>,
+    key: GovernorKey,
+    limits: WindowLimits,
+    margin: AdmissionMargin,
+}
+
+impl PacedQuota {
+    /// Binds `key`, `limits` and the deployment's admission pad to a shared governor.
+    pub fn new(
+        governor: std::sync::Arc<QuotaGovernor>,
+        key: GovernorKey,
+        limits: WindowLimits,
+        margin: AdmissionMargin,
+    ) -> Self {
+        Self {
+            governor,
+            key,
+            limits,
+            margin,
+        }
+    }
+
+    /// The declared limits.
+    pub fn limits(&self) -> WindowLimits {
+        self.limits
+    }
+
+    /// The declared admission pad.
+    pub fn margin(&self) -> AdmissionMargin {
+        self.margin
+    }
+
+    /// The budget this target draws on.
+    pub fn key(&self) -> &GovernorKey {
+        &self.key
+    }
+
+    /// The largest raw estimate this target can admit, from its declaration alone.
+    ///
+    /// A *static* bound: it ignores both the window's current occupancy and any ratio the
+    /// governor has since learned, both of which can only tighten it. The pre-dispatch
+    /// filter uses it to decide that a request belongs on a wider sibling; the send path
+    /// remains the authority.
+    pub fn declared_safe_ceiling(&self) -> Option<u64> {
+        self.limits.safe_input_ceiling(self.margin)
+    }
+
+    /// Reserves one request against the window, at the deployment's pad.
+    pub fn reserve(&self, input_tokens: u64) -> Result<Option<PacingTicket>, PacingError> {
+        self.governor
+            .reserve_with_margin(&self.key, self.limits, self.margin, input_tokens)
+    }
+
+    /// Releases a reservation that never reached the provider.
+    pub fn release(&self, ticket: &PacingTicket) {
+        self.governor.release(ticket);
+    }
+
+    /// Charges a sent request with the provider's own input-token count.
+    pub fn reconcile(&self, ticket: &PacingTicket, actual_tokens: u64) {
+        self.governor.reconcile(ticket, actual_tokens);
+    }
+}
+
+/// A crude character-based estimate of a request body's input tokens, for pacing only.
+///
+/// The governor needs a number before the call, and the only body it can see is the exact
+/// one about to be sent. Counting characters over every string in the body and dividing by
+/// four is the standard approximation. **It is not a measurement and must not be presented
+/// as one**: measured against the provider's own count it has erred by +24 % on one prompt
+/// and -16 % on another, so no accuracy figure is claimed.
+///
+/// Strings that are themselves inline binary payloads (`data:` URIs) are skipped: their
+/// base64 length says nothing about the provider's image accounting, and counting it would
+/// refuse every vision request against a text budget. Those requests are paced by the
+/// request axis alone.
+///
+/// The caller applies [`AdmissionMargin`] to the result before it reaches a window, and
+/// [`QuotaGovernor::reconcile`] corrects the window afterwards with what the provider
+/// reported. This function's job is only to be cheap, deterministic and available before
+/// any bytes leave the process.
+pub fn estimate_input_tokens(body: &serde_json::Value) -> u64 {
+    fn count(value: &serde_json::Value, characters: &mut u64) {
+        match value {
+            serde_json::Value::String(text) => {
+                if !text.starts_with("data:") {
+                    *characters += u64::try_from(text.chars().count()).unwrap_or(u64::MAX);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    count(item, characters);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for field in fields.values() {
+                    count(field, characters);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+    let mut characters = 0_u64;
+    count(body, &mut characters);
+    (characters / 4).max(1)
+}
+
+/// The input-token count a provider reported for an answered request, when it reported one.
+///
+/// Read from the response body rather than from a header, because that is where every
+/// provider on this deployment's wire formats publishes it, and because the caller already
+/// holds the body. The shapes:
+///
+/// - `usage.prompt_tokens` - OpenAI chat completions and the OpenAI-compatible surfaces
+///   Google exposes, which is how the hosted Gemma lanes reported `18054`.
+/// - `usage.input_tokens` - the Responses surface and Anthropic, whose cache counters are
+///   part of the same input budget and are therefore summed rather than treated separately:
+///   a cached prefix is still input the provider counted.
+/// - `usageMetadata.promptTokenCount` - Google's native generateContent.
+///
+/// `None` means the provider said nothing this code can read, which is not the same as
+/// zero: the caller keeps its conservative reservation rather than recording a free request.
+pub fn reported_input_tokens(body: &serde_json::Value) -> Option<u64> {
+    fn reach<'a>(body: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+        path.iter().try_fold(body, |node, key| node.get(key))
+    }
+    if let Some(prompt) =
+        reach(body, &["usage", "prompt_tokens"]).and_then(serde_json::Value::as_u64)
+    {
+        return Some(prompt);
+    }
+    if let Some(input) = reach(body, &["usage", "input_tokens"]).and_then(serde_json::Value::as_u64)
+    {
+        let cached = ["cache_creation_input_tokens", "cache_read_input_tokens"]
+            .iter()
+            .filter_map(|key| reach(body, &["usage", key]).and_then(serde_json::Value::as_u64))
+            .fold(0_u64, u64::saturating_add);
+        return Some(input.saturating_add(cached));
+    }
+    reach(body, &["usageMetadata", "promptTokenCount"]).and_then(serde_json::Value::as_u64)
 }
 
 #[cfg(test)]
@@ -801,5 +1477,533 @@ mod tests {
         assert_ne!(first, second);
         // The same pair resolves to the same path every time.
         assert_eq!(first, allowance_path(&directory, "a/b", "m"));
+    }
+
+    // ---- Per-minute pacing -------------------------------------------------
+
+    fn governor_key(model: &str) -> GovernorKey {
+        GovernorKey::new("google-free", ModelId::from(model), "generate")
+    }
+
+    fn minute_limits(requests: Option<u64>, tokens: Option<u64>) -> WindowLimits {
+        WindowLimits {
+            requests_per_minute: requests,
+            input_tokens_per_minute: tokens,
+        }
+    }
+
+    fn instant(offset: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000 + offset)
+    }
+
+    /// The case the field exists for: Gemma's free window is 16K input tokens per minute,
+    /// so two ten-thousand-token prompts cannot both depart inside one window.
+    #[test]
+    fn two_ten_thousand_token_prompts_cannot_share_a_sixteen_thousand_window() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("google/gemma-4-26b-a4b-it");
+        let limits = minute_limits(None, Some(16_000));
+        governor
+            .reserve_at(&key, limits, 10_000, instant(0))
+            .expect("the first prompt fits");
+        let refused = governor
+            .reserve_at(&key, limits, 10_000, instant(5))
+            .expect_err("the second cannot fit");
+        assert_eq!(
+            refused,
+            PacingError::Throttled(Throttled {
+                scope: PacingScope::InputTokens,
+                // The first reservation leaves the window sixty seconds after it was made.
+                retry_after: Duration::from_secs(55),
+            })
+        );
+    }
+
+    /// A burst of small requests is refused by the request axis even though the token
+    /// budget would have held them.
+    #[test]
+    fn the_thirty_first_request_is_refused_when_the_window_admits_thirty() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(30), None);
+        for second in 0..30 {
+            governor
+                .reserve_at(&key, limits, 1, instant(second))
+                .expect("admits thirty");
+        }
+        assert_eq!(
+            governor
+                .reserve_at(&key, limits, 1, instant(30))
+                .expect_err("the window is full"),
+            PacingError::Throttled(Throttled {
+                scope: PacingScope::Requests,
+                retry_after: Duration::from_secs(30),
+            })
+        );
+    }
+
+    /// The two axes are separate resources: room on one says nothing about the other.
+    #[test]
+    fn the_request_and_token_axes_are_independent() {
+        let tokens_full = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(100), Some(1_000));
+        tokens_full
+            .reserve_at(&key, limits, 900, instant(0))
+            .expect("fits");
+        assert!(matches!(
+            tokens_full.reserve_at(&key, limits, 200, instant(1)),
+            Err(PacingError::Throttled(Throttled {
+                scope: PacingScope::InputTokens,
+                ..
+            }))
+        ));
+
+        let requests_full = QuotaGovernor::new();
+        requests_full
+            .reserve_at(&key, limits, 1, instant(0))
+            .expect("fits");
+        // One request of one token leaves plenty of token room, so the request count is
+        // what refuses.
+        assert!(matches!(
+            requests_full.reserve_at(&key, minute_limits(Some(1), Some(1_000)), 1, instant(1)),
+            Err(PacingError::Throttled(Throttled {
+                scope: PacingScope::Requests,
+                ..
+            }))
+        ));
+    }
+
+    /// The window slides: it opens again sixty seconds after the requests that filled it.
+    #[test]
+    fn a_window_refills_sixty_seconds_after_the_requests_that_filled_it() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(1), Some(16_000));
+        governor
+            .reserve_at(&key, limits, 100, instant(0))
+            .expect("fits");
+        assert!(governor.reserve_at(&key, limits, 100, instant(59)).is_err());
+        governor
+            .reserve_at(&key, limits, 100, instant(60))
+            .expect("the window rolled over");
+    }
+
+    /// One physical model has one window however many names it is served under; a different
+    /// model, or the same model in another project, has its own.
+    #[test]
+    fn aliases_of_one_physical_model_share_one_window() {
+        let governor = QuotaGovernor::new();
+        let limits = minute_limits(Some(1), None);
+        let direct = GovernorKey::new(
+            "google-free",
+            ModelId::from("google/gemma-4-26b-a4b-it"),
+            "generate",
+        );
+        let alias = GovernorKey::new(
+            "google-free",
+            ModelId::from("google/gemma-4-26b-a4b-it"),
+            "generate",
+        );
+        governor
+            .reserve_at(&direct, limits, 10, instant(0))
+            .expect("fits");
+        assert!(matches!(
+            governor.reserve_at(&alias, limits, 10, instant(1)),
+            Err(PacingError::Throttled(_))
+        ));
+
+        let sibling = GovernorKey::new(
+            "google-free",
+            ModelId::from("google/gemma-4-31b-it"),
+            "generate",
+        );
+        governor
+            .reserve_at(&sibling, limits, 10, instant(1))
+            .expect("a different model has its own window");
+
+        let other_project = GovernorKey::new(
+            "google-second-project",
+            ModelId::from("google/gemma-4-26b-a4b-it"),
+            "generate",
+        );
+        governor
+            .reserve_at(&other_project, limits, 10, instant(1))
+            .expect("another project has its own window");
+    }
+
+    /// A reservation returned before the request left gives its room back.
+    #[test]
+    fn a_released_reservation_gives_the_room_back() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(1), Some(16_000));
+        let ticket = governor
+            .reserve_at(&key, limits, 5_000, instant(0))
+            .expect("fits")
+            .expect("a limited key yields a ticket");
+        assert_eq!(governor.used(&key, instant(0)), (1, 5_000));
+        governor.release(&ticket);
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+        governor
+            .reserve_at(&key, limits, 5_000, instant(0))
+            .expect("the room was returned");
+    }
+
+    /// A request larger than a whole window can never be admitted, so waiting is not the
+    /// answer and is not offered.
+    #[test]
+    fn a_request_larger_than_a_whole_window_is_refused_rather_than_queued() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        assert_eq!(
+            governor.reserve_at(&key, minute_limits(None, Some(16_000)), 20_000, instant(0)),
+            Err(PacingError::ExceedsWindow {
+                needed: 20_000,
+                limit: 16_000,
+                margin_permille: 1_000
+            })
+        );
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+    }
+
+    /// A target that declares no window records nothing, so an undeclared deployment
+    /// behaves exactly as it did before the field existed.
+    #[test]
+    fn no_declared_window_records_nothing() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        assert_eq!(
+            governor.reserve_at(&key, WindowLimits::unlimited(), 1_000_000, instant(0)),
+            Ok(None)
+        );
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+    }
+
+    /// The estimate counts message text and never treats a base64 payload as prompt text.
+    #[test]
+    fn the_token_estimate_counts_text_and_ignores_inline_binary() {
+        let plain = serde_json::json!({
+            "messages": [{"role": "user", "content": "a".repeat(4_000)}]
+        });
+        let with_image = serde_json::json!({
+            "messages": [{"role": "user", "content": "a".repeat(4_000)}],
+            "image_url": format!("data:image/png;base64,{}", "A".repeat(40_000)),
+        });
+        // 4,000 characters of content plus the four-character role, divided by four.
+        assert_eq!(estimate_input_tokens(&plain), 1_001);
+        assert_eq!(estimate_input_tokens(&with_image), 1_001);
+        // An empty body is never zero tokens: it is still a request.
+        assert_eq!(estimate_input_tokens(&serde_json::json!({})), 1);
+    }
+    // ---- The measured Gemma overrun, as a regression -------------------------------
+
+    /// The one measured wire call this whole mechanism exists for.
+    ///
+    /// 2026-11-21, `gemma-4-26b-a4b-it`, free tier 30 RPM / 16,000 input TPM:
+    /// `estimate_input_tokens` said **15,202**, the governor admitted it against a 16,000
+    /// window, the provider reported **18,054** prompt tokens, and the AI Studio console
+    /// recorded an 18.05K/16K input-TPM peak. The request left the process on an estimate
+    /// that was 18.8 % low, and the account was charged above its own published window.
+    ///
+    /// At a 1300 per-mille admission pad the reservation is 15,202 * 1.3 = 19,763 against a
+    /// 16,000 window, so the request is refused **before egress** and the route can offer it
+    /// to a 250K-TPM Lite leg instead. This test is the red/green for that fix: without the
+    /// pad it dispatches, with it it cannot.
+    #[test]
+    fn the_measured_gemma_overrun_is_refused_before_egress_under_an_admission_margin() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("google/gemma-4-26b-a4b-it");
+        let limit = minute_limits(Some(30), Some(16_000));
+        let pad = AdmissionMargin::from_permille(1_300).expect("1300 is a valid pad");
+
+        // The estimate that actually went out on the wire.
+        assert_eq!(pad.apply(15_202), 19_763);
+        assert_eq!(
+            governor.reserve_with_margin_at(&key, limit, pad, 15_202, instant(0)),
+            Err(PacingError::ExceedsWindow {
+                needed: 19_763,
+                limit: 16_000,
+                margin_permille: 1_300,
+            })
+        );
+        // Nothing was recorded for a request that never left.
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+
+        // Without the pad the same estimate is admitted - which is the defect, preserved
+        // here as a control so this test cannot pass by the request simply being too large.
+        assert!(
+            governor.reserve_at(&key, limit, 15_202, instant(0)).is_ok(),
+            "the unpadded estimate must still be admissible, or the pad proves nothing"
+        );
+    }
+
+    /// A request the estimate places comfortably inside the window keeps working.
+    ///
+    /// The pad must not make the lane unusable: 8,000 estimated tokens pad to 10,400, well
+    /// inside 16,000, so ordinary traffic is admitted exactly as before.
+    #[test]
+    fn the_margin_still_admits_ordinary_traffic() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("google/gemma-4-26b-a4b-it");
+        let limit = minute_limits(Some(30), Some(16_000));
+        let pad = AdmissionMargin::from_permille(1_300).expect("valid pad");
+        assert_eq!(pad.apply(8_000), 10_400);
+        assert!(
+            governor
+                .reserve_with_margin_at(&key, limit, pad, 8_000, instant(0))
+                .is_ok()
+        );
+        assert_eq!(governor.used(&key, instant(0)), (1, 10_400));
+    }
+
+    /// A provider count above the reservation is charged to the window immediately.
+    #[test]
+    fn a_reported_count_above_the_reservation_raises_the_slot() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("google/gemma-4-26b-a4b-it");
+        let limit = minute_limits(Some(30), Some(16_000));
+        let pad = AdmissionMargin::from_permille(1_300).expect("valid pad");
+        let ticket = governor
+            .reserve_with_margin_at(&key, limit, pad, 2_000, instant(0))
+            .expect("fits")
+            .expect("paced");
+        assert_eq!(governor.used(&key, instant(0)), (1, 2_600));
+
+        // The provider says this request read 4,000 tokens, not 2,600.
+        governor.reconcile(&ticket, 4_000);
+        assert_eq!(governor.used(&key, instant(0)), (1, 4_000));
+
+        // And the learned ratio now pads the next reservation at 2.0x, not 1.3x.
+        assert_eq!(governor.observed_ratio(&key), 2_000);
+        let next = governor
+            .reserve_with_margin_at(&key, limit, pad, 2_000, instant(1))
+            .expect("fits")
+            .expect("paced");
+        assert_eq!(governor.used(&key, instant(1)), (2, 8_000));
+        // The second reservation alone is 4,000 - twice the estimate.
+        drop(next);
+    }
+
+    /// A reported count below the reservation does not buy back room.
+    #[test]
+    fn a_reported_count_below_the_reservation_never_refunds() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(None, Some(10_000));
+        let pad = AdmissionMargin::from_permille(1_500).expect("valid pad");
+        let ticket = governor
+            .reserve_with_margin_at(&key, limits, pad, 4_000, instant(0))
+            .expect("fits")
+            .expect("paced");
+        assert_eq!(governor.used(&key, instant(0)), (1, 6_000));
+        governor.reconcile(&ticket, 1_000);
+        assert_eq!(governor.used(&key, instant(0)), (1, 6_000));
+        assert_eq!(governor.observed_ratio(&key), 1_000);
+    }
+
+    /// The learned ratio survives that request's own expiry: it is evidence about the
+    /// estimator, not about the minute.
+    #[test]
+    fn the_learned_ratio_outlives_the_window_it_was_measured_in() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(Some(10), Some(100_000));
+        let pad = AdmissionMargin::NONE;
+        let ticket = governor
+            .reserve_with_margin_at(&key, limits, pad, 1_000, instant(0))
+            .expect("fits")
+            .expect("paced");
+        governor.reconcile(&ticket, 1_400);
+        assert_eq!(governor.observed_ratio(&key), 1_400);
+        // Two minutes later the spends have aged out; the ratio has not.
+        assert_eq!(governor.used(&key, instant(120)), (0, 0));
+        assert_eq!(governor.observed_ratio(&key), 1_400);
+        let ticket = governor
+            .reserve_with_margin_at(&key, limits, pad, 1_000, instant(120))
+            .expect("fits")
+            .expect("paced");
+        assert_eq!(governor.used(&key, instant(120)), (1, 1_400));
+        drop(ticket);
+    }
+
+    /// `reconcile` on a ticket the ledger no longer holds (released, or already expired)
+    /// changes nothing rather than resurrecting a spend.
+    #[test]
+    fn reconciling_an_unknown_ticket_is_inert() {
+        let governor = QuotaGovernor::new();
+        let key = governor_key("m");
+        let limits = minute_limits(None, Some(10_000));
+        let ticket = governor
+            .reserve_at(&key, limits, 1_000, instant(0))
+            .expect("fits")
+            .expect("paced");
+        governor.release(&ticket);
+        governor.reconcile(&ticket, 9_000);
+        assert_eq!(governor.used(&key, instant(0)), (0, 0));
+    }
+
+    /// The static ceiling used by the pre-dispatch filter is the exact inverse of `apply`.
+    #[test]
+    fn the_declared_ceiling_is_the_inverse_of_the_applied_margin() {
+        let limits = minute_limits(Some(30), Some(16_000));
+        let pad = AdmissionMargin::from_permille(1_300).expect("valid pad");
+        let ceiling = limits.safe_input_ceiling(pad).expect("window declared");
+        assert_eq!(ceiling, 12_307); // floor(16000 * 1000 / 1300)
+        assert!(pad.apply(ceiling) <= 16_000);
+        assert!(pad.apply(ceiling + 1) > 16_000);
+        assert_eq!(minute_limits(None, None).safe_input_ceiling(pad), None);
+    }
+
+    /// A pad below 1.0 is not constructible, so it cannot be used to under-reserve.
+    #[test]
+    fn a_margin_below_one_is_refused_at_construction() {
+        assert_eq!(AdmissionMargin::from_permille(999), None);
+        assert_eq!(AdmissionMargin::from_permille(0), None);
+        assert_eq!(
+            AdmissionMargin::from_permille(1_000),
+            Some(AdmissionMargin::NONE)
+        );
+    }
+
+    /// The pad rounds up, because a fractional token is a token the provider counts.
+    #[test]
+    fn the_margin_rounds_up() {
+        let pad = AdmissionMargin::from_permille(1_300).expect("valid pad");
+        assert_eq!(pad.apply(1), 2);
+        assert_eq!(pad.apply(10), 13);
+        assert_eq!(pad.apply(15_202), 19_763);
+        // 10 * 1300 / 1000 = 13 exactly; 11 -> 14.3 -> 15.
+        assert_eq!(pad.apply(11), 15);
+    }
+
+    // ---- Provider-reported counts ---------------------------------------------------
+
+    /// Every wire shape the deployment actually sees, and the one it must not guess.
+    #[test]
+    fn the_reported_input_count_is_read_from_each_wire_shape() {
+        // The exact shape of the measured Gemma answer.
+        assert_eq!(
+            reported_input_tokens(&serde_json::json!({
+                "usage": {"prompt_tokens": 18_054, "completion_tokens": 0, "total_tokens": 18_067}
+            })),
+            Some(18_054)
+        );
+        // Responses / Anthropic: cache counters are part of the same input budget.
+        assert_eq!(
+            reported_input_tokens(&serde_json::json!({
+                "usage": {
+                    "input_tokens": 900,
+                    "cache_creation_input_tokens": 100,
+                    "cache_read_input_tokens": 10,
+                }
+            })),
+            Some(1_010)
+        );
+        // Google native generateContent.
+        assert_eq!(
+            reported_input_tokens(&serde_json::json!({
+                "usageMetadata": {"promptTokenCount": 4017, "candidatesTokenCount": 1}
+            })),
+            Some(4_017)
+        );
+        // Nothing readable is `None`, not zero: the reservation must stand.
+        assert_eq!(
+            reported_input_tokens(&serde_json::json!({"choices": []})),
+            None
+        );
+        assert_eq!(reported_input_tokens(&serde_json::Value::Null), None);
+    }
+
+    // --- the load-time usability gate --------------------------------------------
+    //
+    // A budget that cannot be accounted is not a budget. But the gate must not CREATE the
+    // accounting state: a deployment preflight runs this same loader, often as root, and a
+    // root-owned counter under a unit that runs as its own user is a production defect that
+    // surfaces as a provider fault. Absent state is the spender's to create.
+
+    /// A newly configured lane's first call works, and the first call is what creates the
+    /// counter - as the account that spends it.
+    #[test]
+    fn a_fresh_lane_is_checked_without_being_created_and_works_on_first_use() {
+        let directory = scratch("fresh-lane");
+        let counter = allowance(&directory, 7);
+
+        counter.check_usable().expect("absent state is not a fault");
+        assert!(
+            !counter.path().exists(),
+            "a check must leave no accounting state behind: a root-run dry run does this"
+        );
+
+        // The first physical call creates the directory, the lock and the counter itself.
+        counter
+            .try_reserve()
+            .expect("the first call of a fresh lane");
+        assert!(counter.path().exists(), "the spender created the counter");
+        assert_eq!(counter.remaining(), 6, "and it counts what it spent");
+        // A fresh instance over the same files agrees: the document is valid, not empty.
+        assert_eq!(allowance(&directory, 7).remaining(), 6);
+    }
+
+    /// An unusable counter must name the file, its owner and the one command that fixes it.
+    ///
+    /// The bare `Permission denied (os error 13)` this replaces was read as a provider
+    /// fault for a production lane; the remedy belongs in the message.
+    #[test]
+    fn check_usable_explains_an_unwritable_counter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = scratch("check-explain");
+        let counter = allowance(&directory, 7);
+        // Created by "someone else" for this test: a real spend, then made read-only.
+        counter
+            .try_reserve()
+            .expect("the file must exist to be probed");
+        std::fs::set_permissions(counter.path(), std::fs::Permissions::from_mode(0o400))
+            .expect("make the counter read-only");
+
+        // Root ignores the mode; the assertion below is about the account the suite runs as.
+        let root = std::fs::OpenOptions::new()
+            .write(true)
+            .open(counter.path())
+            .is_ok();
+        let failure = counter.check_usable();
+        std::fs::set_permissions(counter.path(), std::fs::Permissions::from_mode(0o600))
+            .expect("restore");
+        if root {
+            assert!(
+                failure.is_ok(),
+                "root can open it, so there is nothing to explain"
+            );
+            return;
+        }
+        let reason = failure.expect_err("a read-only counter cannot be accounted");
+        assert!(
+            reason.contains(&counter.path().display().to_string()),
+            "the refusal must name the file: {reason}"
+        );
+        assert!(
+            reason.contains("chown"),
+            "the refusal must name the remedy: {reason}"
+        );
+        assert!(
+            reason.contains(&directory.display().to_string()),
+            "the remedy must name the directory to hand over: {reason}"
+        );
+    }
+
+    /// A counter whose path is occupied by a directory is unusable, and says so.
+    #[test]
+    fn check_usable_refuses_a_path_it_cannot_open() {
+        let directory = scratch("check-blocked");
+        let counter = allowance(&directory, 7);
+        std::fs::create_dir_all(counter.path()).expect("plant a directory in the file's place");
+        let reason = counter
+            .check_usable()
+            .expect_err("a directory is not a counter");
+        assert!(
+            reason.contains(&counter.path().display().to_string()),
+            "the refusal must name the path: {reason}"
+        );
     }
 }

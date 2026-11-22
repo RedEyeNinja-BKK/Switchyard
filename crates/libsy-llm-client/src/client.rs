@@ -22,7 +22,7 @@ use switchyard_protocol::{
 };
 use switchyard_translation::{
     TargetCapabilities, TranslationError, TranslationPolicy, WireFormat,
-    decode_aggregated_response, decode_request, decode_stream,
+    decode_aggregated_response_with_policy, decode_request, decode_stream_with_policy,
     encode_aggregated_response_with_extensions, encode_request_with_policy,
     encode_stream_with_extensions,
 };
@@ -55,9 +55,8 @@ const NON_FORWARDABLE_HEADERS: &[&str] = &[
     "content-encoding",
     "accept-encoding",
     "expect",
-    // Switchyard's own pre-egress admission assertion. It governs whether the bytes may
-    // leave this deployment, so forwarding it would hand a provider a claim about our
-    // policy that it has no use for and no way to verify.
+    // The pre-egress admission assertion header is gone with the gate. Nothing is stripped
+    // for policy reasons any more; this list is transport hygiene only.
     "x-switchyard-privacy-clearance",
 ];
 
@@ -291,6 +290,19 @@ impl TranslatingLlmClient {
         route_reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
         route_reasoning_effort: Option<&str>,
     ) -> Result<EncodedResponse> {
+        // A caller's Responses-only feature may have no representation on this target's wire
+        // format, and the decode has already discarded it. Refused before the cooldown is even
+        // consulted, because the answer is about the request rather than the model's health.
+        // The check reads the caller's own preserved body: the normalized IR no longer carries
+        // the distinction, so this is the last point at which the loss is visible.
+        if !matches!(backend, Backend::OpenAiResponses(_))
+            && let Some(feature) = caller_responses_feature(&llm_request)
+        {
+            return Err(LlmClientError::UnsupportedFeature {
+                model: model.clone(),
+                feature: feature.message(),
+            });
+        }
         let cooldown = backend.failure_cooldown();
         let key = cooldown_key(backend, model);
         let unavailable_until =
@@ -327,15 +339,10 @@ impl TranslatingLlmClient {
             return Err(LlmClientError::TemporarilyUnavailable);
         }
 
-        // A Responses upstream may declare that it requires a list-shaped `input`; the
-        // default policy carries no target capabilities, so it is supplied here.
-        let policy = TranslationPolicy {
-            target_capabilities: TargetCapabilities {
-                requires_list_input: Some(backend.requires_list_input()),
-                ..TargetCapabilities::default()
-            },
-            ..TranslationPolicy::default()
-        };
+        // A Responses upstream may declare that it requires a list-shaped `input`, and a
+        // hosted upstream may embed reasoning behind a marker. Both are per-target wire
+        // facts, so one helper supplies them to every translation site.
+        let policy = translation_policy(backend);
         let mut body = encode_request_with_policy(&llm_request, wire_format, &policy)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -413,6 +420,10 @@ impl TranslatingLlmClient {
                 }
             }
         }
+        // The provider's refusal list has the final word: after every override, a value the
+        // provider rejects is removed rather than forwarded. Removing it leaves the provider's
+        // own default, which is the only other outcome that wire allows.
+        drop_unsupported_reasoning_effort(&mut body, backend.unsupported_reasoning_effort());
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -430,7 +441,7 @@ impl TranslatingLlmClient {
         // Forwarded credentials can hit a user's quota while the backend remains healthy.
         if let Some(until) = unavailable_until
             && let Err(error) = &result
-            && is_transient_failure(error)
+            && rests_the_model(error)
             && !(backend.is_forwarding_auth()
                 && matches!(error, LlmClientError::UpstreamHttp { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS))
         {
@@ -606,30 +617,51 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
-        // Inspected before anything else happens: over the exact body this call is about
-        // to put on the wire, for a provider that may only receive a cleared payload.
-        // This is deliberately not the same check the router performs on the request. A
-        // codec adds fields, a translation layer injects instructions, and a preserved
-        // provider body may be replayed verbatim; only the assembled body shows all of
-        // it. A finding here is terminal, so it neither spends the daily allowance below
-        // nor advances to a candidate that would be handed the same payload.
-        if backend.requires_public_payload() {
-            let findings = crate::privacy::scan_json(body);
-            if !findings.is_empty() {
-                metrics::record_upstream_attempt(None);
-                let codes = findings
-                    .iter()
-                    .map(|finding| finding.code())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                return Err(AttemptFailure {
-                    error: LlmClientError::PayloadNotCleared {
-                        model: model.clone(),
-                        codes,
-                    },
-                    status: None,
-                    retry_after: None,
-                });
+        // The payload is sent as assembled. The egress gate that used to inspect this body
+        // here is removed: nothing about a request's content stops it reaching a provider.
+        // Paced before the daily budget, because the two refusals mean different things and
+        // only one of them is reversible. A minute window has room again shortly, so a
+        // request refused here should not spend a unit of the day's budget; the reservation
+        // is released again below if the daily allowance then refuses, since nothing reached
+        // the provider. Ordering it this way also means a route under minute pressure pays in
+        // the resource that refills rather than the one that does not.
+        let mut pacing = None;
+        if let Some(quota) = backend.pacing() {
+            match quota.reserve(crate::allowance::estimate_input_tokens(body)) {
+                Ok(ticket) => pacing = ticket,
+                Err(crate::allowance::PacingError::Throttled(throttled)) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::MinuteAllowanceThrottled {
+                            model: model.clone(),
+                            scope: throttled.scope.as_str().to_string(),
+                            retry_after_secs: throttled.retry_after.as_secs().max(1),
+                        },
+                        // No request left this process, so there is no upstream status to
+                        // report and nothing was counted by the provider.
+                        status: None,
+                        retry_after: Some(throttled.retry_after),
+                    });
+                }
+                Err(crate::allowance::PacingError::ExceedsWindow {
+                    needed,
+                    limit,
+                    margin_permille,
+                }) => {
+                    // Its own classification, not a capability defect: this model could read
+                    // the input, the deployment's own minute budget cannot admit it at the
+                    // margin it insists on. A sibling with a wider window may serve the
+                    // request now, so the route advances instead of ending.
+                    return Err(AttemptFailure {
+                        error: LlmClientError::InputExceedsMinuteWindow {
+                            model: model.clone(),
+                            needed,
+                            limit,
+                            margin_permille,
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
             }
         }
         // Spent before the request leaves, at the one point every attempt passes
@@ -640,6 +672,9 @@ impl TranslatingLlmClient {
             match allowance.try_reserve() {
                 Ok(()) => {}
                 Err(crate::allowance::ReserveError::Exhausted) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
                     return Err(AttemptFailure {
                         error: LlmClientError::DailyRequestAllowanceExhausted {
                             model: model.clone(),
@@ -650,6 +685,9 @@ impl TranslatingLlmClient {
                     });
                 }
                 Err(crate::allowance::ReserveError::Unusable(reason)) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
                     return Err(AttemptFailure {
                         error: LlmClientError::DailyRequestAllowanceUnavailable {
                             model: model.clone(),
@@ -717,6 +755,24 @@ impl TranslatingLlmClient {
                     });
                 }
             };
+            // The provider's own input count, fed straight back into the window that
+            // admitted this request. This is the only place the two are both in scope: the
+            // reservation lives here, and the response body is about to leave for the
+            // decoder. Doing it before returning matters — the very next request on this
+            // model reads this ledger, and an under-count left uncorrected is exactly how a
+            // minute window silently overruns its published budget.
+            //
+            // Parsed only for a paced target, so an unpaced one pays nothing. A body this
+            // cannot read leaves the conservative reservation in place: "no count" is not
+            // "no tokens".
+            if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref())
+                && let Some(reported) = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(crate::allowance::reported_input_tokens)
+            {
+                quota.reconcile(ticket, reported);
+            }
             metrics::record_upstream_attempt(Some(status.as_u16()));
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
@@ -792,6 +848,10 @@ impl TranslatingLlmClient {
             })?;
         llm_request.model = Some(model_id.to_string());
 
+        // A caller that asked for zero output gets an empty answer by request, not by
+        // failure. Captured here because the request is moved into the send below.
+        let wants_no_output = llm_request.output.max_output_tokens == Some(0);
+
         let orig_format = metadata.as_ref().and_then(|m| m.wire_format);
         let wire_format = orig_format.unwrap_or(
             self.model_to_config
@@ -836,26 +896,63 @@ impl TranslatingLlmClient {
                 })?;
                 // Map a provider's failed generation to 502, even under HTTP 200.
                 // Redact forwarded credentials before returning the provider error.
-                let agg =
-                    decode_aggregated_response(&body, wire_format).map_err(
-                        |error| match error {
-                            TranslationError::UpstreamFailure { error } => {
-                                LlmClientError::UpstreamHttp {
-                                    status: StatusCode::BAD_GATEWAY,
-                                    body: redact_forwarded_headers(
-                                        json!({ "error": error }).to_string(),
-                                        metadata.as_ref(),
-                                        backend.is_forwarding_auth(),
-                                    ),
-                                }
+                let policy = translation_policy(backend);
+                let agg = decode_aggregated_response_with_policy(&body, wire_format, &policy)
+                    .map_err(|error| match error {
+                        TranslationError::UpstreamFailure { error } => {
+                            LlmClientError::UpstreamHttp {
+                                status: StatusCode::BAD_GATEWAY,
+                                body: redact_forwarded_headers(
+                                    json!({ "error": error }).to_string(),
+                                    metadata.as_ref(),
+                                    backend.is_forwarding_auth(),
+                                ),
                             }
-                            error => LlmClientError::ResponseTranslation(error.to_string()),
-                        },
-                    )?;
+                        }
+                        error => LlmClientError::ResponseTranslation(error.to_string()),
+                    })?;
                 (LlmResponse::Agg(agg), upstream_headers)
             }
         };
 
+        // A delivered transport with an unusable result is not a successful call. Recorded
+        // here, where the decoded response exists and the wire status no longer does, so
+        // that"the model answered" and "the caller got something" stay separate facts.
+        //
+        // The route then advances rather than returning the non-answer. A candidate that
+        // answered with nothing has not served the request, and this layer knows it while
+        // the caller does not; handing back an empty 200 is how a leg that never works keeps
+        // being selected. Measured 2026-11-21: measured selection kept choosing a free Gemma
+        // leg that returned `completion_tokens: 0` because an empty reply was recorded as a
+        // success. The one caller that legitimately wants no output asks for zero tokens, and
+        // that request is left alone.
+        // The policy is read for one fact: whether this target declares that it writes
+        // reasoning inline. That is what makes a token total above input-plus-output mean
+        // thinking rather than a provider accounting quirk.
+        let hosted_thinking = translation_policy(backend).hosted_reasoning.is_some();
+        if let Some(reason) = llm_response
+            .as_agg()
+            .and_then(|agg| unusable_answer(agg, hosted_thinking))
+        {
+            metrics::record_incomplete_answer(reason);
+            // Two shapes are refused: a reported output count of zero, and a reply whose
+            // whole output was hidden reasoning on a target declared to charge it against
+            // the caller's reservation. A provider that reports no usage has told us
+            // nothing about its output, and a reply with output tokens but no visible text
+            // is a reasoning- or format-level question; convicting either would turn a
+            // diagnostic into a false accusation. The caller that legitimately wants no
+            // output asks for zero tokens, and that request is left alone.
+            let unanswered = matches!(
+                reason,
+                "empty_answer_zero_completion" | "empty_answer_thinking_only"
+            );
+            if unanswered && !wants_no_output {
+                return Err(LlmClientError::EmptyAnswer {
+                    model: model_id,
+                    reason,
+                });
+            }
+        }
         Ok(Response {
             llm_response,
             metadata,
@@ -1124,6 +1221,15 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
             limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
                 || is_documented_billing_limit(body)
                 || names_free_model_daily_cap(body)
+                // Google returns two different 429s. `quota_exceeded` is the daily one;
+                // `rate_limit_exceeded` is a window that clears and is retried instead. The
+                // daily one is only ACCOUNT-wide when the body positively scoped it that way:
+                // this Free tier allocates RPD per model, so one Model's spent quota must not
+                // take the rest of the pool down with it.
+                || crate::google::parse(Some(status.as_u16()), body).is_some_and(|error| {
+                    error.condition == crate::google::GoogleCondition::DailyQuota
+                        && error.recovery().stop_candidate_list
+                })
         }
         // Insufficient credits: the account balance is the shared resource, so no
         // candidate on this credential can serve the request.
@@ -1155,6 +1261,110 @@ fn is_masked_permanent_failure(body: &str) -> bool {
     )
 }
 
+/// Whether a failure should rest the model it came from, independent of whether the same
+/// request may be sent to that model again.
+///
+/// These are two questions and Google separates them. A 503 `UNAVAILABLE` means the model is
+/// overloaded: replaying the same call would fail the same way, but the model genuinely needs
+/// to be left alone for a while. A 400 policy block means the request was refused without
+/// saying anything about the model's health, so it must not rest it. Arming the cooldown on
+/// `is_transient_failure` alone conflated the two, with the result that a target configured
+/// with a long capacity cooldown never armed it on the very condition it was configured for:
+/// the 31B's `failure_cooldown_ms = 300000` was unreachable because its own 503 correctly
+/// forbids a same-model replay, and forbidding the replay was read as "nothing to cool down".
+///
+/// The retry decision is not loosened here. `is_transient_failure` still decides what may be
+/// replayed; this only decides what rests.
+fn rests_the_model(error: &LlmClientError) -> bool {
+    if is_transient_failure(error) {
+        return true;
+    }
+    match error {
+        LlmClientError::UpstreamHttp { status, body } => {
+            crate::google::parse(Some(status.as_u16()), body)
+                .is_some_and(|error| error.recovery().cool_down_model)
+        }
+        _ => false,
+    }
+}
+
+/// Why an answered response carries nothing a caller can use, if that is the case.
+///
+/// `HTTP 200` says the provider accepted the request and answered it. It does not say the
+/// caller received an answer. The measured case is a Gemma reply whose entire output budget
+/// went to inline `<thought>` reasoning: `completion_tokens: 0`, empty content, no tool
+/// call, status 200. Treating that as a success is how a model looks healthy in transport
+/// telemetry while every caller gets nothing, and it is how a selector learns the wrong
+/// lesson about which leg serves a task.
+///
+/// Only the unambiguous shape is flagged: no text, no tool call, no refusal, and no output
+/// the caller can use. A response with output tokens but no visible text is left alone —
+/// that is a reasoning- or format-level question this function cannot settle, and guessing
+/// would turn a diagnostic into a false accusation.
+///
+/// The one provider-specific certainty is `hosted_thinking`: a target that declares it writes
+/// reasoning inline *and* charges that reasoning against the caller's output reservation. Its
+/// reply can therefore contain thinking only, and its own `completion_tokens` reads `0`
+/// because the provider does not count reasoning as output. Measured 2026-11-21 on Gemma 4
+/// 26B: `finish_reason: length`, `completion_tokens: 0`, `total_tokens` 499 against a
+/// 438-token prompt — 61 tokens of thinking and no answer. Classifying that as
+/// "the provider produced nothing" is wrong twice over: it blames the leg for a budget that
+/// the caller set, and it hides the only fact that would let an operator act on it. The
+/// hidden count is taken from the usage block rather than assumed, so a provider that reports
+/// no totals keeps the older, quieter classification.
+fn unusable_answer(
+    agg: &switchyard_protocol::llm::AggLlmResponse,
+    hosted_thinking: bool,
+) -> Option<&'static str> {
+    use switchyard_protocol::llm::ContentBlock;
+
+    let has_content = agg.outputs.iter().any(|output| {
+        output.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            // A tool call is a usable answer: the caller acts on it. A refusal is an answer
+            // too - the model declined, which is information, not silence.
+            ContentBlock::ToolCall(_) | ContentBlock::Refusal { .. } => true,
+            _ => false,
+        })
+    });
+    if has_content {
+        return None;
+    }
+    if hosted_thinking && hidden_output_tokens(&agg.usage) > 0 {
+        return Some("empty_answer_thinking_only");
+    }
+    match agg.usage.output_tokens {
+        Some(0) => Some("empty_answer_zero_completion"),
+        None => Some("empty_answer_no_usage"),
+        // Output was produced but none of it is visible: the model spent its budget on
+        // reasoning, which is a real and separate condition, not an empty answer.
+        Some(_) => Some("empty_answer_reasoning_only"),
+    }
+}
+
+/// Tokens the provider produced that it did not count as output and did not show.
+///
+/// For a target that hides its reasoning this is the thinking the reply contains. Taken from
+/// the provider's own totals, so an upstream that reports nothing reports zero here rather
+/// than a guess: `total - input - output`, saturating, with the cache details subtracted from
+/// the input side because the codec normalises input to its non-cached component.
+fn hidden_output_tokens(usage: &switchyard_protocol::llm::Usage) -> u64 {
+    let Some(total) = usage.total_tokens else {
+        return 0;
+    };
+    let cache = usage.cache.as_deref();
+    let input = usage.input_tokens.unwrap_or(0)
+        + cache
+            .and_then(|cache| cache.cached_input_tokens)
+            .unwrap_or(0)
+        + cache
+            .and_then(|cache| cache.cache_creation_input_tokens)
+            .unwrap_or(0);
+    total
+        .saturating_sub(input)
+        .saturating_sub(usage.output_tokens.unwrap_or(0))
+}
+
 fn is_transient_failure(error: &LlmClientError) -> bool {
     // Checked before the status table: 429 is retryable in general, but a daily
     // account cap is not a throttle that clears in a moment.
@@ -1169,10 +1379,29 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         // now would burn the next day's budget against an answer already known to be no.
         LlmClientError::DailyRequestAllowanceExhausted { .. }
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => false,
-        // Retrying resends the same payload, which is the thing that was just refused.
-        LlmClientError::PayloadNotCleared { .. } => false,
+        // A minute window refills shortly, but not within a backoff: the same legs' next
+        // attempt would spend the room the next request needs. The route decides whether a
+        // sibling has headroom; this call does not sleep into its own throttle.
+        LlmClientError::MinuteAllowanceThrottled { .. } => false,
+        // No wait on this leg makes the request smaller, and resending it would spend the
+        // window on a request this code already knows it must refuse.
+        LlmClientError::InputExceedsMinuteWindow { .. } => false,
+        // The model answered with nothing. The same budget on the same model produces the
+        // same non-answer, so this call does not retry in place; the route advances.
+        LlmClientError::EmptyAnswer { .. } => false,
+        // The feature is missing from the target, not from the attempt: sending it again,
+        // or to a sibling on the same wire format, cannot add it.
+        LlmClientError::UnsupportedFeature { .. } => false,
         LlmClientError::UpstreamHttp { status, body } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
+                return false;
+            }
+            // A provider that names its condition decides whether the same bytes go out
+            // again. Google distinguishes a window throttle from a spent daily quota on the
+            // same status, and a policy block from an outage on the same 400.
+            if crate::google::parse(Some(status.as_u16()), body)
+                .is_some_and(|error| !error.recovery().retry_same_model)
+            {
                 return false;
             }
             metrics::is_retryable_http_status(status.as_u16())
@@ -1234,7 +1463,8 @@ async fn prepare_response_stream(
             .map(|bytes| bytes.to_vec())
             .map_err(convert_reqwest_error)
     });
-    let mut chunks = decode_stream(bytes, backend.wire_format())?;
+    let mut chunks =
+        decode_stream_with_policy(bytes, backend.wire_format(), &translation_policy(backend))?;
     // Hold non-output events until something usable arrives. A provider announces
     // the response (`response.created`, a role-only delta) and may then stall; if
     // the attempt returned at that announcement, the attempt bound would stop
@@ -1397,6 +1627,38 @@ fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> Reques
         builder = builder.header(name, value);
     }
     builder
+}
+
+// The translation policy one backend declares.
+//
+// Both facts are per-target wire properties: whether the Responses `input` must be a list,
+// and which marker the upstream uses for reasoning it writes inline in the message. They are
+// assembled here rather than at each encode/decode site because a decode path that forgets
+// the marker silently returns the provider's monologue to the caller.
+fn translation_policy(backend: &Backend) -> TranslationPolicy {
+    TranslationPolicy {
+        target_capabilities: TargetCapabilities {
+            requires_list_input: Some(backend.requires_list_input()),
+            ..TargetCapabilities::default()
+        },
+        hosted_reasoning: backend.hosted_reasoning(),
+        ..TranslationPolicy::default()
+    }
+}
+
+// The caller's own Responses body, when this request arrived in that format.
+//
+// The decoder records the verbatim request for same-format replay, which is the only place
+// the fields a Chat target cannot carry survive. Without preservation there is nothing to
+// inspect and the guard cannot fire; that is the pre-existing behaviour, and it is why the
+// guard reads what was captured rather than reconstructing a body it never saw.
+fn caller_responses_feature(
+    request: &switchyard_protocol::LlmRequest,
+) -> Option<switchyard_translation::UnsupportedResponsesFeature> {
+    let format: switchyard_translation::FormatId =
+        switchyard_protocol::WireFormat::OpenAiResponses.into();
+    let body = request.preservation.requests.get(&format)?;
+    switchyard_translation::unsupported_feature(body)
 }
 
 // Overwrites the outbound body's `model` field with the resolved model id.
@@ -1667,6 +1929,39 @@ fn apply_reasoning_policy(body: &mut Value, backend: &Backend) {
     }
 }
 
+// Removes a reasoning-effort value the provider is known to refuse.
+//
+// The effort rides under two spellings depending on the wire, so both are inspected: a Chat
+// body carries a flat `reasoning_effort`, a Responses body nests it under `reasoning.effort`.
+// Only the effort key is touched, so an unrelated sibling (`reasoning.summary`, for example)
+// survives; an emptied `reasoning` object is removed rather than left as `{}`.
+fn drop_unsupported_reasoning_effort(body: &mut Value, unsupported: &BTreeSet<String>) {
+    if unsupported.is_empty() {
+        return;
+    }
+    let Value::Object(object) = body else {
+        return;
+    };
+    if let Some(Value::String(effort)) = object.get("reasoning_effort")
+        && unsupported.contains(effort)
+    {
+        object.remove("reasoning_effort");
+    }
+    let emptied = if let Some(Value::Object(reasoning)) = object.get_mut("reasoning") {
+        if let Some(Value::String(effort)) = reasoning.get("effort")
+            && unsupported.contains(effort)
+        {
+            reasoning.remove("effort");
+        }
+        reasoning.is_empty()
+    } else {
+        false
+    };
+    if emptied {
+        object.remove("reasoning");
+    }
+}
+
 // Applies target defaults without overriding fields supplied by the caller.
 fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     let Value::Object(object) = body else {
@@ -1883,18 +2178,75 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
     use std::io::{Read, Write};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
     use serde_json::json;
-    use switchyard_protocol::{completion_text, text_request};
+    use switchyard_protocol::{ContentBlock, completion_text, text_request};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::backend::HttpBackendConfig;
     use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
+
+    /// Google's two 429s must not be collapsed: one clears, the other waits for the day.
+    #[test]
+    fn a_google_daily_quota_is_not_retried_but_its_window_throttle_is() {
+        let error = |status: u16, body: &str| LlmClientError::UpstreamHttp {
+            status: StatusCode::from_u16(status).expect("status"),
+            body: body.to_string(),
+        };
+
+        let throttle = error(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow"}}"#,
+        );
+        assert!(is_transient_failure(&throttle));
+        assert!(!is_account_wide_quota(&throttle));
+
+        // An unscoped daily quota retires the model that reported it. It is NOT account
+        // wide: this project allocates RPD per model, so its siblings still have budget.
+        let quota = error(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily"}}"#,
+        );
+        assert!(!is_transient_failure(&quota));
+        assert!(!is_account_wide_quota(&quota));
+
+        // Only a scope the body positively identifies as project-wide stops the pool.
+        let project_wide = error(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                  {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier"}]}]}}"#,
+        );
+        assert!(!is_transient_failure(&project_wide));
+        assert!(is_account_wide_quota(&project_wide));
+
+        // A daily quota is still a daily quota when it arrives behind a 5xx: the code, not
+        // the status, says the allowance is spent, so no retry may follow it.
+        let quota_behind_5xx = error(
+            503,
+            r#"{"error":{"code":"quota_exceeded","message":"daily quota"}}"#,
+        );
+        assert!(!is_transient_failure(&quota_behind_5xx));
+        assert!(!is_account_wide_quota(&quota_behind_5xx));
+
+        // A content block is a 400 that must not be resent, and it is not a quota.
+        let blocked = error(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert!(!is_transient_failure(&blocked));
+        assert!(!is_account_wide_quota(&blocked));
+
+        // The other providers' contracts are untouched by the Google decoder.
+        let openrouter = error(
+            429,
+            r#"{"error":{"code":402,"message":"credits","metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#,
+        );
+        assert!(!is_transient_failure(&openrouter));
+        assert!(is_account_wide_quota(&openrouter));
+    }
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
@@ -1904,6 +2256,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
             reasoning_effort: None,
             reasoning_policy: None,
             reasoning_dialect: ReasoningDialect::default(),
@@ -1915,7 +2268,8 @@ mod tests {
             stream_idle_timeout: None,
             requires_list_input: false,
             allowance: None,
-            requires_public_payload: false,
+            pacing: None,
+            hosted_reasoning: None,
         }
     }
 
@@ -2012,6 +2366,13 @@ mod tests {
         )]
     }
 
+    // A chat backend whose upstream writes its reasoning inline behind a marker.
+    fn chat_map_with_hosted_reasoning(base_url: &str) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.hosted_reasoning = Some(switchyard_translation::HostedReasoningMarker::ThoughtTag);
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
     fn chat_map_with_extra_body(
         base_url: &str,
         extra_body: BTreeMap<String, Value>,
@@ -2028,6 +2389,28 @@ mod tests {
         let mut backend = config(base_url);
         backend.omit_body_fields = omit_body_fields;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn chat_map_with_unsupported_effort(
+        base_url: &str,
+        unsupported: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.unsupported_reasoning_effort = unsupported;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn responses_map_with_unsupported_effort(
+        base_url: &str,
+        unsupported: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.unsupported_reasoning_effort = unsupported;
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
     }
 
     fn chat_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {
@@ -2408,6 +2791,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_responses_only_feature_is_refused_before_egress()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // A caller posts /responses with a hosted search tool at a Chat target. The decoder
+        // drops the tool, so forwarding the rest would answer from memory and present that as
+        // the requested search. Nothing may reach the provider instead.
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "answer",
+                    "model": "gemini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "no search happened"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gemini",
+            Backend::OpenAiChat(config(&format!("{}/v1", server.uri()))),
+            None,
+        )])?;
+        let body = json!({
+            "model": "gemini",
+            "input": "what closed higher yesterday?",
+            "tools": [{"type": "web_search"}]
+        });
+
+        let refused = client
+            .call_rewrite_model_raw(
+                body,
+                None,
+                Some(&ModelId::from("gemini".to_string())),
+                WireFormat::OpenAiResponses,
+            )
+            .await;
+        let Err(error) = refused else {
+            panic!("a hosted tool at a Chat target must not be served");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("web_search"),
+            "the refusal must name the feature: {message}"
+        );
+        assert!(
+            message.contains("openai_responses"),
+            "and the way to serve it: {message}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the refusal must happen before any upstream request"
+        );
+
+        // Control: the same request without the hosted tool is served, so the guard refuses
+        // the feature rather than the endpoint.
+        let served = client
+            .call_rewrite_model_raw(
+                json!({"model": "gemini", "input": "hello"}),
+                None,
+                Some(&ModelId::from("gemini".to_string())),
+                WireFormat::OpenAiResponses,
+            )
+            .await?;
+        assert!(matches!(served, RawResponse::Buffered(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_overloaded_google_model_rests_without_being_replayed()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The measured shape Google sent for the 31B while it was starting: a list-wrapped
+        // 503 whose own status word is UNAVAILABLE. It must be neither replayed nor left
+        // available for the next caller, and its sibling must be untouched by either fact.
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&calls);
+        const UNAVAILABLE: &str = r#"[{"error":{"code":503,"message":"The model is overloaded.","status":"UNAVAILABLE"}}]"#;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                observed.lock().expect("call log").push(model.clone());
+                if model == "large" {
+                    ResponseTemplate::new(503).set_body_string(UNAVAILABLE)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "answer",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        // The 31B's production configuration: a five-minute cooldown, no group, and a retry
+        // budget that would be spent if the condition did not forbid a replay.
+        let large = {
+            let mut backend = config(&format!("{}/v1", server.uri()));
+            backend.failure_cooldown = Duration::from_secs(300);
+            backend.max_retries = 2;
+            Backend::OpenAiChat(backend)
+        };
+        let small = {
+            let mut backend = config(&format!("{}/v1", server.uri()));
+            backend.failure_cooldown = Duration::from_secs(5);
+            backend.max_retries = 2;
+            Backend::OpenAiChat(backend)
+        };
+        let client = TranslatingLlmClient::new(&[
+            ModelConfig::new("large", large, None),
+            ModelConfig::new("small", small, None),
+        ])?;
+        let name = |model: &str| ModelId::from(model.to_string());
+
+        // First call: the overloaded model answers 503 once and is not replayed, even though
+        // three attempts were authorised.
+        let first = client
+            .call_rewrite_model(request_for(Some("large"), false), Some(&name("large")))
+            .await;
+        assert!(
+            matches!(
+                first,
+                Err(LlmClientError::UpstreamHttp {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ..
+                })
+            ),
+            "the caller sees the provider's own 503"
+        );
+        assert_eq!(
+            std::mem::take(&mut *calls.lock().expect("call log")),
+            ["large"],
+            "an UNAVAILABLE model must not be asked again inside the call"
+        );
+
+        // Second call: the cooldown is armed even though the failure was not retryable, so no
+        // request reaches the provider at all.
+        let second = client
+            .call_rewrite_model(request_for(Some("large"), false), Some(&name("large")))
+            .await;
+        assert!(
+            matches!(second, Err(LlmClientError::TemporarilyUnavailable)),
+            "a resting model answers without a provider call"
+        );
+        assert!(
+            calls.lock().expect("call log").is_empty(),
+            "the cooldown must arm on an unretryable capacity failure"
+        );
+
+        // The sibling is unaffected: the capacity fact was the large model's, and it was not
+        // declared as a shared pool.
+        let third = client
+            .call_rewrite_model(request_for(Some("small"), false), Some(&name("small")))
+            .await?;
+        assert_eq!(
+            third
+                .llm_response
+                .into_agg()
+                .await
+                .map(|agg| completion_text(&agg))?,
+            "ok"
+        );
+        assert_eq!(
+            std::mem::take(&mut *calls.lock().expect("call log")),
+            ["small"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_model_that_needs_resting_is_rested() {
+        let call = |status: u16, body: &str| LlmClientError::UpstreamHttp {
+            status: StatusCode::from_u16(status).expect("status"),
+            body: body.to_string(),
+        };
+        // Capacity: rest, do not replay.
+        let overloaded = call(
+            503,
+            r#"[{"error":{"code":503,"message":"overloaded","status":"UNAVAILABLE"}}]"#,
+        );
+        assert!(rests_the_model(&overloaded));
+        assert!(!is_transient_failure(&overloaded));
+        // A request fault says nothing about the model's health.
+        let blocked = call(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert!(!rests_the_model(&blocked));
+        // A credential fault is the operator's, and resting the model would hide it.
+        let denied = call(
+            403,
+            r#"{"error":{"code":"permission_denied","message":"no"}}"#,
+        );
+        assert!(!rests_the_model(&denied));
+        // An ordinary transport failure is retryable and therefore rests, as before.
+        let transport = LlmClientError::Transport {
+            source: Box::new(std::io::Error::other("reset")),
+        };
+        assert!(rests_the_model(&transport));
+    }
+
+    #[tokio::test]
+    async fn buffered_hosted_reasoning_never_reaches_the_caller()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The upstream writes its chain of thought into `content`. A backend that declares
+        // the marker must hand the caller only the answer.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "model": "gemma",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "<thought>plan</thought>\n\nready"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 71}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+
+        assert_eq!(completion_text(&agg), "ready");
+        // Not merely out of the answer: the monologue must not survive in ANY block, because a
+        // reasoning block is re-encoded as `reasoning_content` and would reach the caller
+        // through that second field.
+        let output = agg.first_output().expect("one output item");
+        assert!(
+            !output
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Reasoning { .. })),
+            "a declared hosted marker must not leave a reasoning block: {:?}",
+            output.content
+        );
+        assert!(
+            !format!("{:?}", output.content).contains("plan"),
+            "the thought must not survive in any block: {:?}",
+            output.content
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_hosted_reasoning_never_reaches_the_caller()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<thou\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"ght>plan</thought>\\n\\nready\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+
+        assert_eq!(completion_text(&agg), "ready");
+        assert!(
+            !format!("{:?}", agg.first_output().map(|o| &o.content)).contains("plan"),
+            "the streamed thought must not survive in any block"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn invalid_json_is_a_response_translation_error()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
@@ -2578,6 +3265,265 @@ mod tests {
             )
             .await?;
         // The body_partial_json matcher asserts the upstream saw model "gpt".
+        Ok(())
+    }
+
+    /// Measured 2026-11-21 against hosted Gemma 4 26B through `smart-nt`: an output budget
+    /// went entirely to inline `<thought>` reasoning, so the reply was `completion_tokens: 0`
+    /// with no content and `finish_reason: length` while the wire said 200. The route returned
+    /// that empty body to the caller even though a sibling candidate could answer. An empty
+    /// answer is not a served request: it must advance.
+    ///
+    /// Replayed against a target that does *not* declare inline reasoning. That is the older
+    /// classification and it must not move: without a declaration, a token total above input
+    /// plus output is a provider accounting quirk, not evidence of hidden thinking. The
+    /// declared-reasoning case is the test that follows.
+    #[tokio::test]
+    async fn a_reply_that_spent_its_budget_on_reasoning_advances_rather_than_returning_empty()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 225, "completion_tokens": 0, "total_tokens": 1123}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(900);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("an empty answer must not be reported as a successful call");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        // The route may advance, but this call must not resend the same budget: the same
+        // model produces the same non-answer, so a retry only spends the window again.
+        assert!(
+            !is_transient_failure(&error),
+            "an empty answer must advance, not retry in place"
+        );
+        Ok(())
+    }
+
+    /// The measured Gemma shape, replayed against a target that *does* declare inline
+    /// reasoning: `completion_tokens: 0`, no content, and a total that exceeds prompt plus
+    /// completion. The difference is a fact the deployment did not have before — the model
+    /// produced tokens, they were thinking, and the caller's reservation was too small to
+    /// hold both. `empty_answer_zero_completion` would blame the leg; this says what happened.
+    #[tokio::test]
+    async fn a_thought_only_reply_on_a_hosted_reasoning_target_is_named_rather_than_blamed()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                // 438 prompt + 0 counted completion + 61 of thinking = 499, the measured
+                // 64-token-reservation row.
+                "usage": {"prompt_tokens": 438, "completion_tokens": 0, "total_tokens": 499}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_thinking_only");
+        // Same advance-not-retry rule as any empty answer: nothing about the next attempt on
+        // this budget changes the fact that the thinking alone filled it.
+        assert!(!is_transient_failure(&error));
+        Ok(())
+    }
+
+    /// A hosted-reasoning target that reports no totals has told us nothing about what it
+    /// produced. The invisible-token count must come from the provider's own numbers, so this
+    /// keeps the quieter classification rather than inventing thinking out of a missing field.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_without_totals_keeps_the_quieter_classification()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        Ok(())
+    }
+
+    /// The declaration alone must not be enough: a target that hides reasoning still has to
+    /// show spare tokens in its own totals. Here prompt plus completion accounts for the
+    /// whole total, so nothing was produced off the books and the reply is simply empty.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_whose_totals_account_for_every_token_is_not_thinking()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        Ok(())
+    }
+
+    /// A hosted-reasoning target that does answer is a success, thinking or not. The new
+    /// classification must not start refusing replies that carry visible text.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_that_answers_is_still_a_success()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "<thought>two plus two</thought>four"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 438, "completion_tokens": 32, "total_tokens": 675}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(512);
+
+        let response = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert!(
+            completion_text(&agg).contains("four"),
+            "the visible answer must survive: {:?}",
+            agg.outputs
+        );
+        Ok(())
+    }
+
+    /// The one caller that legitimately wants no output asks for zero tokens. Refusing that
+    /// as a failure would turn a deliberate probe into an error.
+    #[tokio::test]
+    async fn a_caller_that_asks_for_zero_output_is_not_an_empty_answer()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(0);
+
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await?;
         Ok(())
     }
 
@@ -2896,6 +3842,153 @@ mod tests {
                 None,
                 Some(&ModelId::from("gpt")),
                 WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // Google's OpenAI-compatibility surface answers HTTP 400 to `reasoning_effort: "none"`
+    // while accepting the graded values, and a no-thinking caller sends exactly `none`.
+    // The declared refusal is what keeps that caller's request from becoming a 400.
+    #[tokio::test]
+    async fn a_refused_effort_value_is_never_sent_on_the_chat_wire()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                body.get("reasoning_effort").is_none()
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none"
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // The refusal is a value list, not a switch: a graded effort the provider accepts still
+    // reaches the wire, so declaring `none` unsupported does not silently disable control.
+    #[tokio::test]
+    async fn an_accepted_effort_value_still_reaches_the_chat_wire()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "reasoning_effort": "high"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // A Responses body nests the effort under `reasoning`, beside fields the caller may have
+    // set. Only the refused `effort` key is removed; an unrelated sibling such as `summary`
+    // survives, and `reasoning` is not left behind as an empty object.
+    #[tokio::test]
+    async fn a_refused_effort_value_is_dropped_without_disturbing_its_siblings()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let reasoning = body.get("reasoning");
+                reasoning
+                    .and_then(|value| value.get("effort"))
+                    .is_none()
+                    && reasoning.and_then(|value| value.get("summary"))
+                        == Some(&json!("auto"))
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "input": "hi",
+            "reasoning": {"effort": "none", "summary": "auto"}
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
             )
             .await?;
         Ok(())

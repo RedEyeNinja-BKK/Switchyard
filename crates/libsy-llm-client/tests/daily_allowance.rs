@@ -58,6 +58,7 @@ fn client_for(
         extra_headers: Default::default(),
         extra_body: Default::default(),
         omit_body_fields: Default::default(),
+        unsupported_reasoning_effort: Default::default(),
         reasoning_effort: None,
         reasoning_policy: None,
         reasoning_dialect: Default::default(),
@@ -69,7 +70,8 @@ fn client_for(
         stream_idle_timeout: None,
         requires_list_input: false,
         allowance,
-        requires_public_payload: false,
+        pacing: None,
+        hosted_reasoning: None,
     };
     Ok(TranslatingLlmClient::new(&[ModelConfig::new(
         "gpt",

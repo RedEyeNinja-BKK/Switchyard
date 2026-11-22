@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use switchyard_runner::Runner;
 use tower::ServiceExt;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn serve(config: &str) -> axum::Router {
@@ -636,5 +636,1004 @@ async fn a_missing_capability_credential_fails_closed_without_an_upstream_call()
         engine.received_requests().await.unwrap_or_default().len(),
         0,
         "an unauthenticated call must not be attempted"
+    );
+}
+
+/// A Google embedding capability. Google has no bulk embed endpoint: one content per
+/// request, named in the path, authenticated with `x-goog-api-key`.
+fn google_config(engine: &str, max_input_tokens: u32) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.google]
+format = "google_embed_content"
+base_url = "{engine}"
+model = "gemini-embedding-001"
+task_type = "RETRIEVAL_DOCUMENT"
+api_key_env = "SWITCHYARD_TEST_GOOGLE_KEY"
+
+[capabilities.gem]
+id = "switchyard-embedding-google"
+target = "google"
+contract = "google-embedding-001:v1"
+dimensions = 3
+normalization = "L2"
+max_batch = 8
+max_input_tokens = {max_input_tokens}
+"#
+    )
+}
+
+/// A caller sends one OpenAI-shaped batch; Google answers one content at a time. The
+/// surface must therefore fan out and reassemble in input order, or the caller receives
+/// vectors whose `index` no longer means what it says.
+#[tokio::test]
+async fn a_google_embedding_capability_assembles_one_response_from_one_call_per_input() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    for (text, values) in [
+        ("alpha", json!([0.1, 0.2, 0.3])),
+        ("beta", json!([0.4, 0.5, 0.6])),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-001:embedContent"))
+            .and(header("x-goog-api-key", "test-key"))
+            .and(body_partial_json(json!({
+                "model": "models/gemini-embedding-001",
+                "content": {"parts": [{"text": text}]},
+                "task_type": "RETRIEVAL_DOCUMENT",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"embedding": {"values": values}})),
+            )
+            .expect(1)
+            .mount(&engine)
+            .await;
+    }
+
+    let router = serve(&google_config(&engine.uri(), 2048)).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let value: Value = serde_json::from_slice(&body).expect("response is json");
+    assert_eq!(value["data"][0]["index"], json!(0));
+    assert_eq!(value["data"][0]["embedding"], json!([0.1, 0.2, 0.3]));
+    assert_eq!(value["data"][1]["index"], json!(1));
+    assert_eq!(value["data"][1]["embedding"], json!([0.4, 0.5, 0.6]));
+    assert_eq!(
+        headers
+            .get("x-switchyard-embedding-contract")
+            .and_then(|value| value.to_str().ok()),
+        Some("google-embedding-001:v1"),
+        "the response must say which space produced the vectors"
+    );
+}
+
+/// A token count cannot be computed here, but a token never covers less than one byte,
+/// so bytes bound tokens from above. The refusal must happen before the wire, and must
+/// say which input and which limit, because "too long" is not actionable.
+#[tokio::test]
+async fn a_google_capability_refuses_an_input_past_its_token_limit_without_calling_the_engine() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    // Nothing is mounted: a leaked call would answer 404 and be visible below.
+    let router = serve(&google_config(&engine.uri(), 16)).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google", "input": ["ok", "a".repeat(17)]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("input[1]"), "{text}");
+    assert!(text.contains("16"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "an over-limit input must not reach the engine"
+    );
+}
+
+/// Returning the vectors that succeeded would hand back a shorter, silently re-indexed
+/// batch. A partial batch is a failed batch, and it must not carry the contract header,
+/// which would otherwise attest to a vector space the caller did not fully receive.
+#[tokio::test]
+async fn a_google_capability_returns_no_vectors_when_one_input_fails() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"content": {"parts": [{"text": "alpha"}]}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": [0.1, 0.2, 0.3]}})),
+        )
+        .mount(&engine)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"content": {"parts": [{"text": "beta"}]}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(json!({"error": {"message": "backend exploded"}})),
+        )
+        .mount(&engine)
+        .await;
+
+    let router = serve(&google_config(&engine.uri(), 2048)).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("input[1]"), "{text}");
+    assert!(text.contains("backend exploded"), "{text}");
+    assert!(
+        !text.contains("\"embedding\""),
+        "a failed batch must not carry vectors: {text}"
+    );
+    assert!(
+        headers.get("x-switchyard-embedding-contract").is_none(),
+        "the contract must not be attested on a failed batch"
+    );
+}
+
+/// `gemini-embedding-2` speaks a different codec: width is a request field and a task is a
+/// text prefix rather than a `task_type`. The caller's contract is unchanged.
+fn gemini2_config(engine: &str, dims: u32, prefix: &str, extra_client: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.google2]
+format = "google_embed_content_v2"
+base_url = "{engine}"
+model = "gemini-embedding-2"
+api_key_env = "SWITCHYARD_TEST_GOOGLE2_KEY"
+{extra_client}
+
+[capabilities.gem2]
+id = "switchyard-embedding-google2"
+target = "google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = {dims}
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+{task_prefix}
+"#,
+        task_prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("task_prefix = \"{prefix}\"")
+        }
+    )
+}
+
+fn unit_vector(dims: usize, scale: f64) -> Value {
+    let each = 1.0 / (dims as f64).sqrt();
+    json!(vec![each * scale; dims])
+}
+
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_sends_the_prefix_and_the_requested_width() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    for text in ["alpha", "beta"] {
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-embedding-2:embedContent"))
+            .and(header("x-goog-api-key", "test-key"))
+            .and(body_partial_json(json!({
+                "model": "models/gemini-embedding-2",
+                "content": {"parts": [{"text": format!("task: search result | query: {text}")}]},
+                "output_dimensionality": 128,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"embedding": {"values": unit_vector(128, 1.0)}})),
+            )
+            .expect(1)
+            .mount(&engine)
+            .await;
+    }
+
+    let router = serve(&gemini2_config(
+        &engine.uri(),
+        128,
+        "task: search result | query: ",
+        "",
+    ))
+    .await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let value: Value = serde_json::from_slice(&body).expect("response is json");
+    assert_eq!(value["data"][0]["index"], json!(0));
+    assert_eq!(value["data"][1]["index"], json!(1));
+    assert_eq!(
+        headers
+            .get("x-switchyard-embedding-contract")
+            .and_then(|value| value.to_str().ok()),
+        Some("google-embedding-space:gemini-embedding-2-v1")
+    );
+}
+
+/// The prefix is sent with the text, so it counts against the model's input limit. A budget
+/// that ignored it would let an over-limit request reach the engine.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_counts_the_prefix_against_the_input_limit() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    let mut config = gemini2_config(&engine.uri(), 128, "task: x | query: ", "");
+    config = config.replace("max_input_tokens = 8192", "max_input_tokens = 17");
+    let router = serve(&config).await;
+    // 26-byte prefix + a 10-byte text is over 17 bytes even though the text alone is not.
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["0123456789"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("input[0]"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "an over-limit input must not reach the engine"
+    );
+}
+
+/// Width is negotiated per call, so a vector of a different width is not the vector the
+/// contract promises. Returning it would make the caller's index silently wrong.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_refuses_a_vector_at_the_wrong_width() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(127, 1.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let router = serve(&gemini2_config(&engine.uri(), 128, "", "")).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(String::from_utf8_lossy(&body).contains("dimension"));
+    assert!(
+        headers.get("x-switchyard-embedding-contract").is_none(),
+        "a refused vector must not be attested to the caller"
+    );
+}
+
+/// A declared normalization is a claim about the value space. If the engine's vector is not
+/// unit length, the contract is not what the caller was promised.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_refuses_a_vector_that_is_not_normalised() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(128, 10.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let router = serve(&gemini2_config(&engine.uri(), 128, "", "")).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        String::from_utf8_lossy(&body).contains("L2-normalised"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// A fan-out makes one provider request per input, so the budget must be charged per
+/// physical call. With one request authorised, the second input must not be sent.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_charges_the_daily_budget_per_physical_call() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(128, 1.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let state =
+        std::env::temp_dir().join(format!("switchyard-gemini2-budget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    let config = format!(
+        "{}\n[quota]\nstate_dir = \"{}\"\n",
+        gemini2_config(&engine.uri(), 128, "", "daily_request_limit = 1"),
+        state.display()
+    );
+    let router = serve(&config).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("daily request allowance"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the spent budget authorised exactly one physical call"
+    );
+}
+
+/// A minute window is taken before the call as well, so a caller cannot fan one request out
+/// into a burst the provider would refuse.
+#[tokio::test]
+async fn a_gemini_embedding_2_capability_charges_the_minute_window_per_physical_call() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"embedding": {"values": unit_vector(128, 1.0)}})),
+        )
+        .mount(&engine)
+        .await;
+    let router = serve(&gemini2_config(
+        &engine.uri(),
+        128,
+        "",
+        "requests_per_minute = 1",
+    ))
+    .await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha", "beta"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        String::from_utf8_lossy(&body).contains("per-minute requests_per_minute"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        1
+    );
+}
+
+/// A held capability is inventory, not a fallback: naming it must fail locally, name what is
+/// actually available, and reach no engine.
+#[tokio::test]
+async fn a_held_capability_is_refused_locally_with_no_egress() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_GOOGLE2_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    let config = format!(
+        "{gemini2_config}\nheld = \"not qualified: response shape unobserved\"\n",
+        gemini2_config = gemini2_config(&engine.uri(), 128, "", "")
+    );
+    let router = serve(&config).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/embeddings",
+        json!({"model": "switchyard-embedding-google2", "input": ["alpha"]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("No capability registered"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "a held capability must never reach its engine"
+    );
+}
+
+// =====================================================================
+// Speech synthesis and transcription
+// =====================================================================
+
+/// Config with one speech capability and one transcription capability, each pointing at the
+/// engine the test chooses.
+fn audio_config(engine: &str, speech_extra: &str, transcribe_extra: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.speech]
+format = "google_speech"
+base_url = "{engine}"
+model = "gemini-2.5-flash-preview-tts"
+api_key_env = "SWITCHYARD_TEST_AUDIO_KEY"
+{speech_extra}
+
+[capability_clients.transcriber]
+format = "google_transcribe"
+base_url = "{engine}"
+model = "gemini-3.5-transcribe"
+api_key_env = "SWITCHYARD_TEST_AUDIO_KEY"
+{transcribe_extra}
+
+[capabilities.tts]
+id = "switchyard-tts"
+target = "speech"
+voice = "Kore"
+audio_format = "wav"
+audio_sample_rate = 24000
+max_input_tokens = 8192
+
+[capabilities.asr]
+id = "switchyard-transcribe"
+target = "transcriber"
+task_prefix = "Transcribe this recording verbatim."
+max_input_tokens = 98304
+max_audio_seconds = 300
+max_audio_bytes = 15728640
+"#
+    )
+}
+
+/// A 16-bit mono WAV of the requested length, so a test can state a duration exactly.
+fn wav_bytes(seconds: f64, sample_rate: u32) -> Vec<u8> {
+    let channels: u16 = 1;
+    let bits: u16 = 16;
+    let frames = (seconds * f64::from(sample_rate)).round() as usize;
+    let data_len = frames * 2;
+    let block_align = channels * bits / 8;
+    let byte_rate = sample_rate * u32::from(block_align);
+    let mut out = Vec::new();
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    out.extend(vec![7u8; data_len]);
+    out
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn pcm16(samples: usize) -> Vec<u8> {
+    vec![0u8; samples * 2]
+}
+
+#[tokio::test]
+async fn speech_asks_for_the_audio_modality_and_returns_a_wav_container() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_AUDIO_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    let pcm = pcm16(480); // 20 ms at 24 kHz
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.5-flash-preview-tts:generateContent",
+        ))
+        .and(header("x-goog-api-key", "test-key"))
+        .and(body_partial_json(json!({
+            "contents": [{"parts": [{"text": "hello there"}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": [{"inlineData": {
+                "mimeType": "audio/L16;codec=pcm;rate=24000",
+                "data": b64(&pcm)
+            }}]}}]
+        })))
+        .expect(1)
+        .mount(&engine)
+        .await;
+
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/audio/speech",
+        json!({"model": "switchyard-tts", "input": "hello there"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "audio/wav");
+    assert_eq!(headers["x-switchyard-audio-format"], "wav");
+    assert_eq!(headers["x-switchyard-audio-rate"], "24000");
+    assert_eq!(headers["x-switchyard-audio-voice"], "Kore");
+    assert_eq!(&body[0..4], b"RIFF");
+    assert_eq!(&body[8..12], b"WAVE");
+    let riff_size = u32::from_le_bytes(body[4..8].try_into().expect("riff size"));
+    assert_eq!(riff_size as usize, body.len() - 8);
+    let channels = u16::from_le_bytes(body[22..24].try_into().expect("channels"));
+    let rate = u32::from_le_bytes(body[24..28].try_into().expect("rate"));
+    let bits = u16::from_le_bytes(body[34..36].try_into().expect("bits"));
+    assert_eq!((channels, rate, bits), (1, 24_000, 16));
+    let data_len = u32::from_le_bytes(body[40..44].try_into().expect("data length"));
+    assert_eq!(data_len as usize, pcm.len());
+    assert_eq!(&body[44..], &pcm[..]);
+}
+
+/// A declared format the engine does not produce must be refused before dispatch: the
+/// engine returns PCM, so a caller asking for a compressed container would otherwise be
+/// handed bytes labelled with a format they are not.
+#[tokio::test]
+async fn speech_refuses_a_container_it_cannot_produce_without_calling_out() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_AUDIO_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/speech",
+        json!({
+            "model": "switchyard-tts",
+            "input": "hello",
+            "response_format": "mp3"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("produces wav and pcm only"), "{text}");
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0
+    );
+}
+
+/// Resampling is not implemented, so a speed other than 1.0 must be refused rather than
+/// silently ignored: the audio would carry a rate the caller did not ask for.
+#[tokio::test]
+async fn speech_refuses_a_speed_it_cannot_apply() {
+    let engine = MockServer::start().await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/speech",
+        json!({"model": "switchyard-tts", "input": "hello", "speed": 1.5}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("does not resample"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// A byte budget bounds the token count from above, so an input past it is refused locally.
+#[tokio::test]
+async fn speech_refuses_input_past_the_declared_byte_budget() {
+    let engine = MockServer::start().await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/audio/speech",
+        json!({"model": "switchyard-tts", "input": "x".repeat(8193)}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(headers.get("x-switchyard-audio-format").is_none());
+    assert!(
+        String::from_utf8_lossy(&body).contains("accepts at most 8192"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0
+    );
+}
+
+/// The engine's own status travels back, and no audio header may attest to audio that was
+/// never received.
+#[tokio::test]
+async fn speech_passes_an_upstream_refusal_back_without_audio_headers() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_AUDIO_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("quota exceeded"))
+        .mount(&engine)
+        .await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let (status, headers, _body) = post(
+        router,
+        "/v1/audio/speech",
+        json!({"model": "switchyard-tts", "input": "hello"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // The error is JSON, not audio, and nothing may attest to a container or rate.
+    assert_eq!(headers["content-type"], "application/json");
+    assert!(headers.get("x-switchyard-audio-format").is_none());
+    assert!(headers.get("x-switchyard-audio-rate").is_none());
+    assert!(headers.get("x-switchyard-audio-voice").is_none());
+}
+
+/// The rate the engine reports is checked against the declared one. A WAV header written at
+/// the wrong rate would play back at the wrong speed, which is worse than a refusal.
+#[tokio::test]
+async fn speech_refuses_audio_whose_reported_rate_differs_from_the_contract() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_AUDIO_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": [{"inlineData": {
+                "mimeType": "audio/L16;codec=pcm;rate=16000",
+                "data": b64(&pcm16(16))
+            }}]}}]
+        })))
+        .mount(&engine)
+        .await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/speech",
+        json!({"model": "switchyard-tts", "input": "hello"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        String::from_utf8_lossy(&body).contains("does not match the declared rate"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// A held speech lane is inventory: naming it fails locally and reaches no engine.
+#[tokio::test]
+async fn a_held_speech_capability_reaches_no_engine() {
+    let engine = MockServer::start().await;
+    let config = audio_config(&engine.uri(), "", "").replace(
+        "[capabilities.tts]",
+        "[capabilities.tts]\nheld = \"not qualified: no authenticated audio response observed\"",
+    );
+    let router = serve(&config).await;
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/speech",
+        json!({"model": "switchyard-tts", "input": "hello"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        String::from_utf8_lossy(&body).contains("No capability registered"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn transcription_sends_the_audio_and_returns_the_text() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_AUDIO_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    let wav = wav_bytes(0.5, 16_000);
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-3.5-transcribe:generateContent"))
+        .and(header("x-goog-api-key", "test-key"))
+        .and(body_partial_json(json!({
+            "contents": [{"parts": [
+                {"inlineData": {"mimeType": "audio/wav", "data": b64(&wav)}},
+                {"text": "Transcribe this recording verbatim."}
+            ]}]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": [{"text": "hello"}, {"text": " world"}]}}]
+        })))
+        .expect(1)
+        .mount(&engine)
+        .await;
+
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let (status, headers, body) = post(
+        router,
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/wav", "data": b64(&wav)}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-switchyard-audio-seconds"], "0.500");
+    let value: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(value["text"], "hello world");
+}
+
+/// A container the surface cannot measure is refused: forwarding it would spend a token
+/// budget nobody bounded.
+#[tokio::test]
+async fn transcription_refuses_a_container_it_cannot_measure() {
+    let engine = MockServer::start().await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+
+    let (status, _headers, body) = post(
+        router.clone(),
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/mpeg", "data": b64(b"ID3notreallyaudio")}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("audio.mime_type audio/mpeg is not accepted"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/wav", "data": b64(b"not a riff file at all")}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("not a RIFF/WAVE container"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0
+    );
+}
+
+/// Duration is parsed from the container, so a recording past the contract is refused even
+/// though its byte count is small.
+#[tokio::test]
+async fn transcription_refuses_audio_longer_than_the_contract() {
+    let engine = MockServer::start().await;
+    let config = audio_config(&engine.uri(), "", "")
+        .replace("max_audio_seconds = 300", "max_audio_seconds = 2");
+    let router = serve(&config).await;
+    let wav = wav_bytes(3.0, 8_000);
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/wav", "data": b64(&wav)}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("accepts at most 2s"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0
+    );
+}
+
+/// A header whose byte rate disagrees with its sample rate would let a long recording be
+/// admitted as a short one, and charged for the short one. Both figures are the caller's, so
+/// they have to agree before either is trusted.
+#[tokio::test]
+async fn transcription_refuses_a_byte_rate_that_understates_the_audio() {
+    let engine = MockServer::start().await;
+    let config = audio_config(&engine.uri(), "", "")
+        .replace("max_audio_seconds = 300", "max_audio_seconds = 2");
+    let router = serve(&config).await;
+    // Three seconds of 16-bit 8 kHz mono, then a byte rate that claims 4 MB/s — which would
+    // read as twelve milliseconds and slip under the two-second ceiling.
+    let mut wav = wav_bytes(3.0, 8_000);
+    wav[28..32].copy_from_slice(&4_000_000u32.to_le_bytes());
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/wav", "data": b64(&wav)}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("byte rate does not agree"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0
+    );
+}
+
+/// The byte ceiling is separate from the duration ceiling and is enforced first.
+#[tokio::test]
+async fn transcription_refuses_audio_larger_than_the_contract() {
+    let engine = MockServer::start().await;
+    let config = audio_config(&engine.uri(), "", "")
+        .replace("max_audio_bytes = 15728640", "max_audio_bytes = 1000");
+    let router = serve(&config).await;
+    let wav = wav_bytes(0.1, 48_000);
+    assert!(wav.len() > 1000);
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/wav", "data": b64(&wav)}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("accepts at most 1000"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0
+    );
+}
+
+/// An answer with no text is a contract mismatch, not an empty transcription: the caller
+/// must not be told the recording was silent when the engine said something else.
+#[tokio::test]
+async fn transcription_reports_an_answer_without_text_as_a_contract_mismatch() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_AUDIO_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{"content": {"parts": []}, "finishReason": "SAFETY"}]
+        })))
+        .mount(&engine)
+        .await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let wav = wav_bytes(0.2, 16_000);
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/wav", "data": b64(&wav)}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("returned no text"), "{text}");
+    assert!(text.contains("SAFETY"), "{text}");
+}
+
+/// The engine's status travels back on the transcription surface too.
+#[tokio::test]
+async fn transcription_passes_an_upstream_failure_back() {
+    unsafe { std::env::set_var("SWITCHYARD_TEST_AUDIO_KEY", "test-key") };
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("model overloaded"))
+        .mount(&engine)
+        .await;
+    let router = serve(&audio_config(&engine.uri(), "", "")).await;
+    let wav = wav_bytes(0.2, 16_000);
+    let (status, _headers, body) = post(
+        router,
+        "/v1/audio/transcriptions",
+        json!({
+            "model": "switchyard-transcribe",
+            "audio": {"mime_type": "audio/wav", "data": b64(&wav)}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        String::from_utf8_lossy(&body).contains("model overloaded"),
+        "{}",
+        String::from_utf8_lossy(&body)
     );
 }

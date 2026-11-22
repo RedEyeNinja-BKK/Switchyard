@@ -64,10 +64,18 @@ def parse_environment_file(path: str) -> dict[str, str]:
     rejected rather than skipped, because a file systemd would refuse is a file
     whose environment this script cannot honestly claim to reproduce.
     """
-    if not os.path.exists(path):
-        return {}
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        raw = fh.read()
+    # A file that is not there is not an empty file. Returning {} would let a
+    # candidate be validated under an environment with a credential silently
+    # missing, and the caller would report "the candidate loads" about an
+    # environment the service never has. The caller decides which files are
+    # optional; this parser only reads what it was given.
+    if not os.path.isfile(path):
+        raise ValueError(f"{path}: no such environment file")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot be read ({exc.strerror})") from exc
 
     # Join continuations before tokenising: a trailing backslash continues the
     # assignment onto the next line.

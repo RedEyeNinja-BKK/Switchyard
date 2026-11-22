@@ -132,10 +132,36 @@ fn decode_openai_chat_stream(
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
             {
-                out.push(LlmResponseChunk::TextDelta {
-                    index: 0,
-                    text: text.to_string(),
-                });
+                if state.hosted_reasoning.is_some() {
+                    // The upstream streams its reasoning through the same channel as the
+                    // answer. Emitting a delta before the split is known would put thought
+                    // text on the wire, and a caller that already displayed it cannot be
+                    // un-shown, so the filter decides before anything is pushed.
+                    match state.thought_filter.push(text) {
+                        // The thought is dropped, not forwarded as a reasoning delta: the
+                        // chat encoder writes reasoning deltas out as `reasoning_content`, so
+                        // forwarding them would leak the monologue through the second field
+                        // after the answer channel had been cleaned.
+                        Ok(events) => {
+                            out.extend(events.into_iter().filter_map(|event| match event {
+                                crate::codecs::openai_chat::Filtered::Reasoning(_) => None,
+                                crate::codecs::openai_chat::Filtered::Answer(text) => {
+                                    Some(LlmResponseChunk::TextDelta { index: 0, text })
+                                }
+                            }))
+                        }
+                        Err(leak) => out.push(LlmResponseChunk::StreamError {
+                            message: format!(
+                                "upstream streamed a malformed inline reasoning block: {leak}"
+                            ),
+                        }),
+                    }
+                } else {
+                    out.push(LlmResponseChunk::TextDelta {
+                        index: 0,
+                        text: text.to_string(),
+                    });
+                }
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for tool_call in tool_calls {

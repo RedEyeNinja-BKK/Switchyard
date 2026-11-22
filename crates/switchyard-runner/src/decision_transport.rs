@@ -85,6 +85,14 @@ pub enum DecisionTransport {
     SystemOne,
     /// OpenRouter `/api/alpha/decisions`, served by SPAN.
     OpenRouterAlpha,
+    /// Google Gemini Decisions API `/v1beta/decisions`, served by `gemini-decision-1`.
+    ///
+    /// The question map is the same semantic encoding, but three details are not: Google
+    /// names the shared input `input` rather than `state`, spells the yes/no criteria keys
+    /// out (`true_description` / `false_description`), and wants a string description for
+    /// every choice option where the other transports pass `null`. Authentication is
+    /// `x-goog-api-key`, not a bearer token.
+    GoogleDecisions,
 }
 
 impl DecisionTransport {
@@ -93,6 +101,29 @@ impl DecisionTransport {
         match self {
             Self::SystemOne => "/v1/systemone",
             Self::OpenRouterAlpha => "/api/alpha/decisions",
+            Self::GoogleDecisions => "/v1beta/decisions",
+        }
+    }
+
+    /// Whether this transport authenticates with an `x-goog-api-key` header.
+    pub fn uses_google_api_key(self) -> bool {
+        matches!(self, Self::GoogleDecisions)
+    }
+
+    /// Whether this transport speaks Google's field spellings.
+    ///
+    /// A separate question from authentication: both are true of today's one Google
+    /// transport, and keeping them apart means a transport that authenticates one way
+    /// and encodes another does not silently inherit the wrong answer.
+    fn google_field_names(self) -> bool {
+        matches!(self, Self::GoogleDecisions)
+    }
+
+    /// The field that carries the shared input.
+    fn context_field(self) -> &'static str {
+        match self {
+            Self::GoogleDecisions => "input",
+            _ => "state",
         }
     }
 
@@ -105,13 +136,16 @@ impl DecisionTransport {
         }
     }
 
-    /// Builds the canonical request body shared by both transport families.
+    /// Builds the canonical request body shared by the transport families.
     ///
-    /// The external contract names the context `state`, carries `questions` as an object
-    /// keyed by question id, and names the kind `type`. Both SystemOne and OpenRouter
-    /// alpha-decisions use this shape, so the difference between them is endpoint,
-    /// authentication and response handling rather than a second semantic encoding.
+    /// The external contract carries `questions` as an object keyed by question id and
+    /// names the kind `type`. SystemOne and OpenRouter alpha-decisions also name the
+    /// context `state`, so the difference between them is endpoint, authentication and
+    /// response handling rather than a second semantic encoding. Google is the one family
+    /// whose field NAMES differ, and those differences are stated here rather than in a
+    /// second encoder, so a question can never mean two things on two backends.
     pub fn request_body(self, model: &str, request: &DecisionRequest) -> Result<Value, String> {
+        let google = self.google_field_names();
         let mut questions = serde_json::Map::new();
         for (id, question) in &request.questions {
             let mut entry = serde_json::Map::new();
@@ -123,24 +157,35 @@ impl DecisionTransport {
                     false_description,
                 } => {
                     // Optional: a noul question may omit criteria entirely.
+                    let (true_key, false_key) = if google {
+                        ("true_description", "false_description")
+                    } else {
+                        ("true", "false")
+                    };
                     let mut criteria = serde_json::Map::new();
                     if let Some(value) = true_description {
-                        criteria.insert("true".to_string(), value.clone());
+                        criteria.insert(true_key.to_string(), value.clone());
                     }
                     if let Some(value) = false_description {
-                        criteria.insert("false".to_string(), value.clone());
+                        criteria.insert(false_key.to_string(), value.clone());
                     }
                     if !criteria.is_empty() {
                         entry.insert("criteria".to_string(), Value::Object(criteria));
                     }
                 }
                 DecisionKind::Choice { options } => {
-                    // A required object mapping option id to an optional description.
+                    // A required object mapping option id to a description. Google refuses
+                    // a null description, so an option that names none is described as the
+                    // empty string, which is what its own documentation prescribes for an
+                    // option id that speaks for itself.
                     let mut criteria = serde_json::Map::new();
                     for option in options {
                         criteria.insert(
                             option.id.clone(),
-                            option.description.clone().unwrap_or(Value::Null),
+                            option
+                                .description
+                                .clone()
+                                .unwrap_or_else(|| if google { json!("") } else { Value::Null }),
                         );
                     }
                     entry.insert("criteria".to_string(), Value::Object(criteria));
@@ -152,11 +197,11 @@ impl DecisionTransport {
             }
             questions.insert(id.clone(), Value::Object(entry));
         }
-        Ok(json!({
-            "model": model,
-            "state": request.context,
-            "questions": Value::Object(questions),
-        }))
+        let mut body = serde_json::Map::new();
+        body.insert("model".to_string(), json!(model));
+        body.insert(self.context_field().to_string(), request.context.clone());
+        body.insert("questions".to_string(), Value::Object(questions));
+        Ok(Value::Object(body))
     }
 }
 
@@ -624,6 +669,59 @@ mod tests {
             DecisionTransport::SystemOne.path(),
             DecisionTransport::OpenRouterAlpha.path()
         );
+    }
+
+    /// Google is the one family whose field NAMES differ: the shared input is `input`, the
+    /// yes/no criteria keys are spelled out, and every choice option needs a string
+    /// description rather than `null`. The question map itself stays the same encoding.
+    #[test]
+    fn google_decisions_speaks_googles_field_names() {
+        let body = DecisionTransport::GoogleDecisions
+            .request_body("gemini-decision-1", &boolean_request())
+            .expect("body builds");
+        assert_eq!(body["model"], "gemini-decision-1");
+        assert!(body.get("input").is_some(), "Google names the input input");
+        assert!(
+            body.get("state").is_none(),
+            "Google does not accept state as the input field"
+        );
+        let risk = &body["questions"]["risk"];
+        assert_eq!(risk["type"], "noul");
+        assert_eq!(risk["criteria"]["true_description"], "needs reasoning");
+        assert_eq!(risk["criteria"]["false_description"], "does not");
+        assert!(
+            risk["criteria"].get("true").is_none(),
+            "the short key belongs to the other transports"
+        );
+
+        let choice = DecisionTransport::GoogleDecisions
+            .request_body("m", &choice_request(2))
+            .expect("choice body builds");
+        assert_eq!(
+            choice["questions"]["team"]["criteria"]["billing"], "",
+            "Google wants a string description where the others pass null"
+        );
+
+        let score = DecisionTransport::GoogleDecisions
+            .request_body("m", &score_request(3))
+            .expect("score body builds");
+        assert!(
+            score["questions"]["severity"]["criteria"].is_array(),
+            "a score rubric is an ordered array on every transport"
+        );
+    }
+
+    /// The one Google transport has its own path and its own authentication, and no other
+    /// transport may claim either.
+    #[test]
+    fn google_decisions_has_its_own_path_and_authentication() {
+        assert_eq!(
+            DecisionTransport::GoogleDecisions.path(),
+            "/v1beta/decisions"
+        );
+        assert!(DecisionTransport::GoogleDecisions.uses_google_api_key());
+        assert!(!DecisionTransport::SystemOne.uses_google_api_key());
+        assert!(!DecisionTransport::OpenRouterAlpha.uses_google_api_key());
     }
 
     /// Answers arrive as an object keyed by question id, each tagged with its kind.

@@ -21,9 +21,10 @@ use switchyard_llm_client::{
 use switchyard_protocol::{
     Category, ModelId, ReasoningDialect, ReasoningPolicy, RoutedLlmClient, WireFormat,
 };
+use switchyard_translation::HostedReasoningMarker;
 
 use crate::{
-    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, MediaCarrier,
+    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, HeldRoute, MediaCarrier,
     ModelCapabilities, Route, Runner, RunnerError, capability, decision_executor,
     decision_transport,
 };
@@ -113,35 +114,6 @@ pub(crate) struct DeploymentConfig {
     /// whose counter cannot be written is a cap nobody is enforcing.
     #[serde(default)]
     quota: Option<QuotaConfig>,
-    /// Admission for providers that may only receive a payload cleared as public.
-    ///
-    /// Optional, but required as soon as one `llm_client` declares
-    /// `requires_public_payload`: without a key nothing can authenticate a clearance, so a
-    /// gated client would be permanently unservable and the mistake would surface as every
-    /// request refused rather than as the configuration error it is.
-    #[serde(default)]
-    privacy: Option<PrivacyConfig>,
-}
-
-/// Admission for providers that may only receive a payload cleared as public.
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PrivacyConfig {
-    /// Environment variable holding the clearance key.
-    ///
-    /// The value is the shared secret a caller signs its clearance with. It is read once at
-    /// load and never printed: the configuration's own `Debug` reports only whether a key
-    /// was found.
-    pub(crate) clearance_key_env: String,
-}
-
-impl std::fmt::Debug for PrivacyConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PrivacyConfig")
-            .field("clearance_key_env", &self.clearance_key_env)
-            .finish()
-    }
 }
 
 /// Accounting for per-target daily request allowances.
@@ -300,7 +272,34 @@ struct RouteConfig {
     /// carries. `context_window` is a route-level promise, and upstream rejects it as an
     /// unknown field on a target, so which leg is wider has to be stated.
     escalation_target: Option<String>,
+    /// How this route orders the candidates that survived eligibility filtering.
+    ///
+    /// Declared order is the historical behaviour and stays the default, so no existing
+    /// route reorders because a new option became available. `measured` lets a route whose
+    /// candidates are interchangeable free models pick by what this deployment has actually
+    /// observed — completion, then latency — instead of by configuration order, which for
+    /// interchangeable models is an accident of spelling rather than a decision.
+    ///
+    /// Read by the manual `Deserialize` below, which is why it carries no attribute: this
+    /// struct removes its own fields from the table before the algorithm spec sees them.
+    selection: SelectionPolicy,
     algorithm: AlgorithmSpec,
+}
+
+/// How a route orders its eligible candidates.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionPolicy {
+    /// Walk candidates in the order configuration states. Unchanged behaviour.
+    #[default]
+    Declared,
+    /// Order by measured completion and latency, falling back to declared order.
+    ///
+    /// Only reorders among candidates that already survived every hard gate — privacy,
+    /// capability, physical fit, quota — so it can never spend a leg the deployment would
+    /// have refused. A target with too few observations keeps its declared position, so a
+    /// cold deployment behaves exactly like a declared-order one.
+    Measured,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -365,6 +364,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
+        let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -380,6 +380,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
             escalation_target,
+            selection: selection.unwrap_or_default(),
             algorithm,
         })
     }
@@ -431,6 +432,17 @@ impl RouteConfig {
     }
 }
 
+/// The two ledgers a resolved deployment shares, owned together.
+///
+/// Kept as one value because the pair is not optional in either direction: a resolver
+/// built with a governor but no counters would pace its calls without counting them,
+/// which is the defect this whole path exists to prevent. Passing them as one value
+/// makes that omission unrepresentable rather than merely discouraged.
+struct Accounting<'a> {
+    governor: &'a Arc<switchyard_llm_client::QuotaGovernor>,
+    allowances: &'a HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+}
+
 impl DeploymentConfig {
     /// The media capabilities a composite actually guarantees.
     ///
@@ -447,30 +459,29 @@ impl DeploymentConfig {
     /// Deriving rather than hand-editing every parent is what keeps the declaration honest
     /// when a child's carrier narrows: the parent follows, and
     /// `validate_composite_media_claims` still refuses an explicit claim no child keeps.
-    fn composite_capabilities(
-        &self,
-        composite: &CompositeRouteConfig,
-    ) -> crate::ModelCapabilities {
+    fn composite_capabilities(&self, composite: &CompositeRouteConfig) -> crate::ModelCapabilities {
         let children: Vec<crate::ModelCapabilities> = composite
             .children
             .iter()
             .filter_map(|child| self.routes.get(child))
             .map(RouteConfig::capabilities)
             .collect();
-        let serves =
-            |medium: fn(&crate::ModelCapabilities) -> Option<bool>| {
-                children.iter().any(|caps| medium(caps) == Some(true))
-            };
-        let carrier_union = |medium: fn(&crate::ModelCapabilities) -> Option<bool>,
-                             carrier: fn(&crate::ModelCapabilities) -> Option<MediaCarrier>| {
-            children
-                .iter()
-                .filter(|caps| medium(caps) == Some(true))
-                .map(|caps| carrier(caps).unwrap_or(MediaCarrier::DEFAULT))
-                .reduce(MediaCarrier::union)
+        let serves = |medium: fn(&crate::ModelCapabilities) -> Option<bool>| {
+            children.iter().any(|caps| medium(caps) == Some(true))
         };
+        let carrier_union =
+            |medium: fn(&crate::ModelCapabilities) -> Option<bool>,
+             carrier: fn(&crate::ModelCapabilities) -> Option<MediaCarrier>| {
+                children
+                    .iter()
+                    .filter(|caps| medium(caps) == Some(true))
+                    .map(|caps| carrier(caps).unwrap_or(MediaCarrier::DEFAULT))
+                    .reduce(MediaCarrier::union)
+            };
         let video = composite.video.unwrap_or_else(|| serves(|caps| caps.video));
-        let vision = composite.vision.unwrap_or_else(|| serves(|caps| caps.vision));
+        let vision = composite
+            .vision
+            .unwrap_or_else(|| serves(|caps| caps.vision));
         crate::ModelCapabilities {
             context_window: composite.context_window,
             tool_calling: composite.tool_calling,
@@ -481,16 +492,16 @@ impl DeploymentConfig {
             // carriers, never the permissive default, so the parent cannot advertise a
             // carrier nothing below it serves.
             video_carrier: video.then(|| {
-                composite.video_carrier.or_else(|| {
-                    carrier_union(|caps| caps.video, |caps| caps.video_carrier)
-                })
-                .unwrap_or(MediaCarrier::DEFAULT)
+                composite
+                    .video_carrier
+                    .or_else(|| carrier_union(|caps| caps.video, |caps| caps.video_carrier))
+                    .unwrap_or(MediaCarrier::DEFAULT)
             }),
             image_carrier: vision.then(|| {
-                composite.image_carrier.or_else(|| {
-                    carrier_union(|caps| caps.vision, |caps| caps.image_carrier)
-                })
-                .unwrap_or(MediaCarrier::DEFAULT)
+                composite
+                    .image_carrier
+                    .or_else(|| carrier_union(|caps| caps.vision, |caps| caps.image_carrier))
+                    .unwrap_or(MediaCarrier::DEFAULT)
             }),
         }
     }
@@ -581,8 +592,6 @@ impl DeploymentConfig {
 
         let facts = self.deployment_facts();
         // Resolved once, before any route is built, so a gated deployment that cannot
-        // authenticate a clearance fails at load instead of refusing every request later.
-        let clearance_key = self.build_clearance_key()?;
 
         let mut route_names_by_id = HashMap::new();
         for (route_name, config) in &self.routes {
@@ -616,11 +625,12 @@ impl DeploymentConfig {
                     if first.reasoning_effort != target.reasoning_effort
                         || first.extra_body != target.extra_body
                         || first.omit_body_fields != target.omit_body_fields
+                        || first.unsupported_reasoning_effort != target.unsupported_reasoning_effort
                         || first.reasoning_policy != target.reasoning_policy
                         || first.reasoning_dialect != target.reasoning_dialect
                     {
                         return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields; one target per model id is kept, so give each its own model id or llm client",
+                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, omit_body_fields, or unsupported_reasoning_effort; one target per model id is kept, so give each its own model id or llm client",
                             target.id, target.llm_client
                         )));
                     }
@@ -634,7 +644,20 @@ impl DeploymentConfig {
         }
 
         let mut provider_api_keys = Vec::new();
-        let clients = self.build_clients(&mut provider_api_keys)?;
+        // Built once and shared: the dispatch gate reserves against these counters and
+        // selection reads the same remainder, so one budget has one source of truth.
+        let allowances = self.build_allowances()?;
+        self.validate_minute_windows()?;
+        // One governor for the whole deployment. Its key is (quota group, physical model),
+        // so every alias of one model draws on one window — which is what the provider
+        // counts, and the only way `smart-nt`, `smart_gemini` and a direct leaf cannot each
+        // spend the same minute's allowance.
+        let governor = Arc::new(switchyard_llm_client::QuotaGovernor::new());
+        let accounting = Accounting {
+            governor: &governor,
+            allowances: &allowances,
+        };
+        let clients = self.build_clients(&mut provider_api_keys, &allowances, &governor)?;
         capability::CapabilityDeployment {
             clients: self.capability_clients.clone(),
             capabilities: self.capabilities.clone(),
@@ -646,7 +669,9 @@ impl DeploymentConfig {
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
         self.validate_composite_media_claims()?;
+        self.validate_physical_context_claims()?;
         self.validate_video_transport()?;
+        self.validate_responses_wire_targets()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
         self.validate_decision_lane_composition()?;
@@ -661,7 +686,7 @@ impl DeploymentConfig {
             BTreeMap::new();
         for (name, lane_config) in &self.decision_lanes {
             let names: Vec<&str> = lane_config.targets.iter().map(String::as_str).collect();
-            let Some(resolver) = self.build_decision_resolver(&names) else {
+            let Some(resolver) = self.build_decision_resolver(&names, &accounting) else {
                 continue;
             };
             let handle = decision_executor::LaneResolverHandle {
@@ -672,6 +697,11 @@ impl DeploymentConfig {
         }
         let lane_composition = self.resolve_decision_lane_composition(&lane_handles)?;
         let lane_identity = self.default_decision_lane.clone();
+        // One evidence set for the whole deployment, shared by every measured route. A
+        // physical model behaves the same whichever alias named it, so a request served by
+        // one route is evidence for the others — and a subsidiary route cannot accumulate
+        // observations nobody reads.
+        let measured_selector = crate::selection::MeasuredSelector::new();
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             // Before the unknown-target sweep below, so a malformed candidate list is
@@ -807,6 +837,7 @@ impl DeploymentConfig {
                 lane_identity.clone(),
                 &lane_index,
                 &lane_composition,
+                &accounting,
             )?;
             let anthropic_auxiliary_target =
                 self.build_anthropic_auxiliary_target(config, &clients);
@@ -825,6 +856,23 @@ impl DeploymentConfig {
             if let Some(subagent) = names.subagent {
                 models = models.with_subagent(resolve_category_models(subagent, &targets)?);
             }
+            // Held targets keep their declaration, credential and facts, but they leave the
+            // candidate set here — before any algorithm is handed it — so no selection rule
+            // and no fallback walk can reach one, and no request spends a provider call on a
+            // model the provider has withdrawn. Filtering the model set rather than each
+            // algorithm's configuration is what makes this true for every algorithm: the
+            // dispatch path reads candidates from here and nowhere else.
+            let held_models: BTreeSet<ModelId> = config
+                .callable_target_names()
+                .into_iter()
+                .filter_map(|name| self.targets.get(name))
+                .filter(|target| target.held.is_some())
+                .map(|target| target.id.clone())
+                .collect();
+            if !held_models.is_empty() {
+                models = models.filtered(&|model| !held_models.contains(model));
+            }
+            let held = self.route_held(config, &held_models);
             let route = Route::new(
                 algorithm,
                 route_clients,
@@ -842,7 +890,37 @@ impl DeploymentConfig {
             )
             .with_target_credentials(target_credentials(config, &self.targets))
             .with_locality(route_locality(config, &self.targets, &self.llm_clients))
-            .with_clearance_key(clearance_key.clone());
+            .with_daily_allowances(Arc::new(
+                config
+                    .routing_target_names()
+                    .into_iter()
+                    .filter_map(|name| self.targets.get(name))
+                    .filter_map(|target| {
+                        let group = self
+                            .llm_clients
+                            .get(&target.llm_client)
+                            .and_then(|client| client.quota_group.clone())
+                            .unwrap_or_else(|| target.llm_client.clone());
+                        allowances
+                            .get(&(group, target.id.clone()))
+                            .map(|allowance| (target.id.clone(), Arc::clone(allowance)))
+                    })
+                    .collect::<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>(
+                    ),
+            ));
+            let route = match held {
+                Some(held) => route.with_held(held),
+                None => route,
+            };
+            // A measured route ranks candidates only after it has evidence, and shares that
+            // evidence with every other measured route so real work is not isolated to one
+            // alias.
+            let route = match config.selection {
+                crate::config::SelectionPolicy::Measured => {
+                    route.with_measured_selection(Arc::clone(&measured_selector))
+                }
+                crate::config::SelectionPolicy::Declared => route,
+            };
             routes.push((config.id.clone(), route));
         }
         // The default logical decision lane. Every configured decision target in
@@ -855,20 +933,25 @@ impl DeploymentConfig {
             .with_fallback_url(fallback_base_url)
             .with_provider_api_keys(provider_api_keys)
             .with_deployment_facts(facts)
-            .with_capabilities(capability::resolve(&capability::CapabilityDeployment {
-                clients: self.capability_clients.clone(),
-                capabilities: self.capabilities.clone(),
-            }));
+            .with_capabilities(
+                capability::resolve_with_budget(
+                    &capability::CapabilityDeployment {
+                        clients: self.capability_clients.clone(),
+                        capabilities: self.capabilities.clone(),
+                    },
+                    Some(&governor),
+                    self.quota.as_ref().map(|quota| quota.state_dir.as_path()),
+                )
+                .map_err(RunnerError::configuration)?,
+            );
         self.validate_decision_lanes()?;
         // Composites are registered as named routes, so lookup is uniform: a caller
         // resolving a route cannot tell whether it is a leaf or a composite.
         for (name, composite) in &self.composites {
             runner = runner.with_composite(name.clone(), composite.children.clone());
             runner = runner.with_composite_cross_policy(name.clone(), composite.cross_on);
-            runner = runner.with_composite_capabilities(
-                name.clone(),
-                self.composite_capabilities(composite),
-            );
+            runner = runner
+                .with_composite_capabilities(name.clone(), self.composite_capabilities(composite));
         }
 
         // The same lanes are registered on the runner, so the public surface and the
@@ -883,49 +966,6 @@ impl DeploymentConfig {
             runner = runner.with_decision_lane_composition(name, children);
         }
         Ok(runner)
-    }
-
-    /// The key that authenticates a caller's privacy clearance.
-    ///
-    /// Required exactly when some `llm_client` declares `requires_public_payload`. Without
-    /// it nothing can authenticate a clearance, so every request to that client would be
-    /// refused: a startup error is the only honest way to report that.
-    fn build_clearance_key(&self) -> RunnerResult<Arc<crate::egress::ClearanceKey>> {
-        let gated: Vec<&str> = self
-            .llm_clients
-            .iter()
-            .filter(|(_, client)| client.requires_public_payload)
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let Some(privacy) = self.privacy.as_ref() else {
-            if gated.is_empty() {
-                return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
-            }
-            return Err(RunnerError::configuration(format!(
-                "llm clients {} declare requires_public_payload but the deployment configures no [privacy] clearance_key_env; a clearance cannot be authenticated without a key, so every request to them would be refused",
-                gated.join(", ")
-            )));
-        };
-        if gated.is_empty() {
-            return Ok(Arc::new(crate::egress::ClearanceKey::refusing()));
-        }
-        let secret = std::env::var(&privacy.clearance_key_env).map_err(|_| {
-            RunnerError::configuration(format!(
-                "[privacy] clearance_key_env names {}, which is not set; llm clients {} require a public payload, so the key is required",
-                privacy.clearance_key_env,
-                gated.join(", ")
-            ))
-        })?;
-        if secret.trim().is_empty() {
-            return Err(RunnerError::configuration(format!(
-                "[privacy] clearance_key_env names {}, which is empty; llm clients {} require a public payload, so the key is required",
-                privacy.clearance_key_env,
-                gated.join(", ")
-            )));
-        }
-        Ok(Arc::new(crate::egress::ClearanceKey::new(
-            secret.into_bytes(),
-        )))
     }
 
     /// Builds one daily request allowance per (quota group, model) that declares a limit.
@@ -992,6 +1032,26 @@ impl DeploymentConfig {
         }
         if !allowances.is_empty() {
             self.validate_quota_state_dir()?;
+            // The directory probe above is not enough. A counter file can be left behind by
+            // a different account - the deployment path runs as root while the unit runs as
+            // its own user - and then the DIRECTORY is writable while that model's counter
+            // and lock are not. The first caller would see a bare `Permission denied`
+            // reported as an unavailable allowance.
+            //
+            // Checked per counter, at load, and refused with the file and its owner named.
+            // Absent counters are not created here on purpose: the first reservation creates
+            // them as the account that spends, so a root-run preflight cannot leave files
+            // the service user cannot write.
+            for allowance in allowances.values() {
+                allowance.check_usable().map_err(|reason| {
+                    RunnerError::configuration(format!(
+                        "the daily request counter for model {} in quota group {} cannot be used \
+                         by this process: {reason}",
+                        allowance.model(),
+                        allowance.group()
+                    ))
+                })?;
+            }
         }
         Ok(allowances)
     }
@@ -1005,12 +1065,14 @@ impl DeploymentConfig {
         let Some(quota) = self.quota.as_ref() else {
             return Ok(());
         };
-        std::fs::create_dir_all(&quota.state_dir).map_err(|error| {
-            RunnerError::configuration(format!(
-                "[quota] state_dir {} cannot be created: {error}",
-                quota.state_dir.display()
-            ))
-        })?;
+        // Only an EXISTING directory is probed. Creating it here would be a load-time side
+        // effect performed by whoever validated - including a root-run preflight - and a
+        // root-owned state directory under a unit that runs as its own user is exactly the
+        // failure this check exists to prevent. A missing directory is created by the first
+        // reservation, as the account that will own it.
+        if !quota.state_dir.exists() {
+            return Ok(());
+        }
         let probe = quota.state_dir.join(".write-probe");
         std::fs::write(&probe, b"switchyard quota state\n").map_err(|error| {
             RunnerError::configuration(format!(
@@ -1030,9 +1092,10 @@ impl DeploymentConfig {
     fn build_clients(
         &self,
         provider_api_keys: &mut Vec<String>,
+        allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+        governor: &Arc<switchyard_llm_client::QuotaGovernor>,
     ) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
         // Built before the per-target backends so each one can carry its own budget.
-        let allowances = self.build_allowances()?;
         let mut models_by_client = self
             .llm_clients
             .keys()
@@ -1046,9 +1109,12 @@ impl DeploymentConfig {
                 client_config,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
+                None,
                 None,
                 None,
             )?;
@@ -1090,6 +1156,14 @@ impl DeploymentConfig {
                     )));
                 }
             }
+            let hosted_reasoning = match target.hosted_reasoning.as_deref() {
+                None => None,
+                Some(value) => Some(HostedReasoningMarker::parse(value).ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "target {target_name} hosted_reasoning {value:?} is not a known marker; expected thought_tag"
+                    ))
+                })?),
+            };
             model_configs.push(ModelConfig::new(
                 target.id.clone(),
                 build_backend(
@@ -1097,6 +1171,7 @@ impl DeploymentConfig {
                     client_config,
                     &target.extra_body,
                     &target.omit_body_fields,
+                    &target.unsupported_reasoning_effort,
                     target.reasoning_effort.clone(),
                     target.reasoning_policy,
                     target.reasoning_dialect,
@@ -1110,6 +1185,8 @@ impl DeploymentConfig {
                             target.id.clone(),
                         ))
                         .cloned(),
+                    pacing_for(target, client_config, governor),
+                    hosted_reasoning,
                 )?,
                 None,
             ));
@@ -1131,6 +1208,42 @@ impl DeploymentConfig {
             .iter()
             .map(|(name, config)| (name.clone(), config.id.clone()))
             .collect()
+    }
+
+    /// The holding record for a route whose every completion target is held.
+    ///
+    /// A route with at least one live candidate is not held: the live ones serve, and the
+    /// held ones were already removed from its candidate set. Only a route with nothing left
+    /// to call is registered as held, which is what keeps the refusal specific instead of
+    /// letting the caller's alias fall through to the unknown-model path.
+    fn route_held(
+        &self,
+        config: &RouteConfig,
+        held_models: &BTreeSet<ModelId>,
+    ) -> Option<HeldRoute> {
+        if held_models.is_empty() {
+            return None;
+        }
+        let names = config.routing_target_names();
+        if names.is_empty() {
+            return None;
+        }
+        let all_held = names.iter().all(|name| {
+            self.targets
+                .get(*name)
+                .is_some_and(|target| target.held.is_some())
+        });
+        if !all_held {
+            return None;
+        }
+        let first = self.targets.get(names[0])?;
+        Some(HeldRoute {
+            // Named by configuration, not by the model id: it is the alias the manifest
+            // declares and the caller reads, and it survives in the message even though the
+            // dispatch set no longer contains it.
+            model: names[0].to_string(),
+            reason: first.held.clone()?,
+        })
     }
 
     /// Builds the decision resolver for a route, from its configured targets in order.
@@ -1285,6 +1398,211 @@ impl DeploymentConfig {
             }
         }
         Ok(())
+    }
+
+    /// Checks the per-minute window declarations before any backend carries one.
+    ///
+    /// Two rules, both of which fail closed at load rather than as a 429 under traffic: a
+    /// window whose per-request ceiling exceeds it can never admit that request however long
+    /// it waits, and two targets naming one physical model in one quota group share one
+    /// window, so stating different values would make whichever loaded first the real limit.
+    fn validate_minute_windows(&self) -> RunnerResult<()> {
+        // Request rate, token rate, admission pad in per mille, and the target that stated
+        // them: one declared window, as compared across aliases of one physical model.
+        type DeclaredMinuteWindow<'a> = (Option<u64>, Option<u64>, u32, &'a str);
+        let mut declared: HashMap<(String, ModelId), DeclaredMinuteWindow<'_>> = HashMap::new();
+        for (target_name, target) in &self.targets {
+            // Validate the pad for every target, not only paced ones: a margin naming no
+            // token window still means the author expected padding to happen, and skipping
+            // the check would let that mistake load and surface only as absent protection.
+            let margin = admission_margin(target, target_name)?;
+            if target.requests_per_minute.is_none() && target.input_tokens_per_minute.is_none() {
+                continue;
+            }
+            if target.requests_per_minute == Some(0) || target.input_tokens_per_minute == Some(0) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares a per-minute limit of zero; a window that \
+                     admits nothing would refuse every request, so omit the field instead"
+                )));
+            }
+            if let Some(limit) = target.input_tokens_per_minute {
+                // The ceiling is judged at the margin, because that is the reservation the
+                // send path will compute. Checking the raw ceiling instead would admit a
+                // manifest whose stated ceiling the governor then refuses on every request —
+                // a window that looks configured and serves nothing.
+                let safe = switchyard_llm_client::WindowLimits {
+                    requests_per_minute: target.requests_per_minute,
+                    input_tokens_per_minute: target.input_tokens_per_minute,
+                }
+                .safe_input_ceiling(margin)
+                .unwrap_or(limit);
+                let margin_per_mille = margin.permille();
+                match target.max_input_tokens {
+                    None => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares input_tokens_per_minute {limit} \
+                             without max_input_tokens; a per-request ceiling at or below the \
+                             minute budget is what keeps a request from being unservable no \
+                             matter how long it waits"
+                        )));
+                    }
+                    Some(max_input) if max_input > limit => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares max_input_tokens {max_input} above \
+                             its input_tokens_per_minute {limit}; a single request larger than \
+                             a whole window can never be admitted"
+                        )));
+                    }
+                    // Above the margin-adjusted ceiling but not above the raw window: this
+                    // would admit nothing the governor allows, so it is a configuration that
+                    // only pretends to be open past `safe`.
+                    Some(max_input) if max_input > safe => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares max_input_tokens {max_input}, but \
+                             at an admission_margin_permille of {margin_per_mille} per mille against \
+                             input_tokens_per_minute {limit} the largest estimate it can admit \
+                             is {safe}; lower max_input_tokens to {safe} or below, or lower the \
+                             margin"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            let group = self
+                .llm_clients
+                .get(&target.llm_client)
+                .and_then(|client| client.quota_group.clone())
+                .unwrap_or_else(|| target.llm_client.clone());
+            match declared.entry((group.clone(), target.id.clone())) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let (first_rpm, first_tpm, first_margin, first_name) = *existing.get();
+                    if first_rpm != target.requests_per_minute
+                        || first_tpm != target.input_tokens_per_minute
+                        || first_margin != margin.permille()
+                    {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} share model {} in quota \
+                             group {group} but declare different per-minute limits or \
+                             admission margins; one window serves them both, so state it once",
+                            target.id
+                        )));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((
+                        target.requests_per_minute,
+                        target.input_tokens_per_minute,
+                        margin.permille(),
+                        target_name.as_str(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that a route's advertised context is capacity some target can actually serve.
+    ///
+    /// `context_window` on a route is what a caller reads before choosing it, and it is
+    /// plain metadata — nothing at request time compares it to a model's real window. A
+    /// route aggregating several physical models may therefore advertise the widest of
+    /// them, which is truthful: some eligible target can hold such a request. Advertising
+    /// more than the widest target is not, so a route that states a window while its
+    /// targets state physical windows must fit inside the largest of them. A target that
+    /// states no physical window is treated as undeclared rather than as zero, so a
+    /// manifest written before this field existed keeps loading unchanged.
+    fn validate_physical_context_claims(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if let Some(max_input) = target.max_input_tokens {
+                if max_input == 0 {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} max_input_tokens must be at least 1"
+                    )));
+                }
+                if let Some(window) = target.context_window
+                    && max_input > window
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} declares max_input_tokens {max_input} above its \
+                         context_window {window}; a per-request ceiling larger than the window \
+                         is never the binding limit, so one of the two is wrong"
+                    )));
+                }
+            }
+            if target.context_window == Some(0) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} context_window must be at least 1"
+                )));
+            }
+        }
+
+        for (route_name, route) in &self.routes {
+            let Some(claimed) = route.context_window else {
+                continue;
+            };
+            let declared: Vec<u64> = route
+                .routing_target_names()
+                .into_iter()
+                .filter_map(|name| self.targets.get(name))
+                .filter_map(|target| target.context_window)
+                .collect();
+            let Some(widest) = declared.iter().copied().max() else {
+                // No target states a physical window, so there is nothing to check against
+                // and the historical manifest keeps its behaviour.
+                continue;
+            };
+            if u64::from(claimed) > widest {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} advertises context_window {claimed} but its widest \
+                     declared target window is {widest}; the route would promise capacity no \
+                     candidate can serve"
+                )));
+            }
+        }
+
+        // A composite is resolved before its children, so the number a caller reads comes
+        // from the composite itself. Leaving it unchecked would let the one surface a
+        // bounded lane publishes be the only unverified promise in the file. A child
+        // route's own stated window is the tighter and therefore the authoritative value;
+        // only a child that states nothing falls back to its targets.
+        for (name, composite) in &self.composites {
+            let Some(claimed) = composite.context_window else {
+                continue;
+            };
+            let widest = composite
+                .children
+                .iter()
+                .filter_map(|child| self.routes.get(child))
+                .filter_map(|route| {
+                    route
+                        .context_window
+                        .map(u64::from)
+                        .or_else(|| self.widest_target_window(route))
+                })
+                .max();
+            let Some(widest) = widest else {
+                // Nothing below states a window, so there is no claim to contradict.
+                continue;
+            };
+            if u64::from(claimed) > widest {
+                return Err(RunnerError::configuration(format!(
+                    "composite {name} advertises context_window {claimed} but its widest \
+                     declared child window is {widest}; the composite would promise capacity \
+                     no child route can serve"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The widest physical window any target behind `route` declares, if any does.
+    fn widest_target_window(&self, route: &RouteConfig) -> Option<u64> {
+        route
+            .routing_target_names()
+            .into_iter()
+            .filter_map(|name| self.targets.get(name))
+            .filter_map(|target| target.context_window)
+            .max()
     }
 
     /// Checks a composite's effective media claim against the children that must keep it.
@@ -1459,6 +1777,36 @@ impl DeploymentConfig {
                 return Err(RunnerError::configuration(format!(
                     "target {target_name} declares video = true but its client uses {format}; \
                      video requires an openai_responses client"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a Responses backend pointed at a provider that serves no such path.
+    ///
+    /// Google documents `/v1beta/openai/chat/completions` and no `/openai/responses`
+    /// equivalent. A target configured as `openai_responses` against that base URL would build
+    /// a path the provider has never offered, and the resulting 404 is a missing endpoint
+    /// rather than a missing model - which is exactly the confusion that gets a healthy model
+    /// recorded as retired. Checked at load so the misconfiguration cannot reach a request,
+    /// and the message names the fix.
+    fn validate_responses_wire_targets(&self) -> RunnerResult<()> {
+        for (name, client) in &self.llm_clients {
+            if !matches!(client.format, ClientFormat::OpenAiResponses) {
+                continue;
+            }
+            if client
+                .base_url
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("generativelanguage.googleapis.com")
+            {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} uses openai_responses against {}; Google's \
+                     OpenAI-compatible surface documents /v1beta/openai/chat/completions only \
+                     and serves no Responses path. Use format = \"openai_chat\" for this client",
+                    client.base_url.as_str()
                 )));
             }
         }
@@ -1649,6 +1997,7 @@ impl DeploymentConfig {
     fn build_decision_resolver(
         &self,
         target_names: &[&str],
+        accounting: &Accounting<'_>,
     ) -> Option<decision_executor::DecisionResolver> {
         let mut candidates = Vec::new();
         for name in target_names {
@@ -1683,11 +2032,62 @@ impl DeploymentConfig {
                     .supported_types
                     .unwrap_or(decision_transport::SupportedTypes::ALL),
                 state_forms: target.state_forms,
+                budget: self.decision_budget(
+                    target,
+                    client,
+                    accounting.governor,
+                    accounting.allowances,
+                ),
             });
         }
         (!candidates.is_empty()).then_some(decision_executor::DecisionResolver { candidates })
     }
 
+    /// The provider budgets one decision backend's calls are charged to.
+    ///
+    /// A decision call is one request to one physical model, so it draws on exactly the
+    /// budgets the same model draws on when it is used for generation: the same quota
+    /// group, the same daily counter, the same minute window. Two counters for one model
+    /// would let a deployment hold two allowances the provider never granted.
+    fn decision_budget(
+        &self,
+        target: &TargetConfig,
+        client: &LlmClientConfig,
+        governor: &Arc<switchyard_llm_client::QuotaGovernor>,
+        allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    ) -> Option<Arc<decision_executor::DecisionBudget>> {
+        let group = client
+            .quota_group
+            .clone()
+            .unwrap_or_else(|| target.llm_client.clone());
+        let allowance = allowances.get(&(group.clone(), target.id.clone())).cloned();
+        let limits = switchyard_llm_client::WindowLimits {
+            requests_per_minute: target.requests_per_minute,
+            input_tokens_per_minute: target.input_tokens_per_minute,
+        };
+        let pacing = if limits.is_unlimited() {
+            None
+        } else {
+            Some(Arc::new(switchyard_llm_client::PacedQuota::new(
+                Arc::clone(governor),
+                switchyard_llm_client::GovernorKey::new(group, target.id.clone(), "decide"),
+                limits,
+                admission_margin_opt(target),
+            )))
+        };
+        if allowance.is_none() && pacing.is_none() {
+            return None;
+        }
+        Some(Arc::new(decision_executor::DecisionBudget {
+            allowance,
+            pacing,
+        }))
+    }
+
+    // One internal builder with one caller. Grouping these further would introduce a
+    // carrier struct purely to satisfy the lint, and would separate the decision wiring
+    // from the route it wires.
+    #[allow(clippy::too_many_arguments)]
     fn build_route_clients(
         &self,
         route_name: &str,
@@ -1704,6 +2104,11 @@ impl DeploymentConfig {
         // surface. Without it, the same request could be served at `/v1/decisions`
         // and fail internally, which is a split contract rather than one mechanism.
         composition: &BTreeMap<String, Vec<String>>,
+        // The deployment's one governor and its per-model daily counters, threaded here so
+        // a route-local decision resolver is paced by the same ledgers as a named lane:
+        // the public surface and an internal Call::Decision must not hold two different
+        // views of one model's remaining budget.
+        accounting: &Accounting<'_>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let TargetPromptPolicy {
             prompts,
@@ -1793,14 +2198,32 @@ impl DeploymentConfig {
                             MediaCarrier::Inline | MediaCarrier::Both
                         ),
                         no_tool_calling: target.tool_calling == Some(false),
-                        // Declared per credential and resolved to the target here, because
-                        // the pre-dispatch filter reads target facts. A provider that may
-                        // only receive cleared payloads makes every target behind that
-                        // credential egress-gated, including one addressed directly.
-                        requires_public_payload: self
-                            .llm_clients
-                            .get(&target.llm_client)
-                            .is_some_and(|client| client.requires_public_payload),
+                        // A target states when it cannot carry a caller's reasoning control;
+                        // an undeclared target keeps permitting it.
+                        no_reasoning_control: target.accepts_reasoning_control == Some(false),
+                        // Stated per target so selection can order a free candidate ahead of
+                        // a metered one without inferring cost from a provider name.
+                        free_tier: target.free_tier,
+                        // The physical window and the per-request input ceiling travel as
+                        // facts so the pre-dispatch filter can drop a target that cannot
+                        // hold this request, before any provider is contacted.
+                        context_window: target.context_window,
+                        max_input_tokens: target.max_input_tokens,
+                        // The bound the deployment will actually admit: the declared ceiling
+                        // capped by what a margin-padded estimate can fit in the minute
+                        // window. Computed from the same arithmetic the send path uses, so
+                        // the filter and the governor cannot disagree about where a request
+                        // stops fitting.
+                        safe_input_tokens: safe_input_tokens(target),
+                        // A target that charges its own reasoning against the caller's
+                        // output reservation states the smallest reservation it can answer
+                        // within, so a smaller one is skipped instead of attempted.
+                        min_output_tokens: target.min_output_tokens,
+                        // The same declaration the send boundary uses to strip a value the
+                        // provider refuses. Carried here so a candidate can be judged
+                        // ineligible BEFORE the call when the caller is the one who asked
+                        // for that value, instead of being sent and silently altered.
+                        unsupported_reasoning_effort: target.unsupported_reasoning_effort.clone(),
                     },
                 );
             }
@@ -1809,7 +2232,7 @@ impl DeploymentConfig {
 
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.
-        if let Some(resolver) = self.build_decision_resolver(&route_targets) {
+        if let Some(resolver) = self.build_decision_resolver(&route_targets, accounting) {
             let resolver = Arc::new(resolver);
             let handler_resolver = Arc::clone(&resolver);
             let handler_lane: Arc<Option<String>> = Arc::new(lane_identity.clone());
@@ -2221,15 +2644,6 @@ struct LlmClientConfig {
     /// as it was.
     #[serde(default)]
     quota_group: Option<String>,
-    /// Whether this client may only receive payloads a caller has cleared for it.
-    ///
-    /// A provider property, declared once per credential: a free tier that uses submitted
-    /// content to improve its products makes every request an egress event, and that is
-    /// true of every model behind the credential. Declaring it turns the pre-egress
-    /// admission gate on for the targets served here; omitting it leaves every existing
-    /// client unchanged.
-    #[serde(default)]
-    requires_public_payload: bool,
 }
 
 /// Where a client's traffic terminates.
@@ -2266,6 +2680,15 @@ struct TargetConfig {
     /// For providers that reject an otherwise standard field.
     #[serde(default)]
     omit_body_fields: BTreeSet<String>,
+    /// Reasoning-effort values this target's provider refuses outright.
+    ///
+    /// The effort vocabulary is not portable: Google's OpenAI-compatibility surface accepts
+    /// `minimal`/`low`/`medium`/`high` and answers HTTP 400 `INVALID_ARGUMENT` to `none`
+    /// (measured 2026-11-21 on `gemini-3.5-flash-lite`), and a no-thinking consumer sends
+    /// exactly `none`. A value named here is removed at the target instead of being forwarded,
+    /// which leaves the provider's own default. Unset forwards every value.
+    #[serde(default)]
+    unsupported_reasoning_effort: BTreeSet<String>,
     system_prompt: Option<String>,
     /// Reasoning effort forced on every request to this target, replacing the caller's value.
     /// Only meaningful on `openai_chat` and `openai_responses` clients.
@@ -2277,6 +2700,16 @@ struct TargetConfig {
     /// one transport routinely differ here, which is why it is not an `llm_client` setting.
     #[serde(default)]
     reasoning_dialect: ReasoningDialect,
+    /// The marker this target's upstream uses when it writes reasoning inline in the message.
+    ///
+    /// A per-target wire fact, like `reasoning_dialect`: Google's hosted Gemma endpoints
+    /// answer `<thought>…</thought>` followed by the answer and count only the answer in
+    /// `completion_tokens`, while the Gemini chat models on the same credential do not.
+    /// Declaring `thought_tag` moves the block into a reasoning block so the monologue is
+    /// never returned as output. An unrecognised value is a load error rather than a
+    /// silently disabled filter.
+    #[serde(default)]
+    hosted_reasoning: Option<String>,
     /// Wire family this target speaks when serving a typed decision call.
     #[serde(default)]
     decision_transport: Option<decision_transport::DecisionTransport>,
@@ -2343,6 +2776,105 @@ struct TargetConfig {
     /// allowance removes the target from consideration and the route advances.
     #[serde(default)]
     daily_request_limit: Option<u64>,
+    /// Requests permitted in any rolling minute, when the provider publishes a window.
+    ///
+    /// A different resource from `daily_request_limit` and enforced separately: the provider
+    /// counts requests per model per minute, and a daily budget reached by bursting through
+    /// the minute is refused long before the day is spent. Declared per target for the same
+    /// reason the daily budget is — the cap belongs to the model, not the client — and targets
+    /// that name one physical model in one quota group must state the same value, because one
+    /// window serves them all.
+    #[serde(default)]
+    requests_per_minute: Option<u64>,
+    /// Input tokens permitted in any rolling minute, when the provider publishes a window.
+    ///
+    /// Tokens are estimated from the outbound body before the call, so this is pacing rather
+    /// than billing: being slightly early is the safe direction, and the request is routed to
+    /// a leg with headroom rather than retried. Requires `max_input_tokens` at or below this
+    /// value — a request larger than a whole window's budget can never be admitted, and
+    /// discovering that at the send path would spend eligibility on a 429.
+    #[serde(default)]
+    input_tokens_per_minute: Option<u64>,
+    /// How much larger than its pre-dispatch estimate a request is assumed to be, in
+    /// thousandths, when it is reserved against `input_tokens_per_minute`.
+    ///
+    /// The estimate is characters over the outbound body divided by four, which measured
+    /// against the provider's own count has erred in both directions on real prompts. This
+    /// is the protective pad that keeps a near-limit request from being dispatched on a
+    /// number the provider will exceed: at 1300, a gemma request estimating 15,202 tokens
+    /// reserves 19,763 and is refused against a 16,000 window instead of being sent and
+    /// charged 18,054.
+    ///
+    /// Not a claim of accuracy. A value below 1000 is rejected at load, because a pad that
+    /// makes the reservation smaller than the estimate is an under-count by construction.
+    /// Omitted means 1000 — the estimate as stated — so a manifest that does not declare it
+    /// keeps the behaviour it had.
+    #[serde(default)]
+    admission_margin_permille: Option<u32>,
+    /// The physical model's own request window, when the deployment knows it.
+    ///
+    /// A route's `context_window` is what callers are promised; this is what one backing
+    /// model can actually hold, input plus output. A route whose aggregate claim exceeds
+    /// every candidate's physical window would promise capacity no target can serve, so
+    /// load refuses the pair rather than discovering it as an upstream 400. Unset leaves
+    /// the target unconstrained on this axis, which keeps every manifest written before the
+    /// field existed behaving exactly as it did.
+    #[serde(default)]
+    context_window: Option<u64>,
+    /// The most input a single request may carry here, when the provider caps it below the
+    /// context window.
+    ///
+    /// This is the per-minute input budget expressed as a per-request ceiling: a request
+    /// that needs more than a whole minute's allowance can never be served, so admitting it
+    /// would spend the target's eligibility and return a 429. The free hosted Gemma models
+    /// are the case that forced the field — 262,144-token window, 16,000 input tokens per
+    /// minute — and a 256K prompt is not a 16K request with a long wait.
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    /// Whether the provider charges nothing for a request here inside a declared allowance.
+    ///
+    /// A selection fact, not an economics one. It lets a route rank a free candidate ahead
+    /// of a metered one structurally: no measured latency moves a paid leg in front of an
+    /// eligible free leg. Defaults to `false`, so an undeclared target keeps the order the
+    /// manifest states rather than being silently promoted over a stated-free one.
+    #[serde(default)]
+    free_tier: bool,
+    /// Whether the backing model accepts a caller's explicit reasoning control.
+    ///
+    /// `false` is a measured wire fact, not a policy: Google's hosted Gemma answers HTTP
+    /// 400 to `reasoning_effort`, while the Gemini chat models on the same credential accept
+    /// it. A target that states `false` is skipped for a request carrying any reasoning
+    /// control and stays eligible for one carrying none, so its native reasoning default is
+    /// never overridden. Unset keeps the previous behaviour, where control is permitted.
+    #[serde(default)]
+    accepts_reasoning_control: Option<bool>,
+    /// The smallest output reservation this target can produce an answer within.
+    ///
+    /// Set only for a target whose reasoning is charged against the caller's
+    /// `max_output_tokens` — Google's hosted Gemma writes `<thought>` inline and stops when
+    /// the budget runs out mid-thought, so at a small reservation it answers with thinking
+    /// only (measured 2026-11-21: 61–328 thinking tokens for prompts of 49–438 tokens, and
+    /// zero visible text once the budget fell below the thought). A request whose output
+    /// reservation is below this floor is not dispatched here: the route keeps the candidate
+    /// list honest and spends the provider request on a leg that can answer. Unset means no
+    /// floor, which is every target outside this shape.
+    #[serde(default)]
+    min_output_tokens: Option<u64>,
+    /// Why this target is held out of service, stated as the provider's own evidence.
+    ///
+    /// A held target keeps its place in the inventory — the declaration, its credential and
+    /// its facts stay readable — but it is removed from every route's candidate set at load,
+    /// so no request is ever dispatched to it and no `/v1/models` entry advertises it. It is
+    /// not retired: retiring would delete the record of what was measured and would make the
+    /// alias indistinguishable from a typo.
+    ///
+    /// The value is the reason the caller is shown, so it must be a fact rather than a
+    /// judgement: for a model the provider has withdrawn, the provider's own sentence. Held
+    /// is deliberately not a fallback: a held target must never be replaced by a live model,
+    /// because the caller asked for this one and a silent substitution would answer a
+    /// different question.
+    #[serde(default)]
+    held: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -2397,17 +2929,100 @@ fn resolve_category_models(
 
 // The per-target overrides are all forwarded verbatim from the target being built;
 // bundling them into a struct would only move the same fields one level down.
+/// The shared minute-window budget one target draws on, when it declares limits.
+///
+/// The key is the provider's own identity — quota group plus physical model — not the
+/// target name or the route alias, because that is what the provider counts. Every alias
+/// therefore draws on one ledger, which is the whole point: three names for one model must
+/// not each be handed the same minute.
+fn pacing_for(
+    target: &TargetConfig,
+    client_config: &LlmClientConfig,
+    governor: &Arc<switchyard_llm_client::QuotaGovernor>,
+) -> Option<Arc<switchyard_llm_client::PacedQuota>> {
+    let limits = switchyard_llm_client::WindowLimits {
+        requests_per_minute: target.requests_per_minute,
+        input_tokens_per_minute: target.input_tokens_per_minute,
+    };
+    if limits.is_unlimited() {
+        return None;
+    }
+    let group = client_config
+        .quota_group
+        .clone()
+        .unwrap_or_else(|| target.llm_client.clone());
+    Some(Arc::new(switchyard_llm_client::PacedQuota::new(
+        Arc::clone(governor),
+        switchyard_llm_client::GovernorKey::new(group, target.id.clone(), "generate"),
+        limits,
+        // Validation already rejected a pad below 1.0, so the fallback here is the
+        // no-pad default rather than an error: this function builds, it does not judge.
+        admission_margin_opt(target),
+    )))
+}
+
+/// The configured admission pad, or no pad when the target declares none.
+fn admission_margin_opt(target: &TargetConfig) -> switchyard_llm_client::AdmissionMargin {
+    target
+        .admission_margin_permille
+        .and_then(switchyard_llm_client::AdmissionMargin::from_permille)
+        .unwrap_or(switchyard_llm_client::AdmissionMargin::NONE)
+}
+
+/// The most estimated input a target will admit, mirroring the send path's arithmetic.
+///
+/// `None` when the target declares no minute token window. Otherwise the smaller of the
+/// declared per-request ceiling and the largest estimate a margin-padded reservation can
+/// fit. A target that declares a window but no ceiling is already a load error, so the
+/// `max_input_tokens` arm is only for completeness.
+fn safe_input_tokens(target: &TargetConfig) -> Option<u64> {
+    let limits = switchyard_llm_client::WindowLimits {
+        requests_per_minute: target.requests_per_minute,
+        input_tokens_per_minute: target.input_tokens_per_minute,
+    };
+    let window = limits.safe_input_ceiling(admission_margin_opt(target))?;
+    Some(match target.max_input_tokens {
+        Some(ceiling) => ceiling.min(window),
+        None => window,
+    })
+}
+
+/// The admission pad, with load-time validation of the declared value.
+fn admission_margin(
+    target: &TargetConfig,
+    target_name: &str,
+) -> RunnerResult<switchyard_llm_client::AdmissionMargin> {
+    let Some(declared) = target.admission_margin_permille else {
+        return Ok(switchyard_llm_client::AdmissionMargin::NONE);
+    };
+    if target.input_tokens_per_minute.is_none() {
+        return Err(RunnerError::configuration(format!(
+            "target {target_name} declares admission_margin_permille {declared} without \
+             input_tokens_per_minute; the margin pads a token reservation, and there is no \
+             token window here to pad, so it would protect nothing"
+        )));
+    }
+    switchyard_llm_client::AdmissionMargin::from_permille(declared).ok_or_else(|| {
+        RunnerError::configuration(format!(
+            "target {target_name} declares admission_margin_permille {declared}; a margin below \
+             1000 would reserve less than the estimate, which is an under-count by construction"
+        ))
+    })
+}
 #[allow(clippy::too_many_arguments)]
 fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
     omit_body_fields: &BTreeSet<String>,
+    unsupported_reasoning_effort: &BTreeSet<String>,
     reasoning_effort: Option<String>,
     reasoning_policy: Option<ReasoningPolicy>,
     reasoning_dialect: ReasoningDialect,
     cooldown_group: Option<String>,
     allowance: Option<Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    pacing: Option<Arc<switchyard_llm_client::PacedQuota>>,
+    hosted_reasoning: Option<HostedReasoningMarker>,
 ) -> RunnerResult<Backend> {
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
@@ -2475,6 +3090,7 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         omit_body_fields: omit_body_fields.clone(),
+        unsupported_reasoning_effort: unsupported_reasoning_effort.clone(),
         reasoning_effort,
         reasoning_policy,
         reasoning_dialect,
@@ -2486,7 +3102,8 @@ fn build_backend(
         stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
         requires_list_input: config.requires_list_input,
         allowance,
-        requires_public_payload: config.requires_public_payload,
+        pacing,
+        hosted_reasoning,
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -2517,6 +3134,146 @@ fn validate_value(label: &str, value: &str) -> RunnerResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Loads a deployment that must be refused, returning the refusal text.
+    ///
+    /// `Runner` has no `Debug` impl, so `expect_err` cannot be used; matching keeps the
+    /// failure honest - a successful load panics rather than being reported as a refusal.
+    fn refuse(source: &str) -> String {
+        match runner_from_toml(source) {
+            Ok(_) => panic!("deployment loaded but should have been refused"),
+            Err(error) => format!("{error}"),
+        }
+    }
+
+    /// A deployment whose paced lane declares a margin but no token window refuses to load.
+    ///
+    /// The margin pads a token reservation. A target with no `input_tokens_per_minute` has
+    /// nothing to pad, so the declaration states an intent the runtime cannot honour. This
+    /// was reachable only through the helper: the paced-target check ran first and skipped
+    /// unpaced targets before the margin was ever validated.
+    #[test]
+    fn a_margin_without_a_token_window_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("without input_tokens_per_minute"),
+            "refusal must name the missing window, got: {message}"
+        );
+        assert!(
+            message.contains("protect nothing"),
+            "refusal must say the margin protects nothing, got: {message}"
+        );
+    }
+
+    /// A margin below parity reserves less than the estimate, which is an under-count by
+    /// construction. It must be refused rather than silently clamped.
+    #[test]
+    fn a_margin_below_parity_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 900
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("below") && message.contains("1000"),
+            "refusal must name the parity floor, got: {message}"
+        );
+    }
+
+    /// The measured overrun, expressed as a manifest: a 16,000-token window padded by 1,300
+    /// per mille can admit at most 12,307 estimated tokens, so a 16,000-token ceiling is a
+    /// promise the governor would refuse on every large request.
+    #[test]
+    fn a_ceiling_above_the_padded_window_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 16000
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("12307"),
+            "refusal must state the derived ceiling 12307, got: {message}"
+        );
+    }
+
+    /// The honest form of the same lane loads: the ceiling is lowered to what the padded
+    /// window can actually admit.
+    #[test]
+    fn a_padded_lane_loads_at_its_derived_ceiling() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 12307
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        runner_from_toml(config).expect("the derived ceiling is admittable");
+    }
 
     /// Locality is the client's own declaration, not a cost class read from billing.
     ///
@@ -2585,6 +3342,98 @@ candidates = []
             crate::route::Locality::Unknown,
             "a subscription credential alone states no locality"
         );
+    }
+
+    /// A target declares the marker its upstream uses, or the deployment does not load.
+    ///
+    /// Accepting an unknown value would disable the filter silently, which is the defect
+    /// the filter exists to prevent, so the refusal must name the field and the accepted
+    /// value.
+    #[test]
+    fn a_target_names_its_hosted_reasoning_marker() {
+        let deployment = |marker: &str| {
+            format!(
+                r#"
+schema_version = 1
+
+[llm_clients.gemma]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma-a]
+id = "google/gemma"
+llm_client = "gemma"
+hosted_reasoning = "{marker}"
+
+[routes.chat]
+id = "chat"
+type = "passthrough"
+target = "gemma-a"
+candidates = []
+"#
+            )
+        };
+
+        crate::Runner::from_toml(&deployment("thought_tag")).expect("a known marker loads");
+
+        let Err(error) = crate::Runner::from_toml(&deployment("thought")) else {
+            panic!("an unknown marker must not load");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("hosted_reasoning") && message.contains("thought_tag"),
+            "the refusal must name the field and the accepted value: {message}"
+        );
+    }
+
+    #[test]
+    fn a_responses_client_cannot_be_pointed_at_google() {
+        // Google serves /v1beta/openai/chat/completions and no Responses path. A target built
+        // against that base with the Responses format would request an endpoint that does not
+        // exist, and a 404 from a missing path is not a retired model. Refused at load.
+        let deployment = |format: &str, base_url: &str| {
+            format!(
+                r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "{format}"
+base_url = "{base_url}"
+
+[targets.gemini]
+id = "gemini-3.5-flash-lite"
+llm_client = "google"
+
+[routes.chat]
+id = "chat"
+type = "passthrough"
+target = "gemini"
+candidates = []
+"#
+            )
+        };
+
+        crate::Runner::from_toml(&deployment(
+            "openai_chat",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ))
+        .expect("the documented Chat Completions path loads");
+
+        let Err(error) = crate::Runner::from_toml(&deployment(
+            "openai_responses",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        )) else {
+            panic!("a Responses client against Google must not load");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("openai_chat") && message.contains("generativelanguage"),
+            "the refusal must name the fix: {message}"
+        );
+
+        // Control: the format itself is still supported for providers that serve it.
+        crate::Runner::from_toml(&deployment("openai_responses", "https://api.openai.com/v1"))
+            .expect("a Responses client against a Responses provider loads");
     }
 
     #[test]
@@ -2698,6 +3547,154 @@ type = "plan_execute"
 capable_target = "strong"
 efficient_target = "weak"
 "#;
+
+    /// The provider's own sentence, repeated verbatim in the refusal.
+    const HELD_REASON: &str = "This model is no longer available to new users.";
+
+    /// A deployment with one held target reached three ways: as a route's whole candidate
+    /// set, as an extra candidate, and as the head target with a live fallback behind it.
+    ///
+    /// The live target is declared once so the three routes differ only in where the held
+    /// one sits — that is the variable these tests are about.
+    const HELD_CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.live]
+id = "live/model"
+llm_client = "primary"
+
+[targets.retired]
+id = "retired/model"
+llm_client = "primary"
+held = "This model is no longer available to new users."
+
+[routes.held_only]
+id = "switchyard/held-only"
+type = "passthrough"
+target = "retired"
+
+[routes.held_as_candidate]
+id = "switchyard/held-as-candidate"
+type = "passthrough"
+target = "live"
+candidates = ["retired"]
+
+[routes.held_as_head]
+id = "switchyard/held-as-head"
+type = "passthrough"
+target = "retired"
+candidates = ["live"]
+
+[routes.live_only]
+id = "switchyard/live-only"
+type = "passthrough"
+target = "live"
+"#;
+
+    /// A held target must not fail the load.
+    ///
+    /// Holding is a service decision about a model that exists in the manifest, so the
+    /// declaration, its credential and its facts all still have to parse. Refusing the
+    /// deployment here would turn a deliberate hold into an outage.
+    #[test]
+    fn a_held_target_still_loads_and_keeps_its_record() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        let route = runner
+            .route("switchyard/held-only")
+            .expect("a held route keeps its registration");
+        assert_eq!(route.held_reason(), Some(HELD_REASON));
+        assert!(
+            route.models().models_for(&Category::Any).is_empty(),
+            "no candidate may remain when every target is held"
+        );
+        Ok(())
+    }
+
+    /// A held target leaves the candidate list without condemning the route that named it.
+    ///
+    /// Both positions are covered because they are filtered by the same set but reached by
+    /// different code: a candidate is one entry in an ordered list, while the head target is
+    /// the entry the algorithm would otherwise always offer first.
+    #[test]
+    fn a_held_candidate_leaves_the_list_without_holding_the_route() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        for name in ["switchyard/held-as-candidate", "switchyard/held-as-head"] {
+            let route = runner.route(name).expect("route is registered");
+            assert_eq!(
+                route.held_reason(),
+                None,
+                "{name} still has a live target and must keep serving"
+            );
+            assert_eq!(
+                route.models().models_for(&Category::Any),
+                vec![ModelId::from("live/model")],
+                "{name} must offer only the live target"
+            );
+        }
+        Ok(())
+    }
+
+    /// The catalogue promises answers; the inventory records what is declared.
+    ///
+    /// Both are asserted together because either one alone would pass under the wrong
+    /// behaviour: dropping the route from both lists would look like a correct retirement,
+    /// and leaving it in both would look like an untouched inventory.
+    #[test]
+    fn the_catalogue_drops_a_held_route_while_the_inventory_keeps_it() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        let advertised: Vec<&str> = runner
+            .advertised_models()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(
+            !advertised.contains(&"switchyard/held-only"),
+            "a route that can only refuse must not be advertised: {advertised:?}"
+        );
+        for name in [
+            "switchyard/held-as-candidate",
+            "switchyard/held-as-head",
+            "switchyard/live-only",
+        ] {
+            assert!(
+                advertised.contains(&name),
+                "{name} serves and must stay advertised: {advertised:?}"
+            );
+        }
+        let inventory: Vec<&str> = runner.models().map(|model| model.id.as_str()).collect();
+        assert!(
+            inventory.contains(&"switchyard/held-only"),
+            "the declaration stays readable for diagnostics: {inventory:?}"
+        );
+        Ok(())
+    }
+
+    /// The refusal names the held alias and quotes the provider, before any request work.
+    ///
+    /// Executed with a default request on purpose: a held route has nothing to dispatch, so
+    /// the decision must not depend on the request being well formed. A refusal that had to
+    /// read the payload could not be trusted to stay free of provider calls.
+    #[tokio::test]
+    async fn a_held_route_refuses_locally_with_the_providers_evidence() {
+        let runner = runner_from_toml(HELD_CONFIG).expect("fixture loads");
+        let route = runner
+            .route("switchyard/held-only")
+            .expect("route is registered");
+        match route
+            .execute(switchyard_protocol::Request::default(), None)
+            .await
+        {
+            Err(RunnerError::Held { model, reason }) => {
+                assert_eq!(model, "retired", "the refusal names the alias asked for");
+                assert_eq!(reason, HELD_REASON, "the provider's evidence is forwarded");
+            }
+            Err(other) => panic!("expected Held, got {other:?}"),
+            Ok(_) => panic!("a held route must never produce a response"),
+        }
+    }
 
     #[test]
     fn public_runner_from_toml_builds_a_deployment() -> RunnerResult<()> {
@@ -3025,8 +4022,8 @@ children = ["child_inline"]
     }
 
     #[test]
-    fn video_true_without_a_carrier_derives_the_union_not_the_permissive_default(
-    ) -> RunnerResult<()> {
+    fn video_true_without_a_carrier_derives_the_union_not_the_permissive_default()
+    -> RunnerResult<()> {
         let runner = runner_from_toml(&composite_media_config(
             "[composites.stated]\nchildren = [\"child_inline\"]\nvideo = true\n",
         ))?;
@@ -3811,7 +4808,7 @@ max_query_chars = 512
         assert!(
             error_message(&conflicting)
                 .contains(
-                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields",
+                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, omit_body_fields, or unsupported_reasoning_effort",
             ),
             "{}",
             error_message(&conflicting)
@@ -3937,11 +4934,14 @@ efficient_target = "weak"
         );
         assert!(error_message(&unknown_classifier_field).contains("unknown field"));
 
+        // `context_window`, `max_input_tokens` and `daily_request_limit` are supported
+        // target fields, so the control names one that is not: a typo must still be
+        // refused rather than silently ignored.
         let target_capability = VALID_CONFIG.replace(
             "llm_client = \"responses\"",
-            "llm_client = \"responses\"\ncontext_window = 1000000",
+            "llm_client = \"responses\"\nwindow_magic = 1000000",
         );
-        assert!(error_message(&target_capability).contains("unknown field `context_window`"));
+        assert!(error_message(&target_capability).contains("unknown field `window_magic`"));
 
         let unknown_algorithm = VALID_CONFIG.replace("type = \"noop\"", "type = \"imaginary\"");
         assert!(error_message(&unknown_algorithm).contains("unknown variant"));
@@ -4543,10 +5543,13 @@ confidence_threshold = 0.5
             client,
             &target.extra_body,
             &target.omit_body_fields,
+            &target.unsupported_reasoning_effort,
             None,
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
+            None,
             None,
         )?;
 
@@ -4586,10 +5589,13 @@ confidence_threshold = 0.5
             client,
             &target.extra_body,
             &target.omit_body_fields,
+            &target.unsupported_reasoning_effort,
             None,
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
+            None,
             None,
         )?;
 
@@ -4613,9 +5619,12 @@ confidence_threshold = 0.5
                 &config,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
+                None,
                 None,
                 None,
             );
@@ -5034,5 +6043,860 @@ mod composition_closure_tests {
                 "{class:?} must not cross routes"
             );
         }
+    }
+
+    // ---- Per-minute windows -------------------------------------------------
+
+    fn paced_config(extra: &str) -> DeploymentConfig {
+        // Self-contained: this module only needs one client for the window checks, and a
+        // shared fixture would make these assertions depend on unrelated route wiring.
+        toml::from_str(&format!(
+            "schema_version = 1\n\
+             [llm_clients.primary]\nformat = \"openai_chat\"\n\
+             base_url = \"https://example.test/v1\"\n\
+             [routes.noop]\nid = \"switchyard/noop\"\ntype = \"noop\"\n\
+             {extra}"
+        ))
+        .expect("the paced fixture parses")
+    }
+
+    /// A minute budget with no per-request ceiling, or a ceiling above the whole minute,
+    /// can never serve its largest admissible request, so both are refused at load rather
+    /// than discovered as a 429 under traffic.
+    #[test]
+    fn a_minute_window_must_contain_the_per_request_ceiling() {
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a token window without a ceiling is unfalsifiable");
+        assert!(
+            error.to_string().contains("without max_input_tokens"),
+            "{error}"
+        );
+
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n\
+             max_input_tokens = 20000\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a ceiling above the window can never be served");
+        assert!(error.to_string().contains("above"), "{error}");
+
+        paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n\
+             max_input_tokens = 16000\n",
+        )
+        .validate_minute_windows()
+        .expect("a ceiling at or below the window is accepted");
+    }
+
+    /// A zero window admits nothing, and one window serves every target that names the same
+    /// physical model in one quota group, so both mistakes are caught at load.
+    #[test]
+    fn minute_windows_reject_zero_and_disagreeing_declarations() {
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 0\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a zero window admits nothing");
+        assert!(error.to_string().contains("zero"), "{error}");
+
+        let error = paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 30\n",
+        )
+        .validate_minute_windows()
+        .expect_err("one window cannot have two limits");
+        assert!(
+            error.to_string().contains("one window serves them both"),
+            "{error}"
+        );
+
+        paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n",
+        )
+        .validate_minute_windows()
+        .expect("the same value stated twice is one declaration");
+    }
+
+    /// A different physical model keeps a separate window even on one credential.
+    #[test]
+    fn a_different_model_is_a_separate_window() {
+        paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-31b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 30\n",
+        )
+        .validate_minute_windows()
+        .expect("per-model windows are independent");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch A: the remaining Google chat models, and the order of a free lane
+// ---------------------------------------------------------------------------
+
+/// A Gemini free-tier deployment carrying every Google chat target, plus the two paid NT
+/// legs the live `smart-nt` route actually falls back to.
+///
+/// The paid targets are present on purpose. A fixture with free legs only cannot say anything
+/// about whether a free leg precedes a paid one, which is the property that had to change.
+/// No credential is declared: these tests exercise ordering, capability declaration and
+/// tariff facts, and a client that reads no environment keeps the suite hermetic.
+#[cfg(test)]
+mod batch_a_tests {
+    use super::*;
+
+    const MANIFEST: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "__STATE_DIR__"
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+quota_group = "google-ai-studio-free"
+max_retries = 0
+
+[llm_clients.openai_nt]
+format = "openai_responses"
+base_url = "https://api.openai.test/v1"
+
+[llm_clients.deepseek_nt]
+format = "openai_responses"
+base_url = "https://api.deepseek.test/v1"
+
+[targets."direct-google-gemini-3.5-flash-lite"]
+id = "gemini-3.5-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 500
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.1-flash-lite"]
+id = "gemini-3.1-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 500
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.6-flash"]
+id = "gemini-3.6-flash"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.8-flash"]
+id = "gemini-3.8-flash"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-4-hydrogen"]
+id = "gemini-4-hydrogen"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-2.5-flash-lite"]
+id = "gemini-2.5-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+free_tier = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+held = "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21)."
+
+[targets."direct-google-gemini-3-flash"]
+id = "gemini-3-flash-preview"
+llm_client = "google"
+vision = false
+video = false
+free_tier = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+min_output_tokens = 600
+
+[targets."direct-google-gemma-4-26b-a4b-it"]
+id = "gemma-4-26b-a4b-it"
+llm_client = "google"
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 1300
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemma-4-31b-it"]
+id = "gemma-4-31b-it"
+llm_client = "google"
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 1300
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets.openai-gpt-6-luna-nt]
+id = "gpt-6-luna"
+llm_client = "openai_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[targets.deepseek-deepseek-flash-nt]
+id = "deepseek-flash"
+llm_client = "deepseek_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[routes."direct-google-gemini-3.5-flash-lite"]
+id = "direct-google-gemini-3.5-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.1-flash-lite"]
+id = "direct-google-gemini-3.1-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.1-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.6-flash"]
+id = "direct-google-gemini-3.6-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.6-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.8-flash"]
+id = "direct-google-gemini-3.8-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.8-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-4-hydrogen"]
+id = "direct-google-gemini-4-hydrogen"
+type = "passthrough"
+target = "direct-google-gemini-4-hydrogen"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-2.5-flash-lite"]
+id = "direct-google-gemini-2.5-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-2.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemini-3-flash"]
+id = "direct-google-gemini-3-flash"
+type = "passthrough"
+target = "direct-google-gemini-3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemma-4-26b-a4b-it"]
+id = "direct-google-gemma-4-26b-a4b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-26b-a4b-it"
+candidates = []
+context_window = 262144
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemma-4-31b-it"]
+id = "direct-google-gemma-4-31b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-31b-it"
+candidates = []
+context_window = 262144
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes.smart_gemini]
+id = "smart_gemini"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-4-hydrogen",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+]
+selection = "measured"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes.smart-nt]
+id = "smart-nt"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-4-hydrogen",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+    "openai-gpt-6-luna-nt",
+    "deepseek-deepseek-flash-nt",
+]
+selection = "measured"
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# Mirrors the live pool shape: a held target named as an inner candidate. Nothing about
+# this route should change except that the dead leg is never offered.
+[routes.pool_with_held]
+id = "switchyard/pool-with-held"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-2.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+]
+selection = "measured"
+"#;
+
+    /// The provider's sentence, repeated from the manifest so the assertions compare the
+    /// refusal a caller would actually see rather than a second hand-written copy.
+    const HELD_2_5_REASON: &str = "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21).";
+
+    /// The fixture with `dir` as its allowance state directory.
+    ///
+    /// A load probes an EXISTING state directory by writing and removing a file in it, so
+    /// parallel tests must not share a directory that exists: two probes racing is reported
+    /// as an unusable quota directory. An absent directory is not created by a load at all.
+    fn fixture(dir: &str) -> String {
+        MANIFEST.replace("__STATE_DIR__", dir)
+    }
+
+    /// Loading a deployment must not create its accounting state.
+    ///
+    /// A deployment preflight runs this same loader, usually as root. Creating the quota
+    /// directory at load left a root-owned directory under a unit that runs as its own
+    /// account, and that lane's first call then failed with a permission error reported as an
+    /// unavailable budget. Creation belongs to the process that spends.
+    #[test]
+    fn loading_a_deployment_creates_no_quota_state() {
+        let dir = format!(
+            "/tmp/switchyard-quota-load-side-effect-{}",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let _runner = Runner::from_toml(&fixture(&dir)).expect("a fresh state directory loads");
+
+        assert!(
+            !std::path::Path::new(&dir).exists(),
+            "a load must leave no accounting state: a root-run validation would own it"
+        );
+    }
+
+    /// An EXISTING state directory this process cannot write is a configuration error at
+    /// load, naming the path, rather than a refused leg at the first request.
+    #[test]
+    fn loading_refuses_a_state_directory_this_process_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = format!("/tmp/switchyard-quota-readonly-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the state directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make it read-only");
+
+        let root = std::fs::write(std::path::Path::new(&dir).join(".root-probe"), b"x").is_ok();
+        let loaded = Runner::from_toml(&fixture(&dir));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore so the directory can be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+        if root {
+            assert!(
+                loaded.is_ok(),
+                "root can write it, so there is nothing to refuse"
+            );
+            return;
+        }
+        let error = match loaded {
+            Ok(_) => panic!("an unwritable state directory is refused at load"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(&dir),
+            "the refusal must name the directory: {error}"
+        );
+    }
+
+    fn runner() -> Runner {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = format!("/tmp/switchyard-quota-batch-a-{n}");
+        Runner::from_toml(&fixture(&dir)).expect("the fixture deployment loads")
+    }
+
+    fn parsed() -> DeploymentConfig {
+        toml::from_str(&fixture("/tmp/switchyard-quota-batch-a-parse"))
+            .expect("the fixture parses as a deployment config")
+    }
+
+    fn ordered_ids(route: &Route) -> Vec<String> {
+        route
+            .models()
+            .all_models()
+            .iter()
+            .map(|model| model.as_str().to_owned())
+            .collect()
+    }
+
+    /// Every Google chat target the owner's dossier names is loadable in one deployment, and
+    /// the two held records are catalogued without claiming a capability they cannot serve.
+    #[test]
+    fn every_google_chat_target_loads_in_one_deployment() {
+        let runner = runner();
+
+        for (name, model) in [
+            (
+                "direct-google-gemini-3.5-flash-lite",
+                "gemini-3.5-flash-lite",
+            ),
+            (
+                "direct-google-gemini-3.1-flash-lite",
+                "gemini-3.1-flash-lite",
+            ),
+            ("direct-google-gemini-3.6-flash", "gemini-3.6-flash"),
+            ("direct-google-gemini-3.8-flash", "gemini-3.8-flash"),
+            ("direct-google-gemini-4-hydrogen", "gemini-4-hydrogen"),
+            // The catalogued id is the preview name; the route name is the stable one.
+            ("direct-google-gemini-3-flash", "gemini-3-flash-preview"),
+            ("direct-google-gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it"),
+            ("direct-google-gemma-4-31b-it", "gemma-4-31b-it"),
+        ] {
+            let Some(route) = runner.route(name) else {
+                panic!("{name} route is missing from the deployment")
+            };
+            assert_eq!(
+                route.first_target_slug(),
+                model,
+                "{name} must resolve to its model id"
+            );
+        }
+
+        for serving in [
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+        ] {
+            let capabilities = runner.route_capabilities(serving).expect("capabilities");
+            assert_eq!(
+                capabilities.tool_calling,
+                Some(true),
+                "{serving} must advertise tool_calling"
+            );
+            assert_eq!(
+                capabilities.reasoning,
+                Some(true),
+                "{serving} must advertise reasoning"
+            );
+        }
+
+        for held in [
+            "direct-google-gemini-2.5-flash-lite",
+            "direct-google-gemini-3-flash",
+        ] {
+            let capabilities = runner.route_capabilities(held).expect("capabilities");
+            assert_ne!(
+                capabilities.tool_calling,
+                Some(true),
+                "{held} is a catalogue record and must not claim tool_calling"
+            );
+            assert_ne!(
+                capabilities.reasoning,
+                Some(true),
+                "{held} is a catalogue record and must not claim reasoning"
+            );
+        }
+
+        // Only the withdrawn 2.5 record is held out of service. The 3-flash record is a
+        // catalogue entry for a model that does answer, so it must stay advertised: holding
+        // it would take a working alias out of the catalogue for the wrong reason.
+        let withheld = runner
+            .route("direct-google-gemini-2.5-flash-lite")
+            .expect("the held route keeps its registration");
+        assert_eq!(
+            withheld.held_reason(),
+            Some(HELD_2_5_REASON),
+            "the hold must carry the provider's evidence, not a placeholder"
+        );
+        assert!(
+            withheld.models().all_models().is_empty(),
+            "a held route must offer no candidate"
+        );
+        assert_eq!(
+            runner
+                .route("direct-google-gemini-3-flash")
+                .expect("3-flash route exists")
+                .held_reason(),
+            None,
+            "3-flash serves and must not be held"
+        );
+        let advertised: Vec<&str> = runner
+            .advertised_models()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(
+            !advertised.contains(&"direct-google-gemini-2.5-flash-lite"),
+            "a held route must not be advertised: {advertised:?}"
+        );
+        assert!(
+            advertised.contains(&"direct-google-gemini-3-flash"),
+            "a serving route must stay advertised: {advertised:?}"
+        );
+    }
+
+    /// The declared order is the whole point: eight free Gemini legs, then the two paid NT
+    /// legs. Selection may demote a free leg on measurement, but the tariff is part of the
+    /// sort key, so no paid leg can be ordered ahead of an eligible free one.
+    #[test]
+    fn smart_nt_declares_eight_free_legs_before_the_paid_fallbacks() {
+        let runner = runner();
+        let route = runner.route("smart-nt").expect("smart-nt exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-4-hydrogen",
+                "gemma-4-26b-a4b-it",
+                "gemma-4-31b-it",
+                "gpt-6-luna",
+                "deepseek-flash",
+            ],
+            "smart-nt must declare every free Gemini leg before the paid NT legs"
+        );
+
+        // The tariff is a per-target fact (`free_tier`), not the `:free` slug convention that
+        // `all_targets_free` reads, so the structural claim is asserted on the declarations.
+        let config = parsed();
+        for free in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert!(
+                config.targets[free].free_tier,
+                "{free} must be declared free, or selection may order a paid leg ahead of it"
+            );
+        }
+        for paid in ["openai-gpt-6-luna-nt", "deepseek-deepseek-flash-nt"] {
+            assert!(
+                !config.targets[paid].free_tier,
+                "{paid} is metered and must stay behind the free tier"
+            );
+        }
+    }
+
+    /// `smart_gemini` is the same pool without the paid fallbacks, so it is genuinely free
+    /// end to end and can be offered where spending a paid call is not acceptable.
+    #[test]
+    fn smart_gemini_carries_every_gemini_leg_and_no_paid_leg() {
+        let runner = runner();
+        let route = runner.route("smart_gemini").expect("smart_gemini exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-4-hydrogen",
+                "gemma-4-26b-a4b-it",
+                "gemma-4-31b-it",
+            ]
+        );
+        // Every leg is in the free allowance, so this alias never spends a paid call.
+        let config = parsed();
+        for free in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert!(
+                config.targets[free].free_tier,
+                "{free} must be declared free"
+            );
+        }
+    }
+
+    /// A held leg inside a measured pool is never offered, and the pool keeps serving.
+    ///
+    /// This is the live shape: `smart_gemini` and `smart-nt` name a target in their candidate
+    /// list that the provider has since withdrawn. Removing it from the declared list would
+    /// hide the measurement; leaving it in without a hold would spend one dispatch per request
+    /// on a 404. Filtering at load is the third option, and the one asserted here.
+    #[test]
+    fn a_held_leg_leaves_a_measured_pool_without_emptying_it() {
+        let runner = runner();
+        let route = runner
+            .route("switchyard/pool-with-held")
+            .expect("the pool exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite".to_string(),
+                "gemini-3.1-flash-lite".to_string()
+            ],
+            "the held leg must be absent and the declared order otherwise preserved"
+        );
+        assert_eq!(
+            route.held_reason(),
+            None,
+            "a pool with live legs is not itself held"
+        );
+    }
+
+    /// The output floor is declared where it was measured, and nowhere else.
+    ///
+    /// `gemini-3-flash-preview` answered HTTP 500 with an empty completion at an 8-token
+    /// reservation and normally at 600, so 600 is the smallest reservation observed to work
+    /// and is the one declared. The Gemma pair keeps its own measured 512. Every other free
+    /// leg declares no floor: adding one there would refuse requests that currently succeed,
+    /// which no measurement supports.
+    #[test]
+    fn the_output_floor_is_declared_where_it_was_measured() {
+        let config = parsed();
+        assert_eq!(
+            config.targets["direct-google-gemini-3-flash"].min_output_tokens,
+            Some(600),
+            "3-flash needs the measured reservation, or an 8-token call becomes a 500"
+        );
+        for gemma in [
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert_eq!(
+                config.targets[gemma].min_output_tokens,
+                Some(512),
+                "{gemma}'s measured floor must survive untouched"
+            );
+        }
+        for unmeasured in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+        ] {
+            assert_eq!(
+                config.targets[unmeasured].min_output_tokens, None,
+                "{unmeasured} has no measured floor; inventing one would refuse working requests"
+            );
+        }
+    }
+
+    /// A held model serves nothing, so it declares no budget at all: zero is refused at load
+    /// ("must be at least 1"), and a fabricated limit would claim an allowance nobody metered.
+    #[test]
+    fn held_models_declare_no_daily_budget_and_serve_nothing() {
+        let config = parsed();
+
+        for held in [
+            "direct-google-gemini-2.5-flash-lite",
+            "direct-google-gemini-3-flash",
+        ] {
+            let target = config
+                .targets
+                .get(held)
+                .expect("the held record is catalogued");
+            assert_eq!(
+                target.daily_request_limit, None,
+                "{held} must not declare a daily budget"
+            );
+        }
+
+        for serving in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            let target = config
+                .targets
+                .get(serving)
+                .expect("the serving target is declared");
+            assert!(
+                target.daily_request_limit.is_some_and(|limit| limit >= 1),
+                "{serving} must declare a real daily budget"
+            );
+            assert!(
+                target.free_tier,
+                "{serving} is served inside a free allowance"
+            );
+        }
+    }
+
+    /// The measured provider refusal is a declaration, not a code branch, so it has to be on
+    /// every Google target: a no-thinking consumer sends `none` and the provider answers 400.
+    #[test]
+    fn the_refused_effort_value_is_declared_on_every_google_target() {
+        let config = parsed();
+        let none = BTreeSet::from(["none".to_string()]);
+
+        for name in config
+            .targets
+            .keys()
+            .filter(|name| name.starts_with("direct-google-"))
+        {
+            assert_eq!(
+                config.targets[name].unsupported_reasoning_effort, none,
+                "{name} must declare that its provider refuses effort `none`"
+            );
+            assert_eq!(
+                config.targets[name].omit_body_fields,
+                BTreeSet::from([
+                    "metadata".to_string(),
+                    "prompt_cache_key".to_string(),
+                    "store".to_string(),
+                ]),
+                "{name} must drop the Responses-only fields Google rejects"
+            );
+        }
+
+        // A target on a wire that accepts `none` keeps every value, so the declaration is
+        // scoped to the provider that needs it rather than applied fleet-wide.
+        assert!(
+            config.targets["openai-gpt-6-luna-nt"]
+                .unsupported_reasoning_effort
+                .is_empty()
+        );
     }
 }

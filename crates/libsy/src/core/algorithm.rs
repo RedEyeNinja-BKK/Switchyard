@@ -136,9 +136,43 @@ impl RuntimeModels {
                 })
                 .collect()
         };
+
         RuntimeModels {
             by_category: promote(&self.by_category),
             subagent: self.subagent.as_ref().map(promote),
+        }
+    }
+
+    /// Returns this model set with each category ordered by `order`.
+    ///
+    /// A candidate named in `order` takes that position; anything unnamed keeps its declared
+    /// order after the named ones, so an ordering computed from partial evidence can never
+    /// drop or invent a candidate. `promoting` moves a named leg to the front but preserves
+    /// the declared order among the named models, which cannot express a full ranking; this
+    /// is the primitive that can.
+    pub fn reordered(&self, order: &[ModelId]) -> RuntimeModels {
+        if order.is_empty() {
+            return self.clone();
+        }
+        let rank = |model: &ModelId| {
+            order
+                .iter()
+                .position(|named| named == model)
+                .unwrap_or(usize::MAX)
+        };
+        let sort = |groups: &HashMap<Category, Vec<ModelId>>| {
+            groups
+                .iter()
+                .map(|(category, models)| {
+                    let mut ordered = models.clone();
+                    ordered.sort_by_key(rank);
+                    (category.clone(), ordered)
+                })
+                .collect()
+        };
+        RuntimeModels {
+            by_category: sort(&self.by_category),
+            subagent: self.subagent.as_ref().map(sort),
         }
     }
 

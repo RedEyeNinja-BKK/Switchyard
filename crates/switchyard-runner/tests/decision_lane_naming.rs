@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use switchyard_protocol::{DecisionKind, DecisionQuestion, DecisionRequest};
+use switchyard_runner::decision_executor::{ComposedLane, LaneSelection};
 use switchyard_runner::{Runner, RunnerError};
 
 fn decision_config(lanes: &str, composition: &str) -> String {
@@ -645,9 +646,12 @@ fn the_shared_classifier_resolves_an_explicitly_named_lane() {
     ]
     .into_iter()
     .collect();
-    let composition: Map<String, Vec<String>> = [(
+    let composition: Map<String, ComposedLane> = [(
         "tier".to_string(),
-        vec!["free-family".to_string(), "local-family".to_string()],
+        ComposedLane {
+            children: vec!["free-family".to_string(), "local-family".to_string()],
+            selection: LaneSelection::Ordered,
+        },
     )]
     .into_iter()
     .collect();
@@ -742,9 +746,12 @@ async fn serve_named_serves_the_named_lane_and_falls_through_only_when_unknown()
     ]
     .into_iter()
     .collect();
-    let composition: Map<String, Vec<String>> = [(
+    let composition: Map<String, ComposedLane> = [(
         "tier".to_string(),
-        vec!["free-family".to_string(), "local-family".to_string()],
+        ComposedLane {
+            children: vec!["free-family".to_string(), "local-family".to_string()],
+            selection: LaneSelection::Ordered,
+        },
     )]
     .into_iter()
     .collect();

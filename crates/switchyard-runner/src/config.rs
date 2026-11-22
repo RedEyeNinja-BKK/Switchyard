@@ -219,17 +219,25 @@ pub(crate) struct DecisionLaneConfig {
     pub(crate) types: Vec<decision_transport::QuestionKind>,
 }
 
-/// A decision lane composed of ordered child POLICY lanes.
+/// A decision lane composed of child POLICY lanes.
 ///
-/// Children are lane names, not targets. Each child runs its own candidate order,
-/// question-kind eligibility and failure policy in process, and the parent adds only
-/// ordered selection between them. Keeping the reference rather than flattening it is
-/// what lets a family stay independently addressable and its policy stay single-sourced.
+/// Children are lane names, not targets. Each child keeps its own question-kind
+/// eligibility and failure policy in process, and the parent adds selection between them.
+/// Keeping the reference rather than flattening it is what lets a family stay
+/// independently addressable and its policy stay single-sourced.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DecisionLaneCompositionConfig {
     /// Child decision lane names in preference order.
     pub(crate) children: Vec<String>,
+    /// How this lane selects between its children.
+    ///
+    /// Absent means [`decision_executor::LaneSelection::Ordered`], the historic
+    /// behaviour, so a manifest that does not name a policy keeps its meaning. The policy
+    /// is stated here rather than inferred from the lane's name: renaming a lane must not
+    /// change how it routes.
+    #[serde(default)]
+    pub(crate) selection: decision_executor::LaneSelection,
 }
 
 #[derive(Debug)]
@@ -885,10 +893,18 @@ impl DeploymentConfig {
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
-            let lane_composition: BTreeMap<String, Vec<String>> = self
+            let lane_composition: BTreeMap<String, decision_executor::ComposedLane> = self
                 .decision_lane_composition
                 .iter()
-                .map(|(name, composition)| (name.clone(), composition.children.clone()))
+                .map(|(name, composition)| {
+                    (
+                        name.clone(),
+                        decision_executor::ComposedLane {
+                            children: composition.children.clone(),
+                            selection: composition.selection,
+                        },
+                    )
+                })
                 .collect();
             let (route_clients, caller_auth) = self.build_route_clients(
                 route_name,
@@ -1041,8 +1057,8 @@ impl DeploymentConfig {
         if let Some(name) = &self.default_decision_lane {
             runner = runner.with_default_decision_lane(name.clone());
         }
-        for (name, children) in lane_composition {
-            runner = runner.with_decision_lane_composition(name, children);
+        for (name, composition) in lane_composition {
+            runner = runner.with_composed_decision_lane(name, composition);
         }
         Ok(runner)
     }
@@ -2178,7 +2194,7 @@ impl DeploymentConfig {
     fn resolve_decision_lane_composition(
         &self,
         lanes: &BTreeMap<String, decision_executor::LaneResolverHandle>,
-    ) -> RunnerResult<Vec<(String, Vec<String>)>> {
+    ) -> RunnerResult<Vec<(String, decision_executor::ComposedLane)>> {
         let mut resolved = Vec::with_capacity(self.decision_lane_composition.len());
         for (name, composition) in &self.decision_lane_composition {
             let children = &composition.children;
@@ -2198,7 +2214,13 @@ impl DeploymentConfig {
                 }
                 ordered.push(child.clone());
             }
-            resolved.push((name.clone(), ordered));
+            resolved.push((
+                name.clone(),
+                decision_executor::ComposedLane {
+                    children: ordered,
+                    selection: composition.selection,
+                },
+            ));
         }
         Ok(resolved)
     }
@@ -2312,7 +2334,7 @@ impl DeploymentConfig {
         // `Call::Decision` resolves a named lane by the SAME mechanism as the public
         // surface. Without it, the same request could be served at `/v1/decisions`
         // and fail internally, which is a split contract rather than one mechanism.
-        composition: &BTreeMap<String, Vec<String>>,
+        composition: &BTreeMap<String, decision_executor::ComposedLane>,
         // The deployment's one governor and its per-model daily counters, threaded here so
         // a route-local decision resolver is paced by the same ledgers as a named lane:
         // the public surface and an internal Call::Decision must not hold two different

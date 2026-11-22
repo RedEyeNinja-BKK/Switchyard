@@ -28,7 +28,7 @@ pub struct Runner {
     /// Decision lanes that compose child POLICY lanes rather than physical targets.
     /// A tier over families is preserved as a reference, so the child policies stay
     /// independently addressable and a child change is inherited rather than copied.
-    decision_lane_composition: BTreeMap<String, Vec<String>>,
+    decision_lane_composition: BTreeMap<String, crate::decision_executor::ComposedLane>,
     /// Ordered composites over complete child routes.
     composites: BTreeMap<String, crate::composition::CompositeSpec>,
     /// Declared capabilities of composite routes, which are policy promises rather than
@@ -286,17 +286,37 @@ impl Runner {
         self
     }
 
-    /// Registers a decision lane that composes child POLICY lanes in order.
+    /// Registers a decision lane that composes child POLICY lanes in declared order.
     ///
     /// The child lanes are resolved in process through the same named-lane mechanism,
     /// so a tier inherits each child's candidate order, question-kind eligibility,
     /// failure policy and telemetry instead of a copied list of physical targets.
+    ///
+    /// This is the ordered form, kept as its own method because ordered selection is a
+    /// policy rather than an implementation detail: a lane that wants another one states
+    /// it through [`Runner::with_composed_decision_lane`].
     pub fn with_decision_lane_composition(
         mut self,
         name: impl Into<String>,
         children: Vec<String>,
     ) -> Self {
-        self.decision_lane_composition.insert(name.into(), children);
+        self.decision_lane_composition.insert(
+            name.into(),
+            crate::decision_executor::ComposedLane {
+                children,
+                selection: crate::decision_executor::LaneSelection::Ordered,
+            },
+        );
+        self
+    }
+
+    /// Registers a composed decision lane with an explicit selection policy.
+    pub fn with_composed_decision_lane(
+        mut self,
+        name: impl Into<String>,
+        lane: crate::decision_executor::ComposedLane,
+    ) -> Self {
+        self.decision_lane_composition.insert(name.into(), lane);
         self
     }
 
@@ -406,7 +426,17 @@ impl Runner {
     pub fn decision_lane_children(&self, lane: &str) -> Option<&[String]> {
         self.decision_lane_composition
             .get(lane)
-            .map(|children| children.as_slice())
+            .map(|composed| composed.children.as_slice())
+    }
+
+    /// A composed lane's selection policy, when it composes other lanes.
+    pub fn decision_lane_selection(
+        &self,
+        lane: &str,
+    ) -> Option<crate::decision_executor::LaneSelection> {
+        self.decision_lane_composition
+            .get(lane)
+            .map(|composed| composed.selection)
     }
 
     /// Every lane's resolver, for a caller resolving a named identity.
@@ -427,7 +457,9 @@ impl Runner {
     }
 
     /// The named composition, so a caller can serve a composed lane by its own name.
-    pub fn decision_lane_composition_map(&self) -> BTreeMap<String, Vec<String>> {
+    pub fn decision_lane_composition_map(
+        &self,
+    ) -> BTreeMap<String, crate::decision_executor::ComposedLane> {
         self.decision_lane_composition.clone()
     }
 
@@ -437,7 +469,9 @@ impl Runner {
     }
 
     /// Every decision lane that composes child lanes, for diagnostics and validation.
-    pub fn decision_lane_compositions(&self) -> &BTreeMap<String, Vec<String>> {
+    pub fn decision_lane_compositions(
+        &self,
+    ) -> &BTreeMap<String, crate::decision_executor::ComposedLane> {
         &self.decision_lane_composition
     }
 

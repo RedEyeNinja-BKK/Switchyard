@@ -19,9 +19,9 @@ use axum::response::{IntoResponse, Response};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use serde_json::json;
-use switchyard_runner::capability::{CapabilityFormat, ResolvedCapability};
 use switchyard_llm_client::PacingError;
 use switchyard_llm_client::PacingTicket;
+use switchyard_runner::capability::{CapabilityFormat, ResolvedCapability};
 
 use crate::ServerState;
 
@@ -89,25 +89,28 @@ fn upstream_ws_url(capability: &ResolvedCapability, api_key: &str) -> String {
 /// Builds the `BidiGenerateContentSetup` from the capability's declaration.
 ///
 /// The caller never supplies a setup: the session's shape is fixed at configuration time.
+/// Only fields the capability actually declares are emitted — Google closes the session
+/// with code 1007 for a thinking control the model does not take, so an unset control must
+/// be absent rather than present-and-empty.
 fn build_setup(capability: &ResolvedCapability) -> serde_json::Value {
     let modalities = capability
         .response_modalities
         .clone()
         .unwrap_or_else(|| vec!["TEXT".to_string()]);
-    let mut generation_config = json!({
-        "responseModalities": modalities,
-        "temperature": null,
-        "topP": null,
-        "topK": null,
-        "candidateCount": null,
-        "maxOutputTokens": null,
-        "stopSequences": null,
-    });
-    if let Some(thinking) = capability.thinking_budget {
+    let mut generation_config = json!({ "responseModalities": modalities });
+    let thinking = match (
+        capability.thinking_budget,
+        capability.thinking_level.as_deref(),
+    ) {
+        (Some(budget), _) => Some(json!({ "thinkingBudget": budget })),
+        (None, Some(level)) => Some(json!({ "thinkingLevel": level })),
+        (None, None) => None,
+    };
+    if let Some(thinking) = thinking {
         generation_config
             .as_object_mut()
             .unwrap()
-            .insert("thinkingConfig".to_string(), json!({ "thinkingBudget": thinking }));
+            .insert("thinkingConfig".to_string(), thinking);
     }
     let mut setup = json!({
         "setup": {
@@ -150,22 +153,25 @@ async fn live_session(
     };
 
     // Connect to Google and send the setup as the first frame.
-    let (mut google_ws, _response) = match tokio_tungstenite::connect_async(google_uri.to_string()).await {
-        Ok((ws, response)) => (ws, response),
-        Err(error) => {
-            tracing::error!(
-                "live {}: cannot connect to Google: {error}",
-                capability.id
-            );
-            release_physical_call(&capability, &ticket);
-            return;
-        }
-    };
+    let (mut google_ws, _response) =
+        match tokio_tungstenite::connect_async(google_uri.to_string()).await {
+            Ok((ws, response)) => (ws, response),
+            Err(error) => {
+                tracing::error!("live {}: cannot connect to Google: {error}", capability.id);
+                release_physical_call(&capability, &ticket);
+                return;
+            }
+        };
 
     // Send setup as the first frame.
     let setup_text = serde_json::to_string(setup).unwrap();
+    tracing::debug!(
+        "live {}: sending setup to Google: {}",
+        capability.id,
+        setup_text
+    );
     if google_ws
-        .send(tungstenite::Message::Text(setup_text))
+        .send(tungstenite::Message::Text(setup_text.clone()))
         .await
         .is_err()
     {
@@ -187,6 +193,10 @@ async fn live_session(
                         .await
                         .is_err()
                     {
+                        tracing::warn!(
+                            "live {}: cannot forward client text frame to Google",
+                            capability.id
+                        );
                         break;
                     }
                 }
@@ -196,12 +206,15 @@ async fn live_session(
                         .await
                         .is_err()
                     {
+                        tracing::warn!(
+                            "live {}: cannot forward client binary frame to Google",
+                            capability.id
+                        );
                         break;
                     }
                 }
                 axum::extract::ws::Message::Close(_) => break,
-                axum::extract::ws::Message::Ping(_)
-                | axum::extract::ws::Message::Pong(_) => {}
+                axum::extract::ws::Message::Ping(_) | axum::extract::ws::Message::Pong(_) => {}
             }
         }
     };
@@ -241,6 +254,7 @@ async fn live_session(
         _ = google_to_client => {},
     }
 
+    tracing::debug!("live {}: session ended", capability.id);
     // Best-effort close of the Google session via the sender half; the caller side is
     // closed by axum when the upgrade future returns.
     let _ = google_tx.close().await;
@@ -270,7 +284,11 @@ fn reserve_physical_call(
                     "minute_allowance_throttled",
                 )));
             }
-            Err(PacingError::ExceedsWindow { needed, limit, margin_permille }) => {
+            Err(PacingError::ExceedsWindow {
+                needed,
+                limit,
+                margin_permille,
+            }) => {
                 return Err(Box::new(error_body(
                     StatusCode::TOO_MANY_REQUESTS,
                     format!(
@@ -287,10 +305,7 @@ fn reserve_physical_call(
     Ok(ticket)
 }
 
-fn release_physical_call(
-    capability: &ResolvedCapability,
-    ticket: &Option<PacingTicket>,
-) {
+fn release_physical_call(capability: &ResolvedCapability, ticket: &Option<PacingTicket>) {
     if let (Some(budget), Some(ticket)) = (&capability.budget, ticket) {
         if let Some(pacing) = &budget.pacing {
             pacing.release(ticket);
@@ -342,7 +357,9 @@ fn upstream_contract_error(capability: &ResolvedCapability, reason: &str) -> Res
 fn contract_error(status: StatusCode, message: String) -> Response {
     (
         status,
-        axum::Json(serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}})),
+        axum::Json(
+            serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}}),
+        ),
     )
         .into_response()
 }
@@ -380,6 +397,7 @@ mod tests {
             response_modalities: Some(vec!["AUDIO".to_string(), "TEXT".to_string()]),
             system_instruction: Some("You are a helpful assistant.".to_string()),
             thinking_budget: Some(1024),
+            thinking_level: None,
         }
     }
 
@@ -391,7 +409,10 @@ mod tests {
             url.starts_with("wss://"),
             "must upgrade https to wss: {url}"
         );
-        assert!(url.contains("key=server-key-123"), "key must be in URL: {url}");
+        assert!(
+            url.contains("key=server-key-123"),
+            "key must be in URL: {url}"
+        );
         assert!(!url.contains("https://"), "must not contain https: {url}");
     }
 
@@ -400,7 +421,10 @@ mod tests {
         let capability = live_capability();
         let setup = build_setup(&capability);
         assert_eq!(
-            setup.get("setup").and_then(|s| s.get("model")).and_then(|v| v.as_str()),
+            setup
+                .get("setup")
+                .and_then(|s| s.get("model"))
+                .and_then(|v| v.as_str()),
             Some("models/gemini-3.8-live"),
             "setup must use models/ prefix"
         );
@@ -427,6 +451,42 @@ mod tests {
                 .and_then(|p| p.get(0))
                 .and_then(|p| p.get("text")),
             Some(&json!("You are a helpful assistant."))
+        );
+    }
+
+    #[test]
+    fn setup_omits_a_thinking_control_the_capability_does_not_declare() {
+        // Measured 2026-11-22: `thinkingBudget` closes a gemini-3.8-live session with
+        // code 1007, so an undeclared control must not be emitted at all.
+        let mut capability = live_capability();
+        capability.thinking_budget = None;
+        let setup = build_setup(&capability);
+        let config = setup
+            .get("setup")
+            .and_then(|s| s.get("generationConfig"))
+            .expect("generationConfig");
+        assert!(
+            config.get("thinkingConfig").is_none(),
+            "undeclared thinking control must be absent: {config}"
+        );
+        assert!(
+            config.get("maxOutputTokens").is_none() && config.get("temperature").is_none(),
+            "unset generation fields must not be emitted as null: {config}"
+        );
+    }
+
+    #[test]
+    fn setup_carries_a_thinking_level_when_declared() {
+        let mut capability = live_capability();
+        capability.thinking_budget = None;
+        capability.thinking_level = Some("HIGH".to_string());
+        let setup = build_setup(&capability);
+        assert_eq!(
+            setup
+                .get("setup")
+                .and_then(|s| s.get("generationConfig"))
+                .and_then(|c| c.get("thinkingConfig")),
+            Some(&json!({ "thinkingLevel": "HIGH" }))
         );
     }
 

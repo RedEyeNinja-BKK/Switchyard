@@ -236,7 +236,9 @@ impl CapabilityFormat {
                 // The Live WebSocket endpoint is not an HTTP path: it names the generative
                 // service method and carries the credential as a query parameter. The surface
                 // builds the full wss:// URL from base_url, this path and the live key.
-                format!("/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
+                format!(
+                    "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+                )
             }
         }
     }
@@ -358,6 +360,15 @@ pub struct CapabilityConfig {
     /// model's published maximum is refused at load rather than sent to fail on every call.
     #[serde(default)]
     pub thinking_budget: Option<u32>,
+    /// Thinking level for Live variants that expose a level rather than a token budget.
+    ///
+    /// Gemini 3.x Live models reject `thinkingBudget` outright (the session closes with
+    /// code 1007 "Thinking budget is not supported for this model") and require
+    /// `thinkingLevel` instead. The two controls are mutually exclusive: declaring both is
+    /// refused, because only one of them would take effect and the other would be a lie
+    /// about the session's shape.
+    #[serde(default)]
+    pub thinking_level: Option<String>,
 }
 
 /// Configured capability endpoints and the capabilities that name them.
@@ -608,7 +619,25 @@ impl CapabilityDeployment {
                             ));
                         }
                     }
-                    if capability.system_instruction.as_deref().is_some_and(str::is_empty) {
+                    if let Some(level) = &capability.thinking_level {
+                        if !matches!(level.as_str(), "MINIMAL" | "LOW" | "MEDIUM" | "HIGH") {
+                            return Err(format!(
+                                "capability {name} declares thinking level {level:?}, but a Live \
+                                 session only serves MINIMAL, LOW, MEDIUM or HIGH"
+                            ));
+                        }
+                        if capability.thinking_budget.is_some() {
+                            return Err(format!(
+                                "capability {name} declares both thinking_budget and thinking_level; \
+                                 a Live session takes one thinking control, not two"
+                            ));
+                        }
+                    }
+                    if capability
+                        .system_instruction
+                        .as_deref()
+                        .is_some_and(str::is_empty)
+                    {
                         return Err(format!(
                             "capability {name} declares an empty system_instruction; state the \
                              exact instruction text, or omit the field"
@@ -977,6 +1006,8 @@ pub struct ResolvedCapability {
     pub system_instruction: Option<String>,
     /// Thinking budget for Extended Thinking variants, in tokens.
     pub thinking_budget: Option<u32>,
+    /// Thinking level for variants that take a level instead of a budget (`MINIMAL`..`HIGH`).
+    pub thinking_level: Option<String>,
 }
 
 /// The budgets one capability's physical calls draw on.
@@ -1060,6 +1091,7 @@ pub fn resolve_with_budget(
                 response_modalities: capability.response_modalities.clone(),
                 system_instruction: capability.system_instruction.clone(),
                 thinking_budget: capability.thinking_budget,
+                thinking_level: capability.thinking_level.clone(),
             },
         );
     }
@@ -1871,7 +1903,10 @@ thinking_budget = 1024
     fn a_live_capability_must_declare_response_modalities() {
         let without = COMPLETE_LIVE.replace("response_modalities = [\"AUDIO\", \"TEXT\"]\n", "");
         let refused = refusal(&format!("{LIVE_CLIENT}{without}"));
-        assert!(refused.contains("must declare response_modalities"), "{refused}");
+        assert!(
+            refused.contains("must declare response_modalities"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -1881,7 +1916,10 @@ thinking_budget = 1024
             "response_modalities = []",
         );
         let refused = refusal(&format!("{LIVE_CLIENT}{without}"));
-        assert!(refused.contains("empty response_modalities list"), "{refused}");
+        assert!(
+            refused.contains("empty response_modalities list"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -1899,6 +1937,45 @@ thinking_budget = 1024
         let too_big = COMPLETE_LIVE.replace("thinking_budget = 1024", "thinking_budget = 65536");
         let refused = refusal(&format!("{LIVE_CLIENT}{too_big}"));
         assert!(refused.contains("above the"), "{refused}");
+    }
+
+    #[test]
+    fn a_thinking_level_is_accepted_and_resolved() {
+        let level =
+            COMPLETE_LIVE.replace("thinking_budget = 1024\n", "thinking_level = \"HIGH\"\n");
+        let source = format!("{LIVE_CLIENT}{level}");
+        deployment(&source).validate().expect("level lane is valid");
+        let resolved = resolve(&deployment(&source));
+        let capability = resolved.get("live").expect("resolved");
+        assert_eq!(capability.thinking_level.as_deref(), Some("HIGH"));
+        assert_eq!(capability.thinking_budget, None);
+    }
+
+    #[test]
+    fn an_unknown_thinking_level_is_refused() {
+        // Gemini publishes MINIMAL/LOW/MEDIUM/HIGH; MINIMAL is itself refused by the
+        // 3.8 extended-thinking model, so the manifest must not silently accept anything
+        // outside the serviceable set.
+        let level =
+            COMPLETE_LIVE.replace("thinking_budget = 1024\n", "thinking_level = \"TURBO\"\n");
+        let refused = refusal(&format!("{LIVE_CLIENT}{level}"));
+        assert!(
+            refused.contains("only serves MINIMAL, LOW, MEDIUM or HIGH"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn both_thinking_controls_are_refused() {
+        let both = COMPLETE_LIVE.replace(
+            "thinking_budget = 1024\n",
+            "thinking_budget = 1024\nthinking_level = \"HIGH\"\n",
+        );
+        let refused = refusal(&format!("{LIVE_CLIENT}{both}"));
+        assert!(
+            refused.contains("one thinking control, not two"),
+            "{refused}"
+        );
     }
 
     #[test]

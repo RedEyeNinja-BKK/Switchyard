@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Negative regression tests: the Switchyard contract is checked, not inferred."""
+import copy
+import importlib.util
+from pathlib import Path
+import unittest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("direct_capability_gate", HERE / "direct_capability_gate.py")
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+
+
+def fixture():
+    google = {"id": "gemini-3.6-flash", "llm_client": "owner-google",
+              "tool_calling": True, "vision": False, "video": False}
+    stephen = {**google, "llm_client": "stephen-google"}
+    non_google = {"id": "nvidia/nemotron-3.5-super-vl:free", "llm_client": "openrouter",
+                  "tool_calling": True, "vision": True, "video": True,
+                  "image_carrier": "inline", "video_carrier": "inline"}
+    doc = {
+        "llm_clients": {
+            "owner-google": {"format": "openai_chat", "api_key_env": "OWNER_GOOGLE",
+                             "quota_group": "owner_google"},
+            "stephen-google": {"format": "openai_chat", "api_key_env": "STEPHEN_GOOGLE",
+                               "quota_group": "stephen_google"},
+            "openrouter": {"format": "openai_responses", "api_key_env": "OWNER_OPENROUTER"},
+        },
+        "targets": {
+            "google-3.6": google, "stephen-google-3.6": stephen, "vl": non_google,
+        },
+        "routes": {
+            "direct-google-gemini-3.6-flash": {
+                "id": "direct-google-gemini-3.6-flash", "type": "passthrough",
+                "target": "google-3.6", "candidates": [],
+                "tool_calling": True, "vision": False, "video": False,
+            },
+            "direct-google-stephen-gemini-3.6-flash": {
+                "id": "direct-google-stephen-gemini-3.6-flash", "type": "passthrough",
+                "target": "stephen-google-3.6", "candidates": [],
+                "tool_calling": True, "vision": False, "video": False,
+            },
+            "direct-openrouter-nemotron-vl": {
+                "id": "direct-openrouter-nemotron-vl", "type": "passthrough",
+                "target": "vl", "candidates": [],
+                "tool_calling": True, "vision": True, "video": True,
+                "image_carrier": "inline", "video_carrier": "inline",
+            },
+        },
+    }
+    return doc
+
+
+class GateTests(unittest.TestCase):
+    def test_clean_known_metadata_passes_without_question_marks(self):
+        result = gate.analyze(fixture(), set(fixture()["routes"]))
+        self.assertEqual(result["status"], "PASS", result["failures"])
+        self.assertEqual(result["direct_count"], 3)
+        self.assertNotIn("?", str(result))
+
+    def test_missing_route_vision_fails(self):
+        d = fixture()
+        d["routes"]["direct-openrouter-nemotron-vl"].pop("vision")
+        self.assertIn("ROUTE_CAPABILITY_NOT_EXPLICIT",
+                      " ".join(gate.analyze(d)["failures"]))
+
+    def test_missing_target_tool_support_fails(self):
+        d = fixture()
+        d["targets"]["vl"].pop("tool_calling")
+        self.assertIn("TARGET_CAPABILITY_UNQUALIFIED",
+                      " ".join(gate.analyze(d)["failures"]))
+
+    def test_target_video_absent_is_not_converted_to_false(self):
+        d = fixture()
+        d["targets"]["vl"].pop("video")
+        result = gate.analyze(d)
+        self.assertIn("TARGET_CAPABILITY_UNQUALIFIED", str(result["failures"]))
+        self.assertEqual(
+            next(row for row in result["routes"] if row["target"] == "vl")
+                ["target_capabilities"]["video"], "NOT_DECLARED")
+
+    def test_unadvertised_alias_is_a_failure(self):
+        d = fixture()
+        shown = set(d["routes"]) - {"direct-openrouter-nemotron-vl"}
+        self.assertIn("DIRECT_NOT_ADVERTISED", str(gate.analyze(d, shown)["failures"]))
+
+    def test_fake_video_overclaim_is_caught(self):
+        d = fixture()
+        d["targets"]["vl"]["video"] = False
+        self.assertIn("DIRECT_OVERCLAIM", str(gate.analyze(d)["failures"]))
+
+    def test_wrong_video_wire_is_caught(self):
+        d = fixture()
+        d["llm_clients"]["openrouter"]["format"] = "openai_chat"
+        self.assertIn("VIDEO_WIRE_MISMATCH", str(gate.analyze(d)["failures"]))
+
+    def test_carrier_mismatch_is_caught(self):
+        d = fixture()
+        d["routes"]["direct-openrouter-nemotron-vl"]["video_carrier"] = "both"
+        self.assertIn("CARRIER_OVERCLAIM", str(gate.analyze(d)["failures"]))
+
+    def test_silent_capability_suppression_is_caught(self):
+        d = fixture()
+        d["routes"]["direct-openrouter-nemotron-vl"]["vision"] = False
+        self.assertIn("DIRECT_SUPPRESSED_CAPABILITY", str(gate.analyze(d)["failures"]))
+
+    def test_credential_boundary_is_not_merged(self):
+        d = fixture()
+        d["llm_clients"]["stephen-google"]["quota_group"] = "owner_google"
+        self.assertIn("GOOGLE_ACCOUNT_BOUNDARY_BROKEN", str(gate.analyze(d)["failures"]))
+
+    def test_shared_google_model_facts_must_be_equal(self):
+        d = fixture()
+        d["targets"]["stephen-google-3.6"]["vision"] = True
+        self.assertIn("GOOGLE_SHARED_CAPABILITY_DRIFT", str(gate.analyze(d)["failures"]))
+
+    def test_missing_stephen_model_is_a_failure(self):
+        d = fixture()
+        del d["routes"]["direct-google-stephen-gemini-3.6-flash"]
+        self.assertIn("GOOGLE_DUAL_PROFILE_MODEL_DRIFT", str(gate.analyze(d)["failures"]))
+
+    def test_unexpected_fallback_is_a_hard_refusal(self):
+        d = fixture()
+        d["routes"]["direct-openrouter-nemotron-vl"]["candidates"] = ["google-3.6"]
+        self.assertIn("DIRECT_HAS_FALLBACK", str(gate.analyze(d)["failures"]))
+
+    def test_retired_native_25_is_refused(self):
+        d = fixture()
+        d["routes"]["direct-google-gemini-2.5-flash"] = copy.deepcopy(
+            d["routes"]["direct-google-gemini-3.6-flash"])
+        with self.assertRaises(gate.ContractError) as err:
+            gate.analyze(d)
+        self.assertEqual(err.exception.token, "RETIRED_DIRECT_DEFINED")
+
+
+if __name__ == "__main__":
+    unittest.main()

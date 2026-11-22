@@ -17,7 +17,10 @@ What "one suite, two profiles" has to mean, mechanically:
       catalogue edit made for one profile cannot silently drop the other's capability;
   P7  the catalogue says which bytes it was captured from, and they are the bytes given;
   P8  the profile files hold no model facts of their own: if they did, the "one catalogue"
-      claim would already be false and every later correction would have two homes.
+      claim would already be false and every later correction would have two homes;
+  P9  EVERY direct alias (not just Google) has explicit, source-backed route AND
+      physical target admission facts; no missing tool/image/video claims, carrier
+      mismatches, hidden fallback, account bleed, or source-level capability loss.
 
 Exit code 0 only when every check passes. `--json` emits the same result as data.
 """
@@ -33,6 +36,8 @@ from pathlib import Path
 import project
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+import direct_capability_gate  # existing physical runtime facts, all providers, not Google cards
 # The deployed manifest must be RESOLVED from the release store, never a literal
 # epoch path. A hardcoded /var/tmp capture silently graded release 53fd9a84 long
 # after production had moved on, so every run reported drift that did not exist
@@ -308,6 +313,16 @@ def check_no_duplicated_facts(owner: dict, stephen: dict) -> list[str]:
     return failures
 
 
+def check_direct_capability_contract(document: dict) -> list[str]:
+    """P9: fail closed if any already-qualified direct route loses runtime facts.
+
+    Native /v1/models route-level flags do not automatically inherit from
+    targets. The two MUST be checked separately rather than pulling an
+    unqualified vendor-model card into a runtime eligibility declaration.
+    """
+    return direct_capability_gate.analyze(document)["failures"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -340,6 +355,7 @@ def main() -> int:
         ("P6-owner-projection-matches-deployed", lambda: check_owner_regression(cat, owner, arguments.manifest)),
         ("P7-catalogue-names-its-bytes", lambda: check_provenance(cat, arguments.manifest, arguments.expected_capture_hash)),
         ("P8-no-model-facts-in-profiles", lambda: check_no_duplicated_facts(owner, stephen)),
+        ("P9-all-direct-capabilities-actually-qualified", lambda: check_direct_capability_contract(document)),
     ]
     checks = []
     for name, run in pending:

@@ -26,6 +26,11 @@ Checks:
       byte what is deployed.
   R8  The pool is not a renamed two-provider pair: every named child contributes
       at least one physical target.
+  R9  Every reachable pool target declares a state form it can actually serve,
+      and a target speaking Google's decision transport declares the plain-string
+      form its live service was measured to accept (2026-11-22). A pool member
+      that declares no usable form is a skip wearing a lane's name, and one with
+      an inverted declaration refuses locally what its backend accepts.
 
 Exit 0 only when every check ran and passed. A check that cannot evaluate its
 subject is a failure, never a skip: a guard that verified nothing and exited 0
@@ -45,6 +50,7 @@ LEGACY_TIER = "tier1-decision"
 LEGACY_TIER_CHILDREN = ["smartfree-decision", "smartlocal-decision"]
 SPAN = "direct-openrouter-span-01-lite"
 OR_TRANSPORT = "open_router_alpha"
+GOOGLE_TRANSPORT = "google_decisions"
 STEPHEN_MARKER = "STEPHEN"
 
 
@@ -182,9 +188,24 @@ def main() -> int:
     empty = [child for child in children if not lanes.get(child, {}).get("targets")]
     check("R8", not empty and len(pool) >= len(REQUIRED_CHILDREN), f"empty children: {empty}")
 
+    # R9 -- a reachable target must declare a state form it can actually serve.
+    unusable: list[str] = []
+    for name in pool:
+        declared = targets.get(name, {})
+        forms = declared.get("state_forms", {})
+        plain = forms.get("plain_string", True)
+        structured = forms.get("structured", True)
+        if not plain and not structured:
+            unusable.append(f"{name} accepts no state form")
+        if declared.get("decision_transport") == GOOGLE_TRANSPORT and not plain:
+            unusable.append(
+                f"{name} refuses the plain-string form its live service accepts"
+            )
+    check("R9", not unusable, f"pool members must declare a usable state form: {unusable}")
+
     # A guard that evaluated nothing must not report success.
-    if len(ran) != 8:
-        failures.append(f"only {len(ran)} of 8 checks ran: {ran}")
+    if len(ran) != 9:
+        failures.append(f"only {len(ran)} of 9 checks ran: {ran}")
 
     if failures:
         for failure in failures:

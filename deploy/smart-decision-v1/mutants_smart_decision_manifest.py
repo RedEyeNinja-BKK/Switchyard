@@ -64,6 +64,18 @@ MUTANTS = [
         "",
         "R1",
     ),
+    (
+        "M8 Google state forms reverted to the measured-wrong declaration",
+        'state_forms = { plain_string = true, structured = false }\nfree_tier = true\n',
+        'state_forms = { plain_string = false, structured = true }\nfree_tier = true\n',
+        "R9",
+    ),
+    (
+        "M9 a pool member declares no state form it can serve",
+        'state_forms = { plain_string = true, structured = false }\nfree_tier = true\n',
+        'state_forms = { plain_string = false, structured = false }\nfree_tier = true\n',
+        "R9",
+    ),
 ]
 
 

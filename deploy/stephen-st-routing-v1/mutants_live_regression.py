@@ -143,6 +143,18 @@ def main() -> int:
         print("SKIP  M6 (no smart-nt route in live manifest)", file=sys.stderr)
         return 1
 
+    # M7 - the Google state-forms allowance must stay narrow. `state_forms` is a
+    # reviewed key on that one target; any other key on it stays unreviewed. If this
+    # survives, the SD1 correction has become a blanket permit for a pool member.
+    m7 = copy.deepcopy(live)
+    google = m7["targets"].get("direct-google-gemini-decision-1")
+    if google is not None:
+        google["max_input_tokens"] = int(google.get("max_input_tokens", 0)) + 1
+        mutants.append(("M7 google target unreviewed key stays refused", m7, None, "L3 deployed targets change only in reviewed keys"))
+    else:
+        print("SKIP  M7 (no google decision target in live manifest)", file=sys.stderr)
+        return 1
+
     failures = 0
     for label, live_doc, cand_doc, expected_check in mutants:
         live_arg, cand_arg = live_path, cand_path

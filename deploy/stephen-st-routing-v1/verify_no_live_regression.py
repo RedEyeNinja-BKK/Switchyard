@@ -48,6 +48,13 @@ ALLOWED_TARGET_KEYS = {
     # Batch A: explicit tariff declaration replaces the old free_tier spelling.
     # Batch B: pool membership labels.
     "*": {"free_tier", "groups"},
+    # Batch SD1. The declared state forms on Google's decision target were inverted
+    # against measured behaviour: a bare string is accepted (HTTP 200) and an object
+    # is refused ("The 'type' parameter is required at 'input[0]'"). Correcting the
+    # declaration makes the lane refuse locally what the provider already refuses,
+    # instead of dispatching a request it is guaranteed to reject. Deliberately
+    # narrow: every other key on this target stays unreviewed, and M7 proves it.
+    "direct-google-gemini-decision-1": {"state_forms"},
 }
 ALLOWED_ROUTE_KEYS = {
     # Batch A replaces the dynamic router leg with the six individually qualified
@@ -111,7 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         if name not in cand.get("targets", {}):
             continue  # covered by L1
         other = cand["targets"][name]
-        allowed = ALLOWED_TARGET_KEYS["*"]
+        # Per-target overrides exist for the same reason they do for routes: a reviewed
+        # change to one object must not open that key on every target.
+        allowed = ALLOWED_TARGET_KEYS.get(name, ALLOWED_TARGET_KEYS["*"])
         changed = {k for k in set(body) | set(other) if body.get(k) != other.get(k)}
         if changed - allowed:
             drifted.append(f"{name}:{sorted(changed - allowed)}")

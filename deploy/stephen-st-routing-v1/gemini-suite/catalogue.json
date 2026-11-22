@@ -3,12 +3,21 @@
   "suite": "gemini-free",
   "purpose": "One canonical catalogue of the Gemini free suite's shared facts. Two account profiles project it onto separate credentials; a fact recorded here applies to both, so a quirk measured or fixed for one profile is never re-learned for the other.",
   "captured_from": {
-    "manifest": "releases/20261122T055957Z-7952200d6583170b-53fd9a84/routes.toml",
-    "manifest_sha256": "53fd9a84",
-    "release": "20261122T055957Z-7952200d6583170b-53fd9a84",
+    "manifest": "releases/20261122T190705Z-684df16fda5c0fe9-e008aa96/routes.toml",
+    "manifest_sha256": "e008aa96",
+    "release": "20261122T190705Z-684df16fda5c0fe9-e008aa96",
     "captured_at": "2026-11-22",
     "measured_on": "2026-11-21",
-    "evidence": "docs/evidence/gemini-r3/2026-11-21/OWNER-CONTROLLING-ALL-FREE-CAPABILITIES.md"
+    "evidence": "docs/evidence/gemini-r3/2026-11-21/OWNER-CONTROLLING-ALL-FREE-CAPABILITIES.md",
+    "history": [
+      {
+        "release": "20261122T055957Z-7952200d6583170b-53fd9a84",
+        "manifest_sha256": "53fd9a84",
+        "note": "initial capture"
+      }
+    ],
+    "reanchored_at": "2026-11-23",
+    "reanchor_note": "P6 found four drifts between this catalogue and the deployed e008aa96: the Gemma temperature omission on two targets, the inverted decision state form, and a retired model still listed as an owner pool candidate. Corrected to the deployed facts, because the deployed bytes are the source of truth: a catalogue that lags them would silently revert a production fix the moment a delta is rendered from it."
   },
   "scope": {
     "included": "Google AI Studio chat lanes reachable over the OpenAI-compatibility surface, plus the Google decision lane's physical model.",
@@ -160,10 +169,17 @@
         "accepts_reasoning_control": false,
         "hosted_reasoning": "thought_tag",
         "min_output_tokens": 512,
-        "admission_margin_permille": 1300
+        "admission_margin_permille": 1300,
+        "omit_body_fields": [
+          "store",
+          "metadata",
+          "prompt_cache_key",
+          "temperature"
+        ],
+        "omit_body_fields_why": "The three Responses-format names every chat model here omits, plus `temperature`: the surface was measured to answer 400 `Unsupported parameter: temperature`, so a caller-pinned value is dropped instead of relayed. The Gemini Lite targets carry only the three, so this is a fact about these two models, not about the surface."
       },
       "provider_state": "serving",
-      "notes": "Hosted Gemma writes its chain of thought into the visible message as <thought>…</thought>; the marker is what keeps the monologue out of the caller's text. Below a 512-token reservation it returns no visible text at all, because the thought is charged against the caller's output budget. The 1,300-per-mille admission pad is the measured estimator under-count on this lane.",
+      "notes": "Hosted Gemma writes its chain of thought into the visible message as <thought>\u2026</thought>; the marker is what keeps the monologue out of the caller's text. Below a 512-token reservation it returns no visible text at all, because the thought is charged against the caller's output budget. The 1,300-per-mille admission pad is the measured estimator under-count on this lane.",
       "wire": "openai_compat"
     },
     {
@@ -188,7 +204,14 @@
         "min_output_tokens": 512,
         "admission_margin_permille": 1300,
         "dedicated_client_reason": "The 31B answers 503 while it spins up and the lane default cooldown is five seconds, short enough to spend a free-minute budget re-asking a model that is still starting. It therefore needs its own client entry (identical except for failure_cooldown_ms) rather than a cooldown group, which would cool the small model down with the large one.",
-        "failure_cooldown_ms": 300000
+        "failure_cooldown_ms": 300000,
+        "omit_body_fields": [
+          "store",
+          "metadata",
+          "prompt_cache_key",
+          "temperature"
+        ],
+        "omit_body_fields_why": "The three Responses-format names every chat model here omits, plus `temperature`: the surface was measured to answer 400 `Unsupported parameter: temperature`, so a caller-pinned value is dropped instead of relayed. The Gemini Lite targets carry only the three, so this is a fact about these two models, not about the surface."
       },
       "provider_state": "serving",
       "notes": "Same Gemma quirks as the 26B, plus the spin-up cooldown.",
@@ -276,10 +299,11 @@
           "score": true
         },
         "state_forms": {
-          "plain_string": false,
-          "structured": true
+          "plain_string": true,
+          "structured": false
         },
-        "decision_base_url": "https://generativelanguage.googleapis.com"
+        "decision_base_url": "https://generativelanguage.googleapis.com",
+        "state_forms_why": "Measured: /v1beta/decisions accepts a bare-string input (HTTP 200) and rejects an untyped object (HTTP 400). The declaration here was inverted, which is what broke google-decision and the smart-decision lane; the deployed manifest records the corrected form and this catalogue follows the deployed bytes."
       },
       "provider_state": "serving",
       "notes": "Typed-decision lane. It shares the suite's credential and project but not its chat route policy, so it is catalogued here and projected identically by both profiles as a NON-CHAT lane.",

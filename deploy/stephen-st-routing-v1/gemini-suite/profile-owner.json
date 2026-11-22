@@ -89,7 +89,6 @@
         "gemini-3.1-flash-lite",
         "gemini-3.6-flash",
         "gemini-3.8-flash",
-        "gemini-2.5-flash",
         "gemini-4-hydrogen",
         "gemma-4-26b-a4b-it",
         "gemma-4-31b-it"
@@ -100,7 +99,8 @@
       "reasoning": true,
       "vision": false,
       "video": false,
-      "policy": "MEASURED: the pool orders by this deployment's own observations (completion, then latency) once a candidate has enough of them, so a replacement model is adopted without a config change. Ordering is a cost and quality decision over one credential at one price, which is why it is a passthrough rather than a composite."
+      "policy": "MEASURED: the pool orders by this deployment's own observations (completion, then latency) once a candidate has enough of them, so a replacement model is adopted without a config change. Ordering is a cost and quality decision over one credential at one price, which is why it is a passthrough rather than a composite.",
+      "candidate_note": "gemini-2.5-flash is retired_404 upstream (Google answers 404 for new users and points at 3.5-flash-lite), so it leaves the pool rather than spending a call to rediscover the retirement."
     },
     {
       "name": "smart-gemini-chat",

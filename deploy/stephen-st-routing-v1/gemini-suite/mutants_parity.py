@@ -13,11 +13,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# The baseline this suite verifies against. It moved from 53fd9a84 to e008aa96 when the
+# catalogue was re-anchored to the deployed bytes, and a mutation harness that names the
+# wrong baseline would report every mutation as CAUGHT for the wrong reason (P7 failing).
+MANIFEST = Path(os.environ.get("PARITY_MANIFEST", "/var/tmp/c5/live-e008aa96.toml"))
+EXPECTED_HASH = os.environ.get("PARITY_HASH", "e008aa96")
+OUT_DIR = Path(os.environ.get("PARITY_OUT", "/var/tmp/c5/parity-out"))
 BACKUP = Path("/var/tmp/st1/work/mut-backup-parity")
 FILES = ["catalogue.json", "profile-owner.json", "profile-stephen.json", "project.py"]
 
@@ -60,7 +67,14 @@ def edit_text(name: str, old: str, new: str) -> None:
 
 def verify() -> tuple[int, str]:
     completed = subprocess.run(
-        [sys.executable, "verify_parity.py", "--expected-capture-hash", "53fd9a84"],
+        [
+            sys.executable,
+            "verify_parity.py",
+            "--manifest",
+            str(MANIFEST),
+            "--expected-capture-hash",
+            EXPECTED_HASH,
+        ],
         cwd=HERE,
         capture_output=True,
         text=True,
@@ -176,7 +190,8 @@ def main() -> int:
     if code != 0 or "0 failure(s)" not in output:
         failures += 1
 
-    Path("/var/tmp/st1/work/mutants-parity.json").write_text(json.dumps(report, indent=2))
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / "mutants-parity.json").write_text(json.dumps(report, indent=2))
     print(f"mutations={len(MUTATIONS)} failures={failures}")
     return 1 if failures else 0
 

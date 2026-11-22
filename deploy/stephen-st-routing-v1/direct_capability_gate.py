@@ -99,8 +99,10 @@ def _carriers(route_name: str, route: dict, target: dict, medium: str, errors: l
         errors.append(f"CARRIER_WITH_DISABLED_MEDIUM {route_name} {field}")
 
 
-def analyze(doc: dict, advertised: set[str] | None = None) -> dict:
+def analyze(doc: dict, advertised: set[str] | dict | None = None) -> dict:
     names = _direct_names(doc)
+    listed = set(advertised) if advertised is not None else None
+    live_entries = advertised if isinstance(advertised, dict) else None
     rows = []
     errors: list[str] = []
     for name in names:
@@ -125,8 +127,34 @@ def analyze(doc: dict, advertised: set[str] | None = None) -> dict:
         if all(_boolean(route.get(k)) for k in BOOL_FIELDS):
             _carriers(name, route, target, "vision", issues)
             _carriers(name, route, target, "video", issues)
-        if advertised is not None and name not in advertised:
+        if listed is not None and name not in listed:
             issues.append(f"DIRECT_NOT_ADVERTISED {name}")
+        if live_entries is not None and name in live_entries:
+            live = live_entries[name]
+            capabilities = live.get("capabilities")
+            if not isinstance(capabilities, dict):
+                issues.append(f"RUNTIME_CAPABILITY_METADATA_MISSING {name}")
+            else:
+                for key in BOOL_FIELDS:
+                    if capabilities.get(key, "MISSING") != route.get(key, "NOT_DECLARED"):
+                        issues.append(f"RUNTIME_ADVERTISEMENT_DRIFT {name}.{key}: "
+                                      f"manifest={route.get(key, 'NOT_DECLARED')!r}, "
+                                      f"GET={capabilities.get(key, 'MISSING')!r}")
+                if live.get("context_length", "MISSING") != route.get("context_window"):
+                    issues.append(f"RUNTIME_CONTEXT_DRIFT {name}: "
+                                  f"manifest={route.get('context_window')!r}, "
+                                  f"GET={live.get('context_length', 'MISSING')!r}")
+                for medium, carrier_field in (("vision", "image_carriers"),
+                                               ("video", "video_carriers")):
+                    declared_carrier = route.get("image_carrier" if medium == "vision"
+                                                 else "video_carrier", "both")
+                    expected_carrier = ([declared_carrier]
+                                        if route.get(medium) is True
+                                        and declared_carrier in ("inline", "remote") else None)
+                    if capabilities.get(carrier_field, "MISSING") != expected_carrier:
+                        issues.append(f"RUNTIME_CARRIER_DRIFT {name}.{carrier_field}: "
+                                      f"manifest={expected_carrier!r}, "
+                                      f"GET={capabilities.get(carrier_field, 'MISSING')!r}")
         if target.get("video") is True and client.get("format") != "openai_responses":
             issues.append(f"VIDEO_WIRE_MISMATCH {name} {client.get('format')}")
         route_window = route.get("context_window")
@@ -202,11 +230,18 @@ def analyze(doc: dict, advertised: set[str] | None = None) -> dict:
             "status": "PASS" if not errors else "REFUSED"}
 
 
-def _model_ids(blob: dict) -> set[str]:
+def _model_entries(blob: dict) -> dict[str, dict]:
     rows = blob.get("data")
     if not isinstance(rows, list):
         _fail("MODEL_LIST_BAD_SHAPE", "/v1/models", "data must be a list")
-    return {row["id"] for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    entries = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+            _fail("MODEL_LIST_INVALID_ENTRY", "/v1/models", repr(row)[:128])
+        if row["id"] in entries:
+            _fail("MODEL_LIST_DUPLICATE_ID", row["id"], "duplicate runtime advertisement")
+        entries[row["id"]] = row
+    return entries
 
 
 def main(argv=None) -> int:
@@ -217,7 +252,7 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     try:
         doc = tomllib.loads(a.manifest.read_text())
-        advertised = _model_ids(json.loads(a.models.read_text())) if a.models else None
+        advertised = _model_entries(json.loads(a.models.read_text())) if a.models else None
         report = analyze(doc, advertised)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)

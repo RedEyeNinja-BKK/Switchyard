@@ -1,3 +1,5 @@
+# Mutation control for the Batch A verifier
+# run 2026-11-22T06:43:11Z
 PASS  CONTROL unmutated candidate passes (rc=0)
 PASS  M1 ST_Free keeps the dynamic router: rc=1 caught_by=A8 ok
 PASS  M2 ST_Free gains a metered leg: rc=1 caught_by=A8 ok

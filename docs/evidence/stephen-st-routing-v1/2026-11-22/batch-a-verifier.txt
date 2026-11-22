@@ -1,3 +1,5 @@
+# Batch A verifier - baseline = DEPLOYED 53fd9a84 (R6 manifest), candidate = batch A
+# run 2026-11-22T06:43:03Z
 PASS  A1 removed objects are exactly the dynamic selector                             n=2    targets=['stephen-openrouter-free'] routes=['direct-openrouter-stephen-openrouter-free']
 PASS  A2 nothing added                                                                n=111  targets=53->52 routes=60->59
 PASS  A3 changed targets are exactly the declared free leaves                         n=7    stephen-dots-3-note-preview-free,stephen-ernie-5_5-flash-preview-free,stephen-flint-v1-0-free,stephen-gemma-4-26b-a4b-it-free,stephen-gemma-4-31b-it-free,stephen-ling-3_2-flash-free,stephen-nemotron-3-5-super-vl-free
@@ -15,7 +17,7 @@ PASS  A14 upstream ids are unique across Stephen direct leaves                  
 PASS  A15 direct-leaf context equals the provider window, never the parent cap        n=9  
 PASS  A16 declared tariff matches the provider price                                  n=8  
 PASS  A17 free_tier is declared on exactly the free leaves                            n=10   declared=7 truth=7
-PASS  A18 no dangling reference, and no new one introduced                            n=126  candidate=[] baseline=0
+PASS  A18 no dangling reference, and no new one introduced                            n=128  candidate=[] baseline=0
 PASS  A19 the removed dynamic target is named nowhere in the candidate                n=2    occurrences=0
 PASS  A20 no nested composite                                                         n=9    nested=[]
 PASS  A21 ST_Route keeps children, credential-only crossing and the 262144 cap        n=3    children=['ST_Free', 'ST_Paid'] cross_on=credential_block ctx=262144
@@ -24,4 +26,4 @@ PASS  A23 every Stephen route appears in the truth table                        
 PASS  A24 truth table matches both the candidate and the captured provider facts      n=10   drift=[]
 PASS  A25 removal has explicit zero-reference evidence                                n=1    target and leaf deleted; the 0 requests naming either in the last 30 days of routing log is the compatibility evidence
 
-25 checks, 458 object judgements, 0 failed
+25 checks, 460 object judgements, 0 failed

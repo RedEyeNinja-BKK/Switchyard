@@ -1,33 +1,41 @@
---- live2/routes-07796640.toml
-+++ /tmp/x.toml
-@@ -1154,4 +1154,5 @@
+--- /var/tmp/st1/live3-routes-53fd9a84.toml	2026-11-22 13:32:06.179509440 +0700
++++ /var/tmp/st1/work/routes-batch-a-v2.toml	2026-11-22 13:37:42.499572118 +0700
+@@ -1221,6 +1221,7 @@
+ [targets.stephen-nemotron-3-5-super-vl-free]
  id = "nvidia/nemotron-3.5-super-vl:free"
  llm_client = "openrouter_stephen"
 +free_tier = true
  vision = true
  video = true
-@@ -1167,4 +1168,5 @@
+ video_carrier = "inline"
+@@ -1234,6 +1235,7 @@
+ [targets.stephen-flint-v1-0-free]
  id = "recursive/flint-v1.0:free"
  llm_client = "openrouter_stephen"
 +free_tier = true
  vision = false
  tool_calling = true
-@@ -1175,4 +1177,5 @@
+ reasoning_policy = "enabled"
+@@ -1242,6 +1244,7 @@
+ [targets.stephen-ernie-5_5-flash-preview-free]
  id = "baidu/ernie-5.5-flash-preview:free"
  llm_client = "openrouter_stephen"
 +free_tier = true
  # Explicit false: an omitted capability is "undeclared", which the runner treats
  # as permitted, so only an explicit refusal keeps images off this text-only target.
-@@ -1186,4 +1189,5 @@
+ vision = false
+@@ -1253,6 +1256,7 @@
+ [targets.stephen-ling-3_2-flash-free]
  id = "inclusionai/ling-3.2-flash:free"
  llm_client = "openrouter_stephen"
 +free_tier = true
  vision = true
  video = false
-@@ -1196,14 +1200,4 @@
+ image_carrier = "inline"
+@@ -1264,16 +1268,6 @@
  reasoning_policy = "disabled"
  reasoning_dialect = "openrouter_enabled"
--
+ 
 -[targets.stephen-openrouter-free]
 -# OpenRouter's Free Models Router. It picks an eligible free model per request, so
 -# the exact model is not knowable here and only the router's own contract is stated:
@@ -37,9 +45,12 @@
 -vision = true
 -video = false
 -tool_calling = true
- 
+-
  # ---- Stephen primitive routes ----
-@@ -1219,10 +1213,13 @@
+ # ---- ST_Free: Stephen free ladder ----------------------------------------
+ # Ordered cheapest-capable-first across Stephen's own credential. A caller's
+@@ -1286,12 +1280,15 @@
+ candidates = [
    "stephen-ling-3_2-flash-free",
    "stephen-nemotron-3-5-super-vl-free",
 -  "stephen-openrouter-free",
@@ -58,7 +69,9 @@
 +# callers may be admitted with.
  context_window = 262144
  tool_calling = true
-@@ -1233,7 +1230,7 @@
+ reasoning = true
+@@ -1300,9 +1297,9 @@
+ video_carrier = "inline"
  image_carrier = "inline"
  route_reasoning_policy = "inherit"
 -# The measured smartfree learning carries over: Ling took ~120 s on a 430k-token
@@ -69,42 +82,52 @@
 +# offered first instead of the narrow one being tried and failing.
  escalation_max_input_tokens = 200000
  escalation_target = "stephen-nemotron-3-5-super-vl-free"
-@@ -1297,4 +1294,5 @@
+ 
+@@ -1364,6 +1361,7 @@
+ [targets.stephen-dots-3-note-preview-free]
  id = "dots-studio/dots-3-note-preview:free"
  llm_client = "openrouter_stephen"
 +free_tier = true
  vision = true
  video = false
-@@ -1311,4 +1309,5 @@
+ tool_calling = true
+@@ -1378,6 +1376,7 @@
+ [targets.stephen-gemma-4-26b-a4b-it-free]
  id = "google/gemma-4-26b-a4b-it:free"
  llm_client = "openrouter_stephen"
 +free_tier = true
  vision = true
  video = false
-@@ -1326,4 +1325,5 @@
+ # Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+@@ -1393,6 +1392,7 @@
+ [targets.stephen-gemma-4-31b-it-free]
  id = "google/gemma-4-31b-it:free"
  llm_client = "openrouter_stephen"
 +free_tier = true
  vision = true
  video = false
-@@ -1496,5 +1496,5 @@
+ # Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+@@ -1563,7 +1563,7 @@
+ type = "passthrough"
  target = "stephen-ernie-5_5-flash-preview-free"
  candidates = []
 -context_window = 262144
 +context_window = 1024000
  tool_calling = true
  reasoning = true
-@@ -1507,5 +1507,5 @@
+ vision = false
+@@ -1574,25 +1574,13 @@
+ type = "passthrough"
  target = "stephen-ling-3_2-flash-free"
  candidates = []
 -context_window = 262144
 +context_window = 1048576
  tool_calling = true
  reasoning = true
-@@ -1513,16 +1513,4 @@
+ vision = true
  video = false
  image_carrier = "inline"
--
+ 
 -[routes.direct-openrouter-stephen-openrouter-free]
 -id = "direct-openrouter-stephen-openrouter-free"
 -type = "passthrough"
@@ -116,12 +139,16 @@
 -reasoning = true
 -vision = true
 -video = false
- 
+-
  [routes.direct-openrouter-stephen-glm-5-3-flash]
-@@ -1545,5 +1533,5 @@
+ id = "direct-openrouter-stephen-glm-5-3-flash"
+ type = "passthrough"
+@@ -1612,7 +1600,7 @@
+ type = "passthrough"
  target = "stephen-nemotron-3-5-super-vl-free"
  candidates = []
 -context_window = 262144
 +context_window = 1000000
  tool_calling = true
  reasoning = true
+ vision = true

@@ -71,3 +71,77 @@ site.
 
 Source, tests, candidate and dry-run pass. No production write, no restart and no reload were
 performed. The release remains gated on the Issue #35 release owner's non-overlapping slot.
+
+---
+
+# Batch B - one provider-neutral free pool
+
+Batch B stacks on Batch A. It answers the second half of the charter: `ST_Free` stops being a
+hand-ordered list of legs and becomes a pool whose membership is a fact declared once per leaf.
+
+## What changes
+
+| Edit | Object | From | To | Evidence |
+|---|---|---|---|---|
+| Pool membership | 7 free Stephen leaves | no group | `groups = ["ST_OR_Free"]` | every member is a `:free` slug |
+| Paid membership | 2 metered Stephen leaves | no group | `groups = ["ST_OR_Paid"]` | both billed |
+| Selection policy | route `ST_Free` | declaration order | `selection = "peer"` | equal fitness breaks ties by canonical id |
+| Pool declaration | route `ST_Free` | candidate list only | `pool_groups = ["ST_OR_Free"]` | membership stated where it is checked |
+
+`ST_Gemini_Free` is deliberately **absent**: no qualified Stephen Gemini chat target exists on
+this credential, so naming the group would be a phantom pool member that validates yet can never
+be served. Adding it later is a two-line manifest change and no code change (check B12 pins this).
+
+## Engine change that travels with Batch B
+
+Three additions, no new selection engine:
+
+- `Tariff { Free, Metered, Unknown }` replaces the boolean `free_tier` fact. The third state is
+  what keeps an undeclared target from being counted as free capacity.
+- `RankingPolicy` gives the pool a stated tie-break (canonical id) and an honest treatment of
+  unknown headroom (demoted, not promoted). `RankingPolicy::LEGACY` preserves declaration order
+  for every existing route, so nothing outside the pool changes rank.
+- A pool route filters non-free members before ranking (`not_free_entitled`), so a mislabelled
+  leg cannot serve as a paid escalation one tier below the pool.
+
+`Tariff::is_free()` and `Tariff::draws_on_free_allowance(target)` are two questions and are kept
+separate. The first is economic and strict (`Unknown` is never free); the second is the provider's
+own allowance scoping and falls back to `is_free_scope` for `Unknown`. Collapsing them regresses
+`a_free_scope_quota_blocks_a_later_free_only_child_on_the_same_credential`.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `apply_batch_b.py` | applies Batch A, then the group labels and pool declaration; idempotency-guarded |
+| `verify_batch_b.py` | 27 checks; B17-B20 guard structure, B1-B13 guard membership |
+| `verify_no_live_regression.py` | anchored on the DEPLOYED manifest; refuses any deployed object the candidate drops or edits outside a named allowlist |
+| `mutants_live_regression.py` | 4 regression mutants + a round-trip fidelity gate + an unmutated control |
+
+## Run
+
+```sh
+python3 apply_batch_b.py --baseline routes.toml --out batch-b.toml --diff
+python3 verify_batch_a.py --baseline routes.toml --candidate <batch-a.toml> \
+    --truth stephen-st-truth-table.json --facts or-model-facts-20261122.json
+python3 verify_batch_b.py --baseline <batch-a.toml> --candidate batch-b.toml
+python3 verify_no_live_regression.py --live routes.toml --candidate batch-b.toml
+python3 mutants_live_regression.py routes.toml batch-b.toml
+```
+
+`apply_batch_b.py` applies Batch A internally, so its `--baseline` is the **deployed** manifest,
+not the Batch A output. Passing a Batch A output is refused by the idempotency guard.
+
+## Rebase onto R6 (2026-11-22)
+
+The batches were first generated against `53fd9a84`'s predecessor. R6 landed the music and
+robotics lanes on the same manifest while this work was in progress, so the stack was regenerated
+against the deployed bytes and the commits were replayed onto `97768e1` (R6 tip). `94bcd30..97768e1`
+touches no crate source, so the rebase cannot change the binary's behaviour. Proof that the base
+is production: the R6 receipt names binary `7952200d…` and manifest `53fd9a84…`, and both are the
+hashes measured on the host.
+
+A candidate binary built before the rebase could not even parse the deployed manifest
+(`unknown field max_session_audio_bytes`). That failure is why `verify_no_live_regression.py`
+exists: a batch verifier that only compares its own two files cannot see a section another
+workstream added to production after the snapshot was taken.

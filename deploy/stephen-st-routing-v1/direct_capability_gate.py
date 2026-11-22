@@ -160,6 +160,9 @@ def analyze(doc: dict, advertised: set[str] | dict | None = None) -> dict:
         route_window = route.get("context_window")
         target_window = target.get("context_window")
         input_ceiling = target.get("max_input_tokens")
+        if type(route_window) is not int or route_window <= 0:
+            issues.append(f"ROUTE_CONTEXT_UNQUALIFIED {name}: /v1/models context_length "
+                          "would be null; set a source-backed conservative route window")
         if not any(type(value) is int and value > 0
                    for value in (route_window, target_window, input_ceiling)):
             issues.append(f"CONTEXT_CAP_UNQUALIFIED {name}: no positive bounded "

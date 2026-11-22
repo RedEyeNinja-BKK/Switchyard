@@ -129,6 +129,17 @@ def analyze(doc: dict, advertised: set[str] | None = None) -> dict:
             issues.append(f"DIRECT_NOT_ADVERTISED {name}")
         if target.get("video") is True and client.get("format") != "openai_responses":
             issues.append(f"VIDEO_WIRE_MISMATCH {name} {client.get('format')}")
+        route_window = route.get("context_window")
+        target_window = target.get("context_window")
+        input_ceiling = target.get("max_input_tokens")
+        if not any(type(value) is int and value > 0
+                   for value in (route_window, target_window, input_ceiling)):
+            issues.append(f"CONTEXT_CAP_UNQUALIFIED {name}: no positive bounded "
+                          "route window, target window, or input ceiling")
+        if type(route_window) is int and type(target_window) is int and route_window > target_window:
+            issues.append(f"CONTEXT_OVERCLAIM {name}: route {route_window} > target {target_window}")
+        if type(input_ceiling) is int and type(target_window) is int and input_ceiling > target_window:
+            issues.append(f"INPUT_CAP_OVERCLAIM {name}: input {input_ceiling} > target context {target_window}")
         row = {
             "route": name,
             "target": target_name,
@@ -146,6 +157,29 @@ def analyze(doc: dict, advertised: set[str] | None = None) -> dict:
             "route_context_window": route.get("context_window", "NOT_DECLARED"),
             "target_context_window": target.get("context_window", "NOT_DECLARED"),
             "max_input_tokens": target.get("max_input_tokens", "NOT_DECLARED"),
+            "min_output_tokens": target.get("min_output_tokens", "NOT_DECLARED"),
+            "max_output_tokens": target.get("max_output_tokens", "NOT_DECLARED"),
+            "route_reasoning_policy": route.get("route_reasoning_policy", "INHERIT_TARGET"),
+            "route_reasoning_control": route.get("reasoning", "NOT_DECLARED"),
+            "target_reasoning_effort": target.get("reasoning_effort", "NOT_DECLARED"),
+            "target_reasoning_policy": target.get("reasoning_policy", "NOT_DECLARED"),
+            "target_reasoning_dialect": target.get("reasoning_dialect", "NOT_DECLARED"),
+            "hosted_reasoning": target.get("hosted_reasoning", "NOT_DECLARED"),
+            "accepts_reasoning_control": target.get("accepts_reasoning_control", "NOT_DECLARED"),
+            "free_tier": target.get("free_tier", "NOT_DECLARED"),
+            "daily_request_limit": target.get("daily_request_limit", "NOT_DECLARED"),
+            "requests_per_minute": target.get("requests_per_minute", "NOT_DECLARED"),
+            "input_tokens_per_minute": target.get("input_tokens_per_minute", "NOT_DECLARED"),
+            "max_retries": client.get("max_retries", "NOT_DECLARED"),
+            "locality": client.get("locality", "NOT_DECLARED"),
+            "admission_input": {
+                "text": "CHAT_INPUT",
+                "image": "ADMITTED" if route.get("vision") is True and target.get("vision") is True else "REFUSED",
+                "video": "ADMITTED" if route.get("video") is True and target.get("video") is True else "REFUSED",
+                "audio": "REFUSED_BY_SWITCHYARD_CURRENT_INGRESS",
+                "pdf": "NOT_A_STANDALONE_ROUTE_ADMISSION_FLAG",
+            },
+            "output_generation": "NOT_A_CHAT_DIRECT_CAPABILITY",
             "state": "QUALIFIED_DECLARATIONS" if not issues else "EXECUTION_METADATA_BLOCKED",
             "problems": issues,
         }

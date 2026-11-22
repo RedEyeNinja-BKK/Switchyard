@@ -4,6 +4,7 @@
 //! One configured algorithm and the clients that serve its targets.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -266,6 +267,114 @@ fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrie
     }
 }
 
+/// Decides whether the terminal leg may be spent, and names why.
+///
+/// This is the whole policy, kept as a free function so its decision table can be
+/// exercised without a live route: every branch is a claim about the primary pool, and a
+/// wrong claim either strands a request the pool could not serve or spends a paid leg it
+/// did not need to.
+///
+/// * `capable` - targets the deployment says could serve this request at all;
+/// * `dispatchable` - of those, the ones no credential block excludes right now;
+/// * `attempts` - every upstream call this request actually made;
+/// * `credential_of` - the credential that serves a target, when configuration says.
+///
+/// Returns `None` when the pool's unavailability is not provable, which is the safe
+/// answer: the caller gets the primary error instead of a paid escalation.
+pub(crate) fn authorize_terminal(
+    capable: &[ModelId],
+    dispatchable: &HashSet<ModelId>,
+    attempts: &[AttemptTrace],
+    credential_of: impl Fn(&ModelId) -> Option<String>,
+) -> Option<&'static str> {
+    // Nothing in the pool could serve this request even with unlimited capacity, so
+    // "exhausted" would be a different claim from the true one. Refuse.
+    if capable.is_empty() {
+        return None;
+    }
+    if dispatchable.is_empty() {
+        // Every capable leg is covered by a credential block, so the pool is provably out
+        // of capacity without a single request being made.
+        return Some("primary_pool_blocked");
+    }
+    let primary_attempts: Vec<&AttemptTrace> = attempts
+        .iter()
+        .filter(|attempt| capable.iter().any(|model| model.as_str() == attempt.model))
+        .collect();
+    if primary_attempts.is_empty() {
+        return None;
+    }
+    // One leg failing for a reason that is about the request - a policy answer, a
+    // malformed tool call, a stream that broke mid-delivery - is enough to keep the
+    // terminal leg out: retrying it elsewhere would fail again, with a bill attached.
+    if !primary_attempts
+        .iter()
+        .all(|attempt| is_capacity_outcome(attempt.outcome))
+    {
+        return None;
+    }
+    let attempted: HashSet<&str> = primary_attempts
+        .iter()
+        .map(|attempt| attempt.model.as_str())
+        .collect();
+    // A capable leg can only be left unattempted if the candidate walk stopped early, and
+    // the walk stops early only on a credential-scoped failure (a 401 or a scope-wide 429).
+    // A timeout is not in `is_capacity_outcome`, so it is already excluded above. Any
+    // unattempted leg must therefore be explained by a credential this request already
+    // proved dead. Anything else is a gap in coverage, not exhaustion.
+    let dead: HashSet<String> = primary_attempts
+        .iter()
+        .filter(|attempt| is_credential_scope_outcome(attempt.outcome))
+        .filter_map(|attempt| credential_of(&ModelId::from(attempt.model.as_str())))
+        .collect();
+    for model in capable.iter().filter(|model| dispatchable.contains(*model)) {
+        if attempted.contains(model.as_str()) {
+            continue;
+        }
+        let Some(credential) = credential_of(model) else {
+            return None;
+        };
+        if !dead.contains(&credential) {
+            return None;
+        }
+    }
+    Some("primary_pool_exhausted")
+}
+
+/// Whether an attempt ended because a leg ran out of capacity or was unavailable.
+///
+/// This is the closed list a terminal leg may be authorized by. It deliberately excludes
+/// `timeout` (a delivered stream broke, which says nothing about the next leg),
+/// `context_window` (a request-fit fact, not a capacity one), `http_403` and `http_400`
+/// (answers about the request or the account's permissions), `empty_answer` (a quality
+/// fact about one model), and every translation or configuration fault.
+fn is_capacity_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "daily_allowance_exhausted"
+            | "daily_allowance_unavailable"
+            | "minute_window"
+            | "minute_window_too_small"
+            | "http_401"
+            | "http_402"
+            | "http_429"
+            | "http_5xx"
+            | "transport"
+            | "unavailable"
+            | "attempt_timeout"
+    )
+}
+
+/// Whether an attempt's outcome says the CREDENTIAL is unusable, rather than the request.
+///
+/// Only used to explain why a capable leg was never called. The candidate walk stops early
+/// only on these two classes, so an unattempted leg here shares a credential the walk
+/// already proved dead. A plain per-model 429 never stops the walk — it falls through to the
+/// next candidate — so any 429 that leaves a leg unattempted is scope-wide by construction.
+fn is_credential_scope_outcome(outcome: &str) -> bool {
+    matches!(outcome, "http_401" | "http_402" | "http_429")
+}
+
 /// Caller credential family required by a forwarded-auth route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallerAuthKind {
@@ -420,6 +529,20 @@ pub struct Route {
     /// asked for and the recorded reason. A held route keeps its registration so the refusal
     /// can be specific, but it serves nothing and is not advertised.
     held: Option<HeldRoute>,
+    /// The target groups whose members are this route's candidate pool, when it declares one.
+    ///
+    /// Presence also selects the provider-neutral ranking policy. Keeping the declaration
+    /// rather than a boolean means the trace can name the groups the pool was built from,
+    /// and a pool route is recognisable at runtime, not only in the manifest that created it.
+    pool_groups: Option<Vec<String>>,
+    /// Targets this route may reach only when every eligible primary candidate is
+    /// verifiably unavailable, in declared order.
+    ///
+    /// Deliberately not part of `models`: a terminal leg must never be ranked with the
+    /// primary candidates, or it would become a peer that merely sorts last and would
+    /// serve whenever the pool was busy. It is dispatched as its own list, under its own
+    /// exhaustion gate, so "this provider is tired" cannot buy it a request.
+    terminal: Option<Arc<RuntimeModels>>,
 }
 
 /// A route whose targets are all held out of service, with the evidence for holding it.
@@ -473,7 +596,52 @@ impl Route {
             selector: None,
             daily_allowances: Arc::new(HashMap::new()),
             held: None,
+            pool_groups: None,
+            terminal: None,
         }
+    }
+
+    /// Declares a leg this route reaches only after its entire eligible primary pool is
+    /// verifiably unavailable.
+    ///
+    /// The terminal models are kept out of the ranked candidate set on purpose: they are a
+    /// last resort, not a peer. `smart-nt` is the shape this exists for — Gemini NT leaves
+    /// and Luna NT compete as one provider-neutral pool, and a metered DeepSeek NT leg is
+    /// reached only when none of them can answer.
+    pub fn with_terminal_fallback(mut self, terminal: RuntimeModels) -> Self {
+        self.terminal = Some(Arc::new(terminal));
+        self
+    }
+
+    /// The terminal targets this route declares, in declared order.
+    pub fn terminal_models(&self) -> Vec<ModelId> {
+        self.terminal
+            .as_ref()
+            .map(|terminal| terminal.all_models())
+            .unwrap_or_default()
+    }
+
+    /// Whether the primary pool is verifiably out of capacity, and which claim says so.
+    ///
+    /// `None` means the terminal leg is not authorized. The two `Some` answers are the ones
+    /// an operator acts on differently:
+    ///
+    /// * `primary_pool_blocked` — every leg that could serve this request is covered by a
+    ///   credential block. Capacity is provably gone and nothing was dispatched.
+    /// * `primary_pool_exhausted` — legs were dispatched and every one failed on capacity or
+    ///   availability, with no capable leg left unexplained.
+    ///
+    /// Everything else refuses: no leg could ever serve the request, a leg failed for a
+    /// reason that is about the request, or a capable leg's absence is unexplained.
+    fn terminal_authorization(
+        &self,
+        capable: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+    ) -> Option<&'static str> {
+        authorize_terminal(capable, dispatchable, attempts, |model| {
+            self.target_credential(model).map(str::to_string)
+        })
     }
 
     /// Enables measured ordering among the candidates this route has already admitted.
@@ -486,6 +654,39 @@ impl Route {
     ) -> Self {
         self.selector = Some(selector);
         self
+    }
+
+    /// Declares that this route's candidates come from `groups`, ranked as peers.
+    ///
+    /// The groups are labels on the targets; this route does not choose between the labels.
+    /// It records them so a decision record can say which pool a request was ranked in, and
+    /// so the provider-neutral ranking policy is a property of the route rather than of the
+    /// spelling of its candidate list.
+    pub fn with_pool_groups(mut self, groups: Vec<String>) -> Self {
+        self.pool_groups = Some(groups);
+        self
+    }
+
+    /// The ranking policy this route uses.
+    ///
+    /// A pool route ranks peers: no group is a stage, and the manifest's order is not a
+    /// decision. Every other route keeps the historical policy unchanged.
+    fn ranking_policy(&self) -> crate::selection::RankingPolicy {
+        if self.pool_groups.is_some() {
+            crate::selection::RankingPolicy::PEER
+        } else {
+            crate::selection::RankingPolicy::LEGACY
+        }
+    }
+
+    /// Whether this route is a provider-neutral pool, for reports and tests.
+    pub fn is_peer_pool(&self) -> bool {
+        self.pool_groups.is_some()
+    }
+
+    /// The groups this route's pool is built from, when it declares one.
+    pub fn pool_groups(&self) -> Option<&[String]> {
+        self.pool_groups.as_deref()
     }
 
     /// Records the daily request allowance behind each target model id.
@@ -525,6 +726,53 @@ impl Route {
         self.models.first_model()
     }
 
+    /// The target models a set of credential blocks still leaves servable.
+    ///
+    /// Judged per target, on the credential that target actually draws on. A mixed-provider
+    /// route has targets on more than one credential, so "the route's credential" is not a
+    /// fact: a block on one provider's account must leave every peer on another provider
+    /// servable, and a block on one model's own budget must leave its siblings servable.
+    ///
+    /// A target with no resolved credential is left servable, because a block that cannot be
+    /// attributed to it is not evidence against it.
+    pub fn servable_after_blocks(
+        &self,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> Vec<ModelId> {
+        self.models
+            .all_models()
+            .into_iter()
+            .filter(|model| !self.target_is_blocked(model, blocks))
+            .collect()
+    }
+
+    /// Whether any block covers `model`, on the credential that model draws on.
+    pub fn target_is_blocked(
+        &self,
+        model: &ModelId,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> bool {
+        let Some(credential) = self.target_credentials.get(model).map(String::as_str) else {
+            return false;
+        };
+        blocks
+            .iter()
+            .any(|block| block.blocks(credential, model.as_str()))
+    }
+
+    /// The exclusion code for the first block covering `model`, for the decision record.
+    fn block_exclusion(
+        &self,
+        model: &ModelId,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> Option<&'static str> {
+        let credential = self.target_credentials.get(model).map(String::as_str)?;
+        blocks
+            .iter()
+            .find(|block| block.blocks(credential, model.as_str()))
+            .map(switchyard_llm_client::CredentialBlock::exclusion_code)
+    }
+
     /// The provider slug of the first target model id, when one exists.
     pub fn first_target_slug(&self) -> &str {
         self.first_target_model()
@@ -533,15 +781,31 @@ impl Route {
             .leak()
     }
 
-    /// Whether every servable target on this route is a `:free` slug.
+    /// Whether every servable target on this route draws on the free-model allowance.
     ///
     /// A free-scope quota blocks the route only when this is true; a route with a paid
     /// candidate still has a servable leg on the same credential.
+    ///
+    /// Judged with the same predicate the failing call used, so the two levels cannot
+    /// disagree. Reading only the `:free` suffix made the provider's Free Models Router
+    /// (`openrouter/free`) look paid, and a free-only route carrying it was then treated
+    /// as having a paid leg: the child was entered after the account-wide allowance was
+    /// gone and its first call was guaranteed to be rejected.
     pub fn all_targets_free(&self) -> bool {
-        self.models
-            .all_models()
-            .iter()
-            .all(|model| model.as_str().ends_with(":free"))
+        // The question this answers is which allowance the requests are charged against,
+        // because that is what the caller (a composite holding a provider quota block) needs
+        // to know. Declared tariff decides it; an undeclared target falls back to the
+        // provider's own allowance scoping, which is a fact about the provider's billing
+        // scope rather than a guess about cost. The economic question - is this request
+        // free - is `Tariff::is_free`, asked separately by selection, and it never treats
+        // `Unknown` as free.
+        let facts = self.clients.target_capabilities();
+        self.models.all_models().iter().all(|model| {
+            let tariff = facts
+                .get(model)
+                .map_or(switchyard_llm_client::Tariff::Unknown, |facts| facts.tariff);
+            tariff.draws_on_free_allowance(model.as_str())
+        })
     }
 
     /// Returns the configured libsy algorithm name.
@@ -726,6 +990,22 @@ impl Route {
         request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
+        self.execute_with_blocks(request, observer, &[]).await
+    }
+
+    /// Execute with credential blocks carried in from the surrounding composite.
+    ///
+    /// A block excludes the candidates it covers and nothing else: the survivors still
+    /// compete in the same order, under the same gates. That is what lets one provider's
+    /// exhausted account or one model's spent budget leave its peers in the pool instead of
+    /// condemning the whole child — which is the mixed-credential defect this parameter
+    /// exists to remove.
+    pub async fn execute_with_blocks(
+        &self,
+        request: Request,
+        observer: Option<RunObserver>,
+        blocks: &[switchyard_llm_client::CredentialBlock],
+    ) -> Result<RunOutput, RunnerError> {
         // A held route has no servable target at all, so the refusal is decided before any
         // request shaping: nothing is inspected, planned or dispatched. Reported here rather
         // than as an ineligible candidate so the caller gets the provider's evidence instead
@@ -755,7 +1035,20 @@ impl Route {
         // that was never contacted can still say why. The codes are a closed vocabulary:
         // they name a rule, never a payload. `unsupported_capability` already answers with
         // one ("vision", "tool_calling", "video", "reasoning", "image_carrier", ...).
-        let verdict = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
+        // A provider-neutral pool is a *free* pool: its membership is the eligible free leaves
+        // of each provider, so a candidate whose tariff is not positively declared free is
+        // excluded before it can be ranked. Without this, a leg listed by mistake would
+        // compete one tier below the free candidates and then serve whenever the free pool
+        // was busy, which is a paid escalation nobody approved. `unknown` fails closed for
+        // the same reason: an undeclared tariff is not evidence of free entitlement.
+        let pool_members_only_free = self.is_peer_pool();
+        // The block gate and the capability gate are separate questions, and the terminal
+        // leg's exhaustion rule needs both answers. `capability_gate` asks "could this
+        // target serve this request at all"; `verdict` adds "and is it allowed to right
+        // now". A pool whose every capable leg is merely blocked is exhausted; a pool where
+        // no leg is capable is a request nobody can serve, and must be refused rather than
+        // handed to a paid leg as if capacity had run out.
+        let capability_gate = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
             let Some(facts) = facts.get(model) else {
                 // Uncharacterised rather than incapable: permitted, except for video,
                 // which no target may receive without stating that it can read it.
@@ -765,6 +1058,9 @@ impl Route {
                     Ok(())
                 };
             };
+            if pool_members_only_free && !facts.tariff.is_free() {
+                return Err("not_free_entitled");
+            }
             // Physical fit, judged on facts the deployment states about one backing
             // model. A request that cannot fit is not a request the target should be
             // asked to refuse: the route advances instead, which is what makes an
@@ -846,8 +1142,38 @@ impl Route {
                 None => Ok(()),
             }
         };
+        // The block gate wraps the capability gate, so an excluded candidate's reason names
+        // the credential when it was the credential, and the request when it was the
+        // request. Judged on this target's own credential, so a block on one provider's
+        // account or one model's budget never reaches a peer that is still healthy, and
+        // never becomes a paid escalation either: a paid leg is only reached by the
+        // route's own crossing policy.
+        let verdict = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
+            match self.block_exclusion(model, blocks) {
+                Some(code) => Err(code),
+                None => capability_gate(model),
+            }
+        };
         let considered = self.models.all_models();
         let verdicts: Vec<Result<(), &'static str>> = considered.iter().map(&verdict).collect();
+        // Snapshot the two answers the terminal leg's exhaustion rule needs, while `request`
+        // is still borrowed read-only. Both gates read request facts, so they cannot be
+        // re-evaluated after the request is moved into the reasoning-policy rewrite below.
+        let capable_legs: Vec<switchyard_protocol::ModelId> = considered
+            .iter()
+            .filter(|model| capability_gate(model).is_ok())
+            .cloned()
+            .collect();
+        let dispatchable_legs: HashSet<switchyard_protocol::ModelId> = capable_legs
+            .iter()
+            .filter(|model| verdict(model).is_ok())
+            .cloned()
+            .collect();
+        let terminal_servable: HashSet<switchyard_protocol::ModelId> = self
+            .terminal_models()
+            .into_iter()
+            .filter(|model| verdict(model).is_ok())
+            .collect();
         let models = self.models.filtered(&|model| verdict(model).is_ok());
         // Among candidates that survived every hard gate, a route may prefer what this
         // deployment has actually observed. This reorders one already-admitted list and
@@ -868,11 +1194,15 @@ impl Route {
                     .into_iter()
                     .map(|model| {
                         let facts = facts.get(&model);
+                        // The tier is the declared tariff. `Unknown` ranks as metered: it is
+                        // not evidence of free eligibility, and a free pool that admitted it
+                        // would be spending a request on a cost nobody declared.
                         crate::selection::Candidate {
-                            tier: if facts.is_some_and(|facts| facts.free_tier) {
-                                crate::selection::CostTier::Free
-                            } else {
-                                crate::selection::CostTier::Paid
+                            tier: match facts.map(|facts| facts.tariff) {
+                                Some(switchyard_llm_client::Tariff::Free) => {
+                                    crate::selection::CostTier::Free
+                                }
+                                _ => crate::selection::CostTier::Paid,
                             },
                             remaining_today: self
                                 .daily_allowances
@@ -885,7 +1215,8 @@ impl Route {
                     })
                     .collect();
                 let declared = self.models.all_models();
-                scores = selector.explain(&candidates, demand, &declared);
+                scores =
+                    selector.explain_with(&candidates, demand, &declared, self.ranking_policy());
                 let ordered: Vec<switchyard_protocol::ModelId> =
                     scores.iter().map(|score| score.model.clone()).collect();
                 let unchanged = candidates
@@ -970,15 +1301,17 @@ impl Route {
                     // The selector's own figures win where it ran; without a selector the
                     // record still names the tier and the pressure the gates judged by,
                     // rather than reporting a zero it never measured.
-                    let free = score
-                        .map(|score| score.tier == crate::selection::CostTier::Free)
-                        .or_else(|| facts.map(|facts| facts.free_tier))
-                        .unwrap_or(false);
+                    // The tier a report prints is the declared tariff, including the case
+                    // where the deployment declared nothing: `unknown` is a distinct answer
+                    // from `paid`, and collapsing it into `paid` would hide a cost the
+                    // deployment never verified.
+                    let tariff =
+                        facts.map_or(switchyard_llm_client::Tariff::Unknown, |facts| facts.tariff);
                     CandidateTrace {
                         model: model.to_string(),
                         eligible: verdict.is_ok(),
                         exclusion: verdict.err(),
-                        tier: if free { "free" } else { "paid" },
+                        tier: tariff.as_str(),
                         rank: rank_of.get(model).copied(),
                         remaining_today: score.and_then(|score| score.remaining_today),
                         pressure_permille: score.map_or_else(
@@ -1003,6 +1336,10 @@ impl Route {
             demand_tokens: demand.required_tokens(),
             estimated_input_tokens,
             promotion: promoted.map(|model| model.to_string()),
+            pool: self.pool_groups.as_ref().map(|groups| groups.join(",")),
+            terminal: self.terminal_models().iter().map(ToString::to_string).collect(),
+            terminal_crossed: false,
+            terminal_reason: None,
         };
         if models.is_empty() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
@@ -1062,18 +1399,47 @@ impl Route {
         // has been observed, or it would report a dispatch with no outcomes.
         let report = observer.clone();
         let attempts: Arc<Mutex<Vec<AttemptTrace>>> = Arc::new(Mutex::new(Vec::new()));
-        let observer = Some(recording_observer(
+        let run_observer = Some(recording_observer(
             Arc::clone(&attempts),
             self.selecting_observer(observer),
         ));
-        let result = switchyard_llm_client::run(
+        // A terminal leg is a last resort. Keep a copy of the shaped request only when one
+        // exists, so the common route pays nothing for a capability it does not have.
+        let terminal_request = self.terminal.as_ref().map(|_| request.clone());
+        let mut result = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
             request,
-            Arc::new(models),
-            observer,
+            Arc::new(models.clone()),
+            run_observer.clone(),
         )
         .await;
+        if let (Some(terminal), Some(terminal_request)) = (self.terminal.as_ref(), terminal_request)
+            && result.is_err()
+        {
+            // The primary pool failed. Before anything is spent on the terminal leg, the
+            // claim "the pool is exhausted" has to be true of the same gates the order used
+            // and of what the dispatch actually observed. A single rate limit, a policy
+            // refusal, or a request that never fit is not that claim.
+            let recorded = attempts.lock().clone();
+            let authorization =
+                self.terminal_authorization(&capable_legs, &dispatchable_legs, &recorded);
+            if let Some(reason) = authorization {
+                let servable = terminal.filtered(&|model| terminal_servable.contains(model));
+                if !servable.is_empty() {
+                    trace.terminal_crossed = true;
+                    trace.terminal_reason = Some(reason);
+                    result = switchyard_llm_client::run(
+                        Arc::clone(&self.algorithm),
+                        self.clients.clone(),
+                        terminal_request,
+                        Arc::new(servable),
+                        run_observer,
+                    )
+                    .await;
+                }
+            }
+        }
         {
             trace.attempts = attempts.lock().clone();
             match &result {
@@ -1255,5 +1621,145 @@ mod carrier_tests {
         assert!(Both.includes(Inline) && Both.includes(Remote) && Both.includes(Both));
         assert!(Inline.includes(Inline) && !Inline.includes(Remote) && !Inline.includes(Both));
         assert!(Remote.includes(Remote) && !Remote.includes(Inline) && !Remote.includes(Both));
+    }
+}
+
+#[cfg(test)]
+mod terminal_authorization_tests {
+    use super::{AttemptTrace, HashSet, ModelId, authorize_terminal};
+    use std::collections::HashMap;
+
+    fn legs(ids: &[(&str, &str)]) -> (Vec<ModelId>, HashMap<ModelId, String>) {
+        let mut models = Vec::new();
+        let mut credentials = HashMap::new();
+        for (model, credential) in ids {
+            let id = ModelId::from(*model);
+            models.push(id.clone());
+            credentials.insert(id, (*credential).to_string());
+        }
+        (models, credentials)
+    }
+
+    fn attempt(model: &str, outcome: &'static str) -> AttemptTrace {
+        AttemptTrace {
+            model: model.to_string(),
+            phase: "routing",
+            outcome,
+            duration_ms: 1,
+            prompt_tokens: 1,
+            completion_tokens: 0,
+        }
+    }
+
+    fn dispatchable(models: &[ModelId]) -> HashSet<ModelId> {
+        models.iter().cloned().collect()
+    }
+
+    #[test]
+    fn nothing_capable_never_authorizes() {
+        let (models, credentials) = legs(&[("a", "A")]);
+        assert_eq!(
+            authorize_terminal(&[], &dispatchable(&models), &[], |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
+    }
+
+    #[test]
+    fn every_capable_leg_blocked_is_a_blocked_pool() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
+        assert_eq!(
+            authorize_terminal(&models, &HashSet::new(), &[], |m| credentials
+                .get(m)
+                .cloned()),
+            Some("primary_pool_blocked")
+        );
+    }
+
+    #[test]
+    fn one_capacity_failure_with_a_dead_credential_is_exhaustion() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    #[test]
+    fn an_unattempted_leg_on_a_live_credential_is_not_exhaustion() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_request_fault_never_authorizes() {
+        for outcome in ["http_403", "http_400", "empty_answer", "timeout", "context_window"] {
+            let (models, credentials) = legs(&[("a", "A")]);
+            let attempts = vec![attempt("a", outcome)];
+            assert_eq!(
+                authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                    .get(m)
+                    .cloned()),
+                None,
+                "outcome {outcome} must not authorize the terminal leg"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_run_with_one_request_fault_never_authorizes() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429"), attempt("b", "http_403")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unattributable_leg_is_never_given_a_dead_credential() {
+        // No credential mapping: a skip cannot be explained, so it is not exhaustion.
+        let (models, _) = legs(&[("a", "A"), ("b", "A")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |_| None),
+            None
+        );
+    }
+
+    #[test]
+    fn every_leg_attempted_and_capacity_failed_is_exhaustion() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429"), attempt("b", "daily_allowance_exhausted")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    #[test]
+    fn an_attempt_on_a_non_capable_target_does_not_count() {
+        let (models, credentials) = legs(&[("a", "A")]);
+        let attempts = vec![attempt("other", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
     }
 }

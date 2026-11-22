@@ -245,6 +245,16 @@ struct RoutingDecisionRecord<'a> {
     demoted: BTreeMap<String, &'static str>,
     /// Leg the context-pressure rule offered first, when it did.
     promotion: Option<String>,
+    /// Targets this route may reach only after every eligible primary is unavailable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    terminal: Vec<String>,
+    /// Why this request stepped onto the terminal leg, when it did.
+    ///
+    /// Absent means the terminal leg was declared and not used, which is the common case.
+    /// A value names the claim that authorized the crossing, so a reader can tell a genuine
+    /// pool exhaustion from a leg that was simply reached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_crossed: Option<&'static str>,
     attempts: Vec<AttemptDecision>,
 }
 
@@ -283,6 +293,10 @@ impl<'a> RoutingDecisionRecord<'a> {
             skipped,
             demoted,
             promotion: trace.promotion.clone(),
+            terminal: trace.terminal.clone(),
+            terminal_crossed: trace
+                .terminal_crossed
+                .then(|| trace.terminal_reason.unwrap_or("terminal")),
             attempts: trace
                 .attempts
                 .iter()
@@ -491,6 +505,10 @@ mod tests {
             demand_tokens: 1_234,
             estimated_input_tokens: 1_000,
             promotion: None,
+            pool: None,
+            terminal: Vec::new(),
+            terminal_crossed: false,
+            terminal_reason: None,
         };
         log.append_decision(
             RoutingLogContext {

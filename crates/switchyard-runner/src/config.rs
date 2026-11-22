@@ -219,17 +219,25 @@ pub(crate) struct DecisionLaneConfig {
     pub(crate) types: Vec<decision_transport::QuestionKind>,
 }
 
-/// A decision lane composed of ordered child POLICY lanes.
+/// A decision lane composed of child POLICY lanes.
 ///
-/// Children are lane names, not targets. Each child runs its own candidate order,
-/// question-kind eligibility and failure policy in process, and the parent adds only
-/// ordered selection between them. Keeping the reference rather than flattening it is
-/// what lets a family stay independently addressable and its policy stay single-sourced.
+/// Children are lane names, not targets. Each child keeps its own question-kind
+/// eligibility and failure policy in process, and the parent adds selection between them.
+/// Keeping the reference rather than flattening it is what lets a family stay
+/// independently addressable and its policy stay single-sourced.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DecisionLaneCompositionConfig {
     /// Child decision lane names in preference order.
     pub(crate) children: Vec<String>,
+    /// How this lane selects between its children.
+    ///
+    /// Absent means [`decision_executor::LaneSelection::Ordered`], the historic
+    /// behaviour, so a manifest that does not name a policy keeps its meaning. The policy
+    /// is stated here rather than inferred from the lane's name: renaming a lane must not
+    /// change how it routes.
+    #[serde(default)]
+    pub(crate) selection: decision_executor::LaneSelection,
 }
 
 #[derive(Debug)]
@@ -266,6 +274,17 @@ struct RouteConfig {
     route_reasoning_policy_best_effort: bool,
     /// Estimated input tokens above which this route escalates to a wider-context leg.
     escalation_max_input_tokens: Option<u64>,
+    /// Groups whose members form this route's candidate pool, when it declares one.
+    pool_groups: Option<Vec<String>>,
+    /// Targets this route may reach only after its entire eligible primary pool is
+    /// verifiably unavailable.
+    ///
+    /// Kept separate from the candidate list on purpose. A terminal leg that was merely a
+    /// candidate would be ranked with its peers and would serve whenever the pool was busy,
+    /// which is the paid escalation this field exists to prevent; naming it here means the
+    /// exhaustion rule is the only way to reach it. A terminal target therefore must not also
+    /// appear among the candidates.
+    terminal_fallback: Option<Vec<String>>,
     /// Target this route prefers once it is under context pressure.
     ///
     /// Named rather than inferred: a target's context window is not a fact this config
@@ -300,6 +319,21 @@ pub enum SelectionPolicy {
     /// have refused. A target with too few observations keeps its declared position, so a
     /// cold deployment behaves exactly like a declared-order one.
     Measured,
+    /// Treat every candidate as a peer, regardless of which provider or credential serves it.
+    ///
+    /// `Measured` still breaks ties with the manifest's own order, which is the right answer
+    /// for a lineup an operator wrote down deliberately. It is the wrong answer for a pool
+    /// assembled from several providers' free tiers, because the manifest order is then an
+    /// accident of how the file was written and would silently become a provider priority:
+    /// the leg typed first would win every tie, every time.
+    ///
+    /// `Peer` removes that priority in two places. Ties are broken by canonical route id, so
+    /// reordering the manifest cannot change the chosen model; and a candidate whose own
+    /// remaining allowance is unknown ranks behind one whose headroom is verifiable, instead
+    /// of ahead of every declared budget as an absent number used to. Free eligibility is
+    /// still decided by declared tariff, never by position: a `Peer` pool excludes every
+    /// candidate that is not stated free before it ranks anything.
+    Peer,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -363,6 +397,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let route_reasoning_policy_best_effort: Option<bool> =
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
+        let pool_groups = take_optional(&mut table, "pool_groups")?;
+        let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
         let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -379,6 +415,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
             route_reasoning_policy,
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
+            pool_groups,
+            terminal_fallback,
             escalation_target,
             selection: selection.unwrap_or_default(),
             algorithm,
@@ -429,6 +467,22 @@ impl RouteConfig {
 
     fn callable_target_names(&self) -> Vec<&str> {
         self.algorithm.callable_target_names()
+    }
+
+    /// Every target this route may contact: the ranked candidates plus the terminal last
+    /// resort. Facts, credentials, daily ledgers and prompt policy have to describe a
+    /// target the route can actually call, or the terminal leg is reached without the
+    /// admission and block machinery that protects every ranked leg.
+    fn served_target_names(&self) -> Vec<&str> {
+        let mut names = self.routing_target_names();
+        if let Some(terminal) = &self.terminal_fallback {
+            for name in terminal {
+                if !names.contains(&name.as_str()) {
+                    names.push(name.as_str());
+                }
+            }
+        }
+        names
     }
 }
 
@@ -821,14 +875,36 @@ impl DeploymentConfig {
                 .algorithm
                 .validate_candidates(route_name)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+            // A pool route states its membership by group label, so the two records of the
+            // pool - the labels on the targets and the candidate list on the route - have to
+            // agree. Disagreeing would either silently narrow the pool (a member forgotten in
+            // the list) or advertise a member the route cannot call (a stale entry). Both are
+            // startup errors, because a pool whose membership is unclear is not a policy.
+            if let Some(groups) = &config.pool_groups {
+                self.validate_route_pool(route_name, config, groups)?;
+            }
+            // A terminal leg is a last resort, so its declaration has to be unambiguous: it
+            // must name real targets, none of them a candidate of this route, and none of
+            // them held. A terminal target that was also a candidate would be ranked as a
+            // peer and could serve without exhaustion; one that does not exist would make
+            // the route silently unwilling to use its last resort at startup.
+            let terminal_ids = self.validate_terminal_fallback(route_name, config)?;
             let algorithm = config
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
-            let lane_composition: BTreeMap<String, Vec<String>> = self
+            let lane_composition: BTreeMap<String, decision_executor::ComposedLane> = self
                 .decision_lane_composition
                 .iter()
-                .map(|(name, composition)| (name.clone(), composition.children.clone()))
+                .map(|(name, composition)| {
+                    (
+                        name.clone(),
+                        decision_executor::ComposedLane {
+                            children: composition.children.clone(),
+                            selection: composition.selection,
+                        },
+                    )
+                })
                 .collect();
             let (route_clients, caller_auth) = self.build_route_clients(
                 route_name,
@@ -844,7 +920,7 @@ impl DeploymentConfig {
             let responses_auxiliary_target =
                 self.build_responses_auxiliary_target(config, &clients);
             let decision_targets = config
-                .routing_target_names()
+                .served_target_names()
                 .into_iter()
                 .filter_map(|name| self.decision_target(name))
                 .collect();
@@ -873,6 +949,14 @@ impl DeploymentConfig {
                 models = models.filtered(&|model| !held_models.contains(model));
             }
             let held = self.route_held(config, &held_models);
+            // The terminal leg is handed to the route as its own model set, never merged with
+            // the candidates, so the ranking machinery cannot see it at all.
+            let terminal = (!terminal_ids.is_empty()).then(|| {
+                RuntimeModels::new(HashMap::from([(
+                    switchyard_protocol::Category::Any,
+                    terminal_ids.clone(),
+                )]))
+            });
             let route = Route::new(
                 algorithm,
                 route_clients,
@@ -892,7 +976,7 @@ impl DeploymentConfig {
             .with_locality(route_locality(config, &self.targets, &self.llm_clients))
             .with_daily_allowances(Arc::new(
                 config
-                    .routing_target_names()
+                    .served_target_names()
                     .into_iter()
                     .filter_map(|name| self.targets.get(name))
                     .filter_map(|target| {
@@ -912,6 +996,10 @@ impl DeploymentConfig {
                 Some(held) => route.with_held(held),
                 None => route,
             };
+            let route = match terminal {
+                Some(terminal) => route.with_terminal_fallback(terminal),
+                None => route,
+            };
             // A measured route ranks candidates only after it has evidence, and shares that
             // evidence with every other measured route so real work is not isolated to one
             // alias.
@@ -919,6 +1007,13 @@ impl DeploymentConfig {
                 crate::config::SelectionPolicy::Measured => {
                     route.with_measured_selection(Arc::clone(&measured_selector))
                 }
+                // A peer pool needs the evidence of a measured route: the ranking is
+                // computed from facts and observation, so without the selector it would
+                // fall back to declared order and quietly become the waterfall this policy
+                // exists to remove.
+                crate::config::SelectionPolicy::Peer => route
+                    .with_measured_selection(Arc::clone(&measured_selector))
+                    .with_pool_groups(config.pool_groups.clone().unwrap_or_default()),
                 crate::config::SelectionPolicy::Declared => route,
             };
             routes.push((config.id.clone(), route));
@@ -962,8 +1057,8 @@ impl DeploymentConfig {
         if let Some(name) = &self.default_decision_lane {
             runner = runner.with_default_decision_lane(name.clone());
         }
-        for (name, children) in lane_composition {
-            runner = runner.with_decision_lane_composition(name, children);
+        for (name, composition) in lane_composition {
+            runner = runner.with_composed_decision_lane(name, composition);
         }
         Ok(runner)
     }
@@ -1061,6 +1156,136 @@ impl DeploymentConfig {
     /// Without this, a wrong path or ownership would leave the budget unenforced until a
     /// request arrived - and then surface as a refused leg rather than as the configuration
     /// error it is.
+    /// Checks that a pool route's group labels and candidate list describe the same leaves.
+    ///
+    /// Every member must exist, be callable by this route, and positively declare itself
+    /// free. A group with no members is refused too: a pool that names an empty group has
+    /// silently become a different pool, and that is exactly the drift the label exists to
+    /// prevent.
+    fn validate_terminal_fallback(
+        &self,
+        route_name: &str,
+        config: &RouteConfig,
+    ) -> RunnerResult<Vec<ModelId>> {
+        let Some(names) = &config.terminal_fallback else {
+            return Ok(Vec::new());
+        };
+        if names.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} declares terminal_fallback but names no target"
+            )));
+        }
+        let candidates = config.callable_target_names();
+        let mut resolved: Vec<ModelId> = Vec::new();
+        for name in names {
+            let Some(target) = self.targets.get(name) else {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names unknown target {name}"
+                )));
+            };
+            if candidates.iter().any(|candidate| candidate == name) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names {name}, which is also a \
+                     candidate; a terminal leg must not be ranked with the primary pool, or it \
+                     would serve whenever that pool was merely busy"
+                )));
+            }
+            if target.held.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names {name}, which is held; a \
+                     withdrawn target cannot be a last resort"
+                )));
+            }
+            if resolved.contains(&target.id) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names {name} more than once"
+                )));
+            }
+            resolved.push(target.id.clone());
+        }
+        Ok(resolved)
+    }
+
+    fn validate_route_pool(
+        &self,
+        route_name: &str,
+        config: &RouteConfig,
+        groups: &[String],
+    ) -> RunnerResult<()> {
+        if groups.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} declares pool_groups but names no group"
+            )));
+        }
+        let callable = config.callable_target_names();
+        let mut members: Vec<&str> = Vec::new();
+        for group in groups {
+            let mut names: Vec<&str> = self
+                .targets
+                .iter()
+                .filter(|(_name, target)| target.groups.iter().any(|label| label == group))
+                .map(|(name, _target)| name.as_str())
+                .collect();
+            names.sort_unstable();
+            if names.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} pool_groups names group {group}, which no target belongs to"
+                )));
+            }
+            for name in names {
+                let target = self
+                    .targets
+                    .get(name)
+                    .expect("group membership was read from this map");
+                // The pool is a free pool by definition, so membership implies a positive
+                // free declaration. `Unknown` is refused for the same reason it is excluded
+                // at request time.
+                // One authority for the question, so the load gate and the request-time gate
+                // cannot disagree about whether a tariff is free.
+                if !switchyard_llm_client::Tariff::from_declaration(target.free_tier).is_free() {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} pool_groups names group {group}, whose member                          {name} does not declare free_tier = true; a free peer pool cannot                          contain a target whose tariff is not positively free"
+                    )));
+                }
+                if !callable.contains(&name) {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} pool_groups names group {group}, whose member                          {name} is not a candidate of this route; the pool and the candidate                          list must state the same membership"
+                    )));
+                }
+                if !members.contains(&name) {
+                    members.push(name);
+                }
+            }
+        }
+        // The union of the groups must be exactly the route's candidates: a member missing
+        // from the list would never be called, and a listed candidate outside every group
+        // would be a leg with no stated membership.
+        let listed: Vec<&str> = callable.clone();
+        let mut extra: Vec<&str> = listed
+            .iter()
+            .copied()
+            .filter(|name| !members.contains(name))
+            .collect();
+        extra.sort_unstable();
+        if !extra.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} lists candidates {extra:?} that belong to none of its                  pool_groups {groups:?}"
+            )));
+        }
+        let mut missing: Vec<&str> = members
+            .iter()
+            .copied()
+            .filter(|name| !listed.contains(name))
+            .collect();
+        missing.sort_unstable();
+        if !missing.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} pool_groups include {missing:?}, which are not in its                  candidate list"
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_quota_state_dir(&self) -> RunnerResult<()> {
         let Some(quota) = self.quota.as_ref() else {
             return Ok(());
@@ -1969,7 +2194,7 @@ impl DeploymentConfig {
     fn resolve_decision_lane_composition(
         &self,
         lanes: &BTreeMap<String, decision_executor::LaneResolverHandle>,
-    ) -> RunnerResult<Vec<(String, Vec<String>)>> {
+    ) -> RunnerResult<Vec<(String, decision_executor::ComposedLane)>> {
         let mut resolved = Vec::with_capacity(self.decision_lane_composition.len());
         for (name, composition) in &self.decision_lane_composition {
             let children = &composition.children;
@@ -1989,7 +2214,13 @@ impl DeploymentConfig {
                 }
                 ordered.push(child.clone());
             }
-            resolved.push((name.clone(), ordered));
+            resolved.push((
+                name.clone(),
+                decision_executor::ComposedLane {
+                    children: ordered,
+                    selection: composition.selection,
+                },
+            ));
         }
         Ok(resolved)
     }
@@ -2103,7 +2334,7 @@ impl DeploymentConfig {
         // `Call::Decision` resolves a named lane by the SAME mechanism as the public
         // surface. Without it, the same request could be served at `/v1/decisions`
         // and fail internally, which is a split contract rather than one mechanism.
-        composition: &BTreeMap<String, Vec<String>>,
+        composition: &BTreeMap<String, decision_executor::ComposedLane>,
         // The deployment's one governor and its per-model daily counters, threaded here so
         // a route-local decision resolver is paced by the same ledgers as a named lane:
         // the public surface and an internal Call::Decision must not hold two different
@@ -2117,7 +2348,15 @@ impl DeploymentConfig {
         let mut by_model = HashMap::new();
         let mut targets_by_model: HashMap<&str, (&str, &TargetConfig)> = HashMap::new();
         let mut caller_auth = None;
-        for name in route.callable_target_names() {
+        // The terminal leg is dispatched through the same router, so its client has to be
+        // constructed here even though it is never a ranked candidate.
+        let mut contact_names = route.callable_target_names();
+        for name in route.terminal_fallback.iter().flatten() {
+            if !contact_names.contains(&name.as_str()) {
+                contact_names.push(name.as_str());
+            }
+        }
+        for name in contact_names {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
             })?;
@@ -2164,7 +2403,7 @@ impl DeploymentConfig {
         // Decision calls need a host. One resolver is built from this route's configured
         // decision targets, in configured order, and serves both the internal call path
         // and any public typed surface, so Decision has one implementation.
-        let route_targets = route.routing_target_names();
+        let route_targets = route.served_target_names();
         // Target capability facts reach the client router so ordered candidates can be
         // filtered before dispatch. A target with no declaration is left in place.
         let mut facts: HashMap<ModelId, switchyard_llm_client::CapabilityFacts> = HashMap::new();
@@ -2201,9 +2440,10 @@ impl DeploymentConfig {
                         // A target states when it cannot carry a caller's reasoning control;
                         // an undeclared target keeps permitting it.
                         no_reasoning_control: target.accepts_reasoning_control == Some(false),
-                        // Stated per target so selection can order a free candidate ahead of
-                        // a metered one without inferring cost from a provider name.
-                        free_tier: target.free_tier,
+                        // Declared per target so selection can order a free candidate ahead
+                        // of a metered one without inferring cost from a provider name or a
+                        // model slug. Absent stays `Unknown`, which is not free.
+                        tariff: switchyard_llm_client::Tariff::from_declaration(target.free_tier),
                         // The physical window and the per-request input ceiling travel as
                         // facts so the pre-dispatch filter can drop a target that cannot
                         // hold this request, before any provider is contacted.
@@ -2229,6 +2469,11 @@ impl DeploymentConfig {
             }
         }
         let router = router.with_target_capabilities(facts);
+        // The credential each target draws on travels with the router as well, so a
+        // failure is attributed to the target that actually failed rather than to the
+        // route's first target. A mixed-provider free pool is exactly the case where
+        // those two differ.
+        let router = router.with_target_credentials(target_credentials(route, &self.targets));
 
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.
@@ -2363,7 +2608,7 @@ impl DeploymentConfig {
     ) -> RunnerResult<TargetPromptPolicy> {
         let mut prompts = HashMap::new();
         let mut aliases = HashMap::<&ModelId, Option<&str>>::new();
-        for name in route.algorithm.routing_target_names() {
+        for name in route.served_target_names() {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
             })?;
@@ -2494,7 +2739,7 @@ fn route_locality(
     let mut legs = 0usize;
     let mut saw_local = false;
     let mut saw_external = false;
-    for name in route.routing_target_names() {
+    for name in route.served_target_names() {
         let Some(target) = targets.get(name) else {
             continue;
         };
@@ -2538,7 +2783,7 @@ fn target_credentials(
     targets: &BTreeMap<String, TargetConfig>,
 ) -> std::collections::HashMap<ModelId, String> {
     route
-        .routing_target_names()
+        .served_target_names()
         .into_iter()
         .filter_map(|name| {
             targets
@@ -2833,12 +3078,27 @@ struct TargetConfig {
     max_input_tokens: Option<u64>,
     /// Whether the provider charges nothing for a request here inside a declared allowance.
     ///
-    /// A selection fact, not an economics one. It lets a route rank a free candidate ahead
-    /// of a metered one structurally: no measured latency moves a paid leg in front of an
-    /// eligible free leg. Defaults to `false`, so an undeclared target keeps the order the
-    /// manifest states rather than being silently promoted over a stated-free one.
+    /// Whether a request here draws on a free allowance, when the deployment states it.
+    ///
+    /// Tri-state, because two answers are not enough to make an economic claim. `true` says
+    /// the request is free, `false` says it is billed, and absent says nothing at all - which
+    /// is [`switchyard_llm_client::Tariff::Unknown`] and never counts as free entitlement.
+    /// A boolean could not tell "this is metered" apart from "nobody declared this", and the
+    /// second is exactly the case a free-only selection pool must exclude.
+    ///
+    /// It is also a selection fact: no measured latency moves a paid leg in front of an
+    /// eligible free leg, and no free leg is entered ahead of a cheaper tier by accident.
     #[serde(default)]
-    free_tier: bool,
+    free_tier: Option<bool>,
+    /// Economic/selection groups this target belongs to, as labels only.
+    ///
+    /// A group is a membership tag, never an execution stage: nothing dispatches *to* a
+    /// group, and no group is preferred over another. It exists so one route can declare a
+    /// pool by membership (`pool_groups`) and so a catalogue can describe which leaves belong
+    /// to `ST_OR_Free`, `ST_Gemini_Free` or `ST_OR_Paid` without the route's candidate list
+    /// being the only record of it.
+    #[serde(default)]
+    groups: Vec<String>,
     /// Whether the backing model accepts a caller's explicit reasoning control.
     ///
     /// `false` is a measured wire fact, not a policy: Google's hosted Gemma answers HTTP
@@ -6704,13 +6964,13 @@ selection = "measured"
             "direct-google-gemma-4-31b-it",
         ] {
             assert!(
-                config.targets[free].free_tier,
+                config.targets[free].free_tier == Some(true),
                 "{free} must be declared free, or selection may order a paid leg ahead of it"
             );
         }
         for paid in ["openai-gpt-6-luna-nt", "deepseek-deepseek-flash-nt"] {
             assert!(
-                !config.targets[paid].free_tier,
+                config.targets[paid].free_tier != Some(true),
                 "{paid} is metered and must stay behind the free tier"
             );
         }
@@ -6747,7 +7007,7 @@ selection = "measured"
             "direct-google-gemma-4-31b-it",
         ] {
             assert!(
-                config.targets[free].free_tier,
+                config.targets[free].free_tier == Some(true),
                 "{free} must be declared free"
             );
         }
@@ -6858,7 +7118,7 @@ selection = "measured"
                 "{serving} must declare a real daily budget"
             );
             assert!(
-                target.free_tier,
+                target.free_tier == Some(true),
                 "{serving} is served inside a free allowance"
             );
         }

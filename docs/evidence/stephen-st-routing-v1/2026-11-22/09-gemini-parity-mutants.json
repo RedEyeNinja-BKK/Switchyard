@@ -1,0 +1,50 @@
+[
+  {
+    "mutation": "PM1-catalogue-quietly-changes-a-model-fact",
+    "expected_check": "P6-owner-projection-matches-deployed",
+    "exit_code": 1,
+    "caught": true,
+    "output_tail": "PASS P1-deployed-targets-are-catalogued\nPASS P2-shared-facts-identical\nPASS P3-accounts-are-isolated\nPASS P4-qualification-gates-the-pool\nPASS P5-route-policies-preserved\nFAIL P6-owner-projection-matches-deployed: direct-google-gemma-4-31b-it.hosted_reasoning: catalogue 'none' != deployed 'thought_tag'\nPASS P7-catalogue-names-its-bytes\nPASS P8-no-model-facts-in-profiles\nparity: 8 checks, 1 failure(s)\n"
+  },
+  {
+    "mutation": "PM2-a-served-model-is-dropped-from-the-catalogue",
+    "expected_check": "P1-deployed-targets-are-catalogued",
+    "exit_code": 1,
+    "caught": true,
+    "output_tail": "FAIL P1-deployed-targets-are-catalogued: deployed Gemini target direct-google-gemma-4-31b-it (gemma-4-31b-it) has no catalogue entry\nPASS P2-shared-facts-identical\nPASS P3-accounts-are-isolated\nFAIL P4-qualification-gates-the-pool: check raised KeyError: \"profile route ST_Gemini_Free names uncatalogued models: ['gemma-4-31b-it']\"\nPASS P5-route-policies-preserved\nFAIL P6-owner-projection-matches-deployed: check raised KeyError: 'gemma-4-31b-it'\nPASS P7-catalogue-names-its-bytes\nPASS P8-no-model-facts-in-profiles\nparity: 8 checks, 3 failure(s)\n"
+  },
+  {
+    "mutation": "PM3-a-profile-starts-holding-model-facts",
+    "expected_check": "P8-no-model-facts-in-profiles",
+    "exit_code": 1,
+    "caught": true,
+    "output_tail": "PASS P1-deployed-targets-are-catalogued\nPASS P2-shared-facts-identical\nPASS P3-accounts-are-isolated\nPASS P4-qualification-gates-the-pool\nPASS P5-route-policies-preserved\nPASS P6-owner-projection-matches-deployed\nPASS P7-catalogue-names-its-bytes\nFAIL P8-no-model-facts-in-profiles: profile-owner restates model fact context_window in its state\nparity: 8 checks, 1 failure(s)\n"
+  },
+  {
+    "mutation": "PM4-the-two-accounts-share-a-credential",
+    "expected_check": "P3-accounts-are-isolated",
+    "exit_code": 1,
+    "caught": true,
+    "output_tail": "PASS P1-deployed-targets-are-catalogued\nPASS P2-shared-facts-identical\nFAIL P3-accounts-are-isolated: credential environment shared across accounts: {'SWITCHYARD_GEMINI_API_KEY'}\nFAIL P3-accounts-are-isolated: stephen credential SWITCHYARD_GEMINI_API_KEY appears in the owner projection\nPASS P4-qualification-gates-the-pool\nPASS P5-route-policies-preserved\nPASS P6-owner-projection-matches-deployed\nPASS P7-catalogue-names-its-bytes\nPASS P8-no-model-facts-in-profiles\nparity: 8 checks, 2 failure(s)\n"
+  },
+  {
+    "mutation": "PM5-the-owner-policy-is-replaced-by-peer-selection",
+    "expected_check": "P5-route-policies-preserved",
+    "exit_code": 1,
+    "caught": true,
+    "output_tail": "PASS P1-deployed-targets-are-catalogued\nPASS P2-shared-facts-identical\nPASS P3-accounts-are-isolated\nPASS P4-qualification-gates-the-pool\nFAIL P5-route-policies-preserved: owner route smart_gemini no longer uses measured selection\nFAIL P6-owner-projection-matches-deployed: routes.smart_gemini.selection: profile 'peer' != deployed 'measured'\nPASS P7-catalogue-names-its-bytes\nPASS P8-no-model-facts-in-profiles\nparity: 8 checks, 2 failure(s)\n"
+  },
+  {
+    "mutation": "PM6-the-pool-ships-before-qualification",
+    "expected_check": "P4-qualification-gates-the-pool",
+    "exit_code": 1,
+    "caught": true,
+    "output_tail": "PASS P1-deployed-targets-are-catalogued\nPASS P2-shared-facts-identical\nPASS P3-accounts-are-isolated\nFAIL P4-qualification-gates-the-pool: an empty pool still rendered a route block\nPASS P5-route-policies-preserved\nPASS P6-owner-projection-matches-deployed\nPASS P7-catalogue-names-its-bytes\nPASS P8-no-model-facts-in-profiles\nparity: 8 checks, 1 failure(s)\n"
+  },
+  {
+    "mutation": "CONTROL-after-restore",
+    "expected_check": "none",
+    "exit_code": 0,
+    "caught": true
+  }
+]

@@ -90,6 +90,85 @@ pub enum CostTier {
     Paid,
 }
 
+/// How the comparator breaks a tie, and what it assumes when a candidate's own
+/// remaining allowance is unknown.
+///
+/// The default is the behaviour every existing route already had, so a route that does not
+/// ask for anything new keeps it. [`RankingPolicy::PEER`] is what a pool assembled across
+/// providers asks for: with the manifest listed provider by provider, the declared order is
+/// not a decision, and treating it as one would hand the first-typed provider every tie.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RankingPolicy {
+    /// What separates two candidates whose facts and evidence are otherwise equal.
+    pub tie_break: TieBreak,
+    /// Where a candidate goes when the deployment has not stated its remaining allowance.
+    pub unknown_headroom: UnknownHeadroom,
+}
+
+impl RankingPolicy {
+    /// The historical policy: declared order breaks ties, and an undeclared budget is
+    /// treated as `u64::MAX` claimed requests for ordering purposes.
+    ///
+    /// The second half is not a claim that the allowance is infinite - it is the behaviour
+    /// every route had before a budget could be declared per target, preserved so no owner
+    /// route reorders because a stricter option became available.
+    pub const LEGACY: Self = Self {
+        tie_break: TieBreak::Declared,
+        unknown_headroom: UnknownHeadroom::Unbounded,
+    };
+
+    /// The provider-neutral policy a mixed free pool uses.
+    pub const PEER: Self = Self {
+        tie_break: TieBreak::CanonicalId,
+        unknown_headroom: UnknownHeadroom::AfterKnown,
+    };
+}
+
+/// What separates two candidates the facts and the evidence cannot order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TieBreak {
+    /// The manifest's own order.
+    ///
+    /// Correct when an operator wrote the list as a decision. Wrong for a pool assembled
+    /// from several providers, where the order is an artifact of how the file was written.
+    #[default]
+    Declared,
+    /// The candidate's own stable identity.
+    ///
+    /// Chosen so that permuting the manifest cannot change the outcome: the same set of
+    /// candidates produces the same choice whatever order they were typed in. It is a
+    /// fairness floor, not a preference - the name carries no provider advantage beyond
+    /// being stable, and it only decides cases the measured facts could not.
+    CanonicalId,
+}
+
+/// Where a candidate sorts when no remaining allowance is declared for it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnknownHeadroom {
+    /// Ahead of any declared budget, as if it had `u64::MAX` requests left.
+    ///
+    /// The historical ordering. Kept as the default so owner routes keep their behaviour,
+    /// and documented as the assumption it is rather than as a fact.
+    #[default]
+    Unbounded,
+    /// Behind every candidate whose headroom is actually verifiable, ahead of an exhausted one.
+    ///
+    /// An undeclared budget is not evidence of capacity, so it cannot be allowed to outrank
+    /// a candidate the deployment can prove still has allowance. It also must not be treated
+    /// as exhausted - that would invent a refusal the deployment never stated - so it sorts
+    /// after the known-positive candidates and before a candidate whose own count reached zero.
+    AfterKnown,
+}
+
+/// A comparable tie key, so the two tie-break policies share one sort.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TieKey {
+    /// Position in the manifest. Only compared against another `Declared`.
+    Declared(usize),
+    /// Canonical model id. Only compared against another `CanonicalId`.
+    Canonical(String),
+}
+
 /// The deployment facts about one admitted candidate that decide its order.
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -342,6 +421,21 @@ impl MeasuredSelector {
         demand: Demand,
         declared: &[ModelId],
     ) -> Vec<CandidateScore> {
+        self.explain_with(candidates, demand, declared, RankingPolicy::LEGACY)
+    }
+
+    /// [`Self::explain`] under an explicit ranking policy.
+    ///
+    /// The policy decides only what the facts leave open: the tie-break and the treatment of
+    /// an undeclared budget. Every gate and every measured component stays the same, so a
+    /// route opting into [`RankingPolicy::PEER`] changes no eligibility and no score.
+    pub fn explain_with(
+        &self,
+        candidates: &[Candidate],
+        demand: Demand,
+        declared: &[ModelId],
+        policy: RankingPolicy,
+    ) -> Vec<CandidateScore> {
         let evidence = self.evidence.lock();
         let position = |model: &ModelId| {
             declared
@@ -355,7 +449,14 @@ impl MeasuredSelector {
         // overtakes eligible free" a property of the shape rather than of the weights.
         let build = |candidate: &Candidate, index: usize| {
             let observed = evidence.get(&candidate.model).copied().unwrap_or_default();
-            let remaining = candidate.remaining_today.unwrap_or(u64::MAX);
+            // An undeclared budget is not capacity. Under `AfterKnown` it sorts behind a
+            // verifiable headroom and ahead of a candidate whose own count reached zero, so
+            // unknown is neither credited nor treated as an invented refusal.
+            let remaining = match (candidate.remaining_today, policy.unknown_headroom) {
+                (Some(remaining), _) => remaining,
+                (None, UnknownHeadroom::Unbounded) => u64::MAX,
+                (None, UnknownHeadroom::AfterKnown) => 0,
+            };
             let pressure = candidate.pressure_per_mille(demand);
             let score = CandidateScore {
                 model: candidate.model.clone(),
@@ -386,7 +487,12 @@ impl MeasuredSelector {
                 // evidence at all, so it keeps the declared tie-break instead of winning
                 // the latency key against a candidate that was actually measured.
                 score.latency_ms.unwrap_or(u64::MAX),
-                position(&candidate.model),
+                match policy.tie_break {
+                    TieBreak::Declared => TieKey::Declared(position(&candidate.model)),
+                    TieBreak::CanonicalId => {
+                        TieKey::Canonical(candidate.model.as_str().to_string())
+                    }
+                },
             );
             (key, score)
         };
@@ -395,7 +501,9 @@ impl MeasuredSelector {
             .enumerate()
             .map(|(index, candidate)| build(candidate, index))
             .collect();
-        ranked.sort_by_key(|(key, _)| *key);
+        // Not `sort_by_key`: the key carries an owned tie-break, so it cannot be copied out
+        // of the element the way `sort_by_key` requires.
+        ranked.sort_by(|(left, _), (right, _)| left.cmp(right));
         ranked
             .into_iter()
             .enumerate()
@@ -413,6 +521,13 @@ impl MeasuredSelector {
                         "unhealthy"
                     } else if score.over_pressure {
                         "over_pressure"
+                    } else if score.remaining_today.is_none()
+                        && policy.unknown_headroom == UnknownHeadroom::AfterKnown
+                    {
+                        // The candidate declared no budget, so it cannot outrank one whose
+                        // headroom is verifiable. Reported as the absence it is, rather than
+                        // as a small budget the deployment never stated.
+                        "unknown_headroom"
                     } else if score.latency_ms.is_some() {
                         "latency"
                     } else {

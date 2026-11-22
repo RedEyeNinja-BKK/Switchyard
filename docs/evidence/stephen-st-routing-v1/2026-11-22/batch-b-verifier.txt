@@ -1,0 +1,31 @@
+# Batch B verifier - baseline = batch A output, candidate = batch B
+# run 2026-11-22T06:43:03Z
+PASS  B1  ST_OR_Free membership is exactly the seven free leaves               n=7
+PASS  B2  every ST_OR_Free member declares free_tier = true                    members=7 offenders=[]
+PASS  B3  ST_OR_Paid membership is exactly the two metered leaves              n=2
+PASS  B4  no ST_OR_Paid member claims a free tariff                            members=2
+PASS  B5  ST_Free selects with `peer`                                          selection='peer'
+PASS  B6  ST_Free pool_groups is exactly [ST_OR_Free]                          pool_groups=['ST_OR_Free']
+PASS  B7  ST_Free legs are exactly the pool members                            legs=7 members=7
+PASS  B8  ST_Free keeps the 262144 policy promise                              context_window=262144
+PASS  B9  no pool group is empty                                               empty=[]
+PASS  B10 ST_Paid is not a pool route                                          pool_groups=None
+PASS  B11 ST_Paid legs are exactly the metered leaves                          legs=['stephen-paid-deepseek-v4-1-flash-1017', 'stephen-paid-glm-5-3-flash']
+PASS  B12 no target claims ST_Gemini_Free, so naming it would be a phantom     members=[]
+PASS  B13 only Stephen leaves carry group labels                               unexpected=[]
+PASS  B15 composite ST_Route is unchanged                                      
+PASS  B14 route ST_Paid is unchanged                                           changed_keys=[]
+PASS  B14 route smartfree is unchanged                                         changed_keys=[]
+PASS  B14 route smartlocal is unchanged                                        changed_keys=[]
+PASS  B14 route smartlocal-nt is unchanged                                     changed_keys=[]
+PASS  B15 composite VC_Paid is unchanged                                       
+PASS  B16 section [capabilities] is unchanged                                  
+PASS  B16 section [decision_lanes] is unchanged                                
+PASS  B16 section [decision_lane_composition] is unchanged                     
+PASS  B16 section [quota] is unchanged                                         
+PASS  B17 every non-Stephen target is unchanged                                changed=[]
+PASS  B18 no dangling target or route reference                                dangling=[]
+PASS  B19 no nested composite                                                  nested=[]
+PASS  B20 no pool member is unreachable from ST_Free                           stranded=[]
+
+27 checks, 0 failed

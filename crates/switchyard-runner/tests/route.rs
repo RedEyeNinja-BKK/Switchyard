@@ -536,3 +536,150 @@ batch_size = 8
     assert_eq!(max_length, Some(4096));
     assert_eq!(batch_size, Some(8));
 }
+
+/// A route whose candidates are all free-scope slugs is skipped, not entered, once the
+/// credential's free allowance is gone.
+///
+/// The provider's dynamic Free Models Router spends that same account-wide allowance
+/// without carrying a `:free` suffix. Reading the suffix alone classified a free-only
+/// route that contains it as having a paid leg, so the composite entered the child and
+/// spent one guaranteed-rejected call per request for the rest of the day.
+#[test]
+fn a_dynamic_free_router_does_not_make_a_free_route_look_paid() {
+    fn passthrough(target: &str, candidates: &[&str]) -> Route {
+        let models: Vec<ModelId> = std::iter::once(target)
+            .chain(candidates.iter().copied())
+            .map(ModelId::from)
+            .collect();
+        let targets: BTreeMap<String, ModelId> = models
+            .iter()
+            .map(|model| (model.as_str().to_owned(), model.clone()))
+            .collect();
+        let algorithm = AlgorithmSpec::Passthrough {
+            target: target.to_string(),
+            candidates: candidates.iter().map(|c| (*c).to_string()).collect(),
+            subagents: None,
+        }
+        .build("switchyard", &targets)
+        .expect("passthrough target map should build");
+        Route::new(
+            algorithm,
+            ClientRouter::new(HashMap::new()),
+            None,
+            ModelCapabilities::default(),
+            None,
+            None,
+            Vec::new(),
+            RuntimeModels::new([(Category::Any, models)].into()),
+            switchyard_runner::RouteReasoningPolicy::Inherit,
+            None,
+            None,
+        )
+    }
+
+    // Freeness is the declared tariff, so the deployment has to declare it. A route whose
+    // every target states `free_tier = true` is free end to end, including one whose legs
+    // carry no `:free` suffix at all - the case the slug convention can never see.
+    fn passthrough_with_tariff(slugs: &[&str], free: &[&str], metered: &[&str]) -> Route {
+        let models: Vec<ModelId> = slugs.iter().map(|slug| ModelId::from(*slug)).collect();
+        let targets: BTreeMap<String, ModelId> = models
+            .iter()
+            .map(|model| (model.as_str().to_owned(), model.clone()))
+            .collect();
+        let mut facts = HashMap::new();
+        for slug in slugs {
+            facts.insert(
+                ModelId::from(*slug),
+                switchyard_llm_client::CapabilityFacts {
+                    tariff: if free.contains(slug) {
+                        switchyard_llm_client::Tariff::Free
+                    } else if metered.contains(slug) {
+                        switchyard_llm_client::Tariff::Metered
+                    } else {
+                        switchyard_llm_client::Tariff::Unknown
+                    },
+                    ..switchyard_llm_client::CapabilityFacts::default()
+                },
+            );
+        }
+        let algorithm = AlgorithmSpec::Passthrough {
+            target: slugs[0].to_string(),
+            candidates: slugs[1..].iter().map(|slug| (*slug).to_string()).collect(),
+            subagents: None,
+        }
+        .build("switchyard", &targets)
+        .expect("passthrough target map should build");
+        Route::new(
+            algorithm,
+            ClientRouter::new(HashMap::new()).with_target_capabilities(facts),
+            None,
+            ModelCapabilities::default(),
+            None,
+            None,
+            Vec::new(),
+            RuntimeModels::new([(Category::Any, models)].into()),
+            switchyard_runner::RouteReasoningPolicy::Inherit,
+            None,
+            None,
+        )
+    }
+
+    assert!(
+        passthrough_with_tariff(
+            &[
+                "baidu/ernie-5.5-flash-preview:free",
+                "google/gemma-4-26b-a4b-it"
+            ],
+            &[
+                "baidu/ernie-5.5-flash-preview:free",
+                "google/gemma-4-26b-a4b-it",
+            ],
+            &[],
+        )
+        .all_targets_free(),
+        "every leg declares itself free, so the route is free end to end regardless of slug"
+    );
+    assert!(
+        !passthrough_with_tariff(
+            &["baidu/ernie-5.5-flash-preview:free", "z-ai/glm-5.3-flash"],
+            &["baidu/ernie-5.5-flash-preview:free"],
+            &["z-ai/glm-5.3-flash"],
+        )
+        .all_targets_free(),
+        "one metered candidate keeps a servable leg, so the route is not free"
+    );
+    // An undeclared tariff still answers the *allowance* question through the provider's own
+    // scoping, which is the fact this method exists to supply. The dynamic router and `:free`
+    // slugs draw on the same allowance, so a route made only of them is free end to end and a
+    // quota block may skip it instead of spending a guaranteed-rejected call.
+    assert!(
+        passthrough("openrouter/free", &[]).all_targets_free(),
+        "an undeclared target falls back to the provider's allowance scope for this question"
+    );
+    assert!(
+        passthrough_with_tariff(
+            &["vendor/model:free", "vendor/other:free"],
+            &["vendor/model:free"],
+            &[],
+        )
+        .all_targets_free(),
+        "the undeclared leg is provider-free-scope, so the route is still all free allowance"
+    );
+    // A declared tariff beats the slug in both directions: a `:free`-suffixed target the
+    // deployment declares metered is metered, because the declaration is the authority.
+    assert!(
+        !passthrough_with_tariff(&["vendor/model:free"], &[], &["vendor/model:free"])
+            .all_targets_free(),
+        "a declared metered tariff overrides the `:free` slug"
+    );
+    // And a target with no `:free` suffix that is declared free still joins the allowance.
+    assert!(
+        passthrough_with_tariff(
+            &["google/gemma-4-26b-a4b-it"],
+            &["google/gemma-4-26b-a4b-it"],
+            &[]
+        )
+        .all_targets_free(),
+        "a declared free tariff is sufficient without any slug convention"
+    );
+}

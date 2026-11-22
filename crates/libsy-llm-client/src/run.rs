@@ -241,7 +241,9 @@ async fn call_first_available(
     // candidate would lose or reconstruct the conversation, so a recorded owner
     // pins the route even when another candidate is configured.
     let pinned_owner = clients.continuation_owner(request);
-    for (index, target) in models.iter().enumerate() {
+    let mut index = 0;
+    while index < models.len() {
+        let target = &models[index];
         let request = clients.prepare_completion_request(request.clone(), target);
         match call_one(
             clients,
@@ -265,15 +267,52 @@ async fn call_first_available(
                 );
                 return Err(error);
             }
-            Err(error) => match fallback_reason(&error) {
-                Some(reason) => tracing::info!(
-                    from = %target,
-                    to = %models[index + 1],
-                    reason = reason.as_str(),
-                    "model call failed; trying next candidate"
-                ),
-                None => return Err(error),
-            },
+            Err(error) => {
+                // A statement about the credential that produced this failure says
+                // nothing about a candidate on a DIFFERENT credential. A free pool spans
+                // providers, so a rejected Google key or an exhausted OpenRouter
+                // allowance must not end the pool while a healthy peer remains.
+                //
+                // The peer need not be the NEXT candidate: a pool lists a provider's
+                // models together, so an account-wide stop would otherwise return before
+                // reaching the other provider at all. Skip to the first later candidate on
+                // a different credential and continue from there; the skipped legs share
+                // the dead credential, so calling them could only repeat the same failure.
+                match fallback_reason(&error) {
+                    Some(reason) => {
+                        tracing::info!(
+                            from = %target,
+                            to = %models[index + 1],
+                            reason = reason.as_str(),
+                            "model call failed; trying next candidate"
+                        );
+                        index += 1;
+                    }
+                    None if credential_scoped_stop(&error) => {
+                        let from = clients.credential_for(target);
+                        let survivor = from.and_then(|from| {
+                            models[index + 1..]
+                                .iter()
+                                .position(|next| clients.credential_for(next) != Some(from))
+                                .map(|offset| index + 1 + offset)
+                        });
+                        match survivor {
+                            Some(next) => {
+                                tracing::info!(
+                                    from = %target,
+                                    to = %models[next],
+                                    skipped = next - index - 1,
+                                    reason = "credential_scope",
+                                    "credential-scoped failure; a peer on another credential may serve"
+                                );
+                                index = next;
+                            }
+                            None => return Err(error),
+                        }
+                    }
+                    None => return Err(error),
+                }
+            }
         }
     }
     Err(LibsyError::NoTargets)
@@ -602,6 +641,47 @@ fn is_account_wide_quota_exhausted(error: &LibsyError) -> bool {
     crate::client::is_account_wide_quota(source)
 }
 
+/// Whether this failure is a statement about the credential that produced it.
+///
+/// Such a failure ends the candidates sharing that credential and says nothing about any
+/// other. It is what makes a free pool spanning two providers usable: one account running
+/// out of allowance, or one key being rejected, must not condemn a peer billed to a
+/// different account.
+///
+/// Deliberately excludes outcomes that are about the REQUEST — a policy refusal, a
+/// malformed tool call, an unsupported feature — because handing those to another provider
+/// would be evading the answer rather than serving the caller. Those keep their existing
+/// terminal behaviour.
+fn credential_scoped_stop(error: &LibsyError) -> bool {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return false;
+    };
+    // A rejected or revoked key.
+    if matches!(
+        source,
+        LlmClientError::UpstreamHttp {
+            status: StatusCode::UNAUTHORIZED,
+            ..
+        }
+    ) {
+        return true;
+    }
+    // The allowance the retry loop already treats as account-wide: a free-tier daily cap,
+    // an exhausted balance, a project-wide Google daily quota.
+    if crate::client::is_account_wide_quota(source) {
+        return true;
+    }
+    // Google names the scope of its own stops, so its verdict decides: a stop that keeps
+    // the outcome is about the request and stays terminal.
+    if let LlmClientError::UpstreamHttp { status, body } = source
+        && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
+    {
+        let recovery = google.recovery();
+        return recovery.stop_candidate_list && !recovery.keep_outcome;
+    }
+    false
+}
+
 /// The scope of an exhausted allowance: which models on the credential it blocks.
 ///
 /// `openrouter_free_tier_daily` is an allowance over `:free` slugs only — a paid slug
@@ -650,6 +730,15 @@ pub enum CredentialBlockKind {
     /// slugs: paid slugs on the same credential draw on the account balance, not this
     /// allowance, and remain servable.
     FreeQuota,
+    /// One exact model's own daily allowance is spent. Blocks that target only.
+    ///
+    /// Google allocates `generate_content_free_tier_requests` per model inside the
+    /// project, so a spent model is not a spent project. Collapsing this into
+    /// [`Self::FreeQuota`] would be wrong twice over: that kind keys on a `:free` slug
+    /// spelling Google does not use, and it would take a sibling model's budget with it.
+    /// It must not become [`Self::WholeQuota`] either, which is reserved for a scope the
+    /// provider positively identified as project-wide.
+    ModelQuota,
     /// The credential's whole allowance is gone (an exhausted balance, or a cap the
     /// error body does not scope to free slugs). Blocks every slug on the credential.
     WholeQuota,
@@ -674,7 +763,42 @@ impl CredentialBlock {
         }
         match self.kind {
             CredentialBlockKind::FreeQuota => is_free_scope(target),
+            // The slug that reported the exhaustion, and nothing else on the credential.
+            CredentialBlockKind::ModelQuota => target == self.target,
             CredentialBlockKind::WholeQuota | CredentialBlockKind::Unauthorized => true,
+        }
+    }
+
+    /// The stable exclusion code a route or composite reports for this block.
+    ///
+    /// A closed vocabulary, so a caller-facing decision record can say why a candidate
+    /// was never contacted without exposing provider text.
+    pub fn exclusion_code(&self) -> &'static str {
+        match self.kind {
+            CredentialBlockKind::FreeQuota | CredentialBlockKind::WholeQuota => "credential_quota",
+            // Kept distinct so a decision record can tell a per-model budget from the
+            // credential's whole allowance: the two retirements are different sizes, and
+            // only the second one authorizes a paid crossing.
+            CredentialBlockKind::ModelQuota => "credential_model_quota",
+            CredentialBlockKind::Unauthorized => "credential_unauthorized",
+        }
+    }
+
+    /// Whether this block justifies spending a paid leg on the same request.
+    ///
+    /// A composite's crossing policy is the owner's money decision, so it is narrower
+    /// than "a block exists". Only a scope the provider positively stated as the whole
+    /// credential — the free allowance for every model, the account balance, or a
+    /// rejected key — makes another leg the only way to answer. A per-model budget is
+    /// not that: the model is out until its own day rolls over, but the project is not
+    /// spent, and paying to work around one model's daily allocation is a cost the owner
+    /// did not authorize. Such a request fails closed instead.
+    pub fn crosses_to_paid(&self) -> bool {
+        match self.kind {
+            CredentialBlockKind::FreeQuota
+            | CredentialBlockKind::WholeQuota
+            | CredentialBlockKind::Unauthorized => true,
+            CredentialBlockKind::ModelQuota => false,
         }
     }
 }
@@ -687,8 +811,95 @@ impl CredentialBlock {
 /// router as paid would send it one guaranteed-rejected call on every request after the
 /// allowance is gone, which can never succeed because the allowance is account-wide
 /// rather than per model.
-fn is_free_scope(target: &str) -> bool {
+///
+/// Exported because the question is asked at two levels: this module asks it of one
+/// failing target, and a composite asks it of a whole child route before spending that
+/// child's first call. Two spellings of "free" that disagree is how a free-only child
+/// came to look paid and take a guaranteed-rejected call.
+pub fn is_free_scope(target: &str) -> bool {
     target.ends_with(":free") || target == "openrouter/free"
+}
+
+/// What a request to one target costs the deployment, as a fact rather than a spelling.
+///
+/// [`is_free_scope`] reads an OpenRouter model slug, which is the right question for
+/// OpenRouter's own wire semantics — its free-tier allowance really is scoped to `:free`
+/// variants. It is the wrong question for a deployment decision, because a provider's
+/// naming convention is not economic evidence: a Google model carries no `:free` suffix and
+/// is free by project entitlement, while a slug ending in `:free` can be delisted by the
+/// provider tomorrow.
+///
+/// This therefore carries three answers and not two. The third is what keeps an unknown
+/// model from being counted as free capacity: a target the deployment has not stated a
+/// tariff for is [`Tariff::Unknown`], and `Unknown` is never `Free`.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Tariff {
+    /// The deployment states this request draws on a free allowance.
+    Free,
+    /// The deployment states every request here is billed.
+    Metered,
+    /// The deployment states nothing about cost.
+    ///
+    /// The default, and deliberately the conservative one: absence of a tariff is not a
+    /// claim that a request is free, so a selection rule that requires free entitlement
+    /// must not include it.
+    #[default]
+    Unknown,
+}
+
+impl Tariff {
+    /// Reads a target's tariff from what the deployment declared about it.
+    ///
+    /// `free_tier` is a tri-state on purpose. `Some(true)` is a positive declaration and
+    /// `Some(false)` a positive denial of free entitlement; `None` means nobody said, which
+    /// stays [`Tariff::Unknown`] rather than becoming an inferred "cheap enough".
+    pub fn from_declaration(free_tier: Option<bool>) -> Self {
+        match free_tier {
+            Some(true) => Self::Free,
+            Some(false) => Self::Metered,
+            None => Self::Unknown,
+        }
+    }
+
+    /// Whether the deployment states this target serves inside a free allowance.
+    ///
+    /// The only predicate an *economic* rule may use - selection tier, free-pool
+    /// eligibility, cost reporting. `Unknown` is not free.
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    /// Whether a request to this target draws on the credential's free-model allowance.
+    ///
+    /// A different question from [`Self::is_free`], and it needs its own predicate. That one
+    /// asks what a request costs; this asks which provider-side allowance the request is
+    /// charged against, because that is what a provider's quota error is scoped to and what
+    /// decides whether a free-allowance block condemns the next target on the same
+    /// credential.
+    ///
+    /// A declared tariff answers it directly. An undeclared one falls back to the provider's
+    /// own convention ([`is_free_scope`]) rather than to "not free", because the fallback is
+    /// not a guess about cost - it is the provider's published scoping for its own allowance,
+    /// and reading it as "not free" is what once made a free-only route look like it held a
+    /// billable leg and spend a guaranteed-rejected call on every request after the
+    /// allowance was exhausted. The fallback is deliberately confined to this question: it
+    /// never promotes a target into a free pool and never labels a request free to a caller.
+    pub fn draws_on_free_allowance(self, target: &str) -> bool {
+        match self {
+            Self::Free => true,
+            Self::Metered => false,
+            Self::Unknown => is_free_scope(target),
+        }
+    }
+
+    /// The name a decision record prints for this tariff.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Metered => "paid",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Reads the credential-level block a failure carries, if any.
@@ -703,6 +914,25 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
         return None;
     };
     let target = target.as_str().to_string();
+    // Google states the scope of a daily quota, so its two scopes are different facts and
+    // must not be collapsed. `is_account_wide_quota` only reports the project-wide case,
+    // which would leave a per-model exhaustion both unrecorded and fatal to a mixed pool:
+    // unrecorded because no block is produced, fatal because a composite with
+    // `cross_on = "credential_block"` treats "no block" as terminal and returns.
+    if let LlmClientError::UpstreamHttp { status, body } = source
+        && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
+        && google.condition == crate::google::GoogleCondition::DailyQuota
+    {
+        let kind = match google.quota_scope {
+            // Positively project-wide: every model behind the project shares the budget.
+            crate::google::GoogleQuotaScope::Project => CredentialBlockKind::WholeQuota,
+            // Per-model, per-feature, or a scope the body never named. Only the exact
+            // reporting target is retired; an unproven scope is never promoted to
+            // project-wide, which is what the owner's per-model RPD allocation needs.
+            _ => CredentialBlockKind::ModelQuota,
+        };
+        return Some((kind, target));
+    }
     // Account-wide quota first: a 429 with the free-tier marker is a quota, not a
     // throttle, and its scope decides how much of the credential is blocked.
     if crate::client::is_account_wide_quota(source) {
@@ -1148,6 +1378,13 @@ struct ClientRouting {
     /// target that cannot see an image is never called for one. A target absent from this
     /// map is treated as uncharacterised rather than incapable.
     target_capabilities: HashMap<ModelId, CapabilityFacts>,
+    /// The credential (`llm_client`) each target draws on, keyed by model id.
+    ///
+    /// A mixed-provider route has targets on more than one credential, so "the credential
+    /// this call failed on" cannot be read off the route. It is looked up per target, and
+    /// only here: a target absent from this map makes a failure unattributable, and an
+    /// unattributable block condemns nothing rather than guessing.
+    target_credentials: HashMap<ModelId, String>,
 }
 
 /// The request requirements a candidate target is checked against.
@@ -1193,12 +1430,14 @@ pub struct CapabilityFacts {
     /// enforce something the deployment never agreed to. Defaults to `false`, so a target
     /// that states nothing keeps the behaviour it had.
     pub no_reasoning_control: bool,
-    /// Whether the provider charges nothing for a request here within a declared allowance.
+    /// What a request here costs the deployment, as a declared fact.
     ///
-    /// A selection fact, not an economics one: it decides that a paid request may never be
-    /// chosen ahead of an eligible free one. Defaults to `false`, which is the conservative
-    /// answer - an undeclared target is never promoted above a target that states it is free.
-    pub free_tier: bool,
+    /// A selection fact: it decides that a paid request may never be chosen ahead of an
+    /// eligible free one. It is also the authority for free eligibility, so it is a
+    /// [`Tariff`] and not a boolean - an undeclared target is `Unknown`, which is not free
+    /// and is never promoted above a target that states it is free. Defaults to `Unknown`,
+    /// the conservative answer.
+    pub tariff: Tariff,
     /// The physical model's own request window: input tokens plus the output it can emit.
     ///
     /// Distinct from the route's advertised `context_window`, which is a promise made to
@@ -1285,6 +1524,30 @@ impl ClientRouter {
         self
     }
 
+    /// Declares which `llm_client` credential serves each target model.
+    ///
+    /// A mixed-provider route has targets on more than one credential, so the credential a
+    /// failure belongs to cannot be read off the route: it is a property of the target that
+    /// actually failed. Resolved once here, from configuration, so neither a composite nor a
+    /// route has to infer credential identity from a wire error.
+    pub fn with_target_credentials(mut self, credentials: HashMap<ModelId, String>) -> Self {
+        let routing =
+            Arc::get_mut(&mut self.inner).expect("client router is not yet shared when configured");
+        routing.target_credentials = credentials;
+        self
+    }
+
+    /// The credential this router was told serves `model`, when it was told anything.
+    ///
+    /// `None` makes a block unattributable rather than guessed at: a failure whose target
+    /// resolves to no configured credential must not condemn one.
+    pub fn credential_for(&self, model: &ModelId) -> Option<&str> {
+        self.inner
+            .target_credentials
+            .get(model)
+            .map(String::as_str)
+    }
+
     /// Supplies the host that fulfils routing-time decision calls.
     ///
     /// Without one, a decision call is answered as unsupported.
@@ -1350,6 +1613,7 @@ impl ClientRouter {
                 track_provider_state: spans_providers,
                 decision_handler: None,
                 target_capabilities: HashMap::new(),
+                target_credentials: HashMap::new(),
             }),
         }
     }
@@ -1369,6 +1633,7 @@ impl ClientRouter {
                 track_provider_state: false,
                 decision_handler: None,
                 target_capabilities: HashMap::new(),
+                target_credentials: HashMap::new(),
             }),
         }
     }
@@ -3757,7 +4022,8 @@ mod tests {
 #[cfg(test)]
 mod account_quota_tests {
     use super::{
-        CredentialBlockKind, FailureClass, credential_block, failure_class, fallback_reason,
+        CredentialBlockKind, FailureClass, Tariff, credential_block, failure_class,
+        fallback_reason, is_free_scope,
     };
     use http::StatusCode;
     use serde_json::json;
@@ -4047,5 +4313,77 @@ mod account_quota_tests {
                 "{error:?} must not produce a credential block"
             );
         }
+    }
+
+    /// The tariff is a declaration read, not a slug guess: three inputs, three answers, and
+    /// only one of them is free.
+    ///
+    /// Pinned because the two mistakes are both plausible and both costly. Treating an
+    /// undeclared target as free spends a request nobody budgeted; treating a declared-free
+    /// target as paid silently removes the cheapest candidate from every pool.
+    #[test]
+    fn a_tariff_is_read_from_the_declaration_and_unknown_is_not_free() {
+        assert_eq!(Tariff::from_declaration(Some(true)), Tariff::Free);
+        assert_eq!(Tariff::from_declaration(Some(false)), Tariff::Metered);
+        assert_eq!(Tariff::from_declaration(None), Tariff::Unknown);
+
+        assert!(Tariff::Free.is_free());
+        assert!(!Tariff::Metered.is_free());
+        assert!(
+            !Tariff::Unknown.is_free(),
+            "an undeclared tariff is not evidence of free entitlement"
+        );
+
+        // The default is the conservative answer, so a target built before the field
+        // existed cannot become free by omission.
+        assert_eq!(Tariff::default(), Tariff::Unknown);
+        assert!(!Tariff::default().is_free());
+
+        assert_eq!(Tariff::Free.as_str(), "free");
+        assert_eq!(Tariff::Metered.as_str(), "paid");
+        assert_eq!(Tariff::Unknown.as_str(), "unknown");
+
+        // Ordering is the selection contract: a paid candidate never precedes an eligible
+        // free one, and an unknown one ranks with the paid, never with the free.
+        assert!(Tariff::Free < Tariff::Unknown);
+        assert!(Tariff::Free < Tariff::Metered);
+    }
+
+    /// The two questions the tariff answers are different, and each has its own direction of
+    /// error. Pinned together because collapsing them is the mistake a single boolean made:
+    /// the economic question must never call an undeclared target free, and the allowance
+    /// question must never call a provider-free-scoped target metered - the second is what
+    /// once spent a guaranteed-rejected call per request on a free-only child.
+    #[test]
+    fn the_allowance_question_falls_back_to_provider_scope_but_the_cost_question_does_not() {
+        // Declared answers are direct, and a declaration overrides the slug both ways.
+        assert!(Tariff::Free.draws_on_free_allowance("vendor/paid-slug"));
+        assert!(!Tariff::Metered.draws_on_free_allowance("vendor/model:free"));
+
+        // Undeclared falls back to the provider's own allowance scoping.
+        assert!(Tariff::Unknown.draws_on_free_allowance("vendor/model:free"));
+        assert!(Tariff::Unknown.draws_on_free_allowance("openrouter/free"));
+        assert!(!Tariff::Unknown.draws_on_free_allowance("vendor/paid-slug"));
+
+        // The cost question stays strict for the same inputs: nothing undeclared is free.
+        assert!(!Tariff::Unknown.is_free());
+        assert!(!Tariff::Unknown.is_free());
+    }
+
+    /// A Google model has no `:free` suffix and can still be free by entitlement, while an
+    /// OpenRouter slug carries the suffix. The two questions stay separate on purpose.
+    #[test]
+    fn free_entitlement_is_not_the_openrouter_slug_convention() {
+        assert!(is_free_scope("vendor/model:free"));
+        assert!(is_free_scope("openrouter/free"));
+        assert!(!is_free_scope("gemini-3.5-flash-lite"));
+        assert!(!is_free_scope("gemma-4-26b-a4b-it"));
+
+        // The declaration is what decides, and it decides the same way regardless of slug.
+        assert!(Tariff::from_declaration(Some(true)).is_free());
+        assert!(
+            !Tariff::from_declaration(None).is_free(),
+            "a slug without a declaration is still not a free claim"
+        );
     }
 }

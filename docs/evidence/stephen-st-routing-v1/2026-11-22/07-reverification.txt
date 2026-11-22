@@ -1,0 +1,15 @@
+# Verifiers re-run after the mixed-credential code change (manifests unchanged)
+# run 2026-11-22T13:25:31Z
+# baseline deployed 53fd9a84 / batch A 05922774 / candidate f66bbdb2
+## verify_batch_a
+
+25 checks, 460 object judgements, 0 failed
+## verify_batch_b
+
+27 checks, 0 failed
+## verify_no_live_regression
+
+6 checks, 0 failed
+## gemini-suite parity
+parity: 8 checks, 0 failure(s)
+owner profile vs live3-routes-53fd9a84.toml: 0 failure(s)

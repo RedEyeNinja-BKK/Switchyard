@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -707,6 +708,202 @@ pub async fn resolve_and_serve(
     Err(aggregate_attempts(&attempts, "all_candidates_exhausted"))
 }
 
+/// How a composed lane chooses between its children.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneSelection {
+    /// Children in declared order: the first that answers serves the request.
+    ///
+    /// The historic behaviour and still the default, so a composed lane that names no
+    /// policy keeps exactly the meaning it had.
+    #[default]
+    Ordered,
+    /// Request fit first, then a provider-neutral entry point into the eligible pool.
+    ///
+    /// Every child's physical candidates are tested against the request BEFORE anything
+    /// is dispatched, so a child whose shape does not fit cannot decide the lane merely
+    /// by being declared first. The eligible pool is then entered at a position that
+    /// advances by one per request, so no declared position - and therefore no provider -
+    /// is systematically offered the request first.
+    CapabilityFirst,
+}
+
+/// A composed lane as the runtime sees it: the child lanes it references, and how it
+/// chooses between them.
+///
+/// The selection policy travels with the composition rather than being inferred from the
+/// lane's name, so which policy a lane runs is a property of its declaration and cannot
+/// be changed by renaming it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposedLane {
+    /// Child decision lane names, in declared order.
+    pub children: Vec<String>,
+    /// How the parent selects among them.
+    pub selection: LaneSelection,
+}
+
+/// One physical candidate that may serve a request, with the child lane that declares it.
+#[derive(Clone, Copy)]
+pub struct EligibleCandidate<'a> {
+    /// Name of the child POLICY lane that declares this candidate.
+    pub lane: &'a str,
+    /// The physical backend.
+    pub candidate: &'a DecisionCandidate,
+}
+
+/// Every distinct physical candidate reachable from `children`, split by request fit.
+///
+/// Deduplicated by target name: a backend declared by two children is one physical model,
+/// and calling it twice for one request would be two provider requests for one answer.
+/// Declaration order is retained only as a stable input to a rotation, never as a
+/// preference between providers.
+///
+/// The split is computed before anything is dispatched, which is the whole point of this
+/// entry point: a lane that answers "does this request fit?" one child at a time lets the
+/// first child's shape refusal decide the lane, even when a later child fits exactly.
+pub fn capability_pool<'a>(
+    children: &'a [LaneChild],
+    request: &DecisionRequest,
+) -> (Vec<EligibleCandidate<'a>>, Vec<(String, DecisionSkip)>) {
+    let mut eligible = Vec::new();
+    let mut refused = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for child in children {
+        for candidate in &child.resolver.candidates {
+            if seen.contains(&candidate.name.as_str()) {
+                continue;
+            }
+            seen.push(candidate.name.as_str());
+            match candidate.eligibility(request) {
+                Ok(()) => eligible.push(EligibleCandidate {
+                    lane: child.lane(),
+                    candidate,
+                }),
+                Err(skip) => refused.push((format!("{}/{}", child.lane(), candidate.name), skip)),
+            }
+        }
+    }
+    (eligible, refused)
+}
+
+/// The order in which one request should enter a pool of `len` eligible candidates.
+///
+/// Pure and explicit so the behaviour is reproducible: the runtime supplies a cursor, a
+/// test supplies the same number directly. Starting at `rotation % len` and wrapping means
+/// every position is offered first equally often over any run of requests, which is the
+/// only neutral tie-break available without inventing quality or latency scores.
+pub fn rotation_order(len: usize, rotation: u64) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let start = (rotation % len as u64) as usize;
+    (0..len).map(|offset| (start + offset) % len).collect()
+}
+
+/// Process-wide rotation cursor for capability-first selection.
+///
+/// A tie must not be broken by declaration position, because declaration position is also
+/// provider order: always entering at the first eligible candidate would be "declared
+/// first", whatever the lane was called. The cursor advances by one per request. It is
+/// process state, never persisted: a restart resumes at the first position, which costs
+/// at most one request's balance and cannot privilege a provider permanently.
+static CAPABILITY_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// Advances the capability-first cursor once and returns its previous value.
+fn next_rotation() -> u64 {
+    CAPABILITY_CURSOR.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Serves a request from every eligible child candidate, in a provider-neutral order.
+///
+/// Selection happens across the whole pool, not child by child:
+///
+/// * every child's physical candidates are tested against the request first, so an
+///   ineligible candidate is refused before its provider is contacted and is recorded
+///   with that reason rather than being silently absent from the trace;
+/// * if nothing is eligible the lane refuses with the most specific reason, which is the
+///   caller's answer and never a provider call;
+/// * otherwise the pool is entered at `rotation % len` and dispatched sequentially, one
+///   physical call at a time. There is no fan-out: a pool is not evidence, and asking two
+///   providers the same question to compare them would spend money to obtain ranking.
+///
+/// Failure handling is unchanged from the ordered path: a retryable failure yields to the
+/// next candidate, and a terminal one stops, because a contract violation or a missing
+/// credential is evidence about this deployment rather than about the next provider.
+pub async fn serve_capability_first(
+    children: &[LaneChild],
+    request: &DecisionRequest,
+    stack: &[String],
+    rotation: u64,
+) -> Result<DecisionOutcome, DecisionFailure> {
+    for child in children {
+        if stack.contains(&child.lane) {
+            return Err(DecisionFailure::Serving {
+                reason: "decision_lane_cycle",
+                retryable: false,
+            });
+        }
+    }
+    let (eligible, refused) = capability_pool(children, request);
+    // Why a backend was not called is part of the answer: without it, "SPAN was not used"
+    // is indistinguishable from "SPAN was not configured".
+    let mut attempts: Vec<(String, DecisionFailure)> = refused
+        .iter()
+        .map(|(name, skip)| (name.clone(), DecisionFailure::NotEligible(*skip)))
+        .collect();
+    if eligible.is_empty() {
+        let skips: Vec<DecisionSkip> = refused.iter().map(|(_, skip)| *skip).collect();
+        return Err(DecisionFailure::Refused(DecisionSkip::dominant(&skips)));
+    }
+    for index in rotation_order(eligible.len(), rotation) {
+        let entry = eligible[index];
+        let body = match entry
+            .candidate
+            .transport
+            .request_body(&entry.candidate.model, request)
+        {
+            Ok(body) => body,
+            Err(_) => {
+                attempts.push((
+                    format!("{}/{}", entry.lane, entry.candidate.name),
+                    DecisionFailure::NotEligible(DecisionSkip::Contract),
+                ));
+                continue;
+            }
+        };
+        match send(entry.candidate, body).await {
+            Ok(payload) => {
+                let response = parse_response(&payload).map_err(|_| DecisionFailure::Serving {
+                    reason: "undecodable_response",
+                    retryable: false,
+                })?;
+                return Ok(DecisionOutcome {
+                    response,
+                    served_by: entry.candidate.name.clone(),
+                    attempts,
+                    served_by_lane: Some(entry.lane.to_string()),
+                });
+            }
+            Err(failure) => {
+                if !failure.try_next() {
+                    return Err(failure);
+                }
+                attempts.push((format!("{}/{}", entry.lane, entry.candidate.name), failure));
+            }
+        }
+    }
+    Err(aggregate_attempts(&attempts, "all_candidates_exhausted"))
+}
+
+/// Serves a capability-first request at the next neutral position.
+pub async fn serve_capability_first_neutral(
+    children: &[LaneChild],
+    request: &DecisionRequest,
+    stack: &[String],
+) -> Result<DecisionOutcome, DecisionFailure> {
+    serve_capability_first(children, request, stack, next_rotation()).await
+}
+
 /// One child lane's contribution to a composed request.
 #[derive(Clone)]
 pub struct LaneChild {
@@ -807,7 +1004,7 @@ pub enum NamedDispatch {
 /// selection, which is what keeps two policy lanes that both support a kind from
 /// stealing each other's requests.
 pub fn classify_named(
-    composition: &BTreeMap<String, Vec<String>>,
+    composition: &BTreeMap<String, ComposedLane>,
     lanes: &BTreeMap<String, LaneResolverHandle>,
     requested: &str,
 ) -> NamedDispatch {
@@ -835,7 +1032,7 @@ pub fn classify_named(
 /// handler bypassed it, was possible precisely because this logic was inlined in two
 /// places.
 pub async fn serve_named(
-    composition: &BTreeMap<String, Vec<String>>,
+    composition: &BTreeMap<String, ComposedLane>,
     lanes: &BTreeMap<String, LaneResolverHandle>,
     requested: &str,
     request: &DecisionRequest,
@@ -843,13 +1040,21 @@ pub async fn serve_named(
     match classify_named(composition, lanes, requested) {
         NamedDispatch::Unknown => Ok(None),
         NamedDispatch::Composed => {
-            let children = composition.get(requested).cloned().unwrap_or_default();
+            let Some(composed) = composition.get(requested) else {
+                return Err(DecisionFailure::NotEligible(DecisionSkip::TargetNotFound));
+            };
             // An unknown child fails closed rather than silently shrinking the policy.
-            let ordered = composed_children(lanes, &children)?;
+            let ordered = composed_children(lanes, &composed.children)?;
             let mut stack = vec![requested.to_string()];
-            serve_composed(&ordered, request, &mut stack)
-                .await
-                .map(Some)
+            // The lane's declared policy decides how it chooses; a composed lane that
+            // names none keeps the historic ordered meaning.
+            let outcome = match composed.selection {
+                LaneSelection::Ordered => serve_composed(&ordered, request, &mut stack).await,
+                LaneSelection::CapabilityFirst => {
+                    serve_capability_first_neutral(&ordered, request, &stack).await
+                }
+            };
+            outcome.map(Some)
         }
         NamedDispatch::Leaf => {
             let lane = lanes
@@ -893,11 +1098,11 @@ pub fn composed_children(
 
 /// Resolves the child policy lanes of a composed lane, in configured order.
 pub fn lane_children(
-    composition: &BTreeMap<String, Vec<String>>,
+    composition: &BTreeMap<String, ComposedLane>,
     lanes: &BTreeMap<String, LaneResolverHandle>,
     lane: &str,
 ) -> Option<Vec<LaneChild>> {
-    let names = composition.get(lane)?;
+    let names = &composition.get(lane)?.children;
     let mut children = Vec::with_capacity(names.len());
     for name in names {
         let handle = lanes.get(name)?;

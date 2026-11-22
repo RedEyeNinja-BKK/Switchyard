@@ -98,6 +98,35 @@ class GateTests(unittest.TestCase):
         shown = set(d["routes"]) - {"direct-openrouter-nemotron-vl"}
         self.assertIn("DIRECT_NOT_ADVERTISED", str(gate.analyze(d, shown)["failures"]))
 
+    def test_actual_model_endpoint_must_match_runtime_route_flags(self):
+        d = fixture()
+        rows = {}
+        for name, route in d["routes"].items():
+            rows[name] = {
+                "id": name, "context_length": route["context_window"],
+                "capabilities": {
+                    "tool_calling": route["tool_calling"],
+                    "vision": route["vision"],
+                    "video": route["video"],
+                    "image_carriers": (["inline"] if route.get("image_carrier") == "inline" else None),
+                    "video_carriers": (["inline"] if route.get("video_carrier") == "inline" else None),
+                },
+            }
+        self.assertEqual(gate.analyze(d, rows)["status"], "PASS")
+        rows["direct-openrouter-nemotron-vl"]["capabilities"]["vision"] = False
+        self.assertIn("RUNTIME_ADVERTISEMENT_DRIFT", str(gate.analyze(d, rows)["failures"]))
+        rows["direct-openrouter-nemotron-vl"]["capabilities"]["vision"] = True
+        rows["direct-openrouter-nemotron-vl"]["capabilities"]["image_carriers"] = None
+        self.assertIn("RUNTIME_CARRIER_DRIFT", str(gate.analyze(d, rows)["failures"]))
+        rows["direct-openrouter-nemotron-vl"]["capabilities"]["image_carriers"] = ["inline"]
+        rows["direct-openrouter-nemotron-vl"]["context_length"] = 1
+        self.assertIn("RUNTIME_CONTEXT_DRIFT", str(gate.analyze(d, rows)["failures"]))
+
+    def test_duplicate_runtime_model_ids_refused(self):
+        with self.assertRaises(gate.ContractError) as err:
+            gate._model_entries({"data": [{"id": "direct-a"}, {"id": "direct-a"}]})
+        self.assertEqual(err.exception.token, "MODEL_LIST_DUPLICATE_ID")
+
     def test_fake_video_overclaim_is_caught(self):
         d = fixture()
         d["targets"]["vl"]["video"] = False

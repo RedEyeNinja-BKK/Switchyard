@@ -33,16 +33,19 @@ def fixture():
             "direct-google-gemini-3.6-flash": {
                 "id": "direct-google-gemini-3.6-flash", "type": "passthrough",
                 "target": "google-3.6", "candidates": [],
+                "context_window": 262144,
                 "tool_calling": True, "vision": False, "video": False,
             },
             "direct-google-stephen-gemini-3.6-flash": {
                 "id": "direct-google-stephen-gemini-3.6-flash", "type": "passthrough",
                 "target": "stephen-google-3.6", "candidates": [],
+                "context_window": 262144,
                 "tool_calling": True, "vision": False, "video": False,
             },
             "direct-openrouter-nemotron-vl": {
                 "id": "direct-openrouter-nemotron-vl", "type": "passthrough",
                 "target": "vl", "candidates": [],
+                "context_window": 262144,
                 "tool_calling": True, "vision": True, "video": True,
                 "image_carrier": "inline", "video_carrier": "inline",
             },
@@ -78,6 +81,17 @@ class GateTests(unittest.TestCase):
         self.assertEqual(
             next(row for row in result["routes"] if row["target"] == "vl")
                 ["target_capabilities"]["video"], "NOT_DECLARED")
+
+    def test_missing_safe_context_bound_refused(self):
+        d = fixture()
+        d["routes"]["direct-openrouter-nemotron-vl"].pop("context_window")
+        self.assertIn("CONTEXT_CAP_UNQUALIFIED",
+                      str(gate.analyze(d)["failures"]))
+
+    def test_context_overclaim_refused(self):
+        d = fixture()
+        d["targets"]["vl"]["context_window"] = 131072
+        self.assertIn("CONTEXT_OVERCLAIM", str(gate.analyze(d)["failures"]))
 
     def test_unadvertised_alias_is_a_failure(self):
         d = fixture()

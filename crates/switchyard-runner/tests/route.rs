@@ -536,3 +536,65 @@ batch_size = 8
     assert_eq!(max_length, Some(4096));
     assert_eq!(batch_size, Some(8));
 }
+
+/// A route whose candidates are all free-scope slugs is skipped, not entered, once the
+/// credential's free allowance is gone.
+///
+/// The provider's dynamic Free Models Router spends that same account-wide allowance
+/// without carrying a `:free` suffix. Reading the suffix alone classified a free-only
+/// route that contains it as having a paid leg, so the composite entered the child and
+/// spent one guaranteed-rejected call per request for the rest of the day.
+#[test]
+fn a_dynamic_free_router_does_not_make_a_free_route_look_paid() {
+    fn passthrough(target: &str, candidates: &[&str]) -> Route {
+        let models: Vec<ModelId> = std::iter::once(target)
+            .chain(candidates.iter().copied())
+            .map(ModelId::from)
+            .collect();
+        let targets: BTreeMap<String, ModelId> = models
+            .iter()
+            .map(|model| (model.as_str().to_owned(), model.clone()))
+            .collect();
+        let algorithm = AlgorithmSpec::Passthrough {
+            target: target.to_string(),
+            candidates: candidates.iter().map(|c| (*c).to_string()).collect(),
+            subagents: None,
+        }
+        .build("switchyard", &targets)
+        .expect("passthrough target map should build");
+        Route::new(
+            algorithm,
+            ClientRouter::new(HashMap::new()),
+            None,
+            ModelCapabilities::default(),
+            None,
+            None,
+            Vec::new(),
+            RuntimeModels::new([(Category::Any, models)].into()),
+            switchyard_runner::RouteReasoningPolicy::Inherit,
+            None,
+            None,
+        )
+    }
+
+    assert!(
+        passthrough(
+            "baidu/ernie-5.5-flash-preview:free",
+            &["nvidia/nemotron-3.5-super-vl:free", "openrouter/free"]
+        )
+        .all_targets_free(),
+        "the dynamic free router draws on the free allowance, so the route is free end to end"
+    );
+    assert!(
+        !passthrough(
+            "baidu/ernie-5.5-flash-preview:free",
+            &["openrouter/free", "z-ai/glm-5.3-flash"]
+        )
+        .all_targets_free(),
+        "one metered candidate keeps a servable leg, so the route is not free"
+    );
+    assert!(
+        passthrough("openrouter/free", &[]).all_targets_free(),
+        "a route whose only target is the dynamic free router is free"
+    );
+}

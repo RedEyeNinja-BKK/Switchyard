@@ -1,0 +1,165 @@
+{
+  "captured_at": "2026-11-22T12:40:00+07:00",
+  "source": "https://openrouter.ai/api/v1/models",
+  "note": "Public model catalogue, unauthenticated read. No inference call, no credential, no quota spend. Subset of the 476 listed models.",
+  "models": {
+    "baidu/ernie-5.5-flash-preview:free": {
+      "listed": true,
+      "name": "Baidu: ERNIE-5.5-Flash-Preview (free)",
+      "context_length": 1024000,
+      "max_completion_tokens": 921600,
+      "input_modalities": [
+        "text"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    "deepseek/deepseek-v4.1-flash-1017": {
+      "listed": true,
+      "name": "DeepSeek: DeepSeek V4.1 Flash 1017",
+      "context_length": 1048576,
+      "max_completion_tokens": 393216,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0.00000015",
+        "completion": "0.0000006"
+      }
+    },
+    "dots-studio/dots-3-note-preview:free": {
+      "listed": false
+    },
+    "google/gemma-4-26b-a4b-it:free": {
+      "listed": true,
+      "name": "Google: Gemma 4 26B A4B  (free)",
+      "context_length": 262144,
+      "max_completion_tokens": 32768,
+      "input_modalities": [
+        "image",
+        "text",
+        "video"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    "google/gemma-4-31b-it:free": {
+      "listed": true,
+      "name": "Google: Gemma 4 31B (free)",
+      "context_length": 262144,
+      "max_completion_tokens": 32768,
+      "input_modalities": [
+        "image",
+        "text",
+        "video"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    "inclusionai/ling-3.2-flash:free": {
+      "listed": true,
+      "name": "inclusionAI: Ling 3.2 Flash (free)",
+      "context_length": 1048576,
+      "max_completion_tokens": 262144,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    "nvidia/nemotron-3.5-super-vl:free": {
+      "listed": true,
+      "name": "NVIDIA: Nemotron 3.5 Super VL (free)",
+      "context_length": 1000000,
+      "max_completion_tokens": 131072,
+      "input_modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    "openrouter/free": {
+      "listed": true,
+      "name": "Free Models Router",
+      "context_length": 200000,
+      "max_completion_tokens": null,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    "recursive/flint-v1.0:free": {
+      "listed": true,
+      "name": "Recursive: Flint (free)",
+      "context_length": 262144,
+      "max_completion_tokens": 235929,
+      "input_modalities": [
+        "text"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    "z-ai/glm-5.3-flash": {
+      "listed": true,
+      "name": "Z.ai: GLM 5.3 Flash",
+      "context_length": 1048576,
+      "max_completion_tokens": 131072,
+      "input_modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "output_modalities": [
+        "text"
+      ],
+      "pricing_per_token": {
+        "prompt": "0.0000000399",
+        "completion": "0.0000000784"
+      }
+    }
+  }
+}

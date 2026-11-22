@@ -1,0 +1,127 @@
+--- live2/routes-07796640.toml
++++ /tmp/x.toml
+@@ -1154,4 +1154,5 @@
+ id = "nvidia/nemotron-3.5-super-vl:free"
+ llm_client = "openrouter_stephen"
++free_tier = true
+ vision = true
+ video = true
+@@ -1167,4 +1168,5 @@
+ id = "recursive/flint-v1.0:free"
+ llm_client = "openrouter_stephen"
++free_tier = true
+ vision = false
+ tool_calling = true
+@@ -1175,4 +1177,5 @@
+ id = "baidu/ernie-5.5-flash-preview:free"
+ llm_client = "openrouter_stephen"
++free_tier = true
+ # Explicit false: an omitted capability is "undeclared", which the runner treats
+ # as permitted, so only an explicit refusal keeps images off this text-only target.
+@@ -1186,4 +1189,5 @@
+ id = "inclusionai/ling-3.2-flash:free"
+ llm_client = "openrouter_stephen"
++free_tier = true
+ vision = true
+ video = false
+@@ -1196,14 +1200,4 @@
+ reasoning_policy = "disabled"
+ reasoning_dialect = "openrouter_enabled"
+-
+-[targets.stephen-openrouter-free]
+-# OpenRouter's Free Models Router. It picks an eligible free model per request, so
+-# the exact model is not knowable here and only the router's own contract is stated:
+-# its page declares text and image input up to 200k and no blanket video path.
+-id = "openrouter/free"
+-llm_client = "openrouter_stephen"
+-vision = true
+-video = false
+-tool_calling = true
+ 
+ # ---- Stephen primitive routes ----
+@@ -1219,10 +1213,13 @@
+   "stephen-ling-3_2-flash-free",
+   "stephen-nemotron-3-5-super-vl-free",
+-  "stephen-openrouter-free",
++  "stephen-flint-v1-0-free",
++  "stephen-dots-3-note-preview-free",
++  "stephen-gemma-4-26b-a4b-it-free",
++  "stephen-gemma-4-31b-it-free",
+ ]
+-# The three named legs are declared at 262144, so that is what this route promises.
+-# The R4 Free Models Router declares up to 200k; it is the last leg and a bonus
+-# rather than the guarantee, which is why the route number follows the primary legs
+-# and the escalation threshold below follows the router's ceiling.
++# 262144 is this route's promise, not a limit any leg imposes: the leaf routes each
++# carry their provider-published window (ERNIE 1,024,000; Ling 1,048,576; Nemotron
++# 1,000,000). Raising this number is a separate, qualified decision about what ST_Free
++# callers may be admitted with.
+ context_window = 262144
+ tool_calling = true
+@@ -1233,7 +1230,7 @@
+ image_carrier = "inline"
+ route_reasoning_policy = "inherit"
+-# The measured smartfree learning carries over: Ling took ~120 s on a 430k-token
+-# request while Nemotron handled it in ~50 s, so above the router's ceiling the
+-# wider leg is offered first instead of the narrow one being tried and failing.
++# The measured learning carries over: Ling took ~120 s on a 430k-token request while
++# Nemotron handled it in ~50 s, so above 200k tokens the proven wide-context leg is
++# offered first instead of the narrow one being tried and failing.
+ escalation_max_input_tokens = 200000
+ escalation_target = "stephen-nemotron-3-5-super-vl-free"
+@@ -1297,4 +1294,5 @@
+ id = "dots-studio/dots-3-note-preview:free"
+ llm_client = "openrouter_stephen"
++free_tier = true
+ vision = true
+ video = false
+@@ -1311,4 +1309,5 @@
+ id = "google/gemma-4-26b-a4b-it:free"
+ llm_client = "openrouter_stephen"
++free_tier = true
+ vision = true
+ video = false
+@@ -1326,4 +1325,5 @@
+ id = "google/gemma-4-31b-it:free"
+ llm_client = "openrouter_stephen"
++free_tier = true
+ vision = true
+ video = false
+@@ -1496,5 +1496,5 @@
+ target = "stephen-ernie-5_5-flash-preview-free"
+ candidates = []
+-context_window = 262144
++context_window = 1024000
+ tool_calling = true
+ reasoning = true
+@@ -1507,5 +1507,5 @@
+ target = "stephen-ling-3_2-flash-free"
+ candidates = []
+-context_window = 262144
++context_window = 1048576
+ tool_calling = true
+ reasoning = true
+@@ -1513,16 +1513,4 @@
+ video = false
+ image_carrier = "inline"
+-
+-[routes.direct-openrouter-stephen-openrouter-free]
+-id = "direct-openrouter-stephen-openrouter-free"
+-type = "passthrough"
+-target = "stephen-openrouter-free"
+-candidates = []
+-# The router's own declared ceiling, not a sibling leaf's.
+-context_window = 200000
+-tool_calling = true
+-reasoning = true
+-vision = true
+-video = false
+ 
+ [routes.direct-openrouter-stephen-glm-5-3-flash]
+@@ -1545,5 +1533,5 @@
+ target = "stephen-nemotron-3-5-super-vl-free"
+ candidates = []
+-context_window = 262144
++context_window = 1000000
+ tool_calling = true
+ reasoning = true

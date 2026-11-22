@@ -687,7 +687,12 @@ impl CredentialBlock {
 /// router as paid would send it one guaranteed-rejected call on every request after the
 /// allowance is gone, which can never succeed because the allowance is account-wide
 /// rather than per model.
-fn is_free_scope(target: &str) -> bool {
+///
+/// Exported because the question is asked at two levels: this module asks it of one
+/// failing target, and a composite asks it of a whole child route before spending that
+/// child's first call. Two spellings of "free" that disagree is how a free-only child
+/// came to look paid and take a guaranteed-rejected call.
+pub fn is_free_scope(target: &str) -> bool {
     target.ends_with(":free") || target == "openrouter/free"
 }
 

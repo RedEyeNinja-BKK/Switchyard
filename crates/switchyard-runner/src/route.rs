@@ -533,15 +533,21 @@ impl Route {
             .leak()
     }
 
-    /// Whether every servable target on this route is a `:free` slug.
+    /// Whether every servable target on this route draws on the free-model allowance.
     ///
     /// A free-scope quota blocks the route only when this is true; a route with a paid
     /// candidate still has a servable leg on the same credential.
+    ///
+    /// Judged with the same predicate the failing call used, so the two levels cannot
+    /// disagree. Reading only the `:free` suffix made the provider's Free Models Router
+    /// (`openrouter/free`) look paid, and a free-only route carrying it was then treated
+    /// as having a paid leg: the child was entered after the account-wide allowance was
+    /// gone and its first call was guaranteed to be rejected.
     pub fn all_targets_free(&self) -> bool {
         self.models
             .all_models()
             .iter()
-            .all(|model| model.as_str().ends_with(":free"))
+            .all(|model| switchyard_llm_client::is_free_scope(model.as_str()))
     }
 
     /// Returns the configured libsy algorithm name.

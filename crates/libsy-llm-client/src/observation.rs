@@ -116,6 +116,21 @@ pub struct SelectionTrace {
     /// decided per request. Absent means the route is not a pool, which is every route that
     /// states a deliberate lineup.
     pub pool: Option<String>,
+    /// Targets the route declares as a terminal leg, in declared order.
+    ///
+    /// A terminal leg is never ranked with the primary candidates: it is reached only after
+    /// every eligible primary is verifiably unavailable. Recording it here keeps the
+    /// distinction visible in the trace, so an answer served by the terminal model cannot be
+    /// mistaken for a peer that merely ranked last.
+    pub terminal: Vec<String>,
+    /// Whether this request stepped onto the terminal leg.
+    pub terminal_crossed: bool,
+    /// Stable code naming why the terminal leg was authorized, when it was.
+    ///
+    /// The crossing carries its reason rather than a bare boolean because "the pool is
+    /// exhausted" and "every capable leg is blocked" are different claims about the primary
+    /// pool, and a reader deciding whether a paid leg was spent needs to see which was made.
+    pub terminal_reason: Option<&'static str>,
 }
 
 /// A stable, value-free code naming how one attempt ended.

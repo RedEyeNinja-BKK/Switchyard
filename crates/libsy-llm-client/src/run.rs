@@ -241,7 +241,9 @@ async fn call_first_available(
     // candidate would lose or reconstruct the conversation, so a recorded owner
     // pins the route even when another candidate is configured.
     let pinned_owner = clients.continuation_owner(request);
-    for (index, target) in models.iter().enumerate() {
+    let mut index = 0;
+    while index < models.len() {
+        let target = &models[index];
         let request = clients.prepare_completion_request(request.clone(), target);
         match call_one(
             clients,
@@ -269,25 +271,44 @@ async fn call_first_available(
                 // A statement about the credential that produced this failure says
                 // nothing about a candidate on a DIFFERENT credential. A free pool spans
                 // providers, so a rejected Google key or an exhausted OpenRouter
-                // allowance must not end the pool while a healthy peer remains. Within
-                // one credential the stop still applies: that is the check above.
-                let next = &models[index + 1];
-                let from = clients.credential_for(target);
-                let crosses_credential = from.is_some() && from != clients.credential_for(next);
+                // allowance must not end the pool while a healthy peer remains.
+                //
+                // The peer need not be the NEXT candidate: a pool lists a provider's
+                // models together, so an account-wide stop would otherwise return before
+                // reaching the other provider at all. Skip to the first later candidate on
+                // a different credential and continue from there; the skipped legs share
+                // the dead credential, so calling them could only repeat the same failure.
                 match fallback_reason(&error) {
-                    Some(reason) => tracing::info!(
-                        from = %target,
-                        to = %next,
-                        reason = reason.as_str(),
-                        "model call failed; trying next candidate"
-                    ),
-                    None if crosses_credential && credential_scoped_stop(&error) => {
+                    Some(reason) => {
                         tracing::info!(
                             from = %target,
-                            to = %next,
-                            reason = "credential_scope",
-                            "credential-scoped failure; a peer on another credential may serve"
+                            to = %models[index + 1],
+                            reason = reason.as_str(),
+                            "model call failed; trying next candidate"
                         );
+                        index += 1;
+                    }
+                    None if credential_scoped_stop(&error) => {
+                        let from = clients.credential_for(target);
+                        let survivor = from.and_then(|from| {
+                            models[index + 1..]
+                                .iter()
+                                .position(|next| clients.credential_for(next) != Some(from))
+                                .map(|offset| index + 1 + offset)
+                        });
+                        match survivor {
+                            Some(next) => {
+                                tracing::info!(
+                                    from = %target,
+                                    to = %models[next],
+                                    skipped = next - index - 1,
+                                    reason = "credential_scope",
+                                    "credential-scoped failure; a peer on another credential may serve"
+                                );
+                                index = next;
+                            }
+                            None => return Err(error),
+                        }
                     }
                     None => return Err(error),
                 }

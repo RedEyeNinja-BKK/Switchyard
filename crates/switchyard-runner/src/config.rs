@@ -268,6 +268,15 @@ struct RouteConfig {
     escalation_max_input_tokens: Option<u64>,
     /// Groups whose members form this route's candidate pool, when it declares one.
     pool_groups: Option<Vec<String>>,
+    /// Targets this route may reach only after its entire eligible primary pool is
+    /// verifiably unavailable.
+    ///
+    /// Kept separate from the candidate list on purpose. A terminal leg that was merely a
+    /// candidate would be ranked with its peers and would serve whenever the pool was busy,
+    /// which is the paid escalation this field exists to prevent; naming it here means the
+    /// exhaustion rule is the only way to reach it. A terminal target therefore must not also
+    /// appear among the candidates.
+    terminal_fallback: Option<Vec<String>>,
     /// Target this route prefers once it is under context pressure.
     ///
     /// Named rather than inferred: a target's context window is not a fact this config
@@ -381,6 +390,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let pool_groups = take_optional(&mut table, "pool_groups")?;
+        let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
         let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -398,6 +408,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
             pool_groups,
+            terminal_fallback,
             escalation_target,
             selection: selection.unwrap_or_default(),
             algorithm,
@@ -448,6 +459,22 @@ impl RouteConfig {
 
     fn callable_target_names(&self) -> Vec<&str> {
         self.algorithm.callable_target_names()
+    }
+
+    /// Every target this route may contact: the ranked candidates plus the terminal last
+    /// resort. Facts, credentials, daily ledgers and prompt policy have to describe a
+    /// target the route can actually call, or the terminal leg is reached without the
+    /// admission and block machinery that protects every ranked leg.
+    fn served_target_names(&self) -> Vec<&str> {
+        let mut names = self.routing_target_names();
+        if let Some(terminal) = &self.terminal_fallback {
+            for name in terminal {
+                if !names.contains(&name.as_str()) {
+                    names.push(name.as_str());
+                }
+            }
+        }
+        names
     }
 }
 
@@ -848,6 +875,12 @@ impl DeploymentConfig {
             if let Some(groups) = &config.pool_groups {
                 self.validate_route_pool(route_name, config, groups)?;
             }
+            // A terminal leg is a last resort, so its declaration has to be unambiguous: it
+            // must name real targets, none of them a candidate of this route, and none of
+            // them held. A terminal target that was also a candidate would be ranked as a
+            // peer and could serve without exhaustion; one that does not exist would make
+            // the route silently unwilling to use its last resort at startup.
+            let terminal_ids = self.validate_terminal_fallback(route_name, config)?;
             let algorithm = config
                 .algorithm
                 .build(route_name, &targets)
@@ -871,7 +904,7 @@ impl DeploymentConfig {
             let responses_auxiliary_target =
                 self.build_responses_auxiliary_target(config, &clients);
             let decision_targets = config
-                .routing_target_names()
+                .served_target_names()
                 .into_iter()
                 .filter_map(|name| self.decision_target(name))
                 .collect();
@@ -900,6 +933,14 @@ impl DeploymentConfig {
                 models = models.filtered(&|model| !held_models.contains(model));
             }
             let held = self.route_held(config, &held_models);
+            // The terminal leg is handed to the route as its own model set, never merged with
+            // the candidates, so the ranking machinery cannot see it at all.
+            let terminal = (!terminal_ids.is_empty()).then(|| {
+                RuntimeModels::new(HashMap::from([(
+                    switchyard_protocol::Category::Any,
+                    terminal_ids.clone(),
+                )]))
+            });
             let route = Route::new(
                 algorithm,
                 route_clients,
@@ -919,7 +960,7 @@ impl DeploymentConfig {
             .with_locality(route_locality(config, &self.targets, &self.llm_clients))
             .with_daily_allowances(Arc::new(
                 config
-                    .routing_target_names()
+                    .served_target_names()
                     .into_iter()
                     .filter_map(|name| self.targets.get(name))
                     .filter_map(|target| {
@@ -937,6 +978,10 @@ impl DeploymentConfig {
             ));
             let route = match held {
                 Some(held) => route.with_held(held),
+                None => route,
+            };
+            let route = match terminal {
+                Some(terminal) => route.with_terminal_fallback(terminal),
                 None => route,
             };
             // A measured route ranks candidates only after it has evidence, and shares that
@@ -1101,6 +1146,50 @@ impl DeploymentConfig {
     /// free. A group with no members is refused too: a pool that names an empty group has
     /// silently become a different pool, and that is exactly the drift the label exists to
     /// prevent.
+    fn validate_terminal_fallback(
+        &self,
+        route_name: &str,
+        config: &RouteConfig,
+    ) -> RunnerResult<Vec<ModelId>> {
+        let Some(names) = &config.terminal_fallback else {
+            return Ok(Vec::new());
+        };
+        if names.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} declares terminal_fallback but names no target"
+            )));
+        }
+        let candidates = config.callable_target_names();
+        let mut resolved: Vec<ModelId> = Vec::new();
+        for name in names {
+            let Some(target) = self.targets.get(name) else {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names unknown target {name}"
+                )));
+            };
+            if candidates.iter().any(|candidate| candidate == name) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names {name}, which is also a \
+                     candidate; a terminal leg must not be ranked with the primary pool, or it \
+                     would serve whenever that pool was merely busy"
+                )));
+            }
+            if target.held.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names {name}, which is held; a \
+                     withdrawn target cannot be a last resort"
+                )));
+            }
+            if resolved.contains(&target.id) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback names {name} more than once"
+                )));
+            }
+            resolved.push(target.id.clone());
+        }
+        Ok(resolved)
+    }
+
     fn validate_route_pool(
         &self,
         route_name: &str,
@@ -2237,7 +2326,15 @@ impl DeploymentConfig {
         let mut by_model = HashMap::new();
         let mut targets_by_model: HashMap<&str, (&str, &TargetConfig)> = HashMap::new();
         let mut caller_auth = None;
-        for name in route.callable_target_names() {
+        // The terminal leg is dispatched through the same router, so its client has to be
+        // constructed here even though it is never a ranked candidate.
+        let mut contact_names = route.callable_target_names();
+        for name in route.terminal_fallback.iter().flatten() {
+            if !contact_names.contains(&name.as_str()) {
+                contact_names.push(name.as_str());
+            }
+        }
+        for name in contact_names {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
             })?;
@@ -2284,7 +2381,7 @@ impl DeploymentConfig {
         // Decision calls need a host. One resolver is built from this route's configured
         // decision targets, in configured order, and serves both the internal call path
         // and any public typed surface, so Decision has one implementation.
-        let route_targets = route.routing_target_names();
+        let route_targets = route.served_target_names();
         // Target capability facts reach the client router so ordered candidates can be
         // filtered before dispatch. A target with no declaration is left in place.
         let mut facts: HashMap<ModelId, switchyard_llm_client::CapabilityFacts> = HashMap::new();
@@ -2489,7 +2586,7 @@ impl DeploymentConfig {
     ) -> RunnerResult<TargetPromptPolicy> {
         let mut prompts = HashMap::new();
         let mut aliases = HashMap::<&ModelId, Option<&str>>::new();
-        for name in route.algorithm.routing_target_names() {
+        for name in route.served_target_names() {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
             })?;
@@ -2620,7 +2717,7 @@ fn route_locality(
     let mut legs = 0usize;
     let mut saw_local = false;
     let mut saw_external = false;
-    for name in route.routing_target_names() {
+    for name in route.served_target_names() {
         let Some(target) = targets.get(name) else {
             continue;
         };
@@ -2664,7 +2761,7 @@ fn target_credentials(
     targets: &BTreeMap<String, TargetConfig>,
 ) -> std::collections::HashMap<ModelId, String> {
     route
-        .routing_target_names()
+        .served_target_names()
         .into_iter()
         .filter_map(|name| {
             targets

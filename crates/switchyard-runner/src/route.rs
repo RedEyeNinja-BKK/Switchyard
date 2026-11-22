@@ -4,6 +4,7 @@
 //! One configured algorithm and the clients that serve its targets.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -266,6 +267,114 @@ fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrie
     }
 }
 
+/// Decides whether the terminal leg may be spent, and names why.
+///
+/// This is the whole policy, kept as a free function so its decision table can be
+/// exercised without a live route: every branch is a claim about the primary pool, and a
+/// wrong claim either strands a request the pool could not serve or spends a paid leg it
+/// did not need to.
+///
+/// * `capable` - targets the deployment says could serve this request at all;
+/// * `dispatchable` - of those, the ones no credential block excludes right now;
+/// * `attempts` - every upstream call this request actually made;
+/// * `credential_of` - the credential that serves a target, when configuration says.
+///
+/// Returns `None` when the pool's unavailability is not provable, which is the safe
+/// answer: the caller gets the primary error instead of a paid escalation.
+pub(crate) fn authorize_terminal(
+    capable: &[ModelId],
+    dispatchable: &HashSet<ModelId>,
+    attempts: &[AttemptTrace],
+    credential_of: impl Fn(&ModelId) -> Option<String>,
+) -> Option<&'static str> {
+    // Nothing in the pool could serve this request even with unlimited capacity, so
+    // "exhausted" would be a different claim from the true one. Refuse.
+    if capable.is_empty() {
+        return None;
+    }
+    if dispatchable.is_empty() {
+        // Every capable leg is covered by a credential block, so the pool is provably out
+        // of capacity without a single request being made.
+        return Some("primary_pool_blocked");
+    }
+    let primary_attempts: Vec<&AttemptTrace> = attempts
+        .iter()
+        .filter(|attempt| capable.iter().any(|model| model.as_str() == attempt.model))
+        .collect();
+    if primary_attempts.is_empty() {
+        return None;
+    }
+    // One leg failing for a reason that is about the request - a policy answer, a
+    // malformed tool call, a stream that broke mid-delivery - is enough to keep the
+    // terminal leg out: retrying it elsewhere would fail again, with a bill attached.
+    if !primary_attempts
+        .iter()
+        .all(|attempt| is_capacity_outcome(attempt.outcome))
+    {
+        return None;
+    }
+    let attempted: HashSet<&str> = primary_attempts
+        .iter()
+        .map(|attempt| attempt.model.as_str())
+        .collect();
+    // A capable leg can only be left unattempted if the candidate walk stopped early, and
+    // the walk stops early only on a credential-scoped failure (a 401 or a scope-wide 429).
+    // A timeout is not in `is_capacity_outcome`, so it is already excluded above. Any
+    // unattempted leg must therefore be explained by a credential this request already
+    // proved dead. Anything else is a gap in coverage, not exhaustion.
+    let dead: HashSet<String> = primary_attempts
+        .iter()
+        .filter(|attempt| is_credential_scope_outcome(attempt.outcome))
+        .filter_map(|attempt| credential_of(&ModelId::from(attempt.model.as_str())))
+        .collect();
+    for model in capable.iter().filter(|model| dispatchable.contains(*model)) {
+        if attempted.contains(model.as_str()) {
+            continue;
+        }
+        let Some(credential) = credential_of(model) else {
+            return None;
+        };
+        if !dead.contains(&credential) {
+            return None;
+        }
+    }
+    Some("primary_pool_exhausted")
+}
+
+/// Whether an attempt ended because a leg ran out of capacity or was unavailable.
+///
+/// This is the closed list a terminal leg may be authorized by. It deliberately excludes
+/// `timeout` (a delivered stream broke, which says nothing about the next leg),
+/// `context_window` (a request-fit fact, not a capacity one), `http_403` and `http_400`
+/// (answers about the request or the account's permissions), `empty_answer` (a quality
+/// fact about one model), and every translation or configuration fault.
+fn is_capacity_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "daily_allowance_exhausted"
+            | "daily_allowance_unavailable"
+            | "minute_window"
+            | "minute_window_too_small"
+            | "http_401"
+            | "http_402"
+            | "http_429"
+            | "http_5xx"
+            | "transport"
+            | "unavailable"
+            | "attempt_timeout"
+    )
+}
+
+/// Whether an attempt's outcome says the CREDENTIAL is unusable, rather than the request.
+///
+/// Only used to explain why a capable leg was never called. The candidate walk stops early
+/// only on these two classes, so an unattempted leg here shares a credential the walk
+/// already proved dead. A plain per-model 429 never stops the walk — it falls through to the
+/// next candidate — so any 429 that leaves a leg unattempted is scope-wide by construction.
+fn is_credential_scope_outcome(outcome: &str) -> bool {
+    matches!(outcome, "http_401" | "http_402" | "http_429")
+}
+
 /// Caller credential family required by a forwarded-auth route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallerAuthKind {
@@ -426,6 +535,14 @@ pub struct Route {
     /// rather than a boolean means the trace can name the groups the pool was built from,
     /// and a pool route is recognisable at runtime, not only in the manifest that created it.
     pool_groups: Option<Vec<String>>,
+    /// Targets this route may reach only when every eligible primary candidate is
+    /// verifiably unavailable, in declared order.
+    ///
+    /// Deliberately not part of `models`: a terminal leg must never be ranked with the
+    /// primary candidates, or it would become a peer that merely sorts last and would
+    /// serve whenever the pool was busy. It is dispatched as its own list, under its own
+    /// exhaustion gate, so "this provider is tired" cannot buy it a request.
+    terminal: Option<Arc<RuntimeModels>>,
 }
 
 /// A route whose targets are all held out of service, with the evidence for holding it.
@@ -480,7 +597,51 @@ impl Route {
             daily_allowances: Arc::new(HashMap::new()),
             held: None,
             pool_groups: None,
+            terminal: None,
         }
+    }
+
+    /// Declares a leg this route reaches only after its entire eligible primary pool is
+    /// verifiably unavailable.
+    ///
+    /// The terminal models are kept out of the ranked candidate set on purpose: they are a
+    /// last resort, not a peer. `smart-nt` is the shape this exists for — Gemini NT leaves
+    /// and Luna NT compete as one provider-neutral pool, and a metered DeepSeek NT leg is
+    /// reached only when none of them can answer.
+    pub fn with_terminal_fallback(mut self, terminal: RuntimeModels) -> Self {
+        self.terminal = Some(Arc::new(terminal));
+        self
+    }
+
+    /// The terminal targets this route declares, in declared order.
+    pub fn terminal_models(&self) -> Vec<ModelId> {
+        self.terminal
+            .as_ref()
+            .map(|terminal| terminal.all_models())
+            .unwrap_or_default()
+    }
+
+    /// Whether the primary pool is verifiably out of capacity, and which claim says so.
+    ///
+    /// `None` means the terminal leg is not authorized. The two `Some` answers are the ones
+    /// an operator acts on differently:
+    ///
+    /// * `primary_pool_blocked` — every leg that could serve this request is covered by a
+    ///   credential block. Capacity is provably gone and nothing was dispatched.
+    /// * `primary_pool_exhausted` — legs were dispatched and every one failed on capacity or
+    ///   availability, with no capable leg left unexplained.
+    ///
+    /// Everything else refuses: no leg could ever serve the request, a leg failed for a
+    /// reason that is about the request, or a capable leg's absence is unexplained.
+    fn terminal_authorization(
+        &self,
+        capable: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+    ) -> Option<&'static str> {
+        authorize_terminal(capable, dispatchable, attempts, |model| {
+            self.target_credential(model).map(str::to_string)
+        })
     }
 
     /// Enables measured ordering among the candidates this route has already admitted.
@@ -881,15 +1042,13 @@ impl Route {
         // was busy, which is a paid escalation nobody approved. `unknown` fails closed for
         // the same reason: an undeclared tariff is not evidence of free entitlement.
         let pool_members_only_free = self.is_peer_pool();
-        let verdict = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
-            // A candidate covered by a block carried in from the composite is excluded
-            // before it can be ranked or dispatched. Judged on this target's own credential,
-            // so a block on one provider's account or one model's budget never reaches a
-            // peer that is still healthy, and never becomes a paid escalation either: a
-            // paid leg is only reached by the composite's own crossing policy.
-            if let Some(code) = self.block_exclusion(model, blocks) {
-                return Err(code);
-            }
+        // The block gate and the capability gate are separate questions, and the terminal
+        // leg's exhaustion rule needs both answers. `capability_gate` asks "could this
+        // target serve this request at all"; `verdict` adds "and is it allowed to right
+        // now". A pool whose every capable leg is merely blocked is exhausted; a pool where
+        // no leg is capable is a request nobody can serve, and must be refused rather than
+        // handed to a paid leg as if capacity had run out.
+        let capability_gate = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
             let Some(facts) = facts.get(model) else {
                 // Uncharacterised rather than incapable: permitted, except for video,
                 // which no target may receive without stating that it can read it.
@@ -983,8 +1142,38 @@ impl Route {
                 None => Ok(()),
             }
         };
+        // The block gate wraps the capability gate, so an excluded candidate's reason names
+        // the credential when it was the credential, and the request when it was the
+        // request. Judged on this target's own credential, so a block on one provider's
+        // account or one model's budget never reaches a peer that is still healthy, and
+        // never becomes a paid escalation either: a paid leg is only reached by the
+        // route's own crossing policy.
+        let verdict = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
+            match self.block_exclusion(model, blocks) {
+                Some(code) => Err(code),
+                None => capability_gate(model),
+            }
+        };
         let considered = self.models.all_models();
         let verdicts: Vec<Result<(), &'static str>> = considered.iter().map(&verdict).collect();
+        // Snapshot the two answers the terminal leg's exhaustion rule needs, while `request`
+        // is still borrowed read-only. Both gates read request facts, so they cannot be
+        // re-evaluated after the request is moved into the reasoning-policy rewrite below.
+        let capable_legs: Vec<switchyard_protocol::ModelId> = considered
+            .iter()
+            .filter(|model| capability_gate(model).is_ok())
+            .cloned()
+            .collect();
+        let dispatchable_legs: HashSet<switchyard_protocol::ModelId> = capable_legs
+            .iter()
+            .filter(|model| verdict(model).is_ok())
+            .cloned()
+            .collect();
+        let terminal_servable: HashSet<switchyard_protocol::ModelId> = self
+            .terminal_models()
+            .into_iter()
+            .filter(|model| verdict(model).is_ok())
+            .collect();
         let models = self.models.filtered(&|model| verdict(model).is_ok());
         // Among candidates that survived every hard gate, a route may prefer what this
         // deployment has actually observed. This reorders one already-admitted list and
@@ -1148,6 +1337,9 @@ impl Route {
             estimated_input_tokens,
             promotion: promoted.map(|model| model.to_string()),
             pool: self.pool_groups.as_ref().map(|groups| groups.join(",")),
+            terminal: self.terminal_models().iter().map(ToString::to_string).collect(),
+            terminal_crossed: false,
+            terminal_reason: None,
         };
         if models.is_empty() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
@@ -1207,18 +1399,47 @@ impl Route {
         // has been observed, or it would report a dispatch with no outcomes.
         let report = observer.clone();
         let attempts: Arc<Mutex<Vec<AttemptTrace>>> = Arc::new(Mutex::new(Vec::new()));
-        let observer = Some(recording_observer(
+        let run_observer = Some(recording_observer(
             Arc::clone(&attempts),
             self.selecting_observer(observer),
         ));
-        let result = switchyard_llm_client::run(
+        // A terminal leg is a last resort. Keep a copy of the shaped request only when one
+        // exists, so the common route pays nothing for a capability it does not have.
+        let terminal_request = self.terminal.as_ref().map(|_| request.clone());
+        let mut result = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
             request,
-            Arc::new(models),
-            observer,
+            Arc::new(models.clone()),
+            run_observer.clone(),
         )
         .await;
+        if let (Some(terminal), Some(terminal_request)) = (self.terminal.as_ref(), terminal_request)
+            && result.is_err()
+        {
+            // The primary pool failed. Before anything is spent on the terminal leg, the
+            // claim "the pool is exhausted" has to be true of the same gates the order used
+            // and of what the dispatch actually observed. A single rate limit, a policy
+            // refusal, or a request that never fit is not that claim.
+            let recorded = attempts.lock().clone();
+            let authorization =
+                self.terminal_authorization(&capable_legs, &dispatchable_legs, &recorded);
+            if let Some(reason) = authorization {
+                let servable = terminal.filtered(&|model| terminal_servable.contains(model));
+                if !servable.is_empty() {
+                    trace.terminal_crossed = true;
+                    trace.terminal_reason = Some(reason);
+                    result = switchyard_llm_client::run(
+                        Arc::clone(&self.algorithm),
+                        self.clients.clone(),
+                        terminal_request,
+                        Arc::new(servable),
+                        run_observer,
+                    )
+                    .await;
+                }
+            }
+        }
         {
             trace.attempts = attempts.lock().clone();
             match &result {
@@ -1400,5 +1621,145 @@ mod carrier_tests {
         assert!(Both.includes(Inline) && Both.includes(Remote) && Both.includes(Both));
         assert!(Inline.includes(Inline) && !Inline.includes(Remote) && !Inline.includes(Both));
         assert!(Remote.includes(Remote) && !Remote.includes(Inline) && !Remote.includes(Both));
+    }
+}
+
+#[cfg(test)]
+mod terminal_authorization_tests {
+    use super::{AttemptTrace, HashSet, ModelId, authorize_terminal};
+    use std::collections::HashMap;
+
+    fn legs(ids: &[(&str, &str)]) -> (Vec<ModelId>, HashMap<ModelId, String>) {
+        let mut models = Vec::new();
+        let mut credentials = HashMap::new();
+        for (model, credential) in ids {
+            let id = ModelId::from(*model);
+            models.push(id.clone());
+            credentials.insert(id, (*credential).to_string());
+        }
+        (models, credentials)
+    }
+
+    fn attempt(model: &str, outcome: &'static str) -> AttemptTrace {
+        AttemptTrace {
+            model: model.to_string(),
+            phase: "routing",
+            outcome,
+            duration_ms: 1,
+            prompt_tokens: 1,
+            completion_tokens: 0,
+        }
+    }
+
+    fn dispatchable(models: &[ModelId]) -> HashSet<ModelId> {
+        models.iter().cloned().collect()
+    }
+
+    #[test]
+    fn nothing_capable_never_authorizes() {
+        let (models, credentials) = legs(&[("a", "A")]);
+        assert_eq!(
+            authorize_terminal(&[], &dispatchable(&models), &[], |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
+    }
+
+    #[test]
+    fn every_capable_leg_blocked_is_a_blocked_pool() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
+        assert_eq!(
+            authorize_terminal(&models, &HashSet::new(), &[], |m| credentials
+                .get(m)
+                .cloned()),
+            Some("primary_pool_blocked")
+        );
+    }
+
+    #[test]
+    fn one_capacity_failure_with_a_dead_credential_is_exhaustion() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "A")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    #[test]
+    fn an_unattempted_leg_on_a_live_credential_is_not_exhaustion() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_request_fault_never_authorizes() {
+        for outcome in ["http_403", "http_400", "empty_answer", "timeout", "context_window"] {
+            let (models, credentials) = legs(&[("a", "A")]);
+            let attempts = vec![attempt("a", outcome)];
+            assert_eq!(
+                authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                    .get(m)
+                    .cloned()),
+                None,
+                "outcome {outcome} must not authorize the terminal leg"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_run_with_one_request_fault_never_authorizes() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429"), attempt("b", "http_403")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unattributable_leg_is_never_given_a_dead_credential() {
+        // No credential mapping: a skip cannot be explained, so it is not exhaustion.
+        let (models, _) = legs(&[("a", "A"), ("b", "A")]);
+        let attempts = vec![attempt("a", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |_| None),
+            None
+        );
+    }
+
+    #[test]
+    fn every_leg_attempted_and_capacity_failed_is_exhaustion() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "http_429"), attempt("b", "daily_allowance_exhausted")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    #[test]
+    fn an_attempt_on_a_non_capable_target_does_not_count() {
+        let (models, credentials) = legs(&[("a", "A")]);
+        let attempts = vec![attempt("other", "http_429")];
+        assert_eq!(
+            authorize_terminal(&models, &dispatchable(&models), &attempts, |m| credentials
+                .get(m)
+                .cloned()),
+            None
+        );
     }
 }

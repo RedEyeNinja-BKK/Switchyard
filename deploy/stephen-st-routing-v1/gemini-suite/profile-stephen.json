@@ -35,8 +35,6 @@
     "gemma-4-26b-a4b-it": "google_gemini_stephen",
     "gemma-4-31b-it": "google_gemma_31b_stephen",
     "gemini-3-flash-preview": "google_gemini_stephen",
-    "gemini-2.5-flash": "google_gemini_stephen",
-    "gemini-2.5-flash-lite": "google_gemini_stephen",
     "gemini-decision-1": "google_gemini_stephen"
   },
   "state": {
@@ -73,14 +71,6 @@
     "gemini-3-flash-preview": {
       "qualification": "unverified",
       "reason": "No serving receipt under this project."
-    },
-    "gemini-2.5-flash": {
-      "qualification": "held",
-      "reason": "Retired by the provider for new users (the catalogue's shared fact): a different project does not un-retire a model."
-    },
-    "gemini-2.5-flash-lite": {
-      "qualification": "held",
-      "reason": "Retired by the provider for new users (the catalogue's shared fact): a different project does not un-retire a model."
     },
     "gemini-decision-1": {
       "qualification": "unverified",

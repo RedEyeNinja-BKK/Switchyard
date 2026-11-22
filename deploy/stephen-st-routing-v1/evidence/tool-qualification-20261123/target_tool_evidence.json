@@ -1,0 +1,157 @@
+{
+ "generated": "2026-11-23",
+ "manifest_baseline": "5211bdc7",
+ "method": "one bounded minimal tool-call request per direct alias; direct aliases are 1:1 passthrough with no candidates",
+ "routes": {
+  "direct-comfyninja-qwen3_8-27b-q4-mtp": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 7.59s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-comfyninja-qwen3_8-27b-q4-mtp-vl": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=length tool_calls=1 in 62.08s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-deepseek-deepseek-flash": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 0.65s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-deepseek-deepseek-flash-nt": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 0.5s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-deepseek-deepseek-v4-pro": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=length tool_calls=1 in 0.76s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-google-gemini-3.1-flash-lite": {
+   "basis": "SHARED_MODEL_SPEC",
+   "note": "owner account returned 429 quota today; capability is a property of the shared upstream model, not the account",
+   "receipt": "model-level tool call proven on direct-google-stephen-gemini-3.1-flash-lite 2026-11-23 (route-tool-probe.jsonl); owner account serving evidence separate",
+   "value": true
+  },
+  "direct-google-gemini-3.5-flash-lite": {
+   "basis": "SHARED_MODEL_SPEC",
+   "note": "owner account returned 429 quota today; capability is a property of the shared upstream model, not the account",
+   "receipt": "model-level tool call proven on direct-google-stephen-gemini-3.5-flash-lite 2026-11-23 (route-tool-probe.jsonl); owner account serving evidence separate",
+   "value": true
+  },
+  "direct-google-gemini-3.6-flash": {
+   "basis": "SHARED_MODEL_SPEC",
+   "note": "owner account returned 429 quota today; capability is a property of the shared upstream model, not the account",
+   "receipt": "model-level tool call proven on direct-google-stephen-gemini-3.6-flash 2026-11-23 (route-tool-probe.jsonl); owner account serving evidence separate",
+   "value": true
+  },
+  "direct-google-gemini-4-hydrogen": {
+   "basis": "SHARED_MODEL_SPEC",
+   "note": "owner account returned 429 quota today; capability is a property of the shared upstream model, not the account",
+   "receipt": "model-level tool call proven on direct-google-stephen-gemini-4-hydrogen 2026-11-23 (route-tool-probe.jsonl); owner account serving evidence separate",
+   "value": true
+  },
+  "direct-google-gemma-4-26b-a4b-it": {
+   "basis": "PRIOR_MEASUREMENT",
+   "note": "200 finish_reason=tool_calls measured on the Gemini OpenAI-compatible endpoint with the production key",
+   "receipt": "PRIOR_MEASUREMENT 2026-11-21 gemma-tools-20261121.jsonl + gemma31-20261121.jsonl (/var/tmp on turnstone-vm)",
+   "value": true
+  },
+  "direct-google-gemma-4-31b-it": {
+   "basis": "PRIOR_MEASUREMENT",
+   "note": "200 finish_reason=tool_calls measured on the Gemini OpenAI-compatible endpoint with the production key",
+   "receipt": "PRIOR_MEASUREMENT 2026-11-21 gemma-tools-20261121.jsonl + gemma31-20261121.jsonl (/var/tmp on turnstone-vm)",
+   "value": true
+  },
+  "direct-google-stephen-gemini-3.1-flash-lite": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 1.65s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-google-stephen-gemini-3.5-flash-lite": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 2.14s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-google-stephen-gemini-3.6-flash": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 0.7s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-google-stephen-gemini-4-hydrogen": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 5.52s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-google-stephen-gemma-4-26b-a4b-it": {
+   "basis": "PRIOR_MEASUREMENT",
+   "note": "200 finish_reason=tool_calls measured on the Gemini OpenAI-compatible endpoint with the production key",
+   "receipt": "PRIOR_MEASUREMENT 2026-11-21 gemma-tools-20261121.jsonl + gemma31-20261121.jsonl (/var/tmp on turnstone-vm)",
+   "value": true
+  },
+  "direct-google-stephen-gemma-4-31b-it": {
+   "basis": "PRIOR_MEASUREMENT",
+   "note": "200 finish_reason=tool_calls measured on the Gemini OpenAI-compatible endpoint with the production key",
+   "receipt": "PRIOR_MEASUREMENT 2026-11-21 gemma-tools-20261121.jsonl + gemma31-20261121.jsonl (/var/tmp on turnstone-vm)",
+   "value": true
+  },
+  "direct-htpc-qwen3_5-9b": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=length tool_calls=1 in 13.75s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-htpc-qwen3_5-9b-mtp": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=length tool_calls=1 in 6.92s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-openrouter-glm-5_3-flash": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 1.33s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-openrouter-qwen3_7-flash": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 5.95s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-openrouter-qwen3_8-flash": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 1.63s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-thaillm-openthaigpt": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 0.57s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-thaillm-thalle": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 0.75s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  },
+  "direct-thaillm-typhoon": {
+   "basis": "LIVE_TOOL_CALL",
+   "note": "finish_reason=tool_calls tool_calls=1 in 0.23s",
+   "receipt": "LIVE_TOOL_CALL 2026-11-23 switchyard-vm /var/tmp/p0/evidence/route-tool-probe.jsonl",
+   "value": true
+  }
+ }
+}

@@ -179,7 +179,7 @@
         "omit_body_fields_why": "The three Responses-format names every chat model here omits, plus `temperature`: the surface was measured to answer 400 `Unsupported parameter: temperature`, so a caller-pinned value is dropped instead of relayed. The Gemini Lite targets carry only the three, so this is a fact about these two models, not about the surface."
       },
       "provider_state": "serving",
-      "notes": "Hosted Gemma writes its chain of thought into the visible message as <thought>\u2026</thought>; the marker is what keeps the monologue out of the caller's text. Below a 512-token reservation it returns no visible text at all, because the thought is charged against the caller's output budget. The 1,300-per-mille admission pad is the measured estimator under-count on this lane.",
+      "notes": "Hosted Gemma writes its chain of thought into the visible message as <thought>…</thought>; the marker is what keeps the monologue out of the caller's text. Below a 512-token reservation it returns no visible text at all, because the thought is charged against the caller's output budget. The 1,300-per-mille admission pad is the measured estimator under-count on this lane.",
       "wire": "openai_compat"
     },
     {
@@ -239,42 +239,6 @@
       "provider_state": "serving",
       "notes": "Serving on its own 20-RPD row, but not a member of the owner pool. Its 600-token thinking floor and the absence of a declared window are facts both profiles must share, whichever pool includes it.",
       "wire": "openai_compat"
-    },
-    {
-      "key": "gemini-2.5-flash",
-      "route": "direct-google-gemini-2.5-flash",
-      "id": "gemini-2.5-flash",
-      "family": "gemini",
-      "lane": "chat",
-      "context_window": 1048576,
-      "vision": false,
-      "video": false,
-      "free_tier": true,
-      "limits": {
-        "max_input_tokens": 250000
-      },
-      "behaviour": {},
-      "provider_state": "retired_404",
-      "notes": "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21). The record stays so the hold is auditable and an alias refuses locally with Google's own evidence.",
-      "wire": "openai_compat",
-      "retirement_evidence": "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21)."
-    },
-    {
-      "key": "gemini-2.5-flash-lite",
-      "route": "direct-google-gemini-2.5-flash-lite",
-      "id": "gemini-2.5-flash-lite",
-      "family": "gemini",
-      "lane": "chat",
-      "context_window": null,
-      "vision": false,
-      "video": false,
-      "free_tier": true,
-      "limits": {},
-      "behaviour": {},
-      "provider_state": "retired_404",
-      "notes": "Google answers HTTP 404 for this model as well (measured 2026-11-21). No window, no budget: a held model serves nothing, so it declares nothing.",
-      "wire": "openai_compat",
-      "retirement_evidence": "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21)."
     },
     {
       "key": "gemini-decision-1",

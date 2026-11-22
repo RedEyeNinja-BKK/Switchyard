@@ -131,6 +131,18 @@ def main() -> int:
         print("SKIP  M4 (candidate has no capabilities section)", file=sys.stderr)
         return 1
 
+    # M6 - the widened smart-nt allowance must stay narrow. `selection` is a
+    # reviewed key on ST_Free, so this mutant is built to be allowed by the
+    # ST_Free entry and refused on smart-nt; if it survives, the F1/F2 allowlist
+    # has become a blanket permit for the route it was meant to bound.
+    m6 = copy.deepcopy(live)
+    if "smart-nt" in m6["routes"]:
+        m6["routes"]["smart-nt"]["selection"] = "peer"
+        mutants.append(("M6 smart-nt unreviewed key stays refused", m6, None, "L4 deployed routes change only in reviewed keys"))
+    else:
+        print("SKIP  M6 (no smart-nt route in live manifest)", file=sys.stderr)
+        return 1
+
     failures = 0
     for label, live_doc, cand_doc, expected_check in mutants:
         live_arg, cand_arg = live_path, cand_path

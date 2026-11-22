@@ -58,6 +58,13 @@ ALLOWED_ROUTE_KEYS = {
     "direct-openrouter-stephen-ernie-5_5-flash-preview-free": {"context_window"},
     "direct-openrouter-stephen-ling-3_2-flash-free": {"context_window"},
     "direct-openrouter-stephen-nemotron-3-5-super-vl-free": {"context_window"},
+    # Batch F1/F2. smart-nt's candidate list drops the HELD 2.5-flash leaf (a held
+    # route answers 404) and moves DeepSeek NT out of the ranked pool and into the
+    # exhaustion-only terminal leg. Deliberately narrow: `selection`, windows and
+    # every other key on smart-nt stay unreviewed, and M6 proves that still fails.
+    "smart-nt": {"candidates", "terminal_fallback"},
+    # Batch F1, the same held-404 cleanup applied to the owner Gemini profile.
+    "smart_gemini": {"candidates"},
     "*": set(),
 }
 

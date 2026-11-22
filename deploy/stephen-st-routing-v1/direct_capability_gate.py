@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Strict, OFFLINE direct-route capability contract, using the ACTIVE Switchyard manifest.
+
+This is a RELEASE GATE, not a dashboard/Google-only model-card renderer.
+It consumes the fields the Switchyard runner actually uses for admission:
+route-level tool_calling/vision/video and image/video carriers, plus the
+target-level corresponding facts. It never turns vendor model docs into an
+admitted wire claim. Missing evidence is a named BLOCKER, not a question mark.
+
+Usage:
+  python3 direct_capability_gate.py --manifest /var/lib/switchyard/releases/CURRENT/routes.toml
+  python3 direct_capability_gate.py --manifest candidate.toml --models models.json
+  python3 direct_capability_gate.py --manifest candidate.toml --json
+
+Exit 0 only for fully qualified active direct routes. No secrets, no API calls,
+no service changes or account mutations.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RETIRED = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite"})
+BOOL_FIELDS = ("tool_calling", "vision", "video")
+CARRIERS = frozenset({"inline", "remote", "both"})
+
+
+class ContractError(ValueError):
+    def __init__(self, token: str, route: str, detail: str):
+        self.token, self.route, self.detail = token, route, detail
+        super().__init__(f"{token} [{route}]: {detail}")
+
+
+def _fail(token: str, route: str, detail: str) -> None:
+    raise ContractError(token, route, detail)
+
+
+def _direct_names(doc: dict) -> list[str]:
+    routes = doc.get("routes")
+    if not isinstance(routes, dict):
+        _fail("DIRECT_ROUTES_NOT_A_TABLE", "manifest", "routes must be a table")
+    direct = sorted(name for name in routes if name.startswith("direct-"))
+    if not direct:
+        _fail("DIRECT_ROUTES_EMPTY", "manifest", "no direct aliases")
+    for name in direct:
+        if any(name.endswith("-" + suffix) for suffix in RETIRED):
+            _fail("RETIRED_DIRECT_DEFINED", name, "native Gemini 2.5 must be removed, not held")
+    return direct
+
+
+def _one_target(doc: dict, route_name: str) -> tuple[dict, str, dict]:
+    route = doc["routes"][route_name]
+    if route.get("type") != "passthrough":
+        _fail("DIRECT_NOT_PASSTHROUGH", route_name, "a direct alias must be 1:1")
+    candidates = route.get("candidates", [])
+    if candidates:
+        _fail("DIRECT_HAS_FALLBACK", route_name, repr(candidates))
+    for key in ("terminal_fallback", "escalation_target", "pool_groups"):
+        if route.get(key):
+            _fail("DIRECT_HIDDEN_SUBSTITUTION", route_name, key)
+    target_name = route.get("target")
+    targets = doc.get("targets") or {}
+    if not isinstance(target_name, str) or target_name not in targets:
+        _fail("DIRECT_TARGET_MISSING", route_name, str(target_name))
+    target = targets[target_name]
+    if not target.get("id") or target.get("held"):
+        _fail("DIRECT_TARGET_NOT_SERVABLE", route_name, target_name)
+    if not target.get("llm_client") or target["llm_client"] not in doc.get("llm_clients", {}):
+        _fail("DIRECT_CLIENT_MISSING", route_name, target_name)
+    return route, target_name, target
+
+
+def _boolean(value) -> bool:
+    return type(value) is bool
+
+
+def _carriers(route_name: str, route: dict, target: dict, medium: str, errors: list[str]):
+    field = "image_carrier" if medium == "vision" else "video_carrier"
+    rc, tc = route.get(field), target.get(field)
+    if rc is not None and rc not in CARRIERS:
+        errors.append(f"CARRIER_INVALID {route_name} route.{field}={rc!r}")
+    if tc is not None and tc not in CARRIERS:
+        errors.append(f"CARRIER_INVALID {route_name} target.{field}={tc!r}")
+    if route[medium]:
+        if medium == "video" and tc is None:
+            errors.append(f"VIDEO_TRANSPORT_NOT_QUALIFIED {route_name} missing target.{field}")
+        if rc in CARRIERS and tc in CARRIERS:
+            needed = {"inline", "remote"} if rc == "both" else {rc}
+            supported = {"inline", "remote"} if tc == "both" else {tc}
+            if not needed <= supported:
+                errors.append(f"CARRIER_OVERCLAIM {route_name} {field} route={rc} target={tc}")
+        elif rc is None and tc in ("inline", "remote"):
+            errors.append(f"CARRIER_UNADVERTISED {route_name} route.{field} must be {tc}")
+    elif rc is not None:
+        errors.append(f"CARRIER_WITH_DISABLED_MEDIUM {route_name} {field}")
+
+
+def analyze(doc: dict, advertised: set[str] | None = None) -> dict:
+    names = _direct_names(doc)
+    rows = []
+    errors: list[str] = []
+    for name in names:
+        try:
+            route, target_name, target = _one_target(doc, name)
+        except ContractError as exc:
+            errors.append(str(exc))
+            continue
+        client = doc["llm_clients"][target["llm_client"]]
+        issues: list[str] = []
+        for key in BOOL_FIELDS:
+            if not _boolean(route.get(key)):
+                issues.append(f"ROUTE_CAPABILITY_NOT_EXPLICIT {name} {key}")
+            if not _boolean(target.get(key)):
+                issues.append(f"TARGET_CAPABILITY_UNQUALIFIED {name} {target_name}.{key}")
+            if _boolean(route.get(key)) and _boolean(target.get(key)):
+                if route[key] and not target[key]:
+                    issues.append(f"DIRECT_OVERCLAIM {name} {key} true against target false")
+                if not route[key] and target[key]:
+                    issues.append(f"DIRECT_SUPPRESSED_CAPABILITY {name} {key}: "
+                                  "must document intentional route narrowing or correct source")
+        if all(_boolean(route.get(k)) for k in BOOL_FIELDS):
+            _carriers(name, route, target, "vision", issues)
+            _carriers(name, route, target, "video", issues)
+        if advertised is not None and name not in advertised:
+            issues.append(f"DIRECT_NOT_ADVERTISED {name}")
+        if target.get("video") is True and client.get("format") != "openai_responses":
+            issues.append(f"VIDEO_WIRE_MISMATCH {name} {client.get('format')}")
+        row = {
+            "route": name,
+            "target": target_name,
+            "model": target["id"],
+            "client": target["llm_client"],
+            "credential_env_name": client.get("api_key_env", "NOT_CONFIGURED"),
+            "quota_group": client.get("quota_group", "NOT_CONFIGURED"),
+            "transport": client.get("format", "NOT_CONFIGURED"),
+            "route_capabilities": {key: route.get(key, "NOT_DECLARED") for key in BOOL_FIELDS},
+            "target_capabilities": {key: target.get(key, "NOT_DECLARED") for key in BOOL_FIELDS},
+            "route_image_carrier": route.get("image_carrier", "NO_NARROWING_DECLARED"),
+            "target_image_carrier": target.get("image_carrier", "NO_NARROWING_DECLARED"),
+            "route_video_carrier": route.get("video_carrier", "NO_NARROWING_DECLARED"),
+            "target_video_carrier": target.get("video_carrier", "NO_NARROWING_DECLARED"),
+            "route_context_window": route.get("context_window", "NOT_DECLARED"),
+            "target_context_window": target.get("context_window", "NOT_DECLARED"),
+            "max_input_tokens": target.get("max_input_tokens", "NOT_DECLARED"),
+            "state": "QUALIFIED_DECLARATIONS" if not issues else "EXECUTION_METADATA_BLOCKED",
+            "problems": issues,
+        }
+        rows.append(row)
+        errors.extend(issues)
+
+    google = [r for r in rows if r["route"].startswith("direct-google-")]
+    owner = {r["model"]: r for r in google if not r["route"].startswith("direct-google-stephen-")}
+    stephen = {r["model"]: r for r in google if r["route"].startswith("direct-google-stephen-")}
+    if set(owner) != set(stephen):
+        errors.append(f"GOOGLE_DUAL_PROFILE_MODEL_DRIFT owner={sorted(owner)} stephen={sorted(stephen)}")
+    for model in set(owner) & set(stephen):
+        a, b = owner[model], stephen[model]
+        for key in ("target_capabilities", "route_capabilities", "max_input_tokens"):
+            if a[key] != b[key]:
+                errors.append(f"GOOGLE_SHARED_CAPABILITY_DRIFT {model}.{key}")
+        if a["quota_group"] == b["quota_group"] or a["credential_env_name"] == b["credential_env_name"]:
+            errors.append(f"GOOGLE_ACCOUNT_BOUNDARY_BROKEN {model}")
+    return {"direct_count": len(names), "routes": rows, "failures": errors,
+            "status": "PASS" if not errors else "REFUSED"}
+
+
+def _model_ids(blob: dict) -> set[str]:
+    rows = blob.get("data")
+    if not isinstance(rows, list):
+        _fail("MODEL_LIST_BAD_SHAPE", "/v1/models", "data must be a list")
+    return {row["id"] for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)}
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--manifest", type=Path, required=True)
+    p.add_argument("--models", type=Path, default=None, help="saved live GET /v1/models JSON")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    try:
+        doc = tomllib.loads(a.manifest.read_text())
+        advertised = _model_ids(json.loads(a.models.read_text())) if a.models else None
+        report = analyze(doc, advertised)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 3
+    if a.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"{report['status']} direct={report['direct_count']} "
+              f"qualified={len(report['routes'])-len(set(row['route'] for row in report['routes'] if row['problems']))} "
+              f"failures={len(report['failures'])}")
+        for err in report["failures"]:
+            print(f"REFUSED {err}")
+    return 0 if report["status"] == "PASS" else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

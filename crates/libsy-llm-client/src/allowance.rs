@@ -284,6 +284,62 @@ impl DailyRequestAllowance {
         Ok(())
     }
 
+    /// Whether both of this allowance's files can be used *by this process*, without
+    /// changing anything.
+    ///
+    /// Answers the question a directory probe cannot: the directory may be writable while a
+    /// counter left behind by a different account is not. Files that are present are opened
+    /// exactly as a real call will, so an unreadable counter is a configuration error with a
+    /// remedy in the message rather than a 503 discovered by the first caller.
+    ///
+    /// **Absent files are not a fault and are not created here.** Creation belongs to the
+    /// account that spends: the first reservation creates the directory, the lock and the
+    /// counter as the process that will own them. Doing it at load looks equivalent and is
+    /// not - a deployment preflight runs the same loader as root, so a load-time create
+    /// leaves root-owned files under a unit that runs as its own user, and the first request
+    /// then fails with a permission error that reads like a provider fault. A dry run must
+    /// be able to validate a fresh deployment without leaving any state behind.
+    pub fn check_usable(&self) -> Result<(), String> {
+        for path in [self.path.clone(), self.lock_path()] {
+            match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(_) => {}
+                // Nothing exists yet: the first reservation creates both files, as the
+                // account that will spend them.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(self.explain(&path, &error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// A refusal that names the file, its owner and the one command that fixes it.
+    ///
+    /// The ownership case is not hypothetical: a deployment path that runs as root creates
+    /// these files under a unit that runs as another account, and the first caller then
+    /// fails with a bare `Permission denied` that reads like a provider fault.
+    fn explain(&self, path: &Path, error: &std::io::Error) -> String {
+        let owner = std::fs::metadata(path).ok().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            format!("{}:{}", metadata.uid(), metadata.gid())
+        });
+        match owner {
+            Some(owner) if error.kind() == std::io::ErrorKind::PermissionDenied => format!(
+                "{} (owner {owner}) cannot be opened read-write by this process: {error}; the \
+                 accounting files must belong to the account the service runs as, for example \
+                 `chown -R <service-user>:<service-group> {}`",
+                path.display(),
+                self.path.parent().unwrap_or(Path::new(".")).display(),
+            ),
+            Some(owner) => format!("{} (owner {owner}) is unusable: {error}", path.display()),
+            None => format!("{} is unusable: {error}", path.display()),
+        }
+    }
+
+    /// The counter file this allowance persists at.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The counter's lock file, beside the counter it guards.
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension("json.lock")
@@ -1857,5 +1913,97 @@ mod tests {
             None
         );
         assert_eq!(reported_input_tokens(&serde_json::Value::Null), None);
+    }
+
+    // --- the load-time usability gate --------------------------------------------
+    //
+    // A budget that cannot be accounted is not a budget. But the gate must not CREATE the
+    // accounting state: a deployment preflight runs this same loader, often as root, and a
+    // root-owned counter under a unit that runs as its own user is a production defect that
+    // surfaces as a provider fault. Absent state is the spender's to create.
+
+    /// A newly configured lane's first call works, and the first call is what creates the
+    /// counter - as the account that spends it.
+    #[test]
+    fn a_fresh_lane_is_checked_without_being_created_and_works_on_first_use() {
+        let directory = scratch("fresh-lane");
+        let counter = allowance(&directory, 7);
+
+        counter.check_usable().expect("absent state is not a fault");
+        assert!(
+            !counter.path().exists(),
+            "a check must leave no accounting state behind: a root-run dry run does this"
+        );
+
+        // The first physical call creates the directory, the lock and the counter itself.
+        counter
+            .try_reserve()
+            .expect("the first call of a fresh lane");
+        assert!(counter.path().exists(), "the spender created the counter");
+        assert_eq!(counter.remaining(), 6, "and it counts what it spent");
+        // A fresh instance over the same files agrees: the document is valid, not empty.
+        assert_eq!(allowance(&directory, 7).remaining(), 6);
+    }
+
+    /// An unusable counter must name the file, its owner and the one command that fixes it.
+    ///
+    /// The bare `Permission denied (os error 13)` this replaces was read as a provider
+    /// fault for a production lane; the remedy belongs in the message.
+    #[test]
+    fn check_usable_explains_an_unwritable_counter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = scratch("check-explain");
+        let counter = allowance(&directory, 7);
+        // Created by "someone else" for this test: a real spend, then made read-only.
+        counter
+            .try_reserve()
+            .expect("the file must exist to be probed");
+        std::fs::set_permissions(counter.path(), std::fs::Permissions::from_mode(0o400))
+            .expect("make the counter read-only");
+
+        // Root ignores the mode; the assertion below is about the account the suite runs as.
+        let root = std::fs::OpenOptions::new()
+            .write(true)
+            .open(counter.path())
+            .is_ok();
+        let failure = counter.check_usable();
+        std::fs::set_permissions(counter.path(), std::fs::Permissions::from_mode(0o600))
+            .expect("restore");
+        if root {
+            assert!(
+                failure.is_ok(),
+                "root can open it, so there is nothing to explain"
+            );
+            return;
+        }
+        let reason = failure.expect_err("a read-only counter cannot be accounted");
+        assert!(
+            reason.contains(&counter.path().display().to_string()),
+            "the refusal must name the file: {reason}"
+        );
+        assert!(
+            reason.contains("chown"),
+            "the refusal must name the remedy: {reason}"
+        );
+        assert!(
+            reason.contains(&directory.display().to_string()),
+            "the remedy must name the directory to hand over: {reason}"
+        );
+    }
+
+    /// A counter whose path is occupied by a directory is unusable, and says so.
+    #[test]
+    fn check_usable_refuses_a_path_it_cannot_open() {
+        let directory = scratch("check-blocked");
+        let counter = allowance(&directory, 7);
+        std::fs::create_dir_all(counter.path()).expect("plant a directory in the file's place");
+        let reason = counter
+            .check_usable()
+            .expect_err("a directory is not a counter");
+        assert!(
+            reason.contains(&counter.path().display().to_string()),
+            "the refusal must name the path: {reason}"
+        );
     }
 }

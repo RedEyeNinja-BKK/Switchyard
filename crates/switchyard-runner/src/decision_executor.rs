@@ -62,6 +62,50 @@ impl DecisionSkip {
     pub fn try_next(self) -> bool {
         matches!(self, Self::UnsupportedType | Self::UnsupportedState)
     }
+
+    /// A caller-facing explanation, for a refusal that is the caller's to fix.
+    ///
+    /// Written as the reason, not the enum name: `NotEligible(UnsupportedState)` tells a
+    /// caller nothing about what to change, and this text is what a 400 body carries.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::TargetNotFound => "no configured decision backend answers to that model name",
+            Self::UnsupportedType => {
+                "no configured decision backend can answer this question type; a request carrying \
+                 a kind that none supports is refused before any provider is called"
+            }
+            Self::UnsupportedState => {
+                "no configured decision backend accepts this `state` shape; this lane takes a \
+                 structured state (an array of typed content blocks), not a bare string"
+            }
+            Self::Contract => {
+                "the request does not fit the decision wire contract: question ids, option and \
+                 level bounds, or a required field are out of range"
+            }
+            Self::Unauthenticated => "the decision backend has no credential configured",
+        }
+    }
+
+    /// The skip that best explains a lane where every candidate was skipped.
+    ///
+    /// Precedence runs from the most specific deployment fault to the most general caller
+    /// mistake, so the answer names the thing that would actually have to change. A
+    /// credential fault is reported rather than masked behind a shape refusal, and a wire
+    /// contract violation outranks a capability mismatch because the request is invalid
+    /// everywhere, not merely unsuited to one backend.
+    fn dominant(skips: &[Self]) -> Self {
+        for candidate in [
+            Self::Unauthenticated,
+            Self::Contract,
+            Self::UnsupportedState,
+            Self::UnsupportedType,
+        ] {
+            if skips.contains(&candidate) {
+                return candidate;
+            }
+        }
+        Self::TargetNotFound
+    }
 }
 
 /// A backend refused or failed to serve the request.
@@ -72,8 +116,20 @@ pub enum DecisionFailure {
         reason: &'static str,
         retryable: bool,
     },
-    /// The request or configuration is at fault; another backend would not help.
+    /// One candidate could not serve this request, but a later candidate might.
+    ///
+    /// Candidate-scoped: this is what an eligibility refusal looks like while the resolver
+    /// still has candidates to try, and its retryability is a property of the skip.
     NotEligible(DecisionSkip),
+    /// Nothing was dispatched anywhere in this lane, and nothing here could serve it.
+    ///
+    /// Lane-scoped and terminal. Distinguished from [`Self::NotEligible`] because the
+    /// opposite decision was made at exactly this point once before: a lane where every
+    /// candidate was skipped was reported as retryable, so a composed tier forwarded a
+    /// request to a sibling family that could only refuse it in the same way, and the
+    /// caller saw an outage instead of the shape mismatch it had sent. The authority to
+    /// keep trying ends with the lane that has already seen the whole request.
+    Refused(DecisionSkip),
 }
 
 impl DecisionFailure {
@@ -82,7 +138,76 @@ impl DecisionFailure {
         match self {
             DecisionFailure::Serving { retryable, .. } => *retryable,
             DecisionFailure::NotEligible(skip) => skip.try_next(),
+            // A lane that could not dispatch anything has finished the question: a
+            // sibling lane would be asked the same request and answer the same way.
+            DecisionFailure::Refused(_) => false,
         }
+    }
+
+    /// A caller-facing explanation for a terminal refusal.
+    ///
+    /// Written as the situation, not the enum name: a caller who reads
+    /// `Serving { reason: "daily_allowance_exhausted" }` has to decode our vocabulary, and
+    /// the reason strings are also provider-side facts that must not leak as if they were
+    /// caller errors.
+    pub fn message(&self) -> String {
+        match self {
+            DecisionFailure::NotEligible(skip) | DecisionFailure::Refused(skip) => {
+                skip.message().to_string()
+            }
+            DecisionFailure::Serving { reason, .. } => match *reason {
+                "all_candidates_exhausted" => {
+                    "every eligible decision backend failed to answer; the lane is temporarily \
+                     exhausted"
+                        .to_string()
+                }
+                "no_eligible_backend" => {
+                    "no configured decision backend can serve this request".to_string()
+                }
+                "minute_allowance_throttled" => {
+                    "this model's per-minute request or input-token budget is full; it refills \
+                     within a minute"
+                        .to_string()
+                }
+                "input_exceeds_minute_window" => {
+                    "this request is larger than the model's whole per-minute input budget, so \
+                     waiting will not make room for it"
+                        .to_string()
+                }
+                "daily_allowance_exhausted" => {
+                    "this model's daily request allowance is spent; it resets at the next \
+                     provider day"
+                        .to_string()
+                }
+                "daily_allowance_unavailable" => {
+                    "this model's daily request counter cannot be accounted, so no budget may be \
+                     spent"
+                        .to_string()
+                }
+                other => format!("the decision backend could not answer ({other})"),
+            },
+        }
+    }
+}
+
+/// The budgets one decision backend's physical calls draw on.
+///
+/// The same two shapes the capability surfaces use, for the same reason: a provider caps
+/// requests and input tokens over a rolling minute, and requests over its civil day. A
+/// decision call is one physical request to one physical model, so it is paced exactly like
+/// any other physical call: one reservation, released only if nothing was sent.
+#[derive(Debug, Default)]
+pub struct DecisionBudget {
+    /// Persistent per-provider-day request counter, when a daily limit is declared.
+    pub allowance: Option<Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    /// Rolling per-minute request and input-token window, when either is declared.
+    pub pacing: Option<Arc<switchyard_llm_client::PacedQuota>>,
+}
+
+impl DecisionBudget {
+    /// Whether this budget declares nothing at all.
+    pub fn is_unlimited(&self) -> bool {
+        self.allowance.is_none() && self.pacing.is_none()
     }
 }
 
@@ -109,6 +234,8 @@ pub struct DecisionCandidate {
     pub supported_types: SupportedTypes,
     /// State shapes this backend accepts.
     pub state_forms: StateForms,
+    /// The provider budgets this backend's calls are charged to.
+    pub budget: Option<Arc<DecisionBudget>>,
 }
 
 impl std::fmt::Debug for DecisionCandidate {
@@ -123,6 +250,7 @@ impl std::fmt::Debug for DecisionCandidate {
             .field("state_forms", &self.state_forms)
             .field("credential_present", &self.api_key.is_some())
             .field("credential_env", &self.api_key_env)
+            .field("budgeted", &self.budget.is_some())
             .finish()
     }
 }
@@ -186,6 +314,113 @@ pub struct DecisionOutcome {
 /// Default deadline for one decision call.
 const DEFAULT_DECISION_TIMEOUT_SECONDS: u64 = 30;
 
+/// Reserves one physical decision call against the backend's declared budgets.
+///
+/// Mirrors the completion path exactly, including the order: the minute window first,
+/// because only its ticket is releasable, then the daily counter, because a daily
+/// reservation is written before the call and is the provider's own countable unit. The
+/// window ticket is released if the daily counter then refuses, since nothing was sent.
+///
+/// One reservation per physical call. A decision request is one provider request, so this
+/// is not a fan-out: a ten-question request still spends one unit.
+fn reserve_decision_call(
+    candidate: &DecisionCandidate,
+    input_tokens: u64,
+) -> Result<Option<switchyard_llm_client::PacingTicket>, DecisionFailure> {
+    let Some(budget) = &candidate.budget else {
+        return Ok(None);
+    };
+    let ticket = match &budget.pacing {
+        None => None,
+        Some(pacing) => match pacing.reserve(input_tokens) {
+            Ok(ticket) => ticket,
+            Err(switchyard_llm_client::PacingError::Throttled(_throttled)) => {
+                // This backend has no room in its current window. Another backend may, so
+                // this stays recoverable, but a lane of one target must answer 429 rather
+                // than pretending to be down.
+                return Err(DecisionFailure::Serving {
+                    reason: "minute_allowance_throttled",
+                    retryable: true,
+                });
+            }
+            Err(switchyard_llm_client::PacingError::ExceedsWindow { .. }) => {
+                return Err(DecisionFailure::Serving {
+                    reason: "input_exceeds_minute_window",
+                    retryable: true,
+                });
+            }
+        },
+    };
+    if let Some(allowance) = &budget.allowance {
+        match allowance.try_reserve() {
+            Ok(()) => {}
+            Err(switchyard_llm_client::ReserveError::Exhausted) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                return Err(DecisionFailure::Serving {
+                    reason: "daily_allowance_exhausted",
+                    retryable: true,
+                });
+            }
+            Err(switchyard_llm_client::ReserveError::Unusable(_)) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                // The counter cannot be trusted, so no budget may be spent. This is a
+                // deployment fault: trying a sibling would hide it.
+                return Err(DecisionFailure::Serving {
+                    reason: "daily_allowance_unavailable",
+                    retryable: false,
+                });
+            }
+        }
+    }
+    Ok(ticket)
+}
+
+/// Releases a minute slot for a call that never reached the provider.
+fn release_decision_call(
+    candidate: &DecisionCandidate,
+    ticket: &Option<switchyard_llm_client::PacingTicket>,
+) {
+    if let (Some(budget), Some(ticket)) = (&candidate.budget, ticket)
+        && let Some(pacing) = &budget.pacing
+    {
+        pacing.release(ticket);
+    }
+}
+
+/// Charges the reservation with the provider's own input-token count, when it reports one.
+///
+/// Read from the two spellings a decision backend uses - Google's `total_input_tokens` and
+/// the OpenAI-shaped `prompt_tokens` - and never invented: a backend that reports no count
+/// keeps the estimate it was reserved at, which is the conservative direction already.
+fn reconcile_decision_call(
+    candidate: &DecisionCandidate,
+    ticket: &Option<switchyard_llm_client::PacingTicket>,
+    payload: &Value,
+) {
+    let Some(ticket) = ticket else { return };
+    let Some(budget) = &candidate.budget else {
+        return;
+    };
+    let Some(pacing) = &budget.pacing else { return };
+    let usage = payload.get("usage");
+    let reported = usage
+        .and_then(|usage| {
+            usage
+                .get("total_input_tokens")
+                .or_else(|| usage.get("prompt_tokens"))
+                .or_else(|| usage.get("input_tokens"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if reported > 0 {
+        pacing.reconcile(ticket, reported);
+    }
+}
+
 async fn send(candidate: &DecisionCandidate, body: Value) -> Result<Value, DecisionFailure> {
     let Some(api_key) = candidate
         .api_key
@@ -194,14 +429,26 @@ async fn send(candidate: &DecisionCandidate, body: Value) -> Result<Value, Decis
     else {
         return Err(DecisionFailure::NotEligible(DecisionSkip::Unauthenticated));
     };
-    let client = reqwest::Client::builder()
+    // Budgets are taken before anything is built or sent. A refusal here is a property of
+    // this backend's remaining allowance, so it carries no upstream status and nothing was
+    // counted by the provider.
+    let estimate = switchyard_llm_client::allowance::estimate_input_tokens(&body);
+    let ticket = reserve_decision_call(candidate, estimate)?;
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(DEFAULT_DECISION_TIMEOUT_SECONDS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| DecisionFailure::Serving {
-            reason: "client_unavailable",
-            retryable: false,
-        })?;
+    {
+        Ok(client) => client,
+        Err(_) => {
+            // Nothing left the process, so the window slot goes back.
+            release_decision_call(candidate, &ticket);
+            return Err(DecisionFailure::Serving {
+                reason: "client_unavailable",
+                retryable: false,
+            });
+        }
+    };
     // Google reads its key from `x-goog-api-key`; every other decision backend takes a
     // bearer token. Sending the wrong one is an authentication failure that looks like a
     // credential problem, so the header is chosen from the transport rather than guessed.
@@ -235,6 +482,7 @@ async fn send(candidate: &DecisionCandidate, body: Value) -> Result<Value, Decis
             retryable: false,
         })?;
     if status.is_success() {
+        reconcile_decision_call(candidate, &ticket, &payload);
         return Ok(payload);
     }
     // A rejection of our own encoding or a credential problem is not a reason to try a
@@ -254,6 +502,74 @@ async fn send(candidate: &DecisionCandidate, body: Value) -> Result<Value, Decis
         "http"
     };
     Err(DecisionFailure::Serving { reason, retryable })
+}
+
+/// The single failure that best explains a set of per-candidate attempts.
+///
+/// Three cases stay distinct, because a caller acts differently on each:
+///
+/// * something was actually sent and failed transiently: the lane is exhausted, which is
+///   an availability answer and may be recovered by retrying later;
+/// * candidates were refused by our own budget: 429-class, not an outage - a lane whose
+///   daily allowance is spent is working exactly as configured;
+/// * every candidate was skipped before dispatch: nothing was tried, so the answer is
+///   about the request's shape or the deployment's wiring, never about availability. This
+///   is what the surface turns into a 400 with a reason the caller can act on.
+fn aggregate_attempts(
+    attempts: &[(String, DecisionFailure)],
+    exhausted_reason: &'static str,
+) -> DecisionFailure {
+    if attempts.is_empty() {
+        return DecisionFailure::Serving {
+            reason: "no_eligible_backend",
+            retryable: false,
+        };
+    }
+    let mut sent = false;
+    let mut quota: Option<&'static str> = None;
+    let mut skips: Vec<DecisionSkip> = Vec::new();
+    for (_, failure) in attempts {
+        match failure {
+            DecisionFailure::Serving { reason, .. } => match *reason {
+                "minute_allowance_throttled"
+                | "input_exceeds_minute_window"
+                | "daily_allowance_exhausted"
+                | "daily_allowance_unavailable" => {
+                    // Keep the most severe: an unusable counter outranks an exhausted one,
+                    // which outranks a minute window that refills shortly.
+                    let rank = |reason: &'static str| match reason {
+                        "daily_allowance_unavailable" => 3,
+                        "daily_allowance_exhausted" => 2,
+                        "minute_allowance_throttled" => 1,
+                        _ => 0,
+                    };
+                    if quota.is_none_or(|current| rank(reason) > rank(current)) {
+                        quota = Some(*reason);
+                    }
+                }
+                _ => sent = true,
+            },
+            // A nested aggregate cannot occur through either entry point, but if one is
+            // ever passed in it is still a pre-dispatch refusal and must not be counted as
+            // something that was sent.
+            DecisionFailure::NotEligible(skip) | DecisionFailure::Refused(skip) => {
+                skips.push(*skip)
+            }
+        }
+    }
+    if sent {
+        return DecisionFailure::Serving {
+            reason: exhausted_reason,
+            retryable: true,
+        };
+    }
+    if let Some(reason) = quota {
+        return DecisionFailure::Serving {
+            reason,
+            retryable: reason != "daily_allowance_unavailable",
+        };
+    }
+    DecisionFailure::Refused(DecisionSkip::dominant(&skips))
 }
 
 /// What a caller asked for, resolved against the deployment.
@@ -379,26 +695,12 @@ pub async fn resolve_and_serve(
             }
         }
     }
-    // Every candidate was tried and every one yielded. The lane itself is exhausted
-    // rather than broken, so the outcome stays recoverable: a composed parent is
-    // entitled to try its NEXT child lane after this one runs out of candidates.
-    //
-    // "Yielded" means a candidate was actually SENT to. A candidate skipped
-    // pre-dispatch was never tried, so a lane where every candidate was skipped
-    // attempted nothing and keeps the terminal no_eligible_backend: forwarding a
-    // request that no candidate here can serve would just spread a request that is
-    // unserviceable by contract.
-    let exhausted = attempts
-        .iter()
-        .any(|(_, failure)| matches!(failure, DecisionFailure::Serving { .. }));
-    Err(DecisionFailure::Serving {
-        reason: if exhausted {
-            "all_candidates_exhausted"
-        } else {
-            "no_eligible_backend"
-        },
-        retryable: exhausted,
-    })
+    // Every candidate was tried and none answered. What that MEANS is not one thing, so
+    // it is classified rather than flattened: a transient serving failure is an outage, a
+    // budget refusal is a rate limit, and a lane where nothing was ever dispatched is
+    // telling the caller its request did not fit - which is a different status and a
+    // different remedy.
+    Err(aggregate_attempts(&attempts, "all_candidates_exhausted"))
 }
 
 /// One child lane's contribution to a composed request.
@@ -448,7 +750,6 @@ pub async fn serve_composed(
     stack: &mut Vec<String>,
 ) -> Result<DecisionOutcome, DecisionFailure> {
     let mut attempts = Vec::new();
-    let mut yielded = false;
     for child in children {
         if stack.contains(&child.lane) {
             return Err(DecisionFailure::Serving {
@@ -473,25 +774,13 @@ pub async fn serve_composed(
                     return Err(failure);
                 }
                 attempts.push((child.lane.clone(), failure.clone()));
-                // Only a child that was actually SENT TO has yielded; a child that
-                // skipped every candidate pre-dispatch was never tried.
-                if matches!(failure, DecisionFailure::Serving { .. }) {
-                    yielded = true;
-                }
             }
         }
     }
-    // Every child yielded after exhausting its own candidates. The composed lane is
-    // itself exhausted, so this stays recoverable: an outer tier may still try its
-    // own next child rather than treating a sibling's exhaustion as terminal.
-    Err(DecisionFailure::Serving {
-        reason: if yielded {
-            "all_child_lanes_exhausted"
-        } else {
-            "no_eligible_backend"
-        },
-        retryable: yielded,
-    })
+    // Every child yielded. The classification is the same question one level up: if any
+    // child actually reached a provider and failed transiently the tier is exhausted, and
+    // if every child refused before dispatch the request itself did not fit the tier.
+    Err(aggregate_attempts(&attempts, "all_child_lanes_exhausted"))
 }
 
 /// What an explicitly named identity resolves to.
@@ -746,6 +1035,7 @@ mod tests {
             api_key_env: Some("TEST_DECISION_KEY".to_string()),
             supported_types: types,
             state_forms,
+            budget: None,
         }
     }
 
@@ -952,5 +1242,301 @@ mod tests {
                 "{terminal:?} must not silently move to another backend"
             );
         }
+    }
+
+    // --- one reservation per physical decision call ------------------------------
+    //
+    // A decision call is one provider request, so it draws on exactly the budgets the same
+    // model draws on for generation. These tests assert the two properties that are easy to
+    // get wrong and expensive to discover in production: that a refusal leaves no slot
+    // consumed, and that a window and a counter are charged once each, not once per child.
+
+    use switchyard_llm_client::{
+        AdmissionMargin, DailyRequestAllowance, GovernorKey, PacedQuota, QuotaGovernor,
+        WindowLimits, allowance_path,
+    };
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            label
+        );
+        std::env::temp_dir()
+            .join("switchyard-decision-budget-tests")
+            .join(unique)
+    }
+
+    fn budget_key() -> GovernorKey {
+        GovernorKey::new(
+            "google-free",
+            switchyard_protocol::ModelId::new("google/gemini-3.8-flash"),
+            "decide",
+        )
+    }
+
+    fn minute_window(governor: &std::sync::Arc<QuotaGovernor>, requests: u64) -> PacedQuota {
+        PacedQuota::new(
+            governor.clone(),
+            budget_key(),
+            WindowLimits {
+                requests_per_minute: Some(requests),
+                input_tokens_per_minute: None,
+            },
+            AdmissionMargin::NONE,
+        )
+    }
+
+    fn budgeted_candidate(
+        allowance: Option<DailyRequestAllowance>,
+        pacing: Option<PacedQuota>,
+    ) -> DecisionCandidate {
+        let mut candidate = candidate(
+            "gemini",
+            DecisionTransport::SystemOne,
+            SupportedTypes::ALL,
+            StateForms::ALL,
+        );
+        candidate.budget = Some(Arc::new(DecisionBudget {
+            allowance: allowance.map(Arc::new),
+            pacing: pacing.map(Arc::new),
+        }));
+        candidate
+    }
+
+    /// A daily refusal must hand the minute slot back.
+    ///
+    /// The window is reserved first because only its ticket can be released, and a refusal
+    /// that kept the slot would make every later call in that minute look throttled by a
+    /// budget it never actually spent.
+    #[test]
+    fn a_daily_refusal_releases_the_minute_window() {
+        let directory = scratch("release");
+        let governor = std::sync::Arc::new(QuotaGovernor::new());
+        let allowance = DailyRequestAllowance::new(
+            "google-free",
+            switchyard_protocol::ModelId::new("google/gemini-3.8-flash"),
+            // Already spent: the very first reservation is refused.
+            0,
+            allowance_path(&directory, "google-free", "google/gemini-3.8-flash"),
+        );
+        let candidate = budgeted_candidate(Some(allowance), Some(minute_window(&governor, 5)));
+
+        let failure =
+            reserve_decision_call(&candidate, 10).expect_err("an exhausted day refuses the call");
+        assert_eq!(
+            failure,
+            DecisionFailure::Serving {
+                reason: "daily_allowance_exhausted",
+                retryable: true,
+            }
+        );
+        let (requests, tokens) = governor.used(&budget_key(), std::time::SystemTime::now());
+        assert_eq!(requests, 0, "the refused call must keep no minute slot");
+        assert_eq!(tokens, 0);
+    }
+
+    /// A granted call is charged once to each budget, and the ticket it returns is the one
+    /// that later releases or reconciles it.
+    #[test]
+    fn a_granted_call_is_charged_once_to_each_budget() {
+        let directory = scratch("charge");
+        let governor = std::sync::Arc::new(QuotaGovernor::new());
+        let allowance = DailyRequestAllowance::new(
+            "google-free",
+            switchyard_protocol::ModelId::new("google/gemini-3.8-flash"),
+            2,
+            allowance_path(&directory, "google-free", "google/gemini-3.8-flash"),
+        );
+        let candidate = budgeted_candidate(Some(allowance), Some(minute_window(&governor, 5)));
+
+        let _first = reserve_decision_call(&candidate, 10)
+            .expect("within both budgets")
+            .expect("a window was declared, so a ticket is returned");
+        let (requests, _) = governor.used(&budget_key(), std::time::SystemTime::now());
+        assert_eq!(requests, 1, "one physical call, one window reservation");
+        assert_eq!(
+            candidate
+                .budget
+                .as_ref()
+                .unwrap()
+                .allowance
+                .as_ref()
+                .unwrap()
+                .remaining(),
+            1,
+            "one physical call, one daily unit"
+        );
+
+        let _second = reserve_decision_call(&candidate, 10).expect("the last unit");
+        assert!(matches!(
+            reserve_decision_call(&candidate, 10),
+            Err(DecisionFailure::Serving {
+                reason: "daily_allowance_exhausted",
+                retryable: true,
+            })
+        ));
+    }
+
+    /// An unusable counter is a deployment fault, so it must not be retried elsewhere: a
+    /// sibling backend configured against the same counter would fail identically.
+    #[test]
+    fn an_unusable_counter_is_not_retryable() {
+        let directory = scratch("unusable");
+        let allowance = DailyRequestAllowance::new(
+            "google-free",
+            switchyard_protocol::ModelId::new("google/gemini-3.8-flash"),
+            20,
+            allowance_path(&directory, "google-free", "google/gemini-3.8-flash"),
+        );
+        // A directory where the counter file should be: the open cannot succeed.
+        std::fs::create_dir_all(allowance.path()).expect("plant a directory in the file's place");
+        let candidate = budgeted_candidate(Some(allowance), None);
+        assert!(matches!(
+            reserve_decision_call(&candidate, 10),
+            Err(DecisionFailure::Serving {
+                reason: "daily_allowance_unavailable",
+                retryable: false,
+            })
+        ));
+    }
+
+    /// The two budgets are advisory to nobody: an unlimited candidate reserves nothing.
+    #[test]
+    fn an_unbudgeted_candidate_reserves_nothing() {
+        let candidate = candidate(
+            "laya",
+            DecisionTransport::SystemOne,
+            SupportedTypes::ALL,
+            StateForms::ALL,
+        );
+        assert!(candidate.budget.is_none());
+    }
+
+    // --- classifying a lane where nothing answered --------------------------------
+
+    fn served(name: &str, reason: &'static str, retryable: bool) -> (String, DecisionFailure) {
+        (
+            name.to_string(),
+            DecisionFailure::Serving { reason, retryable },
+        )
+    }
+
+    fn skipped(name: &str, skip: DecisionSkip) -> (String, DecisionFailure) {
+        (name.to_string(), DecisionFailure::NotEligible(skip))
+    }
+
+    /// Nothing sent, every candidate skipped: the answer is about the request, is terminal,
+    /// and names the most specific skip rather than the first one encountered.
+    #[test]
+    fn a_lane_that_dispatched_nothing_is_refused_not_exhausted() {
+        let attempts = vec![
+            skipped("a", DecisionSkip::UnsupportedType),
+            skipped("b", DecisionSkip::UnsupportedState),
+        ];
+        let failure = aggregate_attempts(&attempts, "all_candidates_exhausted");
+        assert_eq!(
+            failure,
+            DecisionFailure::Refused(DecisionSkip::UnsupportedState)
+        );
+        assert!(
+            !failure.try_next(),
+            "a sibling lane would answer identically"
+        );
+    }
+
+    /// One backend was sent to and failed: that is an availability answer, and a parent may
+    /// try its next child.
+    #[test]
+    fn a_lane_that_sent_and_failed_is_exhausted() {
+        let attempts = vec![served("a", "connect", true)];
+        assert_eq!(
+            aggregate_attempts(&attempts, "all_candidates_exhausted"),
+            DecisionFailure::Serving {
+                reason: "all_candidates_exhausted",
+                retryable: true,
+            }
+        );
+        assert_eq!(
+            aggregate_attempts(&attempts, "all_child_lanes_exhausted"),
+            DecisionFailure::Serving {
+                reason: "all_child_lanes_exhausted",
+                retryable: true,
+            },
+            "a tier labels its own exhaustion, so an operator can tell which level ran out"
+        );
+    }
+
+    /// A budget refusal is neither an outage nor a request defect: it keeps its own reason,
+    /// and the most severe of several budget refusals is the one reported.
+    #[test]
+    fn a_budget_refusal_keeps_its_own_reason() {
+        let attempts = vec![
+            served("a", "minute_allowance_throttled", true),
+            served("b", "daily_allowance_exhausted", true),
+            skipped("c", DecisionSkip::UnsupportedType),
+        ];
+        assert_eq!(
+            aggregate_attempts(&attempts, "all_candidates_exhausted"),
+            DecisionFailure::Serving {
+                reason: "daily_allowance_exhausted",
+                retryable: true,
+            },
+            "a spent day outranks a minute window that refills shortly"
+        );
+        let unusable = vec![
+            served("a", "daily_allowance_unavailable", false),
+            served("b", "daily_allowance_exhausted", true),
+        ];
+        assert_eq!(
+            aggregate_attempts(&unusable, "all_candidates_exhausted"),
+            DecisionFailure::Serving {
+                reason: "daily_allowance_unavailable",
+                retryable: false,
+            }
+        );
+    }
+
+    /// An empty attempt list cannot claim a cause, so it keeps the old terminal answer
+    /// rather than naming a skip nobody observed.
+    #[test]
+    fn no_attempts_at_all_is_not_a_skip() {
+        assert_eq!(
+            aggregate_attempts(&[], "all_candidates_exhausted"),
+            DecisionFailure::Serving {
+                reason: "no_eligible_backend",
+                retryable: false,
+            }
+        );
+    }
+
+    /// Every refusal has words a caller can act on, and none of them is an enum name.
+    #[test]
+    fn refusals_explain_themselves_without_enum_names() {
+        for skip in [
+            DecisionSkip::TargetNotFound,
+            DecisionSkip::UnsupportedType,
+            DecisionSkip::UnsupportedState,
+            DecisionSkip::Contract,
+            DecisionSkip::Unauthenticated,
+        ] {
+            let message = DecisionFailure::Refused(skip).message();
+            assert!(!message.is_empty());
+            assert!(
+                !message.contains("Unsupported") && !message.contains("NotEligible"),
+                "a caller must not be handed our enum name: {message}"
+            );
+        }
+        assert!(
+            DecisionFailure::Serving {
+                reason: "daily_allowance_exhausted",
+                retryable: true
+            }
+            .message()
+            .contains("resets"),
+            "a quota refusal must say when it recovers"
+        );
     }
 }

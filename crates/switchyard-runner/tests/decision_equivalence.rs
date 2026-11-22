@@ -97,6 +97,7 @@ fn local_backend(url: String) -> DecisionCandidate {
         api_key_env: Some("TEST_DECISION_KEY".into()),
         supported_types: SupportedTypes::ALL,
         state_forms: StateForms::ALL,
+        budget: None,
     }
 }
 
@@ -367,7 +368,14 @@ async fn an_ineligible_state_shape_is_never_sent() {
     let failure = resolve_and_serve(&resolver, &noul_request(json!({"task": "x"})))
         .await
         .expect_err("nothing eligible can serve it");
-    assert!(!failure.try_next());
+    // The refusal must NAME the shape mismatch: a caller that sent a structured state to a
+    // lane that only takes strings has to be told that, not handed an outage. It stays
+    // retryable so a later child lane in a composed path may still accept the shape.
+    assert_eq!(
+        failure,
+        DecisionFailure::Refused(DecisionSkip::UnsupportedState),
+        "an unsupported state shape is reported as itself, not flattened"
+    );
 }
 /// A request outside the wire bounds is invalid for every backend on that transport.
 /// The executor must report it without dispatching anything, rather than sending a
@@ -723,6 +731,7 @@ async fn a_google_decision_call_uses_googles_wire() {
             api_key_env: Some("SWITCHYARD_GEMINI_API_KEY".into()),
             supported_types: SupportedTypes::ALL,
             state_forms: StateForms::ALL,
+            budget: None,
         }],
     };
     let outcome = resolve_and_serve(&resolver, &noul_request(json!("plain")))

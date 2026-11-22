@@ -432,6 +432,17 @@ impl RouteConfig {
     }
 }
 
+/// The two ledgers a resolved deployment shares, owned together.
+///
+/// Kept as one value because the pair is not optional in either direction: a resolver
+/// built with a governor but no counters would pace its calls without counting them,
+/// which is the defect this whole path exists to prevent. Passing them as one value
+/// makes that omission unrepresentable rather than merely discouraged.
+struct Accounting<'a> {
+    governor: &'a Arc<switchyard_llm_client::QuotaGovernor>,
+    allowances: &'a HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+}
+
 impl DeploymentConfig {
     /// The media capabilities a composite actually guarantees.
     ///
@@ -642,6 +653,10 @@ impl DeploymentConfig {
         // counts, and the only way `smart-nt`, `smart_gemini` and a direct leaf cannot each
         // spend the same minute's allowance.
         let governor = Arc::new(switchyard_llm_client::QuotaGovernor::new());
+        let accounting = Accounting {
+            governor: &governor,
+            allowances: &allowances,
+        };
         let clients = self.build_clients(&mut provider_api_keys, &allowances, &governor)?;
         capability::CapabilityDeployment {
             clients: self.capability_clients.clone(),
@@ -671,7 +686,7 @@ impl DeploymentConfig {
             BTreeMap::new();
         for (name, lane_config) in &self.decision_lanes {
             let names: Vec<&str> = lane_config.targets.iter().map(String::as_str).collect();
-            let Some(resolver) = self.build_decision_resolver(&names) else {
+            let Some(resolver) = self.build_decision_resolver(&names, &accounting) else {
                 continue;
             };
             let handle = decision_executor::LaneResolverHandle {
@@ -822,6 +837,7 @@ impl DeploymentConfig {
                 lane_identity.clone(),
                 &lane_index,
                 &lane_composition,
+                &accounting,
             )?;
             let anthropic_auxiliary_target =
                 self.build_anthropic_auxiliary_target(config, &clients);
@@ -1016,6 +1032,26 @@ impl DeploymentConfig {
         }
         if !allowances.is_empty() {
             self.validate_quota_state_dir()?;
+            // The directory probe above is not enough. A counter file can be left behind by
+            // a different account - the deployment path runs as root while the unit runs as
+            // its own user - and then the DIRECTORY is writable while that model's counter
+            // and lock are not. The first caller would see a bare `Permission denied`
+            // reported as an unavailable allowance.
+            //
+            // Checked per counter, at load, and refused with the file and its owner named.
+            // Absent counters are not created here on purpose: the first reservation creates
+            // them as the account that spends, so a root-run preflight cannot leave files
+            // the service user cannot write.
+            for allowance in allowances.values() {
+                allowance.check_usable().map_err(|reason| {
+                    RunnerError::configuration(format!(
+                        "the daily request counter for model {} in quota group {} cannot be used \
+                         by this process: {reason}",
+                        allowance.model(),
+                        allowance.group()
+                    ))
+                })?;
+            }
         }
         Ok(allowances)
     }
@@ -1029,12 +1065,14 @@ impl DeploymentConfig {
         let Some(quota) = self.quota.as_ref() else {
             return Ok(());
         };
-        std::fs::create_dir_all(&quota.state_dir).map_err(|error| {
-            RunnerError::configuration(format!(
-                "[quota] state_dir {} cannot be created: {error}",
-                quota.state_dir.display()
-            ))
-        })?;
+        // Only an EXISTING directory is probed. Creating it here would be a load-time side
+        // effect performed by whoever validated - including a root-run preflight - and a
+        // root-owned state directory under a unit that runs as its own user is exactly the
+        // failure this check exists to prevent. A missing directory is created by the first
+        // reservation, as the account that will own it.
+        if !quota.state_dir.exists() {
+            return Ok(());
+        }
         let probe = quota.state_dir.join(".write-probe");
         std::fs::write(&probe, b"switchyard quota state\n").map_err(|error| {
             RunnerError::configuration(format!(
@@ -1959,6 +1997,7 @@ impl DeploymentConfig {
     fn build_decision_resolver(
         &self,
         target_names: &[&str],
+        accounting: &Accounting<'_>,
     ) -> Option<decision_executor::DecisionResolver> {
         let mut candidates = Vec::new();
         for name in target_names {
@@ -1993,11 +2032,62 @@ impl DeploymentConfig {
                     .supported_types
                     .unwrap_or(decision_transport::SupportedTypes::ALL),
                 state_forms: target.state_forms,
+                budget: self.decision_budget(
+                    target,
+                    client,
+                    accounting.governor,
+                    accounting.allowances,
+                ),
             });
         }
         (!candidates.is_empty()).then_some(decision_executor::DecisionResolver { candidates })
     }
 
+    /// The provider budgets one decision backend's calls are charged to.
+    ///
+    /// A decision call is one request to one physical model, so it draws on exactly the
+    /// budgets the same model draws on when it is used for generation: the same quota
+    /// group, the same daily counter, the same minute window. Two counters for one model
+    /// would let a deployment hold two allowances the provider never granted.
+    fn decision_budget(
+        &self,
+        target: &TargetConfig,
+        client: &LlmClientConfig,
+        governor: &Arc<switchyard_llm_client::QuotaGovernor>,
+        allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    ) -> Option<Arc<decision_executor::DecisionBudget>> {
+        let group = client
+            .quota_group
+            .clone()
+            .unwrap_or_else(|| target.llm_client.clone());
+        let allowance = allowances.get(&(group.clone(), target.id.clone())).cloned();
+        let limits = switchyard_llm_client::WindowLimits {
+            requests_per_minute: target.requests_per_minute,
+            input_tokens_per_minute: target.input_tokens_per_minute,
+        };
+        let pacing = if limits.is_unlimited() {
+            None
+        } else {
+            Some(Arc::new(switchyard_llm_client::PacedQuota::new(
+                Arc::clone(governor),
+                switchyard_llm_client::GovernorKey::new(group, target.id.clone(), "decide"),
+                limits,
+                admission_margin_opt(target),
+            )))
+        };
+        if allowance.is_none() && pacing.is_none() {
+            return None;
+        }
+        Some(Arc::new(decision_executor::DecisionBudget {
+            allowance,
+            pacing,
+        }))
+    }
+
+    // One internal builder with one caller. Grouping these further would introduce a
+    // carrier struct purely to satisfy the lint, and would separate the decision wiring
+    // from the route it wires.
+    #[allow(clippy::too_many_arguments)]
     fn build_route_clients(
         &self,
         route_name: &str,
@@ -2014,6 +2104,11 @@ impl DeploymentConfig {
         // surface. Without it, the same request could be served at `/v1/decisions`
         // and fail internally, which is a split contract rather than one mechanism.
         composition: &BTreeMap<String, Vec<String>>,
+        // The deployment's one governor and its per-model daily counters, threaded here so
+        // a route-local decision resolver is paced by the same ledgers as a named lane:
+        // the public surface and an internal Call::Decision must not hold two different
+        // views of one model's remaining budget.
+        accounting: &Accounting<'_>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let TargetPromptPolicy {
             prompts,
@@ -2137,7 +2232,7 @@ impl DeploymentConfig {
 
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.
-        if let Some(resolver) = self.build_decision_resolver(&route_targets) {
+        if let Some(resolver) = self.build_decision_resolver(&route_targets, accounting) {
             let resolver = Arc::new(resolver);
             let handler_resolver = Arc::clone(&resolver);
             let handler_lane: Arc<Option<String>> = Arc::new(lane_identity.clone());
@@ -6382,10 +6477,68 @@ selection = "measured"
 
     /// The fixture with `dir` as its allowance state directory.
     ///
-    /// Every load writes and removes a probe file in that directory, so parallel tests must
-    /// not share one: two probes racing is reported as an unusable quota directory.
+    /// A load probes an EXISTING state directory by writing and removing a file in it, so
+    /// parallel tests must not share a directory that exists: two probes racing is reported
+    /// as an unusable quota directory. An absent directory is not created by a load at all.
     fn fixture(dir: &str) -> String {
         MANIFEST.replace("__STATE_DIR__", dir)
+    }
+
+    /// Loading a deployment must not create its accounting state.
+    ///
+    /// A deployment preflight runs this same loader, usually as root. Creating the quota
+    /// directory at load left a root-owned directory under a unit that runs as its own
+    /// account, and that lane's first call then failed with a permission error reported as an
+    /// unavailable budget. Creation belongs to the process that spends.
+    #[test]
+    fn loading_a_deployment_creates_no_quota_state() {
+        let dir = format!(
+            "/tmp/switchyard-quota-load-side-effect-{}",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let _runner = Runner::from_toml(&fixture(&dir)).expect("a fresh state directory loads");
+
+        assert!(
+            !std::path::Path::new(&dir).exists(),
+            "a load must leave no accounting state: a root-run validation would own it"
+        );
+    }
+
+    /// An EXISTING state directory this process cannot write is a configuration error at
+    /// load, naming the path, rather than a refused leg at the first request.
+    #[test]
+    fn loading_refuses_a_state_directory_this_process_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = format!("/tmp/switchyard-quota-readonly-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the state directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make it read-only");
+
+        let root = std::fs::write(std::path::Path::new(&dir).join(".root-probe"), b"x").is_ok();
+        let loaded = Runner::from_toml(&fixture(&dir));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore so the directory can be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+        if root {
+            assert!(
+                loaded.is_ok(),
+                "root can write it, so there is nothing to refuse"
+            );
+            return;
+        }
+        let error = match loaded {
+            Ok(_) => panic!("an unwritable state directory is refused at load"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(&dir),
+            "the refusal must name the directory: {error}"
+        );
     }
 
     fn runner() -> Runner {
@@ -6416,8 +6569,14 @@ selection = "measured"
         let runner = runner();
 
         for (name, model) in [
-            ("direct-google-gemini-3.5-flash-lite", "gemini-3.5-flash-lite"),
-            ("direct-google-gemini-3.1-flash-lite", "gemini-3.1-flash-lite"),
+            (
+                "direct-google-gemini-3.5-flash-lite",
+                "gemini-3.5-flash-lite",
+            ),
+            (
+                "direct-google-gemini-3.1-flash-lite",
+                "gemini-3.1-flash-lite",
+            ),
             ("direct-google-gemini-3.6-flash", "gemini-3.6-flash"),
             ("direct-google-gemini-3.8-flash", "gemini-3.8-flash"),
             ("direct-google-gemini-4-hydrogen", "gemini-4-hydrogen"),
@@ -6698,7 +6857,10 @@ selection = "measured"
                 target.daily_request_limit.is_some_and(|limit| limit >= 1),
                 "{serving} must declare a real daily budget"
             );
-            assert!(target.free_tier, "{serving} is served inside a free allowance");
+            assert!(
+                target.free_tier,
+                "{serving} is served inside a free allowance"
+            );
         }
     }
 

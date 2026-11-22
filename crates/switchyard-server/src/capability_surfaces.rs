@@ -215,6 +215,17 @@ pub(crate) async fn rerank(
 ///
 /// One reservation per physical call, not per caller request: a fan-out of ten inputs makes
 /// ten charges, because the provider sees ten requests.
+///
+/// A surface that derives its own token estimate — the spatial surface weighs an image by
+/// its measured dimensions — calls this wrapper so there is one reservation path (minute
+/// window and daily allowance together) rather than two that could drift.
+pub(crate) fn reserve_physical_call_for(
+    capability: &ResolvedCapability,
+    estimated_tokens: u64,
+) -> Result<Option<PacingTicket>, Box<Response>> {
+    reserve_physical_call(capability, 0, estimated_tokens)
+}
+
 fn reserve_physical_call(
     capability: &ResolvedCapability,
     input_index: usize,
@@ -296,7 +307,7 @@ fn reserve_physical_call(
 }
 
 /// Releases a minute slot for a request that never reached the provider.
-fn release_physical_call(capability: &ResolvedCapability, ticket: &Option<PacingTicket>) {
+pub(crate) fn release_physical_call(capability: &ResolvedCapability, ticket: &Option<PacingTicket>) {
     if let (Some(budget), Some(ticket)) = (&capability.budget, ticket)
         && let Some(pacing) = &budget.pacing
     {

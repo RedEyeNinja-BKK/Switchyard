@@ -167,6 +167,25 @@ pub enum CapabilityFormat {
     /// declared per capability so the setup message is built locally and the caller cannot
     /// override them.
     GoogleLive,
+    /// Google's stateful `BidiGenerateMusic` session (`Lyria Realtime`) over WebSocket.
+    ///
+    /// A different protocol from `BidiGenerateContent`, not a variant of it: the setup
+    /// message carries only `model`, and every semantic control (weighted prompts, the
+    /// music-generation config, playback) is a *separate* client message afterwards.
+    ///
+    /// Because the controls arrive per message rather than in the setup, the caller's
+    /// messages are validated and re-emitted in canonical form by the surface: a config
+    /// field or value the model does not document is refused rather than forwarded, and a
+    /// session is bounded by wall clock and by delivered audio.
+    GoogleMusic,
+    /// Google `:generateContent` specialised for embodied spatial reasoning (Robotics ER).
+    ///
+    /// Not a chat lane with an image attached: the request is a scene plus a spatial task,
+    /// the instruction carries an exact JSON contract for that task, and the response is
+    /// parsed and validated against it. Free text is refused rather than returned, because
+    /// a caller that asked for coordinates and received prose has been handed something it
+    /// cannot use. Nothing this surface does actuates equipment: it returns coordinates.
+    GoogleRoboticsSpatial,
 }
 
 /// The header a capability credential is presented under.
@@ -202,6 +221,16 @@ impl CapabilityFormat {
         matches!(self, Self::CohereJinaRerank)
     }
 
+    /// Whether this format generates music on a streaming session.
+    pub fn serves_music(self) -> bool {
+        matches!(self, Self::GoogleMusic)
+    }
+
+    /// Whether this format answers a structured spatial question about a scene.
+    pub fn serves_spatial(self) -> bool {
+        matches!(self, Self::GoogleRoboticsSpatial)
+    }
+
     /// How this format's credential is presented.
     ///
     /// The credential is a property of the wire, not a preference: Google reads its Live key
@@ -214,7 +243,9 @@ impl CapabilityFormat {
             | Self::GoogleEmbedContentV2
             | Self::GoogleSpeech
             | Self::GoogleTranscribe
-            | Self::GoogleLive => CapabilityAuth::GoogleApiKey,
+            | Self::GoogleLive
+            | Self::GoogleMusic
+            | Self::GoogleRoboticsSpatial => CapabilityAuth::GoogleApiKey,
             Self::OpenaiEmbeddings | Self::CohereJinaRerank => CapabilityAuth::Bearer,
         }
     }
@@ -239,6 +270,16 @@ impl CapabilityFormat {
                 format!(
                     "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
                 )
+            }
+            Self::GoogleMusic => {
+                // A different generative service method on the same WebSocket host. Named
+                // here rather than in the surface so a client that declares an explicit
+                // endpoint_path still overrides it like every other format.
+                "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateMusic"
+                    .to_string()
+            }
+            Self::GoogleRoboticsSpatial => {
+                format!("/v1beta/models/{model}:generateContent")
             }
         }
     }
@@ -334,6 +375,22 @@ pub struct CapabilityConfig {
     /// an over-size body is refused before it is base64-encoded and sent.
     #[serde(default)]
     pub max_audio_bytes: Option<u64>,
+    /// Largest scene image one spatial request may carry, in raw bytes.
+    ///
+    /// The probe is a vision model, so the image is most of the request's cost and the
+    /// caller's own upload is the only unbounded quantity in the contract. Refusing an
+    /// over-size scene before it is base64-encoded keeps one request from spending a
+    /// minute window (250,000 input tokens at 5 RPM on this Free project).
+    #[serde(default)]
+    pub max_image_bytes: Option<u64>,
+    /// Largest total audio a streaming music session may deliver, in raw bytes.
+    ///
+    /// A music session has no request/response boundary to bound: the provider streams
+    /// chunks for as long as the caller leaves it playing. This is the delivered-audio
+    /// ceiling, declared per capability because the Free-tier budget it protects
+    /// (1,500 requests/day on one project) is shared with every other lane.
+    #[serde(default)]
+    pub max_session_audio_bytes: Option<u64>,
     /// Evidence that keeps this capability out of dispatch, quoted from the provider.
     ///
     /// Present means held: the declaration, its contract and its limits are kept and
@@ -644,6 +701,76 @@ impl CapabilityDeployment {
                         ));
                     }
                 }
+                CapabilityFormat::GoogleMusic => {
+                    // A music session has no request boundary, so the ceiling on what one
+                    // session may deliver has to be declared rather than inferred. Without
+                    // it a single caller could hold the project's 15-per-minute window open
+                    // indefinitely.
+                    let Some(limit) = capability.max_session_audio_bytes else {
+                        return Err(format!(
+                            "capability {name} serves a music session and must declare \
+                             max_session_audio_bytes, the delivered audio one session may \
+                             produce; a session has no request boundary to bound it"
+                        ));
+                    };
+                    if limit == 0 {
+                        return Err(format!(
+                            "capability {name} declares max_session_audio_bytes = 0, which would \
+                             deliver no audio at all"
+                        ));
+                    }
+                    if client.timeout_seconds.is_none() {
+                        return Err(format!(
+                            "capability client {client_name} serves a music session and must declare \
+                             timeout_seconds, the wall-clock ceiling of one session"
+                        ));
+                    }
+                    // The Live setup fields shape a BidiGenerateContent session. A music
+                    // setup carries only `model`, so any of these would be a promise no
+                    // message can carry.
+                    for (field, present) in [
+                        ("response_modalities", capability.response_modalities.is_some()),
+                        ("system_instruction", capability.system_instruction.is_some()),
+                        ("thinking_budget", capability.thinking_budget.is_some()),
+                        ("thinking_level", capability.thinking_level.is_some()),
+                    ] {
+                        if present {
+                            return Err(format!(
+                                "capability {name} declares {field}, which only google_live \
+                                 sends; a BidiGenerateMusic setup carries the model and nothing \
+                                 else, so the value would be inert"
+                            ));
+                        }
+                    }
+                }
+                CapabilityFormat::GoogleRoboticsSpatial => {
+                    let Some(max_input_tokens) = capability.max_input_tokens else {
+                        return Err(format!(
+                            "capability {name} serves a spatial endpoint and must declare \
+                             max_input_tokens, the model's own input-token limit, so an \
+                             over-size scene is refused locally rather than by the provider"
+                        ));
+                    };
+                    if max_input_tokens == 0 {
+                        return Err(format!(
+                            "capability {name} declares max_input_tokens = 0, which would refuse \
+                             every request"
+                        ));
+                    }
+                    let Some(max_image_bytes) = capability.max_image_bytes else {
+                        return Err(format!(
+                            "capability {name} serves a spatial endpoint and must declare \
+                             max_image_bytes, the largest scene it accepts, because the image is \
+                             the only unbounded part of the request"
+                        ));
+                    };
+                    if max_image_bytes == 0 {
+                        return Err(format!(
+                            "capability {name} declares max_image_bytes = 0, which would refuse \
+                             every scene"
+                        ));
+                    }
+                }
             }
 
             // A task prefix is text the model reads, so it is configuration for one wire
@@ -700,19 +827,44 @@ impl CapabilityDeployment {
                     }
                 }
             }
+            // The two streaming/scene bounds are declared once each, on the wire that can
+            // enforce them. Anywhere else they would read as a configured ceiling that no
+            // code path consults.
+            for (field, present, allowed) in [
+                (
+                    "max_session_audio_bytes",
+                    capability.max_session_audio_bytes.is_some(),
+                    client.format == CapabilityFormat::GoogleMusic,
+                ),
+                (
+                    "max_image_bytes",
+                    capability.max_image_bytes.is_some(),
+                    client.format == CapabilityFormat::GoogleRoboticsSpatial,
+                ),
+            ] {
+                if present && !allowed {
+                    return Err(format!(
+                        "capability {name} declares {field}, which this client's wire has no \
+                         slot for; the value would be inert"
+                    ));
+                }
+            }
             // An audio lane is not a vector space. A width or normalization here would
             // describe an embedding contract the lane never produces.
             if matches!(
                 client.format,
-                CapabilityFormat::GoogleSpeech | CapabilityFormat::GoogleTranscribe
+                CapabilityFormat::GoogleSpeech
+                    | CapabilityFormat::GoogleTranscribe
+                    | CapabilityFormat::GoogleMusic
+                    | CapabilityFormat::GoogleRoboticsSpatial
             ) && (capability.dimensions.is_some()
                 || capability.normalization.is_some()
                 || capability.max_batch.is_some())
             {
                 return Err(format!(
-                    "capability {name} serves an audio endpoint and declares embedding fields \
-                     (dimensions, normalization or max_batch), which describe a vector contract \
-                     this lane does not produce"
+                    "capability {name} serves an audio or spatial endpoint and declares embedding \
+                     fields (dimensions, normalization or max_batch), which describe a vector \
+                     contract this lane does not produce"
                 ));
             }
 
@@ -992,6 +1144,10 @@ pub struct ResolvedCapability {
     pub max_audio_seconds: Option<u32>,
     /// Largest audio payload one transcription request may carry, in raw bytes.
     pub max_audio_bytes: Option<u64>,
+    /// Largest scene image one spatial request may carry, in raw bytes.
+    pub max_image_bytes: Option<u64>,
+    /// Largest total audio a streaming music session may deliver, in raw bytes.
+    pub max_session_audio_bytes: Option<u64>,
     /// The budgets this capability's physical calls are charged to.
     ///
     /// `None` when the client declares none, which is the unchanged behaviour of a
@@ -1087,6 +1243,8 @@ pub fn resolve_with_budget(
                 audio_sample_rate: capability.audio_sample_rate,
                 max_audio_seconds: capability.max_audio_seconds,
                 max_audio_bytes: capability.max_audio_bytes,
+                max_image_bytes: capability.max_image_bytes,
+                max_session_audio_bytes: capability.max_session_audio_bytes,
                 budget,
                 response_modalities: capability.response_modalities.clone(),
                 system_instruction: capability.system_instruction.clone(),

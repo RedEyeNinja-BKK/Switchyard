@@ -393,6 +393,8 @@ mod tests {
             audio_sample_rate: None,
             max_audio_seconds: None,
             max_audio_bytes: None,
+            max_image_bytes: None,
+            max_session_audio_bytes: None,
             budget: None,
             response_modalities: Some(vec!["AUDIO".to_string(), "TEXT".to_string()]),
             system_instruction: Some("You are a helpful assistant.".to_string()),

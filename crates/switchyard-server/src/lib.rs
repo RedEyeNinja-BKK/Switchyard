@@ -5,6 +5,8 @@
 
 mod capability_surfaces;
 mod live_surface;
+mod music_surface;
+mod robotics_surface;
 pub mod config;
 pub mod decision_surface;
 pub mod economics;
@@ -634,6 +636,14 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route(
             "/v1/live/{capability}",
             get(live_surface::live_websocket),
+        )
+        .route(
+            "/v1/music/{capability}",
+            get(music_surface::music_websocket),
+        )
+        .route(
+            "/v1/robotics/spatial",
+            post(robotics_surface::spatial),
         )
         .route(
             "/v1/responses/input_tokens",

@@ -1,8 +1,11 @@
 # Stephen ST routing — Batch A
 
-Batch A of the owner's [ST routing v1 charter](../../../docs/plans/stephen-st-routing-v1-implementation-charter-20261122.md):
-make every Stephen direct leaf tell the truth, and remove the one dependency on a model the
-provider chooses at request time.
+Batch A of the owner's ST routing v1 charter: make every Stephen direct leaf tell the truth,
+and remove the one dependency on a model the provider chooses at request time.
+
+The charter document is not in this tree; the link that used to point at
+`docs/plans/stephen-st-routing-v1-implementation-charter-20261122.md` was removed because that
+file does not exist and a dead link in a shipped README is worse than no link.
 
 The production route manifest is not stored here — it names internal hosts. Batch A therefore
 ships as a deterministic edit applied to the deployed bytes, plus the evidence needed to judge

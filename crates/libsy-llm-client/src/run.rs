@@ -696,6 +696,88 @@ pub fn is_free_scope(target: &str) -> bool {
     target.ends_with(":free") || target == "openrouter/free"
 }
 
+/// What a request to one target costs the deployment, as a fact rather than a spelling.
+///
+/// [`is_free_scope`] reads an OpenRouter model slug, which is the right question for
+/// OpenRouter's own wire semantics — its free-tier allowance really is scoped to `:free`
+/// variants. It is the wrong question for a deployment decision, because a provider's
+/// naming convention is not economic evidence: a Google model carries no `:free` suffix and
+/// is free by project entitlement, while a slug ending in `:free` can be delisted by the
+/// provider tomorrow.
+///
+/// This therefore carries three answers and not two. The third is what keeps an unknown
+/// model from being counted as free capacity: a target the deployment has not stated a
+/// tariff for is [`Tariff::Unknown`], and `Unknown` is never `Free`.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Tariff {
+    /// The deployment states this request draws on a free allowance.
+    Free,
+    /// The deployment states every request here is billed.
+    Metered,
+    /// The deployment states nothing about cost.
+    ///
+    /// The default, and deliberately the conservative one: absence of a tariff is not a
+    /// claim that a request is free, so a selection rule that requires free entitlement
+    /// must not include it.
+    #[default]
+    Unknown,
+}
+
+impl Tariff {
+    /// Reads a target's tariff from what the deployment declared about it.
+    ///
+    /// `free_tier` is a tri-state on purpose. `Some(true)` is a positive declaration and
+    /// `Some(false)` a positive denial of free entitlement; `None` means nobody said, which
+    /// stays [`Tariff::Unknown`] rather than becoming an inferred "cheap enough".
+    pub fn from_declaration(free_tier: Option<bool>) -> Self {
+        match free_tier {
+            Some(true) => Self::Free,
+            Some(false) => Self::Metered,
+            None => Self::Unknown,
+        }
+    }
+
+    /// Whether the deployment states this target serves inside a free allowance.
+    ///
+    /// The only predicate an *economic* rule may use - selection tier, free-pool
+    /// eligibility, cost reporting. `Unknown` is not free.
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::Free)
+    }
+
+    /// Whether a request to this target draws on the credential's free-model allowance.
+    ///
+    /// A different question from [`Self::is_free`], and it needs its own predicate. That one
+    /// asks what a request costs; this asks which provider-side allowance the request is
+    /// charged against, because that is what a provider's quota error is scoped to and what
+    /// decides whether a free-allowance block condemns the next target on the same
+    /// credential.
+    ///
+    /// A declared tariff answers it directly. An undeclared one falls back to the provider's
+    /// own convention ([`is_free_scope`]) rather than to "not free", because the fallback is
+    /// not a guess about cost - it is the provider's published scoping for its own allowance,
+    /// and reading it as "not free" is what once made a free-only route look like it held a
+    /// billable leg and spend a guaranteed-rejected call on every request after the
+    /// allowance was exhausted. The fallback is deliberately confined to this question: it
+    /// never promotes a target into a free pool and never labels a request free to a caller.
+    pub fn draws_on_free_allowance(self, target: &str) -> bool {
+        match self {
+            Self::Free => true,
+            Self::Metered => false,
+            Self::Unknown => is_free_scope(target),
+        }
+    }
+
+    /// The name a decision record prints for this tariff.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Metered => "paid",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Reads the credential-level block a failure carries, if any.
 ///
 /// Returns the block KIND and the failing target slug. The composite pairs the kind
@@ -1198,12 +1280,14 @@ pub struct CapabilityFacts {
     /// enforce something the deployment never agreed to. Defaults to `false`, so a target
     /// that states nothing keeps the behaviour it had.
     pub no_reasoning_control: bool,
-    /// Whether the provider charges nothing for a request here within a declared allowance.
+    /// What a request here costs the deployment, as a declared fact.
     ///
-    /// A selection fact, not an economics one: it decides that a paid request may never be
-    /// chosen ahead of an eligible free one. Defaults to `false`, which is the conservative
-    /// answer - an undeclared target is never promoted above a target that states it is free.
-    pub free_tier: bool,
+    /// A selection fact: it decides that a paid request may never be chosen ahead of an
+    /// eligible free one. It is also the authority for free eligibility, so it is a
+    /// [`Tariff`] and not a boolean - an undeclared target is `Unknown`, which is not free
+    /// and is never promoted above a target that states it is free. Defaults to `Unknown`,
+    /// the conservative answer.
+    pub tariff: Tariff,
     /// The physical model's own request window: input tokens plus the output it can emit.
     ///
     /// Distinct from the route's advertised `context_window`, which is a promise made to
@@ -3762,7 +3846,8 @@ mod tests {
 #[cfg(test)]
 mod account_quota_tests {
     use super::{
-        CredentialBlockKind, FailureClass, credential_block, failure_class, fallback_reason,
+        CredentialBlockKind, FailureClass, Tariff, credential_block, failure_class,
+        fallback_reason, is_free_scope,
     };
     use http::StatusCode;
     use serde_json::json;
@@ -4052,5 +4137,77 @@ mod account_quota_tests {
                 "{error:?} must not produce a credential block"
             );
         }
+    }
+
+    /// The tariff is a declaration read, not a slug guess: three inputs, three answers, and
+    /// only one of them is free.
+    ///
+    /// Pinned because the two mistakes are both plausible and both costly. Treating an
+    /// undeclared target as free spends a request nobody budgeted; treating a declared-free
+    /// target as paid silently removes the cheapest candidate from every pool.
+    #[test]
+    fn a_tariff_is_read_from_the_declaration_and_unknown_is_not_free() {
+        assert_eq!(Tariff::from_declaration(Some(true)), Tariff::Free);
+        assert_eq!(Tariff::from_declaration(Some(false)), Tariff::Metered);
+        assert_eq!(Tariff::from_declaration(None), Tariff::Unknown);
+
+        assert!(Tariff::Free.is_free());
+        assert!(!Tariff::Metered.is_free());
+        assert!(
+            !Tariff::Unknown.is_free(),
+            "an undeclared tariff is not evidence of free entitlement"
+        );
+
+        // The default is the conservative answer, so a target built before the field
+        // existed cannot become free by omission.
+        assert_eq!(Tariff::default(), Tariff::Unknown);
+        assert!(!Tariff::default().is_free());
+
+        assert_eq!(Tariff::Free.as_str(), "free");
+        assert_eq!(Tariff::Metered.as_str(), "paid");
+        assert_eq!(Tariff::Unknown.as_str(), "unknown");
+
+        // Ordering is the selection contract: a paid candidate never precedes an eligible
+        // free one, and an unknown one ranks with the paid, never with the free.
+        assert!(Tariff::Free < Tariff::Unknown);
+        assert!(Tariff::Free < Tariff::Metered);
+    }
+
+    /// The two questions the tariff answers are different, and each has its own direction of
+    /// error. Pinned together because collapsing them is the mistake a single boolean made:
+    /// the economic question must never call an undeclared target free, and the allowance
+    /// question must never call a provider-free-scoped target metered - the second is what
+    /// once spent a guaranteed-rejected call per request on a free-only child.
+    #[test]
+    fn the_allowance_question_falls_back_to_provider_scope_but_the_cost_question_does_not() {
+        // Declared answers are direct, and a declaration overrides the slug both ways.
+        assert!(Tariff::Free.draws_on_free_allowance("vendor/paid-slug"));
+        assert!(!Tariff::Metered.draws_on_free_allowance("vendor/model:free"));
+
+        // Undeclared falls back to the provider's own allowance scoping.
+        assert!(Tariff::Unknown.draws_on_free_allowance("vendor/model:free"));
+        assert!(Tariff::Unknown.draws_on_free_allowance("openrouter/free"));
+        assert!(!Tariff::Unknown.draws_on_free_allowance("vendor/paid-slug"));
+
+        // The cost question stays strict for the same inputs: nothing undeclared is free.
+        assert!(!Tariff::Unknown.is_free());
+        assert!(!Tariff::Unknown.is_free());
+    }
+
+    /// A Google model has no `:free` suffix and can still be free by entitlement, while an
+    /// OpenRouter slug carries the suffix. The two questions stay separate on purpose.
+    #[test]
+    fn free_entitlement_is_not_the_openrouter_slug_convention() {
+        assert!(is_free_scope("vendor/model:free"));
+        assert!(is_free_scope("openrouter/free"));
+        assert!(!is_free_scope("gemini-3.5-flash-lite"));
+        assert!(!is_free_scope("gemma-4-26b-a4b-it"));
+
+        // The declaration is what decides, and it decides the same way regardless of slug.
+        assert!(Tariff::from_declaration(Some(true)).is_free());
+        assert!(
+            !Tariff::from_declaration(None).is_free(),
+            "a slug without a declaration is still not a free claim"
+        );
     }
 }

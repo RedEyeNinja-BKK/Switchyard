@@ -42,7 +42,7 @@ pub use observation::{
 };
 pub use raw::RawResponse;
 pub use run::{
-    CapabilityFacts, ClientRouter, CredentialBlock, CredentialBlockKind, FailureClass,
+    CapabilityFacts, ClientRouter, CredentialBlock, CredentialBlockKind, FailureClass, Tariff,
     credential_block, decide, failure_class, is_free_scope, run,
 };
 pub use switchyard_translation::RawEventStream;

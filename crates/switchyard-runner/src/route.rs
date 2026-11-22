@@ -420,6 +420,12 @@ pub struct Route {
     /// asked for and the recorded reason. A held route keeps its registration so the refusal
     /// can be specific, but it serves nothing and is not advertised.
     held: Option<HeldRoute>,
+    /// The target groups whose members are this route's candidate pool, when it declares one.
+    ///
+    /// Presence also selects the provider-neutral ranking policy. Keeping the declaration
+    /// rather than a boolean means the trace can name the groups the pool was built from,
+    /// and a pool route is recognisable at runtime, not only in the manifest that created it.
+    pool_groups: Option<Vec<String>>,
 }
 
 /// A route whose targets are all held out of service, with the evidence for holding it.
@@ -473,6 +479,7 @@ impl Route {
             selector: None,
             daily_allowances: Arc::new(HashMap::new()),
             held: None,
+            pool_groups: None,
         }
     }
 
@@ -486,6 +493,39 @@ impl Route {
     ) -> Self {
         self.selector = Some(selector);
         self
+    }
+
+    /// Declares that this route's candidates come from `groups`, ranked as peers.
+    ///
+    /// The groups are labels on the targets; this route does not choose between the labels.
+    /// It records them so a decision record can say which pool a request was ranked in, and
+    /// so the provider-neutral ranking policy is a property of the route rather than of the
+    /// spelling of its candidate list.
+    pub fn with_pool_groups(mut self, groups: Vec<String>) -> Self {
+        self.pool_groups = Some(groups);
+        self
+    }
+
+    /// The ranking policy this route uses.
+    ///
+    /// A pool route ranks peers: no group is a stage, and the manifest's order is not a
+    /// decision. Every other route keeps the historical policy unchanged.
+    fn ranking_policy(&self) -> crate::selection::RankingPolicy {
+        if self.pool_groups.is_some() {
+            crate::selection::RankingPolicy::PEER
+        } else {
+            crate::selection::RankingPolicy::LEGACY
+        }
+    }
+
+    /// Whether this route is a provider-neutral pool, for reports and tests.
+    pub fn is_peer_pool(&self) -> bool {
+        self.pool_groups.is_some()
+    }
+
+    /// The groups this route's pool is built from, when it declares one.
+    pub fn pool_groups(&self) -> Option<&[String]> {
+        self.pool_groups.as_deref()
     }
 
     /// Records the daily request allowance behind each target model id.
@@ -544,10 +584,20 @@ impl Route {
     /// as having a paid leg: the child was entered after the account-wide allowance was
     /// gone and its first call was guaranteed to be rejected.
     pub fn all_targets_free(&self) -> bool {
-        self.models
-            .all_models()
-            .iter()
-            .all(|model| switchyard_llm_client::is_free_scope(model.as_str()))
+        // The question this answers is which allowance the requests are charged against,
+        // because that is what the caller (a composite holding a provider quota block) needs
+        // to know. Declared tariff decides it; an undeclared target falls back to the
+        // provider's own allowance scoping, which is a fact about the provider's billing
+        // scope rather than a guess about cost. The economic question - is this request
+        // free - is `Tariff::is_free`, asked separately by selection, and it never treats
+        // `Unknown` as free.
+        let facts = self.clients.target_capabilities();
+        self.models.all_models().iter().all(|model| {
+            let tariff = facts
+                .get(model)
+                .map_or(switchyard_llm_client::Tariff::Unknown, |facts| facts.tariff);
+            tariff.draws_on_free_allowance(model.as_str())
+        })
     }
 
     /// Returns the configured libsy algorithm name.
@@ -761,6 +811,13 @@ impl Route {
         // that was never contacted can still say why. The codes are a closed vocabulary:
         // they name a rule, never a payload. `unsupported_capability` already answers with
         // one ("vision", "tool_calling", "video", "reasoning", "image_carrier", ...).
+        // A provider-neutral pool is a *free* pool: its membership is the eligible free leaves
+        // of each provider, so a candidate whose tariff is not positively declared free is
+        // excluded before it can be ranked. Without this, a leg listed by mistake would
+        // compete one tier below the free candidates and then serve whenever the free pool
+        // was busy, which is a paid escalation nobody approved. `unknown` fails closed for
+        // the same reason: an undeclared tariff is not evidence of free entitlement.
+        let pool_members_only_free = self.is_peer_pool();
         let verdict = |model: &switchyard_protocol::ModelId| -> Result<(), &'static str> {
             let Some(facts) = facts.get(model) else {
                 // Uncharacterised rather than incapable: permitted, except for video,
@@ -771,6 +828,9 @@ impl Route {
                     Ok(())
                 };
             };
+            if pool_members_only_free && !facts.tariff.is_free() {
+                return Err("not_free_entitled");
+            }
             // Physical fit, judged on facts the deployment states about one backing
             // model. A request that cannot fit is not a request the target should be
             // asked to refuse: the route advances instead, which is what makes an
@@ -874,11 +934,15 @@ impl Route {
                     .into_iter()
                     .map(|model| {
                         let facts = facts.get(&model);
+                        // The tier is the declared tariff. `Unknown` ranks as metered: it is
+                        // not evidence of free eligibility, and a free pool that admitted it
+                        // would be spending a request on a cost nobody declared.
                         crate::selection::Candidate {
-                            tier: if facts.is_some_and(|facts| facts.free_tier) {
-                                crate::selection::CostTier::Free
-                            } else {
-                                crate::selection::CostTier::Paid
+                            tier: match facts.map(|facts| facts.tariff) {
+                                Some(switchyard_llm_client::Tariff::Free) => {
+                                    crate::selection::CostTier::Free
+                                }
+                                _ => crate::selection::CostTier::Paid,
                             },
                             remaining_today: self
                                 .daily_allowances
@@ -891,7 +955,8 @@ impl Route {
                     })
                     .collect();
                 let declared = self.models.all_models();
-                scores = selector.explain(&candidates, demand, &declared);
+                scores =
+                    selector.explain_with(&candidates, demand, &declared, self.ranking_policy());
                 let ordered: Vec<switchyard_protocol::ModelId> =
                     scores.iter().map(|score| score.model.clone()).collect();
                 let unchanged = candidates
@@ -976,15 +1041,17 @@ impl Route {
                     // The selector's own figures win where it ran; without a selector the
                     // record still names the tier and the pressure the gates judged by,
                     // rather than reporting a zero it never measured.
-                    let free = score
-                        .map(|score| score.tier == crate::selection::CostTier::Free)
-                        .or_else(|| facts.map(|facts| facts.free_tier))
-                        .unwrap_or(false);
+                    // The tier a report prints is the declared tariff, including the case
+                    // where the deployment declared nothing: `unknown` is a distinct answer
+                    // from `paid`, and collapsing it into `paid` would hide a cost the
+                    // deployment never verified.
+                    let tariff =
+                        facts.map_or(switchyard_llm_client::Tariff::Unknown, |facts| facts.tariff);
                     CandidateTrace {
                         model: model.to_string(),
                         eligible: verdict.is_ok(),
                         exclusion: verdict.err(),
-                        tier: if free { "free" } else { "paid" },
+                        tier: tariff.as_str(),
                         rank: rank_of.get(model).copied(),
                         remaining_today: score.and_then(|score| score.remaining_today),
                         pressure_permille: score.map_or_else(
@@ -1009,6 +1076,7 @@ impl Route {
             demand_tokens: demand.required_tokens(),
             estimated_input_tokens,
             promotion: promoted.map(|model| model.to_string()),
+            pool: self.pool_groups.as_ref().map(|groups| groups.join(",")),
         };
         if models.is_empty() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and

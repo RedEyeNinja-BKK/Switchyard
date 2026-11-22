@@ -491,6 +491,7 @@ mod tests {
             demand_tokens: 1_234,
             estimated_input_tokens: 1_000,
             promotion: None,
+            pool: None,
         };
         log.append_decision(
             RoutingLogContext {

@@ -108,6 +108,14 @@ pub struct SelectionTrace {
     pub estimated_input_tokens: u64,
     /// Leg the context-pressure rule promoted, when it promoted one.
     pub promotion: Option<String>,
+    /// The target groups this request's candidate pool was built from, when the route
+    /// declares a pool.
+    ///
+    /// Present only for a provider-neutral pool. It is the labels joined for the record, not
+    /// a preference order: the groups name membership, and the ranking inside them is
+    /// decided per request. Absent means the route is not a pool, which is every route that
+    /// states a deliberate lineup.
+    pub pool: Option<String>,
 }
 
 /// A stable, value-free code naming how one attempt ended.

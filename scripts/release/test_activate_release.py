@@ -70,13 +70,11 @@ class Sandbox:
                      f'  cp {self.state}/good {self.state}/healthy\n'
                      f'fi\n')
         os.chmod(self.restart_sh, 0o755)
-        # The unit is asked which EnvironmentFiles it reads. A sandbox has none, and
-        # the answer must not depend on whether the host happens to run a unit with
-        # this name: a real reply here would make the result host-dependent.
-        self.no_systemctl = os.path.join(root, "systemctl-none")
-        with open(self.no_systemctl, "w") as fh:
-            fh.write("#!/bin/bash\nexit 0\n")
-        os.chmod(self.no_systemctl, 0o755)
+        # The unit is asked which EnvironmentFiles it reads. The sandbox answers with
+        # one file by default, so the answer never depends on whether the host runs a
+        # unit with this name. Cases that need a different answer -- four files, a
+        # missing one, an empty or failing `systemctl` -- build their own stub.
+        self.default_systemctl = self.write_systemctl("systemctl-default", [self.env1])
 
     def env(self, **overrides):
         env = {
@@ -89,9 +87,7 @@ class Sandbox:
             "HEALTH_CMD": self.health_sh,
             "RESTART_CMD": self.restart_sh,
             "HEALTH_ATTEMPTS": "4",
-            "ENV_FILE_1": self.env1,
-            "ENV_FILE_2": os.path.join(self.root, "absent.env"),
-            "SYSTEMCTL": self.no_systemctl,
+            "SYSTEMCTL": self.default_systemctl,
             "MANIFEST_GROUP": "root",
             "VALIDATOR": VALIDATOR,
             "METRICS_URL": "http://127.0.0.1:9/metrics",
@@ -111,21 +107,38 @@ class Sandbox:
                 fh.write(f"{key}={value}\n")
         return path
 
-    def write_systemctl(self, name, output, markers=True):
+    def write_systemctl(self, name, output, markers=True, optional=()):
         """A stub for `systemctl show -p EnvironmentFiles --value`.
 
         `markers=True` reproduces current systemd, one `PATH (ignore_errors=no)` per
         line; `markers=False` reproduces the older single-line form. Both shapes are
-        in the wild, so both are tested.
+        in the wild, so both are tested. Paths in `optional` are reported with
+        `ignore_errors=yes`, which is how a unit says the file may be absent.
         """
         path = os.path.join(self.root, name)
+
+        def quote(item):
+            # systemd quotes a path that contains a space, and only then.
+            return f'"{item}"' if " " in item else item
+
         with open(path, "w") as fh:
             fh.write("#!/bin/bash\n")
             if markers:
                 for item in output:
-                    fh.write(f'printf \'%s\\n\' "{item} (ignore_errors=no)"\n')
+                    flag = "yes" if item in optional else "no"
+                    argument = f"{quote(item)} (ignore_errors={flag})"
+                    fh.write(f"printf '%s\\n' '{argument}'\n")
             else:
-                fh.write(f'echo "{" ".join(output)}"\n')
+                argument = " ".join(quote(item) for item in output)
+                fh.write(f"printf '%s\\n' '{argument}'\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def write_systemctl_silent(self, name, exit_code=0):
+        """A `systemctl` that answers nothing: not installed, or a unit it cannot read."""
+        path = os.path.join(self.root, name)
+        with open(path, "w") as fh:
+            fh.write(f"#!/bin/bash\nexit {exit_code}\n")
         os.chmod(path, 0o755)
         return path
 
@@ -372,6 +385,208 @@ def test_the_release_record_names_every_file_it_was_validated_under(box):
     for path in files:
         assert path in text, f"{path} must be recorded"
         assert sha256(path) in text, f"{path} must be recorded by hash"
+
+
+# ---------------------------------------------------------------------------
+# the production shape: four files, a credential in the fourth, and the ways
+# discovery can be wrong
+#
+# The host that motivated this has four EnvironmentFiles: two on the unit and two
+# drop-ins. The fourth is a credential file, so a validator that reads the first
+# three cannot load a candidate that needs it -- which is exactly what happened,
+# and what a hand-named pair of files could never have caught.
+# ---------------------------------------------------------------------------
+
+
+def _four_file_setup(box):
+    """Four files where the credential the candidate needs is only in the fourth."""
+    files = (
+        box.write_env_file("f1.env", {"FIRST_FILE_KEY": "one"}),
+        box.write_env_file("f2.env", {"SECOND_FILE_KEY": "two"}),
+        box.write_env_file("f3.env", {"THIRD_FILE_KEY": "three"}),
+        box.write_env_file("f4.env", {"FOURTH_FILE_KEY": "from-the-fourth-file"}),
+    )
+    candidate, csha = box.write_candidate(
+        "candidate",
+        "#!/bin/bash\n"
+        '[ "${FOURTH_FILE_KEY:-}" = "from-the-fourth-file" ] || exit 3\n'
+        'echo "server OK: fixture"\n')
+    manifest, msha = box.write_manifest("candidate.toml")
+    return files, (candidate, csha, manifest, msha)
+
+
+def test_a_credential_that_exists_only_in_the_fourth_file_is_what_loads(box):
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _four_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-four", files)
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_fourth_file_is_not_optional_in_practice(box):
+    """The negative control: with only the first three, this candidate must fail.
+
+    Without this, the case above would also pass if validation were toothless.
+    """
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _four_file_setup(box)
+    before = box.live_bytes()
+    systemctl = box.write_systemctl("systemctl-three-of-four", files[:3])
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 1
+    assert "does not validate" in result.stderr
+    assert box.live_bytes() == before
+
+
+def test_the_release_record_lists_four_files_in_read_order_with_hashes(box):
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _four_file_setup(box)
+    systemctl = box.write_systemctl("systemctl-four", files)
+    box.mark_good(candidate)
+    assert box.run("deploy", manifest, msha, candidate, csha,
+                   SYSTEMCTL=systemctl).returncode == 0
+    text = open(os.path.join(box.releases, box.current(), "release.json")).read()
+    positions = [text.index(path) for path in files]
+    assert positions == sorted(positions), "the record must preserve read order"
+    for path in files:
+        assert sha256(path) in text, f"{path} must be recorded by hash"
+
+
+def test_a_later_file_wins_when_two_declare_the_same_variable(box):
+    """Preserved order is what makes this true, for systemd and for the validator."""
+    adopted(box)
+    first = box.write_env_file("p1.env", {"PRECEDENCE_KEY": "loser"})
+    second = box.write_env_file("p2.env", {"PRECEDENCE_KEY": "winner"})
+    candidate, csha = box.write_candidate(
+        "candidate-precedence",
+        "#!/bin/bash\n"
+        '[ "${PRECEDENCE_KEY:-}" = "winner" ] || exit 3\n'
+        'echo "server OK: fixture"\n')
+    manifest, msha = box.write_manifest("candidate.toml")
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     SYSTEMCTL=box.write_systemctl("systemctl-order", [first, second]))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # And the proof that the order is what decided it: swap the files and the same
+    # candidate must now be refused, because the value it needs is no longer last.
+    before = box.live_bytes()
+    swapped = box.write_systemctl("systemctl-swapped", [second, first])
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=swapped)
+    assert result.returncode == 1
+    assert box.live_bytes() == before
+
+
+def test_a_missing_required_environment_file_is_refused(box):
+    """systemd would refuse to start with this file absent, so validation cannot proceed."""
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _four_file_setup(box)
+    before = box.live_bytes()
+    ghost = os.path.join(box.root, "never-written.env")
+    systemctl = box.write_systemctl("systemctl-ghost", (files[0], ghost))
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 1
+    assert "systemd would refuse to start" in result.stderr
+    assert box.live_bytes() == before
+
+
+def test_a_missing_optional_environment_file_is_skipped(box):
+    """ignore_errors=yes is systemd's own statement that the file may be absent."""
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _four_file_setup(box)
+    ghost = os.path.join(box.root, "optional-absent.env")
+    systemctl = box.write_systemctl("systemctl-optional", files + (ghost,),
+                                    optional=(ghost,))
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=systemctl)
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = open(os.path.join(box.releases, box.current(), "release.json")).read()
+    assert ghost in text and '"present":false' in text
+
+
+def test_discovery_that_answers_nothing_is_refused_rather_than_guessed(box):
+    """The two-file fallback is gone: no answer means no deployment.
+
+    Substituting a default here would validate the candidate under an environment
+    the service never gets, and the failure would surface later as a service that
+    cannot start -- with a message about a missing variable, not about this.
+    """
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _four_file_setup(box)
+    before = box.live_bytes()
+    silent = box.write_systemctl_silent("systemctl-silent", 0)
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=silent)
+    assert result.returncode == 1
+    assert "cannot resolve the EnvironmentFiles" in result.stderr
+    assert "ENV_FILES" in result.stderr, "the refusal must name the way out"
+    assert box.live_bytes() == before
+
+
+def test_a_systemctl_that_fails_is_not_read_as_no_files(box):
+    adopted(box)
+    files, (candidate, csha, manifest, msha) = _four_file_setup(box)
+    before = box.live_bytes()
+    failing = box.write_systemctl_silent("systemctl-failing", 1)
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha, SYSTEMCTL=failing)
+    assert result.returncode == 1
+    assert "cannot resolve the EnvironmentFiles" in result.stderr
+    assert box.live_bytes() == before
+
+
+def test_a_discovered_file_that_does_not_parse_is_refused_before_the_swap(box):
+    """A file systemd would reject is a file whose environment cannot be reproduced."""
+    adopted(box)
+    good = box.write_env_file("good.env", {"GOOD_KEY": "value"})
+    bad = os.path.join(box.root, "bad.env")
+    with open(bad, "w") as fh:
+        fh.write("this line is not an assignment\n")
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    manifest, msha = box.write_manifest("candidate.toml")
+    before = box.live_bytes()
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     SYSTEMCTL=box.write_systemctl("systemctl-bad", [good, bad]))
+    assert result.returncode == 1
+    assert "does not validate" in result.stderr
+    assert box.live_bytes() == before
+
+
+def test_a_quoted_path_with_a_space_is_taken_whole(box):
+    """systemd quotes such a path; splitting it would hand the validator half a file."""
+    adopted(box)
+    spaced = box.write_env_file("a file with spaces.env", {"SPACED_KEY": "present"})
+    candidate, csha = box.write_candidate(
+        "candidate-spaced",
+        "#!/bin/bash\n"
+        '[ "${SPACED_KEY:-}" = "present" ] || exit 3\n'
+        'echo "server OK: fixture"\n')
+    manifest, msha = box.write_manifest("candidate.toml")
+    box.mark_good(candidate)
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     SYSTEMCTL=box.write_systemctl("systemctl-spaced", [spaced]))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_validator_refuses_an_environment_file_it_cannot_read(tmp_path):
+    """The second layer: a missing file is not an empty one, whoever asks."""
+    candidate = os.path.join(str(tmp_path), "candidate")
+    with open(candidate, "w") as fh:
+        fh.write("#!/bin/bash\nexit 0\n")
+    os.chmod(candidate, 0o755)
+    manifest = os.path.join(str(tmp_path), "candidate.toml")
+    with open(manifest, "w") as fh:
+        fh.write("route = 1\n")
+    result = subprocess.run(
+        [sys.executable, VALIDATOR, "--binary", candidate, "--manifest", manifest,
+         "--env-file", os.path.join(str(tmp_path), "absent.env")],
+        capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "no such environment file" in result.stderr
 
 
 # ---------------------------------------------------------------------------

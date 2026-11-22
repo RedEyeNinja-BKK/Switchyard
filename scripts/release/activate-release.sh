@@ -37,6 +37,9 @@
 #       Re-check a stored release's bytes, and the live files when it is CURRENT.
 #   list
 #       Show stored releases, their ages and which is CURRENT / LAST-KNOWN-GOOD.
+#   env-files
+#       Show the environment files the unit declares, in read order, with a hash of
+#       each. Refuses rather than guessing when the unit cannot be resolved.
 #
 # EXIT CODES
 #   0  ok
@@ -73,10 +76,13 @@ HEALTH_ATTEMPTS=${HEALTH_ATTEMPTS:-80}
 # hand-maintained list drifts the moment that happens, and it drifts silently: the
 # missing file is only noticed when a variable from it is required, at which point
 # the candidate is refused for a reason that names the variable and not the cause.
-# ENV_FILE_1/ENV_FILE_2 stay as the fallback for a host whose unit cannot be
-# queried, which is also what the acceptance tests use; ENV_FILES overrides both.
-ENV_FILE_1=${ENV_FILE_1:-/etc/switchyard/secrets/providers.env}
-ENV_FILE_2=${ENV_FILE_2:-/var/lib/switchyard/oauth/switchyard-openai.env}
+#
+# There is deliberately no built-in fallback list. A host whose unit cannot be
+# queried is a host where this script cannot say what environment the service gets,
+# and validating under a guess is worse than refusing: two files that happen to be
+# named here would pass a candidate that the service then fails to start. ENV_FILES
+# names the set explicitly for such a host and for the tests, and is the only way to
+# override discovery.
 ENV_FILES=${ENV_FILES:-}
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
 MANIFEST_GROUP=${MANIFEST_GROUP:-switchyard}
@@ -221,64 +227,131 @@ release_id() {
     "$(printf '%s' "$1" | cut -c1-16)" "$(printf '%s' "$2" | cut -c1-8)"
 }
 
-# One resolved path per line: exactly the EnvironmentFiles systemd hands the
-# process, in the order it reads them (a later file wins on a duplicate key, which
-# is why the order is preserved rather than sorted).
+# One resolved file per line, as "<required|optional>\t<path>": exactly the
+# EnvironmentFiles systemd hands the process, in the order it reads them.
+#
+# Order is load-bearing, not cosmetic. When two files declare the same variable the
+# later one wins, both for systemd and for the validator (which merges them in the
+# same order), so the list is preserved rather than sorted or deduplicated.
+#
+# The marker is kept because it is a fact about the unit, not decoration:
+# ignore_errors=no means systemd refuses to start when the file is absent, so a
+# deployment that cannot read that file would be validating an environment the
+# service will never have.
 #
 # Two output shapes have to be read. systemd >= 247 prints one
 # "PATH (ignore_errors=no)" per file; older releases print every path on a single
-# line. Both are handled here, and a token that is not an absolute path is dropped
-# rather than passed on: a truncated or quoted path would otherwise reach the
-# validator as a file it silently finds missing.
+# line. A path containing a space is quoted and is taken whole: word splitting
+# there would hand the validator half a path, which it would then find missing.
+#
+# Returns non-zero when the unit cannot be asked, answers with nothing, or emits
+# something this parser cannot read. It never substitutes a default; see the note
+# above ENV_FILES.
 environment_files() {
-  local raw line path
+  local raw line path rest flag emitted=0
   if [ -n "$ENV_FILES" ]; then
-    printf '%s\n' $ENV_FILES
+    for path in $ENV_FILES; do
+      printf 'required\t%s\n' "$path"
+      emitted=$((emitted + 1))
+    done
+    [ "$emitted" -gt 0 ] || return 1
     return 0
   fi
-  raw=$("$SYSTEMCTL" show -p EnvironmentFiles --value "$UNIT" 2>/dev/null || true)
-  if [ -n "$raw" ]; then
-    while IFS= read -r line; do
-      line=${line%% (ignore_errors=*}
-      # systemd quotes a path that contains a space. Take the quoted value whole:
-      # word splitting here would cut it in half and hand the validator a path
-      # that is not the file.
+  if ! raw=$("$SYSTEMCTL" show -p EnvironmentFiles --value "$UNIT" 2>/dev/null); then
+    return 1
+  fi
+  [ -n "$raw" ] || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    flag=required
+    case $line in
+      *"(ignore_errors=yes)"*) flag=optional ;;
+    esac
+    line=${line%% (ignore_errors=*}
+    while [ -n "$line" ]; do
+      line=${line#"${line%%[![:space:]]*}"}
+      [ -n "$line" ] || break
       case $line in
-        \"*\")
+        \"*)
           path=${line#\"}
+          case $path in
+            *\"*) ;;
+            *) return 1 ;;
+          esac
+          rest=${path#*\"}
           path=${path%%\"*}
-          printf '%s\n' "$path"
-          continue
+          line=$rest
+          ;;
+        *)
+          path=${line%%[[:space:]]*}
+          line=${line#"$path"}
           ;;
       esac
-      for path in $line; do
-        path=${path#\"}
-        path=${path%\"}
-        case $path in
-          /*) printf '%s\n' "$path" ;;
-        esac
-      done
-    done <<< "$raw"
-    return 0
+      case $path in
+        "") ;;
+        /*)
+          printf '%s\t%s\n' "$flag" "$path"
+          emitted=$((emitted + 1))
+          ;;
+      esac
+    done
+  done <<< "$raw"
+  [ "$emitted" -gt 0 ]
+}
+
+# The resolved set, in read order, as two parallel arrays. Every caller is about to
+# make a claim -- "this candidate loads under the service's environment", "this
+# record names the configuration" -- that a partial or guessed set would make false,
+# so anything short of the unit's own answer is fatal here rather than later.
+ENV_FLAGS=()
+ENV_PATHS=()
+resolve_environment_files() {
+  local listing flag path i
+  if ! listing=$(environment_files); then
+    die "cannot resolve the EnvironmentFiles of $UNIT: systemd was not asked, or the unit declares none. Refusing to validate a candidate under an environment the service will not get. Set ENV_FILES only if you know the set the unit runs with."
   fi
-  printf '%s\n' "$ENV_FILE_1" "$ENV_FILE_2"
+  ENV_FLAGS=()
+  ENV_PATHS=()
+  while IFS=$'\t' read -r flag path; do
+    [ -n "$path" ] || continue
+    ENV_FLAGS+=("$flag")
+    ENV_PATHS+=("$path")
+  done <<< "$listing"
+  if [ "${#ENV_PATHS[@]}" -eq 0 ]; then
+    die "resolved no environment files for $UNIT; refusing to validate under an empty environment"
+  fi
+  for i in "${!ENV_PATHS[@]}"; do
+    if [ -f "${ENV_PATHS[$i]}" ]; then
+      continue
+    fi
+    if [ "${ENV_FLAGS[$i]}" = optional ]; then
+      say "note: ${ENV_PATHS[$i]} is declared optional and absent; systemd skips it"
+      continue
+    fi
+    die "the unit declares ${ENV_PATHS[$i]} but it is missing: systemd would refuse to start $UNIT, so no candidate can be validated under the service's real environment"
+  done
 }
 
 # Records the release being replaced and installation, without the secret. A hash
 # identifies a configuration; the file keeps the secret.
 env_identity_json() {
-  local path out="" entry
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
+  local path out="" entry i required
+  [ "${#ENV_PATHS[@]}" -gt 0 ] \
+    || die "no environment files resolved; refusing to write a release record that names none"
+  for i in "${!ENV_PATHS[@]}"; do
+    path=${ENV_PATHS[$i]}
+    required=true
+    [ "${ENV_FLAGS[$i]}" = optional ] && required=false
     if [ -f "$path" ]; then
-      entry=$(printf '{"path":"%s","sha256":"%s","bytes":%s,"mode":"%s","owner":"%s","group":"%s"}' \
-        "$path" "$(sha "$path")" "$(stat -c %s "$path")" "$(stat -c %a "$path")" \
+      entry=$(printf '{"path":"%s","required":%s,"sha256":"%s","bytes":%s,"mode":"%s","owner":"%s","group":"%s"}' \
+        "$path" "$required" \
+        "$(sha "$path")" "$(stat -c %s "$path")" "$(stat -c %a "$path")" \
         "$(stat -c %U "$path")" "$(stat -c %G "$path")")
     else
-      entry=$(printf '{"path":"%s","present":false}' "$path")
+      entry=$(printf '{"path":"%s","required":false,"present":false}' "$path")
     fi
     out=${out:+$out,}$entry
-  done < <(environment_files)
+  done
   printf '[%s]' "$out"
 }
 
@@ -390,6 +463,7 @@ adopt_release() {
   local label=$1 commit=$2 branch=$3 dirty=$4 basis=$5 caps=$6
   [ -f "$LIVE_BIN" ] || die "no live binary at $LIVE_BIN"
   [ -f "$LIVE_MANIFEST" ] || die "no live manifest at $LIVE_MANIFEST"
+  resolve_environment_files
   local b_sha m_sha id dir
   b_sha=$(sha "$LIVE_BIN")
   m_sha=$(sha "$LIVE_MANIFEST")
@@ -486,16 +560,21 @@ list_release_ids() {
 #      before they reach a log, and its full output goes to a 0600 file under the
 #      release root for the operator, not to the terminal.
 validate_candidate() {
-  local binary=$1 manifest=$2 log=$3 path
+  local binary=$1 manifest=$2 log=$3 path i
   local -a env_args=()
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
+  for i in "${!ENV_PATHS[@]}"; do
+    path=${ENV_PATHS[$i]}
+    # A declared-optional file that is absent was already skipped during
+    # resolution; anything still listed here is a file systemd will read.
+    [ -f "$path" ] || continue
     env_args+=(--env-file "$path")
-  done < <(environment_files)
-  # Never validate under an environment this script could not enumerate: an empty
-  # list would run the candidate with no credentials at all and refuse a release
-  # for a reason that has nothing to do with the candidate.
-  [ "${#env_args[@]}" -gt 0 ] || die "no environment files resolved for $UNIT"
+  done
+  # Never validate under a guessed environment. Resolution has already refused the
+  # cases it could not read; an empty list here means every declared file is
+  # optional and absent, which is a real (if unusual) unit environment, so it is
+  # reported rather than turned into a refusal for the candidate's innocence.
+  [ "${#env_args[@]}" -gt 0 ] \
+    || say "note: no environment file is readable for $UNIT; validating with an empty environment"
   if [ -n "$VALIDATE_CMD" ]; then
     # Testing seam: the real check would need a working binary and real keys. The
     # override runs with the same parsed environment so an injected failure still
@@ -595,6 +674,12 @@ cmd_deploy() {
   [ "$(sha "$m_src")" = "$m_want" ] || die "manifest hash mismatch"
   [ "$(sha "$b_src")" = "$b_want" ] || die "binary hash mismatch"
   say "artefacts match the approved hashes"
+
+  # What the service actually runs with. Resolved once, here, so the validation
+  # below and the release record further on cannot disagree about the set, and so a
+  # host whose unit cannot be read is refused before anything is touched.
+  resolve_environment_files
+  say "the unit reads ${#ENV_PATHS[@]} environment file(s)"
 
   # The rollback target must exist BEFORE anything is replaced. A deployment with
   # nowhere to go back to is the situation this whole change exists to remove.
@@ -849,6 +934,25 @@ a release, so there is nothing to verify against a record it never had"
   return $rc
 }
 
+# What the unit reads, as this installer resolves it. No contents: the hash
+# identifies a file, and the whole point of the verb is to answer "will a
+# deployment validate under the same environment the service gets?" without
+# deploying anything.
+cmd_env_files() {
+  resolve_environment_files
+  local i path digest
+  printf '%s reads %d environment file(s), in read order:\n' "$UNIT" "${#ENV_PATHS[@]}"
+  for i in "${!ENV_PATHS[@]}"; do
+    path=${ENV_PATHS[$i]}
+    if [ -f "$path" ]; then
+      digest=$(sha "$path")
+    else
+      digest="(absent)"
+    fi
+    printf '  %-8s %s  %s\n' "${ENV_FLAGS[$i]}" "$digest" "$path"
+  done
+}
+
 cmd_list() {
   local cur lkg id created bin mark
   cur=$(link_target "$CURRENT_LINK")
@@ -876,7 +980,9 @@ cmd_list() {
 RELEASE_VERIFIED=0
 
 usage() {
-  sed -n '1,40p' "${BASH_SOURCE[0]}" | sed -n '/^# VERBS/,/^# EXIT/p' | sed 's/^# \{0,1\}//'
+  # Bounded by the markers rather than by a line count: the verb list grows, and a
+  # fixed window silently truncates the last verb when it does.
+  sed -n '/^# VERBS/,/^# EXIT/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 verb=${1:-}
@@ -891,6 +997,7 @@ case $verb in
   promote) shift; cmd_promote "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   list) shift; cmd_list "$@" ;;
+  env-files) shift; cmd_env_files "$@" ;;
   adopt)
     shift
     label="" ; commit="" ; branch="" ; dirty=false ; basis="adopted-unattested" ; caps=""

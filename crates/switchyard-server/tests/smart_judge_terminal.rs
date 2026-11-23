@@ -268,6 +268,31 @@ async fn call(runner: Runner) -> (StatusCode, Value) {
     )
 }
 
+/// A broken 26B candidate is not a whole-pool failure when 31B still works.
+/// The measured judge pool must try the sibling and return its verdict without
+/// spending Luna NT, even when the first candidate yields a provider 503.
+#[tokio::test]
+async fn one_gemma_unavailable_healthy_sibling_serves_without_luna() {
+    let script: Script = |model| {
+        if model.contains("26b") {
+            unavailable(model)
+        } else {
+            None
+        }
+    };
+    let (pool, terminal, config) = judge(script, serves, QUOTA_ONLY);
+    let (status, body) = call(runner(&config)).await;
+
+    assert_eq!(status, StatusCode::OK, "healthy sibling should serve: {body}");
+    assert_eq!(body["model"], "google/gemma-4-31b-it");
+    assert_eq!(
+        contacted(&pool).await,
+        vec!["google/gemma-4-26b-a4b-it", "google/gemma-4-31b-it"],
+        "both Gemma candidates must be evaluated when the first is down"
+    );
+    assert_eq!(terminal.calls(), 0, "Luna is not needed when a Gemma succeeds");
+}
+
 /// Both Gemma legs throttled is the one situation Luna NT exists for.
 #[tokio::test]
 async fn both_primaries_throttled_spends_the_terminal_leg() {

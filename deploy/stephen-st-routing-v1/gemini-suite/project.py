@@ -24,6 +24,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = Path("/var/tmp/st1/live3-routes-53fd9a84.toml")
+REMOVED_NATIVE_MODELS = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite"})
 
 # Fields the catalogue owns. Two profiles project these identically, so a correction is
 # made once. `limits` is deliberately absent: an allowance belongs to the account.
@@ -70,6 +71,21 @@ def profile(which: str) -> dict:
 
 def models_by_key(cat: dict) -> dict[str, dict]:
     return {model["key"]: model for model in cat["models"]}
+
+
+def assert_removed_native_models_absent(cat: dict, *profiles: dict) -> None:
+    """A held 2.5 leaf is still a defined route. Owner requires full retirement."""
+    leaked = REMOVED_NATIVE_MODELS.intersection(models_by_key(cat))
+    for prof in profiles:
+        leaked |= REMOVED_NATIVE_MODELS.intersection(prof["client_for"])
+        leaked |= REMOVED_NATIVE_MODELS.intersection(prof["state"])
+        for route in prof["chat_routes"]:
+            used = [route.get("target"), *route.get("candidates", []),
+                    *route.get("members", [])]
+            leaked |= REMOVED_NATIVE_MODELS.intersection(used)
+    if leaked:
+        raise ValueError("retired native Gemini models are still configured: "
+                         + ", ".join(sorted(leaked)))
 
 
 def scalar(value: object) -> str:
@@ -354,6 +370,51 @@ def check_owner_against_deployed(cat: dict, prof: dict, manifest: Path) -> list[
     return failures
 
 
+
+
+def check_native_google_direct_routes(cat: dict, prof: dict, manifest: Path) -> list[str]:
+    """C5 direct aliases and removed native 2.5 targets: exact serving projection."""
+    document = tomllib.loads(manifest.read_text())
+    routes, targets = document.get("routes", {}), document.get("targets", {})
+    expected = {
+        route_name("stephen", model): target_name("stephen", model)
+        for model in cat["models"] if model["lane"] == "chat"
+    }
+    failures = []
+    advertised = {name for name in routes if name.startswith("direct-google-stephen-")}
+    if advertised != set(expected):
+        failures.append(
+            "Stephen direct native aliases: expected "
+            + repr(sorted(expected)) + "; found " + repr(sorted(advertised))
+        )
+    for name, target in expected.items():
+        row = routes.get(name, {})
+        if row.get("target") != target or row.get("type") != "passthrough":
+            failures.append(f"{name}: wrong type or target (expected {target})")
+        if target not in targets:
+            failures.append(f"{name}: Stephen target {target} missing")
+    banned_routes = [
+        f"direct-google-{model}" for model in REMOVED_NATIVE_MODELS
+    ] + [
+        f"direct-google-stephen-{model}" for model in REMOVED_NATIVE_MODELS
+    ]
+    banned_targets = [
+        f"stephen-google-{model}" for model in REMOVED_NATIVE_MODELS
+    ]
+    for model in cat["models"]:
+        if model["lane"] == "chat" and model["route"] not in routes:
+            failures.append(f"{model['route']}: owner native direct alias missing")
+    for name in banned_routes:
+        if name in routes:
+            failures.append(f"{name}: retired native route still DEFINED")
+    for name in banned_targets:
+        if name in targets:
+            failures.append(f"{name}: retired Stephen target still DEFINED")
+    for name, row in targets.items():
+        if name in REMOVED_NATIVE_MODELS or row.get("id") in REMOVED_NATIVE_MODELS:
+            failures.append(f"{name}: retired native model still in targets")
+    return failures
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -364,6 +425,7 @@ def main() -> int:
     cat = catalogue()
     owner = profile("owner")
     stephen = profile("stephen")
+    assert_removed_native_models_absent(cat, owner, stephen)
 
     arguments.out.mkdir(parents=True, exist_ok=True)
     written = {
@@ -373,6 +435,7 @@ def main() -> int:
         "owner-routes.toml": render_owner_routes("owner", cat, owner),
         "stephen-clients.toml": render_clients("stephen", cat, stephen),
         "stephen-targets.toml": render_targets("stephen", cat, stephen),
+        "stephen-leaves.toml": render_owner_leaf_routes("stephen", cat, stephen),
         "stephen-routes.toml": render_stephen_staged(cat, stephen),
     }
     for name, text in written.items():
@@ -387,6 +450,7 @@ def main() -> int:
         return 0
 
     failures = check_owner_against_deployed(cat, owner, arguments.manifest)
+    failures.extend(check_native_google_direct_routes(cat, stephen, arguments.manifest))
     for failure in failures:
         print(f"OWNER-PARITY FAIL: {failure}")
     print(f"owner profile vs {arguments.manifest.name}: {len(failures)} failure(s)")

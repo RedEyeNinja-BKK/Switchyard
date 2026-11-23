@@ -6,7 +6,9 @@
     "credential_env": "SWITCHYARD_GEMINI_STEPHEN_API_KEY",
     "quota_group": "google-ai-studio-free-stephen",
     "note": "A separate AI Studio project. Its daily allowance and its quota counters are its own: joining the owner's quota group would let one account's spending pace the other's, and merging counters would enforce a cap neither provider applied.",
-    "allowance_basis": "Published per-model free-tier rows from the owner's AI Studio record, applied as rate CEILINGS. They are not a measurement of this project's remaining allowance, and a measured receipt for this account may lower them: allowance fields are account facts, so overriding one here is a profile edit and never a parity failure."
+    "allowance_basis": "Published per-model free-tier rows from the owner's AI Studio record, applied as rate CEILINGS. They are not a measurement of this project's remaining allowance, and a measured receipt for this account may lower them: allowance fields are account facts, so overriding one here is a profile edit and never a parity failure.",
+    "last_qualified_at": "2026-11-22T21:40:51Z",
+    "qualification_method": "Root-run probe on switchyard-vm reading the credential from /etc/switchyard-gemini-secrets/stephen.env itself, so the key never crossed a command line or this repository. Bounded: fixed candidate list, one request each, stop at the first 200."
   },
   "clients": [
     {
@@ -33,14 +35,14 @@
     "gemma-4-26b-a4b-it": "google_gemini_stephen",
     "gemma-4-31b-it": "google_gemma_31b_stephen",
     "gemini-3-flash-preview": "google_gemini_stephen",
-    "gemini-2.5-flash": "google_gemini_stephen",
-    "gemini-2.5-flash-lite": "google_gemini_stephen",
     "gemini-decision-1": "google_gemini_stephen"
   },
   "state": {
     "gemini-3.5-flash-lite": {
-      "qualification": "unverified",
-      "reason": "No serving receipt exists under this project. The key is a root-only systemd credential, so the receipt needs one root-run measurement; until then the target must not enter a served pool."
+      "qualification": "serving",
+      "evidence": "One native chat completion under this account's own key, 2026-11-22T21:40:51Z, on the wire production uses (format openai_chat, POST /v1beta/openai/chat/completions, Authorization: Bearer, max_completion_tokens): HTTP 200, provider model echo gemini-3.5-flash-lite, finish_reason stop, usage prompt 8 / completion 1 / total 9, 1,500.6 ms, content 'ready'. Receipt: /var/tmp/stephen-native-receipts/20261122T214051Z-stephen-native-chat.json on switchyard-vm (root-owned, 0640).",
+      "measured_at": "2026-11-22T21:40:51Z",
+      "note": "This is a credential-and-project receipt, not a per-model quality record. It proves the account answers native Google chat on a free-tier model; the other members stay unverified until each gets its own receipt."
     },
     "gemini-3.1-flash-lite": {
       "qualification": "unverified",
@@ -60,7 +62,7 @@
     },
     "gemma-4-26b-a4b-it": {
       "qualification": "unverified",
-      "reason": "No serving receipt under this project."
+      "reason": "One attempt returned HTTP 503 UNAVAILABLE ('This model is currently experiencing high demand') after 1,006 ms. A 503 is not a credential verdict - auth had already passed for the model to be selected - and it is not a serving receipt either. No retry was spent beyond the session ceiling; the model stays out of the pool until it answers a 200."
     },
     "gemma-4-31b-it": {
       "qualification": "unverified",
@@ -69,14 +71,6 @@
     "gemini-3-flash-preview": {
       "qualification": "unverified",
       "reason": "No serving receipt under this project."
-    },
-    "gemini-2.5-flash": {
-      "qualification": "held",
-      "reason": "Retired by the provider for new users (the catalogue's shared fact): a different project does not un-retire a model."
-    },
-    "gemini-2.5-flash-lite": {
-      "qualification": "held",
-      "reason": "Retired by the provider for new users (the catalogue's shared fact): a different project does not un-retire a model."
     },
     "gemini-decision-1": {
       "qualification": "unverified",

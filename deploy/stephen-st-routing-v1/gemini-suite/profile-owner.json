@@ -32,8 +32,6 @@
     "gemma-4-26b-a4b-it": "google_gemini",
     "gemma-4-31b-it": "google_gemma_31b",
     "gemini-3-flash-preview": "google_gemini",
-    "gemini-2.5-flash": "google_gemini",
-    "gemini-2.5-flash-lite": "google_gemini",
     "gemini-decision-1": "google_gemini"
   },
   "state": {
@@ -69,12 +67,6 @@
       "qualification": "serving",
       "evidence": "deployed leaf, not a pool member"
     },
-    "gemini-2.5-flash": {
-      "qualification": "held"
-    },
-    "gemini-2.5-flash-lite": {
-      "qualification": "held"
-    },
     "gemini-decision-1": {
       "qualification": "serving",
       "evidence": "typed-decision lane, not a chat route"
@@ -89,7 +81,6 @@
         "gemini-3.1-flash-lite",
         "gemini-3.6-flash",
         "gemini-3.8-flash",
-        "gemini-2.5-flash",
         "gemini-4-hydrogen",
         "gemma-4-26b-a4b-it",
         "gemma-4-31b-it"

@@ -34,6 +34,32 @@ except ModuleNotFoundError:  # the deployment host has no test framework
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "activate-release.sh")
 VALIDATOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release_validate.py")
 
+# A candidate manifest that the P9 direct-capability contract accepts. The suite
+# below is about restore mechanics, not routing content, so every candidate it
+# deploys carries the smallest manifest that passes P9 -- which keeps the REAL
+# gate in the deploy path instead of bypassing it with the --command test seam.
+# (The seam is deliberately forbidden for the production release store.)
+P9_VALID_MANIFEST = """\
+[routes.direct-fixture]
+type = "passthrough"
+target = "fixture-target"
+tool_calling = true
+vision = false
+video = false
+context_window = 8192
+
+[targets.fixture-target]
+id = "fixture/model-1"
+llm_client = "fixture-client"
+tool_calling = true
+vision = false
+video = false
+context_window = 8192
+
+[llm_clients.fixture-client]
+format = "openai_chat"
+"""
+
 
 class Sandbox:
     """One isolated installation: paths, stubs, and helpers to drive the script."""
@@ -149,7 +175,7 @@ class Sandbox:
         os.chmod(path, 0o755)
         return path, sha256(path)
 
-    def write_manifest(self, name, body="route = 1\n"):
+    def write_manifest(self, name, body=P9_VALID_MANIFEST):
         path = os.path.join(self.root, name)
         with open(path, "w") as fh:
             fh.write(body)
@@ -249,6 +275,28 @@ def test_a_successful_deployment_is_recorded_and_does_not_move_the_rollback_targ
     assert csha in text and msha in text
     assert "a" * 40 in text
     assert "build-session" in text
+
+
+def test_a_candidate_that_fails_p9_is_refused_before_anything_is_installed(box):
+    """The negative control for the new release gate.
+
+    The deploy path must refuse a manifest the P9 contract rejects, and the
+    refusal must happen while the live pair is still the old one. Without this
+    case, a broken checker or a bypassed validator would leave every other test
+    in this file passing.
+    """
+    adopted(box)
+    before = box.live_bytes()
+    candidate, csha = box.write_candidate("candidate", "#!/bin/bash\nexit 0\n")
+    # Structurally valid TOML with a direct alias that has no target: the
+    # installer's own checks pass, so only P9 can refuse it.
+    manifest, msha = box.write_manifest(
+        "candidate.toml",
+        '[routes.direct-unqualified]\ntype = "passthrough"\ntarget = "absent"\n')
+    result = box.run("deploy", manifest, msha, candidate, csha)
+    assert result.returncode != 0, "a P9-refused candidate must not deploy"
+    assert "P9 direct-route capability release gate" in result.stderr
+    assert box.live_bytes() == before, "the refused candidate must not be installed"
 
 
 def test_the_previous_release_survives_the_activation_script(box):

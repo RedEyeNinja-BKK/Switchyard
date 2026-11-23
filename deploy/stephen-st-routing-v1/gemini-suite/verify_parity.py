@@ -17,7 +17,10 @@ What "one suite, two profiles" has to mean, mechanically:
       catalogue edit made for one profile cannot silently drop the other's capability;
   P7  the catalogue says which bytes it was captured from, and they are the bytes given;
   P8  the profile files hold no model facts of their own: if they did, the "one catalogue"
-      claim would already be false and every later correction would have two homes.
+      claim would already be false and every later correction would have two homes;
+  P9  EVERY direct alias (not just Google) has explicit, source-backed route AND
+      physical target admission facts; no missing tool/image/video claims, carrier
+      mismatches, hidden fallback, account bleed, or source-level capability loss.
 
 Exit code 0 only when every check passes. `--json` emits the same result as data.
 """
@@ -33,7 +36,28 @@ from pathlib import Path
 import project
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_MANIFEST = Path("/var/tmp/st1/live3-routes-53fd9a84.toml")
+sys.path.insert(0, str(HERE.parent))
+import direct_capability_gate  # existing physical runtime facts, all providers, not Google cards
+# The deployed manifest must be RESOLVED from the release store, never a literal
+# epoch path. A hardcoded /var/tmp capture silently graded release 53fd9a84 long
+# after production had moved on, so every run reported drift that did not exist
+# (and would have missed drift that did). Fail closed when it cannot be resolved.
+RELEASE_STORE = Path("/var/lib/switchyard/releases")
+
+
+def resolve_current_manifest() -> Path:
+    current = RELEASE_STORE / "CURRENT"
+    try:
+        release = current.resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve {current}: {error}. Pass --manifest with the deployed "
+            "routes.toml; a verifier must never grade a guessed or stale capture."
+        ) from error
+    manifest = release / "routes.toml"
+    if not manifest.is_file():
+        raise SystemExit(f"{manifest} is not a readable manifest")
+    return manifest
 
 # A profile may state these about an account; it may not state anything about a model.
 PROFILE_MODEL_FACT_KEYS = {
@@ -159,40 +183,77 @@ def check_account_isolation(cat: dict, owner: dict, stephen: dict) -> list[str]:
 
 
 def check_qualification_gate(cat: dict, stephen: dict) -> list[str]:
-    """P4: unqualified members stay out of the pool, and qualifying one adds only it."""
-    failures = []
+    """P4: an unqualified member cannot reach the served pool, and qualifying one adds it.
+
+    This is asserted STRUCTURALLY, on the rendered fragment parsed as TOML. An earlier
+    version searched the rendered text before the substring "# Staged members" -- but that
+    substring is a header line near the TOP of the fragment, so the slice it searched was
+    a few comment lines and no member name could ever appear in it. The check could not
+    fail, and its mutation survived. Parsing the route's target and candidates is a fact
+    about what would be served, not about where a comment happens to sit.
+    """
+    import tomllib
+
+    failures: list[str] = []
     rendered = project.render_stephen_staged(cat, stephen)
     by_key = project.models_by_key(cat)
     route = stephen["chat_routes"][0]
-    serving = [key for key in route["members"] if key in project.servable_keys(stephen)]
-    unqualified = [key for key in route["members"] if key not in serving]
+    route_name = route["name"]
 
-    for key in unqualified:
-        name = project.target_name("stephen", by_key[key])
-        if f'"{name}"' in rendered.split("# Staged members")[0]:
-            failures.append(f"{key}: unqualified member appears in a servable position")
+    try:
+        fragment = tomllib.loads(rendered)
+    except tomllib.TOMLDecodeError as error:
+        return [f"the rendered fragment is not valid TOML: {error}"]
 
-    if not serving:
-        if "[routes.ST_Gemini_Free]" in rendered:
+    servable = [key for key in route["members"] if key in project.servable_keys(stephen)]
+    expected = [project.target_name("stephen", by_key[key]) for key in servable]
+    unqualified = [key for key in route["members"] if key not in servable]
+
+    block = (fragment.get("routes") or {}).get(route_name)
+
+    if not servable:
+        if block is not None:
             failures.append("an empty pool still rendered a route block")
-        # The gate must be a one-flag change: qualify one member and exactly that member
-        # becomes the route's target.
+    else:
+        if block is None:
+            failures.append(f"{len(servable)} qualified member(s) but no [routes.{route_name}]")
+        else:
+            served = [block.get("target")] + list(block.get("candidates") or [])
+            if served != expected:
+                failures.append(
+                    f"served set {served} != qualified set {expected}"
+                )
+            for key in unqualified:
+                name = project.target_name("stephen", by_key[key])
+                if name in served:
+                    failures.append(f"{key}: unqualified member is served as {name}")
+
+    # The gate must be a one-flag change, in both directions: qualifying exactly one more
+    # member adds exactly that member, and removes nothing that was already served.
+    for candidate in unqualified:
         flipped = json.loads(json.dumps(stephen))
-        candidate = route["members"][0]
         flipped["state"][candidate]["qualification"] = "serving"
         flipped["state"][candidate]["evidence"] = "synthetic flip for the gate test"
-        after = project.render_stephen_staged(cat, flipped)
-        expected = project.target_name("stephen", by_key[candidate])
-        if f"[routes.ST_Gemini_Free]" not in after:
-            failures.append("qualifying one member did not produce the route")
-        if f'target = "{expected}"' not in after:
-            failures.append("qualifying one member did not make it the route target")
+        after = tomllib.loads(project.render_stephen_staged(cat, flipped))
+        after_block = (after.get("routes") or {}).get(route_name)
+        if after_block is None:
+            failures.append(f"qualifying {candidate} did not produce the route")
+            continue
+        after_served = [after_block.get("target")] + list(after_block.get("candidates") or [])
+        added = project.target_name("stephen", by_key[candidate])
+        if added not in after_served:
+            failures.append(f"qualifying {candidate} did not add it to the served set")
+        missing = [name for name in expected if name not in after_served]
+        if missing:
+            failures.append(f"qualifying {candidate} dropped already-served {missing}")
         for other in unqualified:
             if other == candidate:
                 continue
             other_name = project.target_name("stephen", by_key[other])
-            if f'"{other_name}"' in after.split("# Staged members")[0]:
-                failures.append(f"{other}: joined the pool when a sibling was qualified")
+            if other_name in after_served:
+                failures.append(f"{other}: joined the pool when {candidate} was qualified")
+        break  # one flip proves the property; the loop above checks every member's absence
+
     return failures
 
 
@@ -252,12 +313,30 @@ def check_no_duplicated_facts(owner: dict, stephen: dict) -> list[str]:
     return failures
 
 
+def check_direct_capability_contract(document: dict) -> list[str]:
+    """P9: fail closed if any already-qualified direct route loses runtime facts.
+
+    Native /v1/models route-level flags do not automatically inherit from
+    targets. The two MUST be checked separately rather than pulling an
+    unqualified vendor-model card into a runtime eligibility declaration.
+    """
+    return direct_capability_gate.analyze(document)["failures"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="deployed routes.toml; defaults to the release store CURRENT",
+    )
     parser.add_argument("--expected-capture-hash", default=None)
     parser.add_argument("--json", action="store_true")
     arguments = parser.parse_args()
+    if arguments.manifest is None:
+        arguments.manifest = resolve_current_manifest()
+    print(f"manifest: {arguments.manifest}", file=sys.stderr)
 
     cat = project.catalogue()
     owner = project.profile("owner")
@@ -276,6 +355,7 @@ def main() -> int:
         ("P6-owner-projection-matches-deployed", lambda: check_owner_regression(cat, owner, arguments.manifest)),
         ("P7-catalogue-names-its-bytes", lambda: check_provenance(cat, arguments.manifest, arguments.expected_capture_hash)),
         ("P8-no-model-facts-in-profiles", lambda: check_no_duplicated_facts(owner, stephen)),
+        ("P9-all-direct-capabilities-actually-qualified", lambda: check_direct_capability_contract(document)),
     ]
     checks = []
     for name, run in pending:

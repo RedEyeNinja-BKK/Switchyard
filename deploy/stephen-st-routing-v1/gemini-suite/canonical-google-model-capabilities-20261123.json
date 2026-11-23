@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-11-23",
+  "scope": "Owner and Stephen native Google AI Studio chat models. One shared model fact; separate serving account/credential and transport qualifications.",
+  "policy": "This is a reference catalogue, not a live capability gate. Never set route vision/video purely from this document without confirming Switchyard carrier/admission/transport, and never infer model supports image GENERATION from image INPUT.",
+  "official_sources": [
+    "https://ai.google.dev/gemini-api/docs/openai",
+    "https://ai.google.dev/gemma/docs/core/model_card_4",
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview",
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite",
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite",
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash"
+  ],
+  "removed_models": [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite"
+  ],
+  "models": {
+    "gemini-3-flash-preview": {
+      "canonical_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview",
+      "model_input": {
+        "text": "DOCUMENTED",
+        "image": "DOCUMENTED",
+        "audio": "DOCUMENTED",
+        "video": "DOCUMENTED_INPUT",
+        "pdf": "DOCUMENTED"
+      },
+      "model_output": {
+        "text": "DOCUMENTED",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "DOCUMENTED",
+      "structured_output": "DOCUMENTED",
+      "context_input_max": 1048576,
+      "context_output_max": 65536,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "FAMILY_WIRE_OR_MODEL_COMPATIBILITY_UNVERIFIED",
+        "audio_input": "UNVERIFIED",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "Google model-specific page is authoritative for upstream modalities; Switchyard route declarations can lag it."
+    },
+    "gemini-3.1-flash-lite": {
+      "canonical_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite",
+      "model_input": {
+        "text": "DOCUMENTED",
+        "image": "DOCUMENTED",
+        "audio": "DOCUMENTED",
+        "video": "DOCUMENTED_INPUT",
+        "pdf": "DOCUMENTED"
+      },
+      "model_output": {
+        "text": "DOCUMENTED",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "DOCUMENTED",
+      "structured_output": "DOCUMENTED",
+      "context_input_max": 1048576,
+      "context_output_max": 65536,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "FAMILY_WIRE_OR_MODEL_COMPATIBILITY_UNVERIFIED",
+        "audio_input": "UNVERIFIED",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "Google model-specific page is authoritative for upstream modalities; Switchyard route declarations can lag it."
+    },
+    "gemini-3.5-flash-lite": {
+      "canonical_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite",
+      "model_input": {
+        "text": "DOCUMENTED",
+        "image": "DOCUMENTED",
+        "audio": "DOCUMENTED",
+        "video": "DOCUMENTED_INPUT",
+        "pdf": "DOCUMENTED"
+      },
+      "model_output": {
+        "text": "DOCUMENTED",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "DOCUMENTED",
+      "structured_output": "DOCUMENTED",
+      "context_input_max": 1048576,
+      "context_output_max": 65536,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "FAMILY_WIRE_OR_MODEL_COMPATIBILITY_UNVERIFIED",
+        "audio_input": "UNVERIFIED",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "Google model-specific page is authoritative for upstream modalities; Switchyard route declarations can lag it."
+    },
+    "gemini-3.6-flash": {
+      "canonical_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash",
+      "model_input": {
+        "text": "DOCUMENTED",
+        "image": "DOCUMENTED",
+        "audio": "DOCUMENTED",
+        "video": "DOCUMENTED_INPUT",
+        "pdf": "DOCUMENTED"
+      },
+      "model_output": {
+        "text": "DOCUMENTED",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "DOCUMENTED",
+      "structured_output": "DOCUMENTED",
+      "context_input_max": 1048576,
+      "context_output_max": 65536,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "GOOGLE_OFFICIAL_EXAMPLE; SWITCHYARD_NOT_PROVEN",
+        "audio_input": "GOOGLE_OFFICIAL_EXAMPLE; SWITCHYARD_NOT_PROVEN",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "Google model-specific page is authoritative for upstream modalities; Switchyard route declarations can lag it."
+    },
+    "gemini-3.8-flash": {
+      "canonical_url": "https://ai.google.dev/gemini-api/docs/get-started",
+      "model_input": {
+        "text": "EXAMPLE_DOCUMENTED",
+        "image": "GENERAL_API_DOCS_ONLY",
+        "audio": "GENERAL_API_DOCS_ONLY",
+        "video": "EXAMPLE_FILES_API_DOCS",
+        "pdf": "GENERAL_API_DOCS_ONLY"
+      },
+      "model_output": {
+        "text": "UNKNOWN",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "UNKNOWN",
+      "structured_output": "UNKNOWN",
+      "context_input_max": null,
+      "context_output_max": null,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "FAMILY_WIRE_OR_MODEL_COMPATIBILITY_UNVERIFIED",
+        "audio_input": "UNVERIFIED",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "Google uses this exact ID in API examples; a dedicated public model card was not established, do not copy 3.6 model limits or full modality matrix."
+    },
+    "gemini-4-hydrogen": {
+      "canonical_url": null,
+      "model_input": {
+        "text": "LIVE_CONFIGURED_MODEL_ID",
+        "image": "UNKNOWN",
+        "audio": "UNKNOWN",
+        "video": "UNKNOWN",
+        "pdf": "UNKNOWN"
+      },
+      "model_output": {
+        "text": "UNKNOWN",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "UNKNOWN",
+      "structured_output": "UNKNOWN",
+      "context_input_max": null,
+      "context_output_max": null,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "FAMILY_WIRE_OR_MODEL_COMPATIBILITY_UNVERIFIED",
+        "audio_input": "UNVERIFIED",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "No authoritative model-specific public card established. Do not infer capabilities from a version prefix."
+    },
+    "gemma-4-26b-a4b-it": {
+      "canonical_url": "https://ai.google.dev/gemma/docs/core/model_card_4",
+      "model_input": {
+        "text": "DOCUMENTED",
+        "image": "DOCUMENTED",
+        "audio": "NOT_SUPPORTED_FOR_THIS_SIZE",
+        "video": "FRAME_SEQUENCE_DOC; API_WIRE_UNVERIFIED",
+        "pdf": "NOT_SPECIFIED_AS_API_MODALITY"
+      },
+      "model_output": {
+        "text": "DOCUMENTED",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "DOCUMENTED",
+      "structured_output": "UNKNOWN",
+      "context_input_max": 262144,
+      "context_output_max": null,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "FAMILY_WIRE_OR_MODEL_COMPATIBILITY_UNVERIFIED",
+        "audio_input": "UNVERIFIED",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "Google Gemma 4 model card states text+image for 26B/31B; reports since Nov 2026 of hosted image 400 require carrier qualification; 26B/31B do not have native audio."
+    },
+    "gemma-4-31b-it": {
+      "canonical_url": "https://ai.google.dev/gemma/docs/core/model_card_4",
+      "model_input": {
+        "text": "DOCUMENTED",
+        "image": "DOCUMENTED",
+        "audio": "NOT_SUPPORTED_FOR_THIS_SIZE",
+        "video": "FRAME_SEQUENCE_DOC; API_WIRE_UNVERIFIED",
+        "pdf": "NOT_SPECIFIED_AS_API_MODALITY"
+      },
+      "model_output": {
+        "text": "DOCUMENTED",
+        "image": "NO_CHAT_IMAGE_GENERATION_CLAIM",
+        "audio": "NO_CHAT_AUDIO_GENERATION_CLAIM",
+        "video": "NO_CHAT_VIDEO_GENERATION_CLAIM"
+      },
+      "function_calling": "DOCUMENTED",
+      "structured_output": "UNKNOWN",
+      "context_input_max": 262144,
+      "context_output_max": null,
+      "transport": {
+        "openai_compatible_chat": "CONFIGURED; NOT AUTOMATIC MULTIMODAL_PROOF",
+        "image_url": "FAMILY_WIRE_OR_MODEL_COMPATIBILITY_UNVERIFIED",
+        "audio_input": "UNVERIFIED",
+        "video_input": "NOT_PROVEN_IN_SWITCHYARD_OPENAI_CHAT",
+        "tool_roundtrip": "NEEDS_PER_WIRE_FAMILY_VALIDATION; PER_ACCOUNT_ROUTE_STATE_SEPARATE"
+      },
+      "modality_source": "MODEL_SPEC_DOCUMENTATION_NOT_A_RUNTIME_PROOF",
+      "notes": "Google Gemma 4 model card states text+image for 26B/31B; reports since Nov 2026 of hosted image 400 require carrier qualification; 26B/31B do not have native audio."
+    }
+  },
+  "required_dashboard_evidence": [
+    "model_upstream_input",
+    "route_declared_vision",
+    "route_declared_video",
+    "transport_image_qualified",
+    "transport_audio_qualified",
+    "transport_video_qualified",
+    "credential_scope",
+    "account_specific_serving_receipt",
+    "model_spec_url",
+    "observed_at"
+  ],
+  "status_distinctions": [
+    "DOCUMENTED",
+    "DECLARED",
+    "QUALIFIED",
+    "UNSUPPORTED",
+    "UNKNOWN",
+    "HELD",
+    "REMOVED"
+  ],
+  "privacy": "Do not re-enable the old broad content-based Google filter. Preserve secret hygiene and managed-agent per-job approvals."
+}

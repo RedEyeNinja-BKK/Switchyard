@@ -436,16 +436,20 @@ pub enum TerminalPolicy {
     /// that the pool's free allowance ran out, and the terminal leg is reserved for the
     /// second case.
     QuotaOnly,
-    /// Any capacity or availability failure of the whole pool, but never a credential
-    /// refusal.
+    /// Capacity or availability failure of the whole pool, but never a credential refusal and
+    /// never a fault that is about this deployment's accounting or this request's size.
     ///
-    /// The difference from `Capacity` is exactly the two authentication outcomes: a rejected
-    /// key or a refused balance says the deployment is misconfigured or unpaid, and spending a
+    /// The difference from `Capacity` is the two authentication outcomes, plus
+    /// `daily_allowance_unavailable` and `minute_window_too_small`. A rejected key or a
+    /// refused balance says the deployment is misconfigured or unpaid, and spending a
     /// further leg on it converts a configuration fault into cost without making the request
-    /// any more likely to be answered. Every other capacity class is accepted -- allowance
-    /// exhaustion, a minute window, a retryable 5xx or 429, a transport fault, a leg that went
-    /// unavailable, or an attempt that timed out -- because those are the ways a healthy
-    /// deployment legitimately cannot serve right now.
+    /// any more likely to be answered. An unreadable allowance ledger is an accounting fault
+    /// rather than a measured exhaustion -- the allowance may be untouched -- and a request
+    /// larger than a model's whole minute window can never be served by that model. Every
+    /// other capacity class is accepted -- allowance exhaustion, a minute window, a retryable
+    /// 5xx or 429, a transport fault, a leg that went unavailable, or an attempt that timed
+    /// out -- because those are the ways a healthy deployment legitimately cannot serve right
+    /// now.
     Availability,
 }
 

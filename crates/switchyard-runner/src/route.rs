@@ -395,9 +395,21 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
             outcome,
             "daily_allowance_exhausted" | "minute_window" | "http_429"
         ),
-        // Everything `Capacity` accepts except the two authentication outcomes. A rejected
-        // key or a refused balance is not a capacity fact: the deployment is misconfigured or
-        // unpaid, and the next leg would be chosen on a claim that is false about this one.
+        // Everything `Capacity` accepts except the two authentication outcomes, the two
+        // faults that are about this deployment's accounting or this request's size, and a
+        // delivered-stream timeout. A rejected key or a refused balance is not a capacity
+        // fact: the deployment is misconfigured or unpaid, and the next leg would be chosen
+        // on a claim that is false about this one.
+        //
+        // `daily_allowance_unavailable` is an unreadable ledger, not a measured exhaustion:
+        // the allowance may be entirely unspent, so the honest answer is to fail closed and
+        // surface the accounting fault rather than buy a further leg on it.
+        //
+        // `minute_window_too_small` is a per-request fit failure: the payload is larger than
+        // the whole minute budget, so no amount of waiting makes this model able to serve it.
+        // Advancing would hand a too-large request to the next tier and silently widen the
+        // declaration that admitted it; the caller is told their request does not fit.
+        //
         // `attempt_timeout` is accepted here deliberately -- the owner's policy names a timed
         // out attempt as a reason to advance -- and its cost is that a leg which answered
         // slowly may also have been answering; the decision record keeps every attempt, so a
@@ -405,9 +417,7 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         TerminalPolicy::Availability => matches!(
             outcome,
             "daily_allowance_exhausted"
-                | "daily_allowance_unavailable"
                 | "minute_window"
-                | "minute_window_too_small"
                 | "http_429"
                 | "http_5xx"
                 | "transport"
@@ -1866,6 +1876,24 @@ mod terminal_authorization_tests {
         )
     }
 
+    /// The judge's shape: capacity or a real outage may escalate; a fault about the
+    /// deployment's accounting or about this request's size may not.
+    fn authorize_availability(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+    ) -> Option<&'static str> {
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::Availability,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+        )
+    }
+
     #[test]
     fn nothing_capable_never_authorizes() {
         let (models, credentials) = legs(&[("a", "A")]);
@@ -2027,6 +2055,111 @@ mod terminal_authorization_tests {
                 authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
                 None,
                 "outcome {outcome} must not spend a quota-only route's terminal leg"
+            );
+        }
+    }
+
+    /// The judge's escalation taxonomy, stated as a closed list rather than inherited from
+    /// `Capacity`. A real outage and a spent allowance are reasons to advance; two faults
+    /// that are *about this deployment or this request* are not.
+    #[test]
+    fn an_availability_route_escalates_on_capacity_and_real_outages() {
+        for outcome in [
+            "daily_allowance_exhausted",
+            "minute_window",
+            "http_429",
+            "http_5xx",
+            "transport",
+            "unavailable",
+            "attempt_timeout",
+        ] {
+            let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+            let attempts = vec![attempt("a", outcome), attempt("b", outcome)];
+            assert_eq!(
+                authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+                Some("primary_pool_exhausted"),
+                "outcome {outcome} is a capacity or availability fact about the pool"
+            );
+        }
+    }
+
+    /// An unreadable allowance ledger is an accounting fault. The allowance may be
+    /// untouched, so advancing spends a metered or local leg on a claim nobody measured.
+    /// Default fail-closed: the caller gets the primary error.
+    #[test]
+    fn an_availability_route_refuses_an_accounting_fault() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![
+            attempt("a", "daily_allowance_unavailable"),
+            attempt("b", "daily_allowance_unavailable"),
+        ];
+        assert_eq!(
+            authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+            None,
+            "an unreadable ledger is not a measured exhaustion"
+        );
+    }
+
+    /// A request larger than the model's whole minute window can never be served by it,
+    /// however long the caller waits. That is a request-fit fact, not a closed window.
+    /// Letting it advance would spill a too-large payload onto the next tier, which is
+    /// exactly the silent paid/local escalation the policy exists to prevent.
+    #[test]
+    fn an_availability_route_refuses_a_request_that_cannot_fit() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![
+            attempt("a", "minute_window_too_small"),
+            attempt("b", "minute_window_too_small"),
+        ];
+        assert_eq!(
+            authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+            None,
+            "a per-request fit failure is not temporary unavailability"
+        );
+    }
+
+    /// The half of the taxonomy that must never move, asserted against the policy that
+    /// actually runs. A request or policy answer is about the request; a rejected key or a
+    /// refused balance is about the deployment. Neither is a reason to spend another leg.
+    #[test]
+    fn an_availability_route_refuses_answers_about_the_request_or_the_credentials() {
+        for outcome in [
+            "http_400",
+            "http_401",
+            "http_402",
+            "http_403",
+            "empty_answer",
+            "timeout",
+            "context_window",
+            "unsupported_capability",
+        ] {
+            let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+            let attempts = vec![attempt("a", outcome), attempt("b", outcome)];
+            assert_eq!(
+                authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+                None,
+                "outcome {outcome} must not spend an availability route's terminal leg"
+            );
+        }
+    }
+
+    /// The mutation control for the two exclusions above. Flipping either classification
+    /// back to `Capacity`'s answer must change the decision, or the tests above would pass
+    /// on a policy that never distinguished them.
+    #[test]
+    fn the_availability_policy_is_the_discriminator_for_its_two_exclusions() {
+        for outcome in ["daily_allowance_unavailable", "minute_window_too_small"] {
+            let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+            let attempts = vec![attempt("a", outcome), attempt("b", outcome)];
+            assert_eq!(
+                authorize(&models, &dispatchable(&models), &attempts, &credentials),
+                Some("primary_pool_exhausted"),
+                "the historical capacity rule still accepts {outcome}"
+            );
+            assert_eq!(
+                authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+                None,
+                "{outcome} is the one outcome the availability policy must refuse"
             );
         }
     }

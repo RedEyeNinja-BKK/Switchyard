@@ -302,8 +302,12 @@ pub(crate) fn authorize_terminal(
         // of capacity without a single request being made. A route that escalates only on
         // quota evidence has to say which block it is trusting: a rejected credential and
         // a spent allowance are both "blocked", but only the second is the claim this
-        // route's terminal leg exists for.
-        if policy == TerminalPolicy::QuotaOnly && !capable.iter().all(quota_blocked) {
+        // route's terminal leg exists for. `Availability` asks the same question for a wider
+        // set of reasons, and a rejected credential is still not one of them: it is a
+        // deployment fault, and answering it with a further call spends money on a
+        // configuration error instead of surfacing it. Only the historical `Capacity` rule
+        // reads every block as exhaustion.
+        if policy != TerminalPolicy::Capacity && !capable.iter().all(quota_blocked) {
             return None;
         }
         return Some("primary_pool_blocked");
@@ -390,6 +394,25 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         TerminalPolicy::QuotaOnly => matches!(
             outcome,
             "daily_allowance_exhausted" | "minute_window" | "http_429"
+        ),
+        // Everything `Capacity` accepts except the two authentication outcomes. A rejected
+        // key or a refused balance is not a capacity fact: the deployment is misconfigured or
+        // unpaid, and the next leg would be chosen on a claim that is false about this one.
+        // `attempt_timeout` is accepted here deliberately -- the owner's policy names a timed
+        // out attempt as a reason to advance -- and its cost is that a leg which answered
+        // slowly may also have been answering; the decision record keeps every attempt, so a
+        // duplicated answer is visible rather than silent.
+        TerminalPolicy::Availability => matches!(
+            outcome,
+            "daily_allowance_exhausted"
+                | "daily_allowance_unavailable"
+                | "minute_window"
+                | "minute_window_too_small"
+                | "http_429"
+                | "http_5xx"
+                | "transport"
+                | "unavailable"
+                | "attempt_timeout"
         ),
     }
 }
@@ -569,13 +592,18 @@ pub struct Route {
     /// and a pool route is recognisable at runtime, not only in the manifest that created it.
     pool_groups: Option<Vec<String>>,
     /// Targets this route may reach only when every eligible primary candidate is
-    /// verifiably unavailable, in declared order.
+    /// verifiably unavailable, grouped into ordered tiers.
     ///
     /// Deliberately not part of `models`: a terminal leg must never be ranked with the
     /// primary candidates, or it would become a peer that merely sorts last and would
     /// serve whenever the pool was busy. It is dispatched as its own list, under its own
     /// exhaustion gate, so "this provider is tired" cannot buy it a request.
-    terminal: Option<Arc<RuntimeModels>>,
+    ///
+    /// The outer order is the escalation order and is never re-decided by a selector. A
+    /// tier's members are peers of each other, so the route's own selection policy orders
+    /// them; two tiers are never merged, because "the second tier looks cheaper" is not a
+    /// reason to consult it before the first one is proved out.
+    terminal: Vec<Arc<RuntimeModels>>,
     /// Which evidence may spend `terminal`. Configuration sets this per route; the default
     /// is the historical capacity rule, so a route that names no policy behaves as before.
     terminal_policy: TerminalPolicy,
@@ -633,7 +661,7 @@ impl Route {
             daily_allowances: Arc::new(HashMap::new()),
             held: None,
             pool_groups: None,
-            terminal: None,
+            terminal: Vec::new(),
             terminal_policy: TerminalPolicy::default(),
         }
     }
@@ -645,8 +673,8 @@ impl Route {
     /// last resort, not a peer. `smart-nt` is the shape this exists for — Gemini NT leaves
     /// and Luna NT compete as one provider-neutral pool, and a metered DeepSeek NT leg is
     /// reached only when none of them can answer.
-    pub fn with_terminal_fallback(mut self, terminal: RuntimeModels) -> Self {
-        self.terminal = Some(Arc::new(terminal));
+    pub fn with_terminal_fallback(mut self, terminal: Vec<RuntimeModels>) -> Self {
+        self.terminal = terminal.into_iter().map(Arc::new).collect();
         self
     }
 
@@ -660,12 +688,12 @@ impl Route {
         self
     }
 
-    /// The terminal targets this route declares, in declared order.
+    /// The terminal targets this route declares, in declared order, across every tier.
     pub fn terminal_models(&self) -> Vec<ModelId> {
         self.terminal
-            .as_ref()
-            .map(|terminal| terminal.all_models())
-            .unwrap_or_default()
+            .iter()
+            .flat_map(|tier| tier.all_models())
+            .collect()
     }
 
     /// Whether the primary pool is verifiably out of capacity, and which claim says so.
@@ -1246,10 +1274,28 @@ impl Route {
             .filter(|model| verdict(model).is_ok())
             .cloned()
             .collect();
-        let terminal_servable: HashSet<switchyard_protocol::ModelId> = self
-            .terminal_models()
-            .into_iter()
-            .filter(|model| verdict(model).is_ok())
+        // One snapshot per tier: capability is "could this leg serve this request at all",
+        // dispatchability adds the block gate. Each tier boundary is judged by both, so both
+        // are kept for every tier, not only for the primary pool.
+        let terminal_capable: Vec<Vec<switchyard_protocol::ModelId>> = self
+            .terminal
+            .iter()
+            .map(|tier| {
+                tier.all_models()
+                    .into_iter()
+                    .filter(|model| capability_gate(model).is_ok())
+                    .collect()
+            })
+            .collect();
+        let terminal_servable: Vec<HashSet<switchyard_protocol::ModelId>> = terminal_capable
+            .iter()
+            .map(|capable| {
+                capable
+                    .iter()
+                    .filter(|model| verdict(model).is_ok())
+                    .cloned()
+                    .collect()
+            })
             .collect();
         let models = self.models.filtered(&|model| verdict(model).is_ok());
         // Among candidates that survived every hard gate, a route may prefer what this
@@ -1414,9 +1460,19 @@ impl Route {
             estimated_input_tokens,
             promotion: promoted.map(|model| model.to_string()),
             pool: self.pool_groups.as_ref().map(|groups| groups.join(",")),
-            terminal: self.terminal_models().iter().map(ToString::to_string).collect(),
+            terminal: self
+                .terminal_models()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            terminal_tiers: self
+                .terminal
+                .iter()
+                .map(|tier| tier.all_models().iter().map(ToString::to_string).collect())
+                .collect(),
             terminal_crossed: false,
             terminal_reason: None,
+            terminal_tier: None,
         };
         if models.is_empty() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
@@ -1482,7 +1538,7 @@ impl Route {
         ));
         // A terminal leg is a last resort. Keep a copy of the shaped request only when one
         // exists, so the common route pays nothing for a capability it does not have.
-        let terminal_request = self.terminal.as_ref().map(|_| request.clone());
+        let terminal_request = (!self.terminal.is_empty()).then(|| request.clone());
         let mut result = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
@@ -1491,30 +1547,63 @@ impl Route {
             run_observer.clone(),
         )
         .await;
-        if let (Some(terminal), Some(terminal_request)) = (self.terminal.as_ref(), terminal_request)
+        if let Some(terminal_request) = terminal_request
             && result.is_err()
         {
             // The primary pool failed. Before anything is spent on the terminal leg, the
             // claim "the pool is exhausted" has to be true of the same gates the order used
             // and of what the dispatch actually observed. A single rate limit, a policy
             // refusal, or a request that never fit is not that claim.
-            let recorded = attempts.lock().clone();
-            let authorization =
-                self.terminal_authorization(&capable_legs, &dispatchable_legs, &recorded, blocks);
-            if let Some(reason) = authorization {
-                let servable = terminal.filtered(&|model| terminal_servable.contains(model));
-                if !servable.is_empty() {
-                    trace.terminal_crossed = true;
-                    trace.terminal_reason = Some(reason);
-                    result = switchyard_llm_client::run(
-                        Arc::clone(&self.algorithm),
-                        self.clients.clone(),
-                        terminal_request,
-                        Arc::new(servable),
-                        run_observer,
-                    )
-                    .await;
+            //
+            // Each boundary is authorized separately against the set it is leaving, never
+            // against the union: tier 2 is only reachable once tier 1 has itself been proved
+            // out, which is the entire difference between an ordered declaration and a peer
+            // pool. The union would let "the second tier looks cheaper" skip the first.
+            let mut authorization = self.terminal_authorization(
+                &capable_legs,
+                &dispatchable_legs,
+                &attempts.lock().clone(),
+                blocks,
+            );
+            for (index, tier) in self.terminal.iter().enumerate() {
+                let Some(reason) = authorization else { break };
+                let servable = tier.filtered(&|model| terminal_servable[index].contains(model));
+                if servable.is_empty() {
+                    // This tier has nothing to dispatch, so it cannot answer and the request
+                    // must not be re-pointed at an empty set. Its own gates still decide
+                    // whether the next boundary is reachable: a declared tier that no
+                    // request could ever fit is a coverage gap, not exhaustion.
+                    authorization = self.terminal_authorization(
+                        &terminal_capable[index],
+                        &terminal_servable[index],
+                        &attempts.lock().clone(),
+                        blocks,
+                    );
+                    continue;
                 }
+                trace.terminal_crossed = true;
+                trace.terminal_reason = Some(reason);
+                trace.terminal_tier = Some(index + 1);
+                result = switchyard_llm_client::run(
+                    Arc::clone(&self.algorithm),
+                    self.clients.clone(),
+                    terminal_request.clone(),
+                    Arc::new(servable),
+                    run_observer.clone(),
+                )
+                .await;
+                if result.is_ok() {
+                    break;
+                }
+                // This tier answered with a failure. Whether the next one may be consulted is
+                // a fact about THIS tier's legs and this request's attempts at them, so the
+                // claim is re-derived rather than carried over from the boundary above.
+                authorization = self.terminal_authorization(
+                    &terminal_capable[index],
+                    &terminal_servable[index],
+                    &attempts.lock().clone(),
+                    blocks,
+                );
             }
         }
         {

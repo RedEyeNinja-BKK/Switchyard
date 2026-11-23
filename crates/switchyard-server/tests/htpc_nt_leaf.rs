@@ -858,14 +858,17 @@ async fn the_local_verdict_round_trips_through_a_closed_schema() {
     let (status, body) = post(runner, judge_request()).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
+    let delivered = output_text(&body);
     assert_eq!(
-        output_text(&body),
-        VERDICT,
+        delivered, VERDICT,
         "the verdict must arrive byte-for-byte; any edit here is a fabricated verdict"
     );
 
+    // Parsed from the bytes that came off the wire, not from the constant that produced
+    // them: a schema check on `VERDICT` would restate the fixture's own input and could
+    // pass even if the cascade rewrote or truncated the answer.
     let verdict: JudgedVerdict =
-        serde_json::from_str(VERDICT).expect("a real verdict satisfies the closed schema");
+        serde_json::from_str(delivered).expect("a real verdict satisfies the closed schema");
     assert_eq!(verdict.risk_level, RiskLevel::Low);
     assert_eq!(verdict.recommendation, Recommendation::Approve);
     assert_eq!(verdict.confidence, 0.93);

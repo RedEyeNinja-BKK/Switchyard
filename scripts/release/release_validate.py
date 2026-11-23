@@ -31,6 +31,11 @@ EXIT CODES
     0  the candidate validated
     1  the candidate refused to load
     2  usage or environment-file problem
+
+P9 RELEASE CONTRACT
+    All normal candidate validations refuse if the versioned P9 checker is
+    missing or reports an unqualified direct route. The explicit --command
+    substitution is ONLY a test seam; it does not establish release admission.
 """
 
 from __future__ import annotations
@@ -123,6 +128,40 @@ def scrub(text: str, secrets: list[str]) -> str:
     return text
 
 
+def validate_p9(manifest: str) -> tuple[bool, str]:
+    """Mandatory OFFLINE P9 admission preflight for a real release candidate.
+
+    Keep the implementation in the versioned Switchyard checkout; never treat a
+    missing checker as success. This checks the candidate's bytes, not the
+    currently serving /v1/models (which is verified AFTER deployment).
+    """
+    script = os.path.realpath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "deploy",
+        "stephen-st-routing-v1", "direct_capability_gate.py",
+    ))
+    if not os.path.isfile(script):
+        return False, (
+            "P9_GATE_UNAVAILABLE: expected versioned checker at " + script
+            + "; stage the same Switchyard checkout before deploying"
+        )
+    try:
+        result = subprocess.run(
+            [sys.executable, script, "--manifest", manifest],
+            env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "P9_GATE_TIMEOUT: capability preflight exceeded 90 seconds"
+    except OSError as exc:
+        return False, "P9_GATE_EXECUTION_FAILED: " + str(exc)
+    if result.returncode:
+        return False, (
+            f"P9_GATE_REFUSED exit={result.returncode}\n"
+            + (result.stdout or "") + (result.stderr or "")
+        )
+    return True, ""
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -145,6 +184,19 @@ def main(argv: list[str]) -> int:
     except ValueError as exc:
         print(f"FAILED: {exc}", file=sys.stderr)
         return 2
+
+    # A real deployment must fail closed on the candidate's P9 direct-route
+    # contract BEFORE its binary dry-run. --command is an existing explicit test
+    # seam, not a deployable proof; the actual activate-release.sh production
+    # path supplies no --command.
+    if not args.command:
+        p9_ok, p9_detail = validate_p9(args.manifest)
+        if not p9_ok:
+            print("FAILED: P9 direct-route capability release gate", file=sys.stderr)
+            detail = scrub(p9_detail, [value for value in env.values() if value])
+            for line in detail.strip().splitlines()[:DETAIL_LINES]:
+                print(f"  {line}", file=sys.stderr)
+            return 1
 
     # The child gets the service environment and a minimal PATH. It does not get
     # this process's environment: inheriting it would reintroduce exactly the leak

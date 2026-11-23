@@ -302,8 +302,12 @@ pub(crate) fn authorize_terminal(
         // of capacity without a single request being made. A route that escalates only on
         // quota evidence has to say which block it is trusting: a rejected credential and
         // a spent allowance are both "blocked", but only the second is the claim this
-        // route's terminal leg exists for.
-        if policy == TerminalPolicy::QuotaOnly && !capable.iter().all(quota_blocked) {
+        // route's terminal leg exists for. `Availability` asks the same question for a wider
+        // set of reasons, and a rejected credential is still not one of them: it is a
+        // deployment fault, and answering it with a further call spends money on a
+        // configuration error instead of surfacing it. Only the historical `Capacity` rule
+        // reads every block as exhaustion.
+        if policy != TerminalPolicy::Capacity && !capable.iter().all(quota_blocked) {
             return None;
         }
         return Some("primary_pool_blocked");
@@ -390,6 +394,35 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         TerminalPolicy::QuotaOnly => matches!(
             outcome,
             "daily_allowance_exhausted" | "minute_window" | "http_429"
+        ),
+        // Everything `Capacity` accepts except the two authentication outcomes, the two
+        // faults that are about this deployment's accounting or this request's size, and a
+        // delivered-stream timeout. A rejected key or a refused balance is not a capacity
+        // fact: the deployment is misconfigured or unpaid, and the next leg would be chosen
+        // on a claim that is false about this one.
+        //
+        // `daily_allowance_unavailable` is an unreadable ledger, not a measured exhaustion:
+        // the allowance may be entirely unspent, so the honest answer is to fail closed and
+        // surface the accounting fault rather than buy a further leg on it.
+        //
+        // `minute_window_too_small` is a per-request fit failure: the payload is larger than
+        // the whole minute budget, so no amount of waiting makes this model able to serve it.
+        // Advancing would hand a too-large request to the next tier and silently widen the
+        // declaration that admitted it; the caller is told their request does not fit.
+        //
+        // `attempt_timeout` is accepted here deliberately -- the owner's policy names a timed
+        // out attempt as a reason to advance -- and its cost is that a leg which answered
+        // slowly may also have been answering; the decision record keeps every attempt, so a
+        // duplicated answer is visible rather than silent.
+        TerminalPolicy::Availability => matches!(
+            outcome,
+            "daily_allowance_exhausted"
+                | "minute_window"
+                | "http_429"
+                | "http_5xx"
+                | "transport"
+                | "unavailable"
+                | "attempt_timeout"
         ),
     }
 }
@@ -569,13 +602,18 @@ pub struct Route {
     /// and a pool route is recognisable at runtime, not only in the manifest that created it.
     pool_groups: Option<Vec<String>>,
     /// Targets this route may reach only when every eligible primary candidate is
-    /// verifiably unavailable, in declared order.
+    /// verifiably unavailable, grouped into ordered tiers.
     ///
     /// Deliberately not part of `models`: a terminal leg must never be ranked with the
     /// primary candidates, or it would become a peer that merely sorts last and would
     /// serve whenever the pool was busy. It is dispatched as its own list, under its own
     /// exhaustion gate, so "this provider is tired" cannot buy it a request.
-    terminal: Option<Arc<RuntimeModels>>,
+    ///
+    /// The outer order is the escalation order and is never re-decided by a selector. A
+    /// tier's members are peers of each other, so the route's own selection policy orders
+    /// them; two tiers are never merged, because "the second tier looks cheaper" is not a
+    /// reason to consult it before the first one is proved out.
+    terminal: Vec<Arc<RuntimeModels>>,
     /// Which evidence may spend `terminal`. Configuration sets this per route; the default
     /// is the historical capacity rule, so a route that names no policy behaves as before.
     terminal_policy: TerminalPolicy,
@@ -633,7 +671,7 @@ impl Route {
             daily_allowances: Arc::new(HashMap::new()),
             held: None,
             pool_groups: None,
-            terminal: None,
+            terminal: Vec::new(),
             terminal_policy: TerminalPolicy::default(),
         }
     }
@@ -645,8 +683,8 @@ impl Route {
     /// last resort, not a peer. `smart-nt` is the shape this exists for — Gemini NT leaves
     /// and Luna NT compete as one provider-neutral pool, and a metered DeepSeek NT leg is
     /// reached only when none of them can answer.
-    pub fn with_terminal_fallback(mut self, terminal: RuntimeModels) -> Self {
-        self.terminal = Some(Arc::new(terminal));
+    pub fn with_terminal_fallback(mut self, terminal: Vec<RuntimeModels>) -> Self {
+        self.terminal = terminal.into_iter().map(Arc::new).collect();
         self
     }
 
@@ -660,12 +698,12 @@ impl Route {
         self
     }
 
-    /// The terminal targets this route declares, in declared order.
+    /// The terminal targets this route declares, in declared order, across every tier.
     pub fn terminal_models(&self) -> Vec<ModelId> {
         self.terminal
-            .as_ref()
-            .map(|terminal| terminal.all_models())
-            .unwrap_or_default()
+            .iter()
+            .flat_map(|tier| tier.all_models())
+            .collect()
     }
 
     /// Whether the primary pool is verifiably out of capacity, and which claim says so.
@@ -1246,10 +1284,28 @@ impl Route {
             .filter(|model| verdict(model).is_ok())
             .cloned()
             .collect();
-        let terminal_servable: HashSet<switchyard_protocol::ModelId> = self
-            .terminal_models()
-            .into_iter()
-            .filter(|model| verdict(model).is_ok())
+        // One snapshot per tier: capability is "could this leg serve this request at all",
+        // dispatchability adds the block gate. Each tier boundary is judged by both, so both
+        // are kept for every tier, not only for the primary pool.
+        let terminal_capable: Vec<Vec<switchyard_protocol::ModelId>> = self
+            .terminal
+            .iter()
+            .map(|tier| {
+                tier.all_models()
+                    .into_iter()
+                    .filter(|model| capability_gate(model).is_ok())
+                    .collect()
+            })
+            .collect();
+        let terminal_servable: Vec<HashSet<switchyard_protocol::ModelId>> = terminal_capable
+            .iter()
+            .map(|capable| {
+                capable
+                    .iter()
+                    .filter(|model| verdict(model).is_ok())
+                    .cloned()
+                    .collect()
+            })
             .collect();
         let models = self.models.filtered(&|model| verdict(model).is_ok());
         // Among candidates that survived every hard gate, a route may prefer what this
@@ -1414,9 +1470,19 @@ impl Route {
             estimated_input_tokens,
             promotion: promoted.map(|model| model.to_string()),
             pool: self.pool_groups.as_ref().map(|groups| groups.join(",")),
-            terminal: self.terminal_models().iter().map(ToString::to_string).collect(),
+            terminal: self
+                .terminal_models()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            terminal_tiers: self
+                .terminal
+                .iter()
+                .map(|tier| tier.all_models().iter().map(ToString::to_string).collect())
+                .collect(),
             terminal_crossed: false,
             terminal_reason: None,
+            terminal_tier: None,
         };
         if models.is_empty() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
@@ -1482,7 +1548,7 @@ impl Route {
         ));
         // A terminal leg is a last resort. Keep a copy of the shaped request only when one
         // exists, so the common route pays nothing for a capability it does not have.
-        let terminal_request = self.terminal.as_ref().map(|_| request.clone());
+        let terminal_request = (!self.terminal.is_empty()).then(|| request.clone());
         let mut result = switchyard_llm_client::run(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
@@ -1491,30 +1557,63 @@ impl Route {
             run_observer.clone(),
         )
         .await;
-        if let (Some(terminal), Some(terminal_request)) = (self.terminal.as_ref(), terminal_request)
+        if let Some(terminal_request) = terminal_request
             && result.is_err()
         {
             // The primary pool failed. Before anything is spent on the terminal leg, the
             // claim "the pool is exhausted" has to be true of the same gates the order used
             // and of what the dispatch actually observed. A single rate limit, a policy
             // refusal, or a request that never fit is not that claim.
-            let recorded = attempts.lock().clone();
-            let authorization =
-                self.terminal_authorization(&capable_legs, &dispatchable_legs, &recorded, blocks);
-            if let Some(reason) = authorization {
-                let servable = terminal.filtered(&|model| terminal_servable.contains(model));
-                if !servable.is_empty() {
-                    trace.terminal_crossed = true;
-                    trace.terminal_reason = Some(reason);
-                    result = switchyard_llm_client::run(
-                        Arc::clone(&self.algorithm),
-                        self.clients.clone(),
-                        terminal_request,
-                        Arc::new(servable),
-                        run_observer,
-                    )
-                    .await;
+            //
+            // Each boundary is authorized separately against the set it is leaving, never
+            // against the union: tier 2 is only reachable once tier 1 has itself been proved
+            // out, which is the entire difference between an ordered declaration and a peer
+            // pool. The union would let "the second tier looks cheaper" skip the first.
+            let mut authorization = self.terminal_authorization(
+                &capable_legs,
+                &dispatchable_legs,
+                &attempts.lock().clone(),
+                blocks,
+            );
+            for (index, tier) in self.terminal.iter().enumerate() {
+                let Some(reason) = authorization else { break };
+                let servable = tier.filtered(&|model| terminal_servable[index].contains(model));
+                if servable.is_empty() {
+                    // This tier has nothing to dispatch, so it cannot answer and the request
+                    // must not be re-pointed at an empty set. Its own gates still decide
+                    // whether the next boundary is reachable: a declared tier that no
+                    // request could ever fit is a coverage gap, not exhaustion.
+                    authorization = self.terminal_authorization(
+                        &terminal_capable[index],
+                        &terminal_servable[index],
+                        &attempts.lock().clone(),
+                        blocks,
+                    );
+                    continue;
                 }
+                trace.terminal_crossed = true;
+                trace.terminal_reason = Some(reason);
+                trace.terminal_tier = Some(index + 1);
+                result = switchyard_llm_client::run(
+                    Arc::clone(&self.algorithm),
+                    self.clients.clone(),
+                    terminal_request.clone(),
+                    Arc::new(servable),
+                    run_observer.clone(),
+                )
+                .await;
+                if result.is_ok() {
+                    break;
+                }
+                // This tier answered with a failure. Whether the next one may be consulted is
+                // a fact about THIS tier's legs and this request's attempts at them, so the
+                // claim is re-derived rather than carried over from the boundary above.
+                authorization = self.terminal_authorization(
+                    &terminal_capable[index],
+                    &terminal_servable[index],
+                    &attempts.lock().clone(),
+                    blocks,
+                );
             }
         }
         {
@@ -1777,6 +1876,24 @@ mod terminal_authorization_tests {
         )
     }
 
+    /// The judge's shape: capacity or a real outage may escalate; a fault about the
+    /// deployment's accounting or about this request's size may not.
+    fn authorize_availability(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+    ) -> Option<&'static str> {
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::Availability,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+        )
+    }
+
     #[test]
     fn nothing_capable_never_authorizes() {
         let (models, credentials) = legs(&[("a", "A")]);
@@ -1938,6 +2055,111 @@ mod terminal_authorization_tests {
                 authorize_quota_only(&models, &dispatchable(&models), &attempts, &credentials),
                 None,
                 "outcome {outcome} must not spend a quota-only route's terminal leg"
+            );
+        }
+    }
+
+    /// The judge's escalation taxonomy, stated as a closed list rather than inherited from
+    /// `Capacity`. A real outage and a spent allowance are reasons to advance; two faults
+    /// that are *about this deployment or this request* are not.
+    #[test]
+    fn an_availability_route_escalates_on_capacity_and_real_outages() {
+        for outcome in [
+            "daily_allowance_exhausted",
+            "minute_window",
+            "http_429",
+            "http_5xx",
+            "transport",
+            "unavailable",
+            "attempt_timeout",
+        ] {
+            let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+            let attempts = vec![attempt("a", outcome), attempt("b", outcome)];
+            assert_eq!(
+                authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+                Some("primary_pool_exhausted"),
+                "outcome {outcome} is a capacity or availability fact about the pool"
+            );
+        }
+    }
+
+    /// An unreadable allowance ledger is an accounting fault. The allowance may be
+    /// untouched, so advancing spends a metered or local leg on a claim nobody measured.
+    /// Default fail-closed: the caller gets the primary error.
+    #[test]
+    fn an_availability_route_refuses_an_accounting_fault() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![
+            attempt("a", "daily_allowance_unavailable"),
+            attempt("b", "daily_allowance_unavailable"),
+        ];
+        assert_eq!(
+            authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+            None,
+            "an unreadable ledger is not a measured exhaustion"
+        );
+    }
+
+    /// A request larger than the model's whole minute window can never be served by it,
+    /// however long the caller waits. That is a request-fit fact, not a closed window.
+    /// Letting it advance would spill a too-large payload onto the next tier, which is
+    /// exactly the silent paid/local escalation the policy exists to prevent.
+    #[test]
+    fn an_availability_route_refuses_a_request_that_cannot_fit() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![
+            attempt("a", "minute_window_too_small"),
+            attempt("b", "minute_window_too_small"),
+        ];
+        assert_eq!(
+            authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+            None,
+            "a per-request fit failure is not temporary unavailability"
+        );
+    }
+
+    /// The half of the taxonomy that must never move, asserted against the policy that
+    /// actually runs. A request or policy answer is about the request; a rejected key or a
+    /// refused balance is about the deployment. Neither is a reason to spend another leg.
+    #[test]
+    fn an_availability_route_refuses_answers_about_the_request_or_the_credentials() {
+        for outcome in [
+            "http_400",
+            "http_401",
+            "http_402",
+            "http_403",
+            "empty_answer",
+            "timeout",
+            "context_window",
+            "unsupported_capability",
+        ] {
+            let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+            let attempts = vec![attempt("a", outcome), attempt("b", outcome)];
+            assert_eq!(
+                authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+                None,
+                "outcome {outcome} must not spend an availability route's terminal leg"
+            );
+        }
+    }
+
+    /// The mutation control for the two exclusions above. Flipping either classification
+    /// back to `Capacity`'s answer must change the decision, or the tests above would pass
+    /// on a policy that never distinguished them.
+    #[test]
+    fn the_availability_policy_is_the_discriminator_for_its_two_exclusions() {
+        for outcome in ["daily_allowance_unavailable", "minute_window_too_small"] {
+            let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+            let attempts = vec![attempt("a", outcome), attempt("b", outcome)];
+            assert_eq!(
+                authorize(&models, &dispatchable(&models), &attempts, &credentials),
+                Some("primary_pool_exhausted"),
+                "the historical capacity rule still accepts {outcome}"
+            );
+            assert_eq!(
+                authorize_availability(&models, &dispatchable(&models), &attempts, &credentials),
+                None,
+                "{outcome} is the one outcome the availability policy must refuse"
             );
         }
     }

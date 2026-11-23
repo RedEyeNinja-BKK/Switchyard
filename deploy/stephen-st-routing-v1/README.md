@@ -219,3 +219,95 @@ Source and tests pass; the manifest is staged, not deployed. The deployed binary
 parse the candidate manifest (`unknown variant 'peer'`), so binary and manifest must land
 together with a whole rollback. Dry-run against `routes-batch-f1.toml` with the unit's four
 EnvironmentFiles is outstanding.
+
+---
+
+# Batch F3 - the local no-thinking third tier
+
+Batch F3 is the owner's decision of 2026-11-23 (Issue #35): `smart-judge`'s single metered
+terminal leg becomes **two ordered tiers**, and the second one is a local model asked not to
+think.
+
+Hierarchy, and nothing may reorder it: **Gemma 26B/31B measured pool -> Luna NT -> local
+Qwen3.5 9B MTP NT.**
+
+## What changes
+
+| Edit | Object | From | To | Evidence |
+|---|---|---|---|---|
+| Ordered tiers | `routes.smart-judge.terminal_fallback` | `["openai-gpt-6-luna-nt"]` | `[["openai-gpt-6-luna-nt"], ["htpc-qwen3_5-9b-mtp-nt"]]` | one flat leg was one tier of peers; two tiers is a sequence |
+| Boundary rule | `routes.smart-judge.terminal_policy` | `quota_only` | `availability` | capacity OR temporary unavailability spends the next tier; a rejected key does not |
+| Second client | `llm_clients.htpc-nt` | absent | present, `quota_group = "htpc"` | loader refuses one model + one client + two policies |
+| Second target | `targets.htpc-qwen3_5-9b-mtp-nt` | absent | reasoning disabled | wire probe: `enable_thinking = false` is honoured, and is already the server default |
+| Direct alias | `routes.direct-htpc-qwen3_5-9b-mtp-nt` | absent | 1:1 passthrough | so the leg is exercised directly, not only through a cascade |
+| Capability facts | that target and route | - | `tool_calling = true`, `vision = false`, `video = false` | measured, see the evidence file |
+
+## Wiring evidence
+
+`evidence/smart-judge-three-tier-20261123/htpc-nt-wire-evidence.json`, produced by bounded
+inference calls against the already-running endpoint. The three findings that decide the
+declarations:
+
+- **No-thinking is real and already the default.** At temperature 0 with a fixed seed,
+  `enable_thinking = false` twice is byte-identical, and `false` is identical to *absent*.
+  `true` differs from both and, under a 64-token ceiling, spends the whole allowance on
+  reasoning and answers nothing. So `reasoning_policy = "disabled"` makes an implicit default
+  explicit rather than fighting a thinking default - and the leaf exists precisely because a
+  thinking leg cannot answer a verdict at the budget the judge can afford.
+- **Tools work.** A function definition plus an invoking request produced a populated
+  `tool_calls` array, `finish_reason = "tool_calls"` and null content.
+- **Media do not.** The provider itself answers 400 for an image ("current GGUF model does not
+  support vision") and for a video ("cannot take video input"), so `vision = false` and
+  `video = false` are provider-confirmed rather than inferred from model metadata.
+
+One caveat belongs in the record: the front does not enforce the requested model id. Every
+arm - `Qwen3.5-9B-MTP`, `Qwen3.5-9B-Q4_0`, `htpc/qwen3.5-9b*` - was served as
+`Qwen3.5-9B-Q4_0`, and `/props` names those weights as loaded. The manifest's `id` is a
+requested name, not evidence that a separate MTP variant is resident.
+
+## Engine change that travels with Batch F3
+
+`terminal_fallback` changes type, `Option<Vec<String>>` -> `Option<TerminalFallback>`, where
+`TerminalFallback` is `Flat(Vec<String>) | Tiered( Vec<TerminalTierSpec> )`. A flat list keeps
+its historical meaning - one tier whose members are peers - so every existing route is
+unaffected; a list of lists declares ordered tiers. `terminal_policy = "availability"` is
+`Capacity` minus `http_401` and `http_402`: a rejected credential or a refused balance says the
+deployment is wrong, and answering it with another call turns a configuration fault into cost.
+
+Each boundary is authorized against the set it is leaving, never against the union, so a
+partly-exhausted tier cannot authorize the next one through the other tier's evidence.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `apply_smart_judge_three_tier.py` | anchored editor; refuses a missing or doubled anchor, then refuses unless the finished document differs from the baseline exactly as declared |
+| `evidence/smart-judge-three-tier-20261123/htpc-nt-wire-evidence.json` | the probe receipt behind every capability declaration |
+
+The applier's last check is the one review depends on: it asserts that `targets.htpc-qwen3_5-9b-mtp`
+and `routes.direct-htpc-qwen3_5-9b-mtp` are byte-identical to the deployed ones, that no
+existing client/target/route changes, and that `[composites]`, `[capabilities]`,
+`[decision_lanes]` and `[quota]` are untouched. The negative controls are recorded in the
+release report: sibling drift, an undeclared extra route, a touched composite section, an
+inverted tier order and a leaf that gains a candidate are each refused.
+
+## Run
+
+```sh
+python3 apply_smart_judge_three_tier.py --baseline routes.toml --out candidate.toml --diff
+python3 direct_capability_gate.py --manifest candidate.toml --json
+```
+
+The gate must show the new leaf with **zero** findings and no new or removed findings anywhere
+else. It does: `direct_count` 53 -> 54, `failures` 78 -> 78, new 0, gone 0.
+
+## Status
+
+Source and tests pass; the manifest is staged, not deployed. **The deployed binary cannot
+parse this candidate**: at the batch's base commit the field is `Option<Vec<String>>` and the
+policy has no `availability` variant, so a list of lists is a parse error. Binary and manifest
+must land as one paired unit with a whole rollback, exactly as Batch F1 noted.
+
+Beyond the new leaf, the gate still refuses 78 pre-existing findings across 39 aliases; five of
+them are the `tool_calling` gaps on the declaration chain that the P9 declaration candidate
+closes. None of them concerns this batch.

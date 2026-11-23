@@ -27,6 +27,12 @@ HERE = Path(__file__).resolve().parent
 RETIRED = frozenset({"gemini-2.5-flash", "gemini-2.5-flash-lite"})
 BOOL_FIELDS = ("tool_calling", "vision", "video")
 CARRIERS = frozenset({"inline", "remote", "both"})
+# Distinct from any TOML value, so "the route never declared this" cannot be
+# confused with "the route declared the string NOT_DECLARED".
+ABSENT = object()
+# Distinct from JSON null: a key missing from /v1/models is a shape problem, not
+# an absence of the fact.
+UNREPORTED = object()
 
 
 class ContractError(ValueError):
@@ -145,10 +151,24 @@ def analyze(doc: dict, advertised: set[str] | dict | None = None,
                 issues.append(f"RUNTIME_CAPABILITY_METADATA_MISSING {name}")
             else:
                 for key in BOOL_FIELDS:
-                    if capabilities.get(key, "MISSING") != route.get(key, "NOT_DECLARED"):
+                    declared = route.get(key, ABSENT)
+                    advertised = capabilities.get(key, UNREPORTED)
+                    # The runtime carries Option<bool>: a flag the config does not
+                    # declare reaches the wire as JSON null, which is the encoding of
+                    # absence rather than a third value. Comparing that null against a
+                    # "not declared" marker reported drift on every undeclared field,
+                    # so absence is normalised; a declared value stays an exact claim
+                    # and a key the payload never carried stays its own failure.
+                    expected = None if declared is ABSENT else declared
+                    if advertised != expected:
+                        shown_declared = ("NOT_DECLARED" if declared is ABSENT
+                                          else repr(declared))
+                        shown_get = ("MISSING_KEY" if advertised is UNREPORTED
+                                     else repr(advertised))
                         issues.append(f"RUNTIME_ADVERTISEMENT_DRIFT {name}.{key}: "
-                                      f"manifest={route.get(key, 'NOT_DECLARED')!r}, "
-                                      f"GET={capabilities.get(key, 'MISSING')!r}")
+                                      f"manifest={shown_declared}, "
+                                      f"expected_on_wire={expected!r}, "
+                                      f"GET={shown_get}")
                 if live.get("context_length", "MISSING") != route.get("context_window"):
                     issues.append(f"RUNTIME_CONTEXT_DRIFT {name}: "
                                   f"manifest={route.get('context_window')!r}, "

@@ -188,6 +188,56 @@ class GateTests(unittest.TestCase):
         d["routes"]["direct-openrouter-nemotron-vl"]["candidates"] = ["google-3.6"]
         self.assertIn("DIRECT_HAS_FALLBACK", str(gate.analyze(d)["failures"]))
 
+    def _rows_for(self, d, overrides=None):
+        rows = {}
+        for name, route in d["routes"].items():
+            rows[name] = {
+                "id": name, "context_length": route["context_window"],
+                "capabilities": {
+                    "tool_calling": route.get("tool_calling"),
+                    "vision": route.get("vision"),
+                    "video": route.get("video"),
+                    "image_carriers": (["inline"] if route.get("image_carrier") == "inline" else None),
+                    "video_carriers": (["inline"] if route.get("video_carrier") == "inline" else None),
+                },
+            }
+        for name, patch in (overrides or {}).items():
+            rows[name]["capabilities"].update(patch)
+        return rows
+
+    def test_undeclared_flag_advertised_as_null_is_not_drift(self):
+        """`capabilities` is Option<bool>: an undeclared flag reaches the wire as null.
+
+        Comparing that null against a "not declared" marker reported drift on every
+        field the config left absent, which punished a truthful advertisement.
+        """
+        d = fixture()
+        route = d["routes"]["direct-openrouter-nemotron-vl"]
+        route.pop("video")
+        route.pop("video_carrier")
+        d["targets"]["vl"].pop("video")
+        d["targets"]["vl"].pop("video_carrier")
+        rows = self._rows_for(d)
+        failures = " ".join(gate.analyze(d, rows)["failures"])
+        self.assertNotIn("RUNTIME_ADVERTISEMENT_DRIFT direct-openrouter-nemotron-vl.video",
+                         failures)
+        self.assertIn("ROUTE_CAPABILITY_NOT_EXPLICIT", failures)
+
+    def test_declared_false_advertised_as_null_is_still_drift(self):
+        """Normalising absence must not neuter the check: a declared value is a claim."""
+        d = fixture()
+        rows = self._rows_for(d, {"direct-openrouter-nemotron-vl": {"video": None}})
+        failures = " ".join(gate.analyze(d, rows)["failures"])
+        self.assertIn("RUNTIME_ADVERTISEMENT_DRIFT direct-openrouter-nemotron-vl.video",
+                      failures)
+
+    def test_missing_wire_key_stays_distinct_from_null(self):
+        d = fixture()
+        rows = self._rows_for(d)
+        del rows["direct-openrouter-nemotron-vl"]["capabilities"]["vision"]
+        self.assertIn("RUNTIME_ADVERTISEMENT_DRIFT direct-openrouter-nemotron-vl.vision",
+                      " ".join(gate.analyze(d, rows)["failures"]))
+
     def test_retired_native_25_is_refused(self):
         d = fixture()
         d["routes"]["direct-google-gemini-2.5-flash"] = copy.deepcopy(

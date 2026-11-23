@@ -668,6 +668,15 @@ cmd_deploy() {
         shift ;;
     esac
   done
+  # --command is a unit-test seam in release_validate.py. It skips the
+  # production P9 preflight, so never allow an inherited VALIDATE_CMD to make
+  # a real deployment appear qualified. Sandbox release roots remain usable.
+  if [ -n "$VALIDATE_CMD" ]; then
+    case "$RELEASE_ROOT" in
+      /var/lib/switchyard/releases|/var/lib/switchyard/releases/*)
+        die "VALIDATE_CMD test seam is forbidden for the production release store" ;;
+    esac
+  fi
   [ -n "$b_want" ] || die "usage: $0 deploy <manifest> <manifest-sha> <binary> <binary-sha>"
   [ -f "$m_src" ] || die "missing manifest $m_src"
   [ -f "$b_src" ] || die "missing binary $b_src"

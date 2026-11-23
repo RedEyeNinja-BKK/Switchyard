@@ -517,12 +517,14 @@ id = "google/gemma-4-26b-a4b-it"
 llm_client = "google"
 free_tier = true
 tool_calling = true
+max_input_tokens = 12307
 
 [targets.gemma31]
 id = "google/gemma-4-31b-it"
 llm_client = "google"
 free_tier = true
 tool_calling = true
+max_input_tokens = 12307
 
 [llm_clients.luna]
 format = "openai_responses"
@@ -686,5 +688,621 @@ async fn a_local_refusal_is_reported_truthfully_and_not_replaced_by_a_success() 
             .as_str()
             .is_some_and(|message| message.contains("Invalid value for 'input'")),
         "the terminal leg's own reason reaches the caller: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The judgment contract itself.
+//
+// The third tier exists to answer a *strict JSON verdict*. Everything above proves the leaf
+// is reached and asks not to think; none of it proves the answer it returns is the answer
+// Turnstone's judge can use. These tests pin the contract from both ends:
+//
+// * the prompt side — the tools Turnstone actually sends (`read_file`, `list_directory`) and
+//   the no-thinking switch, since a thinking turn spends the verdict budget on a monologue;
+// * the answer side — a real verdict body survives the cascade byte-for-byte and parses
+//   through a *closed* schema, so a deployment cannot quietly accept a field Turnstone would
+//   discard;
+// * the refusal side — an answer that is not JSON reaches the caller verbatim. Turnstone's
+//   own parser returns `None` for it and falls back to a heuristic verdict labelled
+//   `llm_fallback`. Switchyard must not manufacture a verdict in its place, because a
+//   fabricated `approve` is the one outcome the gate exists to prevent.
+// ---------------------------------------------------------------------------------------
+
+use serde::Deserialize;
+
+/// The verdict shape Turnstone's `IntentVerdict` carries off the wire. Closed on purpose:
+/// an unexpected key or an out-of-vocabulary enum is a contract break, and a test that
+/// ignored it could not tell a real verdict from a plausible-looking one.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct JudgedVerdict {
+    intent_summary: String,
+    risk_level: RiskLevel,
+    confidence: f64,
+    recommendation: Recommendation,
+    reasoning: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Recommendation {
+    Approve,
+    Review,
+    Deny,
+}
+
+/// A verdict a judge model really emits, in the shape the contract requires.
+const VERDICT: &str = r#"{"intent_summary":"Read the deployment file to confirm the timeout value.","risk_level":"low","confidence":0.93,"recommendation":"approve","reasoning":"The call reads one configuration file inside the workspace and changes nothing.","evidence":["path is inside /srv/switchyard","no write flags"]}"#;
+
+/// The tools Turnstone's judge sends when `read_only_tools` is on. Frozen here so the
+/// assertion is against the names the judge uses, not a name invented by this file.
+fn judge_tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "name": "read_file",
+            "description": "Read the contents of a file to verify what would be affected.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        },
+        {
+            "type": "function",
+            "name": "list_directory",
+            "description": "List the contents of a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        }
+    ])
+}
+
+/// A Responses envelope carrying `text` as the assistant's output, which is where the judge
+/// reads the verdict from.
+fn answer_text(model: &str, text: &str) -> (u16, String) {
+    (
+        200,
+        json!({
+            "id": "resp_verdict",
+            "object": "response",
+            "model": model,
+            "status": "completed",
+            "output": [{
+                "type": "message", "id": "m1", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}]
+            }],
+            "usage": {"input_tokens": 2600, "output_tokens": 64, "total_tokens": 2664}
+        })
+        .to_string(),
+    )
+}
+
+/// The output text of the first assistant message in a Responses body.
+fn output_text(body: &Value) -> &str {
+    body.pointer("/output/0/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("no output text in {body}"))
+}
+
+/// The request the judge sends: a verdict prompt plus its two read-only tools. The body is a
+/// fixed shape so an input-fit boundary can be computed against it.
+fn judge_request() -> Value {
+    json!({
+        "model": "smart-judge",
+        "input": "Evaluate the following tool call and answer with a JSON verdict.",
+        "tools": judge_tools(),
+        "tool_choice": "auto"
+    })
+}
+
+/// The tools and the no-thinking switch both reach the local leg on the verdict path.
+#[tokio::test]
+async fn the_third_tier_receives_the_judges_tools_and_asks_for_no_thought() {
+    let (pool, luna, local, runner) = judge_runner(exhausted, exhausted, |model| {
+        Some(answer_text(model, VERDICT))
+    });
+
+    let (status, body) = post(runner, judge_request()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(pool.calls() >= 1);
+    assert_eq!(luna.calls(), 1);
+    assert_eq!(local.calls(), 1);
+
+    let sent = local.only_body().await;
+    let names: Vec<&str> = sent
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("the judge's tools reach the terminal leg")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["read_file", "list_directory"],
+        "the evidence-gathering tools the judge declares must survive the cascade: {sent}"
+    );
+    assert_eq!(
+        sent.pointer("/chat_template_kwargs/enable_thinking"),
+        Some(&json!(false)),
+        "a tool-bearing verdict prompt must still refuse to think: {sent}"
+    );
+}
+
+/// The verdict body survives the cascade unchanged and parses through a closed schema.
+///
+/// This is the property the third tier is for: the answer is usable by Turnstone without a
+/// repair step, and no field was added or dropped on the way through.
+#[tokio::test]
+async fn the_local_verdict_round_trips_through_a_closed_schema() {
+    let (_pool, _luna, _local, runner) = judge_runner(exhausted, exhausted, |model| {
+        Some(answer_text(model, VERDICT))
+    });
+
+    let (status, body) = post(runner, judge_request()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        output_text(&body),
+        VERDICT,
+        "the verdict must arrive byte-for-byte; any edit here is a fabricated verdict"
+    );
+
+    let verdict: JudgedVerdict =
+        serde_json::from_str(VERDICT).expect("a real verdict satisfies the closed schema");
+    assert_eq!(verdict.risk_level, RiskLevel::Low);
+    assert_eq!(verdict.recommendation, Recommendation::Approve);
+    assert_eq!(verdict.confidence, 0.93);
+    assert_eq!(verdict.evidence.len(), 2);
+}
+
+/// An answer that is not JSON is delivered verbatim, and the closed schema refuses it.
+///
+/// Turnstone's `_parse_verdict` returns `None` for this text and the caller substitutes a
+/// heuristic verdict it labels `llm_fallback`. The one thing that must not happen is
+/// Switchyard inventing a verdict — a plausible-looking `approve` produced on the caller's
+/// behalf would defeat the gate while looking like a success.
+#[tokio::test]
+async fn a_non_json_answer_is_delivered_verbatim_and_refused_by_the_contract() {
+    const PROSE: &str = "I believe this call is safe and I would approve it.";
+    let (_pool, _luna, _local, runner) = judge_runner(exhausted, exhausted, |model| {
+        Some(answer_text(model, PROSE))
+    });
+
+    let (status, body) = post(runner, judge_request()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        output_text(&body),
+        PROSE,
+        "the answer reaches the caller unchanged so the judge can classify it"
+    );
+    assert!(
+        serde_json::from_str::<JudgedVerdict>(output_text(&body)).is_err(),
+        "prose is not a verdict, and a contract that accepted it would accept anything"
+    );
+}
+
+/// Out-of-vocabulary fields are delivered as written rather than repaired locally.
+///
+/// Turnstone normalises them (`risk_level` to `medium`, `recommendation` to `review`,
+/// `confidence` into 0..1). That normalisation is Turnstone's decision and has to happen on
+/// Turnstone's side of the boundary, on the bytes the model produced. A closed consumer sees
+/// the break, which is exactly how the test knows no one silently rewrote the answer.
+#[tokio::test]
+async fn out_of_vocabulary_fields_are_not_repaired_inside_switchyard() {
+    const ODD: &str = r#"{"intent_summary":"x","risk_level":"severe","confidence":5,"recommendation":"maybe","reasoning":"","evidence":[]}"#;
+    let (_pool, _luna, _local, runner) =
+        judge_runner(exhausted, exhausted, |model| Some(answer_text(model, ODD)));
+
+    let (status, body) = post(runner, judge_request()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        output_text(&body),
+        ODD,
+        "Switchyard must not normalise a field it does not own: {body}"
+    );
+    assert!(
+        serde_json::from_str::<JudgedVerdict>(output_text(&body)).is_err(),
+        "a closed schema refuses the vocabulary break, which is what keeps the repair honest"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Input fit at the declared ceiling, measured on the real estimator.
+//
+// `max_input_tokens = 12307` is not an arbitrary number: it is
+// `floor(input_tokens_per_minute 16000 * 1000 / admission_margin_permille 1300)`, the largest
+// single request the minute governor will admit at a 1.3x pad. The gate compares
+// `estimate_input_tokens(body) + max_output_tokens` against it, and the estimate covers the
+// whole outbound body — tools, schemas and formatting included — so a boundary test written
+// against it is a test of the number production actually uses.
+// ---------------------------------------------------------------------------------------
+
+const JUDGE_CEILING: u64 = 12307;
+
+fn with_output_budget(base: &Value, budget: u64) -> Value {
+    let mut body = base.clone();
+    body["max_output_tokens"] = json!(budget);
+    body
+}
+
+/// A body whose own estimate plus its own output reservation is exactly `ceiling`.
+///
+/// Solved by iteration rather than assumed, because writing `max_output_tokens` changes the
+/// body and therefore its estimate. A one-shot subtraction would be wrong by the width of the
+/// digits it inserted.
+fn exact_fit_body(base: &Value, ceiling: u64) -> (Value, u64) {
+    let mut budget = ceiling;
+    for _ in 0..8 {
+        let body = with_output_budget(base, budget);
+        let estimate = switchyard_runner::request_fit::estimate_input_tokens(&body);
+        if estimate + budget == ceiling {
+            return (body, budget);
+        }
+        budget = ceiling.saturating_sub(estimate);
+    }
+    panic!("output budget did not converge on an exact fit at {ceiling}");
+}
+
+/// The boundary is inclusive: a request that lands exactly on the ceiling is served, and one
+/// token over it is refused before any provider is contacted.
+#[tokio::test]
+async fn the_judge_gate_admits_exactly_at_its_ceiling_and_refuses_one_token_over() {
+    let base = judge_request();
+    let (fits, budget) = exact_fit_body(&base, JUDGE_CEILING);
+    let over = with_output_budget(&base, budget + 1);
+    let over_required = switchyard_runner::request_fit::estimate_input_tokens(&over) + budget + 1;
+    assert!(
+        over_required > JUDGE_CEILING,
+        "the over-ceiling body must actually be over: {over_required}"
+    );
+
+    let (_pool, _luna, _local, runner) = judge_runner(exhausted, exhausted, |model| {
+        Some(answer_text(model, VERDICT))
+    });
+    let (status, body) = post(runner, fits).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (pool, luna, local, runner) = judge_runner(exhausted, exhausted, |model| {
+        Some(answer_text(model, VERDICT))
+    });
+    let (status, body) = post(runner, over).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["code"], "unsupported_capability",
+        "an unfittable request is a request fact, not a server fault: {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("input_tokens_per_minute")),
+        "the refusal names the binding limit. The gate compared `max_input_tokens`, but that \
+         ceiling and the margin-adjusted minute bound are one limit and are reported to the \
+         caller under one name; the routing log keeps the internal field name: {body}"
+    );
+    assert_eq!(
+        pool.calls(),
+        0,
+        "no provider call for a request that cannot fit"
+    );
+    assert_eq!(luna.calls(), 0);
+    assert_eq!(local.calls(), 0);
+}
+
+/// The declared ceiling is derivable, and the loader refuses one that pretends to be wider
+/// than the minute window allows. This is the provenance of `12307`, asserted rather than
+/// asserted-to.
+#[test]
+fn the_declared_ceiling_is_the_margin_adjusted_minute_window() {
+    let ceiling = switchyard_llm_client::WindowLimits {
+        requests_per_minute: Some(30),
+        input_tokens_per_minute: Some(16000),
+    }
+    .safe_input_ceiling(
+        switchyard_llm_client::AdmissionMargin::from_permille(1300)
+            .expect("1.3x is a constructible margin"),
+    )
+    .expect("a declared minute window has a safe ceiling");
+    assert_eq!(
+        ceiling, JUDGE_CEILING,
+        "12307 is floor(16000 * 1000 / 1300), not a hand-picked number"
+    );
+
+    let deploy = |max_input: u64| -> String {
+        format!(
+            r#"schema_version = 1
+
+[llm_clients.google]
+format = "openai_responses"
+base_url = "http://127.0.0.1:1/v1"
+
+[targets.gemma]
+id = "gemma-4-26b-a4b-it"
+llm_client = "google"
+free_tier = true
+max_input_tokens = {max_input}
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 1300
+
+[routes.smart-judge]
+id = "smart-judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+"#
+        )
+    };
+
+    assert!(
+        Runner::from_toml(&deploy(JUDGE_CEILING)).is_ok(),
+        "the live ceiling sits exactly on the margin-adjusted bound and loads"
+    );
+    let error = Runner::from_toml(&deploy(JUDGE_CEILING + 1))
+        .err()
+        .expect("above the margin-adjusted bound must be refused");
+    assert!(
+        error.to_string().contains("max_input_tokens"),
+        "the refusal names the field: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// What the routing log says, and which counter the two profiles share.
+// ---------------------------------------------------------------------------------------
+
+/// Runs one request with a decision log attached and returns the record the route emitted.
+async fn post_logged(runner: Runner, body: Value) -> (StatusCode, Value, Value) {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("routing.jsonl");
+    let decision_path = directory.path().join("routing.decisions.jsonl");
+    let state = switchyard_server::ServerState::from_runner(runner)
+        .expect("state builds")
+        .with_routing_log(&log_path)
+        .expect("routing log");
+    let router = switchyard_server::build_switchyard_router(state);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    let answered = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let text = std::fs::read_to_string(&decision_path).expect("decision log written");
+    let decision =
+        serde_json::from_str(text.lines().last().expect("one record")).expect("record is json");
+    (status, answered, decision)
+}
+
+/// The local leg is tier two, and the record says so. A flat list and a tiered list are
+/// different declarations, and the difference has to be readable after the fact.
+#[tokio::test]
+async fn the_decision_record_names_the_local_leg_as_the_second_tier() {
+    let (_pool, _luna, _local, runner) = judge_runner(exhausted, exhausted, |model| {
+        Some(answer_text(model, VERDICT))
+    });
+
+    let (status, body, decision) = post_logged(runner, judge_request()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(decision["outcome"], json!("served"), "{decision}");
+    assert_eq!(
+        decision["served"],
+        json!("Qwen3.5-9B-MTP"),
+        "the record names the model that answered: {decision}"
+    );
+    assert_eq!(
+        decision["terminal_tier"],
+        json!(2),
+        "Luna is tier one and the local leg is tier two: {decision}"
+    );
+    assert_eq!(
+        decision["terminal_tiers"],
+        json!([["gpt-6-luna-nt"], ["Qwen3.5-9B-MTP"]]),
+        "the declared order is reported as declared: {decision}"
+    );
+    assert_eq!(
+        decision["terminal_crossed"],
+        json!("primary_pool_exhausted"),
+        "the record says why the terminal leg was spent: {decision}"
+    );
+}
+
+/// A request that cannot fit its own route is recorded as such, with no tier claimed.
+#[tokio::test]
+async fn an_unfittable_judge_request_records_no_eligible_candidate() {
+    let base = judge_request();
+    let (_, budget) = exact_fit_body(&base, JUDGE_CEILING);
+    let over = with_output_budget(&base, budget + 1);
+
+    let (_pool, _luna, _local, runner) = judge_runner(exhausted, exhausted, |model| {
+        Some(answer_text(model, VERDICT))
+    });
+    let (status, body, decision) = post_logged(runner, over).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        decision["outcome"],
+        json!("no_eligible_candidate"),
+        "the record and the caller name the same reason: {decision}"
+    );
+    assert!(
+        decision.get("terminal_crossed").is_none(),
+        "no terminal leg was spent, so there is no crossing to report: {decision}"
+    );
+    assert_eq!(decision["served"], Value::Null, "{decision}");
+}
+
+/// `quota_group` is what makes the two profiles one budget.
+///
+/// The two clients name one physical server, so a per-client counter would hand the
+/// deployment twice the allowance the provider actually grants. The loader keys the counter
+/// by `(quota_group, model)`, and refuses a group whose members disagree about the limit.
+fn quota_deploy(state_dir: &str, first_limit: u64, second_limit: u64, share_group: bool) -> String {
+    let first_group = if share_group {
+        "quota_group = \"htpc\"\n"
+    } else {
+        ""
+    };
+    let second_group = if share_group {
+        "quota_group = \"htpc\"\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"schema_version = 1
+
+[quota]
+state_dir = "{state_dir}"
+
+[llm_clients.htpc]
+format = "openai_responses"
+base_url = "http://127.0.0.1:1/v1"
+locality = "local"
+billing = "local"
+{first_group}
+[llm_clients.htpc-nt]
+format = "openai_responses"
+base_url = "http://127.0.0.1:1/v1"
+locality = "local"
+billing = "local"
+{second_group}
+[targets.thinking]
+id = "Qwen3.5-9B-MTP"
+llm_client = "htpc"
+daily_request_limit = {first_limit}
+
+[targets.no-thinking]
+id = "Qwen3.5-9B-MTP"
+llm_client = "htpc-nt"
+daily_request_limit = {second_limit}
+
+[routes.direct-htpc-qwen3_5-9b-mtp]
+id = "direct-htpc-qwen3_5-9b-mtp"
+type = "passthrough"
+target = "thinking"
+candidates = []
+"#
+    )
+}
+
+/// Two profiles of one model in one group are one budget, so they cannot disagree about it.
+#[test]
+fn two_profiles_in_one_quota_group_must_declare_one_limit() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let state_dir = directory.path().join("quota");
+    let state_dir = state_dir.display().to_string();
+
+    assert!(
+        Runner::from_toml(&quota_deploy(&state_dir, 500, 500, true)).is_ok(),
+        "one model, one group, one limit is a single counter and must load"
+    );
+    let error = Runner::from_toml(&quota_deploy(&state_dir, 500, 501, true))
+        .err()
+        .expect("a group that disagrees about its budget must be refused");
+    assert!(
+        error.to_string().contains("different daily_request_limit"),
+        "the refusal names the disagreement: {error}"
+    );
+
+    // The control. Without a shared group the same two limits are two clients and two
+    // counters, so the deployment loads. This is what proves the grouping — not the limits —
+    // is what collapsed them above.
+    assert!(
+        Runner::from_toml(&quota_deploy(&state_dir, 500, 501, false)).is_ok(),
+        "separate groups are separate counters, which is the status quo for every other pair"
+    );
+}
+
+/// The two aliases are two policies over one physical model, and the wire proves it: same
+/// server, same model id, and only the thinking switch moves.
+#[tokio::test]
+async fn the_two_aliases_are_one_model_that_differs_only_in_its_thinking_switch() {
+    let physical = Upstream::new(|model| Some(success(model)));
+    let url = physical.clone().server();
+    let source = local_pair(&url, &url);
+    let router = || {
+        switchyard_server::build_switchyard_router(
+            switchyard_server::ServerState::from_runner(runner(&source)).expect("state builds"),
+        )
+    };
+
+    for model in [
+        "direct-htpc-qwen3_5-9b-mtp",
+        "direct-htpc-qwen3_5-9b-mtp-nt",
+    ] {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": model, "input": "hi"}).to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body reads");
+    }
+
+    let bodies = physical.bodies().await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "one physical server answered both aliases: {bodies:?}"
+    );
+    let models: Vec<&str> = bodies
+        .iter()
+        .filter_map(|body| body.get("model").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        models,
+        vec!["Qwen3.5-9B-MTP", "Qwen3.5-9B-MTP"],
+        "both aliases name the same served model: {bodies:?}"
+    );
+    let switches: Vec<Option<bool>> = bodies
+        .iter()
+        .map(|body| {
+            body.pointer("/chat_template_kwargs/enable_thinking")
+                .and_then(Value::as_bool)
+        })
+        .collect();
+    assert_eq!(
+        switches,
+        vec![Some(true), Some(false)],
+        "the profiles differ in the thinking switch and in nothing else: {bodies:?}"
     );
 }

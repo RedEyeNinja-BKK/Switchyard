@@ -76,6 +76,20 @@ class ChainTests(unittest.TestCase):
                       "the gate was never reached, so rc=2 stopped the chain")
         self.assertNotEqual(rc, 1)
 
+    def test_documented_tools_are_applied_before_the_gate(self):
+        _, scripts, calls = self.build({})
+        applier = "apply_official_model_tool_caps.py"
+        self.assertIn(applier, scripts)
+        self.assertLess(scripts.index(applier), scripts.index("direct_capability_gate.py"))
+        self.assertIn("6-candidate.toml",
+                      (HERE / "build_p9_candidate.py").read_text(),
+                      "the chain must name the final model-card-qualified output")
+
+    def test_a_model_card_applier_refusal_stops_before_the_gate(self):
+        rc, scripts, _ = self.build({"apply_official_model_tool_caps.py": 3})
+        self.assertEqual(rc, 1)
+        self.assertNotIn("direct_capability_gate.py", scripts)
+
     def test_only_the_reconciler_accepts_a_nonzero_exit(self):
         _, _, calls = self.build({})
         for step, script, _, accept in calls:

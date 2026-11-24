@@ -123,6 +123,15 @@ pub struct SelectionTrace {
     /// distinction visible in the trace, so an answer served by the terminal model cannot be
     /// mistaken for a peer that merely ranked last.
     pub terminal: Vec<String>,
+    /// The same declared targets, grouped into the ordered tiers that were declared.
+    ///
+    /// The flat `terminal` field is the union and keeps every existing reader working. This
+    /// one exists because the union cannot express the thing that distinguishes a tiered
+    /// declaration from a single set: which legs are peers of each other and which are only
+    /// reachable after the previous set was proved out. A reader reconstructing escalation
+    /// from the union would see one pool and infer that the cheaper member was skipped
+    /// first, when in fact it was consulted second.
+    pub terminal_tiers: Vec<Vec<String>>,
     /// Whether this request stepped onto the terminal leg.
     pub terminal_crossed: bool,
     /// Stable code naming why the terminal leg was authorized, when it was.
@@ -131,6 +140,12 @@ pub struct SelectionTrace {
     /// exhausted" and "every capable leg is blocked" are different claims about the primary
     /// pool, and a reader deciding whether a paid leg was spent needs to see which was made.
     pub terminal_reason: Option<&'static str>,
+    /// Which terminal tier answered, one-based, when the leg was crossed.
+    ///
+    /// Declared order is the escalation order, so a record that says tier 2 is also a record
+    /// that tier 1 was proved out first. It is the index into `terminal_tiers` (one-based, to
+    /// match how an operator reads a manifest) rather than a position in the flat union.
+    pub terminal_tier: Option<usize>,
 }
 
 /// A stable, value-free code naming how one attempt ended.

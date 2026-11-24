@@ -102,7 +102,7 @@ def apply(text: str, evidence: dict, manifest: dict) -> tuple[str, list[str], li
         head = _heading(sections, target_name)
         start, _ = sections[head]
         body = "".join(lines[start + 1:sections[head][1]])
-        if "tool_calling" in body:
+        if _declares(body, "tool_calling"):
             raise Refused(f"REFUSED_KEY_ALREADY_PRESENT {target_name}")
         lines.insert(start + 1, "tool_calling = true\n")
 
@@ -122,6 +122,24 @@ def apply(text: str, evidence: dict, manifest: dict) -> tuple[str, list[str], li
                 if after.get(key) != value:
                     raise Refused(f"REFUSED_VALUE_CHANGED {kind}.{name}.{key}")
     return out, sorted(writes), skipped
+
+
+def _declares(body: str, key: str) -> bool:
+    """Whether the block really assigns this key, not merely mentions it.
+
+    Manifests document measured facts in comments. A substring search reads
+    ``# tool_calling = true was called, not inferred`` as an existing
+    declaration and refuses a write that is still needed, so only a
+    non-comment assignment line counts. The authoritative check remains the
+    parsed table above; this one only guards the textual insert.
+    """
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.partition("=")[0].strip() == key:
+            return True
+    return False
 
 
 def _heading(sections: dict, name: str) -> str:

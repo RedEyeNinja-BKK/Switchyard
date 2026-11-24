@@ -105,6 +105,23 @@ class VerifierCase(unittest.TestCase):
         row["evidence_class"] = "PRIOR_MEASUREMENT"
         self.assert_refused(matrix, "C3_evidence")
 
+    def test_a_shared_spec_row_relabelled_as_a_live_call_is_refused(self):
+        """The owner accepted these four as model-level evidence only.
+
+        Promoting one to LIVE_TOOL_CALL is the exact rewrite the acceptance
+        forbids: it would claim the owner's own credential path served a tool
+        call. The class must stay re-derived from the receipt.
+        """
+        matrix = copy.deepcopy(self.matrix)
+        row = next(r for r in matrix["findings"]
+                   if r["evidence_class"] == "SHARED_MODEL_SPEC")
+        owner_route, witness = row["route"], row["witness_route"]
+        row["evidence_class"] = "LIVE_TOOL_CALL"
+        self.assert_refused(matrix, "C3_evidence")
+        # And the refusal is about the class, not an incidental missing field.
+        self.assertNotEqual(owner_route, witness)
+        self.assertIsNotNone(witness)
+
     def test_a_flipped_capability_value_is_refused(self):
         matrix = copy.deepcopy(self.matrix)
         row = next(r for r in matrix["findings"]

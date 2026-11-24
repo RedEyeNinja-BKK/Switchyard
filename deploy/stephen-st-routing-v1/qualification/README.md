@@ -4,7 +4,7 @@
 
 **Explicit owner decision:** ACCEPT the four **`SHARED_MODEL_SPEC`** target `tool_calling=true` qualifications on owner routes `direct-google-gemini-3.1-flash-lite`, `direct-google-gemini-3.5-flash-lite`, `direct-google-gemini-3.6-flash`, and `direct-google-gemini-4-hydrogen`. Their direct routes already advertise `tool_calling=true`; each row in `p9-matrix.json` names the same upstream model's `direct-google-stephen-*` successful completed-tool-call `witness_route` through the `openai_chat` wire. This is **evidence of model-level tool support** sufficient for the proposed *declaration* at P9, not a measured tool call with the owner's `google_gemini` credential.
 
-**Preserve the evidence downgrade conspicuously:** leave `evidence_class=SHARED_MODEL_SPEC` and `resolution=DECLARATION_ONLY_SHARED_MODEL_SPEC`, `witness_route` and `evidence_note` unchanged; never rewrite those four records as `LIVE_TOOL_CALL` or same-credential proof. This acceptance grants no owner provider quota, key/project identity, paid agent calls, account-level tool access, fallback policy, runtime deployment or release exception. If a later release candidate widens effective route admission or changes more than the narrowly stated targets' metadata, stop and request a fresh owner decision.
+**Preserve the evidence downgrade conspicuously:** leave `evidence_class=SHARED_MODEL_SPEC` and `resolution=DECLARATION_ONLY_SHARED_MODEL_SPEC`, `witness_route` and `evidence_note` unchanged; never rewrite those four records as `LIVE_TOOL_CALL` or same-credential proof. **This is enforced, not merely asked for:** `test_a_shared_spec_row_relabelled_as_a_live_call_is_refused` requires the verifier to refuse a `SHARED_MODEL_SPEC` row rewritten as `LIVE_TOOL_CALL` with `C3_evidence`, because the verifier re-derives the class from the cited receipt instead of trusting the matrix label. This acceptance grants no owner provider quota, key/project identity, paid agent calls, account-level tool access, fallback policy, runtime deployment or release exception. If a later release candidate widens effective route admission or changes more than the narrowly stated targets' metadata, stop and request a fresh owner decision.
 
 **Report the qualification correctly:** **69 independently supported + 4 owner-accepted shared-model-spec = 73 qualified, 5 `BLOCKED_PROVIDER_PROOF` out of 78**. The five must still be proven separately: owner Gemini 3.8, Stephen Gemini 3.8, OpenAI Luna, Luna NT and Sol `.tool_calling`. The chain's strict P9 gate remains **REFUSED (5)**. No paid/quota-consuming probe is authorized by acceptance of the four; do not call this release-ready. Keep this as a source/evidence-only **draft PR #52** and preserve all matrix verifier and source fixture hashes.
 
@@ -92,9 +92,14 @@ returned its daily-allowance 429. The tool call was measured for the same model 
 Stephen's credential (`google_gemini_stephen`). Each row names its witness route, and
 the verifier requires the witness to be the same model id on a different
 `llm_client` with a completed tool call in the cited receipt. The capability is a
-property of the model; the *credential path* is not proven. Two ways to close it and
-they are the owner's call: approve the shared-spec widening, or convert those four
-to explicit refusals.
+property of the model; the *credential path* is not proven. **Resolved 2026-11-24 by
+owner decision** — the first option, recorded at the top of this file: the four
+declarations are accepted as model-level evidence, the `SHARED_MODEL_SPEC` class is
+kept, and the four are counted as 4 accepted of the 73. The alternative (converting
+them to explicit refusals) was not taken, so those four targets declare
+`tool_calling = true` on shared-model grounds and the owner credential path remains
+unproven. `test_verify_p9_qualification` refuses any later rewrite of these four as
+`LIVE_TOOL_CALL`.
 
 **R2 — two receipts do not name their own model.** `gemma31-20261121.jsonl` carries
 no `model` field. Its rows are attributed to `gemma-4-31b-it` because it is the
@@ -128,7 +133,7 @@ python3 verify_p9_qualification.py \
     --gate-candidate gate-candidate.json --gate-chain gate-chain.json \
     --evidence-dir ../evidence/tool-qualification-20261123
 
-# mutation controls (20)
+# mutation controls (21)
 python3 -m unittest test_verify_p9_qualification -v
 ```
 

@@ -1,5 +1,14 @@
 # P9 qualification matrix — direct capability declarations, 2026-11-24
 
+## Owner disposition — four SHARED_MODEL_SPEC rows ACCEPTED as model-level evidence (2026-11-24)
+
+**Explicit owner decision:** ACCEPT the four **`SHARED_MODEL_SPEC`** target `tool_calling=true` qualifications on owner routes `direct-google-gemini-3.1-flash-lite`, `direct-google-gemini-3.5-flash-lite`, `direct-google-gemini-3.6-flash`, and `direct-google-gemini-4-hydrogen`. Their direct routes already advertise `tool_calling=true`; each row in `p9-matrix.json` names the same upstream model's `direct-google-stephen-*` successful completed-tool-call `witness_route` through the `openai_chat` wire. This is **evidence of model-level tool support** sufficient for the proposed *declaration* at P9, not a measured tool call with the owner's `google_gemini` credential.
+
+**Preserve the evidence downgrade conspicuously:** leave `evidence_class=SHARED_MODEL_SPEC` and `resolution=DECLARATION_ONLY_SHARED_MODEL_SPEC`, `witness_route` and `evidence_note` unchanged; never rewrite those four records as `LIVE_TOOL_CALL` or same-credential proof. This acceptance grants no owner provider quota, key/project identity, paid agent calls, account-level tool access, fallback policy, runtime deployment or release exception. If a later release candidate widens effective route admission or changes more than the narrowly stated targets' metadata, stop and request a fresh owner decision.
+
+**Report the qualification correctly:** **69 independently supported + 4 owner-accepted shared-model-spec = 73 qualified, 5 `BLOCKED_PROVIDER_PROOF` out of 78**. The five must still be proven separately: owner Gemini 3.8, Stephen Gemini 3.8, OpenAI Luna, Luna NT and Sol `.tool_calling`. The chain's strict P9 gate remains **REFUSED (5)**. No paid/quota-consuming probe is authorized by acceptance of the four; do not call this release-ready. Keep this as a source/evidence-only **draft PR #52** and preserve all matrix verifier and source fixture hashes.
+
+
 Source-only. No provider call, no credential read, no release-store write, no
 service restart. This directory answers one question per gate finding: *what
 evidence exists, what declaration does it support, and does the declaration chain

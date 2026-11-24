@@ -146,6 +146,14 @@ pub struct SelectionTrace {
     /// that tier 1 was proved out first. It is the index into `terminal_tiers` (one-based, to
     /// match how an operator reads a manifest) rather than a position in the flat union.
     pub terminal_tier: Option<usize>,
+    /// Every declared terminal target a gate excluded, with the rule that excluded it.
+    ///
+    /// `terminal_crossed = false` alone cannot distinguish two very different records: tiers
+    /// that were never consulted, and tiers that were consulted and found unable to hold the
+    /// request. This field makes the second case visible, so a refusal can be read as "the
+    /// wider legs were asked and refused this size" rather than "the wider legs do not
+    /// exist". Empty when every terminal target was eligible.
+    pub terminal_skipped: Vec<(String, &'static str)>,
 }
 
 /// A stable, value-free code naming how one attempt ended.

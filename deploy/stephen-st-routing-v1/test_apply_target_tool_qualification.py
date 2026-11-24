@@ -159,6 +159,50 @@ class Refuses(Base):
         self.assertEqual(self.baseline.read_text(), MANIFEST)
 
 
+COMMENTED = """
+[targets.good]
+id = "good-model"
+llm_client = "c"
+# The receipt records that `tool_calling = true` was called, not inferred: a
+# request carrying tools and tool_choice="auto" returned finish_reason="tool_calls".
+# Second mention, still prose: tool_calling = true.
+
+[routes."direct-good"]
+id = "direct-good"
+type = "passthrough"
+target = "good"
+candidates = []
+tool_calling = true
+"""
+
+
+class CommentText(Base):
+    """Prose about the key is not the key.
+
+    The composer's real CURRENT manifest documents the HTPC NT target with a
+    comment block that names `tool_calling = true`. A substring search over the
+    raw block reads that annotation as an existing declaration and refuses to
+    insert the real key, so a manifest that is eligible for the write is
+    reported as already written.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.baseline.write_text(COMMENTED)
+
+    def test_comment_mentioning_key_does_not_block_the_write(self):
+        result = self.run_tool(evidence(**{"direct-good": ("LIVE_TOOL_CALL", RECEIPT)}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = tomllib.loads(self.out.read_text())
+        self.assertIs(parsed["targets"]["good"]["tool_calling"], True)
+
+    def test_comment_is_preserved_verbatim(self):
+        result = self.run_tool(evidence(**{"direct-good": ("LIVE_TOOL_CALL", RECEIPT)}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.out.read_text()
+        self.assertIn('# The receipt records that `tool_calling = true` was called', text)
+
+
 class Control(Base):
     def test_detects_a_tampered_value(self):
         """A negative control: if the applier ever changed a value it must be caught.

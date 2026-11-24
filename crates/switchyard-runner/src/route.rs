@@ -1547,20 +1547,6 @@ impl Route {
             .enumerate()
             .map(|(rank, model)| (model.clone(), rank as u32))
             .collect();
-        // Every declared terminal target that a gate excluded, with the rule that excluded
-        // it. A flat list rather than a single code because the interesting case is a tier
-        // passed over for a different reason than the pool was, and leaving it out would make
-        // `terminal_crossed = false` look like the tiers were never consulted.
-        let terminal_skipped: Vec<(String, &'static str)> = terminal_verdicts
-            .iter()
-            .zip(self.terminal.iter())
-            .flat_map(|(gates, tier)| {
-                tier.all_models()
-                    .into_iter()
-                    .zip(gates.iter())
-                    .filter_map(|(model, gate)| gate.err().map(|code| (model.to_string(), code)))
-            })
-            .collect();
         let mut trace = SelectionTrace {
             algorithm: self.algorithm.name().to_string(),
             considered: considered.iter().map(ToString::to_string).collect(),
@@ -1622,7 +1608,12 @@ impl Route {
             terminal_crossed: false,
             terminal_reason: None,
             terminal_tier: None,
-            terminal_skipped,
+            // Filled only as the walk actually reaches a tier and finds it empty. A tier the
+            // walk never reached is absent, so `terminal_crossed = false` plus an empty list
+            // means "the tiers were never consulted", not "the tiers were consulted and
+            // refused". The precomputed `terminal_verdicts` are deliberately NOT recorded here:
+            // a gate being evaluated is not the same as a boundary being crossed.
+            terminal_skipped: Vec::new(),
         };
         if models.is_empty() && fit_escalation.is_none() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
@@ -1741,6 +1732,17 @@ impl Route {
                     // whether the next boundary is reachable: a declared tier that no
                     // request could ever fit is a coverage gap, not exhaustion.
                     //
+                    // The walk has reached this tier, so its exclusions are a traversal fact
+                    // and are recorded -- a target absent from the record was never consulted.
+                    for (model, gate) in tier
+                        .all_models()
+                        .into_iter()
+                        .zip(terminal_verdicts[index].iter())
+                    {
+                        if let Err(code) = gate {
+                            trace.terminal_skipped.push((model.to_string(), *code));
+                        }
+                    }
                     // A size boundary keeps the walk alive on its own claim. Every target
                     // here being unable to *hold* the request is the same fact the pool
                     // reported, and the next tier is asked the same question; any other

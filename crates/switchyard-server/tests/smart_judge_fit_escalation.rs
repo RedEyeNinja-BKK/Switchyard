@@ -875,3 +875,106 @@ async fn the_decision_record_names_why_a_tier_was_passed_over() {
     );
     assert_eq!(record["terminal_skipped"]["Qwen3.5-9B-MTP"], Value::Null);
 }
+
+/// `terminal_skipped` is a traversal fact, not an evaluation fact. When the option is off the
+/// tiers are never consulted, so the field is absent — the refusal cannot be read as "the wider
+/// legs were asked and could not hold this".
+#[tokio::test]
+async fn the_record_leaves_terminal_skipped_absent_when_tiers_are_never_consulted() {
+    let pool = Upstream::new(serves);
+    let first = Upstream::new(serves);
+    let second = Upstream::new(serves);
+    let pool_url = pool.clone().server();
+    let first_url = first.clone().server();
+    let second_url = second.clone().server();
+    let config = deployment(
+        &Shape {
+            fit_escalation: false,
+            ..Shape::default()
+        },
+        &pool_url,
+        &first_url,
+        &second_url,
+    );
+
+    let dir = std::env::temp_dir().join(format!("sj-fit-never-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let attempts = dir.join("routing.jsonl");
+    let decisions = dir.join("routing.decisions.jsonl");
+    let _ = std::fs::remove_file(&decisions);
+    let state = switchyard_server::ServerState::from_runner(runner(&config))
+        .expect("state builds")
+        .with_routing_log(&attempts)
+        .expect("log opens");
+    let (status, _body) = post(
+        switchyard_server::build_switchyard_router(state),
+        judged(13_200, Some(2_048)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = std::fs::read_to_string(&decisions).expect("decision log was written");
+    let record: Value =
+        serde_json::from_str(text.lines().next().expect("one record")).expect("record parses");
+    assert_eq!(record["outcome"], "no_eligible_candidate");
+    assert!(
+        record.get("terminal_skipped").is_none(),
+        "tiers were never consulted, so terminal_skipped must be absent: {record}"
+    );
+}
+
+/// Both tiers are reached, neither can hold the request, and the walk ends without a dispatch.
+/// `terminal_skipped` names both, and `terminal_crossed` stays absent because no tier was ever
+/// spent. That pair is the one the field exists to make readable.
+#[tokio::test]
+async fn the_record_names_every_reached_tier_that_could_not_hold_it() {
+    let pool = Upstream::new(serves);
+    let first = Upstream::new(serves);
+    let second = Upstream::new(serves);
+    let pool_url = pool.clone().server();
+    let first_url = first.clone().server();
+    let second_url = second.clone().server();
+    let config = deployment(
+        &Shape {
+            luna_ceiling: Some(20_000),
+            htpc_ceiling: Some(20_000),
+            ..Shape::default()
+        },
+        &pool_url,
+        &first_url,
+        &second_url,
+    );
+
+    let dir = std::env::temp_dir().join(format!("sj-fit-both-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let attempts = dir.join("routing.jsonl");
+    let decisions = dir.join("routing.decisions.jsonl");
+    let _ = std::fs::remove_file(&decisions);
+    let state = switchyard_server::ServerState::from_runner(runner(&config))
+        .expect("state builds")
+        .with_routing_log(&attempts)
+        .expect("log opens");
+    let (status, _body) = post(
+        switchyard_server::build_switchyard_router(state),
+        judged(19_580, Some(2_048)),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = std::fs::read_to_string(&decisions).expect("decision log was written");
+    let record: Value =
+        serde_json::from_str(text.lines().next().expect("one record")).expect("record parses");
+    assert_eq!(record["outcome"], "no_eligible_candidate");
+    assert_eq!(
+        record["terminal_skipped"]["openai/gpt-6-luna-nt"], "max_input_tokens",
+        "the first tier was reached and could not hold it: {record}"
+    );
+    assert_eq!(
+        record["terminal_skipped"]["Qwen3.5-9B-MTP"], "max_input_tokens",
+        "the second tier was reached and could not hold it: {record}"
+    );
+    assert!(
+        record.get("terminal_crossed").is_none(),
+        "no tier was dispatched, so terminal_crossed stays absent: {record}"
+    );
+}

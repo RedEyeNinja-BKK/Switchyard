@@ -1,0 +1,56 @@
+{
+  "policy": "owner_authorized_official_model_docs_2026-11-24",
+  "interpretation": "Official vendor model docs qualify model-level tool_calling support; not an observed credential-specific request and not a claim of remaining quota.",
+  "capabilities": [
+    {
+      "route": "direct-google-gemini-3.8-flash",
+      "target": "direct-google-gemini-3.8-flash",
+      "model": "gemini-3.8-flash",
+      "capability": "tool_calling",
+      "value": true,
+      "evidence_class": "OFFICIAL_MODEL_DOC",
+      "source": "https://aistudio.google.com/docs/models/gemini-3.8-flash",
+      "source_capability": "Function calling Supported"
+    },
+    {
+      "route": "direct-google-stephen-gemini-3.8-flash",
+      "target": "stephen-google-gemini-3.8-flash",
+      "model": "gemini-3.8-flash",
+      "capability": "tool_calling",
+      "value": true,
+      "evidence_class": "OFFICIAL_MODEL_DOC",
+      "source": "https://aistudio.google.com/docs/models/gemini-3.8-flash",
+      "source_capability": "Function calling Supported"
+    },
+    {
+      "route": "direct-openai-gpt-6-luna",
+      "target": "openai-gpt-6-luna",
+      "model": "gpt-6-luna",
+      "capability": "tool_calling",
+      "value": true,
+      "evidence_class": "OFFICIAL_MODEL_DOC",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+      "source_capability": "Responses API function calling supported"
+    },
+    {
+      "route": "direct-openai-gpt-6-luna-nt",
+      "target": "openai-gpt-6-luna-nt",
+      "model": "gpt-6-luna",
+      "capability": "tool_calling",
+      "value": true,
+      "evidence_class": "OFFICIAL_MODEL_DOC",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+      "source_capability": "Same Luna model; function calling supported via Responses API; no-thinking is a serving profile"
+    },
+    {
+      "route": "direct-openai-gpt-6-sol",
+      "target": "openai-gpt-6-sol",
+      "model": "gpt-6-sol",
+      "capability": "tool_calling",
+      "value": true,
+      "evidence_class": "OFFICIAL_MODEL_DOC",
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+      "source_capability": "Responses API function calling supported"
+    }
+  ]
+}

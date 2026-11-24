@@ -6,6 +6,13 @@ the ORDER, keeps every intermediate file for review, and runs the gate last.
 Nothing here writes to the release store: the output is a candidate file that
 the guarded release path validates again before anything is installed.
 
+IMPORTANT: this is ONLY the P9 declaration chain. Even though PR #51 Rust was
+merged into PR #52, this function does NOT add PR #51's three-tier judge route
+manifest/HTPC NT alias. To qualify the ACTUAL full judge+P9 release, use
+compose_judge_p9_candidate.py which applies the judge FIRST and P9 SECOND,
+then independently checks P9 on that final composed manifest. P9 PASS here
+alone is NOT evidence the new judge tier is present or that users recovered.
+
 Order matters and is deliberate:
 
   1. remove a retired leaf whose provider no longer serves the model, so a dead

@@ -141,6 +141,34 @@ The chain is byte-reproducible: rebuilding from `5211bdc7` yields
 `ccda1bc6…` at every stage. The verifier exits 0 clean, 3 on any disagreement, and
 2 when a check examined nothing — a vacuous pass is treated as a defect.
 
+### The oracle, and the tooling that will gate the release
+
+The gate that produced both projections is
+`deploy/stephen-st-routing-v1/direct_capability_gate.py`, 18,501 bytes, sha256
+`72838c340dc55f8ca6958ad0c15a1e7afaac623649d78335b3b7b61865835877`. Re-running
+those exact bytes over the two pinned manifests on 2026-11-24 reproduces
+`gate-candidate.json` and `gate-chain.json` **identically** — 54 direct / 78
+findings / 28 gaps, and 52 / 5 / 28 — so the committed evidence is not a transcript
+of some other build.
+
+Those are also the bytes the release host runs. Read-only, 2026-11-24:
+
+| Path | sha256 | Equals PR #50 source at `3799ce1` |
+| --- | --- | --- |
+| `/opt/deploy/stephen-st-routing-v1/direct_capability_gate.py` | `72838c34…` | yes |
+| `/opt/switchyard/bin/release_validate.py` | `55b805c6…` | yes (`scripts/release/release_validate.py`) |
+| `/opt/switchyard/bin/activate-release.sh` | `192581b0…` | yes (`scripts/release/activate-release.sh`) |
+
+`release_validate.py::validate_p9` invokes that gate with `--manifest` only — the
+same invocation shape used here — and fails closed with `P9_GATE_UNAVAILABLE`,
+`P9_GATE_TIMEOUT`, `P9_GATE_EXECUTION_FAILED` or `P9_GATE_REFUSED`. The
+`--models` input is deliberately unused on both paths: P9 judges the candidate's
+bytes, and the serving `/v1/models` is verified after deployment.
+
+**This hash is recorded here but not yet in `summary.inputs`.** If the gate changes,
+rebuild the matrix instead of re-reading these numbers — the gate lives on a branch
+that is still open, so drift is possible and silent.
+
 `candidate-declarations.json` and `chain-declarations.json` are projections of the
 two manifests containing only direct routes, their targets, the target model id,
 `llm_client` and the three admission flags. No base URL, credential name, limit or

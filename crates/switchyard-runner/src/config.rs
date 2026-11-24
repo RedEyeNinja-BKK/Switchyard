@@ -277,14 +277,23 @@ struct RouteConfig {
     /// Groups whose members form this route's candidate pool, when it declares one.
     pool_groups: Option<Vec<String>>,
     /// Targets this route may reach only after its entire eligible primary pool is
-    /// verifiably unavailable.
+    /// verifiably unavailable, in declared order.
     ///
     /// Kept separate from the candidate list on purpose. A terminal leg that was merely a
     /// candidate would be ranked with its peers and would serve whenever the pool was busy,
     /// which is the paid escalation this field exists to prevent; naming it here means the
     /// exhaustion rule is the only way to reach it. A terminal target therefore must not also
     /// appear among the candidates.
-    terminal_fallback: Option<Vec<String>>,
+    ///
+    /// A flat list of names is ONE leg, which is the historical shape and still means exactly
+    /// what it meant: its members are peers of each other and the route crosses onto them as a
+    /// single set. A list of lists declares ordered TIERS instead, and only the nested form
+    /// orders them. The distinction is not cosmetic. Peerage inside one set is decided by the
+    /// route's selection policy, so two providers' last resorts written as `[a, b]` would
+    /// compete and the cheaper or faster one would win regardless of the order they were
+    /// typed in. Tier `n + 1` is reachable only once tier `n` has itself been proved out, and
+    /// each boundary is authorized separately.
+    terminal_fallback: Option<TerminalFallback>,
     /// Which evidence may spend `terminal_fallback`.
     ///
     /// Absent keeps the historical rule, so no route changes behaviour because this option
@@ -344,6 +353,70 @@ pub enum SelectionPolicy {
     Peer,
 }
 
+/// One declared terminal leg: either a single target or one tier of peers.
+///
+/// Untagged so the manifest stays readable. This is the INNER shape — what one tier is —
+/// and it is only ever reached through [`TerminalFallback::Tiered`], so seeing `One` here
+/// never means "a separate tier", only "a tier written without brackets".
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TerminalTierSpec {
+    /// A tier of one target.
+    One(String),
+    /// One tier whose members are peers of each other.
+    Many(Vec<String>),
+}
+
+impl TerminalTierSpec {
+    /// The target names in this tier, in declared order.
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            Self::One(name) => vec![name.as_str()],
+            Self::Many(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// A route's declared terminal legs, and whether their order means anything.
+///
+/// Untagged so that every manifest written before tiers existed keeps its meaning exactly.
+/// The distinction is not cosmetic and it is not inferable from the inner type: if this
+/// enum did not exist, `["a", "b"]` would deserialise as *two* tiers of one target each, and
+/// a route that declares two peers would silently become an escalation from `a` to `b`.
+/// Peerage inside one set is decided by the route's own selection policy; only the nested
+/// form orders legs, and only the nested form makes a leg wait for its predecessor.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TerminalFallback {
+    /// The historical shape: one leg, whose members are peers of one another.
+    Flat(Vec<String>),
+    /// Declared escalation order: a tier is reachable only once its predecessor is proved out.
+    Tiered(Vec<TerminalTierSpec>),
+}
+
+impl TerminalFallback {
+    /// The declaration as ordered tiers, flattening the historical one-leg shape into a
+    /// single tier so every reader sees one representation.
+    fn tiers(&self) -> Vec<TerminalTierSpec> {
+        match self {
+            Self::Flat(names) => vec![TerminalTierSpec::Many(names.clone())],
+            Self::Tiered(tiers) => tiers.clone(),
+        }
+    }
+
+    /// Every declared target name, in declaration order, borrowed from the declaration.
+    ///
+    /// Separate from [`Self::tiers`] because the target lists here are handed to builders
+    /// that store `&str`: those borrows have to point into the configuration, not into a
+    /// temporary that `tiers` allocated.
+    fn name_refs(&self) -> Vec<&str> {
+        match self {
+            Self::Flat(names) => names.iter().map(String::as_str).collect(),
+            Self::Tiered(tiers) => tiers.iter().flat_map(TerminalTierSpec::names).collect(),
+        }
+    }
+}
+
 /// Which evidence may spend a route's declared terminal fallback.
 ///
 /// A terminal leg exists so that one specific kind of failure does not become the caller's
@@ -363,6 +436,21 @@ pub enum TerminalPolicy {
     /// that the pool's free allowance ran out, and the terminal leg is reserved for the
     /// second case.
     QuotaOnly,
+    /// Capacity or availability failure of the whole pool, but never a credential refusal and
+    /// never a fault that is about this deployment's accounting or this request's size.
+    ///
+    /// The difference from `Capacity` is the two authentication outcomes, plus
+    /// `daily_allowance_unavailable` and `minute_window_too_small`. A rejected key or a
+    /// refused balance says the deployment is misconfigured or unpaid, and spending a
+    /// further leg on it converts a configuration fault into cost without making the request
+    /// any more likely to be answered. An unreadable allowance ledger is an accounting fault
+    /// rather than a measured exhaustion -- the allowance may be untouched -- and a request
+    /// larger than a model's whole minute window can never be served by that model. Every
+    /// other capacity class is accepted -- allowance exhaustion, a minute window, a retryable
+    /// 5xx or 429, a transport fault, a leg that went unavailable, or an attempt that timed
+    /// out -- because those are the ways a healthy deployment legitimately cannot serve right
+    /// now.
+    Availability,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -507,9 +595,9 @@ impl RouteConfig {
     fn served_target_names(&self) -> Vec<&str> {
         let mut names = self.routing_target_names();
         if let Some(terminal) = &self.terminal_fallback {
-            for name in terminal {
-                if !names.contains(&name.as_str()) {
-                    names.push(name.as_str());
+            for name in terminal.name_refs() {
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
         }
@@ -980,13 +1068,19 @@ impl DeploymentConfig {
                 models = models.filtered(&|model| !held_models.contains(model));
             }
             let held = self.route_held(config, &held_models);
-            // The terminal leg is handed to the route as its own model set, never merged with
-            // the candidates, so the ranking machinery cannot see it at all.
+            // The terminal leg is handed to the route as its own model sets, one per declared
+            // tier, never merged with the candidates, so the ranking machinery cannot see it at
+            // all and tier order cannot be re-decided by a cost or latency score.
             let terminal = (!terminal_ids.is_empty()).then(|| {
-                RuntimeModels::new(HashMap::from([(
-                    switchyard_protocol::Category::Any,
-                    terminal_ids.clone(),
-                )]))
+                terminal_ids
+                    .iter()
+                    .map(|tier| {
+                        RuntimeModels::new(HashMap::from([(
+                            switchyard_protocol::Category::Any,
+                            tier.clone(),
+                        )]))
+                    })
+                    .collect::<Vec<_>>()
             });
             let route = Route::new(
                 algorithm,
@@ -1199,8 +1293,8 @@ impl DeploymentConfig {
         &self,
         route_name: &str,
         config: &RouteConfig,
-    ) -> RunnerResult<Vec<ModelId>> {
-        let Some(names) = &config.terminal_fallback else {
+    ) -> RunnerResult<Vec<Vec<ModelId>>> {
+        let Some(declaration) = &config.terminal_fallback else {
             if config.terminal_policy.is_some() {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} declares terminal_policy but no terminal_fallback; a \
@@ -1209,38 +1303,56 @@ impl DeploymentConfig {
             }
             return Ok(Vec::new());
         };
-        if names.is_empty() {
+        let tiers = declaration.tiers();
+        if tiers.is_empty() {
             return Err(RunnerError::configuration(format!(
                 "route {route_name} declares terminal_fallback but names no target"
             )));
         }
         let candidates = config.callable_target_names();
-        let mut resolved: Vec<ModelId> = Vec::new();
-        for name in names {
-            let Some(target) = self.targets.get(name) else {
+        let mut resolved: Vec<Vec<ModelId>> = Vec::new();
+        // Duplicates are refused across the whole declaration, not just inside one tier: a
+        // target named twice would be tried twice under two different exhaustion claims, and
+        // the second attempt would repeat a call the first one already made.
+        let mut seen: Vec<ModelId> = Vec::new();
+        for (index, tier) in tiers.iter().enumerate() {
+            let names = tier.names();
+            if names.is_empty() {
                 return Err(RunnerError::configuration(format!(
-                    "route {route_name} terminal_fallback names unknown target {name}"
-                )));
-            };
-            if candidates.iter().any(|candidate| candidate == name) {
-                return Err(RunnerError::configuration(format!(
-                    "route {route_name} terminal_fallback names {name}, which is also a \
-                     candidate; a terminal leg must not be ranked with the primary pool, or it \
-                     would serve whenever that pool was merely busy"
-                )));
-            }
-            if target.held.is_some() {
-                return Err(RunnerError::configuration(format!(
-                    "route {route_name} terminal_fallback names {name}, which is held; a \
-                     withdrawn target cannot be a last resort"
+                    "route {route_name} terminal_fallback tier {} names no target; an empty \
+                     tier would escalate past a leg that was never consulted",
+                    index + 1
                 )));
             }
-            if resolved.contains(&target.id) {
-                return Err(RunnerError::configuration(format!(
-                    "route {route_name} terminal_fallback names {name} more than once"
-                )));
+            let mut tier_ids: Vec<ModelId> = Vec::new();
+            for name in names {
+                let Some(target) = self.targets.get(name) else {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names unknown target {name}"
+                    )));
+                };
+                if candidates.contains(&name) {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names {name}, which is also a \
+                         candidate; a terminal leg must not be ranked with the primary pool, or \
+                         it would serve whenever that pool was merely busy"
+                    )));
+                }
+                if target.held.is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names {name}, which is held; a \
+                         withdrawn target cannot be a last resort"
+                    )));
+                }
+                if seen.contains(&target.id) {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names {name} more than once"
+                    )));
+                }
+                seen.push(target.id.clone());
+                tier_ids.push(target.id.clone());
             }
-            resolved.push(target.id.clone());
+            resolved.push(tier_ids);
         }
         Ok(resolved)
     }
@@ -2390,9 +2502,13 @@ impl DeploymentConfig {
         // The terminal leg is dispatched through the same router, so its client has to be
         // constructed here even though it is never a ranked candidate.
         let mut contact_names = route.callable_target_names();
-        for name in route.terminal_fallback.iter().flatten() {
-            if !contact_names.contains(&name.as_str()) {
-                contact_names.push(name.as_str());
+        for name in route
+            .terminal_fallback
+            .iter()
+            .flat_map(TerminalFallback::name_refs)
+        {
+            if !contact_names.contains(&name) {
+                contact_names.push(name);
             }
         }
         for name in contact_names {

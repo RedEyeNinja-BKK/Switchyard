@@ -211,6 +211,11 @@ fn runner(source: &str) -> Runner {
 }
 
 async fn call(runner: Runner, input: &str) -> (StatusCode, Value) {
+    call_body(runner, json!({"model": "smart-nt", "input": input})).await
+}
+
+/// Sends an arbitrary request body, so a test can add the fields the real caller sends.
+async fn call_body(runner: Runner, body: Value) -> (StatusCode, Value) {
     let router = switchyard_server::build_switchyard_router(
         switchyard_server::ServerState::from_runner(runner).expect("state builds"),
     );
@@ -220,9 +225,7 @@ async fn call(runner: Runner, input: &str) -> (StatusCode, Value) {
                 .method("POST")
                 .uri("/v1/responses")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({"model": "smart-nt", "input": input}).to_string(),
-                ))
+                .body(Body::from(body.to_string()))
                 .expect("request builds"),
         )
         .await
@@ -239,10 +242,7 @@ async fn call(runner: Runner, input: &str) -> (StatusCode, Value) {
 
 /// Two credentialed backends: the pool's credential and the terminal leg's credential.
 /// Returns the primary pool upstreams (one credential) and the terminal upstream.
-fn pool_and_terminal(
-    pool_script: Script,
-    terminal_script: Script,
-) -> (Upstream, Upstream, String) {
+fn pool_and_terminal(pool_script: Script, terminal_script: Script) -> (Upstream, Upstream, String) {
     let pool = Upstream::new(pool_script);
     let terminal = Upstream::new(terminal_script);
     let pool_url = pool.clone().server();
@@ -264,9 +264,8 @@ fn pool_and_terminal(
 /// credential is spent, so calling `p2` could only repeat it.
 #[tokio::test]
 async fn an_exhausted_pool_credential_serves_from_the_terminal_leg() {
-    let (pool, terminal, config) = pool_and_terminal(account_wide_free_cap, |model| {
-        Some(success(model))
-    });
+    let (pool, terminal, config) =
+        pool_and_terminal(account_wide_free_cap, |model| Some(success(model)));
     let (status, body) = call(runner(&config), "hi").await;
 
     assert_eq!(status, StatusCode::OK, "terminal leg answered: {body}");
@@ -284,7 +283,11 @@ async fn a_policy_refusal_never_reaches_the_terminal_leg() {
     let (status, _) = call(runner(&config), "hi").await;
 
     assert_ne!(status, StatusCode::OK);
-    assert_eq!(terminal.calls(), 0, "the refusal is not retried on a paid leg");
+    assert_eq!(
+        terminal.calls(),
+        0,
+        "the refusal is not retried on a paid leg"
+    );
     assert_eq!(pool.calls(), 1);
 }
 
@@ -292,15 +295,17 @@ async fn a_policy_refusal_never_reaches_the_terminal_leg() {
 /// and the terminal leg stays out of the request.
 #[tokio::test]
 async fn a_model_scoped_quota_is_served_by_the_sibling() {
-    let (pool, terminal, config) = pool_and_terminal(model_scoped_daily_quota, |model| {
-        Some(success(model))
-    });
+    let (pool, terminal, config) =
+        pool_and_terminal(model_scoped_daily_quota, |model| Some(success(model)));
     let (status, body) = call(runner(&config), "hi").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["model"], "bbb/gemini-flash");
     assert_eq!(terminal.calls(), 0);
-    assert_eq!(pool.models().await, vec!["aaa/gemini-lite", "bbb/gemini-flash"]);
+    assert_eq!(
+        pool.models().await,
+        vec!["aaa/gemini-lite", "bbb/gemini-flash"]
+    );
 }
 
 /// A healthy primary pool never reaches the terminal leg. This is the property that keeps
@@ -354,7 +359,9 @@ async fn a_terminal_target_cannot_also_be_a_candidate() {
         "",
         "",
     );
-    let error = Runner::from_toml(&config).err().expect("ambiguous terminal leg is refused");
+    let error = Runner::from_toml(&config)
+        .err()
+        .expect("ambiguous terminal leg is refused");
     let text = error.to_string();
     assert!(
         text.contains("also a candidate"),
@@ -371,7 +378,9 @@ async fn an_unknown_terminal_target_is_refused() {
         client("google", "http://127.0.0.1:1/v1"),
         target("p1", "google", "aaa/gemini-lite"),
     );
-    let error = Runner::from_toml(&config).err().expect("unknown terminal target is refused");
+    let error = Runner::from_toml(&config)
+        .err()
+        .expect("unknown terminal target is refused");
     assert!(
         error.to_string().contains("unknown target ghost"),
         "{error}"
@@ -386,7 +395,9 @@ async fn an_empty_terminal_list_is_refused() {
         client("google", "http://127.0.0.1:1/v1"),
         target("p1", "google", "aaa/gemini-lite"),
     );
-    let error = Runner::from_toml(&config).err().expect("empty terminal list is refused");
+    let error = Runner::from_toml(&config)
+        .err()
+        .expect("empty terminal list is refused");
     assert!(error.to_string().contains("names no target"), "{error}");
 }
 
@@ -394,9 +405,8 @@ async fn an_empty_terminal_list_is_refused() {
 /// declared terminal leg, whether it was crossed, and why.
 #[tokio::test]
 async fn the_routing_log_records_the_terminal_crossing() {
-    let (pool, terminal, config) = pool_and_terminal(account_wide_free_cap, |model| {
-        Some(success(model))
-    });
+    let (pool, terminal, config) =
+        pool_and_terminal(account_wide_free_cap, |model| Some(success(model)));
     let directory = tempfile::tempdir().expect("tempdir");
     let log_path = directory.path().join("routing.jsonl");
     let decision_path = directory.path().join("routing.decisions.jsonl");
@@ -424,11 +434,450 @@ async fn the_routing_log_records_the_terminal_crossing() {
         .expect("body reads");
 
     let text = std::fs::read_to_string(&decision_path).expect("decision log written");
-    let record: Value = serde_json::from_str(text.lines().last().expect("one record"))
-        .expect("record is json");
+    let record: Value =
+        serde_json::from_str(text.lines().last().expect("one record")).expect("record is json");
     assert_eq!(record["terminal"], json!(["zzz/neutral-nt"]));
     assert_eq!(record["terminal_crossed"], json!("primary_pool_exhausted"));
     assert_eq!(record["served"], json!("zzz/neutral-nt"));
     assert_eq!(pool.calls(), 1);
     assert_eq!(terminal.calls(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Ordered tiers.
+//
+// `smart-judge` declares more than one last resort: a free Gemma pool, then a
+// provider-neutral NT leg, then a local one. Those are not peers. Tier n + 1 exists because
+// tier n was proved out, and the declaration order is the escalation order. The tests below
+// name the observation that rules out the alternative for each boundary.
+// ---------------------------------------------------------------------------
+
+/// A backend that answers "the service is unavailable" - capacity evidence for an
+/// `availability` route and evidence of nothing for a quota-only one.
+fn upstream_unavailable(_model: &str) -> Option<(u16, String)> {
+    Some((
+        503,
+        json!({"error": {
+            "code": 503,
+            "message": "The service is currently unavailable",
+            "status": "UNAVAILABLE"
+        }})
+        .to_string(),
+    ))
+}
+
+/// Renders declared tiers of TARGET NAMES as the manifest form. Each tier is written with
+/// brackets so the declaration is unambiguously ordered, even when it has one member.
+fn rendered_tiers(tiers: &[Vec<String>]) -> String {
+    let body = tiers
+        .iter()
+        .map(|tier| {
+            let names = tier
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{names}]")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{body}]")
+}
+
+/// A pool of two legs on one credential, plus one independent backend per terminal tier.
+///
+/// `tier_scripts[i]` answers for every target in tier `i`; `tiers[i][j]` is the slug the
+/// target reports, so an assertion names the tier that answered rather than a position.
+fn cascade(
+    pool_script: Script,
+    tier_scripts: &[Script],
+    tiers: &[&[&str]],
+    policy: &str,
+) -> (Upstream, Vec<Upstream>, String) {
+    let declared: Vec<Vec<String>> = (0..tiers.len())
+        .map(|index| {
+            (0..tiers[index].len())
+                .map(|position| format!("t{index}{position}"))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        tier_scripts.len(),
+        tiers.len(),
+        "every declared tier needs a backend"
+    );
+    let pool = Upstream::new(pool_script);
+    let pool_url = pool.clone().server();
+    let mut config = format!(
+        "schema_version = 1\n{}{}{}",
+        client("google", &pool_url),
+        target("p1", "google", "aaa/gemini-lite"),
+        target("p2", "google", "bbb/gemini-flash"),
+    );
+    let mut backends = Vec::new();
+    for (index, script) in tier_scripts.iter().copied().enumerate() {
+        let backend = Upstream::new(script);
+        let url = backend.clone().server();
+        let name = format!("tier{index}");
+        config.push_str(&client(&name, &url));
+        for (position, slug) in tiers[index].iter().enumerate() {
+            let target_name = format!("t{index}{position}");
+            config.push_str(&target(&target_name, &name, &format!("tier{index}/{slug}")));
+        }
+        backends.push(backend);
+    }
+    config.push_str(&format!(
+        "\n[routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\ntarget = \"p1\"\ncandidates = [\"p2\"]\nterminal_fallback = {}\nterminal_policy = \"{policy}\"\n",
+        rendered_tiers(&declared)
+    ));
+    (pool, backends, config)
+}
+
+/// Runs one request through the decision log and returns the record the route emitted.
+async fn record(config: &str) -> Value {
+    record_with(config, json!({"model": "smart-nt", "input": "hi"})).await
+}
+
+/// Runs one request body through the decision log and returns the record the route emitted.
+async fn record_with(config: &str, body: Value) -> Value {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let log_path = directory.path().join("routing.jsonl");
+    let decision_path = directory.path().join("routing.decisions.jsonl");
+    let state = switchyard_server::ServerState::from_runner(runner(config))
+        .expect("state builds")
+        .with_routing_log(&log_path)
+        .expect("routing log");
+    let router = switchyard_server::build_switchyard_router(state);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    let _ = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    let text = std::fs::read_to_string(&decision_path).expect("decision log written");
+    serde_json::from_str(text.lines().last().expect("one record")).expect("record is json")
+}
+
+/// The historical flat declaration is ONE tier whose members are peers. Written any other
+/// way it would become an escalation, which is the precise meaning this field must not drift
+/// into: two peers of one leg are ranked by the route's own policy, and the record says tier
+/// one answered because both names were consulted inside the same escalation step.
+#[tokio::test]
+async fn a_flat_terminal_declaration_is_one_tier_of_peers() {
+    let pool = Upstream::new(account_wide_free_cap);
+    let pool_url = pool.clone().server();
+    // Two peers of one declared leg. They sit on separate credentials on purpose: a 429
+    // marks the credential that answered it spent, so putting both peers on one backend
+    // would test that rule instead of the one under test here.
+    let first = Upstream::new(account_wide_free_cap);
+    let first_url = first.clone().server();
+    let second = Upstream::new(|model| Some(success(model)));
+    let second_url = second.clone().server();
+    let config = format!(
+        "schema_version = 1\n{}{}{}{}{}{}{}\n[routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\ntarget = \"p1\"\ncandidates = [\"p2\"]\nterminal_fallback = [\"first\", \"second\"]\n",
+        client("google", &pool_url),
+        client("neutral1", &first_url),
+        client("neutral2", &second_url),
+        target("p1", "google", "aaa/gemini-lite"),
+        target("p2", "google", "bbb/gemini-flash"),
+        target("first", "neutral1", "peer/first"),
+        target("second", "neutral2", "peer/second"),
+    );
+
+    let decision = record(&config).await;
+
+    assert_eq!(decision["served"], json!("peer/second"));
+    assert_eq!(
+        decision["terminal_tier"],
+        json!(1),
+        "both names were consulted inside one escalation step: {decision}"
+    );
+    assert!(
+        decision.get("terminal_tiers").is_none(),
+        "a one-tier declaration has no order to report: {decision}"
+    );
+    assert_eq!(first.models().await, vec!["peer/first"]);
+    assert_eq!(second.models().await, vec!["peer/second"]);
+}
+
+/// Tier two is reached only after tier one is proved out, and the record says so.
+#[tokio::test]
+async fn the_second_tier_is_consulted_only_after_the_first_is_proved_out() {
+    let (pool, backends, config) = cascade(
+        account_wide_free_cap,
+        &[account_wide_free_cap, |model| Some(success(model))],
+        &[&["first"], &["second"]],
+        "availability",
+    );
+
+    let decision = record(&config).await;
+
+    assert_eq!(decision["served"], json!("tier1/second"));
+    assert_eq!(decision["terminal_tier"], json!(2));
+    assert_eq!(
+        decision["terminal_tiers"],
+        json!([["tier0/first"], ["tier1/second"]])
+    );
+    assert_eq!(backends[0].models().await, vec!["tier0/first"]);
+    assert_eq!(backends[1].models().await, vec!["tier1/second"]);
+    assert_eq!(pool.calls(), 1);
+}
+
+/// A healthy first tier answers, and the later ones are never contacted. This is the
+/// property that keeps a declared order from becoming a preference list.
+#[tokio::test]
+async fn a_healthy_first_tier_never_reaches_the_second() {
+    let (_pool, backends, config) = cascade(
+        account_wide_free_cap,
+        &[|model| Some(success(model)), |model| Some(success(model))],
+        &[&["first"], &["second"]],
+        "availability",
+    );
+
+    let decision = record(&config).await;
+
+    assert_eq!(decision["served"], json!("tier0/first"));
+    assert_eq!(decision["terminal_tier"], json!(1));
+    assert_eq!(backends[0].calls(), 1);
+    assert_eq!(backends[1].calls(), 0, "the later tier is never touched");
+}
+
+/// A refusal in tier one is an answer about the request. It does not prove tier one is out
+/// of capacity, so it must not advance the cascade - the same rule that governs the primary
+/// pool, applied at each boundary rather than only at the first.
+#[tokio::test]
+async fn a_policy_refusal_in_the_first_tier_never_reaches_the_second() {
+    let (_pool, backends, config) = cascade(
+        account_wide_free_cap,
+        &[permission_denied, |model| Some(success(model))],
+        &[&["first"], &["second"]],
+        "availability",
+    );
+
+    let (status, _) = call(runner(&config), "hi").await;
+
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(backends[0].calls(), 1);
+    assert_eq!(
+        backends[1].calls(),
+        0,
+        "a policy refusal does not buy the next leg"
+    );
+}
+
+/// Declared order is the escalation order, not a ranking. Swapping the same two targets
+/// changes which one is consulted first, which is only true if no selector is choosing.
+#[tokio::test]
+async fn the_declared_order_is_the_escalation_order_not_a_ranking() {
+    let succeed = |model: &str| Some(success(model));
+
+    let (_p1, first_order, config_a) = cascade(
+        account_wide_free_cap,
+        &[succeed, succeed],
+        &[&["alpha"], &["beta"]],
+        "availability",
+    );
+    assert_eq!(record(&config_a).await["served"], json!("tier0/alpha"));
+    assert_eq!(first_order[1].calls(), 0);
+
+    let (_p2, second_order, config_b) = cascade(
+        account_wide_free_cap,
+        &[succeed, succeed],
+        &[&["beta"], &["alpha"]],
+        "availability",
+    );
+    assert_eq!(record(&config_b).await["served"], json!("tier0/beta"));
+    assert_eq!(
+        second_order[1].calls(),
+        0,
+        "the cheaper or faster leg does not jump the declared order"
+    );
+}
+
+/// Every earlier tier is out of capacity, so the last one answers. A 5xx counts for an
+/// `availability` route, which is the difference between this declaration and a quota-only
+/// one: without the wider policy the cascade would stop at tier two.
+#[tokio::test]
+async fn an_unavailable_tier_advances_an_availability_route() {
+    let (_pool, backends, config) = cascade(
+        account_wide_free_cap,
+        &[account_wide_free_cap, upstream_unavailable, |model| {
+            Some(success(model))
+        }],
+        &[&["gemma"], &["luna"], &["local"]],
+        "availability",
+    );
+
+    let decision = record(&config).await;
+
+    assert_eq!(decision["served"], json!("tier2/local"));
+    assert_eq!(decision["terminal_tier"], json!(3));
+    assert_eq!(backends[0].calls(), 1);
+    assert_eq!(backends[1].calls(), 1);
+    assert_eq!(backends[2].calls(), 1);
+}
+
+/// The control for the test above. The same failures under the historical policy stop at
+/// tier two, because a 5xx is not quota evidence. If this control ever passes, the wider
+/// policy is not what advanced the cascade and the test above proves nothing.
+#[tokio::test]
+async fn a_quota_only_route_does_not_advance_on_a_5xx() {
+    let (_pool, backends, config) = cascade(
+        account_wide_free_cap,
+        &[account_wide_free_cap, upstream_unavailable, |model| {
+            Some(success(model))
+        }],
+        &[&["gemma"], &["luna"], &["local"]],
+        "quota_only",
+    );
+
+    let (status, _) = call(runner(&config), "hi").await;
+
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(backends[1].calls(), 1);
+    assert_eq!(
+        backends[2].calls(),
+        0,
+        "a 5xx is not quota evidence for a quota-only route"
+    );
+}
+
+/// A target named in two tiers would be tried twice under two different exhaustion claims,
+/// so the declaration is refused at load.
+#[tokio::test]
+async fn a_target_repeated_across_tiers_is_refused() {
+    let config = format!(
+        "schema_version = 1\n{}{}{}\n[routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\ntarget = \"p1\"\ncandidates = []\nterminal_fallback = [[\"last\"], [\"last\"]]\n",
+        client("google", "http://127.0.0.1:1/v1"),
+        target("p1", "google", "aaa/gemini-lite"),
+        target("last", "google", "zzz/neutral-nt"),
+    );
+    let error = Runner::from_toml(&config)
+        .err()
+        .expect("a repeated terminal target is refused");
+    assert!(
+        error.to_string().contains("more than once"),
+        "refusal names the repetition: {error}"
+    );
+}
+
+/// An empty tier would escalate past a leg that was never consulted, so it is a startup
+/// error rather than a silent skip.
+#[tokio::test]
+async fn an_empty_tier_is_refused() {
+    let config = format!(
+        "schema_version = 1\n{}{}{}\n[routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\ntarget = \"p1\"\ncandidates = []\nterminal_fallback = [[\"last\"], []]\n",
+        client("google", "http://127.0.0.1:1/v1"),
+        target("p1", "google", "aaa/gemini-lite"),
+        target("last", "google", "zzz/neutral-nt"),
+    );
+    let error = Runner::from_toml(&config)
+        .err()
+        .expect("an empty tier is refused");
+    assert!(
+        error.to_string().contains("tier 2 names no target"),
+        "refusal names the empty tier: {error}"
+    );
+}
+
+/// The judge's real turns carry tools, and a tool-bearing request must still reach the later
+/// tiers. This is the contract that decides whether the third tier is usable at all: a leg
+/// excluded from every tool-bearing turn would answer nothing that matters. The target here
+/// declares no tool-calling fact, which the gate reads as uncharacterised rather than
+/// incapable - the same rule that lets a newly added leg serve before it is characterised.
+#[tokio::test]
+async fn a_tool_bearing_judge_turn_reaches_the_later_tier() {
+    let (_pool, backends, config) = cascade(
+        account_wide_free_cap,
+        &[account_wide_free_cap, |model| Some(success(model))],
+        &[&["luna"], &["local"]],
+        "availability",
+    );
+
+    let (status, body) = call_body(
+        runner(&config),
+        json!({
+            "model": "smart-nt",
+            "input": "verdict please",
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the tool-bearing turn was served: {body}"
+    );
+    assert_eq!(body["model"], "tier1/local");
+    assert_eq!(backends[1].calls(), 1);
+}
+
+/// The paired control for the test above: a tier whose target explicitly refuses tools is not
+/// dispatchable for that request, so it is never called and the cascade stops rather than
+/// escalating past a leg it could not use. Without this, "the tool-bearing turn was served"
+/// could be true because the tool check never ran.
+#[tokio::test]
+async fn an_unfit_tier_is_neither_dispatched_nor_skipped_over() {
+    let pool = Upstream::new(account_wide_free_cap);
+    let pool_url = pool.clone().server();
+    let luna = Upstream::new(account_wide_free_cap);
+    let luna_url = luna.clone().server();
+    // The local leg cannot carry tools, and says so.
+    let local = Upstream::new(|model| Some(success(model)));
+    let local_url = local.clone().server();
+    let config = format!(
+        "schema_version = 1\n{}{}{}{}{}{}{}\n[routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\ntarget = \"p1\"\ncandidates = [\"p2\"]\nterminal_fallback = [[\"t00\"], [\"t10\"]]\nterminal_policy = \"availability\"\n",
+        client("google", &pool_url),
+        client("tier0", &luna_url),
+        client("tier1", &local_url),
+        target("p1", "google", "aaa/gemini-lite"),
+        target("p2", "google", "bbb/gemini-flash"),
+        target("t00", "tier0", "tier0/luna"),
+        format!(
+            "\n[targets.t10]\nid = \"tier1/local\"\nllm_client = \"tier1\"\ntool_calling = false\n"
+        ),
+    );
+
+    let decision = record_with(
+        &config,
+        json!({
+            "model": "smart-nt",
+            "input": "verdict please",
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }),
+    )
+    .await;
+
+    // `calls()` alone cannot tell "never dispatched" from "dispatched and refused before the
+    // wire", because the send path applies the same gate. The tier index can: a cascade that
+    // entered the unfit tier reports tier 2 even though no request left the process.
+    assert_eq!(decision["outcome"], json!("failed"));
+    assert_eq!(
+        decision["terminal_tier"],
+        json!(1),
+        "the cascade stopped at the tier it could use: {decision}"
+    );
+    assert_eq!(luna.calls(), 1, "the first tier was still consulted");
+    assert_eq!(
+        local.calls(),
+        0,
+        "a tier that cannot carry this request is not dispatched"
+    );
 }

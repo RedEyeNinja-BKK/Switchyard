@@ -255,6 +255,16 @@ struct RoutingDecisionRecord<'a> {
     /// pool exhaustion from a leg that was simply reached.
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_crossed: Option<&'static str>,
+    /// The ordered tiers the terminal declaration was written as, when it had more than one.
+    ///
+    /// Omitted for the historical single-set shape, so existing records read exactly as they
+    /// did. Present only when the manifest declared an escalation order, because that is the
+    /// only case where the flat `terminal` union could be misread as one peer pool.
+    #[serde(skip_serializing_if = "terminal_tiers_are_not_a_sequence")]
+    terminal_tiers: Vec<Vec<String>>,
+    /// One-based index of the tier that answered, when the leg was crossed at a tier boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_tier: Option<usize>,
     attempts: Vec<AttemptDecision>,
 }
 
@@ -297,6 +307,8 @@ impl<'a> RoutingDecisionRecord<'a> {
             terminal_crossed: trace
                 .terminal_crossed
                 .then(|| trace.terminal_reason.unwrap_or("terminal")),
+            terminal_tiers: trace.terminal_tiers.clone(),
+            terminal_tier: trace.terminal_tier,
             attempts: trace
                 .attempts
                 .iter()
@@ -309,6 +321,15 @@ impl<'a> RoutingDecisionRecord<'a> {
                 .collect(),
         }
     }
+}
+
+/// Whether the tiered form would add nothing the flat `terminal` union does not already say.
+///
+/// A declaration written as one set — including every manifest that predates tiers — has no
+/// escalation order to record, and emitting `[[a, b]]` beside `[a, b]` would invite a reader to
+/// believe an order was declared. Only a genuine sequence is serialized.
+fn terminal_tiers_are_not_a_sequence(tiers: &[Vec<String>]) -> bool {
+    tiers.len() <= 1
 }
 
 /// Session totals returned by the routing stats endpoint.
@@ -507,8 +528,10 @@ mod tests {
             promotion: None,
             pool: None,
             terminal: Vec::new(),
+            terminal_tiers: Vec::new(),
             terminal_crossed: false,
             terminal_reason: None,
+            terminal_tier: None,
         };
         log.append_decision(
             RoutingLogContext {

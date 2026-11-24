@@ -17,7 +17,9 @@ Order matters and is deliberate:
      tool requests, which is only legal behind a route that already refuses;
   5. normalise the remaining absent declarations (video, carriers, inherited
      flags) with the existing safe reconciler;
-  6. run the P9 contract over the result.
+  6. qualify five documented model-level tool flags from official vendor docs
+     under explicit owner authorization (no new model or route admission);
+  7. run the unchanged P9 contract over the result.
 
 Usage:
   python3 build_p9_candidate.py --baseline CURRENT/routes.toml \
@@ -87,6 +89,14 @@ def main(argv=None) -> int:
             PY, str(HERE / "reconcile_direct_capability_declarations.py"),
             "--baseline", str(out / "4-targets-refused.toml"),
             "--out", str(out / "5-candidate.toml")], (0, 2)),
+        # Owner-approved 2026-11-24: official vendor model cards qualify model
+        # tool support on five pre-admitted 1:1 routes, without wasting another
+        # provider-day on 429/503 probes. No credential/billing call here.
+        ("official-model-docs", [
+            PY, str(HERE / "qualification" / "apply_official_model_tool_caps.py"),
+            "--baseline", str(out / "5-candidate.toml"),
+            "--evidence", str(HERE / "qualification" / "official-model-tool-capabilities.json"),
+            "--out", str(out / "6-candidate.toml")], (0,)),
     ]
     for name, command, accept in steps:
         ok, _ = run(name, command, accept)
@@ -95,7 +105,7 @@ def main(argv=None) -> int:
             return 1
 
     gate = [PY, str(HERE / "direct_capability_gate.py"),
-            "--manifest", str(out / "5-candidate.toml")]
+            "--manifest", str(out / "6-candidate.toml")]
     if args.models:
         gate += ["--models", str(args.models)]
     ok, output = run("p9-gate", gate)

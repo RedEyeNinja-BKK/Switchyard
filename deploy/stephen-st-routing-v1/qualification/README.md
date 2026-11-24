@@ -1,5 +1,23 @@
 # P9 qualification matrix — direct capability declarations, 2026-11-24
 
+## LATEST OWNER AUTHORIZATION — DOCUMENTED MODEL CAPABILITIES ARE SUFFICIENT; NO PAID TOOL PROBES
+
+The owner explicitly directs Switchyard to use **official vendor model documentation/model cards**, rather than spending more provider allowance on repeat tool-call probes. **This supersedes the older five `BLOCKED_PROVIDER_PROOF` release requirements and the prior "no release this cycle" hold for the specific capability propagation.**
+
+**Source is now committed in this PR:** `official-model-tool-capabilities.json` lists five exact direct aliases/models and official references:
+- owner + Stephen `gemini-3.8-flash`: [Google AI Studio model specification](https://aistudio.google.com/docs/models/gemini-3.8-flash), explicitly **Function calling Supported**;
+- `gpt-6-luna` and the `-nt` profile: [OpenAI GPT-6 Luna model specification](https://developers.openai.com/api/docs/models/gpt-6-luna), **Responses API function calling**;
+- `gpt-6-sol`: [OpenAI GPT-6 Sol model specification](https://developers.openai.com/api/docs/models/gpt-6-sol), **Responses API function calling**.
+
+The script `apply_official_model_tool_caps.py` refuses unknown/mismatched route, model, client wire, preexisting false declaration, or any unexpected TOML delta. `build_p9_candidate.py` now applies this **exact five-target stage after existing step 5**, writes `6-candidate.toml` and runs the unchanged strict P9 gate against the **final** result. No API calls, keys, billing, account crossover, or default capability widening. The owner and Stephen routes both point to the same documented Gemini model but retain separate credentials and quotas. Luna and Luna NT use the same documented model and separate target profiles.
+
+**Evidence truth:** classify these five as `OFFICIAL_MODEL_DOC` / `DOCUMENTED_MODEL_CAPABILITY` — NEVER fake `LIVE_TOOL_CALL`. A documented model feature is not a successful owner/Stephen HTTP request or proof of current available capacity. Preserve 429/503 telemetry honestly as **availability/quota** outcomes, NOT evidence that the upstream model lacks function calling. Existing 69 measured/refusal/retired + four explicitly owner-accepted `SHARED_MODEL_SPEC` qualifications are unchanged.
+
+**Important temporal distinction:** the committed `p9-matrix.json` and `gate-chain.json` are the **PRE-OWNER-OVERRIDE historical 78→5 evidence snapshot**. Do not rewrite their original source receipts as if they had proved the five. The final `6-candidate.toml` and its P9 check must be freshly derived by Turnstone from the same CURRENT source (and combined with PR #51's nested-tier manifest at release stage); expected result is 0 remaining target capability findings, but do NOT claim a measured P9 PASS until the local strict gate exits 0. Rebuild the matrix/acceptance ledger with an explicit new `OFFICIAL_MODEL_DOC` category and pinned provenance, without requiring provider calls. Run normal offline syntax, Rust compatibility and paired-binary/manifest checks only. **Do not raise another owner approval/paid-probe question to promote these already documented capabilities.**
+
+**Delivery:** Turnstone is directed to finish the finite source/test/release path through the established **Issue #35 single production writer**, preserving exact CURRENT rollback and change receipts. Owner is explicitly asking to pass the documented capabilities to Switchyard now. This is not a blanket P9 waiver or permission for unrelated route or credential changes.
+
+
 ## Owner disposition — four SHARED_MODEL_SPEC rows ACCEPTED as model-level evidence (2026-11-24)
 
 **Explicit owner decision:** ACCEPT the four **`SHARED_MODEL_SPEC`** target `tool_calling=true` qualifications on owner routes `direct-google-gemini-3.1-flash-lite`, `direct-google-gemini-3.5-flash-lite`, `direct-google-gemini-3.6-flash`, and `direct-google-gemini-4-hydrogen`. Their direct routes already advertise `tool_calling=true`; each row in `p9-matrix.json` names the same upstream model's `direct-google-stephen-*` successful completed-tool-call `witness_route` through the `openai_chat` wire. This is **evidence of model-level tool support** sufficient for the proposed *declaration* at P9, not a measured tool call with the owner's `google_gemini` credential.

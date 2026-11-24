@@ -187,6 +187,76 @@ fn required_tokens(request: &Request) -> u64 {
         .map_or(input, |reservation| input.saturating_add(reservation))
 }
 
+/// The exclusion codes that say a target could not *hold* this request.
+///
+/// Closed vocabulary. Every one of these is a fact about the size of the request against a
+/// limit of one target, so asking the next tier the same question is meaningful. Codes
+/// outside this list are not: a capability the request needs, a credential or a balance the
+/// deployment lost, an accounting fault, or a policy refusal would be re-learned at the next
+/// tier with a bill attached, and would tell the caller nothing they could act on.
+fn is_request_fit_exclusion(code: &str) -> bool {
+    matches!(
+        code,
+        "context_window"
+            | "max_input_tokens"
+            | "minute_window_too_small"
+            | "output_budget_below_thinking_floor"
+    )
+}
+
+/// Whether a pool that admitted nothing did so only because no target could hold the request,
+/// and the request is one this route is authorized to serve at all.
+///
+/// This is deliberately NOT one of [`authorize_terminal`]'s answers. "The pool ran out" is a
+/// claim about capacity; "no candidate can hold this request" is a claim about size, and the
+/// two lead somewhere different. Reading a size refusal as exhaustion would let a metered tier
+/// absorb a request the deployment never declared it could serve and would hide from the
+/// caller that their prompt was the problem. Refusing to escalate at all leaves a request that
+/// an authorized wider tier can serve unanswered.
+///
+/// `route_accepts` is the route's own capability declaration read against the request. It is
+/// required because the per-target gates test size *before* capabilities, so a request that
+/// needs vision can still show nothing but size exclusions here; without this the route would
+/// escalate a request it never promised to serve. It also covers the request-level controls
+/// the owner named: a malformed payload, a missing capability, a policy refusal and an invalid
+/// judgment all fail either this check or the exclusion vocabulary below.
+///
+/// Every candidate must be excluded, and every exclusion must be a size fact. One candidate
+/// the pool simply could hold means the pool is not empty and this function is not reached; one
+/// exclusion for another reason means the next tier would be asked to answer a question about
+/// the request rather than about capacity.
+pub(crate) fn authorize_fit_escalation(
+    route_accepts: bool,
+    gates: &[Result<(), &'static str>],
+) -> Option<&'static str> {
+    if !route_accepts || gates.is_empty() {
+        return None;
+    }
+    if !gates.iter().all(|gate| match gate {
+        Err(code) => is_request_fit_exclusion(code),
+        Ok(()) => false,
+    }) {
+        return None;
+    }
+    Some("primary_pool_cannot_hold_request")
+}
+
+/// Whether every target in one declared tier was excluded only because it could not hold the
+/// request.
+///
+/// This is the tier-level form of [`authorize_fit_escalation`], and it answers exactly one
+/// question: may the ordered walk continue past a tier that admitted nothing? It may, only
+/// when the reason is the same one the primary pool gave. A tier whose targets refused for any
+/// other reason ends the walk, because the next tier would be consulted on a claim about the
+/// request that has already been settled.
+fn tier_cannot_hold(gates: &[Result<(), &'static str>]) -> bool {
+    !gates.is_empty()
+        && gates.iter().all(|gate| match gate {
+            Err(code) => is_request_fit_exclusion(code),
+            Ok(()) => false,
+        })
+}
+
 /// Hands the route's decision record to whichever observer the caller supplied.
 ///
 /// Cloning only when someone is listening keeps the cost of the record to the routes that
@@ -617,6 +687,15 @@ pub struct Route {
     /// Which evidence may spend `terminal`. Configuration sets this per route; the default
     /// is the historical capacity rule, so a route that names no policy behaves as before.
     terminal_policy: TerminalPolicy,
+    /// Whether a request that no primary candidate can hold may be escalated to the declared
+    /// tiers.
+    ///
+    /// A separate axis from `terminal_policy` on purpose. That one governs a pool that
+    /// *failed*; this one governs a pool that never dispatched, because the request is larger
+    /// than any of its targets can hold. Escalating on a size refusal is not a redefinition of
+    /// capacity exhaustion -- it is a different claim, recorded under its own reason, and the
+    /// tier that receives the request is judged on its own gates.
+    fit_escalation: bool,
 }
 
 /// A route whose targets are all held out of service, with the evidence for holding it.
@@ -673,6 +752,7 @@ impl Route {
             pool_groups: None,
             terminal: Vec::new(),
             terminal_policy: TerminalPolicy::default(),
+            fit_escalation: false,
         }
     }
 
@@ -695,6 +775,21 @@ impl Route {
     /// last resort can be narrower than a lane whose fallback is an ordinary peer.
     pub fn with_terminal_policy(mut self, policy: TerminalPolicy) -> Self {
         self.terminal_policy = policy;
+        self
+    }
+
+    /// Declares whether a request no primary candidate can hold may reach the tiers.
+    ///
+    /// Only meaningful beside `with_terminal_fallback`; configuration refuses the option
+    /// without a leg to escalate to. Off is the historical behaviour: the pool admitted
+    /// nothing, so the caller is told what did not fit and no further leg is contacted.
+    ///
+    /// On does not widen any tier. It changes one thing: a pool that dispatched nothing is
+    /// asked the size question of each declared tier in order, instead of being refused
+    /// before the tiers are looked at. A tier that cannot hold the request either ends the
+    /// walk with the same refusal.
+    pub fn with_fit_escalation(mut self, enabled: bool) -> Self {
+        self.fit_escalation = enabled;
         self
     }
 
@@ -1307,6 +1402,36 @@ impl Route {
                     .collect()
             })
             .collect();
+        // The same tier boundaries judged by the block gate, keeping each target's refusal
+        // code rather than only the survivors. A tier that admitted nothing has to be able to
+        // say whether that was a size fact -- in which case the ordered walk continues -- or
+        // something the next tier would re-learn at a price.
+        let terminal_verdicts: Vec<Vec<Result<(), &'static str>>> = self
+            .terminal
+            .iter()
+            .map(|tier| {
+                tier.all_models()
+                    .into_iter()
+                    .map(|model| verdict(&model))
+                    .collect()
+            })
+            .collect();
+        // A request that no primary candidate can hold is a different claim from a pool that
+        // ran out, and the route has to say which one it is making. This is computed before
+        // the request is moved into the reasoning rewrite, and it is the only place a size
+        // escalation is authorized: `route_accepts` is the route's own declaration read
+        // against the request, so a request the lane never promised to serve (vision, a
+        // reasoning control it refuses) is refused here rather than handed to a metered tier.
+        let route_accepts = crate::request_fit::unsupported_capability(
+            self.capabilities,
+            &request.llm_request,
+            &raw,
+        )
+        .is_none();
+        let fit_escalation = self
+            .fit_escalation
+            .then(|| authorize_fit_escalation(route_accepts, &verdicts))
+            .flatten();
         let models = self.models.filtered(&|model| verdict(model).is_ok());
         // Among candidates that survived every hard gate, a route may prefer what this
         // deployment has actually observed. This reorders one already-admitted list and
@@ -1483,8 +1608,14 @@ impl Route {
             terminal_crossed: false,
             terminal_reason: None,
             terminal_tier: None,
+            // Filled only as the walk actually reaches a tier and finds it empty. A tier the
+            // walk never reached is absent, so `terminal_crossed = false` plus an empty list
+            // means "the tiers were never consulted", not "the tiers were consulted and
+            // refused". The precomputed `terminal_verdicts` are deliberately NOT recorded here:
+            // a gate being evaluated is not the same as a boundary being crossed.
+            terminal_skipped: Vec::new(),
         };
-        if models.is_empty() {
+        if models.is_empty() && fit_escalation.is_none() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
             // an empty attempt list. Emitted before either refusal so the caller and the
             // routing log name the same reason.
@@ -1549,32 +1680,49 @@ impl Route {
         // A terminal leg is a last resort. Keep a copy of the shaped request only when one
         // exists, so the common route pays nothing for a capability it does not have.
         let terminal_request = (!self.terminal.is_empty()).then(|| request.clone());
-        let mut result = switchyard_llm_client::run(
-            Arc::clone(&self.algorithm),
-            self.clients.clone(),
-            request,
-            Arc::new(models.clone()),
-            run_observer.clone(),
-        )
-        .await;
+        // A pool that admitted nothing has nothing to dispatch, so there is no call to fail.
+        // The error exists only to carry the refusal if no authorized tier can hold the
+        // request either; `attempts` stays empty, which is what makes the record say
+        // `no_eligible_candidate` rather than `failed`.
+        let mut result = if models.is_empty() {
+            Err(RunnerError::unsupported_capability(
+                self.algorithm.name(),
+                self.physical_ineligibility(&request)
+                    .unwrap_or("an eligible route"),
+            ))
+        } else {
+            switchyard_llm_client::run(
+                Arc::clone(&self.algorithm),
+                self.clients.clone(),
+                request,
+                Arc::new(models.clone()),
+                run_observer.clone(),
+            )
+            .await
+            .map_err(RunnerError::from)
+        };
         if let Some(terminal_request) = terminal_request
             && result.is_err()
         {
-            // The primary pool failed. Before anything is spent on the terminal leg, the
-            // claim "the pool is exhausted" has to be true of the same gates the order used
-            // and of what the dispatch actually observed. A single rate limit, a policy
-            // refusal, or a request that never fit is not that claim.
+            // The primary pool could not answer. Before anything is spent on the terminal
+            // leg, the claim has to be true of the same gates the order used and of what the
+            // dispatch actually observed. A single rate limit, a policy refusal, or a request
+            // that never fit is not that claim -- unless this route declared that a size
+            // refusal is exactly what the tiers are for, in which case the claim is
+            // "no candidate in the pool can hold it" and it is recorded under its own reason.
             //
             // Each boundary is authorized separately against the set it is leaving, never
             // against the union: tier 2 is only reachable once tier 1 has itself been proved
             // out, which is the entire difference between an ordered declaration and a peer
             // pool. The union would let "the second tier looks cheaper" skip the first.
-            let mut authorization = self.terminal_authorization(
-                &capable_legs,
-                &dispatchable_legs,
-                &attempts.lock().clone(),
-                blocks,
-            );
+            let mut authorization = fit_escalation.or_else(|| {
+                self.terminal_authorization(
+                    &capable_legs,
+                    &dispatchable_legs,
+                    &attempts.lock().clone(),
+                    blocks,
+                )
+            });
             for (index, tier) in self.terminal.iter().enumerate() {
                 let Some(reason) = authorization else { break };
                 let servable = tier.filtered(&|model| terminal_servable[index].contains(model));
@@ -1583,16 +1731,44 @@ impl Route {
                     // must not be re-pointed at an empty set. Its own gates still decide
                     // whether the next boundary is reachable: a declared tier that no
                     // request could ever fit is a coverage gap, not exhaustion.
-                    authorization = self.terminal_authorization(
-                        &terminal_capable[index],
-                        &terminal_servable[index],
-                        &attempts.lock().clone(),
-                        blocks,
-                    );
+                    //
+                    // The walk has reached this tier, so its exclusions are a traversal fact
+                    // and are recorded -- a target absent from the record was never consulted.
+                    for (model, gate) in tier
+                        .all_models()
+                        .into_iter()
+                        .zip(terminal_verdicts[index].iter())
+                    {
+                        if let Err(code) = gate {
+                            trace.terminal_skipped.push((model.to_string(), *code));
+                        }
+                    }
+                    // A size boundary keeps the walk alive on its own claim. Every target
+                    // here being unable to *hold* the request is the same fact the pool
+                    // reported, and the next tier is asked the same question; any other
+                    // refusal ends the walk, because the next tier would be asked to settle
+                    // something about the request rather than about capacity.
+                    authorization = fit_escalation
+                        .filter(|_| tier_cannot_hold(&terminal_verdicts[index]))
+                        .or_else(|| {
+                            self.terminal_authorization(
+                                &terminal_capable[index],
+                                &terminal_servable[index],
+                                &attempts.lock().clone(),
+                                blocks,
+                            )
+                        });
                     continue;
                 }
                 trace.terminal_crossed = true;
-                trace.terminal_reason = Some(reason);
+                // The entry authorization is what an operator needs: it is the claim that
+                // opened the terminal leg at all. A later boundary re-derives its own reason
+                // because it is leaving a different set, but overwriting this would lose the
+                // fact that the walk started on size rather than on capacity -- both true,
+                // and only the first explains why the pool was never called.
+                if trace.terminal_reason.is_none() {
+                    trace.terminal_reason = Some(reason);
+                }
                 trace.terminal_tier = Some(index + 1);
                 result = switchyard_llm_client::run(
                     Arc::clone(&self.algorithm),
@@ -1601,7 +1777,8 @@ impl Route {
                     Arc::new(servable),
                     run_observer.clone(),
                 )
-                .await;
+                .await
+                .map_err(RunnerError::from);
                 if result.is_ok() {
                     break;
                 }
@@ -1634,6 +1811,11 @@ impl Route {
                         .or_else(|| Some(selected_model.to_string()));
                     trace.outcome = "served";
                 }
+                // Nothing was dispatched at all, so nothing failed: every candidate the route
+                // could reach was unable to hold the request. Reporting `failed` here would
+                // blame a deployment that was never asked, and would hide the request-fit
+                // answer the caller needs.
+                Err(_) if trace.attempts.is_empty() => trace.outcome = "no_eligible_candidate",
                 // Every candidate was eligible and at least one was dispatched, so an error
                 // here is a deployment fault rather than a request the route could not fit.
                 Err(_) => trace.outcome = "failed",
@@ -2222,5 +2404,112 @@ mod terminal_authorization_tests {
             ),
             Some("primary_pool_blocked")
         );
+    }
+}
+
+#[cfg(test)]
+mod fit_escalation_tests {
+    use super::{authorize_fit_escalation, is_request_fit_exclusion, tier_cannot_hold};
+
+    /// The vocabulary is closed on purpose. Every code listed here is a size fact about one
+    /// target, so asking the next tier the same question is meaningful. Anything else is a
+    /// statement about the request or the deployment, which a metered tier cannot change.
+    #[test]
+    fn the_fit_vocabulary_is_exactly_the_size_facts() {
+        for code in [
+            "context_window",
+            "max_input_tokens",
+            "minute_window_too_small",
+            "output_budget_below_thinking_floor",
+        ] {
+            assert!(is_request_fit_exclusion(code), "{code} is a size fact");
+        }
+        for code in [
+            "tool_calling",
+            "vision",
+            "video",
+            "reasoning",
+            "unsupported_capability",
+            "credential_missing",
+            "account_balance",
+            "no_eligible_candidate",
+            "primary_pool_blocked",
+            "invalid_request",
+            "",
+        ] {
+            assert!(
+                !is_request_fit_exclusion(code),
+                "{code} must not escalate on its own"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pool_emptied_only_by_size_authorizes_the_tier_walk() {
+        assert_eq!(
+            authorize_fit_escalation(true, &[Err("max_input_tokens"), Err("max_input_tokens")]),
+            Some("primary_pool_cannot_hold_request")
+        );
+        // Mixed size reasons are still all size reasons.
+        assert_eq!(
+            authorize_fit_escalation(
+                true,
+                &[Err("context_window"), Err("minute_window_too_small")]
+            ),
+            Some("primary_pool_cannot_hold_request")
+        );
+    }
+
+    #[test]
+    fn a_request_the_route_never_promised_is_not_authorized() {
+        // The per-target gates test size before capabilities, so a request needing vision can
+        // show nothing but size exclusions. The route's own declaration is the only thing that
+        // keeps the walk from serving it.
+        assert_eq!(
+            authorize_fit_escalation(false, &[Err("max_input_tokens")]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reason_other_than_size_is_not_authorized() {
+        assert_eq!(
+            authorize_fit_escalation(true, &[Err("max_input_tokens"), Err("tool_calling")]),
+            None
+        );
+        assert_eq!(
+            authorize_fit_escalation(true, &[Err("credential_missing")]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_could_hold_it_means_the_pool_is_not_empty() {
+        // Reached only by a caller that asked the wrong question, but answering `Some` here
+        // would let a served request be re-sent to a metered tier.
+        assert_eq!(
+            authorize_fit_escalation(true, &[Err("max_input_tokens"), Ok(())]),
+            None
+        );
+    }
+
+    #[test]
+    fn no_candidates_at_all_is_not_a_size_claim() {
+        assert_eq!(authorize_fit_escalation(true, &[]), None);
+        assert_eq!(authorize_fit_escalation(false, &[]), None);
+    }
+
+    #[test]
+    fn a_tier_is_passed_over_only_when_every_target_refused_on_size() {
+        assert!(tier_cannot_hold(&[
+            Err("max_input_tokens"),
+            Err("context_window")
+        ]));
+        assert!(!tier_cannot_hold(&[]));
+        assert!(!tier_cannot_hold(&[Err("max_input_tokens"), Ok(())]));
+        assert!(!tier_cannot_hold(&[
+            Err("max_input_tokens"),
+            Err("tool_calling")
+        ]));
     }
 }

@@ -302,6 +302,24 @@ struct RouteConfig {
     /// no terminal leg is refused rather than ignored, because a policy that governs nothing
     /// reads as a guarantee it cannot provide.
     terminal_policy: Option<TerminalPolicy>,
+    /// Whether a request no primary candidate can hold may be escalated to the declared
+    /// tiers.
+    ///
+    /// Absent is the historical behaviour and stays the default: the pool admitted nothing,
+    /// the caller is told what did not fit, and no further leg is contacted. Declared, it is
+    /// a second and narrower claim beside `terminal_policy` -- not a wider reading of it.
+    ///
+    /// The two are deliberately separate axes. `terminal_policy` decides what may spend the
+    /// leg when the pool *failed*: an allowance gone, a throttle, an outage. This decides
+    /// whether a pool that never dispatched anything may hand the request to the next tier
+    /// because the request is larger than the pool can hold. Reading a size refusal as
+    /// capacity exhaustion would let a metered tier absorb a request the deployment never
+    /// promised to serve and would hide from the caller that their prompt was the problem;
+    /// refusing to escalate at all strands a request an authorized wider tier can serve.
+    ///
+    /// It cannot widen what any tier accepts: each tier is judged on its own gates, and a
+    /// request that fails them ends the walk with the refusal the primary pool gave.
+    fit_escalation: Option<bool>,
     /// Target this route prefers once it is under context pressure.
     ///
     /// Named rather than inferred: a target's context window is not a fact this config
@@ -517,6 +535,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let pool_groups = take_optional(&mut table, "pool_groups")?;
         let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
         let terminal_policy = take_optional(&mut table, "terminal_policy")?;
+        let fit_escalation = take_optional(&mut table, "fit_escalation")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
         let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -536,6 +555,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             pool_groups,
             terminal_fallback,
             terminal_policy,
+            fit_escalation,
             escalation_target,
             selection: selection.unwrap_or_default(),
             algorithm,
@@ -1124,7 +1144,8 @@ impl DeploymentConfig {
             let route = match terminal {
                 Some(terminal) => route
                     .with_terminal_fallback(terminal)
-                    .with_terminal_policy(config.terminal_policy.unwrap_or_default()),
+                    .with_terminal_policy(config.terminal_policy.unwrap_or_default())
+                    .with_fit_escalation(config.fit_escalation.unwrap_or(false)),
                 None => route,
             };
             // A measured route ranks candidates only after it has evidence, and shares that
@@ -1299,6 +1320,13 @@ impl DeploymentConfig {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} declares terminal_policy but no terminal_fallback; a \
                      policy that governs no leg would read as a guarantee it cannot provide"
+                )));
+            }
+            if config.fit_escalation == Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares fit_escalation but no terminal_fallback; a \
+                     size refusal would have no wider tier to escalate to, so the option would \
+                     read as a guarantee it cannot provide"
                 )));
             }
             return Ok(Vec::new());
@@ -7376,5 +7404,109 @@ selection = "measured"
                 .unsupported_reasoning_effort
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod fit_escalation_config_tests {
+    use super::*;
+
+    /// Loads a deployment that must be refused, returning the refusal text.
+    ///
+    /// Matched rather than unwrapped because `Runner` has no `Debug`; a successful load panics
+    /// instead of being reported as a refusal.
+    fn refuse(source: &str) -> String {
+        match runner_from_toml(source) {
+            Ok(_) => panic!("deployment loaded but should have been refused"),
+            Err(error) => format!("{error}"),
+        }
+    }
+
+    /// A deployment whose route opts into fit escalation but declares no wider tier refuses to
+    /// load. The option promises a request its pool cannot hold will still be answered, and
+    /// without a terminal leg there is nothing that could answer it.
+    #[test]
+    fn fit_escalation_without_a_terminal_leg_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.judge]
+id = "judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+fit_escalation = true
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("fit_escalation"),
+            "refusal must name the option, got: {message}"
+        );
+        assert!(
+            message.contains("terminal_fallback"),
+            "refusal must name the missing declaration, got: {message}"
+        );
+    }
+
+    /// The same route with one declared tier loads. This is the control for the refusal above:
+    /// the guard must bite on the missing declaration, not on the option itself.
+    #[test]
+    fn fit_escalation_with_a_terminal_leg_loads() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[targets.wider]
+id = "wider/model"
+llm_client = "google"
+
+[routes.judge]
+id = "judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+terminal_fallback = [["wider"]]
+fit_escalation = true
+"#;
+        runner_from_toml(config).expect("a route with a wider tier may declare fit_escalation");
+    }
+
+    /// Declaring the option off is the pre-change behaviour and must not require a tier.
+    #[test]
+    fn fit_escalation_off_does_not_require_a_tier() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.judge]
+id = "judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+fit_escalation = false
+"#;
+        runner_from_toml(config).expect("fit_escalation = false is the default behaviour");
     }
 }

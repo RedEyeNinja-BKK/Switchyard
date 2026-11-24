@@ -265,6 +265,16 @@ struct RoutingDecisionRecord<'a> {
     /// One-based index of the tier that answered, when the leg was crossed at a tier boundary.
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_tier: Option<usize>,
+    /// Terminal target to the rule that excluded it, recorded only for tiers the walk reached.
+    ///
+    /// Beside `terminal_crossed` on purpose. `terminal_crossed` absent means no tier was spent,
+    /// and that alone cannot distinguish "the tiers were never consulted" from "the tiers were
+    /// asked and could not hold this request". A non-empty map is a traversal fact -- the walk
+    /// reached that tier and it admitted nothing -- so it settles the distinction without a
+    /// second field. Absent means no tier was reached (never consulted) or every reached tier
+    /// had an eligible target.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    terminal_skipped: BTreeMap<String, &'static str>,
     attempts: Vec<AttemptDecision>,
 }
 
@@ -282,6 +292,7 @@ impl<'a> RoutingDecisionRecord<'a> {
     fn from_trace(context: RoutingLogContext, trace: &SelectionTrace) -> Self {
         let mut skipped = BTreeMap::new();
         let mut demoted = BTreeMap::new();
+        let terminal_skipped = trace.terminal_skipped.iter().cloned().collect();
         for candidate in &trace.candidates {
             if let Some(code) = candidate.exclusion {
                 skipped.insert(candidate.model.clone(), code);
@@ -309,6 +320,7 @@ impl<'a> RoutingDecisionRecord<'a> {
                 .then(|| trace.terminal_reason.unwrap_or("terminal")),
             terminal_tiers: trace.terminal_tiers.clone(),
             terminal_tier: trace.terminal_tier,
+            terminal_skipped,
             attempts: trace
                 .attempts
                 .iter()
@@ -532,6 +544,7 @@ mod tests {
             terminal_crossed: false,
             terminal_reason: None,
             terminal_tier: None,
+            terminal_skipped: Vec::new(),
         };
         log.append_decision(
             RoutingLogContext {

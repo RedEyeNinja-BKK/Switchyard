@@ -146,6 +146,23 @@ pub struct SelectionTrace {
     /// that tier 1 was proved out first. It is the index into `terminal_tiers` (one-based, to
     /// match how an operator reads a manifest) rather than a position in the flat union.
     pub terminal_tier: Option<usize>,
+    /// Terminal targets the walk actually reached and found empty, with the rule that excluded
+    /// each one.
+    ///
+    /// This is a *traversal* fact, not an evaluation fact. The gates are precomputed for every
+    /// terminal target, but a target is recorded here only when the ordered walk reached its
+    /// tier and the tier admitted nothing, so the four states stay separable:
+    ///
+    /// * evaluated  — the gate was computed (never recorded here);
+    /// * reached    — the walk consulted the tier; recorded here when it found the tier empty,
+    ///   and via `terminal_crossed` / `terminal_tier` when it dispatched it;
+    /// * attempted  — `attempts`;
+    /// * served     — `served`.
+    ///
+    /// `terminal_crossed = false` plus an empty list therefore means the tiers were never
+    /// consulted; the same flag with a non-empty list means they were consulted and could not
+    /// hold the request. Empty when every reached tier had an eligible target.
+    pub terminal_skipped: Vec<(String, &'static str)>,
 }
 
 /// A stable, value-free code naming how one attempt ended.

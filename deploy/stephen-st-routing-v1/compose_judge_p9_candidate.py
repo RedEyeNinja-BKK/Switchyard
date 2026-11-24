@@ -133,6 +133,9 @@ def main(argv=None) -> int:
                         help="sha256 of confirmed CURRENT routes.toml")
     parser.add_argument("--work-dir", type=Path, required=True,
                         help="new empty non-production scratch directory")
+    parser.add_argument("--reset-gemma31-cooldown", action="store_true",
+                        help="ONLY when CURRENT has exact 300000ms on google_gemma_31b; "
+                             "emit one-field 5000ms-default reset candidate")
     args = parser.parse_args(argv)
     try:
         require_safe_input_output(args.baseline, args.work_dir, args.expected_baseline_sha)
@@ -149,6 +152,12 @@ def main(argv=None) -> int:
             "--baseline", str(judge), "--out-dir", str(chain)])
         if not final.is_file():
             raise Refused("COMPOSITION_MISSING_FINAL: no p9/6-candidate.toml")
+        if args.reset_gemma31_cooldown:
+            corrected = args.work_dir / "7-incident-cooldown-candidate.toml"
+            run_stage("exact 300s Gemma31 cooldown reset", [
+                sys.executable, str(HERE / "apply_gemma31_cooldown_reset.py"),
+                "--baseline", str(final), "--out", str(corrected)])
+            final = corrected
         result = subprocess.run([
             sys.executable, str(HERE / "direct_capability_gate.py"),
             "--manifest", str(final), "--json"],
@@ -170,6 +179,7 @@ def main(argv=None) -> int:
             "gate_script_sha256": sha256(HERE / "direct_capability_gate.py"),
             "direct_routes": report["direct_count"],
             "P9_findings": len(report["failures"]),
+            "gemma31_cooldown_reset_requested": bool(args.reset_gemma31_cooldown),
             "new_alias": NEW_ALIAS, "terminal_tiers": TIERS,
             "final_path": str(final),
             "warning": "Does not build/test the Switchyard binary, publish releases, or prove live error-rate recovery",

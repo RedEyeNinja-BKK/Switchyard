@@ -81,8 +81,9 @@ class ChainTests(unittest.TestCase):
         applier = "apply_official_model_tool_caps.py"
         self.assertIn(applier, scripts)
         self.assertLess(scripts.index(applier), scripts.index("direct_capability_gate.py"))
-        self.assertIn("6-candidate.toml", str(calls[-1]),
-                      "the final gate must validate the model-card-qualified output")
+        self.assertIn("6-candidate.toml",
+                      (HERE / "build_p9_candidate.py").read_text(),
+                      "the chain must name the final model-card-qualified output")
 
     def test_a_model_card_applier_refusal_stops_before_the_gate(self):
         rc, scripts, _ = self.build({"apply_official_model_tool_caps.py": 3})

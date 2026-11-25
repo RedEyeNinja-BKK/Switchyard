@@ -151,7 +151,7 @@ python3 verify_p9_qualification.py \
     --gate-candidate gate-candidate.json --gate-chain gate-chain.json \
     --evidence-dir ../evidence/tool-qualification-20261123
 
-# mutation controls (21)
+# mutation controls (28)
 python3 -m unittest test_verify_p9_qualification -v
 ```
 
@@ -169,6 +169,26 @@ those exact bytes over the two pinned manifests on 2026-11-24 reproduces
 findings / 28 gaps, and 52 / 5 / 28 — so the committed evidence is not a transcript
 of some other build.
 
+**That hash is now pinned.** `summary.inputs.gate_script_sha256` is
+`72838c340dc55f8ca6958ad0c15a1e7afaac623649d78335b3b7b61865835877` — the full
+SHA256 of `direct_capability_gate.py`, computed by the builder from the file it
+actually ran. `verify_p9_qualification.py` recomputes the same digest from the
+source and refuses when it is absent, when the script is missing, when the script
+is unreadable, or when the digest differs. Seven controls pin that:
+`test_the_pinned_gate_hash_matches_the_source`,
+`test_gate_hash_tampering_is_refused_with_the_outputs_intact`,
+`test_a_gate_hash_missing_entirely_is_refused`,
+`test_a_gate_hash_from_a_different_build_is_refused`,
+`test_a_gate_script_byte_change_is_refused`,
+`test_a_missing_gate_script_is_refused_not_skipped`, and
+`test_the_parked_checker_is_restored_byte_for_byte`.
+
+The point of the pin is precisely that the gate JSONs stay unchanged: append a
+byte to the script and both committed projections are still perfectly consistent
+with the matrix, and only the oracle's identity gives the change away. When the
+checker changes intentionally, rebuild the matrix and publish the new pin —
+a self-consistent matrix is not automatic release approval.
+
 Those are also the bytes the release host runs. Read-only, 2026-11-24:
 
 | Path | sha256 | Equals PR #50 source at `3799ce1` |
@@ -183,9 +203,10 @@ same invocation shape used here — and fails closed with `P9_GATE_UNAVAILABLE`,
 `--models` input is deliberately unused on both paths: P9 judges the candidate's
 bytes, and the serving `/v1/models` is verified after deployment.
 
-**This hash is recorded here but not yet in `summary.inputs`.** If the gate changes,
-rebuild the matrix instead of re-reading these numbers — the gate lives on a branch
-that is still open, so drift is possible and silent.
+**If the gate changes, the verifier will say so.** The checker lives on a branch
+that is still open, so drift is possible — and now visible rather than silent: a
+byte change fails `C8_identity` without any matrix edit, and a rebuild publishes a
+new `gate_script_sha256` that a reviewer can compare against this section.
 
 `candidate-declarations.json` and `chain-declarations.json` are projections of the
 two manifests containing only direct routes, their targets, the target model id,

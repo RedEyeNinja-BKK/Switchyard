@@ -21,6 +21,9 @@ Usage:
       --chain-declarations chain-declarations.json \
       --gate-candidate gate-candidate.json --gate-chain gate-chain.json \
       --evidence-dir ../evidence/tool-qualification-20261123
+
+This file must stay independent of `build_p9_matrix.py`: it deliberately does not
+import anything from the builder, so a defect in the builder cannot also hide itself.
 """
 from __future__ import annotations
 
@@ -37,6 +40,11 @@ POSITIVE_BASES = ("LIVE_TOOL_CALL", "PRIOR_MEASUREMENT", "SHARED_MODEL_SPEC")
 TOOL_POSITIVE_VERDICTS = ("TOOL_CALL",)
 TOOL_POSITIVE_FINISH = ("tool_calls",)
 INCONCLUSIVE_STATUSES = (429, 500, 502, 503, 504)
+
+#: The checker whose verdicts this matrix reports. Its bytes are pinned in
+#: ``summary.inputs.gate_script_sha256`` and re-computed here from the deployed
+#: source, never trusted from the matrix.
+GATE = pathlib.Path(__file__).resolve().parent.parent / "direct_capability_gate.py"
 
 
 def tool_positive(record: dict) -> bool:
@@ -389,6 +397,29 @@ def main(argv=None) -> int:
             ("gate_chain_sha256", args.gate_chain)):
         if inputs.get(key) != sha256(path):
             fail("C8_identity", f"{key} is {inputs.get(key)!r}, file is {sha256(path)!r}")
+
+    # The oracle itself, fail closed. Every verdict above came from these bytes; if
+    # the source changed, the matrix describes a checker that no longer exists and
+    # must be rebuilt. A missing pin, a missing script or an unreadable script is a
+    # refusal, never a skip: "could not check" is not "checked and fine".
+    #
+    # A missing script must be its own refusal, not the `OSError` of the read
+    # below: both are refusals, but they say different things to a reader, and a
+    # single try block would report an absent oracle as an unreadable one.
+    try:
+        actual = sha256(GATE)
+    except OSError as exc:
+        fail("C8_identity",
+             f"gate_script_sha256: checker {GATE} is missing or unreadable ({exc}), "
+             "so the matrix verdicts cannot be attributed to any build")
+    else:
+        pinned = inputs.get("gate_script_sha256")
+        if not pinned:
+            fail("C8_identity",
+                 "gate_script_sha256 is absent from summary.inputs, so the matrix "
+                 f"verdicts are unattributable (checker is {actual})")
+        elif pinned != actual:
+            fail("C8_identity", f"gate_script_sha256 is {pinned!r}, checker file is {actual!r}")
     if candidate_doc.get("manifest_sha256") != inputs.get("candidate_sha256"):
         fail("C8_identity", "candidate projection was not derived from the pinned manifest")
     if chain_doc.get("manifest_sha256") != inputs.get("chain_candidate_sha256"):

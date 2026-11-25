@@ -36,6 +36,12 @@ HERE = pathlib.Path(__file__).resolve().parent
 DEPLOY = HERE.parent
 EVIDENCE = DEPLOY / "evidence" / "tool-qualification-20261123"
 
+#: The checker whose verdicts these artifacts contain. Pinned by sha256 into
+#: ``summary.inputs.gate_script_sha256`` and re-computed independently by
+#: ``verify_p9_qualification.py``: a matrix whose verdicts came from a different
+#: build must be rebuilt, not reinterpreted.
+GATE = DEPLOY / "direct_capability_gate.py"
+
 CAPABILITIES = ("tool_calling", "vision", "video")
 
 # Evidence bases that may support a positive `tool_calling` declaration, weakest
@@ -99,8 +105,7 @@ def run_chain(baseline: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
 
 
 def run_gate(manifest_path: pathlib.Path, out: pathlib.Path) -> dict:
-    command = [sys.executable, str(DEPLOY / "direct_capability_gate.py"),
-               "--manifest", str(manifest_path), "--json"]
+    command = [sys.executable, str(GATE), "--manifest", str(manifest_path), "--json"]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     text = completed.stdout.strip()
     if not text:
@@ -381,6 +386,8 @@ def main(argv=None) -> int:
             "chain_declarations_sha256": None,
             "gate_candidate_sha256": sha256(gate_candidate_path),
             "gate_chain_sha256": sha256(gate_chain_path),
+            # The verdicts above came from these exact bytes.
+            "gate_script_sha256": sha256(GATE),
         },
         "candidate": {
             "direct_routes": gate_candidate["direct_count"],

@@ -8,7 +8,8 @@
       "candidate_declarations_sha256": "ad7d994d02949576d70e9ab097756bd2028b05924b43583d21fcca13de65c9c2",
       "chain_declarations_sha256": "2939641b97c1b3988799f78fb4b25dbb0c32c1807637e83dce5b3d89fdc1aabd",
       "gate_candidate_sha256": "319791f0871934e28754aa23c40045a6c6a7132e6bf780f4e08b12ef5dcfa888",
-      "gate_chain_sha256": "0561b05f38d8b1118568f7714e72a8157ea3ea444aab911799f49ee6e61edf13"
+      "gate_chain_sha256": "0561b05f38d8b1118568f7714e72a8157ea3ea444aab911799f49ee6e61edf13",
+      "gate_script_sha256": "72838c340dc55f8ca6958ad0c15a1e7afaac623649d78335b3b7b61865835877"
     },
     "candidate": {
       "direct_routes": 54,

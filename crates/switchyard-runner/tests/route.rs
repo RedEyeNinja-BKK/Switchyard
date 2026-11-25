@@ -688,9 +688,7 @@ fn a_dynamic_free_router_does_not_make_a_free_route_look_paid() {
 ///
 /// The declaration is a wire fact about one provider, so the route must keep serving the
 /// definitional call there while sending the continuation to a sibling that accepts it.
-fn replay_aware_route(
-    calls: &Arc<Mutex<Vec<&'static str>>>,
-) -> Route {
+fn replay_aware_route(calls: &Arc<Mutex<Vec<&'static str>>>) -> Route {
     let spec = AlgorithmSpec::Passthrough {
         target: "no-replay".to_string(),
         candidates: vec!["replays".to_string()],
@@ -821,5 +819,313 @@ async fn a_leg_that_cannot_replay_a_tool_call_is_skipped_only_for_the_continuati
         *definitional.lock().unwrap(),
         vec!["no-replay"],
         "offering tools must stay eligible on the leg that cannot continue them"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Capability escalation: a pool whose wires cannot carry a request may look at the next
+// declared group, and nothing else changes.
+// ---------------------------------------------------------------------------------------
+
+/// A route whose entire primary pool cannot replay a tool call, with one declared later group.
+///
+/// `terminal_replays` decides whether that group can carry the request: false is the case where
+/// no declared group can, which must refuse rather than spend a call proving it again.
+fn wire_incompatible_pool(
+    primary_calls: &Arc<Mutex<Vec<&'static str>>>,
+    terminal_calls: &Arc<Mutex<Vec<&'static str>>>,
+    tiers: &[(&'static str, bool)],
+    escalation: bool,
+) -> Route {
+    let spec = AlgorithmSpec::Passthrough {
+        target: "google-a".to_string(),
+        candidates: vec!["google-b".to_string()],
+        subagents: None,
+    };
+    let targets = BTreeMap::from([
+        ("google-a".to_string(), ModelId::from("google-a")),
+        ("google-b".to_string(), ModelId::from("google-b")),
+    ]);
+    let algorithm = spec
+        .build("switchyard", &targets)
+        .expect("algorithm builds");
+    let mut facts = HashMap::from([
+        (
+            ModelId::from("google-a"),
+            switchyard_llm_client::CapabilityFacts {
+                no_tool_call_replay: true,
+                ..switchyard_llm_client::CapabilityFacts::default()
+            },
+        ),
+        (
+            ModelId::from("google-b"),
+            switchyard_llm_client::CapabilityFacts {
+                no_tool_call_replay: true,
+                ..switchyard_llm_client::CapabilityFacts::default()
+            },
+        ),
+    ]);
+    for (name, replays) in tiers {
+        if !replays {
+            facts.insert(
+                ModelId::from(*name),
+                switchyard_llm_client::CapabilityFacts {
+                    no_tool_call_replay: true,
+                    ..switchyard_llm_client::CapabilityFacts::default()
+                },
+            );
+        }
+    }
+    let mut clients: HashMap<ModelId, Arc<dyn RoutedLlmClient>> = HashMap::from([
+        (
+            ModelId::from("google-a"),
+            Arc::new(EchoClient {
+                model: "google-a",
+                calls: Arc::clone(primary_calls),
+            }) as Arc<dyn RoutedLlmClient>,
+        ),
+        (
+            ModelId::from("google-b"),
+            Arc::new(EchoClient {
+                model: "google-b",
+                calls: Arc::clone(primary_calls),
+            }) as Arc<dyn RoutedLlmClient>,
+        ),
+    ]);
+    for (name, _) in tiers {
+        clients.insert(
+            ModelId::from(*name),
+            Arc::new(EchoClient {
+                model: name,
+                calls: Arc::clone(terminal_calls),
+            }) as Arc<dyn RoutedLlmClient>,
+        );
+    }
+    let clients = ClientRouter::new(clients).with_target_capabilities(facts);
+    let route = Route::new(
+        algorithm,
+        clients,
+        None,
+        ModelCapabilities::default(),
+        None,
+        None,
+        Vec::new(),
+        RuntimeModels::new(HashMap::from([(
+            Category::Any,
+            vec![ModelId::from("google-a"), ModelId::from("google-b")],
+        )])),
+        switchyard_runner::RouteReasoningPolicy::Inherit,
+        None,
+        None,
+    )
+    .with_terminal_fallback(
+        tiers
+            .iter()
+            .map(|(name, _)| {
+                RuntimeModels::new(HashMap::from([(Category::Any, vec![ModelId::from(*name)])]))
+            })
+            .collect(),
+    );
+    if escalation {
+        route.with_capability_escalation(true)
+    } else {
+        route
+    }
+}
+
+/// Collects every selection record the route emits.
+fn trace_sink() -> (
+    Arc<Mutex<Vec<switchyard_llm_client::SelectionTrace>>>,
+    switchyard_llm_client::RunObserver,
+) {
+    let sink: Arc<Mutex<Vec<switchyard_llm_client::SelectionTrace>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let written = Arc::clone(&sink);
+    let observer: switchyard_llm_client::RunObserver =
+        Arc::new(move |observation: RunObservation| {
+            if let RunObservation::Selection(trace) = observation {
+                written.lock().expect("trace sink").push(*trace);
+            }
+        });
+    (sink, observer)
+}
+
+/// The measured live case: five wire-incompatible legs in the preferred group, and a later
+/// group that accepts the same transcript. Escalation must reach the group and record a reason
+/// distinct from exhaustion, naming the target that actually answered.
+#[tokio::test]
+async fn a_wire_incompatible_pool_escalates_to_the_next_declared_group() {
+    let primary = Arc::new(Mutex::new(Vec::new()));
+    let terminal = Arc::new(Mutex::new(Vec::new()));
+    let route = wire_incompatible_pool(&primary, &terminal, &[("portable", true)], true);
+    let (sink, observer) = trace_sink();
+
+    let output = route
+        .execute(
+            Request {
+                llm_request: request_with_tool_lineage(),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("the later group can carry the replay");
+
+    assert_eq!(output.selected_model.as_str(), "portable");
+    assert!(
+        primary.lock().unwrap().is_empty(),
+        "no leg of the incompatible pool may be called"
+    );
+    assert_eq!(*terminal.lock().unwrap(), vec!["portable"]);
+
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert_eq!(trace.outcome, "served");
+    assert_eq!(trace.served.as_deref(), Some("portable"));
+    assert!(trace.terminal_crossed);
+    assert_eq!(
+        trace.terminal_reason,
+        Some("primary_pool_capability_incompatible"),
+        "the crossing names the wire, not exhaustion"
+    );
+    assert_eq!(trace.terminal_tier, Some(1));
+    assert!(
+        trace
+            .attempts
+            .iter()
+            .all(|attempt| attempt.model == "portable"),
+        "the record must name the leg that actually answered"
+    );
+}
+
+/// Off is the historical behaviour, and it must not touch the later group: the option adds
+/// reach, never a default.
+#[tokio::test]
+async fn capability_escalation_off_refuses_without_contacting_the_group() {
+    let primary = Arc::new(Mutex::new(Vec::new()));
+    let terminal = Arc::new(Mutex::new(Vec::new()));
+    let route = wire_incompatible_pool(&primary, &terminal, &[("portable", true)], false);
+    let (sink, observer) = trace_sink();
+
+    let error = route
+        .execute(
+            Request {
+                llm_request: request_with_tool_lineage(),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .err()
+        .expect("the pool cannot carry the replay and nothing authorizes a look further");
+
+    assert!(format!("{error}").contains("tool_call_replay"), "{error}");
+    assert!(primary.lock().unwrap().is_empty());
+    assert!(
+        terminal.lock().unwrap().is_empty(),
+        "the default must not consult a later group"
+    );
+
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert_eq!(trace.outcome, "no_eligible_candidate");
+    assert!(!trace.terminal_crossed);
+    assert_eq!(trace.terminal_reason, None);
+    assert_eq!(trace.terminal_tier, None);
+    assert!(
+        trace.terminal_skipped.is_empty(),
+        "a tier the walk never reached is absent, not refused"
+    );
+}
+
+/// Escalation that finds no capable group still refuses, and records the tier it reached: the
+/// walk must not spend a call to discover what its own declarations already say.
+#[tokio::test]
+async fn an_escalation_that_finds_no_capable_group_still_refuses() {
+    let primary = Arc::new(Mutex::new(Vec::new()));
+    let terminal = Arc::new(Mutex::new(Vec::new()));
+    let route = wire_incompatible_pool(&primary, &terminal, &[("portable", false)], true);
+    let (sink, observer) = trace_sink();
+
+    let error = route
+        .execute(
+            Request {
+                llm_request: request_with_tool_lineage(),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .err()
+        .expect("no declared group can carry the replay");
+
+    assert!(format!("{error}").contains("tool_call_replay"), "{error}");
+    assert!(primary.lock().unwrap().is_empty());
+    assert!(
+        terminal.lock().unwrap().is_empty(),
+        "an incompatible tier must not be called"
+    );
+
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert_eq!(trace.outcome, "no_eligible_candidate");
+    assert!(!trace.terminal_crossed);
+    assert_eq!(
+        trace.terminal_skipped,
+        vec![("portable".to_string(), "tool_call_replay")],
+        "the reached tier is recorded with the rule that excluded it"
+    );
+}
+
+/// A group the walk reaches and finds incompatible must not end the walk: the next declared
+/// group is asked the same question. This is the difference between "evaluate the next
+/// declared group" and "evaluate the next group only if the first one had a capable leg".
+#[tokio::test]
+async fn an_incompatible_group_does_not_end_the_ordered_walk() {
+    let primary = Arc::new(Mutex::new(Vec::new()));
+    let terminal = Arc::new(Mutex::new(Vec::new()));
+    // Group 1 is Google again -- same wire, same refusal. Group 2 can carry the replay.
+    let route = wire_incompatible_pool(
+        &primary,
+        &terminal,
+        &[("google-c", false), ("portable", true)],
+        true,
+    );
+    let (sink, observer) = trace_sink();
+
+    let output = route
+        .execute(
+            Request {
+                llm_request: request_with_tool_lineage(),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("the second declared group can carry the replay");
+
+    assert_eq!(output.selected_model.as_str(), "portable");
+    assert!(primary.lock().unwrap().is_empty());
+    assert_eq!(
+        *terminal.lock().unwrap(),
+        vec!["portable"],
+        "the incompatible group is skipped by its declaration, not called to find out"
+    );
+
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert_eq!(
+        trace.terminal_reason,
+        Some("primary_pool_capability_incompatible")
+    );
+    assert_eq!(
+        trace.terminal_tier,
+        Some(2),
+        "tier 2 is also a record that tier 1 was proved out first"
+    );
+    assert_eq!(
+        trace.terminal_skipped,
+        vec![("google-c".to_string(), "tool_call_replay")],
+        "the reached group is recorded with the rule that excluded it"
     );
 }

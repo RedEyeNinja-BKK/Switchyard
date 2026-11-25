@@ -320,6 +320,25 @@ struct RouteConfig {
     /// It cannot widen what any tier accepts: each tier is judged on its own gates, and a
     /// request that fails them ends the walk with the refusal the primary pool gave.
     fit_escalation: Option<bool>,
+    /// Whether a request no primary candidate's *wire* can carry may be escalated to the
+    /// declared tiers.
+    ///
+    /// Absent is the historical behaviour and stays the default: a pool whose targets cannot
+    /// carry the request refuses, and the caller is told what the deployment lacks rather than
+    /// having a later group asked the same question. Declared, it is a third and narrower claim
+    /// beside `terminal_policy` and `fit_escalation`, and the three are deliberately separate
+    /// axes: capacity, size, and the wire.
+    ///
+    /// It authorizes consideration of the next declared group, not expenditure. Every group is
+    /// judged on its own credential, allowance, fit, privacy and continuation gates, so a
+    /// metered group reached this way still has to admit the request on its own terms, or it is
+    /// skipped exactly as before.
+    ///
+    /// Only a closed vocabulary of measured per-target wire facts may open this boundary
+    /// (`tool_call_replay` today). A malformed or unsafe continuation, an authentication,
+    /// billing or policy refusal, and a request the route never promised to serve all fail
+    /// outside it and end the walk with the pool's own refusal.
+    capability_escalation: Option<bool>,
     /// Target this route prefers once it is under context pressure.
     ///
     /// Named rather than inferred: a target's context window is not a fact this config
@@ -536,6 +555,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
         let terminal_policy = take_optional(&mut table, "terminal_policy")?;
         let fit_escalation = take_optional(&mut table, "fit_escalation")?;
+        let capability_escalation = take_optional(&mut table, "capability_escalation")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
         let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -556,6 +576,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             terminal_fallback,
             terminal_policy,
             fit_escalation,
+            capability_escalation,
             escalation_target,
             selection: selection.unwrap_or_default(),
             algorithm,
@@ -1172,7 +1193,8 @@ impl DeploymentConfig {
                 Some(terminal) => route
                     .with_terminal_fallback(terminal)
                     .with_terminal_policy(config.terminal_policy.unwrap_or_default())
-                    .with_fit_escalation(config.fit_escalation.unwrap_or(false)),
+                    .with_fit_escalation(config.fit_escalation.unwrap_or(false))
+                    .with_capability_escalation(config.capability_escalation.unwrap_or(false)),
                 None => route,
             };
             // A measured route ranks candidates only after it has evidence, and shares that
@@ -1396,6 +1418,13 @@ impl DeploymentConfig {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} declares fit_escalation but no terminal_fallback; a \
                      size refusal would have no wider tier to escalate to, so the option would \
+                     read as a guarantee it cannot provide"
+                )));
+            }
+            if config.capability_escalation == Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares capability_escalation but no terminal_fallback; a \
+                     wire refusal would have no later group to consider, so the option would \
                      read as a guarantee it cannot provide"
                 )));
             }
@@ -7805,6 +7834,94 @@ candidates = []
 fit_escalation = false
 "#;
         runner_from_toml(config).expect("fit_escalation = false is the default behaviour");
+    }
+
+    /// The capability axis refuses the same unfillable promise: a route that says a wire
+    /// refusal will still be answered must name the group that would answer it.
+    #[test]
+    fn capability_escalation_without_a_terminal_leg_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+capability_escalation = true
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("capability_escalation"),
+            "refusal must name the option, got: {message}"
+        );
+        assert!(
+            message.contains("terminal_fallback"),
+            "refusal must name the missing declaration, got: {message}"
+        );
+    }
+
+    /// Control for the refusal above: the guard bites on the missing declaration, not on the
+    /// option.
+    #[test]
+    fn capability_escalation_with_a_terminal_leg_loads() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[targets.portable]
+id = "portable/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+terminal_fallback = [["portable"]]
+capability_escalation = true
+"#;
+        runner_from_toml(config).expect("a route with a later group may declare the option");
+    }
+
+    /// Off is the default and needs no tier, exactly as the fit axis does. This is the
+    /// invariant that keeps the option from widening any existing route at load.
+    #[test]
+    fn capability_escalation_off_does_not_require_a_tier() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+capability_escalation = false
+"#;
+        runner_from_toml(config).expect("capability_escalation = false is the default behaviour");
     }
 }
 

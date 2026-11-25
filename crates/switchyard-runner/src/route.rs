@@ -269,6 +269,79 @@ fn tier_cannot_hold(gates: &[Result<(), &'static str>]) -> bool {
         })
 }
 
+/// The exclusion codes that say this *target's* wire cannot carry a request it was given.
+///
+/// Closed vocabulary, and deliberately narrow. Every code here is a measured property of one
+/// provider's wire rather than a judgement about the request: the request is portable, the
+/// leg is not, and another leg in a later declared group may be. Codes outside this list are
+/// not, and the distinction is the whole safety of capability escalation:
+///
+/// * a size code is the caller's prompt, and is handled by its own escalation axis;
+/// * a credential, allowance or block code is the deployment's capacity;
+/// * a malformed, unsafe or unverifiable continuation is a defect in the request, and sending
+///   it to a second provider would re-learn the same refusal with a bill attached;
+/// * an authentication, billing or policy refusal is a fact about the deployment or the
+///   account, and spending another group on it hides the fault the caller needs to see.
+///
+/// `tool_call_replay` is the only entry because it is the only one measured as a per-wire
+/// property with a portable counterpart. Measured 2026-11-26 on the loopback deployment: each
+/// Google chat leg accepted a definitional tool call and refused that same call replayed with
+/// the signature stripped (HTTP 400 naming `thought_signature`), while a DeepSeek leg served
+/// the same replayed transcript. Adding a code here is a new claim about a wire and needs its
+/// own measurement and its own test.
+fn is_target_capability_exclusion(code: &str) -> bool {
+    matches!(code, "tool_call_replay")
+}
+
+/// Whether a pool that admitted nothing did so only because every leg's *wire* cannot carry
+/// this otherwise valid request, and the route is authorized to look further.
+///
+/// This is the capability counterpart of [`authorize_fit_escalation`] and answers the same
+/// shape of question about a different fact. A size refusal says the pool cannot hold the
+/// request; this says the pool cannot carry it, and a later declared group might.
+///
+/// Three conditions, all required:
+///
+/// * `route_accepts` -- the lane's own declaration permits the request. A request the route
+///   never promised to serve is the caller's problem, not a missing capability in a group.
+/// * every candidate is excluded, and
+/// * every exclusion is a target wire fact from the closed vocabulary above.
+///
+/// The answer authorizes *consideration* of the next declared group and nothing else: the
+/// target's own credential, allowance, fit, privacy and continuation gates are evaluated
+/// exactly as before when that group is reached, so an escalation cannot by itself spend a
+/// metered request.
+pub(crate) fn authorize_capability_escalation(
+    route_accepts: bool,
+    gates: &[Result<(), &'static str>],
+) -> Option<&'static str> {
+    if !route_accepts || gates.is_empty() {
+        return None;
+    }
+    if !gates.iter().all(|gate| match gate {
+        Err(code) => is_target_capability_exclusion(code),
+        Ok(()) => false,
+    }) {
+        return None;
+    }
+    Some("primary_pool_capability_incompatible")
+}
+
+/// Whether every target in one declared tier was excluded only by its own wire.
+///
+/// The tier-level form of [`authorize_capability_escalation`]: a tier that admitted nothing
+/// keeps the walk alive only when its own targets are the reason, so the next group is asked
+/// about capacity rather than asked to settle something about the request. A tier that has a
+/// capable leg blocked by a credential is not this claim, and is judged by
+/// [`authorize_terminal`] instead.
+fn tier_capability_incompatible(gates: &[Result<(), &'static str>]) -> bool {
+    !gates.is_empty()
+        && gates.iter().all(|gate| match gate {
+            Err(code) => is_target_capability_exclusion(code),
+            Ok(()) => false,
+        })
+}
+
 /// Hands the route's decision record to whichever observer the caller supplied.
 ///
 /// Cloning only when someone is listening keeps the cost of the record to the routes that
@@ -713,6 +786,19 @@ pub struct Route {
     /// capacity exhaustion -- it is a different claim, recorded under its own reason, and the
     /// tier that receives the request is judged on its own gates.
     fit_escalation: bool,
+    /// Whether a request that no primary candidate's *wire* can carry may be escalated to the
+    /// declared tiers.
+    ///
+    /// The third axis, and the narrowest. `terminal_policy` governs a pool that failed;
+    /// `fit_escalation` governs a request too large for the pool; this governs a request the
+    /// pool's targets cannot carry at the wire level while a later group's can. It is off
+    /// unless a route declares it, so a lane that has never been measured for this keeps
+    /// refusing rather than quietly spending a downstream group.
+    ///
+    /// It authorizes consideration, never expenditure: the group that receives the request is
+    /// judged on its own credential, allowance, fit, privacy and continuation gates, so an
+    /// escalation cannot by itself buy a metered call.
+    capability_escalation: bool,
 }
 
 /// A route whose targets are all held out of service, with the evidence for holding it.
@@ -770,6 +856,7 @@ impl Route {
             terminal: Vec::new(),
             terminal_policy: TerminalPolicy::default(),
             fit_escalation: false,
+            capability_escalation: false,
         }
     }
 
@@ -807,6 +894,22 @@ impl Route {
     /// walk with the same refusal.
     pub fn with_fit_escalation(mut self, enabled: bool) -> Self {
         self.fit_escalation = enabled;
+        self
+    }
+
+    /// Declares whether a request no primary candidate's wire can carry may reach the tiers.
+    ///
+    /// Only meaningful beside `with_terminal_fallback`; configuration refuses the option
+    /// without a leg to escalate to. Off is the historical behaviour: a pool whose targets
+    /// cannot carry the request refuses, and no further group is contacted.
+    ///
+    /// On does not widen any tier and does not authorize spend. It changes one thing: a pool
+    /// that dispatched nothing because every target refused the request *at its own wire* is
+    /// allowed to ask the next declared group the same question, instead of being refused
+    /// before the groups are looked at. A group that cannot carry it either ends the walk with
+    /// the primary pool's refusal.
+    pub fn with_capability_escalation(mut self, enabled: bool) -> Self {
+        self.capability_escalation = enabled;
         self
     }
 
@@ -1145,6 +1248,46 @@ impl Route {
         false
     }
 
+    /// The capability a pool with no eligible leg owed the request, named from the targets that
+    /// were excluded rather than from the route's own declaration.
+    ///
+    /// The route's declaration may be silent while a specific target was the blocker — the live
+    /// case is a lane whose own `tool_call_replay` is undeclared (permitted) over a pool of
+    /// Google legs that each refuse a replayed call — so naming the route's capabilities alone
+    /// would report "an eligible route" for a request that was refused for a concrete reason.
+    /// The target facts are read exactly as the eligibility predicate reads them, or the refusal
+    /// would name a different capability than the one that excluded the candidate.
+    ///
+    /// Order is deliberate: a capability a target lacked, then the route's own declaration, then
+    /// the binding size limit. The size limit is last because it is the only answer that is not
+    /// about a capability, and it is reported only when no candidate fits at all.
+    fn missing_capability(&self, request: &Request, raw: &serde_json::Value) -> &'static str {
+        self.clients
+            .target_capabilities()
+            .iter()
+            .find_map(|(_model, facts)| {
+                let capabilities = crate::ModelCapabilities {
+                    vision: Some(!facts.no_vision),
+                    tool_calling: Some(!facts.no_tool_calling),
+                    tool_call_replay: Some(!facts.no_tool_call_replay),
+                    video: Some(!facts.no_video),
+                    video_carrier: carrier_from_facts(facts),
+                    image_carrier: image_carrier_from_facts(facts),
+                    ..crate::ModelCapabilities::default()
+                };
+                crate::request_fit::unsupported_capability(capabilities, &request.llm_request, raw)
+            })
+            .or_else(|| {
+                crate::request_fit::unsupported_capability(
+                    self.capabilities,
+                    &request.llm_request,
+                    raw,
+                )
+            })
+            .or_else(|| self.physical_ineligibility(request))
+            .unwrap_or("an eligible route")
+    }
+
     /// Whether no candidate of this route can hold the request, and why.
     ///
     /// The physical counterpart of [`Self::payload_refused`]: a composite needs to know
@@ -1454,6 +1597,14 @@ impl Route {
             .fit_escalation
             .then(|| authorize_fit_escalation(route_accepts, &verdicts))
             .flatten();
+        // The same computation over the other closed vocabulary. The two cannot both be
+        // `Some` (a gate is excluded for one reason), so a chain is unambiguous, but they are
+        // kept as separate values because the reason they are recorded under is different and
+        // an operator reads that reason to decide what to fix.
+        let capability_escalation = self
+            .capability_escalation
+            .then(|| authorize_capability_escalation(route_accepts, &verdicts))
+            .flatten();
         let models = self.models.filtered(&|model| verdict(model).is_ok());
         // Among candidates that survived every hard gate, a route may prefer what this
         // deployment has actually observed. This reorders one already-admitted list and
@@ -1637,55 +1788,16 @@ impl Route {
             // a gate being evaluated is not the same as a boundary being crossed.
             terminal_skipped: Vec::new(),
         };
-        if models.is_empty() && fit_escalation.is_none() {
+        if models.is_empty() && fit_escalation.is_none() && capability_escalation.is_none() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
             // an empty attempt list. Emitted before either refusal so the caller and the
             // routing log name the same reason.
             emit_selection(observer.as_ref(), &trace);
             // Nothing in this route can serve the request, which is the caller's request
             // rather than a deployment fault. The skipped targets get no provider call.
-            // Name what the request needs, not what the route happens to lack: the route's
-            // own declaration may be silent while a specific target was the blocker.
-            let capability = self
-                .clients
-                .target_capabilities()
-                .iter()
-                .find_map(|(_model, facts)| {
-                    // Mirror the eligibility predicate's reading of these facts, or the
-                    // refusal would name a different capability than the one that
-                    // actually excluded the candidate.
-                    let capabilities = crate::ModelCapabilities {
-                        vision: Some(!facts.no_vision),
-                        tool_calling: Some(!facts.no_tool_calling),
-                        tool_call_replay: Some(!facts.no_tool_call_replay),
-                        video: Some(!facts.no_video),
-                        video_carrier: carrier_from_facts(facts),
-                        image_carrier: image_carrier_from_facts(facts),
-                        ..crate::ModelCapabilities::default()
-                    };
-                    crate::request_fit::unsupported_capability(
-                        capabilities,
-                        &request.llm_request,
-                        &raw,
-                    )
-                })
-                .or_else(|| {
-                    crate::request_fit::unsupported_capability(
-                        self.capabilities,
-                        &request.llm_request,
-                        &raw,
-                    )
-                })
-                // A request that fits every capability and still found nothing was excluded
-                // on size. Naming the binding limit is the difference between a caller who
-                // knows to send less and one who reads "ineligible" and retries the same
-                // payload: the physical gate is the only other reason a candidate drops out,
-                // and it is reported only when no candidate fits at all.
-                .or_else(|| self.physical_ineligibility(&request))
-                .unwrap_or("an eligible route");
             return Err(RunnerError::unsupported_capability(
                 self.algorithm.name(),
-                capability,
+                self.missing_capability(&request, &raw),
             ));
         }
         // The measurement rides on the observation the run already emits, so no separate
@@ -1708,10 +1820,13 @@ impl Route {
         // request either; `attempts` stays empty, which is what makes the record say
         // `no_eligible_candidate` rather than `failed`.
         let mut result = if models.is_empty() {
+            // The walk may still reach a declared group, but this is what the caller gets if
+            // no group can carry the request. It names the same capability the direct refusal
+            // would have named, so an escalation that finds nothing does not change the answer
+            // into a vaguer one.
             Err(RunnerError::unsupported_capability(
                 self.algorithm.name(),
-                self.physical_ineligibility(&request)
-                    .unwrap_or("an eligible route"),
+                self.missing_capability(&request, &raw),
             ))
         } else {
             switchyard_llm_client::run(
@@ -1738,7 +1853,7 @@ impl Route {
             // against the union: tier 2 is only reachable once tier 1 has itself been proved
             // out, which is the entire difference between an ordered declaration and a peer
             // pool. The union would let "the second tier looks cheaper" skip the first.
-            let mut authorization = fit_escalation.or_else(|| {
+            let mut authorization = fit_escalation.or(capability_escalation).or_else(|| {
                 self.terminal_authorization(
                     &capable_legs,
                     &dispatchable_legs,
@@ -1771,8 +1886,16 @@ impl Route {
                     // reported, and the next tier is asked the same question; any other
                     // refusal ends the walk, because the next tier would be asked to settle
                     // something about the request rather than about capacity.
+                    //
+                    // The capability boundary does the same for its own vocabulary: a tier
+                    // that admitted nothing because every one of its wires refused this
+                    // request keeps the walk alive, and a tier that had a capable leg blocked
+                    // by a credential falls through to the exhaustion rule below, which is the
+                    // only one entitled to call that exhaustion.
                     authorization = fit_escalation
                         .filter(|_| tier_cannot_hold(&terminal_verdicts[index]))
+                        .or(capability_escalation
+                            .filter(|_| tier_capability_incompatible(&terminal_verdicts[index])))
                         .or_else(|| {
                             self.terminal_authorization(
                                 &terminal_capable[index],
@@ -2594,6 +2717,145 @@ mod fit_escalation_tests {
         assert!(!tier_cannot_hold(&[
             Err("max_input_tokens"),
             Err("tool_calling")
+        ]));
+    }
+}
+
+#[cfg(test)]
+mod capability_escalation_tests {
+    use super::{
+        authorize_capability_escalation, is_target_capability_exclusion,
+        tier_capability_incompatible,
+    };
+
+    /// Closed on purpose, and deliberately one entry. Each additional code here is a claim that
+    /// some *wire* cannot carry a request another wire can, which is a measurement, not a
+    /// judgement. Everything a second group would re-learn at a price -- a malformed or unsafe
+    /// continuation, a credential, an allowance, a policy or billing refusal, a size fact this
+    /// axis does not own, or a request the route never promised -- must stay out.
+    #[test]
+    fn the_vocabulary_is_exactly_the_measured_wire_facts() {
+        assert!(is_target_capability_exclusion("tool_call_replay"));
+        for code in [
+            "tool_calling",
+            "vision",
+            "video",
+            "video_carrier",
+            "image_carrier",
+            "reasoning",
+            "unsupported_reasoning_effort",
+            "context_window",
+            "max_input_tokens",
+            "minute_window_too_small",
+            "output_budget_below_thinking_floor",
+            "credential_missing",
+            "credential_rejected",
+            "daily_allowance_exhausted",
+            "provider_allowance_exhausted",
+            "account_balance",
+            "malformed_tool_call",
+            "unsafe_tool_continuation",
+            "invalid_request",
+            "policy_refused",
+            "no_eligible_candidate",
+            "primary_pool_blocked",
+            "",
+        ] {
+            assert!(
+                !is_target_capability_exclusion(code),
+                "{code} must not authorize a capability escalation"
+            );
+        }
+    }
+
+    /// The exact live case the option was added for: five Google chat legs, every one of them
+    /// refusing a replayed tool call at its own wire.
+    #[test]
+    fn a_pool_emptied_only_by_wire_facts_authorizes_the_group_walk() {
+        let five_google = [
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+        ];
+        assert_eq!(
+            authorize_capability_escalation(true, &five_google),
+            Some("primary_pool_capability_incompatible")
+        );
+    }
+
+    #[test]
+    fn a_request_the_route_never_promised_is_not_authorized() {
+        // A lane that declares it does not serve this request has no missing capability to
+        // make up for; escalating would hand a request the deployment refused to a metered
+        // group.
+        assert_eq!(
+            authorize_capability_escalation(false, &[Err("tool_call_replay")]),
+            None
+        );
+    }
+
+    #[test]
+    fn one_candidate_that_could_carry_it_ends_the_claim() {
+        assert_eq!(
+            authorize_capability_escalation(true, &[Err("tool_call_replay"), Ok(())]),
+            None
+        );
+    }
+
+    /// Every other class of refusal must not open the boundary, and the list is the owner's
+    /// exclusion list rather than an inviting vocabulary.
+    #[test]
+    fn request_validity_and_deployment_faults_do_not_open_the_walk() {
+        for code in [
+            "malformed_tool_call",
+            "invalid_request",
+            "credential_missing",
+            "daily_allowance_exhausted",
+            "account_balance",
+            "vision",
+            "context_window",
+        ] {
+            assert_eq!(
+                authorize_capability_escalation(true, &[Err(code)]),
+                None,
+                "{code} must end the walk"
+            );
+            // Mixed with a real wire fact, the other reason still ends it: one leg failing
+            // for a reason about the request means the next group would settle the same
+            // question again.
+            assert_eq!(
+                authorize_capability_escalation(true, &[Err("tool_call_replay"), Err(code)]),
+                None,
+                "{code} mixed with the wire fact must end the walk"
+            );
+        }
+    }
+
+    #[test]
+    fn no_candidates_at_all_is_not_a_capability_claim() {
+        assert_eq!(authorize_capability_escalation(true, &[]), None);
+        assert_eq!(authorize_capability_escalation(false, &[]), None);
+    }
+
+    /// A tier is passed over on this axis only when every target in it refused at its wire.
+    /// A tier with a capable-but-blocked leg is a capacity question and belongs to
+    /// `authorize_terminal`, which is a different claim in the record.
+    #[test]
+    fn a_tier_is_passed_over_only_when_every_target_refused_at_its_wire() {
+        assert!(tier_capability_incompatible(&[
+            Err("tool_call_replay"),
+            Err("tool_call_replay")
+        ]));
+        assert!(!tier_capability_incompatible(&[]));
+        assert!(!tier_capability_incompatible(&[
+            Err("tool_call_replay"),
+            Ok(())
+        ]));
+        assert!(!tier_capability_incompatible(&[
+            Err("tool_call_replay"),
+            Err("daily_allowance_exhausted")
         ]));
     }
 }

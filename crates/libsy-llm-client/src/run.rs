@@ -81,7 +81,17 @@ pub async fn run(
             Ok(outcome)
         }
         None => {
-            ensure_tool_lineage(&request)?;
+            // No recorded state answers this request. If the route tracks
+            // provider state, an id it has never seen is foreign or expired and
+            // is refused here. If the route does not track it (one provider
+            // serves every candidate), that provider owns the continuation
+            // entirely and only it can judge the id; refusing would break a
+            // working native continuation that this layer never recorded.
+            let provider_owns =
+                has_continuation_reference(&request) && !clients.tracks_provider_state();
+            if !provider_owns {
+                ensure_tool_lineage(&request)?;
+            }
             drive(algorithm, request, models, {
                 let routing_observations = routing_observations.clone();
                 move |call| serve(routing_clients.clone(), call, routing_observations.clone())
@@ -1274,6 +1284,16 @@ fn ensure_tool_lineage(request: &Request) -> Result<()> {
     ))
 }
 
+/// True when the request names continuation state a provider could hold.
+fn has_continuation_reference(request: &Request) -> bool {
+    let fields = &request.llm_request.extensions.fields;
+    fields
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        || fields.contains_key("conversation")
+}
+
 /// Route to `owner` without fallbacks and record why the algorithm did not run.
 fn continue_on(owner: StateOwner, algorithm: &str, mut request: Request) -> RoutingOutcome {
     tracing::debug!(
@@ -1735,6 +1755,11 @@ impl ClientRouter {
     }
 
     /// Return the recorded model for the requested response or conversation ID.
+    /// Whether this route records provider-owned Responses state at all.
+    fn tracks_provider_state(&self) -> bool {
+        self.inner.track_provider_state
+    }
+
     fn stored_state_owner(&self, request: &Request) -> Option<StateOwner> {
         let fields = &request.llm_request.extensions.fields;
         let (trigger, id) = match fields.get("previous_response_id").and_then(Value::as_str) {
@@ -2816,6 +2841,55 @@ mod tests {
             client.calls.lock().len(),
             1,
             "a provider-owned continuation must reach its provider"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_untracked_single_provider_continuation_is_forwarded() -> Result<()> {
+        // A route whose candidates all share one provider records no state of
+        // its own, so it holds nothing an id could be checked against. The
+        // provider is the sole authority there and the result must reach it.
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let clients = ClientRouter::new(HashMap::from([(
+            ModelId::from("weak"),
+            client.clone() as Arc<dyn RoutedLlmClient>,
+        )]));
+        assert!(
+            !clients.tracks_provider_state(),
+            "one client cannot span providers"
+        );
+        let follow = Request {
+            llm_request: switchyard_translation::decode_request(
+                WireFormat::OpenAiResponses,
+                &json!({
+                    "model": "weak",
+                    "previous_response_id": "resp_elsewhere",
+                    "input": [{"type": "function_call_output", "call_id": "held", "output": "ok"}]
+                }),
+            )
+            .map_err(|error| LibsyError::external("decoding follow", error))?,
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
+        };
+        run(
+            Arc::new(switchyard_libsy::Passthrough),
+            clients,
+            follow,
+            to_category_map(&["weak"]),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            client.calls.lock().len(),
+            1,
+            "an untracked continuation must reach the provider that holds it"
         );
         Ok(())
     }

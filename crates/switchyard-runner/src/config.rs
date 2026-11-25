@@ -747,6 +747,8 @@ impl DeploymentConfig {
                     base_url: client.base_url.as_str().to_string(),
                     api_key_env: client.api_key_env.clone(),
                     billing: client.billing,
+                    quota_group: Some(client.quota_group.clone().unwrap_or_else(|| name.clone())),
+                    quota_provider: client.quota_provider,
                 },
             );
         }
@@ -850,6 +852,7 @@ impl DeploymentConfig {
         // selection reads the same remainder, so one budget has one source of truth.
         let allowances = self.build_allowances()?;
         self.validate_minute_windows()?;
+        self.validate_quota_providers()?;
         // One governor for the whole deployment. Its key is (quota group, physical model),
         // so every alias of one model draws on one window — which is what the provider
         // counts, and the only way `smart-nt`, `smart_gemini` and a direct leaf cannot each
@@ -1197,6 +1200,7 @@ impl DeploymentConfig {
         // compatibility surface, so Decision has one implementation.
 
         let mut runner = Runner::new(routes)
+            .with_daily_allowance_registry(allowances.clone())
             .with_fallback_url(fallback_base_url)
             .with_provider_api_keys(provider_api_keys)
             .with_deployment_facts(facts)
@@ -1261,11 +1265,17 @@ impl DeploymentConfig {
         switchyard_llm_client::DayBoundary,
     ) {
         let client = self.llm_clients.get(&target.llm_client);
-        let boundary = match client.and_then(|client| client.quota_reset).unwrap_or_default() {
+        let boundary = match client
+            .and_then(|client| client.quota_reset)
+            .unwrap_or_default()
+        {
             QuotaReset::Pacific => switchyard_llm_client::DayBoundary::Pacific,
             QuotaReset::Utc => switchyard_llm_client::DayBoundary::Utc,
         };
-        match client.and_then(|client| client.quota_scope).unwrap_or_default() {
+        match client
+            .and_then(|client| client.quota_scope)
+            .unwrap_or_default()
+        {
             QuotaScope::Account => (
                 ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL),
                 switchyard_llm_client::account_allowance_path(state_dir, group),
@@ -1304,7 +1314,8 @@ impl DeploymentConfig {
                     "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
                 ))
             })?;
-            let (counter_model, path, boundary) = self.quota_counter(target, &group, &quota.state_dir);
+            let (counter_model, path, boundary) =
+                self.quota_counter(target, &group, &quota.state_dir);
             let key = (group.clone(), counter_model.clone());
             match limits.entry(key.clone()) {
                 std::collections::hash_map::Entry::Occupied(existing) => {
@@ -1549,6 +1560,69 @@ impl DeploymentConfig {
                 quota.state_dir.display()
             ))
         })?;
+        Ok(())
+    }
+
+    /// Rejects a provider-pool mapping that could not be applied honestly.
+    ///
+    /// Three rules, each of which prevents a specific wrong admission rather than a
+    /// stylistic preference:
+    ///
+    /// * The pool is account-wide, so the counter it reconciles must be account-scoped. A
+    ///   per-model counter fed an account total would refuse model B on the account's
+    ///   spend and then refuse model A again on the same number -- one account's figure
+    ///   spent as though it were several budgets.
+    /// * The boundary must be the pool's own. A reading is placed in a day on the
+    ///   counter's clock; an OpenRouter reading counted on the Pacific clock lands in the
+    ///   wrong day for eight hours a night, so exhaustion from yesterday could refuse the
+    ///   new UTC day or, worse, a fresh reading could be ignored as belonging to another
+    ///   day.
+    /// * The client must actually have a counter. Naming a pool for a client whose targets
+    ///   declare no `daily_request_limit` would authorize a reconciliation with nowhere to
+    ///   write, so the mapping would read as configured while doing nothing.
+    fn validate_quota_providers(&self) -> RunnerResult<()> {
+        for (name, client) in &self.llm_clients {
+            let Some(provider) = client.quota_provider else {
+                continue;
+            };
+            let scope = client.quota_scope.unwrap_or_default();
+            if scope != QuotaScope::Account {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but quota_scope is \
+                     {:?}; {} reports one allowance for the whole account, so the counter it \
+                     reconciles must be account-scoped (quota_scope = \"account\") or several \
+                     model counters would each spend the one account figure",
+                    provider.as_str(),
+                    scope,
+                    provider.as_str()
+                )));
+            }
+            let reset = client.quota_reset.unwrap_or_default();
+            if reset != provider.reset() {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but quota_reset is {:?}; \
+                     {} turns over at midnight {} ({}), so the counter must use the same \
+                     clock or a reading lands in a day the provider does not recognise",
+                    provider.as_str(),
+                    reset,
+                    provider.as_str(),
+                    provider.reset().as_str(),
+                    provider.pool()
+                )));
+            }
+            let holds_counter = self.targets.values().any(|target| {
+                target.llm_client == *name
+                    && target.daily_request_limit.is_some_and(|limit| limit > 0)
+            });
+            if !holds_counter {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but none of its targets \
+                     declares daily_request_limit, so there is no counter to reconcile and \
+                     the mapping would read as configured while admitting on nothing",
+                    provider.as_str()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -3154,6 +3228,67 @@ struct LlmClientConfig {
     /// early or refuse traffic the provider has already restored.
     #[serde(default)]
     quota_reset: Option<QuotaReset>,
+    /// The provider-reported request pool this client's counter reconciles against.
+    ///
+    /// A local counter sees only this deployment's traffic. On a shared free tier another
+    /// client -- or the same person in a browser -- can spend the account's allowance while
+    /// our counter still shows room. Naming a pool here authorizes the economics collector
+    /// to write the provider's own figure into this client's counter, so admission is
+    /// decided on the account rather than on our own slice of it.
+    ///
+    /// Omitted means the local budget is the only authority, which is the historical
+    /// behaviour and is correct for a provider that exposes no such reading.
+    #[serde(default)]
+    quota_provider: Option<QuotaProvider>,
+}
+
+/// A provider-reported request pool a counter may reconcile against.
+///
+/// A closed set rather than a free string: each variant names a pool whose wire shape and
+/// reset semantics this code knows, so a configuration cannot ask for a mapping the
+/// parser does not implement and then silently admit on a reading that never arrives.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaProvider {
+    /// OpenRouter's account-wide free-model daily request counter, reported by
+    /// `GET /api/v1/key` as `data.free_model_daily_requests`. It resets at midnight UTC.
+    ///
+    /// The spelling is pinned rather than derived from the variant name: serde's snake_case
+    /// rule would render `OpenRouterFreeModels` as `open_router_free_models`, which is not
+    /// how the provider's name is written anywhere else in this codebase and would become a
+    /// second spelling for one thing.
+    #[serde(rename = "openrouter_free_models")]
+    OpenRouterFreeModels,
+}
+
+impl QuotaProvider {
+    /// The pool name the provider itself uses.
+    ///
+    /// This must match the `pool` an account reader publishes, because reconciliation
+    /// selects the reading by that string. The two are joined here rather than written
+    /// out twice, so a rename cannot leave the reader and the config disagreeing.
+    pub fn pool(self) -> &'static str {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => "free_model_daily_requests",
+        }
+    }
+
+    /// The stable spelling used in configuration and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => "openrouter_free_models",
+        }
+    }
+
+    /// The day boundary the pool turns over on.
+    ///
+    /// Not configurable: the provider states when its own window resets, and counting it
+    /// on a different clock would place a reading in a day the provider does not recognise.
+    pub fn reset(self) -> QuotaReset {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => QuotaReset::Utc,
+        }
+    }
 }
 
 /// How a client's daily request cap is scoped.
@@ -3176,6 +3311,16 @@ pub enum QuotaReset {
     Pacific,
     /// Midnight UTC — OpenRouter's free-model daily counter.
     Utc,
+}
+
+impl QuotaReset {
+    /// The stable spelling used in configuration and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaReset::Pacific => "pacific",
+            QuotaReset::Utc => "utc",
+        }
+    }
 }
 
 /// Where a client's traffic terminates.
@@ -7797,5 +7942,159 @@ candidates = ["free-b"]
             switchyard_llm_client::DayBoundary::Pacific,
             "Pacific stays the default boundary"
         );
+    }
+}
+
+#[cfg(test)]
+mod quota_provider_tests {
+    use super::*;
+
+    const BASE: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "/var/tmp/switchyard-quota-provider-fixture"
+
+[llm_clients.openrouter_free]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-a"]
+id = "vendor/free-a"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[routes."free"]
+id = "free"
+type = "passthrough"
+target = "free-a"
+"#;
+
+    fn config() -> DeploymentConfig {
+        toml::from_str(BASE).expect("the fixture must parse")
+    }
+
+    /// The declared pool is read into the typed form, so the loader never carries a free
+    /// string that a reader might not implement.
+    #[test]
+    fn a_declared_pool_parses_and_names_the_providers_own_bucket() {
+        let config = config();
+        let client = &config.llm_clients["openrouter_free"];
+        let provider = client.quota_provider.expect("the pool must parse");
+        assert_eq!(provider, QuotaProvider::OpenRouterFreeModels);
+        assert_eq!(provider.pool(), "free_model_daily_requests");
+        assert_eq!(provider.reset(), QuotaReset::Utc);
+    }
+
+    /// A pool name the code does not implement is refused at load. Accepting it would
+    /// authorize a mapping that never produces a reading, which reads as configured and
+    /// admits on the local budget forever.
+    #[test]
+    fn an_unknown_pool_name_refuses_the_deployment() {
+        let source = BASE.replace(
+            "quota_provider = \"openrouter_free_models\"",
+            "quota_provider = \"some_other_pool\"",
+        );
+        assert!(source.contains("some_other_pool"), "the edit must apply");
+        assert!(
+            toml::from_str::<DeploymentConfig>(&source).is_err(),
+            "an unimplemented pool must not deserialize"
+        );
+    }
+
+    /// An account-wide pool cannot feed a per-model counter: one account figure spent as
+    /// though it were several budgets would refuse each model on the same number.
+    #[test]
+    fn a_pool_on_a_model_scoped_counter_refuses_the_deployment() {
+        let source = BASE.replace("quota_scope = \"account\"", "quota_scope = \"model\"");
+        assert!(
+            source.contains("quota_scope = \"model\""),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a model-scoped counter must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("quota_scope") && message.contains("openrouter_free_models"),
+            "the refusal must name the pool and the rule: {message}"
+        );
+    }
+
+    /// The counter must turn over on the pool's own clock. An OpenRouter reading counted on
+    /// the Pacific boundary lands in the wrong day for eight hours a night.
+    #[test]
+    fn a_pool_on_the_wrong_reset_clock_refuses_the_deployment() {
+        let source = BASE.replace("quota_reset = \"utc\"", "quota_reset = \"pacific\"");
+        assert!(
+            source.contains("quota_reset = \"pacific\""),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a counter on the wrong clock must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("quota_reset") && message.contains("utc"),
+            "the refusal must name the clock the pool requires: {message}"
+        );
+    }
+
+    /// A pool named for a client whose targets declare no daily limit has nowhere to write,
+    /// so the mapping would read as configured while doing nothing.
+    #[test]
+    fn a_pool_without_a_counter_refuses_the_deployment() {
+        let source = BASE.replace("daily_request_limit = 1000\n", "");
+        assert!(
+            !source.contains("daily_request_limit"),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a pool with no counter must be refused");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("daily_request_limit"),
+            "the refusal must say what is missing: {message}"
+        );
+    }
+
+    /// The valid shape passes, so the three refusals above are about the rule and not about
+    /// the fixture being invalid in every direction.
+    #[test]
+    fn a_valid_pool_mapping_is_accepted() {
+        config()
+            .validate_quota_providers()
+            .expect("the documented shape must be accepted");
+    }
+
+    /// The facts carry the resolved group and the pool, so a consumer outside the route path
+    /// can find the counter without repeating the loader's defaults.
+    #[test]
+    fn the_facts_carry_the_group_and_the_pool() {
+        let config = config();
+        let facts = config.deployment_facts();
+        let client = &facts.clients["openrouter_free"];
+        assert_eq!(client.quota_group.as_deref(), Some("openrouter-free-owner"));
+        assert_eq!(
+            client.quota_provider,
+            Some(QuotaProvider::OpenRouterFreeModels)
+        );
+
+        // A client that names no group is its own group, so a consumer never has to
+        // reproduce that default.
+        let source = BASE.replace("quota_group = \"openrouter-free-owner\"\n", "")
+            + "\n[llm_clients.other]\nformat = \"openai_chat\"\nbase_url = \"https://x.test/v1\"\n";
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let facts = config.deployment_facts();
+        assert_eq!(facts.clients["other"].quota_group.as_deref(), Some("other"));
+        assert_eq!(facts.clients["other"].quota_provider, None);
     }
 }

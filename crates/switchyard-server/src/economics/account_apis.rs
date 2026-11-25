@@ -33,7 +33,14 @@ fn parse_rfc3339_utc(text: &str) -> Option<SystemTime> {
     let minute: i64 = t.next()?.parse().ok()?;
     // Seconds may carry a fractional part; the whole second is enough for a reset.
     let second: i64 = t.next()?.split('.').next()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(0..24).contains(&hour) {
+    if !(1..=12).contains(&month) || !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return None;
+    }
+    // A leap second is written as :60 and is the only value above 59 that is real.
+    if !(0..=60).contains(&second) {
+        return None;
+    }
+    if !(1..=days_in_month(year, month)).contains(&day) {
         return None;
     }
     let days = days_from_civil(year, month, day);
@@ -42,6 +49,21 @@ fn parse_rfc3339_utc(text: &str) -> Option<SystemTime> {
         return None;
     }
     Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).ok()?))
+}
+
+/// The number of days in a month of the proleptic Gregorian calendar.
+///
+/// Checked rather than left to the day-number arithmetic: that arithmetic normalises an
+/// out-of-range day into the following month, so 2026-02-31 would silently become
+/// 2026-03-03. A reset time that is three days wrong is worse than no reset time.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date.
@@ -53,6 +75,52 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+/// Reads OpenRouter's `free_model_daily_requests` block into a request allowance.
+///
+/// Kept as a pure function over the response body so the accepted shapes are stated and
+/// tested in one place. A block that is absent, carries a missing field, or carries a
+/// value of the wrong type yields nothing: the account did not report a usable figure, and
+/// inventing one -- a zero, a limit of one, a remainder equal to the limit -- would admit
+/// or refuse traffic on a number the provider never sent.
+fn openrouter_free_model_allowance(
+    data: &Value,
+    observed_at: SystemTime,
+) -> Option<RequestAllowanceReading> {
+    let block = data.get("free_model_daily_requests")?;
+    let number = |key: &str| block.get(key).and_then(Value::as_u64);
+    let used = number("used")?;
+    let limit = number("limit")?;
+    let remaining = number("remaining")?;
+    // `resets_at` is only present on some responses; an absent one is a missing fact,
+    // not a zero.
+    let reset_at = block
+        .get("resets_at")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_utc);
+    // A figure above the block's own limit is not a usable answer at all, so it is refused
+    // rather than clamped: clamping would present a fabricated limit as if the provider had
+    // stated it.
+    if used > limit || remaining > limit {
+        return None;
+    }
+    // The provider states the remainder twice: outright as `remaining`, and implicitly as
+    // `limit - used`. When they agree there is nothing to decide. When they disagree the
+    // provider's own accounting is lagging or reserved against, and the honest figure is
+    // the smaller one -- admitting on the larger would spend requests that may not exist.
+    let remaining = remaining.min(limit.saturating_sub(used));
+    let reading = RequestAllowanceReading::new(
+        "free_model_daily_requests",
+        used,
+        limit,
+        remaining,
+        observed_at,
+        reset_at,
+    );
+    // A reading whose own numbers disagree is refused here rather than stored and then
+    // discarded downstream, so the reason is visible where the response was parsed.
+    reading.is_consistent().then_some(reading)
 }
 
 /// The HTTP client the account readers use.
@@ -156,28 +224,9 @@ impl OpenRouterAccount {
                     // sees only its own traffic -- and why it is published as a
                     // request count with its limit and reset rather than as a
                     // percentage, so it can be reconciled rather than merely displayed.
-                    if let Some(block) = data.get("free_model_daily_requests") {
-                        let number = |key: &str| block.get(key).and_then(Value::as_u64);
-                        if let (Some(used), Some(limit), Some(remaining)) =
-                            (number("used"), number("limit"), number("remaining"))
-                        {
-                            // `resets_at` is only present on some responses; an absent
-                            // one is a missing fact, not a zero.
-                            let reset_at = block
-                                .get("resets_at")
-                                .and_then(Value::as_str)
-                                .and_then(parse_rfc3339_utc);
-                            observation
-                                .request_allowances
-                                .push(RequestAllowanceReading::new(
-                                    "free_model_daily_requests",
-                                    used,
-                                    limit,
-                                    remaining,
-                                    SystemTime::now(),
-                                    reset_at,
-                                ));
-                        }
+                    if let Some(reading) = openrouter_free_model_allowance(data, SystemTime::now())
+                    {
+                        observation.request_allowances.push(reading);
                     }
                     // The key endpoint reports the usage of this key over several
                     // windows. Each window is a different amount, so each is
@@ -519,5 +568,242 @@ impl AccountApi for CodexAllowanceAccount {
             return FetchOutcome::Failed("provider reported no allowance".to_string());
         }
         FetchOutcome::Ok(Box::new(observation))
+    }
+}
+
+#[cfg(test)]
+mod allowance_parsing_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn utc(text: &str) -> Option<u64> {
+        parse_rfc3339_utc(text).map(|at| {
+            at.duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0)
+        })
+    }
+
+    /// A well-formed reset time is read to the second.
+    #[test]
+    fn a_reset_time_is_parsed_to_the_second() {
+        // 2026-01-16T00:00:00Z
+        assert_eq!(utc("2026-01-16T00:00:00Z"), Some(1_768_521_600));
+        // 2026-01-15T23:00:00Z
+        assert_eq!(utc("2026-01-15T23:00:00Z"), Some(1_768_518_000));
+    }
+
+    /// A fractional second is truncated, not rejected: the provider states a sub-second
+    /// reset and the whole second is the useful precision.
+    #[test]
+    fn a_fractional_second_is_truncated() {
+        assert_eq!(utc("2026-01-16T00:00:00.000Z"), utc("2026-01-16T00:00:00Z"));
+    }
+
+    /// A timestamp without the UTC marker is refused. A reset time carries a zone, and
+    /// guessing one would place the reset hours away from where the provider meant it.
+    #[test]
+    fn a_timestamp_without_the_utc_marker_is_refused() {
+        assert_eq!(utc("2026-01-16T00:00:00"), None);
+        assert_eq!(utc("2026-01-16T00:00:00+07:00"), None);
+        assert_eq!(utc("2026-01-16 00:00:00Z"), None);
+    }
+
+    /// Missing and malformed shapes are refused rather than defaulted.
+    #[test]
+    fn a_malformed_timestamp_is_refused() {
+        for text in [
+            "",
+            "Z",
+            "2026-01-16T00:00:00",
+            "2026-01T00:00:00Z",
+            "2026-01-16",
+            "not-a-date",
+            "2026-01-16T00:00Z",
+            "2026-13-16T00:00:00Z",
+            "2026-00-16T00:00:00Z",
+        ] {
+            assert_eq!(utc(text), None, "{text} must not parse");
+        }
+    }
+
+    /// Out-of-range clock fields are refused. A minute of 99 is not a time, and accepting
+    /// it would place the reset an hour and a half from where the provider said.
+    #[test]
+    fn an_out_of_range_clock_field_is_refused() {
+        assert_eq!(utc("2026-01-16T24:00:00Z"), None);
+        assert_eq!(utc("2026-01-16T00:60:00Z"), None);
+        assert_eq!(utc("2026-01-16T00:00:61Z"), None);
+    }
+
+    /// A day that does not exist in its month is refused, not rolled into the next month.
+    #[test]
+    fn an_impossible_calendar_day_is_refused() {
+        assert_eq!(utc("2026-02-31T00:00:00Z"), None);
+        assert_eq!(utc("2026-04-31T00:00:00Z"), None);
+        assert_eq!(utc("2026-02-29T00:00:00Z"), None);
+        // 2024 is a leap year, so its February does have a 29th.
+        assert!(utc("2024-02-29T00:00:00Z").is_some());
+        // 2000 is divisible by 400; 1900 is not divisible by 400.
+        assert!(utc("2000-02-29T00:00:00Z").is_some());
+        assert_eq!(utc("1900-02-29T00:00:00Z"), None);
+    }
+
+    /// The observed time is what the caller supplies, so a reading is stamped with when it
+    /// was taken rather than with whatever the provider's clock happened to say.
+    #[test]
+    fn the_reading_carries_the_observation_instant_it_was_given() {
+        let at = UNIX_EPOCH + Duration::from_secs(1_768_518_000);
+        let reading = openrouter_free_model_allowance(
+            &json!({
+                "free_model_daily_requests": {
+                    "used": 12, "limit": 1000, "remaining": 988,
+                    "resets_at": "2026-01-16T00:00:00Z"
+                }
+            }),
+            at,
+        )
+        .expect("a complete block parses");
+        assert_eq!(reading.used, 12);
+        assert_eq!(reading.limit, 1000);
+        assert_eq!(reading.remaining, 988);
+        assert_eq!(reading.observed_at, at);
+        assert_eq!(reading.pool, "free_model_daily_requests");
+        assert_eq!(reading.reset_at, parse_rfc3339_utc("2026-01-16T00:00:00Z"));
+    }
+
+    /// An absent block reports nothing. It is not a spent pool and not an empty one.
+    #[test]
+    fn an_absent_block_reports_nothing() {
+        assert!(openrouter_free_model_allowance(&json!({}), UNIX_EPOCH).is_none());
+        assert!(
+            openrouter_free_model_allowance(
+                &json!({"free_model_daily_requests": null}),
+                UNIX_EPOCH
+            )
+            .is_none()
+        );
+    }
+
+    /// A partially reported block is refused: a limit with no remainder cannot say how much
+    /// is left, and filling the gap with the limit would admit the whole budget again.
+    #[test]
+    fn a_block_missing_a_field_reports_nothing() {
+        for block in [
+            json!({"used": 1, "limit": 1000}),
+            json!({"used": 1, "remaining": 999}),
+            json!({"limit": 1000, "remaining": 999}),
+        ] {
+            assert!(
+                openrouter_free_model_allowance(
+                    &json!({"free_model_daily_requests": block}),
+                    UNIX_EPOCH
+                )
+                .is_none()
+            );
+        }
+    }
+
+    /// A field of the wrong type is refused rather than coerced. A stringified number is
+    /// not the provider's figure, and treating it as absent or as zero would both be wrong.
+    #[test]
+    fn a_field_of_the_wrong_type_reports_nothing() {
+        for block in [
+            json!({"used": "12", "limit": 1000, "remaining": 988}),
+            json!({"used": 12, "limit": 1000.5, "remaining": 988}),
+            json!({"used": -1, "limit": 1000, "remaining": 988}),
+            json!({"used": 12, "limit": 1000, "remaining": null}),
+        ] {
+            assert!(
+                openrouter_free_model_allowance(
+                    &json!({"free_model_daily_requests": block}),
+                    UNIX_EPOCH
+                )
+                .is_none()
+            );
+        }
+    }
+
+    /// When the two stated headrooms disagree, the smaller one is kept.
+    ///
+    /// The provider states the remainder outright and implicitly as `limit - used`. These
+    /// normally agree; when they do not, its accounting is lagging or something is
+    /// reserved, and admitting on the larger figure would spend requests that may not
+    /// exist. This is a normalisation rather than a refusal because either way the reading
+    /// is usable -- refusing it would silently fall back to the local budget, which is the
+    /// less informed authority.
+    #[test]
+    fn a_contradicting_remainder_is_reduced_to_the_stricter_figure() {
+        // `remaining` claims more than the arithmetic allows.
+        let reading = openrouter_free_model_allowance(
+            &json!({"free_model_daily_requests": {
+                "used": 990, "limit": 1000, "remaining": 100
+            }}),
+            UNIX_EPOCH,
+        )
+        .expect("a usable reading");
+        assert_eq!(reading.remaining, 10, "limit - used is the stricter figure");
+
+        // The arithmetic claims more than `remaining`.
+        let reading = openrouter_free_model_allowance(
+            &json!({"free_model_daily_requests": {
+                "used": 12, "limit": 1000, "remaining": 100
+            }}),
+            UNIX_EPOCH,
+        )
+        .expect("a usable reading");
+        assert_eq!(reading.remaining, 100, "remaining is the stricter figure");
+
+        // Agreement is preserved exactly.
+        let reading = openrouter_free_model_allowance(
+            &json!({"free_model_daily_requests": {
+                "used": 12, "limit": 1000, "remaining": 988
+            }}),
+            UNIX_EPOCH,
+        )
+        .expect("a usable reading");
+        assert_eq!(reading.remaining, 988);
+    }
+
+    /// A block whose figures exceed its own limit is still refused: `used` above `limit`
+    /// has no reading at all that could be true.
+    #[test]
+    fn a_block_that_exceeds_its_limit_reports_nothing() {
+        assert!(
+            openrouter_free_model_allowance(
+                &json!({"free_model_daily_requests": {
+                    "used": 1001, "limit": 1000, "remaining": 0
+                }}),
+                UNIX_EPOCH
+            )
+            .is_none()
+        );
+        assert!(
+            openrouter_free_model_allowance(
+                &json!({"free_model_daily_requests": {
+                    "used": 0, "limit": 1000, "remaining": 1001
+                }}),
+                UNIX_EPOCH
+            )
+            .is_none()
+        );
+    }
+
+    /// An absent or unparseable reset time leaves the field empty instead of inventing one.
+    #[test]
+    fn an_absent_reset_time_is_left_absent() {
+        let block = json!({"free_model_daily_requests": {
+            "used": 0, "limit": 1000, "remaining": 1000
+        }});
+        let reading =
+            openrouter_free_model_allowance(&block, UNIX_EPOCH).expect("the figures are complete");
+        assert_eq!(reading.reset_at, None);
+
+        let block = json!({"free_model_daily_requests": {
+            "used": 0, "limit": 1000, "remaining": 1000, "resets_at": "tomorrow"
+        }});
+        let reading = openrouter_free_model_allowance(&block, UNIX_EPOCH)
+            .expect("the figures are complete without a usable reset");
+        assert_eq!(reading.reset_at, None);
     }
 }

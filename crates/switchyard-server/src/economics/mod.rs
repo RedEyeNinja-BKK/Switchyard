@@ -19,10 +19,12 @@ pub mod classification;
 pub mod collector;
 pub mod metrics;
 pub mod providers;
+pub mod reconcile;
 pub mod rolling;
 pub mod runtime;
 
 pub use calendar::CalendarWindow;
 pub use classification::{CostClass, DeploymentClassification, ProviderFacts, RouteFamily};
 pub use collector::AccountCollector;
+pub use reconcile::{AllowanceReconciler, Reconcilers};
 pub use rolling::RollingWindows;

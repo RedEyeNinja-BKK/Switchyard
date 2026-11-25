@@ -73,9 +73,19 @@ const DAY_SECONDS: i64 = 86_400;
 
 /// How long a provider-reported request count stays actionable.
 ///
-/// See [`DailyRequestAllowance::provider_tolerance`] for why this number and why the
-/// state it produces is always reported rather than assumed.
-const DEFAULT_PROVIDER_TOLERANCE: Duration = Duration::from_secs(300);
+/// Two collection intervals, not one. The collector in this deployment reads accounts
+/// every 300 s, so a tolerance equal to that interval would expire a good reading in the
+/// window between the instant it ages out and the instant the next one is written --
+/// including whenever a single round is slow or fails. The reading would then be discarded
+/// for being stale, which is the one thing the three-state design exists to avoid.
+///
+/// It stays bounded rather than generous: a collector that has been dead for ten minutes
+/// should stop being the authority, because the provider's day may have rolled over and
+/// nothing here would know. Two intervals tolerate exactly one missed round.
+///
+/// See [`DailyRequestAllowance::provider_tolerance`] for the state this produces and why
+/// it is always reported rather than assumed.
+const DEFAULT_PROVIDER_TOLERANCE: Duration = Duration::from_secs(600);
 
 /// Offset of Pacific standard time from UTC, in seconds (negative: west of Greenwich).
 const PACIFIC_STANDARD_SECONDS: i64 = -8 * 3_600;

@@ -435,7 +435,11 @@ fn a_stale_reading_does_not_confirm_exhaustion() {
 /// recently it was taken. It cannot constrain the new day.
 #[test]
 fn a_reading_from_yesterday_cannot_refuse_today() {
-    let allowance = account_allowance(&scratch("provider-yesterday"), 10);
+    // A tolerance wide enough to outlive the day boundary on purpose. Otherwise the reading
+    // would be Unknown for being stale, and this case would pass without ever exercising
+    // the rule it names -- the day the reading belongs to.
+    let allowance = account_allowance(&scratch("provider-yesterday"), 10)
+        .with_provider_tolerance(Duration::from_secs(2 * 86_400));
     allowance
         .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
         .expect("the reading is durable");

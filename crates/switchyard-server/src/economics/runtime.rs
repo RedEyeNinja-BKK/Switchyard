@@ -20,6 +20,8 @@ use super::account_apis::{
 };
 use super::collector::AccountCollector;
 use super::providers::{AccountApi, LabeledAccount};
+use super::reconcile::{AllowanceReconciler, Reconcilers};
+use switchyard_protocol::ModelId;
 
 /// How often the calendar counters are republished.
 const CALENDAR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
@@ -37,10 +39,27 @@ const CALENDAR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 /// They describe one account, so they must produce one reader: two readers would
 /// read the same account endpoint twice per interval and report two account reads
 /// for a single account, which is a doubled count of something that happened once.
-pub fn build_account_apis(
+/// One provider account reader, with the facts needed to bind it to counters.
+///
+/// The label is an account identity, not a provider name: it is derived from the
+/// credential group, so two credentials for one provider carry two labels and one
+/// credential shared by two clients carries one. That is what lets a reading be written
+/// into exactly the counters of the account it describes.
+pub struct AccountReader {
+    /// The reader the collector polls.
+    pub api: Arc<dyn AccountApi>,
+    /// The account label the reading arrives under.
+    pub label: String,
+    /// The account surface this reader speaks.
+    pub surface: AccountSurface,
+    /// The clients whose credential built this reader.
+    pub clients: Vec<String>,
+}
+
+pub fn build_account_readers(
     facts: &switchyard_runner::DeploymentFacts,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Vec<Arc<dyn AccountApi>> {
+) -> Vec<AccountReader> {
     // Group the clients by the account they read: one group per (surface,
     // credential). Two clients holding one credential read one account, so they
     // produce one reader; two clients holding different credentials are two readers
@@ -69,7 +88,7 @@ pub fn build_account_apis(
             .push(client.name.clone());
     }
 
-    let mut apis: Vec<Arc<dyn AccountApi>> = Vec::new();
+    let mut apis: Vec<AccountReader> = Vec::new();
     for ((surface, credential), mut names) in groups {
         names.sort();
 
@@ -96,9 +115,78 @@ pub fn build_account_apis(
                 Arc::new(CodexAllowanceAccount::new(credential, account_id))
             }
         };
-        apis.push(Arc::new(LabeledAccount::new(label, api)));
+        apis.push(AccountReader {
+            api: Arc::new(LabeledAccount::new(label.clone(), api)),
+            label,
+            surface,
+            clients: names,
+        });
     }
     apis
+}
+
+/// The account readers a deployment authorizes, in the order they were built.
+pub fn build_account_apis(
+    facts: &switchyard_runner::DeploymentFacts,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Arc<dyn AccountApi>> {
+    build_account_readers(facts, env)
+        .into_iter()
+        .map(|reader| reader.api)
+        .collect()
+}
+
+/// Binds every declared provider pool to the counter it governs.
+///
+/// A binding is only made where all three facts meet: an account reader was built from a
+/// credential, a client that presents that credential declares a pool, and that client's
+/// quota group owns an account-scoped counter. Any one of them missing produces no binding
+/// rather than a guessed one -- a counter reconciled from the wrong account is worse than
+/// a counter that only knows its own traffic, because it would refuse real work.
+pub fn build_reconcilers(
+    readers: &[AccountReader],
+    facts: &switchyard_runner::DeploymentFacts,
+    allowances: &std::collections::HashMap<
+        (String, ModelId),
+        Arc<switchyard_llm_client::DailyRequestAllowance>,
+    >,
+) -> Reconcilers {
+    let mut entries = Vec::new();
+    for reader in readers {
+        // Only an account surface that reports request pools can reconcile a counter.
+        // Another provider's reader is simply not consulted.
+        if reader.surface != AccountSurface::OpenRouter {
+            continue;
+        }
+        for name in &reader.clients {
+            let Some(client) = facts.clients.get(name) else {
+                continue;
+            };
+            let Some(provider) = client.quota_provider else {
+                continue;
+            };
+            let group = client.quota_group.clone().unwrap_or_else(|| name.clone());
+            let counter = ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL);
+            let Some(allowance) = allowances.get(&(group.clone(), counter)) else {
+                // The loader refuses this shape, so reaching it means the two views of the
+                // configuration disagree. Reported rather than guessed.
+                tracing::warn!(
+                    client = %name,
+                    group = %group,
+                    pool = %provider.as_str(),
+                    "a provider pool is declared but no account-scoped counter was built for \
+                     the group; nothing will be reconciled"
+                );
+                continue;
+            };
+            entries.push(AllowanceReconciler::new(
+                reader.label.clone(),
+                provider.pool(),
+                Arc::clone(allowance),
+            ));
+        }
+    }
+    Reconcilers::new(entries)
 }
 
 /// Starts the background economics collection.
@@ -115,10 +203,25 @@ pub fn start(
     facts: &switchyard_runner::DeploymentFacts,
     calendar: Arc<super::CalendarWindow>,
     env: &dyn Fn(&str) -> Option<String>,
+    allowances: &std::collections::HashMap<
+        (String, ModelId),
+        Arc<switchyard_llm_client::DailyRequestAllowance>,
+    >,
 ) -> std::thread::JoinHandle<()> {
-    let apis = build_account_apis(facts, env);
-    if !apis.is_empty() {
-        AccountCollector::new(apis).spawn();
+    let readers = build_account_readers(facts, env);
+    if !readers.is_empty() {
+        let reconcilers = build_reconcilers(&readers, facts, allowances);
+        if !reconcilers.is_empty() {
+            // Stated at startup because a reconciliation that was configured but not wired
+            // is indistinguishable, on a dashboard, from one that is working.
+            for (account, pool) in reconcilers.bindings() {
+                tracing::info!(%account, %pool, "provider allowance reconciliation is bound");
+            }
+        }
+        let api_handles = readers.into_iter().map(|reader| reader.api).collect();
+        AccountCollector::new(api_handles)
+            .with_reconcilers(reconcilers)
+            .spawn();
     }
     std::thread::Builder::new()
         .name("switchyard-economics-calendar".to_string())

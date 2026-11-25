@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::providers::{AccountApi, AccountPublisher, FetchOutcome};
+use super::reconcile::Reconcilers;
 
 /// How often the collector reads the provider accounts.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
@@ -34,6 +35,8 @@ pub struct AccountCollector {
     /// Whether a shadowing collision has already been reported, so the warning is
     /// emitted once per pair rather than once per round.
     reported: BTreeSet<(String, String)>,
+    /// The counters a provider reading is written into, bound by account.
+    reconcilers: Reconcilers,
 }
 
 impl AccountCollector {
@@ -47,7 +50,23 @@ impl AccountCollector {
             owner_of: BTreeMap::new(),
             shadowed: BTreeSet::new(),
             reported: BTreeSet::new(),
+            reconcilers: Reconcilers::default(),
         }
+    }
+
+    /// Binds the counters this collector writes provider readings into.
+    ///
+    /// A deployment that configures no provider pool supplies an empty set, which makes
+    /// this a pass-through: the collector still reads and publishes the account, exactly
+    /// as before, but no counter is reconciled.
+    pub fn with_reconcilers(mut self, reconcilers: Reconcilers) -> Self {
+        self.reconcilers = reconcilers;
+        self
+    }
+
+    /// How many counters are reconciled by this collector.
+    pub fn reconciled_counters(&self) -> usize {
+        self.reconcilers.len()
     }
 
     /// Overrides the collection interval.
@@ -133,6 +152,19 @@ impl AccountCollector {
             let started = Instant::now();
             match api.fetch().await {
                 FetchOutcome::Ok(observation) => {
+                    // The provider's own allowance statement is written into every counter
+                    // bound to this account before anything else looks at the reading. It
+                    // happens ahead of the shadow check on purpose: two credentials for one
+                    // account are the same account, so both counters are entitled to the
+                    // same figure even though only one of them keeps being polled.
+                    let applied = self.reconcilers.apply(provider, observation.as_ref());
+                    if applied.written > 0 {
+                        tracing::debug!(
+                            account = %provider,
+                            counters = applied.written,
+                            "reconciled a provider allowance reading"
+                        );
+                    }
                     // An account the provider identified, whose figures are already
                     // published under a different label, is the same money twice.
                     // Publishing it would double the account's reported balance,

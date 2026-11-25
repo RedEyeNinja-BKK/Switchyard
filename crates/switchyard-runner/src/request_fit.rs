@@ -12,7 +12,7 @@
 
 use crate::{MediaCarrier, ModelCapabilities};
 use serde_json::Value;
-use switchyard_protocol::{ContentBlock, LlmRequest, MediaSource};
+use switchyard_protocol::{ContentBlock, LlmRequest, MediaSource, Role};
 
 /// Return the first explicitly disabled capability used by decoded or preserved input.
 /// Forwarding can retain provider JSON fields that decoding omits.
@@ -39,6 +39,14 @@ pub fn unsupported_capability(
     }
     if capabilities.tool_calling == Some(false) && wants_tools(request, body) {
         return Some("tool_calling");
+    }
+    // Narrower than `tool_calling`, and separate because the two answers differ: a surface
+    // can accept tool definitions and still be unable to continue a transaction. Google's
+    // OpenAI-compatibility endpoint requires a provider-issued signature on every replayed
+    // function call and refuses the request without it, so a request carrying tool lineage
+    // must not be sent to a target that states it cannot replay.
+    if capabilities.tool_call_replay == Some(false) && replays_tool_call(request, body) {
+        return Some("tool_call_replay");
     }
     // Audio first: it has no declaration at all and is refused wherever it appears. Video
     // follows, and is admitted only where the route states it can read video. Doing this
@@ -81,6 +89,69 @@ pub fn wants_tools(request: &LlmRequest, body: &Value) -> bool {
         || ["tool_choice", "parallel_tool_calls", "function_call"]
             .iter()
             .any(|key| body.get(key).is_some_and(|value| !value.is_null()))
+}
+
+/// Whether the request carries a tool call made earlier in the conversation.
+///
+/// This is the continuation half of a tool transaction, and it is what a signature-bound
+/// wire cannot accept: the assistant's call being sent back, or the result that answers one,
+/// or both. Offering tools is NOT lineage — the definitional call is a fresh request that
+/// needs no provider signature, so a target excluded here stays eligible there.
+///
+/// Read from the decoded request and from the preserved body, like [`wants_tools`]: a caller
+/// can spell the same fact in a field decoding does not normalize (`function_call`, a
+/// Responses `function_call` item), and a target must not be selected on one spelling only.
+pub fn replays_tool_call(request: &LlmRequest, body: &Value) -> bool {
+    let decoded = request.messages.iter().any(|message| {
+        message.role == Role::Tool
+            || message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)))
+    });
+    decoded || preserved_tool_lineage(body)
+}
+
+/// Tool lineage as the raw body spells it, including the legacy chat fields.
+fn preserved_tool_lineage(body: &Value) -> bool {
+    let chat = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                let role = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                role == "tool"
+                    || message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|calls| !calls.is_empty())
+                    || message
+                        .get("function_call")
+                        .is_some_and(|call| !call.is_null())
+            })
+        });
+    if chat {
+        return true;
+    }
+    // Responses: a call item or the output answering one. `ends_with` covers the function,
+    // custom, shell, file and MCP spellings without enumerating a vocabulary that grows.
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        kind.ends_with("_call")
+                            || kind.ends_with("_call_output")
+                            || kind.ends_with("_tool_use")
+                            || kind.ends_with("_tool_result")
+                    })
+            })
+        })
 }
 
 /// Video and audio, refused unless the route states it can read the medium.
@@ -822,6 +893,137 @@ mod tests {
         let body = json!({"messages": [{"role": "user", "content": "hello"}], "tools": [], "functions": []});
         let request = decode_request(OpenAiChat, &body)?;
         assert_eq!(unsupported_capability(capabilities, &request, &body), None);
+        Ok(())
+    }
+
+    // A target that cannot carry a tool CONTINUATION is excluded only from requests that
+    // replay one. Its definitional call is still served, which is what keeps Google in the
+    // ladder for every request that merely offers tools.
+    #[test]
+    fn a_target_that_cannot_replay_a_tool_call_still_serves_its_definition() -> TestResult {
+        let cannot_replay = ModelCapabilities {
+            tool_call_replay: Some(false),
+            ..Default::default()
+        };
+        let definition = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        });
+        let replay = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "18C and raining"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        });
+        for (label, body, expected) in [
+            ("definitional call", definition, None),
+            ("replayed call", replay, Some("tool_call_replay")),
+        ] {
+            let request = decode_request(OpenAiChat, &body)?;
+            assert_eq!(
+                unsupported_capability(cannot_replay, &request, &body),
+                expected,
+                "{label} on a target that cannot replay: {body}"
+            );
+            // Undeclared and explicitly-capable targets keep serving both, so the flag
+            // cannot leak into a deployment that never states it.
+            for permissive in [
+                ModelCapabilities::default(),
+                ModelCapabilities {
+                    tool_call_replay: Some(true),
+                    ..Default::default()
+                },
+            ] {
+                assert_eq!(
+                    unsupported_capability(permissive, &request, &body),
+                    None,
+                    "{label} on a permissive target: {body}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // A tool result alone is lineage: the call it answers may sit in history this body does
+    // not carry, and the provider still has to accept the replay.
+    #[test]
+    fn a_tool_result_alone_is_a_replay() -> TestResult {
+        let cannot_replay = ModelCapabilities {
+            tool_call_replay: Some(false),
+            ..Default::default()
+        };
+        for (format, body) in [
+            (
+                OpenAiChat,
+                json!({"messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                ]}),
+            ),
+            (
+                OpenAiResponses,
+                json!({"input": [
+                    {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+                ]}),
+            ),
+            (
+                AnthropicMessages,
+                json!({"max_tokens": 32, "messages": [
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "done"}]},
+                ]}),
+            ),
+        ] {
+            let request = decode_request(format, &body)?;
+            assert_eq!(
+                unsupported_capability(cannot_replay, &request, &body),
+                Some("tool_call_replay"),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    // Lineage has to be read from the preserved body too: a caller can spell the replayed
+    // call in a field decoding does not normalise, and it must not reach a target that
+    // cannot accept it.
+    #[test]
+    fn lineage_is_read_from_the_preserved_body_not_only_decoded_blocks() -> TestResult {
+        let cannot_replay = ModelCapabilities {
+            tool_call_replay: Some(false),
+            ..Default::default()
+        };
+        let legacy_function_call = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "function_call": {"name": "lookup", "arguments": "{}"}},
+            {"role": "function", "name": "lookup", "content": "done"},
+        ]});
+        let request = decode_request(OpenAiChat, &legacy_function_call)?;
+        assert_eq!(
+            unsupported_capability(cannot_replay, &request, &legacy_function_call),
+            Some("tool_call_replay"),
+            "a legacy function_call is a replayed call: {legacy_function_call}"
+        );
+        // Control: an assistant turn with no call at all is ordinary history.
+        let plain = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "again"},
+        ]});
+        let request = decode_request(OpenAiChat, &plain)?;
+        assert_eq!(
+            unsupported_capability(cannot_replay, &request, &plain),
+            None,
+            "ordinary history must stay eligible: {plain}"
+        );
         Ok(())
     }
 

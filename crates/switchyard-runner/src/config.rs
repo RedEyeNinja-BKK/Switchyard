@@ -597,6 +597,11 @@ impl RouteConfig {
                 .then(|| self.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
             image_carrier: (self.vision == Some(true))
                 .then(|| self.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+            // Deliberately undeclared at route level: whether a replayed tool call can be
+            // accepted is a property of one provider's wire, not a promise a route can make
+            // across children with different wires. Candidate filtering reads each target's
+            // fact instead, so this stays `None` rather than becoming a knob that does nothing.
+            tool_call_replay: None,
         }
     }
 
@@ -696,6 +701,10 @@ impl DeploymentConfig {
                     .or_else(|| carrier_union(|caps| caps.vision, |caps| caps.image_carrier))
                     .unwrap_or(MediaCarrier::DEFAULT)
             }),
+            // A composite resolves before its children and each child filters its own
+            // candidates on this axis, so the parent states nothing and cannot exclude a
+            // child that could still serve the continuation.
+            tool_call_replay: None,
         }
     }
 
@@ -2620,6 +2629,11 @@ impl DeploymentConfig {
                             MediaCarrier::Inline | MediaCarrier::Both
                         ),
                         no_tool_calling: target.tool_calling == Some(false),
+                        // A target that states its wire cannot accept a replayed tool call
+                        // is skipped for a request carrying one, and stays eligible for the
+                        // request that merely offers tools. Undeclared keeps permitting,
+                        // so a manifest written before the field behaves as it did.
+                        no_tool_call_replay: target.tool_call_replay == Some(false),
                         // A target states when it cannot carry a caller's reasoning control;
                         // an undeclared target keeps permitting it.
                         no_reasoning_control: target.accepts_reasoning_control == Some(false),
@@ -3196,6 +3210,17 @@ struct TargetConfig {
     image_carrier: Option<MediaCarrier>,
     #[serde(default)]
     tool_calling: Option<bool>,
+    /// Whether this deployment accepts a request that replays an earlier tool call.
+    ///
+    /// `false` is a measured wire fact, not a policy: Google's OpenAI-compatibility surface
+    /// issues a `thought_signature` with each function call and refuses a replayed
+    /// `functionCall` part without it (HTTP 400 `INVALID_ARGUMENT`, measured 2026-11-26 for
+    /// both a call that surface had just issued with the signature stripped and a call issued
+    /// elsewhere). A caller that only offers tools is still served there, so this is narrower
+    /// than `tool_calling` and does not replace it. Omitted permits replayed calls, which is
+    /// what every manifest written before the field did.
+    #[serde(default)]
+    tool_call_replay: Option<bool>,
     /// Requests this target may make per provider day, when the provider caps them.
     ///
     /// Stated on the target rather than the client because the cap is per model within one
@@ -3587,6 +3612,43 @@ mod tests {
             Ok(_) => panic!("deployment loaded but should have been refused"),
             Err(error) => format!("{error}"),
         }
+    }
+
+    /// A target may state that its wire cannot accept a replayed tool call.
+    ///
+    /// The declaration has to be a consumed field on the target: an unconsumed key would be
+    /// rejected by the strict schema, and a key that parses into nothing would be a knob with
+    /// no effect. This asserts the load accepts it and that a misspelling does not.
+    #[test]
+    fn a_target_may_declare_that_it_cannot_replay_a_tool_call() {
+        let accepted = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+[targets.gemini]
+id = "gemini-lite"
+llm_client = "google"
+tool_calling = true
+tool_call_replay = false
+
+[routes.ladder]
+id = "ladder"
+type = "passthrough"
+target = "gemini"
+candidates = []
+"#;
+        runner_from_toml(accepted).expect("a declared replay refusal loads");
+
+        // The same manifest with the key misspelt must fail, not silently ignore it.
+        let misspelt = accepted.replace("tool_call_replay = false", "tool_call_replays = false");
+        let message = refuse(&misspelt);
+        assert!(
+            message.contains("tool_call_replays") || message.to_lowercase().contains("unknown"),
+            "a misspelt capability key must be refused by name, got: {message}"
+        );
     }
 
     /// A deployment whose paced lane declares a margin but no token window refuses to load.

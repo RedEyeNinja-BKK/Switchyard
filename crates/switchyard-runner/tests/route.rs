@@ -10,8 +10,8 @@ use futures_util::StreamExt;
 use libsy::RuntimeModels;
 use switchyard_llm_client::{ClientRouter, RunObservation};
 use switchyard_protocol::{
-    Category, LlmClientError, LlmResponse, ModelId, Request, Response, RoutedLlmClient,
-    text_request, text_response,
+    Category, ContentBlock, LlmClientError, LlmRequest, LlmResponse, Message, ModelId, Request,
+    Response, Role, RoutedLlmClient, text_request, text_response,
 };
 use switchyard_runner::{
     AlgorithmSpec, ModelCapabilities, Route, request_fit::estimate_input_tokens,
@@ -681,5 +681,145 @@ fn a_dynamic_free_router_does_not_make_a_free_route_look_paid() {
         )
         .all_targets_free(),
         "a declared free tariff is sufficient without any slug convention"
+    );
+}
+
+/// A route whose primary leg declares it cannot replay a tool call.
+///
+/// The declaration is a wire fact about one provider, so the route must keep serving the
+/// definitional call there while sending the continuation to a sibling that accepts it.
+fn replay_aware_route(
+    calls: &Arc<Mutex<Vec<&'static str>>>,
+) -> Route {
+    let spec = AlgorithmSpec::Passthrough {
+        target: "no-replay".to_string(),
+        candidates: vec!["replays".to_string()],
+        subagents: None,
+    };
+    let targets = BTreeMap::from([
+        ("no-replay".to_string(), ModelId::from("no-replay")),
+        ("replays".to_string(), ModelId::from("replays")),
+    ]);
+    let algorithm = spec
+        .build("switchyard", &targets)
+        .expect("algorithm builds");
+    let clients = ClientRouter::new(
+        BTreeMap::from([
+            (
+                ModelId::from("no-replay"),
+                Arc::new(EchoClient {
+                    model: "no-replay",
+                    calls: Arc::clone(calls),
+                }) as Arc<dyn RoutedLlmClient>,
+            ),
+            (
+                ModelId::from("replays"),
+                Arc::new(EchoClient {
+                    model: "replays",
+                    calls: Arc::clone(calls),
+                }) as Arc<dyn RoutedLlmClient>,
+            ),
+        ])
+        .into_iter()
+        .collect(),
+    )
+    .with_target_capabilities(HashMap::from([(
+        ModelId::from("no-replay"),
+        switchyard_llm_client::CapabilityFacts {
+            no_tool_call_replay: true,
+            ..switchyard_llm_client::CapabilityFacts::default()
+        },
+    )]));
+    Route::new(
+        algorithm,
+        clients,
+        None,
+        ModelCapabilities::default(),
+        None,
+        None,
+        Vec::new(),
+        RuntimeModels::new(HashMap::from([(
+            Category::Any,
+            vec![ModelId::from("no-replay"), ModelId::from("replays")],
+        )])),
+        switchyard_runner::RouteReasoningPolicy::Inherit,
+        None,
+        None,
+    )
+}
+
+fn request_with_tool_lineage() -> LlmRequest {
+    LlmRequest {
+        model: None,
+        messages: vec![
+            Message::text(Role::User, "weather in Paris?"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolCall(switchyard_protocol::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "Paris"}),
+                })],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult(switchyard_protocol::ToolResult {
+                    tool_call_id: "call_1".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "18C and raining".to_string(),
+                    }],
+                    is_error: None,
+                })],
+            },
+        ],
+        ..LlmRequest::default()
+    }
+}
+
+/// The declaration reaches candidate selection: a replay skips the leg that cannot
+/// continue it, while the same leg still answers the call that merely offers tools.
+#[tokio::test]
+async fn a_leg_that_cannot_replay_a_tool_call_is_skipped_only_for_the_continuation() {
+    let replayed = Arc::new(Mutex::new(Vec::new()));
+    let route = replay_aware_route(&replayed);
+    route
+        .execute(
+            Request {
+                llm_request: request_with_tool_lineage(),
+                ..Request::default()
+            },
+            None,
+        )
+        .await
+        .expect("a sibling can serve the continuation");
+    assert_eq!(
+        *replayed.lock().unwrap(),
+        vec!["replays"],
+        "the replay must not reach the leg that cannot accept one"
+    );
+
+    let definitional = Arc::new(Mutex::new(Vec::new()));
+    let route = replay_aware_route(&definitional);
+    let mut request = text_request(None, "weather in Paris?");
+    request.tools = vec![switchyard_protocol::ToolDefinition {
+        name: "get_weather".to_string(),
+        description: None,
+        parameters: serde_json::json!({"type": "object"}),
+        strict: None,
+    }];
+    route
+        .execute(
+            Request {
+                llm_request: request,
+                ..Request::default()
+            },
+            None,
+        )
+        .await
+        .expect("the primary leg serves a definitional call");
+    assert_eq!(
+        *definitional.lock().unwrap(),
+        vec!["no-replay"],
+        "offering tools must stay eligible on the leg that cannot continue them"
     );
 }

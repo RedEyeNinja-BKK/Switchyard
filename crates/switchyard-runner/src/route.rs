@@ -87,6 +87,18 @@ pub struct ModelCapabilities {
     /// The image counterpart, and optional for the historical reason `vision` is: a
     /// deployment that predates carriers declares images and means both.
     pub image_carrier: Option<MediaCarrier>,
+    /// Whether the routed model can accept a request that REPLAYS an earlier tool call.
+    ///
+    /// A target wire fact, never a route promise: no route declaration feeds it, which is
+    /// why [`ModelCapabilities::default`] leaves it `None`. Google's OpenAI-compatibility
+    /// surface requires a provider-issued `thought_signature` on every replayed
+    /// `functionCall` part and answers HTTP 400 `INVALID_ARGUMENT` without one — measured
+    /// 2026-11-26, where a call that surface had just issued was refused once the signature
+    /// was stripped, and a call issued elsewhere was refused as well. Switchyard cannot
+    /// manufacture the signature and cannot tell whether a caller echoed it, so a target
+    /// stating `false` is skipped for any request that carries tool lineage. Its
+    /// definitional call stays eligible, because offering tools needs no signature.
+    pub tool_call_replay: Option<bool>,
 }
 
 /// The two ways media reaches a provider, which are not the same capability.
@@ -1333,6 +1345,11 @@ impl Route {
                 // something the deployment never agreed to. The route advances to a
                 // leg that can carry it, and a directly addressed leaf refuses.
                 reasoning: Some(!facts.no_reasoning_control),
+                // A wire that cannot accept a replayed tool call is skipped for a
+                // request that carries one, and stays eligible for the definitional
+                // call that merely offers tools. Carried as a concrete boolean like
+                // the other facts, so an undeclared target keeps permitting both.
+                tool_call_replay: Some(!facts.no_tool_call_replay),
                 // Carried as a concrete boolean like the other facts, so an
                 // undeclared target is treated as video-incapable here.
                 video: Some(!facts.no_video),
@@ -1635,6 +1652,7 @@ impl Route {
                     let capabilities = crate::ModelCapabilities {
                         vision: Some(!facts.no_vision),
                         tool_calling: Some(!facts.no_tool_calling),
+                        tool_call_replay: Some(!facts.no_tool_call_replay),
                         video: Some(!facts.no_video),
                         video_carrier: carrier_from_facts(facts),
                         image_carrier: image_carrier_from_facts(facts),

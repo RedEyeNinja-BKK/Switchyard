@@ -1508,6 +1508,16 @@ pub struct CapabilityFacts {
     pub no_inline_image: bool,
     /// The backing deployment cannot accept tool definitions or calls.
     pub no_tool_calling: bool,
+    /// The backing deployment cannot accept a request that REPLAYS an earlier tool call.
+    ///
+    /// Narrower than `no_tool_calling`, and deliberately separate: the Google
+    /// OpenAI-compatibility surface issues a `thought_signature` with every function call
+    /// and refuses a replayed `functionCall` part without it (HTTP 400 `INVALID_ARGUMENT`,
+    /// measured 2026-11-26 both for its own call with the signature stripped and for a call
+    /// issued elsewhere). A caller that merely offers tools is still served there; only the
+    /// continuation of a transaction is not. Defaults to `false`, so a target that states
+    /// nothing keeps the behaviour it had.
+    pub no_tool_call_replay: bool,
     /// The backing deployment cannot carry a caller's explicit reasoning control.
     ///
     /// Measured per family rather than inferred: a hosted free model can think natively and

@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use switchyard_llm_client::{
-    Backend, DailyRequestAllowance, HttpBackendConfig, LlmClientError, ModelConfig,
-    TranslatingLlmClient, allowance_path,
+    Backend, DayBoundary, DailyRequestAllowance, HttpBackendConfig, LlmClientError, ModelConfig,
+    ReserveError, TranslatingLlmClient, account_allowance_path, allowance_path,
 };
 use switchyard_protocol::{Request, text_request};
 use wiremock::matchers::{method, path};
@@ -209,4 +209,145 @@ async fn an_undeclared_allowance_changes_nothing() -> Result<(), Box<dyn Error +
         client.call_rewrite_model(request(), None).await?;
     }
     Ok(())
+}
+
+fn at(seconds: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+// Fixed instants around the two candidate midnights. 2026-01-15 is mid-winter, so
+// Pacific is a clean UTC-8 with no daylight-saving transition nearby:
+//   04:00Z = 2026-01-14 20:00 PST  - Pacific and UTC disagree about the date
+//   23:00Z = 2026-01-15 15:00 PST  - last hour of the UTC day
+//   00:30Z = 2026-01-15 16:30 PST  - next UTC day, same Pacific day
+const PACIFIC_DATE_BEHIND: u64 = 1_768_449_600;
+const LATE_UTC_DAY: u64 = 1_768_518_000;
+const EARLY_NEXT_UTC_DAY: u64 = 1_768_523_400;
+
+/// The two boundaries really are different days for the same instant; otherwise the
+/// reset tests below could pass while the boundary was ignored.
+#[test]
+fn the_boundaries_disagree_about_which_day_an_instant_belongs_to() {
+    let now = at(PACIFIC_DATE_BEHIND);
+    let utc = DayBoundary::Utc.day(now);
+    let pacific = DayBoundary::Pacific.day(now);
+    assert_eq!(
+        utc,
+        pacific + 1,
+        "04:00Z is the next UTC day but the same Pacific evening day"
+    );
+}
+
+/// A UTC-scoped allowance turns over at 00:00Z: a request after that instant is served
+/// from the new day's budget, while the same instant leaves a Pacific-scoped allowance
+/// still inside yesterday's spent budget.
+#[test]
+fn utc_boundary_resets_at_midnight_utc_and_pacific_does_not() {
+    let directory = scratch("utc-reset");
+    let utc = DailyRequestAllowance::new_on(
+        "openrouter-free",
+        "vendor/free-a".into(),
+        1,
+        account_allowance_path(&directory, "openrouter-free"),
+        DayBoundary::Utc,
+    );
+
+    utc.try_reserve_at(at(LATE_UTC_DAY))
+        .expect("first request of the UTC day");
+    assert!(
+        matches!(utc.try_reserve_at(at(LATE_UTC_DAY)), Err(ReserveError::Exhausted)),
+        "the UTC day's single unit must be spent"
+    );
+    utc.try_reserve_at(at(EARLY_NEXT_UTC_DAY))
+        .expect("00:30Z is a new UTC day, so the budget is restored");
+
+    let directory = scratch("pacific-reset");
+    let pacific = DailyRequestAllowance::new_on(
+        "google-free",
+        "google/gemini-test".into(),
+        1,
+        allowance_path(&directory, "google-free", "google/gemini-test"),
+        DayBoundary::Pacific,
+    );
+
+    pacific
+        .try_reserve_at(at(LATE_UTC_DAY))
+        .expect("first request of the Pacific day");
+    assert!(
+        matches!(
+            pacific.try_reserve_at(at(EARLY_NEXT_UTC_DAY)),
+            Err(ReserveError::Exhausted)
+        ),
+        "00:30Z is still 16:30 PST, so a Pacific allowance must not reset"
+    );
+}
+
+/// The declared default is Pacific, so an allowance built with `new` keeps the historical
+/// behaviour and a config that names no boundary does not silently change when it resets.
+#[test]
+fn new_still_defaults_to_the_pacific_boundary() {
+    let allowance = DailyRequestAllowance::new(
+        "google-free",
+        "google/gemini-test".into(),
+        1,
+        allowance_path(&scratch("default-boundary"), "google-free", "google/gemini-test"),
+    );
+    assert_eq!(allowance.boundary(), DayBoundary::Pacific);
+}
+
+/// An account-scoped allowance is one counter for every model that draws on it: two
+/// different models on the same account path share the budget, so the second model is
+/// refused once the first model has spent it.
+#[test]
+fn an_account_scope_shares_one_budget_across_models() {
+    let directory = scratch("account-scope");
+    let path = account_allowance_path(&directory, "openrouter-free");
+
+    let a = DailyRequestAllowance::new_on(
+        "openrouter-free",
+        "vendor/free-a".into(),
+        2,
+        path.clone(),
+        DayBoundary::Utc,
+    );
+    let b = DailyRequestAllowance::new_on(
+        "openrouter-free",
+        "vendor/free-b".into(),
+        2,
+        path,
+        DayBoundary::Utc,
+    );
+
+    a.try_reserve_at(at(LATE_UTC_DAY)).expect("a's first");
+    a.try_reserve_at(at(LATE_UTC_DAY)).expect("a's second");
+    assert!(
+        matches!(b.try_reserve_at(at(LATE_UTC_DAY)), Err(ReserveError::Exhausted)),
+        "b must see a's spend, because the account budget is shared"
+    );
+}
+
+/// The contrast case: without the account sentinel, the same two models on their own
+/// paths each get their own budget. This is the behaviour the account scope replaces, and
+/// it must stay available for providers that cap per model.
+#[test]
+fn per_model_paths_keep_separate_budgets() {
+    let directory = scratch("per-model");
+    let a = DailyRequestAllowance::new_on(
+        "openrouter-free",
+        "vendor/free-a".into(),
+        1,
+        allowance_path(&directory, "openrouter-free", "vendor/free-a"),
+        DayBoundary::Utc,
+    );
+    let b = DailyRequestAllowance::new_on(
+        "openrouter-free",
+        "vendor/free-b".into(),
+        1,
+        allowance_path(&directory, "openrouter-free", "vendor/free-b"),
+        DayBoundary::Utc,
+    );
+
+    a.try_reserve_at(at(LATE_UTC_DAY)).expect("a's own unit");
+    b.try_reserve_at(at(LATE_UTC_DAY))
+        .expect("b has its own unit when the counter is keyed per model");
 }

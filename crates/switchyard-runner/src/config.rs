@@ -7662,3 +7662,140 @@ fit_escalation = false
         runner_from_toml(config).expect("fit_escalation = false is the default behaviour");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Daily quota scope: one counter per account, or one per model
+// ---------------------------------------------------------------------------
+
+/// Two free models drawing on one provider account.
+///
+/// The account scope exists because the OpenRouter free-model allowance is stated once per
+/// account (`free_model_daily_requests: 1000`), so a per-model counter would hand the fleet
+/// one 1000-request budget per model and the fleet could spend several times the real cap
+/// before any counter refused it.
+#[cfg(test)]
+mod daily_quota_scope_tests {
+    use super::*;
+
+    const SHARED_ACCOUNT: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "/var/tmp/switchyard-quota-scope-fixture"
+
+[llm_clients.openrouter_free]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+
+[targets."free-a"]
+id = "vendor/free-a"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[routes."free"]
+id = "free"
+type = "passthrough"
+target = "free-a"
+candidates = ["free-b"]
+"#;
+
+    fn shared_account_config() -> DeploymentConfig {
+        toml::from_str(SHARED_ACCOUNT).expect("the fixture must parse")
+    }
+
+    /// Every model in an account-scoped group resolves to the one sentinel counter, at one
+    /// path, on the client's declared clock. A regression that keyed by target id would
+    /// give each model its own budget while the manifest still read `quota_scope = "account"`.
+    #[test]
+    fn account_scope_collapses_every_model_onto_one_counter() {
+        let config = shared_account_config();
+        let state_dir = std::path::Path::new("/var/tmp/switchyard-quota-scope-fixture");
+        let group = "openrouter-free-owner";
+
+        let (model_a, path_a, boundary_a) =
+            config.quota_counter(&config.targets["free-a"], group, state_dir);
+        let (model_b, path_b, boundary_b) =
+            config.quota_counter(&config.targets["free-b"], group, state_dir);
+
+        assert_eq!(
+            model_a.as_str(),
+            switchyard_llm_client::ACCOUNT_SCOPE_MODEL,
+            "an account-scoped target must count against the account sentinel"
+        );
+        assert_eq!(model_a, model_b, "two models, one account counter");
+        assert_eq!(path_a, path_b, "one counter means one file");
+        assert_eq!(
+            boundary_a,
+            switchyard_llm_client::DayBoundary::Utc,
+            "the OpenRouter free-model counter turns over at midnight UTC"
+        );
+        assert_eq!(boundary_a, boundary_b);
+    }
+
+    /// One counter cannot serve two budgets: two targets on the same account counter that
+    /// declare different limits are refused, and the refusal names both targets and both
+    /// numbers so the operator can decide which one is meant.
+    #[test]
+    fn differing_limits_on_one_account_counter_refuse_the_deployment() {
+        let source = SHARED_ACCOUNT.replace(
+            "id = \"vendor/free-b\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000",
+            "id = \"vendor/free-b\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 250",
+        );
+        assert!(
+            source.contains("daily_request_limit = 250"),
+            "the fixture edit must apply, or this test proves nothing"
+        );
+
+        let message = match runner_from_toml(&source) {
+            Ok(_) => panic!("a shared counter with two different limits must be refused"),
+            Err(error) => format!("{error}"),
+        };
+
+        assert!(
+            message.contains("free-a") && message.contains("free-b"),
+            "the refusal must name both targets, got: {message}"
+        );
+        assert!(
+            message.contains("1000") && message.contains("250"),
+            "the refusal must name both limits, got: {message}"
+        );
+        assert!(
+            message.contains("one counter serves one budget"),
+            "the refusal must say why it is refused, got: {message}"
+        );
+    }
+
+    /// The default is per model: a client that names no scope keeps a counter per target,
+    /// so declaring a daily limit today cannot silently change meaning.
+    #[test]
+    fn a_client_naming_no_scope_keeps_one_counter_per_model() {
+        let source = SHARED_ACCOUNT
+            .replace("quota_scope = \"account\"\n", "")
+            .replace("quota_reset = \"utc\"\n", "");
+        let config: DeploymentConfig = toml::from_str(&source).expect("the fixture must parse");
+        let state_dir = std::path::Path::new("/var/tmp/switchyard-quota-scope-fixture");
+        let group = "openrouter-free-owner";
+
+        let (model_a, path_a, boundary_a) =
+            config.quota_counter(&config.targets["free-a"], group, state_dir);
+        let (model_b, path_b, _) =
+            config.quota_counter(&config.targets["free-b"], group, state_dir);
+
+        assert_eq!(model_a.as_str(), "vendor/free-a");
+        assert_eq!(model_b.as_str(), "vendor/free-b");
+        assert_ne!(path_a, path_b, "per-model counters are separate files");
+        assert_eq!(
+            boundary_a,
+            switchyard_llm_client::DayBoundary::Pacific,
+            "Pacific stays the default boundary"
+        );
+    }
+}

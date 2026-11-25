@@ -95,6 +95,43 @@ CAPABILITY_TOOL=${CAPABILITY_TOOL:-$SELF_DIR/capability_contract.py}
 say() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
 
+# --------------------------------------------------------------------- serialisation
+#
+# Every verb that reads the release store and then moves CURRENT or LAST-KNOWN-GOOD
+# takes this lock FIRST, and the state it reasons about -- which release is CURRENT,
+# which rollback target exists, whether the release id is already stored, what the
+# unit's environment files currently are -- is read AFTER the lock is held.
+#
+# That read-under-lock is the compare-and-swap. Without it two writers each take a
+# snapshot of the same pre-state, each believe they own the rollback target, and the
+# later failure path restores over the release the other just activated. The window
+# is not theoretical: a deploy validates, installs, restarts, waits for health and
+# then verifies, so it holds the store open for seconds to minutes.
+#
+# A plain flock on a file inside the release store, deliberately. No daemon and no
+# unit, because a lock that needs its own service is a new critical path; and the
+# kernel drops it when the process dies, so a killed deployment cannot wedge the
+# store. The refusal names the holder, so a stuck lock is diagnosable rather than
+# indistinguishable from a slow validation.
+RELEASE_LOCK_TIMEOUT=${RELEASE_LOCK_TIMEOUT:-900}
+hold_release_lock() {
+  local lock=$RELEASE_ROOT/.release.lock
+  mkdir -p "$RELEASE_ROOT" || die "cannot create the release store at $RELEASE_ROOT"
+  command -v flock >/dev/null 2>&1 \
+    || die "flock is not installed, so concurrent release operations cannot be serialised; install util-linux"
+  # Fixed descriptor 9: no verb calls another verb, so there is nothing to nest, and
+  # a fixed number keeps the failure message a plain sentence.
+  exec 9>>"$lock" || die "cannot open the release lock at $lock"
+  if ! flock -w "$RELEASE_LOCK_TIMEOUT" 9; then
+    local holder
+    holder=$(cat "$lock" 2>/dev/null || true)
+    die "another release operation (pid ${holder:-unknown}) has held $lock for more than ${RELEASE_LOCK_TIMEOUT}s; refusing to act on the release store concurrently (raise RELEASE_LOCK_TIMEOUT if that operation is expected to be slow)"
+  fi
+  # Written under the lock, so the next contender's refusal names the real holder
+  # rather than whoever released it last.
+  printf '%s\n' "$$" > "$lock" 2>/dev/null || true
+}
+
 healthy() {
   if [ -n "$HEALTH_CMD" ]; then
     "$HEALTH_CMD" >/dev/null 2>&1
@@ -463,6 +500,8 @@ adopt_release() {
   local label=$1 commit=$2 branch=$3 dirty=$4 basis=$5 caps=$6
   [ -f "$LIVE_BIN" ] || die "no live binary at $LIVE_BIN"
   [ -f "$LIVE_MANIFEST" ] || die "no live manifest at $LIVE_MANIFEST"
+  # Adopt writes the only two pointers this host has, so it is a writer like any other.
+  hold_release_lock
   resolve_environment_files
   local b_sha m_sha id dir
   b_sha=$(sha "$LIVE_BIN")
@@ -684,6 +723,12 @@ cmd_deploy() {
   [ "$(sha "$b_src")" = "$b_want" ] || die "binary hash mismatch"
   say "artefacts match the approved hashes"
 
+  # Everything below reads or writes the release store, the live pair or the unit's
+  # environment, so it runs inside the lock. Taken before the reads, not before the
+  # argument checks: a malformed invocation should fail instantly rather than wait
+  # out the timeout to be told its hashes are wrong.
+  hold_release_lock
+
   # What the service actually runs with. Resolved once, here, so the validation
   # below and the release record further on cannot disagree about the set, and so a
   # host whose unit cannot be read is refused before anything is touched.
@@ -830,6 +875,7 @@ cmd_deploy() {
 # exited, possibly days later, with nothing in /var/tmp to rely on.
 cmd_rollback() {
   local target=${1:-} from_id from_dir
+  hold_release_lock
   from_id=$(link_target "$CURRENT_LINK")
   case $from_id in
     DANGLING:*) die "CURRENT points at ${from_id#DANGLING:} which is not a release" ;;
@@ -880,6 +926,7 @@ cmd_rollback() {
 
 cmd_promote() {
   local id=${1:-}
+  hold_release_lock
   if [ -z "$id" ]; then
     id=$(link_target "$CURRENT_LINK")
     [ -n "$id" ] || die "no CURRENT release to promote"

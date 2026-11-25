@@ -68,8 +68,16 @@ pub async fn run(
     let routing_observations = observer.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
     let outcome = match clients.stored_state_owner(&request) {
         Some(owner) => {
+            // Provider-owned state (`history: None`) means the provider holds
+            // the call itself and will validate the result: this layer cannot
+            // see those ids and must not call the lineage unresolved. Canonical
+            // state is ours to check, so it is materialized first and then
+            // validated.
+            let provider_owned = owner.history.is_none();
             let outcome = continue_on(owner, &algorithm_name, request);
-            ensure_tool_lineage(&outcome.request)?;
+            if !provider_owned {
+                ensure_tool_lineage(&outcome.request)?;
+            }
             Ok(outcome)
         }
         None => {
@@ -2755,6 +2763,60 @@ mod tests {
         assert_eq!(third["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(third["messages"][3]["content"], "sunny");
         assert_eq!(third["messages"][4]["content"][0]["text"], "thanks");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_owned_continuation_is_not_called_unresolved() -> Result<()> {
+        // A native Responses provider keeps the call on its side and replays it
+        // from `previous_response_id`. This router therefore stores no history
+        // for that id (`history: None`). The result names a call this request
+        // does not carry, and that is legitimate: only the provider can judge
+        // it, so dispatch must forward instead of refusing.
+        let client = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let clients = ClientRouter::new(HashMap::from([(
+            ModelId::from("weak"),
+            client.clone() as Arc<dyn RoutedLlmClient>,
+        )]));
+        clients
+            .inner
+            .state_owners
+            .lock()
+            .remember(Some("resp_1"), None, &ModelId::from("weak"), None)
+            .map_err(|error| LibsyError::client_call(ModelId::from("weak"), error))?;
+        let models = to_category_map(&["weak"]);
+        let follow = Request {
+            llm_request: switchyard_translation::decode_request(
+                WireFormat::OpenAiResponses,
+                &json!({
+                    "model": "weak",
+                    "previous_response_id": "resp_1",
+                    "input": [{"type": "function_call_output", "call_id": "held", "output": "ok"}]
+                }),
+            )
+            .map_err(|error| LibsyError::external("decoding follow", error))?,
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
+        };
+        run(
+            Arc::new(switchyard_libsy::Passthrough),
+            clients,
+            follow,
+            models,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            client.calls.lock().len(),
+            1,
+            "a provider-owned continuation must reach its provider"
+        );
         Ok(())
     }
 

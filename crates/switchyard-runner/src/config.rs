@@ -1139,8 +1139,23 @@ impl DeploymentConfig {
                             .get(&target.llm_client)
                             .and_then(|client| client.quota_group.clone())
                             .unwrap_or_else(|| target.llm_client.clone());
+                        // Look the counter up under the scope it was built with: account
+                        // scope has one counter for the whole group, so every model in the
+                        // group resolves to that one allowance rather than to a per-model
+                        // counter that was never created.
+                        let counter_model = match self
+                            .llm_clients
+                            .get(&target.llm_client)
+                            .and_then(|client| client.quota_scope)
+                            .unwrap_or_default()
+                        {
+                            QuotaScope::Account => {
+                                ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL)
+                            }
+                            QuotaScope::Model => target.id.clone(),
+                        };
                         allowances
-                            .get(&(group, target.id.clone()))
+                            .get(&(group, counter_model))
                             .map(|allowance| (target.id.clone(), Arc::clone(allowance)))
                     })
                     .collect::<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>(
@@ -1227,6 +1242,43 @@ impl DeploymentConfig {
     /// one budget, and keying them apart would hand the deployment twice the allowance it
     /// actually has. A client that declares no group is its own group, which leaves a
     /// single-client deployment unchanged.
+    /// The counter a target's declared daily limit is counted on, and the clock it resets on.
+    ///
+    /// Model scope — the default — keys the counter by the target's model id, which is
+    /// correct for a provider that budgets each model separately. Account scope collapses
+    /// every model in the group onto one counter and one sentinel, because the provider
+    /// states one allowance for the whole account; under model scope each free model would
+    /// be granted the full budget and the fleet could spend several times the real cap
+    /// before any counter reported exhaustion.
+    fn quota_counter(
+        &self,
+        target: &TargetConfig,
+        group: &str,
+        state_dir: &std::path::Path,
+    ) -> (
+        ModelId,
+        std::path::PathBuf,
+        switchyard_llm_client::DayBoundary,
+    ) {
+        let client = self.llm_clients.get(&target.llm_client);
+        let boundary = match client.and_then(|client| client.quota_reset).unwrap_or_default() {
+            QuotaReset::Pacific => switchyard_llm_client::DayBoundary::Pacific,
+            QuotaReset::Utc => switchyard_llm_client::DayBoundary::Utc,
+        };
+        match client.and_then(|client| client.quota_scope).unwrap_or_default() {
+            QuotaScope::Account => (
+                ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL),
+                switchyard_llm_client::account_allowance_path(state_dir, group),
+                boundary,
+            ),
+            QuotaScope::Model => (
+                target.id.clone(),
+                switchyard_llm_client::allowance_path(state_dir, group, target.id.as_str()),
+                boundary,
+            ),
+        }
+    }
+
     fn build_allowances(
         &self,
     ) -> RunnerResult<HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>>
@@ -1247,14 +1299,20 @@ impl DeploymentConfig {
                 .get(&target.llm_client)
                 .and_then(|client| client.quota_group.clone())
                 .unwrap_or_else(|| target.llm_client.clone());
-            let key = (group.clone(), target.id.clone());
-            match limits.entry(key) {
+            let quota = self.quota.as_ref().ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
+                ))
+            })?;
+            let (counter_model, path, boundary) = self.quota_counter(target, &group, &quota.state_dir);
+            let key = (group.clone(), counter_model.clone());
+            match limits.entry(key.clone()) {
                 std::collections::hash_map::Entry::Occupied(existing) => {
                     let (first_limit, first_name) = existing.get();
                     if *first_limit != limit {
                         return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} share model {} in quota group {group} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
-                            target.id
+                            "targets {first_name} and {target_name} draw on the same daily counter ({}) in quota group {group} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
+                            counter_model.as_str()
                         )));
                     }
                     continue;
@@ -1263,22 +1321,14 @@ impl DeploymentConfig {
                     slot.insert((limit, target_name.as_str()));
                 }
             }
-            let quota = self.quota.as_ref().ok_or_else(|| {
-                RunnerError::configuration(format!(
-                    "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
-                ))
-            })?;
             allowances.insert(
-                (group.clone(), target.id.clone()),
-                Arc::new(switchyard_llm_client::DailyRequestAllowance::new(
+                key,
+                Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
                     group.clone(),
-                    target.id.clone(),
+                    counter_model,
                     limit,
-                    switchyard_llm_client::allowance_path(
-                        &quota.state_dir,
-                        &group,
-                        target.id.as_str(),
-                    ),
+                    path,
+                    boundary,
                 )),
             );
         }
@@ -3086,6 +3136,46 @@ struct LlmClientConfig {
     /// as it was.
     #[serde(default)]
     quota_group: Option<String>,
+    /// Whether this client's daily cap is stated per model or for the whole account.
+    ///
+    /// Model scope is the historical behaviour and stays the default, because it is
+    /// correct for a provider that budgets each model separately (Google's free tier).
+    /// Account scope exists for providers that publish one free-request allowance for the
+    /// whole account (OpenRouter): under model scope every free model would be given the
+    /// full daily budget as its own, and the fleet would collectively spend several times
+    /// the real cap before any counter reported exhaustion.
+    #[serde(default)]
+    quota_scope: Option<QuotaScope>,
+    /// Which midnight this client's daily counter turns over on.
+    ///
+    /// Pacific by default, which is the historical behaviour and is correct for Google's
+    /// AI Studio free tier. OpenRouter's free-model counter turns over at midnight UTC;
+    /// counting it on the Pacific clock would either spend the new day's budget hours
+    /// early or refuse traffic the provider has already restored.
+    #[serde(default)]
+    quota_reset: Option<QuotaReset>,
+}
+
+/// How a client's daily request cap is scoped.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaScope {
+    /// One counter per model within the quota group.
+    #[default]
+    Model,
+    /// One counter for the whole quota group: every model draws on one account budget.
+    Account,
+}
+
+/// Which midnight a client's daily counter turns over on.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaReset {
+    /// Midnight Pacific — Google's AI Studio free tier.
+    #[default]
+    Pacific,
+    /// Midnight UTC — OpenRouter's free-model daily counter.
+    Utc,
 }
 
 /// Where a client's traffic terminates.

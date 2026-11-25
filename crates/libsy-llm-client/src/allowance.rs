@@ -169,6 +169,60 @@ pub fn provider_day_label(day: u64) -> String {
     format!("{year:04}-{month:02}-{date:02}")
 }
 
+/// The UTC civil day number containing `now`.
+///
+/// A second day boundary exists because provider families do not agree on when "today"
+/// starts. Google's free tier turns over at midnight Pacific; OpenRouter's free-model
+/// counter turns over at midnight UTC. Counting one on the other's clock either spends
+/// the new day's budget a few hours early or refuses traffic the provider has already
+/// restored, so the boundary belongs to the allowance rather than being a global
+/// constant.
+pub fn utc_day(now: SystemTime) -> u64 {
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+    u64::try_from(seconds.div_euclid(DAY_SECONDS)).unwrap_or(0)
+}
+
+/// Which midnight a daily counter turns over on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DayBoundary {
+    /// Midnight Pacific — Google's AI Studio free tier. The historical default, so a
+    /// deployment that names no boundary keeps exactly its previous behaviour.
+    #[default]
+    Pacific,
+    /// Midnight UTC — OpenRouter's free-model daily counter.
+    Utc,
+}
+
+impl DayBoundary {
+    /// The civil day number containing `now` on this boundary's clock.
+    pub fn day(self, now: SystemTime) -> u64 {
+        match self {
+            DayBoundary::Pacific => provider_day(now),
+            DayBoundary::Utc => utc_day(now),
+        }
+    }
+
+    /// The `YYYY-MM-DD` date of `day` on this boundary's clock.
+    ///
+    /// Both boundaries count whole civil days from the epoch, so the calendar date of a
+    /// day number is the same arithmetic; only which day `now` falls in differs.
+    pub fn label(self, day: u64) -> String {
+        provider_day_label(day)
+    }
+
+    /// The stable spelling used in configuration and telemetry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DayBoundary::Pacific => "pacific",
+            DayBoundary::Utc => "utc",
+        }
+    }
+}
+
 /// Why a reservation could not be granted.
 #[derive(Debug)]
 pub enum ReserveError {
@@ -183,14 +237,18 @@ pub enum ReserveError {
 pub struct DailyRequestAllowance {
     /// The quota group the allowance belongs to — the provider-side project whose counter
     /// this is. Every client that bills to the same project shares one group, and so one
-    /// counter per model.
+    /// counter per model — or one counter for the whole group when the cap is stated at
+    /// account scope.
     group: String,
-    /// The target model whose allowance this is.
+    /// The target model whose allowance this is. At account scope this is the group
+    /// sentinel rather than a model, because one counter serves every model in the group.
     model: ModelId,
     /// Requests permitted per provider day.
     limit: u64,
     /// Where this allowance's counter lives.
     path: PathBuf,
+    /// Which midnight the counter turns over on.
+    boundary: DayBoundary,
 }
 
 /// The persisted counter.
@@ -209,6 +267,24 @@ impl DailyRequestAllowance {
             model,
             limit,
             path,
+            boundary: DayBoundary::Pacific,
+        }
+    }
+
+    /// [`Self::new`] with an explicit day boundary.
+    pub fn new_on(
+        group: impl Into<String>,
+        model: ModelId,
+        limit: u64,
+        path: PathBuf,
+        boundary: DayBoundary,
+    ) -> Self {
+        Self {
+            group: group.into(),
+            model,
+            limit,
+            path,
+            boundary,
         }
     }
 
@@ -227,9 +303,14 @@ impl DailyRequestAllowance {
         &self.group
     }
 
+    /// Which midnight this counter turns over on.
+    pub fn boundary(&self) -> DayBoundary {
+        self.boundary
+    }
+
     /// The provider-day number the counter currently belongs to.
     pub fn current_day(&self) -> u64 {
-        provider_day(SystemTime::now())
+        self.boundary.day(SystemTime::now())
     }
 
     /// Requests this counter still permits in the current provider day.
@@ -244,7 +325,7 @@ impl DailyRequestAllowance {
 
     /// [`Self::remaining`] against an explicit clock, for tests and replays.
     pub fn remaining_at(&self, now: SystemTime) -> u64 {
-        let day = provider_day(now);
+        let day = self.boundary.day(now);
         match self.read_under_lock() {
             Ok(counter) => self.limit.saturating_sub(spent_on(counter, day)),
             Err(_) => 0,
@@ -262,7 +343,7 @@ impl DailyRequestAllowance {
 
     /// [`Self::try_reserve`] against an explicit clock, for tests and for replays.
     pub fn try_reserve_at(&self, now: SystemTime) -> Result<(), ReserveError> {
-        let day = provider_day(now);
+        let day = self.boundary.day(now);
         // The lock is held across the read, the decision and the write. Without it two
         // processes sharing a state directory would each read the same count, each decide
         // it may spend, and together exceed the budget by one request per race.
@@ -507,6 +588,19 @@ pub fn allowance_path(directory: &Path, group: &str, model: &str) -> PathBuf {
         legible(model),
         fnv1a(&key)
     ))
+}
+
+/// The model component an account-scoped counter uses.
+///
+/// A provider that caps free requests per *account* shares one budget across every model,
+/// so that counter must not be keyed by model. The sentinel is spelled so it cannot
+/// collide with a real model id: provider model ids use `[a-z0-9./:_-]` and never begin
+/// with `*`.
+pub const ACCOUNT_SCOPE_MODEL: &str = "*account*";
+
+/// The counter file for an account-scoped allowance: one per quota group, not per model.
+pub fn account_allowance_path(directory: &Path, group: &str) -> PathBuf {
+    allowance_path(directory, group, ACCOUNT_SCOPE_MODEL)
 }
 
 /// `value` reduced to characters that are safe in a path component.

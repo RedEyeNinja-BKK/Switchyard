@@ -29,9 +29,10 @@ pub mod raw;
 pub mod run;
 
 pub use allowance::{
-    AdmissionMargin, DailyRequestAllowance, GovernorKey, PacedQuota, PacingError, PacingScope,
-    PacingTicket, QuotaGovernor, ReserveError, Throttled, WindowLimits, allowance_path,
-    estimate_input_tokens, reported_input_tokens,
+    ACCOUNT_SCOPE_MODEL, AdmissionMargin, DailyRequestAllowance, DayBoundary, GovernorKey,
+    PacedQuota, PacingError, PacingScope, PacingTicket, QuotaGovernor, ReserveError, Throttled,
+    WindowLimits, account_allowance_path, allowance_path, estimate_input_tokens,
+    reported_input_tokens,
 };
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};

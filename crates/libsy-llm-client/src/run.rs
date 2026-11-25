@@ -31,7 +31,7 @@ use switchyard_libsy::{
     RuntimeModels, drive,
 };
 use switchyard_protocol::{
-    AggLlmResponse, DecisionRequest, DecisionResponse, LlmClientError, LlmResponse,
+    AggLlmResponse, ContentBlock, DecisionRequest, DecisionResponse, LlmClientError, LlmResponse,
     LlmResponseChunk, LlmResponseStream, Message, ModelId, Request, Response, ResponseAccumulator,
     RoutedLlmClient, RoutingFallbackReason, WireFormat,
 };
@@ -67,8 +67,13 @@ pub async fn run(
     // No observer means we don't want any routing_observations.
     let routing_observations = observer.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
     let outcome = match clients.stored_state_owner(&request) {
-        Some(owner) => Ok(continue_on(owner, &algorithm_name, request)),
+        Some(owner) => {
+            let outcome = continue_on(owner, &algorithm_name, request);
+            ensure_tool_lineage(&outcome.request)?;
+            Ok(outcome)
+        }
         None => {
+            ensure_tool_lineage(&request)?;
             drive(algorithm, request, models, {
                 let routing_observations = routing_observations.clone();
                 move |call| serve(routing_clients.clone(), call, routing_observations.clone())
@@ -1205,6 +1210,60 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         }
         _ => None,
     }
+}
+
+/// Refuses a request whose tool results cannot be matched to a tool call.
+///
+/// A result whose call is absent from the request can only be answered from
+/// continuation state. When the request reached here with no line for that call
+/// -- either the history window began mid transaction, or the state id is
+/// foreign or expired -- dispatching it would fail upstream. It is also never
+/// repaired by rewriting the output into a user turn, because that would give
+/// untrusted tool text the authority of a caller instruction. The decision is
+/// made here because this is the only layer that can see whether a verified,
+/// scoped continuation store answers the call.
+fn ensure_tool_lineage(request: &Request) -> Result<()> {
+    use std::collections::HashSet;
+
+    let calls: HashSet<&str> = request
+        .llm_request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut unresolved: Vec<&str> = request
+        .llm_request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult(result) => Some(result.tool_call_id.as_str()),
+            _ => None,
+        })
+        .filter(|id| !id.is_empty() && !calls.contains(id))
+        .collect();
+    unresolved.sort_unstable();
+    unresolved.dedup();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    Err(LibsyError::client_call(
+        request.llm_request.model.clone().unwrap_or_default(),
+        LlmClientError::RequestTranslation(format!(
+            "tool result(s) {} have no matching tool call in this request, and no verified \
+             continuation state supplies them; resend the complete tool transaction (the call, \
+             any required reasoning metadata, and every result of the parallel group)",
+            unresolved
+                .iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    ))
 }
 
 /// Route to `owner` without fallbacks and record why the algorithm did not run.
@@ -2696,6 +2755,79 @@ mod tests {
         assert_eq!(third["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(third["messages"][3]["content"], "sunny");
         assert_eq!(third["messages"][4]["content"][0]["text"], "thanks");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reference_without_resolved_state_is_refused_before_any_upstream_call() -> Result<()> {
+        // A `previous_response_id` is caller-supplied. When this router holds no
+        // state for it, the tool result it was supposed to answer stays
+        // unresolved: the request is refused before dispatch, so no leg of the
+        // route - primary or fallback - sees an upstream attempt.
+        let primary = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let fallback = Arc::new(CandidateClient {
+            calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            first: FirstOutcome::StreamSuccess,
+        });
+        let clients = ClientRouter::new(HashMap::from([
+            (ModelId::from("weak"), primary.clone() as Arc<dyn RoutedLlmClient>),
+            (
+                ModelId::from("strong"),
+                fallback.clone() as Arc<dyn RoutedLlmClient>,
+            ),
+        ]));
+        let models = to_category_map(&["weak", "strong"]);
+        let follow = Request {
+            llm_request: switchyard_translation::decode_request(
+                WireFormat::OpenAiResponses,
+                &json!({
+                    "model": "route",
+                    "previous_response_id": "resp_not_held",
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": "call_absent",
+                        "output": "result"
+                    }],
+                    "store": true
+                }),
+            )
+            .map_err(|error| LibsyError::external("decoding unmatched continuation", error))?,
+            raw_request: None,
+            metadata: None,
+            route_reasoning_policy: None,
+            route_reasoning_effort: None,
+        };
+        let error = match run(
+            Arc::new(switchyard_libsy::Passthrough),
+            clients,
+            follow,
+            models,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("an unresolvable tool result must be refused"),
+            Err(error) => error,
+        };
+        match &error {
+            LibsyError::ClientCall {
+                source: LlmClientError::RequestTranslation(message),
+                ..
+            } => assert!(
+                message.contains("call_absent") && message.contains("no matching tool call"),
+                "the refusal must name the unresolved call: {message}"
+            ),
+            other => panic!("expected a request-translation refusal, got {other:?}"),
+        }
+        assert!(
+            primary.calls.lock().is_empty() && fallback.calls.lock().is_empty(),
+            "a malformed lineage must not reach any upstream leg"
+        );
         Ok(())
     }
 

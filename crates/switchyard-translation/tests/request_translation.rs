@@ -1873,9 +1873,13 @@ fn responses_input_without_type_or_message_shape_is_rejected() {
     assert!(error.to_string().contains("$.input[0].type"));
 }
 
-// Verifies orphan Responses tool outputs degrade to readable user text.
+// Verifies an orphan Responses tool output never becomes conversation authority.
 #[test]
-fn responses_orphan_function_call_output_degrades_to_user_text_for_openai_chat() -> TestResult {
+fn responses_orphan_function_call_output_is_never_promoted_to_user_text() -> TestResult {
+    // Untrusted tool output must not be rewritten into a user turn on any
+    // translation path: that would give it the authority of an instruction.
+    // With no continuation reference nothing can supply the call, so the
+    // request is refused instead.
     let engine = TranslationEngine::default();
     let body = json!({
         "model": "gpt-4",
@@ -1886,18 +1890,66 @@ fn responses_orphan_function_call_output_degrades_to_user_text_for_openai_chat()
         }]
     });
 
-    let output = engine
+    for target in [WireFormat::OpenAiChat, WireFormat::OpenAiResponses] {
+        let error = engine
+            .translate_request(
+                WireFormat::OpenAiResponses,
+                target,
+                &body,
+                &TranslationPolicy::default(),
+            )
+            .expect_err("an unmatched tool output must be refused, not promoted");
+        let message = error.to_string();
+        assert!(
+            message.contains("call_orphan") && message.contains("no matching tool call"),
+            "the refusal must name the orphan on the {target:?} path: {message}"
+        );
+        assert!(
+            !message.contains("\"role\":\"user\""),
+            "no path may rewrite tool output into a user turn"
+        );
+    }
+
+    // With a continuation reference the typed result is preserved for the
+    // dispatch layer to validate against the state it actually holds.
+    let referenced = json!({
+        "model": "gpt-4",
+        "previous_response_id": "resp_prev",
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "call_held",
+            "output": "result"
+        }]
+    });
+    let chat = engine
         .translate_request(
             WireFormat::OpenAiResponses,
             WireFormat::OpenAiChat,
-            &body,
+            &referenced,
             &TranslationPolicy::default(),
         )?
         .body;
+    let serialized = serde_json::to_string(&chat)?;
+    assert!(
+        !serialized.contains("role\":\"user\""),
+        "a continuation reference must not promote tool output: {serialized}"
+    );
+    assert!(
+        serialized.contains("\"role\":\"tool\"") && serialized.contains("call_held"),
+        "the referenced result must stay a tool result carrying its call id: {serialized}"
+    );
 
+    let same_format = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiResponses,
+            &referenced,
+            &TranslationPolicy::default(),
+        )?
+        .body;
     assert_eq!(
-        output["messages"],
-        json!([{"role": "user", "content": "Tool result call_orphan: result"}])
+        same_format, referenced,
+        "a same-format request with a reference is preserved for dispatch"
     );
     Ok(())
 }
@@ -4468,6 +4520,8 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
         "input": outputs
     });
 
+    // The outputs answer calls held behind `previous_response_id`; the caller
+    // asserts that continuation state at dispatch, not in translation.
     let request = engine
         .decode_request(
             WireFormat::OpenAiResponses,
@@ -4491,7 +4545,7 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
             WireFormat::OpenAiResponses,
             WireFormat::OpenAiResponses,
             &body,
-            &normalized_policy(),
+            &TranslationPolicy::default(),
         )?
         .body;
     assert_eq!(output["input"], outputs);

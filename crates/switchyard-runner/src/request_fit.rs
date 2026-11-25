@@ -808,7 +808,10 @@ mod tests {
             json!({"input": "hello", "parallel_tool_calls": false}),
             json!({"input": [{"type": "additional_tools", "tools": []}]}),
             json!({"input": [{"type": "shell_call", "id": "shell_1", "call_id": "call_1", "action": {"commands": ["pwd"]}}]}),
-            json!({"input": [{"type": "function_call_output", "call_id": "call_1", "output": "done"}]}),
+            json!({"input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+            ]}),
             json!({"input": [{"type": "mcp_list_tools", "server_label": "server", "tools": []}]}),
             json!({"input": [{"type": "mcp_approval_request", "id": "approval_1", "name": "lookup", "arguments": "{}", "server_label": "server"}]}),
             json!({"input": [{"type": "mcp_approval_response", "approval_request_id": "approval_1", "approve": true}]}),
@@ -1027,11 +1030,14 @@ mod tests {
     #[test]
     fn media_named_fields_inside_tool_output_are_not_request_media() -> TestResult {
         let body = json!({
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": {"video": "clip.mp4", "audio": "note.wav"}
-            }]
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "collect", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": {"video": "clip.mp4", "audio": "note.wav"}
+                }
+            ]
         });
         let request = decode_request(OpenAiResponses, &body)?;
         assert_eq!(

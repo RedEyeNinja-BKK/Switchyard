@@ -288,6 +288,21 @@ fn reserve_physical_call(
                     "daily_allowance_exhausted",
                 )));
             }
+            Err(ReserveError::ProviderExhausted { limit }) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                return Err(Box::new(error_body(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "the provider reports the account allowance for capability {} ({}) is \
+                         spent ({limit} per provider day); a local budget with room cannot \
+                         reopen it, and it clears at the provider's own day boundary",
+                        capability.id, capability.model
+                    ),
+                    "provider_allowance_exhausted",
+                )));
+            }
             Err(ReserveError::Unusable(reason)) => {
                 if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
                     pacing.release(ticket);

@@ -684,6 +684,19 @@ impl TranslatingLlmClient {
                         retry_after: None,
                     });
                 }
+                Err(crate::allowance::ReserveError::ProviderExhausted { limit }) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
+                    return Err(AttemptFailure {
+                        error: LlmClientError::ProviderAllowanceExhausted {
+                            model: model.clone(),
+                            limit,
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
                 Err(crate::allowance::ReserveError::Unusable(reason)) => {
                     if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
                         quota.release(ticket);

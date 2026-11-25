@@ -455,6 +455,7 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         TerminalPolicy::Capacity => matches!(
             outcome,
             "daily_allowance_exhausted"
+                | "provider_allowance_exhausted"
                 | "daily_allowance_unavailable"
                 | "minute_window"
                 | "minute_window_too_small"
@@ -475,7 +476,10 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         // policy lets the terminal leg be spent on.
         TerminalPolicy::QuotaOnly => matches!(
             outcome,
-            "daily_allowance_exhausted" | "minute_window" | "http_429"
+            "daily_allowance_exhausted"
+                | "provider_allowance_exhausted"
+                | "minute_window"
+                | "http_429"
         ),
         // Everything `Capacity` accepts except the two authentication outcomes, the two
         // faults that are about this deployment's accounting or this request's size, and a
@@ -499,6 +503,7 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         TerminalPolicy::Availability => matches!(
             outcome,
             "daily_allowance_exhausted"
+                | "provider_allowance_exhausted"
                 | "minute_window"
                 | "http_429"
                 | "http_5xx"
@@ -1997,6 +2002,67 @@ mod carrier_tests {
         assert!(Both.includes(Inline) && Both.includes(Remote) && Both.includes(Both));
         assert!(Inline.includes(Inline) && !Inline.includes(Remote) && !Inline.includes(Both));
         assert!(Remote.includes(Remote) && !Remote.includes(Inline) && !Remote.includes(Both));
+    }
+}
+
+/// A provider-confirmed allowance refusal must mean exactly what the local one means to
+/// every routing decision, and nothing less.
+///
+/// The two labels are separate so the record can say which authority refused, but the
+/// consequence is identical: the leg has no allowance today, so the route may advance and
+/// a terminal leg may be spent on it. Keeping them aligned by hand across three policy
+/// lists is exactly the change that goes wrong quietly -- a new error class with no policy
+/// arm ends the route with a refusal even when a sibling could answer. So the invariant is
+/// asserted mechanically, for every policy, rather than trusted to review.
+#[cfg(test)]
+mod allowance_label_parity_tests {
+    use super::{TerminalPolicy, is_capacity_outcome};
+
+    const LOCAL: &str = "daily_allowance_exhausted";
+    const PROVIDER: &str = "provider_allowance_exhausted";
+
+    const POLICIES: [TerminalPolicy; 3] = [
+        TerminalPolicy::Capacity,
+        TerminalPolicy::QuotaOnly,
+        TerminalPolicy::Availability,
+    ];
+
+    #[test]
+    fn the_provider_label_is_accepted_wherever_the_local_one_is() {
+        for policy in POLICIES {
+            assert_eq!(
+                is_capacity_outcome(LOCAL, policy),
+                is_capacity_outcome(PROVIDER, policy),
+                "policy {policy:?} treats the provider-confirmed refusal differently from the \
+                 local one; a route would then refuse instead of advancing, or spend a \
+                 terminal leg on a class it was told to ignore"
+            );
+        }
+    }
+
+    /// The parity above would also hold if BOTH labels were wrongly rejected, so the
+    /// allowance class is pinned to being accepted where it must be.
+    #[test]
+    fn the_allowance_refusal_is_accepted_by_every_policy() {
+        for policy in POLICIES {
+            assert!(
+                is_capacity_outcome(LOCAL, policy),
+                "policy {policy:?} must accept an allowance refusal"
+            );
+            assert!(
+                is_capacity_outcome(PROVIDER, policy),
+                "policy {policy:?} must accept a provider-confirmed allowance refusal"
+            );
+        }
+    }
+
+    /// And the label must stay distinguishable: folding it into the local one would make
+    /// the decision record unable to say which authority refused.
+    #[test]
+    fn the_two_labels_are_different_strings() {
+        assert_ne!(LOCAL, PROVIDER);
+        assert!(LOCAL.contains("daily_allowance"));
+        assert!(PROVIDER.contains("provider_allowance"));
     }
 }
 

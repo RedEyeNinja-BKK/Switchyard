@@ -186,6 +186,12 @@ pub fn outcome_code(error: &switchyard_protocol::client::LlmClientError) -> &'st
         E::TemporarilyUnavailable => "unavailable",
         E::ContextWindowExceeded { .. } => "context_window",
         E::DailyRequestAllowanceExhausted { .. } => "daily_allowance_exhausted",
+        // A separate label, not folded into the local one. The routing consequence is the
+        // same -- the leg has no allowance today and the route may advance -- but the
+        // cause is different, and a deployment that conflated them could not tell its own
+        // budget from the account's. `policy_outcome_label` keeps them aligned; see the
+        // invariant test in the runner.
+        E::ProviderAllowanceExhausted { .. } => "provider_allowance_exhausted",
         E::DailyRequestAllowanceUnavailable { .. } => "daily_allowance_unavailable",
         E::MinuteAllowanceThrottled { .. } => "minute_window",
         E::InputExceedsMinuteWindow { .. } => "minute_window_too_small",

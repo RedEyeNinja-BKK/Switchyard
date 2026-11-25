@@ -6,14 +6,54 @@
 //! Each implementation uses the same credential Switchyard uses to serve inference
 //! from that provider. Nothing here creates, rotates or broadens a credential.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use super::providers::{
     AccountAmount, AccountApi, AccountBalanceComponent, AccountObservation, AccountScope,
-    FetchOutcome, ReportingPeriod,
+    FetchOutcome, ReportingPeriod, RequestAllowanceReading,
 };
+
+/// Parses an RFC 3339 UTC timestamp (`2026-11-26T00:00:00Z`) into a clock reading.
+///
+/// Only the `Z` form is accepted. A provider that states an offset instead would need a
+/// timezone database to interpret, and a wrong reset time is worse than none: the reading
+/// is still useful for its counts, so an unparsed reset is reported as absent rather than
+/// approximated.
+fn parse_rfc3339_utc(text: &str) -> Option<SystemTime> {
+    let text = text.strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    let mut t = time.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let minute: i64 = t.next()?.parse().ok()?;
+    // Seconds may carry a fractional part; the whole second is enough for a reset.
+    let second: i64 = t.next()?.split('.').next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(0..24).contains(&hour) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    if seconds < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).ok()?))
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = (month + 9) % 12;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
 
 /// The HTTP client the account readers use.
 ///
@@ -109,6 +149,36 @@ impl OpenRouterAccount {
                         // weaker but still provider-reported grouping.
                         observation.account_identity = Some(format!("workspace:{workspace}"));
                     }
+                    // The free-model request count. This is per ACCOUNT, not per key:
+                    // it is the provider's own tally of every free-model request the
+                    // account made today, whichever key sent it. That is precisely why
+                    // it is the figure a deployment must admit on -- a local counter
+                    // sees only its own traffic -- and why it is published as a
+                    // request count with its limit and reset rather than as a
+                    // percentage, so it can be reconciled rather than merely displayed.
+                    if let Some(block) = data.get("free_model_daily_requests") {
+                        let number = |key: &str| block.get(key).and_then(Value::as_u64);
+                        if let (Some(used), Some(limit), Some(remaining)) =
+                            (number("used"), number("limit"), number("remaining"))
+                        {
+                            // `resets_at` is only present on some responses; an absent
+                            // one is a missing fact, not a zero.
+                            let reset_at = block
+                                .get("resets_at")
+                                .and_then(Value::as_str)
+                                .and_then(parse_rfc3339_utc);
+                            observation
+                                .request_allowances
+                                .push(RequestAllowanceReading::new(
+                                    "free_model_daily_requests",
+                                    used,
+                                    limit,
+                                    remaining,
+                                    SystemTime::now(),
+                                    reset_at,
+                                ));
+                        }
+                    }
                     // The key endpoint reports the usage of this key over several
                     // windows. Each window is a different amount, so each is
                     // published under its own period rather than folded into one
@@ -179,6 +249,13 @@ impl OpenRouterAccount {
         if observation.is_empty() {
             return FetchOutcome::Failed("provider reported no account state".to_string());
         }
+        // The request-count reading is what a deployment can act on: it is the only
+        // statement that covers traffic this host never saw. A figure that contradicts
+        // itself is not usable evidence, so it is dropped rather than published, and the
+        // window fields the provider did state are kept.
+        observation
+            .request_allowances
+            .retain(|reading| reading.is_consistent());
         FetchOutcome::Ok(Box::new(observation))
     }
 }

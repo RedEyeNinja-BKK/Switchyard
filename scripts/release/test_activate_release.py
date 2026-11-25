@@ -1301,6 +1301,164 @@ def _stable(sandbox):
     return (names, sandbox.current(), sandbox.lkg(), sandbox.live_bytes())
 
 
+def test_a_candidate_that_changes_while_waiting_is_refused_under_the_lock(box):
+    """The pre-lock hash check is a fast rejection, not a proof.
+
+    The candidate path is normally a staging directory under /var/tmp, which anyone
+    can write, so the bytes compared before the lock was taken are not necessarily
+    the bytes that would be installed. This drives the real TOCTOU: the manifest is
+    approved and correct while the script waits, and is rewritten by another process
+    during the wait. The lock is released only after the swap, so the deployment must
+    re-derive the digest under the lock and refuse rather than install an unapproved
+    manifest whose recorded hash would then be a lie.
+    """
+    baseline = adopted(box)
+    candidate, csha = box.write_candidate("swap-bin", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("swap.toml")
+    approved = open(manifest).read()
+    before = _stable(box)
+
+    fd = _hold_release_lock(box)
+    swapper = subprocess.Popen(
+        ["bash", "-c",
+         f"while [ ! -e {box.root}/go ]; do sleep 0.05; done; "
+         f"printf '%s' 'route = tampered\\n' > {manifest}"])
+    try:
+        proc = subprocess.Popen(
+            ["bash", SCRIPT, "deploy", manifest, msha, candidate, csha,
+             "--label", "swapped", "--capabilities", ""],
+            env=box.env(RELEASE_LOCK_TIMEOUT="120"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.0)          # the deploy is blocked on the lock by now
+        open(os.path.join(box.root, "go"), "w").close()   # release the swapper
+        swapper.wait(timeout=30)
+        os.close(fd)             # only now can the deployment proceed
+        out, err = proc.communicate(timeout=180)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    text = out + err
+    assert proc.returncode != 0, (
+        "a manifest rewritten while the deployment waited must be refused, not "
+        "installed: " + text)
+    assert "changed while this deployment waited" in text, text
+    assert open(manifest).read() != approved, "the fixture must actually have tampered"
+
+    # Nothing was installed: the store and the live pair are as they were.
+    assert _stable(box) == before, text
+    assert box.current() == baseline
+
+
+def test_a_lock_file_belonging_to_another_account_is_refused(box):
+    """A lock another account can replace cannot serialise writers.
+
+    Only asserted as root, which is how the suite runs: an unprivileged run owns its
+    own sandbox lock legitimately. The point is the production case -- a release store
+    whose lock is not root-owned is one where a second account could delete and
+    recreate the inode, leaving the holder asleep on a file nobody else will open.
+    """
+    if os.geteuid() != 0:
+        return
+    adopted(box)
+    lock = os.path.join(box.releases, ".release.lock")
+    with open(lock, "w"):
+        pass
+    os.chmod(lock, 0o666)          # world-writable: replaceable by any account
+
+    candidate, csha = box.write_candidate("perm-bin", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("perm.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--label", "perm", "--capabilities", "")
+
+    text = result.stdout + result.stderr
+    assert result.returncode != 0, text
+    assert "world-writable" in text or "group- or world-writable" in text, text
+
+
+def test_the_release_lock_is_stable_across_the_whole_deployment(box):
+    """The lock inode is never unlinked, so a contender locks the same object.
+
+    Comparing inode NUMBERS does not prove this: a file deleted and recreated in the
+    same directory is routinely handed the same inode number, so that check passes on
+    exactly the defect it was written for (measured -- the mutant survived it). The
+    reuse-immune proof is a descriptor held across the deployment: unlinking the lock
+    drops that descriptor's link count to zero, and no reallocation can undo it.
+    """
+    adopted(box)
+    candidate, csha = box.write_candidate("stable-bin", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("stable.toml")
+
+    lock = os.path.join(box.releases, ".release.lock")
+    if not os.path.exists(lock):
+        with open(lock, "w"):
+            pass
+    holder = os.open(lock, os.O_WRONLY | os.O_APPEND)
+    try:
+        assert os.fstat(holder).st_nlink == 1
+        result = box.run("deploy", manifest, msha, candidate, csha,
+                         "--label", "stable", "--capabilities", "")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert os.fstat(holder).st_nlink == 1, (
+            "the deployment unlinked the release lock; a contender that opened the "
+            "old file would then be locking an object the store no longer listens "
+            "to, and both writers would proceed while believing they were alone")
+    finally:
+        os.close(holder)
+
+
+def test_a_child_does_not_inherit_the_release_lock(box):
+    """A child that keeps fd 9 would hold the lock after the deployment exits.
+
+    Proved from outside, without looking at the script: the restart command is
+    replaced with one that writes its own descriptor table, and the deployment is
+    then required to leave the store immediately available. If the child inherited
+    fd 9, a second writer would block until the child died.
+    """
+    adopted(box)
+    candidate, csha = box.write_candidate("fd-bin", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("fd.toml")
+
+    dumped = os.path.join(box.root, "child-fds.txt")
+    restart = os.path.join(box.root, "restart-dump.sh")
+    with open(restart, "w") as fh:
+        fh.write("#!/bin/bash\n")
+        # Ask the kernel for the descriptor itself. `ls -l /proc/$$/fd` prints
+        # " 9 -> target", not the path, so a substring test for "/fd/9" could never
+        # fail -- it survived the mutant that removes the close (measured).
+        fh.write(f"if [ -e /proc/$$/fd/9 ]; then echo PRESENT > {dumped}; "
+                 f"else echo ABSENT > {dumped}; fi\n")
+        fh.write(f"if [ -f {box.state}/good ]; then cp {box.state}/good {box.state}/healthy; fi\n")
+        fh.write("exit 0\n")
+    os.chmod(restart, 0o755)
+
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--label", "fd", "--capabilities", "",
+                     RESTART_CMD=restart)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    verdict = open(dumped).read().strip()
+    assert verdict == "ABSENT", (
+        "the restart child inherited the release lock descriptor; a child that "
+        f"outlives the deploy would then hold the store (probe said {verdict!r})")
+
+    # And the store is usable straight away, which is the consequence that matters.
+    fd = _hold_release_lock(box)
+    try:
+        second = box.run("promote", RELEASE_LOCK_TIMEOUT="1")
+    finally:
+        os.close(fd)
+    assert second.returncode != 0
+    assert "concurrently" in (second.stdout + second.stderr), (
+        "the store must be free to lock once the deployment has exited")
+
+
 def test_a_second_writer_is_refused_by_the_lock_and_changes_nothing(box):
     baseline = adopted(box)
     candidate, csha = box.write_candidate("contended", "#!/bin/bash\nexit 0\n")

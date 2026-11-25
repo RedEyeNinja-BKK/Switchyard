@@ -113,19 +113,61 @@ die() { say "FATAL: $*" >&2; exit 1; }
 # kernel drops it when the process dies, so a killed deployment cannot wedge the
 # store. The refusal names the holder, so a stuck lock is diagnosable rather than
 # indistinguishable from a slow validation.
+#
+# Two properties the lock is only worth anything without, and how they are kept:
+#
+#   * The inode must be stable and belong to the writer's own trust domain. A lock
+#     file that anyone may delete can be removed and recreated, and the contender
+#     then locks a DIFFERENT inode while the holder sleeps on the old one -- both
+#     proceed, which is worse than no lock because it looks protected. So the file
+#     is created once, never removed, and its owner and mode are checked: the store
+#     is root-owned in production, so a non-root owner here means the store itself
+#     has been compromised and the refusal says so instead of locking it anyway.
+#
+#   * The descriptor must not leak into children. `flock` is held per open file
+#     description, and a fork/exec shares it, so a child that outlives this script
+#     would hold the lock after the deploy returned. Children get it closed.
 RELEASE_LOCK_TIMEOUT=${RELEASE_LOCK_TIMEOUT:-900}
+RELEASE_LOCK_FD=9
 hold_release_lock() {
-  local lock=$RELEASE_ROOT/.release.lock
+  local lock=$RELEASE_ROOT/.release.lock owner mode
   mkdir -p "$RELEASE_ROOT" || die "cannot create the release store at $RELEASE_ROOT"
   command -v flock >/dev/null 2>&1 \
     || die "flock is not installed, so concurrent release operations cannot be serialised; install util-linux"
-  # Fixed descriptor 9: no verb calls another verb, so there is nothing to nest, and
-  # a fixed number keeps the failure message a plain sentence.
+  # Created if absent and never unlinked by this script: O_APPEND to an existing
+  # inode is what makes the lock addressable by more than one writer.
   exec 9>>"$lock" || die "cannot open the release lock at $lock"
+  # Read back what we actually locked, rather than trusting the path. Ownership is
+  # only asserted when this process is root: an unprivileged run against a sandbox
+  # store legitimately owns its own lock, and inventing a refusal there would make
+  # the acceptance suite test the wrong thing.
+  owner=$(stat -c '%u' "$lock" 2>/dev/null || echo "?")
+  mode=$(stat -c '%a' "$lock" 2>/dev/null || echo "?")
+  if [ "$(id -u)" = "0" ] && [ "$owner" != "0" ]; then
+    die "the release lock $lock is owned by uid $owner, not root; a lock file that another account can delete or replace cannot serialise writers, so the release store is not safe to use (expected root-owned, found mode $mode)"
+  fi
+  # A group- or world-writable lock file can be replaced between writers, so it
+  # cannot serialise them. Only asserted as root: an unprivileged run against a
+  # sandbox store legitimately owns its own lock, and inventing a refusal there
+  # would make the acceptance suite test the wrong thing.
+  if [ "$(id -u)" = "0" ] && [ "$mode" != "?" ]; then
+    local group_bits other_bits
+    group_bits=$(( (8#$mode / 8) % 8 ))
+    other_bits=$(( 8#$mode % 8 ))
+    if [ $(( group_bits & 2 )) -ne 0 ] || [ $(( other_bits & 2 )) -ne 0 ]; then
+      die "the release lock $lock is mode $mode; a group- or world-writable lock file can be replaced between writers, so it cannot serialise them (expected root-owned 0644 or 0600)"
+    fi
+  fi
   if ! flock -w "$RELEASE_LOCK_TIMEOUT" 9; then
     local holder
     holder=$(cat "$lock" 2>/dev/null || true)
     die "another release operation (pid ${holder:-unknown}) has held $lock for more than ${RELEASE_LOCK_TIMEOUT}s; refusing to act on the release store concurrently (raise RELEASE_LOCK_TIMEOUT if that operation is expected to be slow)"
+  fi
+  # The inode must still be the one we locked. If it was unlinked and recreated
+  # between open and flock, the lock we hold is on a file no later contender will
+  # ever open, and continuing would run unprotected while appearing serialised.
+  if [ "$(stat -c '%i' "$lock" 2>/dev/null || echo ?)" != "$(stat -Lc '%i' /proc/$$/fd/9 2>/dev/null || echo !)" ]; then
+    die "the release lock $lock was replaced while it was being acquired (its inode no longer matches the descriptor this process holds); refusing to act on a store whose lock can be swapped under a holder"
   fi
   # Written under the lock, so the next contender's refusal names the real holder
   # rather than whoever released it last.
@@ -209,7 +251,7 @@ activate_release() {
   install_pair "$dir/switchyard-server" "$want_bin" "$dir/routes.toml" "$want_man" \
     || return 1
   say "restarting $UNIT onto $id"
-  eval "$RESTART_CMD" >/dev/null 2>&1 || say "restart command reported failure"
+  ( eval "$RESTART_CMD" ) 9>&- >/dev/null 2>&1 || say "restart command reported failure"
   wait_healthy || return 1
   [ "$(sha "$LIVE_BIN")" = "$want_bin" ] || { say "live binary is not $id"; return 1; }
   [ "$(sha "$LIVE_MANIFEST")" = "$want_man" ] || { say "live manifest is not $id"; return 1; }
@@ -618,13 +660,16 @@ validate_candidate() {
     # Testing seam: the real check would need a working binary and real keys. The
     # override runs with the same parsed environment so an injected failure still
     # exercises the same path.
+    # The validator executes the candidate binary. It is trusted, but it is not the
+    # lock holder, so fd 9 is closed for it: a child that inherited the descriptor
+    # would keep the release lock held past the deploy's own exit.
     "$VALIDATOR" --binary "$binary" --manifest "$manifest" \
       ${env_args[@]+"${env_args[@]}"} \
-      --command "$VALIDATE_CMD" --log "$log"
+      --command "$VALIDATE_CMD" --log "$log" 9>&-
     return
   fi
   "$VALIDATOR" --binary "$binary" --manifest "$manifest" \
-    ${env_args[@]+"${env_args[@]}"} --log "$log"
+    ${env_args[@]+"${env_args[@]}"} --log "$log" 9>&-
 }
 
 capability_gate() {
@@ -729,6 +774,19 @@ cmd_deploy() {
   # out the timeout to be told its hashes are wrong.
   hold_release_lock
 
+  # The hashes checked above were checked OUTSIDE the lock, so they say what the
+  # candidate files held while this process was still waiting for the store. The
+  # candidate path is normally a staging directory under /var/tmp, which anyone can
+  # write, so that earlier comparison is a fast rejection, not a proof. Re-derive
+  # both digests now that the lock is held and the files are about to be installed:
+  # the bytes the deployment records must be the bytes it read while it was the only
+  # writer. This is the pinned-hash revalidation the store's integrity rests on.
+  [ "$(sha "$m_src")" = "$m_want" ] \
+    || die "the manifest at $m_src changed while this deployment waited for the release lock (expected $m_want); refusing to install bytes that were not the ones approved"
+  [ "$(sha "$b_src")" = "$b_want" ] \
+    || die "the binary at $b_src changed while this deployment waited for the release lock (expected $b_want); refusing to install bytes that were not the ones approved"
+  say "pinned artefact hashes re-verified under the release lock"
+
   # What the service actually runs with. Resolved once, here, so the validation
   # below and the release record further on cannot disagree about the set, and so a
   # host whose unit cannot be read is refused before anything is touched.
@@ -802,7 +860,9 @@ cmd_deploy() {
   say "installing"
   install_pair "$b_src" "$b_want" "$m_src" "$m_want" || fail_and_rollback "could not install the candidate"
   say "restarting $UNIT"
-  eval "$RESTART_CMD" >/dev/null 2>&1 || fail_and_rollback "restart failed"
+  # fd 9 closed for the child: this is where a deployment could hand the release
+  # lock to a long-lived process by accident, and the one place it must not.
+  ( eval "$RESTART_CMD" ) 9>&- >/dev/null 2>&1 || fail_and_rollback "restart failed"
   wait_healthy || fail_and_rollback "health check failed after restart"
   say "health ok after restart"
   [ "$(sha "$LIVE_BIN")" = "$b_want" ] || fail_and_rollback "installed binary is not the candidate"

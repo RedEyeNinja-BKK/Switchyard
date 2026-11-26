@@ -1794,3 +1794,82 @@ async fn a_current_reading_proves_an_undispatched_domain_spent() {
         Some("primary_pool_exhausted")
     );
 }
+
+/// An empty pool that has recovered: the provider reports headroom again, so the counter
+/// admits the send and there is nothing left to retain.
+fn recovering_provider_allowance(
+    group: &str,
+    model: &str,
+    tag: &str,
+) -> (ModelId, Arc<DailyRequestAllowance>) {
+    let path = std::env::temp_dir().join(format!(
+        "sy-provider-{}-{tag}-{}.json",
+        std::process::id(),
+        model
+    ));
+    let _ = std::fs::remove_file(&path);
+    let allowance = DailyRequestAllowance::new_on(
+        group,
+        ModelId::from(model),
+        1_000,
+        path,
+        DayBoundary::Utc,
+    )
+    .with_provider_tolerance(std::time::Duration::from_secs(60));
+    allowance
+        .reconcile(ProviderReading {
+            used: 900,
+            limit: 1_000,
+            remaining: 100,
+            observed_at: std::time::SystemTime::now(),
+            reset_at: None,
+        })
+        .expect("the fixture's reading belongs to the current provider day");
+    allowance
+        .try_reserve()
+        .expect("fixture: a recovered pool admits the send");
+    assert_eq!(
+        allowance.spent_today(),
+        Some(false),
+        "fixture: headroom is a readable counter with room, not an unknown"
+    );
+    (ModelId::from(model), Arc::new(allowance))
+}
+
+/// The recovery control: the same pool once the provider reports headroom again. The leg
+/// serves, nothing is retained, and the local tier is never reached -- the correction withholds
+/// a claim about the past, it does not make an exhausted pool sticky.
+#[tokio::test]
+async fn a_recovered_provider_reading_serves_without_spending_the_local_tier() {
+    let (g1, google_a) = spent_allowance("google", "g1", "recovered-a");
+    let (g2, google_b) = spent_allowance("google", "g2", "recovered-b");
+    let (o1, openai) = recovering_provider_allowance("openai", "o1", "recovered");
+    let pool = strict_pool_with(
+        Some(200_000),
+        O1Behavior::Serves,
+        HashMap::from([(g1, google_a), (g2, google_b), (o1, openai)]),
+    );
+    let (sink, observer) = trace_sink();
+    let output = pool
+        .route
+        .execute(
+            Request {
+                llm_request: text_request(None, "hello"),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("the recovered leg serves");
+    // The record names the leg that answered; the algorithm's own label for a passthrough is
+    // its declared target, so the responder is read from the trace.
+    assert_eq!(output.selected_model, "g1");
+    assert!(
+        pool.local.lock().unwrap().is_empty(),
+        "a serving leg must not spend the local tier"
+    );
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert!(!trace.terminal_crossed);
+    assert_eq!(trace.served.as_deref(), Some("o1"));
+}

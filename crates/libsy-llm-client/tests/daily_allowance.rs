@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use switchyard_llm_client::{
-    Backend, DailyRequestAllowance, DayBoundary, HttpBackendConfig, LlmClientError, ModelConfig,
-    ProviderReading, ProviderState, ReserveError, TranslatingLlmClient, account_allowance_path,
-    allowance_path,
+    Backend, DailyRequestAllowance, DayBoundary, ExhaustionBasis, HttpBackendConfig,
+    LlmClientError, ModelConfig, ProviderReading, ProviderState, ReserveError,
+    TranslatingLlmClient, account_allowance_path, allowance_path,
 };
 use switchyard_protocol::{Request, text_request};
 use wiremock::matchers::{method, path};
@@ -537,7 +537,10 @@ fn the_reading_is_durable_across_a_restart() {
     let after_restart = account_allowance(&directory, 1000);
     assert_eq!(
         after_restart.provider_state_at(at(LATE_UTC_DAY)),
-        ProviderState::Exhausted { limit: 1000 }
+        ProviderState::Exhausted {
+            limit: 1000,
+            basis: ExhaustionBasis::Confirmed
+        }
     );
     assert!(matches!(
         after_restart.try_reserve_at(at(LATE_UTC_DAY)),
@@ -820,7 +823,10 @@ fn a_known_exhaustion_still_refuses_after_the_reading_goes_stale() {
     let stale = LATE_UTC_DAY + 120;
     assert!(matches!(
         allowance.provider_state_at(at(stale)),
-        ProviderState::Exhausted { limit: 1000 }
+        ProviderState::Exhausted {
+            limit: 1000,
+            basis: ExhaustionBasis::Retained
+        }
     ));
     assert!(
         matches!(
@@ -890,6 +896,110 @@ fn the_exhaustion_retention_does_not_survive_the_day_boundary() {
     allowance
         .try_reserve_at(at(EARLY_NEXT_UTC_DAY))
         .expect("yesterday's exhaustion must not refuse today's request");
+}
+
+/// Production defaults: freshness and retention are both 600 s, so a retention counted from
+/// apply time expires at the same instant the reading does and protects nothing against the
+/// failure it exists for -- one collection round that never arrives. The retention is
+/// measured from the end of freshness, so it still refuses for a full window after the
+/// reading stops being current.
+#[test]
+fn the_retention_outlives_the_default_freshness_window() {
+    let allowance = account_allowance(&scratch("retention-default"), 1000);
+    assert_eq!(
+        allowance.provider_tolerance(),
+        Duration::from_secs(600),
+        "this test is about the deployed defaults, so it must not set a tolerance"
+    );
+    allowance
+        .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
+        .expect("the reading is applied");
+
+    // Past the 600 s freshness window, inside the 600 s retention that follows it.
+    let after_freshness = LATE_UTC_DAY + 700;
+    assert!(
+        matches!(
+            allowance.provider_state_at(at(after_freshness)),
+            ProviderState::Exhausted {
+                basis: ExhaustionBasis::Retained,
+                ..
+            }
+        ),
+        "one missed round must not turn an empty account into admitted traffic"
+    );
+    assert!(matches!(
+        allowance.try_reserve_at(at(after_freshness)),
+        Err(ReserveError::ProviderExhausted { .. })
+    ));
+
+    // And the hold ends: a recovered account serves without waiting for a new reading.
+    let after_hold = LATE_UTC_DAY + 1_300;
+    assert_eq!(
+        allowance.provider_state_at(at(after_hold)),
+        ProviderState::Unknown
+    );
+    allowance
+        .try_reserve_at(at(after_hold))
+        .expect("the retention is bounded in both directions");
+}
+
+/// The pool is usually emptied by this deployment's own sends, not by a provider that
+/// volunteers a zero. The reservation that spends the last unit arms the same retention, so
+/// the next request after the reading ages out is refused instead of admitted.
+#[test]
+fn the_retention_is_armed_by_the_reservation_that_empties_the_pool() {
+    let allowance = account_allowance(&scratch("retention-effective"), 1000);
+    allowance
+        .reconcile(provider(997, 1000, 3, LATE_UTC_DAY))
+        .expect("the reading is applied");
+    for _ in 0..3 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the reported headroom");
+    }
+    assert!(matches!(
+        allowance.provider_state_at(at(LATE_UTC_DAY)),
+        ProviderState::Exhausted {
+            basis: ExhaustionBasis::Confirmed,
+            ..
+        }
+    ));
+
+    let after_freshness = LATE_UTC_DAY + 700;
+    assert!(
+        matches!(
+            allowance.try_reserve_at(at(after_freshness)),
+            Err(ReserveError::ProviderExhausted { .. })
+        ),
+        "the last unit was spent locally; admitting the next request invents a request the \
+         account does not have"
+    );
+}
+
+/// The retention never outlives the provider's stated reset: a window that has ended cannot
+/// refuse the next one, even if the bounded hold still has time on it.
+#[test]
+fn the_retention_never_outlives_the_provider_stated_reset() {
+    let allowance = account_allowance(&scratch("retention-reset"), 1000);
+    allowance
+        .reconcile(ProviderReading {
+            used: 1000,
+            limit: 1000,
+            remaining: 0,
+            observed_at: at(LATE_UTC_DAY),
+            reset_at: Some(at(LATE_UTC_DAY + 700)),
+        })
+        .expect("the reading is applied");
+
+    assert!(matches!(
+        allowance.provider_state_at(at(LATE_UTC_DAY + 650)),
+        ProviderState::Exhausted { .. }
+    ));
+    assert_eq!(
+        allowance.provider_state_at(at(LATE_UTC_DAY + 750)),
+        ProviderState::Unknown,
+        "past the provider's own reset the statement is over, whatever the bounded hold says"
+    );
 }
 
 /// The reported state is the headroom this counter may use, not the provider's raw figure.

@@ -340,6 +340,26 @@ impl ProviderReading {
     }
 }
 
+/// Why an exhaustion is being reported.
+///
+/// The two are kept apart because they licence different decisions. [`Self::Confirmed`] is
+/// the provider saying, in a reading that is still current, that the pool has no headroom
+/// left. [`Self::Retained`] is that same statement carried past the point where the reading
+/// is current, for a bounded time, so that a collection round which never arrives does not
+/// turn into a retry storm.
+///
+/// A retained refusal is still a refusal: data this stale is never a reason to spend. But it
+/// is not evidence about the account *now*, so nothing outside the decision to send may read
+/// it as a confirmed exhaustion -- in particular, a recovered account must not be described
+/// as empty on the strength of a reading that has stopped being current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExhaustionBasis {
+    /// A current reading reports no headroom.
+    Confirmed,
+    /// A confirmed exhaustion held past the freshness of the reading that reported it.
+    Retained,
+}
+
 /// What is known about the provider's own accounting for this allowance.
 ///
 /// Three states, kept apart because collapsing any two of them produces a wrong
@@ -356,10 +376,15 @@ pub enum ProviderState {
         /// Requests the provider said remained at that moment.
         remaining: u64,
     },
-    /// The provider reported no headroom, recently enough to act on.
+    /// The provider reported no headroom, recently enough to act on, or recently enough that
+    /// its statement is still being honoured.
     Exhausted {
         /// The pool's stated limit, for the refusal message.
         limit: u64,
+        /// Whether the provider said so in a current reading, or whether that statement is
+        /// being retained past its freshness. Reported because a retained refusal describes
+        /// the past, not the account.
+        basis: ExhaustionBasis,
     },
 }
 
@@ -578,21 +603,41 @@ impl DailyRequestAllowance {
             drop(lock);
             return Err(ReserveError::Exhausted);
         }
+        // A reservation is not an observation: the provider reading keeps whatever it said
+        // and its age keeps growing, so it expires on its own schedule instead of being
+        // refreshed by traffic that did not check it.
+        let provider = counter.provider.filter(|reading| {
+            // Drop a reading from a previous provider day: it describes a window
+            // that has ended and cannot constrain this one.
+            self.boundary.day(reading.observed_at) == day
+        });
+        // A reservation can be what empties the pool: the provider's figure was current
+        // when it said three remained, and this deployment has now sent all three. Arming
+        // the same bounded retention here is what stops the next request, once that reading
+        // ages out, from being admitted into a pool that is already empty. Without it the
+        // protection covers only a provider that volunteers the zero, and misses the very
+        // common case where the last unit is spent locally.
+        let mut retention = counter.retention.filter(|retention| retention.day == day);
+        if retention.is_none()
+            && let Some(reading) = provider
+            && reading.is_fresh_at(now, self.provider_tolerance)
+        {
+            let sent_since = if counter.day == day {
+                (spent + 1).saturating_sub(counter.provider_anchor)
+            } else {
+                0
+            };
+            if reading.remaining.saturating_sub(sent_since) == 0 {
+                retention =
+                    Some(self.retention_for(&reading)).filter(|retention| retention.until > now);
+            }
+        }
         let next = Counter {
             day,
             spent: spent + 1,
-            // A reservation is not an observation: the provider reading keeps whatever
-            // it said, and its age keeps growing, so it expires on its own schedule
-            // instead of being refreshed by traffic that did not check it.
-            provider: counter.provider.filter(|reading| {
-                // Drop a reading from a previous provider day: it describes a window
-                // that has ended and cannot constrain this one.
-                self.boundary.day(reading.observed_at) == day
-            }),
+            provider,
             provider_anchor: counter.provider_anchor,
-            // A retention belongs to the day it was recorded in. Carrying it across the
-            // boundary would refuse the first request of a day the provider has restored.
-            retention: counter.retention.filter(|retention| retention.day == day),
+            retention,
         };
         // Persist before sending. A counter that disagrees with the provider is the
         // failure this exists to prevent, so a failed write must also undo the spend.
@@ -633,6 +678,16 @@ impl DailyRequestAllowance {
     /// How old a provider reading may be and still be acted on.
     pub fn provider_tolerance(&self) -> Duration {
         self.provider_tolerance
+    }
+
+    /// The counter file this allowance governs.
+    ///
+    /// Two reconcilers that resolve to the same path are the same budget, however many
+    /// credential labels name them. A reading is applied to that budget once, not once per
+    /// label: applying it twice would report a duplicate write as a refusal and, worse,
+    /// invites the belief that the labels hold separate budgets when they do not.
+    pub fn counter_path(&self) -> &Path {
+        &self.path
     }
 
     /// Sets the tolerance for provider readings, for tests and for a deployment whose
@@ -719,16 +774,12 @@ impl DailyRequestAllowance {
             }
             _ => 0,
         };
-        let retention = (reading.remaining == 0).then(|| Retention {
-            day: reading_day,
-            // Never further than the provider's own stated reset, and never further than
-            // the bounded retention. A reset already in the past retains nothing.
-            until: reading
-                .reset_at
-                .map(|reset| reset.min(now + EXHAUSTION_RETENTION))
-                .unwrap_or(now + EXHAUSTION_RETENTION),
-        });
-        let retention = retention.filter(|retention| retention.until > now);
+        let retention = (reading
+            .remaining
+            .saturating_sub(spent.saturating_sub(anchor))
+            == 0)
+            .then(|| self.retention_for(&reading))
+            .filter(|retention| retention.until > now);
         let next = Counter {
             day: reading_day,
             spent,
@@ -761,6 +812,19 @@ impl DailyRequestAllowance {
         if !reading.is_fresh_at(now, self.provider_tolerance) {
             return None;
         }
+        self.effective_headroom(counter, &reading, day)
+    }
+
+    /// The headroom one reading still permits, after subtracting local traffic.
+    ///
+    /// `None` when the reading describes another provider day, where the anchor means
+    /// nothing.
+    fn effective_headroom(
+        &self,
+        counter: &Counter,
+        reading: &ProviderReading,
+        day: u64,
+    ) -> Option<u64> {
         if self.boundary.day(reading.observed_at) != day {
             return None;
         }
@@ -772,6 +836,51 @@ impl DailyRequestAllowance {
             0
         };
         Some(reading.remaining.saturating_sub(sent_since))
+    }
+
+    /// Which of the two reasons is producing an exhaustion.
+    ///
+    /// [`ExhaustionBasis::Confirmed`] requires a reading that is current *and* whose
+    /// adjusted headroom is zero. Anything else that still refuses is a retention, which
+    /// describes a past observation rather than the account.
+    fn exhaustion_basis(
+        &self,
+        counter: &Counter,
+        day: u64,
+        now: SystemTime,
+    ) -> Option<ExhaustionBasis> {
+        if let Some(reading) = counter.provider
+            && reading.is_fresh_at(now, self.provider_tolerance)
+            && self.effective_headroom(counter, &reading, day) == Some(0)
+        {
+            return Some(ExhaustionBasis::Confirmed);
+        }
+        counter
+            .retention
+            .filter(|retention| retention.day == day && now < retention.until)
+            .map(|_| ExhaustionBasis::Retained)
+    }
+
+    /// The bounded retention for a pool confirmed to have no headroom.
+    ///
+    /// Measured from the END OF THE READING'S FRESHNESS, not from `now`. A retention counted
+    /// from `now` expires at the same instant the reading does whenever the reading is
+    /// applied promptly -- which is the normal case -- so it would protect nothing against
+    /// exactly the failure it exists for: one collection round that never arrives. Counting
+    /// from the end of freshness gives a full retention window of protection *after* the
+    /// reading stops being current.
+    ///
+    /// Capped by the provider's own stated reset, because a window that has ended cannot
+    /// refuse the next one. The provider day is the second cap, and it is enforced where the
+    /// retention is read: a retention belongs to the day it was recorded in.
+    fn retention_for(&self, reading: &ProviderReading) -> Retention {
+        let day = self.boundary.day(reading.observed_at);
+        let until = reading.observed_at + self.provider_tolerance + EXHAUSTION_RETENTION;
+        let until = match reading.reset_at {
+            Some(reset) => reset.min(until),
+            None => until,
+        };
+        Retention { day, until }
     }
 
     /// What the provider last reported, adjusted for traffic sent since.
@@ -801,6 +910,13 @@ impl DailyRequestAllowance {
                     .provider
                     .map(|reading| reading.limit)
                     .unwrap_or(self.limit),
+                // A refusal answers the same question either way, but a caller reading the
+                // state is told which: a current reading, or a statement retained past its
+                // freshness. Defaulting to `Retained` is the conservative answer for a state
+                // this function cannot attribute.
+                basis: self
+                    .exhaustion_basis(&counter, day, now)
+                    .unwrap_or(ExhaustionBasis::Retained),
             },
             Some(remaining) => ProviderState::Available { remaining },
         }

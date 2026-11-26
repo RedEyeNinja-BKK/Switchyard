@@ -1609,7 +1609,13 @@ impl DeploymentConfig {
     /// * The client must actually have a counter. Naming a pool for a client whose targets
     ///   declare no `daily_request_limit` would authorize a reconciliation with nowhere to
     ///   write, so the mapping would read as configured while doing nothing.
+    /// * One pool names one counter. Two clients on one pool with different groups produce
+    ///   two counters fed the same account figure, each admitting the full reported
+    ///   remainder; there is no way to merge those reservations after the fact, so the
+    ///   mapping is refused rather than reconciled.
     fn validate_quota_providers(&self) -> RunnerResult<()> {
+        // One provider account is one budget, so it may name exactly one counter.
+        let mut accounts: BTreeMap<&'static str, (&str, String)> = BTreeMap::new();
         for (name, client) in &self.llm_clients {
             let Some(provider) = client.quota_provider else {
                 continue;
@@ -1650,6 +1656,30 @@ impl DeploymentConfig {
                      the mapping would read as configured while admitting on nothing",
                     provider.as_str()
                 )));
+            }
+            // Two clients naming one pool resolve to two counters whenever they name
+            // different groups, and both counters are then fed the same account figure. Each
+            // admits the full reported remainder, so the account is spent twice over -- and
+            // no runtime bookkeeping can merge reservations that live in two files. One
+            // account is one counter, therefore one group.
+            let group = client.quota_group.clone().unwrap_or_else(|| name.clone());
+            match accounts.entry(provider.as_str()) {
+                std::collections::btree_map::Entry::Occupied(existing) => {
+                    let (first_client, first_group) = existing.get();
+                    if *first_group != group {
+                        return Err(RunnerError::configuration(format!(
+                            "llm clients {first_client} and {name} both name quota_provider = \
+                             \"{}\" but resolve to different quota groups ({first_group} and \
+                             {group}); one provider account is one budget, so both counters \
+                             would spend the same reported remainder -- give them one \
+                             quota_group, or name the pool on only one of them",
+                            provider.as_str()
+                        )));
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((name.as_str(), group));
+                }
             }
         }
         Ok(())
@@ -8181,6 +8211,64 @@ target = "free-a"
             message.contains("daily_request_limit"),
             "the refusal must say what is missing: {message}"
         );
+    }
+
+    /// Two clients naming one pool must resolve to one counter. With different groups they
+    /// get two, both fed the same account figure, and each admits the full reported
+    /// remainder -- the account is spent twice over with nothing to detect it.
+    #[test]
+    fn two_groups_on_one_provider_account_are_refused() {
+        let second = r#"
+[llm_clients.openrouter_free_second]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-second"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free_second"
+daily_request_limit = 1000
+"#;
+        let source = format!("{BASE}\n{second}");
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("two counters on one account must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("openrouter_free_models")
+                && message.contains("openrouter-free-owner")
+                && message.contains("openrouter-free-second"),
+            "the refusal must name the pool and both groups: {message}"
+        );
+    }
+
+    /// A second client on the same group is the same counter, which is the shape a second
+    /// credential for one account must use.
+    #[test]
+    fn a_second_client_on_the_same_group_shares_one_counter() {
+        let second = r#"
+[llm_clients.openrouter_free_second]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free_second"
+daily_request_limit = 1000
+"#;
+        let source = format!("{BASE}\n{second}");
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        config
+            .validate_quota_providers()
+            .expect("one account may be read by more than one credential label");
     }
 
     /// The valid shape passes, so the three refusals above are about the rule and not about

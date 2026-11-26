@@ -105,6 +105,13 @@ pub struct Applied {
     pub written: usize,
     /// Reconcilers that matched the account but found no reading for their pool.
     pub absent: usize,
+    /// Reconcilers that resolved to a counter already written this round.
+    ///
+    /// Two labels the provider says are one account are one budget, so they share one
+    /// counter. The reading governs it once; counting the second label as a separate write
+    /// would both overstate the work done and, if it were written again, refuse the duplicate
+    /// as though something were wrong.
+    pub shared: usize,
     /// Reconcilers whose write was refused, with the reason.
     pub refused: Vec<String>,
 }
@@ -217,6 +224,10 @@ impl Reconcilers {
         now: SystemTime,
     ) -> Applied {
         let mut applied = Applied::default();
+        // The counters already written this round, by (file, pool). Identity is the counter
+        // file, not the credential label: labels are how an account is *read*, counters are
+        // what a budget *is*, and only the second can be spent twice.
+        let mut seen: Vec<(&std::path::Path, &'static str)> = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.account != account {
                 continue;
@@ -238,6 +249,15 @@ impl Reconcilers {
                 );
                 continue;
             };
+            let path = entry.allowance.counter_path();
+            if seen
+                .iter()
+                .any(|(written, pool)| *written == path && *pool == entry.pool)
+            {
+                applied.shared += 1;
+                continue;
+            }
+            seen.push((path, entry.pool));
             // A missing watermark is not a reason to skip the write: it anchors at zero,
             // which understates headroom instead of forgiving in-flight traffic.
             let ticket = pending
@@ -435,13 +455,16 @@ mod tests {
 
     /// A label the provider says belongs to another label's account follows that account.
     /// Its counter keeps being reconciled instead of silently admitting on its local budget.
+    ///
+    /// Both labels resolve to the one counter the account owns, and the reading is written to
+    /// it once. Two labels were never two budgets: writing the same account figure into two
+    /// counters would let each admit the full reported remainder.
     #[test]
-    fn a_shadowed_label_follows_the_account_that_reads_it() {
-        let owner = counter("follow-owner", 1000);
-        let second = counter("follow-second", 1000);
+    fn a_shadowed_label_shares_the_counter_that_reads_its_account() {
+        let shared = counter("follow-shared", 1000);
         let mut reconcilers = Reconcilers::new(vec![
-            AllowanceReconciler::new("owner", "free_model_daily_requests", Arc::clone(&owner)),
-            AllowanceReconciler::new("second", "free_model_daily_requests", Arc::clone(&second)),
+            AllowanceReconciler::new("owner", "free_model_daily_requests", Arc::clone(&shared)),
+            AllowanceReconciler::new("second", "free_model_daily_requests", Arc::clone(&shared)),
         ]);
 
         reconcilers.absorb("second", "owner");
@@ -454,9 +477,18 @@ mod tests {
             ),
         );
 
-        assert_eq!(applied.written, 2, "both counters are one account");
+        assert_eq!(
+            (applied.written, applied.shared),
+            (1, 1),
+            "one account is one counter, written once and shared once"
+        );
+        assert!(
+            applied.refused.is_empty(),
+            "the second label is a share of the same budget, not a refused duplicate write: {:?}",
+            applied.refused
+        );
         assert!(matches!(
-            second.try_reserve_at(at(LATE_UTC_DAY)),
+            shared.try_reserve_at(at(LATE_UTC_DAY)),
             Err(switchyard_llm_client::ReserveError::ProviderExhausted { .. })
         ));
         // The diagnostic still names the counter the operator configured.
@@ -470,6 +502,41 @@ mod tests {
                 )
             ]
         );
+    }
+
+    /// One account's headroom is one budget. Two labels that resolve to the same counter must
+    /// not each admit the full reported remainder, or the pool is spent twice over.
+    #[test]
+    fn a_shared_counter_does_not_double_the_reported_headroom() {
+        let shared = counter("shared-headroom", 1000);
+        let mut reconcilers = Reconcilers::new(vec![
+            AllowanceReconciler::new("owner", "free_model_daily_requests", Arc::clone(&shared)),
+            AllowanceReconciler::new("second", "free_model_daily_requests", Arc::clone(&shared)),
+        ]);
+        reconcilers.absorb("second", "owner");
+        let applied = apply_all(
+            &reconcilers,
+            "owner",
+            &observation(
+                None,
+                vec![reading("free_model_daily_requests", 995, 1000, 5)],
+            ),
+        );
+        assert_eq!((applied.written, applied.shared), (1, 1));
+        assert_eq!(
+            shared.remaining_at(at(LATE_UTC_DAY)),
+            5,
+            "five reported requests, not ten: one counter, whatever the label count"
+        );
+        for expected in 0..5 {
+            shared
+                .try_reserve_at(at(LATE_UTC_DAY))
+                .unwrap_or_else(|error| panic!("reservation {expected} must fit: {error:?}"));
+        }
+        assert!(matches!(
+            shared.try_reserve_at(at(LATE_UTC_DAY)),
+            Err(switchyard_llm_client::ReserveError::ProviderExhausted { .. })
+        ));
     }
 
     /// Releasing a shadow returns its counter to its own label, so a second credential can

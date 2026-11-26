@@ -881,3 +881,205 @@ async fn an_unfit_tier_is_neither_dispatched_nor_skipped_over() {
         "a tier that cannot carry this request is not dispatched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Capability escalation over a five-primary pool
+//
+// The primary pool is the shape `smart-route` actually ships: five Google legs that have
+// each been measured as unable to replay an earlier function call, because that surface
+// issues a provider signature with every call and refuses a replay without it. A request
+// that continues a tool transaction therefore cannot be answered there at all, and the
+// route is authorized to consider the declared tiers.
+//
+// Every case here drives the real request path: the body is normalized, the lineage gate
+// reads both the decoded request and the preserved body, and only then is a target chosen.
+// A backend that was never contacted records zero calls, so "escalated" is a measurement
+// rather than an inference.
+// ---------------------------------------------------------------------------
+
+/// The tool declarations both bodies offer. Offering them is not lineage.
+fn lookup_tool() -> Value {
+    json!([{
+        "type": "function",
+        "name": "lookup",
+        "parameters": {"type": "object", "properties": {"sku": {"type": "string"}}}
+    }])
+}
+
+/// A request that continues a tool transaction: the call, and the output answering it.
+fn tool_lineage_body() -> Value {
+    json!({
+        "model": "smart-route",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "lookup",
+                "arguments": "{\"sku\":\"A1\"}",
+                "call_id": "call_1"
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": "42"}
+        ],
+        "tools": lookup_tool()
+    })
+}
+
+/// The same tool offered, with no earlier call: a fresh request. A signature-bound surface
+/// serves this, which is why the exclusion is narrower than `tool_calling`.
+fn tools_offered_body() -> Value {
+    json!({
+        "model": "smart-route",
+        "input": "how many units are in stock for SKU A1?",
+        "tools": lookup_tool()
+    })
+}
+
+/// The five-primary pool plus one backend per declared tier.
+///
+/// `replay_capable` names the primaries that do not declare `tool_call_replay = false`; the
+/// rest are the measured Google shape. Tiers are free (3) then DeepSeek (2) then paid (2),
+/// in the order the route ships.
+fn five_primary(
+    pool_url: &str,
+    tier_urls: [&str; 3],
+    escalation: bool,
+    replay_capable: &[&str],
+) -> (Vec<Upstream>, String) {
+    let primary: [(&str, &str); 5] = [
+        ("p1", "google/gemini-4-hydrogen"),
+        ("p2", "google/gemini-3-8-flash"),
+        ("p3", "google/gemini-3-6-flash"),
+        ("p4", "google/gemini-3-5-flash-lite"),
+        ("p5", "google/gemini-3-1-flash-lite"),
+    ];
+    let mut config = format!("schema_version = 1\n{}", client("google", pool_url));
+    for (name, slug) in primary {
+        config.push_str(&format!(
+            "\n[targets.{name}]\nid = \"{slug}\"\nllm_client = \"google\"\nfree_tier = true\n"
+        ));
+        if !replay_capable.contains(&name) {
+            config.push_str("tool_call_replay = false\n");
+        }
+    }
+    let tiers: [(&str, &[(&str, &str)]); 3] = [
+        (
+            "free",
+            &[
+                ("f1", "openrouter/ernie"),
+                ("f2", "openrouter/ling"),
+                ("f3", "openrouter/nemotron"),
+            ],
+        ),
+        (
+            "deepseek",
+            &[("d1", "deepseek/flash"), ("d2", "deepseek/pro")],
+        ),
+        (
+            "paid",
+            &[("q1", "openrouter/hy4"), ("q2", "openrouter/glm")],
+        ),
+    ];
+    let mut backends = Vec::new();
+    for (index, (client_name, members)) in tiers.iter().enumerate() {
+        let backend = Upstream::new(|model| Some(success(model)));
+        let url = backend.clone().server();
+        config.push_str(&client(client_name, &url));
+        let _ = tier_urls[index];
+        for (name, slug) in members.iter() {
+            config.push_str(&target(name, client_name, slug));
+        }
+        backends.push(backend);
+    }
+    config.push_str(&format!(
+        "\n[routes.smart-route]\nid = \"smart-route\"\ntype = \"passthrough\"\ntarget = \"p1\"\ncandidates = [\"p2\", \"p3\", \"p4\", \"p5\"]\nterminal_fallback = {}\nterminal_policy = \"availability\"\ncapability_escalation = {escalation}\ncontext_window = 262144\n",
+        rendered_tiers(&[
+            vec!["f1".to_string(), "f2".to_string(), "f3".to_string()],
+            vec!["d1".to_string(), "d2".to_string()],
+            vec!["q1".to_string(), "q2".to_string()],
+        ])
+    ));
+    (backends, config)
+}
+
+fn primaries() -> Upstream {
+    Upstream::new(|model| Some(success(model)))
+}
+
+/// Lineage cannot be served by any of the five primaries, so the route consults the first
+/// tier and serves there. The primary backend records zero calls: the exclusion happened
+/// before dispatch, not as five failed attempts.
+#[tokio::test]
+async fn a_five_primary_pool_escalates_a_tool_lineage_request() {
+    let pool = primaries();
+    let pool_url = pool.clone().server();
+    let (tiers, config) = five_primary(&pool_url, ["", "", ""], true, &[]);
+
+    let (status, body) = call_body(runner(&config), tool_lineage_body()).await;
+
+    assert_eq!(status, StatusCode::OK, "the free tier must answer: {body}");
+    assert_eq!(
+        pool.calls(),
+        0,
+        "a leg that cannot replay a call is excluded before dispatch, not after failing"
+    );
+    assert!(tiers[0].calls() > 0, "the first tier is consulted");
+    assert_eq!(tiers[1].calls(), 0, "a served tier stops the cascade");
+    assert_eq!(tiers[2].calls(), 0, "no paid leg is touched");
+}
+
+/// Offering tools is not lineage. A fresh request is servable by the signature-bound
+/// surface, so the pool answers and no tier is consulted.
+#[tokio::test]
+async fn a_fresh_tool_request_is_served_by_the_primary_pool() {
+    let pool = primaries();
+    let pool_url = pool.clone().server();
+    let (tiers, config) = five_primary(&pool_url, ["", "", ""], true, &[]);
+
+    let (status, body) = call_body(runner(&config), tools_offered_body()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pool.calls(), 1, "the declared primary serves it");
+    for (index, tier) in tiers.iter().enumerate() {
+        assert_eq!(tier.calls(), 0, "tier {index} must not be consulted");
+    }
+}
+
+/// An eligible sibling in the same primary pool is evaluated before any tier. Here one leg
+/// does not declare the replay refusal, so it can serve the continuation and the tiers stay
+/// untouched -- capability exclusion is per target, not per pool.
+#[tokio::test]
+async fn an_eligible_sibling_in_the_pool_serves_without_a_tier() {
+    let pool = primaries();
+    let pool_url = pool.clone().server();
+    let (tiers, config) = five_primary(&pool_url, ["", "", ""], true, &["p3"]);
+
+    let (status, body) = call_body(runner(&config), tool_lineage_body()).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pool.calls(), 1, "one primary leg carries the request");
+    let served = pool.models().await;
+    assert_eq!(
+        served,
+        vec!["google/gemini-3-6-flash".to_string()],
+        "the leg that may replay the call is the one that serves"
+    );
+    for (index, tier) in tiers.iter().enumerate() {
+        assert_eq!(tier.calls(), 0, "tier {index} must not be consulted");
+    }
+}
+
+/// Default off. Without the opt-in the same request is refused rather than escalated: this
+/// is a new authorization, and a route that has not declared it keeps its old behaviour.
+#[tokio::test]
+async fn capability_escalation_off_refuses_rather_than_crossing() {
+    let pool = primaries();
+    let pool_url = pool.clone().server();
+    let (tiers, config) = five_primary(&pool_url, ["", "", ""], false, &[]);
+
+    let (status, body) = call_body(runner(&config), tool_lineage_body()).await;
+
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(pool.calls(), 0);
+    for (index, tier) in tiers.iter().enumerate() {
+        assert_eq!(tier.calls(), 0, "tier {index} must not be consulted");
+    }
+}

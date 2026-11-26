@@ -710,6 +710,22 @@ impl TranslatingLlmClient {
                         retry_after: None,
                     });
                 }
+                // A reservation path never orders an observation, so this cannot be
+                // produced here. It is handled as a closed refusal rather than a panic: if
+                // the invariant ever breaks, the request must not be sent unaccounted.
+                Err(crate::allowance::ReserveError::ObservationRejected { reason }) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceUnavailable {
+                            model: model.clone(),
+                            reason: reason.to_string(),
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
             }
         }
         let client = if backend.is_forwarding_auth() {
@@ -3964,11 +3980,8 @@ mod tests {
             .and(|request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
                 let reasoning = body.get("reasoning");
-                reasoning
-                    .and_then(|value| value.get("effort"))
-                    .is_none()
-                    && reasoning.and_then(|value| value.get("summary"))
-                        == Some(&json!("auto"))
+                reasoning.and_then(|value| value.get("effort")).is_none()
+                    && reasoning.and_then(|value| value.get("summary")) == Some(&json!("auto"))
             })
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "resp_1",

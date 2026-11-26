@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::providers::{AccountApi, AccountPublisher, FetchOutcome};
 use super::reconcile::Reconcilers;
@@ -92,6 +92,10 @@ impl AccountCollector {
     /// than a duplicate to be discarded.
     fn shadow(&mut self, label: &str, owner: &str) {
         self.shadowed.insert(label.to_string());
+        // The counters bound to this label follow the label that now reads the account.
+        // Without this they would stop being reconciled the moment this label stops being
+        // polled, and admit on their local budget for the rest of the day.
+        self.reconcilers.absorb(label, owner);
         if self.reported.insert((label.to_string(), owner.to_string())) {
             tracing::warn!(
                 account = %label,
@@ -132,6 +136,9 @@ impl AccountCollector {
                  its second credential is polled again"
             );
         }
+        // The counters that followed the failing label return to their own, which is about
+        // to be polled again. Entries genuinely bound to the owner are unchanged.
+        self.reconcilers.release(owner);
     }
 
     /// Runs one collection round, reading every provider once.
@@ -150,6 +157,12 @@ impl AccountCollector {
                 continue;
             }
             let started = Instant::now();
+            // The watermark is taken before the network call. Requests sent while it is
+            // outstanding are absent from the provider's count, so the application must
+            // measure them from this point rather than from the moment it writes.
+            let pending = self
+                .reconcilers
+                .begin_observation(provider, SystemTime::now());
             match api.fetch().await {
                 FetchOutcome::Ok(observation) => {
                     // The provider's own allowance statement is written into every counter
@@ -157,7 +170,12 @@ impl AccountCollector {
                     // happens ahead of the shadow check on purpose: two credentials for one
                     // account are the same account, so both counters are entitled to the
                     // same figure even though only one of them keeps being polled.
-                    let applied = self.reconcilers.apply(provider, observation.as_ref());
+                    let applied = self.reconcilers.apply_at(
+                        provider,
+                        observation.as_ref(),
+                        &pending,
+                        SystemTime::now(),
+                    );
                     if applied.written > 0 {
                         tracing::debug!(
                             account = %provider,

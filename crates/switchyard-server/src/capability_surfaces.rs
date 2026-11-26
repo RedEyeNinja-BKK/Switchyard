@@ -316,13 +316,31 @@ fn reserve_physical_call(
                     "daily_allowance_unavailable",
                 )));
             }
+            // A reservation path never orders an observation. Refused rather than
+            // unwrapped: an accounting invariant that broke must not spend budget.
+            Err(ReserveError::ObservationRejected { reason }) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                return Err(Box::new(error_body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "daily request allowance for capability {} cannot be accounted: {reason}",
+                        capability.id
+                    ),
+                    "daily_allowance_unavailable",
+                )));
+            }
         }
     }
     Ok(ticket)
 }
 
 /// Releases a minute slot for a request that never reached the provider.
-pub(crate) fn release_physical_call(capability: &ResolvedCapability, ticket: &Option<PacingTicket>) {
+pub(crate) fn release_physical_call(
+    capability: &ResolvedCapability,
+    ticket: &Option<PacingTicket>,
+) {
     if let (Some(budget), Some(ticket)) = (&capability.budget, ticket)
         && let Some(pacing) = &budget.pacing
     {

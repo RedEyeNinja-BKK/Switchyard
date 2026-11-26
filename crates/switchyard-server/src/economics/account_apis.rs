@@ -24,15 +24,45 @@ use super::providers::{
 fn parse_rfc3339_utc(text: &str) -> Option<SystemTime> {
     let text = text.strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
-    let mut d = date.split('-');
-    let year: i64 = d.next()?.parse().ok()?;
-    let month: i64 = d.next()?.parse().ok()?;
-    let day: i64 = d.next()?.parse().ok()?;
-    let mut t = time.split(':');
-    let hour: i64 = t.next()?.parse().ok()?;
-    let minute: i64 = t.next()?.parse().ok()?;
-    // Seconds may carry a fractional part; the whole second is enough for a reset.
-    let second: i64 = t.next()?.split('.').next()?.parse().ok()?;
+
+    // Exactly three date components and no more. A trailing component is not a shape any
+    // provider sends; accepting it would store a timestamp this parser only half-read.
+    let date: Vec<&str> = date.split('-').collect();
+    let [year, month, day] = date.as_slice() else {
+        return None;
+    };
+    if !is_digits(year, 4) {
+        return None;
+    }
+    let year: i64 = year.parse().ok()?;
+    let month: i64 = parse_two_digits(month)?;
+    let day: i64 = parse_two_digits(day)?;
+
+    // Exactly three time components. A fraction is digits after the seconds, and only
+    // digits: `.5abc` is a malformed timestamp, not a timestamp with ignorable text.
+    let time: Vec<&str> = time.split(':').collect();
+    let [hour, minute, second] = time.as_slice() else {
+        return None;
+    };
+    let hour: i64 = parse_two_digits(hour)?;
+    let minute: i64 = parse_two_digits(minute)?;
+    let (second_text, fraction) = match second.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (*second, None),
+    };
+    if let Some(fraction) = fraction
+        && (fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let second: i64 = parse_two_digits(second_text)?;
+
+    // A bounded year. The arithmetic below is calendar arithmetic over a day count; an
+    // unbounded year turns a malformed figure into an overflow rather than a refusal, and
+    // no provider states a reset outside this range.
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
     if !(1..=12).contains(&month) || !(0..24).contains(&hour) || !(0..60).contains(&minute) {
         return None;
     }
@@ -44,11 +74,27 @@ fn parse_rfc3339_utc(text: &str) -> Option<SystemTime> {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if seconds < 0 {
-        return None;
-    }
-    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).ok()?))
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    u64::try_from(seconds)
+        .ok()
+        .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
+/// Whether `text` is exactly `width` ASCII digits.
+///
+/// Fixed-width fields are checked rather than parsed loosely: `+1` parses as a year and
+/// `1` parses as a day, and neither is a date component a provider writes.
+fn is_digits(text: &str, width: usize) -> bool {
+    text.len() == width && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// A two-digit component of an RFC 3339 timestamp.
+fn parse_two_digits(text: &str) -> Option<i64> {
+    is_digits(text, 2).then(|| text.parse().ok()).flatten()
 }
 
 /// The number of days in a month of the proleptic Gregorian calendar.
@@ -805,5 +851,56 @@ mod allowance_parsing_tests {
         let reading = openrouter_free_model_allowance(&block, UNIX_EPOCH)
             .expect("the figures are complete without a usable reset");
         assert_eq!(reading.reset_at, None);
+    }
+
+    /// Every component shape is validated, so a timestamp this parser only half-reads is
+    /// refused instead of stored.
+    #[test]
+    fn a_timestamp_with_trailing_components_is_refused() {
+        for text in [
+            "2026-01-16T00:00:00:00Z",
+            "2026-01-16-01T00:00:00Z",
+            "2026-01-16T00:00Z",
+            "2026-01-16T00:00:00+00:00",
+        ] {
+            assert_eq!(parse_rfc3339_utc(text), None, "{text} was accepted");
+        }
+    }
+
+    /// A fraction is digits or it is nothing. Text after the seconds is not a timestamp
+    /// with ignorable trailing characters.
+    #[test]
+    fn a_malformed_fraction_is_refused() {
+        for text in [
+            "2026-01-16T00:00:00.Z",
+            "2026-01-16T00:00:00.5abcZ",
+            "2026-01-16T00:00:00..5Z",
+        ] {
+            assert_eq!(parse_rfc3339_utc(text), None, "{text} was accepted");
+        }
+        assert!(parse_rfc3339_utc("2026-01-16T00:00:00.123456Z").is_some());
+    }
+
+    /// The year is bounded, so a malformed figure is refused rather than overflowing the
+    /// day arithmetic into a timestamp nobody wrote.
+    #[test]
+    fn an_unbounded_year_is_refused_rather_than_overflowing() {
+        for text in [
+            "999999999-01-16T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_rfc3339_utc(text), None, "{text} was accepted");
+        }
+    }
+
+    /// A well-formed timestamp is read exactly, so the parser change above cannot have
+    /// made every reset time look absent.
+    #[test]
+    fn a_well_formed_timestamp_is_read_exactly() {
+        assert_eq!(
+            parse_rfc3339_utc("2026-01-16T00:00:00Z"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_768_521_600))
+        );
     }
 }

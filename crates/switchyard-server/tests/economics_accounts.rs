@@ -921,7 +921,7 @@ fn a_declared_pool_is_bound_and_refuses_admission() {
             None,
         ),
     );
-    let applied = reconcilers.apply("openrouter-free", &observation);
+    let applied = reconcilers.apply("openrouter-free", &observation, at(LATE_UTC_DAY));
     assert_eq!(applied.written, 1);
 
     assert!(matches!(
@@ -1013,7 +1013,7 @@ fn two_accounts_on_one_provider_are_bound_apart() {
     );
     for (account, _) in reconcilers.bindings() {
         if account.contains("owner") {
-            reconcilers.apply(&account, &observation);
+            reconcilers.apply(&account, &observation, at(LATE_UTC_DAY));
         }
     }
 

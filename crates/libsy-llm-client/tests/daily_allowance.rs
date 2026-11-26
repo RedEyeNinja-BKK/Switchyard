@@ -596,3 +596,325 @@ fn the_counter_records_its_basis_and_the_provider_figures() {
     assert!(body.contains("\"used\":997"), "{body}");
     assert!(body.contains("\"remaining\":3"), "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// A reading is data, not an instruction: ordering, freshness and the difference
+// between a provider's raw figure and the headroom this counter may actually use.
+// ---------------------------------------------------------------------------
+
+/// A reading that arrives after the provider day it describes has ended must not be
+/// applied. Adopting it would move the counter back a day, discard the spend this
+/// deployment has already made today, and hand back a budget the provider has already
+/// closed the window on.
+#[test]
+fn a_delayed_previous_day_reading_does_not_reset_todays_spend() {
+    let allowance = account_allowance(&scratch("order-prev-day"), 10);
+    for _ in 0..3 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("today has room");
+    }
+    assert_eq!(allowance.remaining_at(at(LATE_UTC_DAY)), 7);
+
+    // Read yesterday at the same wall-clock time; applied now.
+    let yesterday = LATE_UTC_DAY - 86_400;
+    let ticket = allowance
+        .begin_observation_at(at(yesterday))
+        .expect("a ticket is taken before the read");
+    let refused =
+        allowance.reconcile_at(provider(0, 1000, 1000, yesterday), ticket, at(LATE_UTC_DAY));
+
+    assert!(
+        matches!(
+            refused,
+            Err(ReserveError::ObservationRejected { reason })
+                if reason.contains("ended")
+        ),
+        "a reading for a closed window must be refused, got {refused:?}"
+    );
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        7,
+        "today's three sends must survive a delayed reading from yesterday"
+    );
+    assert_eq!(
+        allowance.spent_at(at(LATE_UTC_DAY)),
+        3,
+        "the counter must not adopt the reading's earlier day"
+    );
+}
+
+/// An older observation of the same day must not replace a newer one. The older figure
+/// was true before requests were made since; applying it restores headroom that has
+/// already been spent.
+#[test]
+fn an_older_same_day_reading_does_not_restore_headroom() {
+    let allowance = account_allowance(&scratch("order-reversed"), 1000);
+    allowance
+        .reconcile(provider(997, 1000, 3, LATE_UTC_DAY))
+        .expect("the newer reading is applied");
+    for _ in 0..3 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("the provider said three remain");
+    }
+    assert_eq!(allowance.remaining_at(at(LATE_UTC_DAY)), 0);
+
+    let older = LATE_UTC_DAY - 600;
+    let ticket = allowance
+        .begin_observation_at(at(older))
+        .expect("a ticket is taken before the read");
+    let refused = allowance.reconcile_at(provider(897, 1000, 100, older), ticket, at(LATE_UTC_DAY));
+
+    assert!(
+        matches!(
+            refused,
+            Err(ReserveError::ObservationRejected { reason })
+                if reason.contains("later")
+        ),
+        "an out-of-order reading must be refused, got {refused:?}"
+    );
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        0,
+        "a stale figure must not restore headroom that has been spent"
+    );
+}
+
+/// The same observation delivered twice changes nothing. Re-applying it must not reset the
+/// anchor either, which would forgive every request made since the first application.
+#[test]
+fn a_duplicate_reading_is_not_applied_twice() {
+    let allowance = account_allowance(&scratch("order-duplicate"), 1000);
+    allowance
+        .reconcile(provider(900, 1000, 100, LATE_UTC_DAY))
+        .expect("the first delivery is applied");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the reported headroom");
+    }
+    assert_eq!(allowance.remaining_at(at(LATE_UTC_DAY)), 95);
+
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("a ticket is taken before the read");
+    let refused = allowance.reconcile_at(
+        provider(900, 1000, 100, LATE_UTC_DAY),
+        ticket,
+        at(LATE_UTC_DAY),
+    );
+
+    assert!(
+        matches!(refused, Err(ReserveError::ObservationRejected { .. })),
+        "the same observation delivered again must be refused, got {refused:?}"
+    );
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        95,
+        "a duplicate must not move the anchor and forgive the five sends"
+    );
+}
+
+/// A reading stamped in the future cannot have been taken, so it describes nothing.
+#[test]
+fn a_future_reading_is_refused() {
+    let allowance = account_allowance(&scratch("order-future"), 1000);
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("a ticket is taken before the read");
+    let refused = allowance.reconcile_at(
+        provider(0, 1000, 1000, LATE_UTC_DAY + 3_600),
+        ticket,
+        at(LATE_UTC_DAY),
+    );
+
+    assert!(
+        matches!(
+            refused,
+            Err(ReserveError::ObservationRejected { reason })
+                if reason.contains("future")
+        ),
+        "a future observation must be refused, got {refused:?}"
+    );
+    assert_eq!(allowance.remaining_at(at(LATE_UTC_DAY)), 1000);
+}
+
+/// Requests sent while the account read was outstanding are not in the provider's figure,
+/// so they must still be subtracted. The ticket is taken before the read for exactly this
+/// reason: anchoring at application time would forgive them.
+#[test]
+fn an_inflight_reservation_is_not_forgiven_by_the_application() {
+    let allowance = account_allowance(&scratch("order-inflight"), 1000);
+    // The collector starts its read here, before the five requests below are sent.
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("a ticket is taken before the read");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("the local budget has room");
+    }
+
+    allowance
+        .reconcile_at(
+            provider(10, 1000, 990, LATE_UTC_DAY),
+            ticket,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is newer than anything held");
+
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        985,
+        "the five sends made during the read are not in the provider's 990"
+    );
+}
+
+/// A read that straddles the day boundary is refused rather than applied to either day: the
+/// counter cannot tell which requests the provider counted in which window.
+#[test]
+fn a_read_that_straddles_the_day_boundary_is_refused() {
+    let allowance = account_allowance(&scratch("order-rollover"), 10);
+    // Started at 23:00Z, the day rolls over while the read is outstanding.
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("a ticket is taken before the read");
+    allowance
+        .try_reserve_at(at(EARLY_NEXT_UTC_DAY))
+        .expect("the new day has room");
+
+    let refused = allowance.reconcile_at(
+        provider(1000, 1000, 0, LATE_UTC_DAY),
+        ticket,
+        at(EARLY_NEXT_UTC_DAY),
+    );
+
+    assert!(
+        matches!(
+            refused,
+            Err(ReserveError::ObservationRejected { reason })
+                if reason.contains("ended")
+        ),
+        "a reading from the previous day must not be applied after rollover, got {refused:?}"
+    );
+    assert_eq!(
+        allowance.remaining_at(at(EARLY_NEXT_UTC_DAY)),
+        9,
+        "the new day's spend must survive"
+    );
+}
+
+/// A known exhaustion keeps refusing after the reading ages out, so a collector that stops
+/// answering does not turn a 429 into a retry storm. The retention is bounded and ends.
+#[test]
+fn a_known_exhaustion_still_refuses_after_the_reading_goes_stale() {
+    let allowance = account_allowance(&scratch("cooldown-hold"), 1000)
+        .with_provider_tolerance(Duration::from_secs(60));
+    allowance
+        .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
+        .expect("the reading is applied");
+
+    // Older than the tolerance, so the reading is no longer fresh, but the exhaustion is
+    // still within its bounded retention.
+    let stale = LATE_UTC_DAY + 120;
+    assert!(matches!(
+        allowance.provider_state_at(at(stale)),
+        ProviderState::Exhausted { limit: 1000 }
+    ));
+    assert!(
+        matches!(
+            allowance.try_reserve_at(at(stale)),
+            Err(ReserveError::ProviderExhausted { limit: 1000 })
+        ),
+        "an account known to be empty must not be re-probed just because the reading aged out"
+    );
+}
+
+/// The retention ends, so a recovered account serves again without requiring a new reading
+/// to arrive first. Bounded in both directions: no storm, no permanent wall.
+#[test]
+fn the_exhaustion_retention_ends_and_recovery_admits() {
+    let allowance = account_allowance(&scratch("cooldown-expiry"), 10);
+    allowance
+        .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
+        .expect("the reading is applied");
+
+    let after_retention = LATE_UTC_DAY + 3600;
+    assert_eq!(
+        allowance.provider_state_at(at(after_retention)),
+        ProviderState::Unknown,
+        "past the bounded retention the provider has told us nothing current"
+    );
+    allowance
+        .try_reserve_at(at(after_retention))
+        .expect("a recovered account must serve on the local budget");
+}
+
+/// A fresh reading that reports headroom clears the retention immediately.
+#[test]
+fn a_recovered_reading_clears_the_retention() {
+    let allowance = account_allowance(&scratch("cooldown-clear"), 1000)
+        .with_provider_tolerance(Duration::from_secs(600));
+    allowance
+        .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
+        .expect("the exhausted reading is applied");
+
+    allowance
+        .reconcile(provider(0, 1000, 1000, LATE_UTC_DAY + 60))
+        .expect("the recovered reading is applied");
+
+    assert!(matches!(
+        allowance.provider_state_at(at(LATE_UTC_DAY + 60)),
+        ProviderState::Available { .. }
+    ));
+    allowance
+        .try_reserve_at(at(LATE_UTC_DAY + 60))
+        .expect("a recovered account admits again");
+}
+
+/// The retention does not survive the provider day it belongs to: yesterday's exhaustion
+/// says nothing about today.
+#[test]
+fn the_exhaustion_retention_does_not_survive_the_day_boundary() {
+    let allowance = account_allowance(&scratch("cooldown-day"), 10)
+        .with_provider_tolerance(Duration::from_secs(2 * 86_400));
+    allowance
+        .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
+        .expect("the reading is applied");
+
+    assert_eq!(
+        allowance.provider_state_at(at(EARLY_NEXT_UTC_DAY)),
+        ProviderState::Unknown
+    );
+    allowance
+        .try_reserve_at(at(EARLY_NEXT_UTC_DAY))
+        .expect("yesterday's exhaustion must not refuse today's request");
+}
+
+/// The reported state is the headroom this counter may use, not the provider's raw figure.
+/// Preselection reads the state, so answering with the raw remainder would advertise
+/// requests that have already been sent since the reading.
+#[test]
+fn the_reported_state_is_effective_headroom_not_the_raw_reading() {
+    let allowance = account_allowance(&scratch("state-effective"), 1000);
+    allowance
+        .reconcile(provider(990, 1000, 10, LATE_UTC_DAY))
+        .expect("the reading is applied");
+    for _ in 0..4 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the reported headroom");
+    }
+
+    assert_eq!(
+        allowance.provider_state_at(at(LATE_UTC_DAY)),
+        ProviderState::Available { remaining: 6 },
+        "four sends since the reading leave six of the reported ten"
+    );
+    assert_eq!(
+        allowance.provider_reading_at(at(LATE_UTC_DAY)),
+        Some(provider(990, 1000, 10, LATE_UTC_DAY)),
+        "the raw observation stays available for telemetry"
+    );
+}

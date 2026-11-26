@@ -398,6 +398,17 @@ fn reserve_decision_call(
                     retryable: false,
                 });
             }
+            // A reservation path never orders an observation. Handled as a closed refusal
+            // rather than a panic, so a broken invariant cannot spend budget unaccounted.
+            Err(switchyard_llm_client::ReserveError::ObservationRejected { .. }) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                return Err(DecisionFailure::Serving {
+                    reason: "daily_allowance_unavailable",
+                    retryable: false,
+                });
+            }
         }
     }
     Ok(ticket)

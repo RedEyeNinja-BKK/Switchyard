@@ -512,6 +512,17 @@ pub(crate) fn authorize_terminal(
             .iter()
             .filter(|attempt| capable.iter().any(|model| model.as_str() == attempt.model))
             .filter(|attempt| is_capacity_outcome(attempt.outcome, policy))
+            // A provider-confirmed refusal is raised by the pre-send reservation, never by
+            // this request's own answer: the reservation runs before anything leaves, so the
+            // outcome inherits the basis of the reading behind it and the string cannot carry
+            // that distinction. Ask the counter again here -- a current zero is evidence the
+            // domain is spent, a retained statement about the past is not, and the two arrive
+            // as the same outcome. The local refusal is not re-asked: this deployment's own
+            // ledger is current by construction.
+            .filter(|attempt| {
+                attempt.outcome != "provider_allowance_exhausted"
+                    || allowance_spent(&ModelId::from(attempt.model.as_str()))
+            })
             .map(|attempt| attempt.model.as_str())
             .collect();
         declared_domains_exhausted(domains, capable, |model| {
@@ -642,8 +653,14 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         // nothing to try; it is wrong for a lane that promises to cross only once BOTH primary
         // allowances are genuinely spent. A minute window regains room on its own, and an
         // unclassified 429 may be a concurrency limit or a policy answer - neither is a
-        // measured exhaustion, and a stale retained reading arrives here as
-        // `daily_allowance_unavailable` rather than as exhaustion, so it is excluded too.
+        // measured exhaustion.
+        //
+        // `provider_allowance_exhausted` is accepted here only because a *current* provider
+        // zero is affirmative evidence. The string is also produced by a refusal that is only
+        // being retained past its reading's freshness, and it cannot say which. Acceptance
+        // therefore only says the class is eligible: `authorize_terminal`'s strict branch asks
+        // the counter again before an attempt of this class may authorise the local tier, and
+        // a retained statement about the past fails that second question.
         TerminalPolicy::AllowanceOnly => matches!(
             outcome,
             "daily_allowance_exhausted" | "provider_allowance_exhausted"
@@ -3199,6 +3216,10 @@ mod strict_allowance_boundary_tests {
 
     /// The boundary the owner asked for: both allowance domains at zero is the one condition
     /// that may spend the local tier.
+    ///
+    /// The provider-confirmed refusal is backed by the counter here, because that is where the
+    /// refusal came from: the pre-send reservation reads the counter, so "the provider's pool
+    /// is empty" is only ever as good as the reading behind it.
     #[test]
     fn both_allowance_domains_exhausted_opens_the_boundary() {
         let (models, credentials) = two_domains();
@@ -3207,7 +3228,74 @@ mod strict_allowance_boundary_tests {
             attempt("openai", "provider_allowance_exhausted"),
         ];
         assert_eq!(
-            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &["openai"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// A retained refusal reaches this judgement as the same outcome string as a current one,
+    /// because the reservation error cannot carry the basis. The counter can, so the attempt
+    /// is evidence only while the counter affirms it: a statement about the past may refuse
+    /// the send and must not buy the local tier.
+    #[test]
+    fn a_retained_provider_refusal_is_not_spent_evidence() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "provider_allowance_exhausted"),
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &[],
+            ),
+            None,
+            "the counter cannot affirm this domain is spent, so the attempt cannot either"
+        );
+        // Control: the same attempt opens the boundary once the counter is current.
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &["openai"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// This deployment's own ledger is always current, so a local refusal is evidence on its
+    /// own. Asking the counter about it would be harmless today and wrong the moment the two
+    /// questions drift apart again.
+    #[test]
+    fn a_local_refusal_needs_no_counter_to_be_evidence() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "daily_allowance_exhausted"),
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &[],
+            ),
             Some("primary_pool_exhausted")
         );
     }
@@ -3535,12 +3623,13 @@ mod strict_allowance_boundary_tests {
         ];
         let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
         assert_eq!(
-            authorize_with_domains(
+            authorize_with_state(
                 &models,
                 &dispatchable(&models),
                 &attempts,
                 &credentials,
-                &domains
+                &domains,
+                &["b"],
             ),
             Some("primary_pool_exhausted")
         );

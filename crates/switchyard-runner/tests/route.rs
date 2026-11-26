@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use libsy::RuntimeModels;
-use switchyard_llm_client::{ClientRouter, DailyRequestAllowance, RunObservation};
+use switchyard_llm_client::{
+    ClientRouter, DailyRequestAllowance, DayBoundary, ProviderReading, ReserveError, RunObservation,
+};
 use switchyard_protocol::{
     Category, ContentBlock, LlmClientError, LlmRequest, LlmResponse, Message, ModelId, Request,
     Response, Role, RoutedLlmClient, text_request, text_response,
@@ -1163,6 +1165,33 @@ struct StrictPool {
     local: Arc<Mutex<Vec<&'static str>>>,
 }
 
+/// Answers the way a client does when its pre-send reservation refuses: the send never
+/// leaves, and the error says the provider's pool is empty. The reading behind that refusal
+/// may be current or retained, and the error cannot say which -- which is the whole point.
+struct ProviderExhaustedClient {
+    model: &'static str,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl RoutedLlmClient for ProviderExhaustedClient {
+    async fn call(&self, _request: Request) -> Result<Response, LlmClientError> {
+        self.calls.lock().unwrap().push(self.model);
+        Err(LlmClientError::ProviderAllowanceExhausted {
+            model: ModelId::from(self.model),
+            limit: 1_000,
+        })
+    }
+}
+
+/// How the other domain's only member answers this request.
+#[derive(Clone, Copy)]
+enum O1Behavior {
+    Serves,
+    SpentLocally,
+    ProviderRefused,
+}
+
 /// Two primary groups over one pool -- `google` {g1, g2} and `openai` {o1} -- and a local
 /// tier that is only reachable through the strict allowance boundary.
 ///
@@ -1172,6 +1201,22 @@ struct StrictPool {
 fn strict_pool(
     o1_window: Option<u64>,
     o1_refuses: bool,
+    allowances: HashMap<ModelId, Arc<DailyRequestAllowance>>,
+) -> StrictPool {
+    strict_pool_with(
+        o1_window,
+        if o1_refuses {
+            O1Behavior::SpentLocally
+        } else {
+            O1Behavior::Serves
+        },
+        allowances,
+    )
+}
+
+fn strict_pool_with(
+    o1_window: Option<u64>,
+    o1: O1Behavior,
     allowances: HashMap<ModelId, Arc<DailyRequestAllowance>>,
 ) -> StrictPool {
     let primary = Arc::new(Mutex::new(Vec::new()));
@@ -1221,16 +1266,19 @@ fn strict_pool(
         ),
         (
             ModelId::from("o1"),
-            if o1_refuses {
-                Arc::new(SpentClient {
+            match o1 {
+                O1Behavior::SpentLocally => Arc::new(SpentClient {
                     model: "o1",
                     calls: Arc::clone(&primary),
-                }) as Arc<dyn RoutedLlmClient>
-            } else {
-                Arc::new(EchoClient {
+                }) as Arc<dyn RoutedLlmClient>,
+                O1Behavior::ProviderRefused => Arc::new(ProviderExhaustedClient {
                     model: "o1",
                     calls: Arc::clone(&primary),
-                }) as Arc<dyn RoutedLlmClient>
+                }) as Arc<dyn RoutedLlmClient>,
+                O1Behavior::Serves => Arc::new(EchoClient {
+                    model: "o1",
+                    calls: Arc::clone(&primary),
+                }) as Arc<dyn RoutedLlmClient>,
             },
         ),
         (
@@ -1496,5 +1544,253 @@ async fn a_corrupt_counter_does_not_open_the_local_tier() {
             .last()
             .expect("a selection record")
             .terminal_crossed
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Retained provider exhaustion: the refusal is real, the statement behind it is about the
+// past. The two facts are different, and only the first one belongs to admission.
+// ---------------------------------------------------------------------------------------
+
+/// A counter whose provider reading reported an empty pool, refused the send, and whose
+/// evidence is whatever `observed` and `tolerance` make it.
+fn provider_empty(
+    group: &str,
+    model: &str,
+    tag: &str,
+    observed: std::time::SystemTime,
+    tolerance: std::time::Duration,
+) -> (ModelId, Arc<DailyRequestAllowance>) {
+    let path = std::env::temp_dir().join(format!(
+        "sy-provider-{}-{tag}-{}.json",
+        std::process::id(),
+        model
+    ));
+    let _ = std::fs::remove_file(&path);
+    let allowance = DailyRequestAllowance::new_on(
+        group,
+        ModelId::from(model),
+        1_000,
+        path,
+        DayBoundary::Utc,
+    )
+    .with_provider_tolerance(tolerance);
+    allowance
+        .reconcile(ProviderReading {
+            used: 1_000,
+            limit: 1_000,
+            remaining: 0,
+            observed_at: observed,
+            reset_at: None,
+        })
+        .expect("the fixture's reading belongs to the current provider day");
+    assert!(
+        matches!(
+            allowance.try_reserve(),
+            Err(ReserveError::ProviderExhausted { limit: 1_000 })
+        ),
+        "fixture: an empty pool refuses the send, whatever its basis"
+    );
+    (ModelId::from(model), Arc::new(allowance))
+}
+
+/// An empty pool whose reading is current: affirmative evidence that the domain is spent.
+fn fresh_provider_allowance(
+    group: &str,
+    model: &str,
+    tag: &str,
+) -> (ModelId, Arc<DailyRequestAllowance>) {
+    let now = std::time::SystemTime::now();
+    let fixture = provider_empty(group, model, tag, now, std::time::Duration::from_secs(60));
+    assert_eq!(
+        fixture.1.spent_today(),
+        Some(true),
+        "fixture: a current zero reading is spent evidence"
+    );
+    fixture
+}
+
+/// An empty pool whose reading is only being retained: the send is still refused, but the
+/// statement describes the past and must not be quoted as "spent now".
+///
+/// The observation is placed inside the current provider day and at least a second old, so
+/// the retention is entered by construction rather than by waiting. The first instant of a
+/// provider day has no older same-day instant, so in that one-in-86,400 case the test waits
+/// for a second to pass instead of asserting on an impossible state.
+fn retained_provider_allowance(
+    group: &str,
+    model: &str,
+    tag: &str,
+) -> (ModelId, Arc<DailyRequestAllowance>) {
+    let now = std::time::SystemTime::now();
+    let day_start =
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(DayBoundary::Utc.day(now) * 86_400);
+    let observed = if now
+        .duration_since(day_start)
+        .expect("now is after the epoch")
+        >= std::time::Duration::from_secs(60)
+    {
+        now - std::time::Duration::from_secs(60)
+    } else {
+        day_start
+    };
+    if observed >= now {
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+    }
+    let fixture = provider_empty(group, model, tag, observed, std::time::Duration::ZERO);
+    assert_eq!(
+        fixture.1.spent_today(),
+        None,
+        "fixture: a retained reading is neither spent nor shown to have room"
+    );
+    fixture
+}
+
+/// The retained refusal on the dispatch path. `o1` is offered and its send is refused by the
+/// counter before anything leaves, so an attempt exists and its outcome says the provider's
+/// pool is empty. That outcome inherits the basis of the reading behind it, and a statement
+/// about the past cannot prove the domain is spent now -- so the local tier stays closed.
+#[tokio::test]
+async fn a_retained_provider_refusal_does_not_open_the_local_tier() {
+    let (g1, google_a) = spent_allowance("google", "g1", "retained-a");
+    let (g2, google_b) = spent_allowance("google", "g2", "retained-b");
+    let (o1, openai) = retained_provider_allowance("openai", "o1", "retained");
+    let pool = strict_pool_with(
+        Some(200_000),
+        O1Behavior::ProviderRefused,
+        HashMap::from([(g1, google_a), (g2, google_b), (o1, openai)]),
+    );
+    let (sink, observer) = trace_sink();
+    assert!(
+        pool.route
+            .execute(
+                Request {
+                    llm_request: text_request(None, "hello"),
+                    ..Request::default()
+                },
+                Some(observer),
+            )
+            .await
+            .is_err(),
+        "one domain is spent and the other is only retained, so the pool's exhaustion is not provable"
+    );
+    assert_eq!(
+        *pool.primary.lock().unwrap(),
+        vec!["g1", "g2", "o1"],
+        "the retained leg is offered and its client refuses the send"
+    );
+    assert!(
+        pool.local.lock().unwrap().is_empty(),
+        "a retained statement about the past must not buy the local tier"
+    );
+    assert!(
+        !sink
+            .lock()
+            .unwrap()
+            .last()
+            .expect("a selection record")
+            .terminal_crossed
+    );
+}
+
+/// The control for the test above: the same shape with a current reading. The counter can
+/// affirm the domain is spent *now*, so the boundary opens -- the correction narrows the
+/// retained case and must not narrow this one.
+#[tokio::test]
+async fn a_current_provider_exhaustion_still_opens_the_local_tier() {
+    let (g1, google_a) = spent_allowance("google", "g1", "fresh-a");
+    let (g2, google_b) = spent_allowance("google", "g2", "fresh-b");
+    let (o1, openai) = fresh_provider_allowance("openai", "o1", "fresh");
+    let pool = strict_pool_with(
+        Some(200_000),
+        O1Behavior::ProviderRefused,
+        HashMap::from([(g1, google_a), (g2, google_b), (o1, openai)]),
+    );
+    let (sink, observer) = trace_sink();
+    let output = pool
+        .route
+        .execute(
+            Request {
+                llm_request: text_request(None, "hello"),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("both domains are provably spent, so the local tier serves");
+    assert_eq!(output.selected_model, "local");
+    assert_eq!(*pool.local.lock().unwrap(), vec!["local"]);
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert!(trace.terminal_crossed);
+    assert_eq!(trace.terminal_reason, Some("primary_pool_exhausted"));
+}
+
+/// The same retained state when the leg is skipped on fit rather than dispatched. Both paths
+/// have to agree: the evidence is the counter's, and it does not become stronger because the
+/// request happened to reach the leg.
+#[tokio::test]
+async fn a_retained_reading_does_not_prove_an_undispatched_domain_spent() {
+    let (g1, google_a) = spent_allowance("google", "g1", "retained-skip-a");
+    let (g2, google_b) = spent_allowance("google", "g2", "retained-skip-b");
+    let (o1, openai) = retained_provider_allowance("openai", "o1", "retained-skip");
+    let pool = strict_pool_with(
+        Some(1_000),
+        O1Behavior::Serves,
+        HashMap::from([(g1, google_a), (g2, google_b), (o1, openai)]),
+    );
+    let (sink, observer) = trace_sink();
+    assert!(
+        pool.route
+            .execute(big_request(5_000), Some(observer))
+            .await
+            .is_err(),
+        "a domain that skipped the request and can only be described from the past is not spent"
+    );
+    assert_eq!(
+        *pool.primary.lock().unwrap(),
+        vec!["g1", "g2"],
+        "the leg cannot hold the request, so it is never called"
+    );
+    assert!(pool.local.lock().unwrap().is_empty());
+    assert!(
+        !sink
+            .lock()
+            .unwrap()
+            .last()
+            .expect("a selection record")
+            .terminal_crossed
+    );
+}
+
+/// The control for the skipped path: a current reading does prove the undispatched domain
+/// spent, and the tier opens without the ineligible leg being called to find out.
+#[tokio::test]
+async fn a_current_reading_proves_an_undispatched_domain_spent() {
+    let (g1, google_a) = spent_allowance("google", "g1", "fresh-skip-a");
+    let (g2, google_b) = spent_allowance("google", "g2", "fresh-skip-b");
+    let (o1, openai) = fresh_provider_allowance("openai", "o1", "fresh-skip");
+    let pool = strict_pool_with(
+        Some(1_000),
+        O1Behavior::Serves,
+        HashMap::from([(g1, google_a), (g2, google_b), (o1, openai)]),
+    );
+    let (sink, observer) = trace_sink();
+    let output = pool
+        .route
+        .execute(big_request(5_000), Some(observer))
+        .await
+        .expect("the local tier serves");
+    assert_eq!(output.selected_model, "local");
+    assert_eq!(
+        *pool.primary.lock().unwrap(),
+        vec!["g1", "g2"],
+        "the ineligible leg is never dispatched to learn its state"
+    );
+    assert_eq!(*pool.local.lock().unwrap(), vec!["local"]);
+    let traces = sink.lock().unwrap();
+    assert_eq!(
+        traces.last().expect("a selection record").terminal_reason,
+        Some("primary_pool_exhausted")
     );
 }

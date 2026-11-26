@@ -713,6 +713,69 @@ async fn an_ordered_pool_admits_a_metered_group_behind_a_free_one() {
     );
 }
 
+/// The dispatch half of the same exemption, which the test above cannot see because the free
+/// group answers every request it sends. Here each free leaf declares a budget of one request,
+/// so the third request has no free capacity left and must be served by the metered group.
+///
+/// This is the observation that separates the two places the free-only rule lives. The load
+/// gate admits the metered member; the dispatch gate must then keep admitting it. A route that
+/// refuses not-free candidates at dispatch filters the metered leg out exactly when the ladder
+/// needs it, so every request past the free allowance fails while the manifest names a leg that
+/// could have answered.
+#[tokio::test]
+async fn an_ordered_pool_serves_from_its_metered_group_once_the_free_budgets_are_spent() {
+    let chat = Upstream::new(|model| Some((200, success(model))));
+    let paid = Upstream::new(|model| Some((200, success(model))));
+    let chat_url = chat.clone().server();
+    let paid_url = paid.clone().server();
+    let quota = tempfile::tempdir().expect("quota dir");
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n{}{}{}{}{}\n\
+         [routes.smart-route]\nid = \"smart-route\"\ntype = \"passthrough\"\n\
+         selection = \"grouped\"\ngroup_ordering = \"ordered\"\n\
+         pool_groups = [\"smart-gemini-chat\", \"smart-openrouter-paid\"]\n\
+         target = \"g1\"\ncandidates = [\"g2\", \"z1\"]\n",
+        quota.path().display(),
+        client("chat", &chat_url),
+        client("paid", &paid_url),
+        grouped_leaf("g1", "chat", "vendor/g1", "smart-gemini-chat", 1),
+        grouped_leaf("g2", "chat", "vendor/g2", "smart-gemini-chat", 1),
+        ladder_leaf(
+            "z1",
+            "paid",
+            "paid/z1",
+            "smart-openrouter-paid",
+            false,
+            None
+        ),
+    );
+    std::mem::forget(quota);
+    let state = switchyard_server::ServerState::from_runner(runner(&config)).expect("state");
+    let router = switchyard_server::build_switchyard_router(state);
+
+    let mut served = Vec::new();
+    for _ in 0..3 {
+        let (status, body) = call(&router, "smart-route", "hi").await;
+        assert!(status.is_success(), "{body}");
+        served.push(body["model"].as_str().unwrap_or_default().to_string());
+    }
+    assert_eq!(
+        served
+            .iter()
+            .filter(|model| model.starts_with("vendor/"))
+            .count(),
+        2,
+        "each free leaf serves exactly its declared budget: {served:?}"
+    );
+    assert_eq!(
+        served.last().map(String::as_str),
+        Some("paid/z1"),
+        "the metered group serves once both free budgets are spent: {served:?}"
+    );
+    assert_eq!(chat.calls(), 2, "a spent budget issues no further request");
+    assert_eq!(paid.calls(), 1);
+}
+
 /// A ready earlier group keeps the request however the later group measures. Under the
 /// adaptive policy two equal groups rotate; under the ordered policy they do not, so three
 /// requests that all land on the free group is the observation that separates the two.

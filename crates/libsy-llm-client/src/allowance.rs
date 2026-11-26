@@ -569,6 +569,44 @@ impl DailyRequestAllowance {
         }
     }
 
+    /// Whether this allowance's remainder is knowably zero for the current provider day.
+    ///
+    /// Three answers, because the two-answer form is the one that spends money. `Some(true)`
+    /// only when the counter can be read and its remainder is zero; `Some(false)` when it can
+    /// be read and still has room, or when no counter exists yet; `None` when a counter
+    /// exists but cannot be read. A caller deciding whether to escalate on "this allowance is
+    /// spent" must treat `None` as unknown: an unreadable ledger is not an exhausted one, and
+    /// [`Self::remaining`] answers `0` for both, which is right for admission and wrong for
+    /// this claim.
+    ///
+    /// Reads without taking the lock and creates nothing: the counter is replaced atomically,
+    /// so a reader sees a whole file either way, and a judgement about what the deployment's
+    /// accounting says must not write to the directory it is judging.
+    pub fn spent_today(&self) -> Option<bool> {
+        self.spent_today_at(SystemTime::now())
+    }
+
+    /// [`Self::spent_today`] against an explicit clock, for tests and replays.
+    pub fn spent_today_at(&self, now: SystemTime) -> Option<bool> {
+        let day = self.boundary.day(now);
+        let counter = match fs::read(&self.path) {
+            Ok(bytes) => match parse_counter(&bytes) {
+                Ok(counter) => counter,
+                Err(_) => return None,
+            },
+            // No counter yet: the day's allowance is untouched, which is a fact about this
+            // deployment rather than an absence of evidence.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        let local = self.limit.saturating_sub(spent_on(counter, day));
+        let remaining = match self.provider_headroom(&counter, day, now) {
+            Some(headroom) => local.min(headroom),
+            None => local,
+        };
+        Some(remaining == 0)
+    }
+
     /// Reserves one request against the current provider day.
     ///
     /// Returns [`ReserveError::Exhausted`] when the allowance is spent, in which case
@@ -2016,6 +2054,57 @@ mod tests {
         allowance(&directory, 5).try_reserve().expect("first");
         let restarted = allowance(&directory, 5);
         assert_eq!(restarted.remaining(), 4);
+    }
+
+    /// The three-state reading: absent is untouched, spent is spent, and a counter that cannot
+    /// be parsed is neither. The last case is why the two-state form is unusable as evidence —
+    /// `remaining` answers `0` for it, which a caller would read as exhaustion.
+    #[test]
+    fn spent_today_separates_unknown_from_spent() {
+        let directory = scratch("spent-today");
+        let counted = allowance(&directory, 1);
+        assert_eq!(
+            counted.spent_today(),
+            Some(false),
+            "no counter yet is an untouched day, not an absent answer"
+        );
+        assert_eq!(
+            counted.remaining(),
+            1,
+            "and the same day is visible to admission"
+        );
+
+        counted.try_reserve().expect("the day's only request");
+        assert_eq!(counted.spent_today(), Some(true));
+        assert_eq!(counted.remaining(), 0);
+
+        let corrupt = scratch("spent-today-corrupt");
+        let unreadable = allowance(&corrupt, 1);
+        fs::create_dir_all(unreadable.path().parent().expect("a parent")).expect("directory");
+        fs::write(unreadable.path(), b"{not json").expect("a broken counter");
+        assert_eq!(
+            unreadable.spent_today(),
+            None,
+            "a counter that cannot be read is unknown, never spent"
+        );
+        assert_eq!(
+            unreadable.remaining(),
+            0,
+            "the two-state reading collapses unknown into spent, which is the defect"
+        );
+    }
+
+    /// Judging the evidence must not change what it judges: no counter, no lock file.
+    #[test]
+    fn spent_today_creates_nothing() {
+        let directory = scratch("spent-today-inert");
+        let judged = allowance(&directory, 1);
+        let lock = judged.lock_path();
+        assert_eq!(judged.spent_today(), Some(false));
+        assert!(
+            !judged.path().exists() && !lock.exists(),
+            "a decision about the accounting must not write the accounting"
+        );
     }
 
     /// Two instances over one file cannot both spend the last request, however they race.

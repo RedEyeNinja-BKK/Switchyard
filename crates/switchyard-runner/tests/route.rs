@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use libsy::RuntimeModels;
-use switchyard_llm_client::{ClientRouter, RunObservation};
+use switchyard_llm_client::{ClientRouter, DailyRequestAllowance, RunObservation};
 use switchyard_protocol::{
     Category, ContentBlock, LlmClientError, LlmRequest, LlmResponse, Message, ModelId, Request,
     Response, Role, RoutedLlmClient, text_request, text_response,
@@ -1127,5 +1127,374 @@ async fn an_incompatible_group_does_not_end_the_ordered_walk() {
         trace.terminal_skipped,
         vec![("google-c".to_string(), "tool_call_replay")],
         "the reached group is recorded with the rule that excluded it"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Strict allowance boundary, end to end: two declared primary domains and one local tier.
+//
+// The claim under test is about the deployment's allowance domains, so the fixtures below
+// drive it through a real route: one domain whose members refuse on their own daily budget,
+// one domain that either skips the request (fit), answers (recovery) or is proved spent by
+// its own counter while remaining ineligible. The local tier records every call, so "no paid
+// spill" and "no dispatch to an ineligible leaf" are observable rather than inferred.
+// ---------------------------------------------------------------------------------------
+
+/// Answers with the local daily-budget refusal, before any request leaves the process.
+struct SpentClient {
+    model: &'static str,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl RoutedLlmClient for SpentClient {
+    async fn call(&self, _request: Request) -> Result<Response, LlmClientError> {
+        self.calls.lock().unwrap().push(self.model);
+        Err(LlmClientError::DailyRequestAllowanceExhausted {
+            model: ModelId::from(self.model),
+            limit: 20,
+        })
+    }
+}
+
+struct StrictPool {
+    route: Route,
+    primary: Arc<Mutex<Vec<&'static str>>>,
+    local: Arc<Mutex<Vec<&'static str>>>,
+}
+
+/// Two primary groups over one pool -- `google` {g1, g2} and `openai` {o1} -- and a local
+/// tier that is only reachable through the strict allowance boundary.
+///
+/// `o1_window` is the physical window declared for the other domain's only member, which is
+/// how a request is made to skip that domain on fit alone. `allowances` is the authoritative
+/// counter state the route reads for members it never dispatches.
+fn strict_pool(
+    o1_window: Option<u64>,
+    o1_refuses: bool,
+    allowances: HashMap<ModelId, Arc<DailyRequestAllowance>>,
+) -> StrictPool {
+    let primary = Arc::new(Mutex::new(Vec::new()));
+    let local = Arc::new(Mutex::new(Vec::new()));
+    let spec = AlgorithmSpec::Passthrough {
+        target: "g1".to_string(),
+        candidates: vec!["g2".to_string(), "o1".to_string()],
+        subagents: None,
+    };
+    let targets = BTreeMap::from([
+        ("g1".to_string(), ModelId::from("g1")),
+        ("g2".to_string(), ModelId::from("g2")),
+        ("o1".to_string(), ModelId::from("o1")),
+    ]);
+    let algorithm = spec
+        .build("switchyard", &targets)
+        .expect("algorithm builds");
+    let wide = switchyard_llm_client::CapabilityFacts {
+        context_window: Some(200_000),
+        ..switchyard_llm_client::CapabilityFacts::default()
+    };
+    let facts = HashMap::from([
+        (ModelId::from("g1"), wide.clone()),
+        (ModelId::from("g2"), wide),
+        (
+            ModelId::from("o1"),
+            switchyard_llm_client::CapabilityFacts {
+                context_window: o1_window,
+                ..switchyard_llm_client::CapabilityFacts::default()
+            },
+        ),
+    ]);
+    let clients: HashMap<ModelId, Arc<dyn RoutedLlmClient>> = HashMap::from([
+        (
+            ModelId::from("g1"),
+            Arc::new(SpentClient {
+                model: "g1",
+                calls: Arc::clone(&primary),
+            }) as Arc<dyn RoutedLlmClient>,
+        ),
+        (
+            ModelId::from("g2"),
+            Arc::new(SpentClient {
+                model: "g2",
+                calls: Arc::clone(&primary),
+            }) as Arc<dyn RoutedLlmClient>,
+        ),
+        (
+            ModelId::from("o1"),
+            if o1_refuses {
+                Arc::new(SpentClient {
+                    model: "o1",
+                    calls: Arc::clone(&primary),
+                }) as Arc<dyn RoutedLlmClient>
+            } else {
+                Arc::new(EchoClient {
+                    model: "o1",
+                    calls: Arc::clone(&primary),
+                }) as Arc<dyn RoutedLlmClient>
+            },
+        ),
+        (
+            ModelId::from("local"),
+            Arc::new(EchoClient {
+                model: "local",
+                calls: Arc::clone(&local),
+            }) as Arc<dyn RoutedLlmClient>,
+        ),
+    ]);
+    let clients = ClientRouter::new(clients)
+        .with_target_capabilities(facts)
+        .with_target_credentials(HashMap::from([
+            (ModelId::from("g1"), "GOOGLE".to_string()),
+            (ModelId::from("g2"), "GOOGLE".to_string()),
+            (ModelId::from("o1"), "OPENAI".to_string()),
+            (ModelId::from("local"), "HTPC".to_string()),
+        ]));
+    let route = Route::new(
+        algorithm,
+        clients,
+        None,
+        ModelCapabilities::default(),
+        None,
+        None,
+        Vec::new(),
+        RuntimeModels::new(HashMap::from([(
+            Category::Any,
+            vec![
+                ModelId::from("g1"),
+                ModelId::from("g2"),
+                ModelId::from("o1"),
+            ],
+        )])),
+        switchyard_runner::RouteReasoningPolicy::Inherit,
+        None,
+        None,
+    )
+    .with_terminal_fallback(vec![RuntimeModels::new(HashMap::from([(
+        Category::Any,
+        vec![ModelId::from("local")],
+    )]))])
+    .with_terminal_policy(switchyard_runner::TerminalPolicy::AllowanceOnly)
+    .with_group_plan(switchyard_runner::selection::GroupPlan {
+        groups: vec![
+            switchyard_runner::selection::GroupMembers {
+                name: "google".to_string(),
+                members: vec![ModelId::from("g1"), ModelId::from("g2")],
+            },
+            switchyard_runner::selection::GroupMembers {
+                name: "openai".to_string(),
+                members: vec![ModelId::from("o1")],
+            },
+        ],
+    })
+    .with_daily_allowances(Arc::new(allowances));
+    StrictPool {
+        route,
+        primary,
+        local,
+    }
+}
+
+/// A counter that has spent its whole day, as the deployment's own accounting would leave it.
+fn spent_allowance(group: &str, model: &str, tag: &str) -> (ModelId, Arc<DailyRequestAllowance>) {
+    let path = std::env::temp_dir().join(format!(
+        "sy-strict-{}-{tag}-{}.json",
+        std::process::id(),
+        model
+    ));
+    let _ = std::fs::remove_file(&path);
+    let allowance = DailyRequestAllowance::new(group, ModelId::from(model), 1, path);
+    allowance.try_reserve().expect("the day's only request");
+    assert!(
+        allowance.try_reserve().is_err(),
+        "the counter must be provably spent"
+    );
+    assert_eq!(allowance.remaining(), 0);
+    (ModelId::from(model), Arc::new(allowance))
+}
+
+/// A counter that exists on disk but cannot be parsed: the state is unknown, and the
+/// two-state reading reports it as a full day's spend.
+fn corrupt_allowance(group: &str, model: &str, tag: &str) -> (ModelId, Arc<DailyRequestAllowance>) {
+    let path = std::env::temp_dir().join(format!(
+        "sy-strict-{}-{tag}-{}.json",
+        std::process::id(),
+        model
+    ));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("a state directory");
+    }
+    std::fs::write(&path, b"{not a counter").expect("a broken counter");
+    let allowance = DailyRequestAllowance::new(group, ModelId::from(model), 1, path);
+    assert_eq!(allowance.remaining(), 0, "the trap this fixture exists for");
+    (ModelId::from(model), Arc::new(allowance))
+}
+
+fn big_request(tokens: u64) -> Request {
+    Request {
+        llm_request: text_request(None, "hello"),
+        raw_request: Some(body_of_estimated_tokens(tokens)),
+        ..Request::default()
+    }
+}
+
+/// Both primary domains refuse on their own budget, so both allowances really are spent and
+/// the local tier is the authorized answer. The record names the exhaustion boundary rather
+/// than the fit or capability ones.
+#[tokio::test]
+async fn both_primary_domains_refusing_locally_opens_the_local_tier() {
+    let pool = strict_pool(Some(200_000), true, HashMap::new());
+    let (sink, observer) = trace_sink();
+    let output = pool
+        .route
+        .execute(
+            Request {
+                llm_request: text_request(None, "hello"),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("the local tier serves");
+    assert_eq!(output.selected_model, "local");
+    assert_eq!(*pool.local.lock().unwrap(), vec!["local"]);
+    assert_eq!(
+        *pool.primary.lock().unwrap(),
+        vec!["g1", "g2", "o1"],
+        "every primary leg is offered exactly once"
+    );
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert!(trace.terminal_crossed);
+    assert_eq!(trace.terminal_reason, Some("primary_pool_exhausted"));
+}
+
+/// The reviewed counterexample at route level: the other domain is absent because the request
+/// does not fit it, and nothing has established that its allowance is spent. The local tier
+/// must stay closed even though every leg this request did try has spent its budget.
+#[tokio::test]
+async fn a_domain_that_only_skipped_the_request_keeps_the_local_tier_closed() {
+    let pool = strict_pool(Some(1_000), false, HashMap::new());
+    let (sink, observer) = trace_sink();
+    let result = pool.route.execute(big_request(5_000), Some(observer)).await;
+    assert!(
+        result.is_err(),
+        "an unproven allowance is not a spent one, so the request is refused"
+    );
+    assert!(
+        pool.local.lock().unwrap().is_empty(),
+        "the local tier must not be spent on an unproven domain"
+    );
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert!(!trace.terminal_crossed);
+    assert_eq!(trace.terminal_reason, None);
+}
+
+/// The same shape, with the excluded domain's own counter read instead of inferred: it is
+/// spent, so the boundary opens -- and the ineligible leg is never dispatched to learn that.
+#[tokio::test]
+async fn an_excluded_domain_proved_spent_by_its_counter_opens_the_tier_without_dispatch() {
+    let (o1, allowance) = spent_allowance("openai", "o1", "excluded");
+    let pool = strict_pool(Some(1_000), false, HashMap::from([(o1, allowance)]));
+    let (sink, observer) = trace_sink();
+    let output = pool
+        .route
+        .execute(big_request(5_000), Some(observer))
+        .await
+        .expect("the local tier serves");
+    assert_eq!(output.selected_model, "local");
+    assert_eq!(*pool.local.lock().unwrap(), vec!["local"]);
+    assert_eq!(
+        *pool.primary.lock().unwrap(),
+        vec!["g1", "g2"],
+        "o1 cannot hold this request and must not be called to find out"
+    );
+    let traces = sink.lock().unwrap();
+    assert_eq!(
+        traces.last().expect("a selection record").terminal_reason,
+        Some("primary_pool_exhausted")
+    );
+}
+
+/// Recovery: the first domain is spent, the second has headroom and can serve, so the local
+/// tier is never reached. A boundary that opened on the first domain alone would spend it.
+#[tokio::test]
+async fn a_domain_with_headroom_serves_and_the_local_tier_is_not_spent() {
+    let pool = strict_pool(Some(200_000), false, HashMap::new());
+    let (sink, observer) = trace_sink();
+    let output = pool
+        .route
+        .execute(
+            Request {
+                llm_request: text_request(None, "hello"),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("the second domain serves");
+    // The record names the leg that answered; the algorithm's own label for a passthrough
+    // is its declared target, so the responder is read from the trace.
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert_eq!(trace.served.as_deref(), Some("o1"));
+    assert!(pool.local.lock().unwrap().is_empty());
+    assert!(!trace.terminal_crossed);
+    drop(traces);
+    assert_eq!(output.selected_model, "g1");
+}
+
+/// A target the deployment keeps no counter for is unknown, not spent: the same route, the
+/// same exhausted request, and the local tier stays closed because one domain's state was
+/// never established.
+#[tokio::test]
+async fn a_target_without_a_counter_is_not_exhaustion_at_route_level() {
+    let pool = strict_pool(Some(1_000), false, HashMap::new());
+    // `o1` has no registered allowance, so `allowance_spent` answers false and the excluded
+    // domain stays unknown -- which is the point: nothing established its state.
+    let (sink, observer) = trace_sink();
+    assert!(
+        pool.route
+            .execute(big_request(5_000), Some(observer))
+            .await
+            .is_err()
+    );
+    assert!(pool.local.lock().unwrap().is_empty());
+    assert!(
+        !sink
+            .lock()
+            .unwrap()
+            .last()
+            .expect("a selection record")
+            .terminal_crossed
+    );
+}
+
+/// A counter that exists but cannot be parsed is unknown too, and this is the case a
+/// two-state reading gets wrong: `remaining()` reports `0` for a broken file, so reading the
+/// figure alone would mark the domain spent and buy the local tier with a corrupt ledger.
+#[tokio::test]
+async fn a_corrupt_counter_does_not_open_the_local_tier() {
+    let (o1, allowance) = corrupt_allowance("openai", "o1", "corrupt");
+    let pool = strict_pool(Some(1_000), false, HashMap::from([(o1, allowance)]));
+    let (sink, observer) = trace_sink();
+    assert!(
+        pool.route
+            .execute(big_request(5_000), Some(observer))
+            .await
+            .is_err(),
+        "an unparseable ledger is not an exhausted one, so the request is refused"
+    );
+    assert!(
+        pool.local.lock().unwrap().is_empty(),
+        "the local tier must not be bought with a broken file"
+    );
+    assert!(
+        !sink
+            .lock()
+            .unwrap()
+            .last()
+            .expect("a selection record")
+            .terminal_crossed
     );
 }

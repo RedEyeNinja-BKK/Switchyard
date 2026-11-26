@@ -422,6 +422,35 @@ fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrie
     }
 }
 
+/// Whether every declared allowance domain is affirmatively spent.
+///
+/// The claim is about the deployment's allowance domains, so neither `capable` nor
+/// `dispatchable` can bound it: both are what survived gates, and a member excluded by fit,
+/// by a rejected key or by an unreadable ledger is precisely a member whose allowance still
+/// has to be established. `domains` is the declared membership; a route that declares none
+/// is one domain over its capable set, because that is the only pool the deployment named.
+///
+/// An empty declared domain is a configuration fault and is never read as spent: a claim
+/// about a pool with no members is a claim about nothing, and answering it "yes" is how a
+/// misconfigured pool would buy the local tier on the first request.
+fn declared_domains_exhausted(
+    domains: &[Vec<ModelId>],
+    ungrouped: &[ModelId],
+    exhausted: impl Fn(&ModelId) -> bool,
+) -> bool {
+    let single: Vec<Vec<ModelId>>;
+    let judged: &[Vec<ModelId>] = if domains.is_empty() {
+        single = vec![ungrouped.to_vec()];
+        &single
+    } else {
+        domains
+    };
+    !judged.is_empty()
+        && judged
+            .iter()
+            .all(|domain| !domain.is_empty() && domain.iter().all(&exhausted))
+}
+
 /// Decides whether the terminal leg may be spent, and names why.
 ///
 /// This is the whole policy, kept as a free function so its decision table can be
@@ -434,13 +463,19 @@ fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrie
 /// * `attempts` - every upstream call this request actually made;
 /// * `policy` - which evidence this route accepts as "the pool cannot serve this";
 /// * `domains` - the declared primary groups: the allowance domains the strict policy
-///   makes a claim about. Empty means "treat the capable set as one domain";
+///   makes a claim about, judged over their whole declared membership rather than over the
+///   legs this request happened to be able to try. Empty means "one domain, the capable
+///   set", which is the strongest statement available when the deployment never declared
+///   which targets share a budget;
 /// * `credential_of` - the credential that serves a target, when configuration says;
 /// * `quota_blocked` - whether a block excludes a target because its allowance is spent,
-///   rather than because the credential was rejected.
+///   rather than because the credential was rejected;
+/// * `allowance_spent` - whether the counter governing a target reports no remainder for
+///   the current provider day and can be read at all.
 ///
 /// Returns `None` when the pool's unavailability is not provable, which is the safe
 /// answer: the caller gets the primary error instead of a paid escalation.
+#[allow(clippy::too_many_arguments)] // Each argument is one piece of evidence, varied independently in tests.
 pub(crate) fn authorize_terminal(
     capable: &[ModelId],
     dispatchable: &HashSet<ModelId>,
@@ -449,12 +484,40 @@ pub(crate) fn authorize_terminal(
     domains: &[Vec<ModelId>],
     credential_of: impl Fn(&ModelId) -> Option<String>,
     quota_blocked: impl Fn(&ModelId) -> bool,
+    allowance_spent: impl Fn(&ModelId) -> bool,
 ) -> Option<&'static str> {
     // Nothing in the pool could serve this request even with unlimited capacity, so
     // "exhausted" would be a different claim from the true one. Refuse.
     if capable.is_empty() {
         return None;
     }
+    // The strict boundary is decided here, before the block and attempt branches, because
+    // it is the one judgement that must not be narrowed by them: a member dropped for fit,
+    // for a rejected key or for an unreadable ledger is still a member of its domain, and
+    // its allowance still has to be established before the local tier may be spent.
+    //
+    // Only affirmative current-window evidence counts:
+    //   * this request saw the target answer that its daily allowance is spent;
+    //   * a quota-scoped credential block covers it -- a block `credential_block` builds
+    //     only from a provider quota statement, never from a bare 429, a cooldown or a
+    //     rejected key, and scoped so a per-model block covers only that model;
+    //   * the counter governing it reports no remainder for the current provider day and
+    //     can be read at all.
+    // A rejected credential, an unreadable or stale ledger, a leg skipped for fit and a leg
+    // nobody looked at leave the domain unknown, and unknown is not spent. A per-model
+    // exhaustion is never promoted to its credential: Google allocates that budget per model
+    // inside the project, so a spent sibling says nothing about this one.
+    let strict = (policy == TerminalPolicy::AllowanceOnly).then(|| {
+        let spent_here: HashSet<&str> = attempts
+            .iter()
+            .filter(|attempt| capable.iter().any(|model| model.as_str() == attempt.model))
+            .filter(|attempt| is_capacity_outcome(attempt.outcome, policy))
+            .map(|attempt| attempt.model.as_str())
+            .collect();
+        declared_domains_exhausted(domains, capable, |model| {
+            spent_here.contains(model.as_str()) || quota_blocked(model) || allowance_spent(model)
+        })
+    });
     if dispatchable.is_empty() {
         // Every capable leg is covered by a credential block, so the pool is provably out
         // of capacity without a single request being made. A route that escalates only on
@@ -465,16 +528,26 @@ pub(crate) fn authorize_terminal(
         // deployment fault, and answering it with a further call spends money on a
         // configuration error instead of surfacing it. Only the historical `Capacity` rule
         // reads every block as exhaustion.
-        if policy != TerminalPolicy::Capacity && !capable.iter().all(quota_blocked) {
-            return None;
+        //
+        // The strict policy keeps its own reading of "blocked": the block kind alone is not
+        // proof, so the declared domains are judged as they are on every other path, and a
+        // domain whose members are merely rejected stays unknown rather than spent.
+        match strict {
+            Some(true) => return Some("primary_pool_blocked"),
+            Some(false) => return None,
+            None => {
+                if policy != TerminalPolicy::Capacity && !capable.iter().all(quota_blocked) {
+                    return None;
+                }
+                return Some("primary_pool_blocked");
+            }
         }
-        return Some("primary_pool_blocked");
     }
     let primary_attempts: Vec<&AttemptTrace> = attempts
         .iter()
         .filter(|attempt| capable.iter().any(|model| model.as_str() == attempt.model))
         .collect();
-    if primary_attempts.is_empty() {
+    if primary_attempts.is_empty() && strict.is_none() {
         return None;
     }
     // One leg failing for a reason that is about the request - a policy answer, a
@@ -485,6 +558,12 @@ pub(crate) fn authorize_terminal(
         .all(|attempt| is_capacity_outcome(attempt.outcome, policy))
     {
         return None;
+    }
+    if let Some(spent) = strict {
+        // The domain judgement above already accounts for every declared member, including
+        // the ones this request never dispatched and the ones it could not fit, so there is
+        // no coverage gap left to explain by a dead credential.
+        return spent.then_some("primary_pool_exhausted");
     }
     let attempted: HashSet<&str> = primary_attempts
         .iter()
@@ -505,45 +584,6 @@ pub(crate) fn authorize_terminal(
         })
         .filter_map(|attempt| credential_of(&ModelId::from(attempt.model.as_str())))
         .collect();
-    // The strict policy is a claim about the deployment's allowance domains, not about the
-    // legs this request happened to try. `capable` cannot express it: it is what survived
-    // capability and fit filtering, so a sibling excluded by fit is absent rather than
-    // accounted for. `dispatchable` cannot express it either, and is worse, because it drops
-    // exactly the blocked legs whose state has to be established. So the declared groups are
-    // passed in, and each domain is judged over its own capable members.
-    //
-    // A member counts as exhausted when this request saw it spend its allowance, when a
-    // quota-scoped block covers it, or when its credential was already proved exhausted by
-    // another attempt in this request. A rejected credential, an unreadable or stale ledger,
-    // a leg skipped for fit, and a leg nobody looked at all leave the domain's state unknown
-    // -- and unknown is not exhausted. A domain with no capable member could not have served
-    // this request, so its allowance is not part of the claim.
-    if policy == TerminalPolicy::AllowanceOnly {
-        let exhausted = |model: &ModelId| -> bool {
-            attempted.contains(model.as_str())
-                || quota_blocked(model)
-                || credential_of(model).is_some_and(|credential| dead.contains(&credential))
-        };
-        let single: Vec<Vec<ModelId>>;
-        let judged: &[Vec<ModelId>] = if domains.is_empty() {
-            single = vec![capable.to_vec()];
-            &single
-        } else {
-            domains
-        };
-        for domain in judged {
-            let applicable: Vec<&ModelId> = domain
-                .iter()
-                .filter(|model| capable.contains(*model))
-                .collect();
-            if applicable.is_empty() {
-                continue;
-            }
-            if applicable.iter().any(|model| !exhausted(model)) {
-                return None;
-            }
-        }
-    }
     for model in capable.iter().filter(|model| dispatchable.contains(*model)) {
         if attempted.contains(model.as_str()) {
             continue;
@@ -1035,8 +1075,15 @@ impl Route {
         attempts: &[AttemptTrace],
         blocks: &[switchyard_llm_client::CredentialBlock],
     ) -> Option<&'static str> {
-        // The primary pool's allowance domains are its declared groups. A route that declares
-        // no groups is one domain, which is what the caller passes by leaving this empty.
+        // The primary pool's allowance domains are its declared groups, and the strict policy
+        // judges them over their whole declared membership -- a member excluded by fit or by
+        // a block is exactly a member whose allowance still has to be accounted for.
+        //
+        // A route that declares no groups is one domain over its capable set, which is the
+        // strongest statement its configuration supports. That residual is stated rather than
+        // hidden: an ungrouped strict route cannot account for a sibling the request did not
+        // fit, because nothing declares that the sibling shares a budget with the legs that
+        // were tried. Every strict route in this deployment is grouped.
         let domains: Vec<Vec<ModelId>> = self
             .group_plan
             .groups
@@ -1076,7 +1123,28 @@ impl Route {
             domains,
             |model| self.target_credential(model).map(str::to_string),
             |model| self.quota_blocked(model, blocks),
+            |model| self.allowance_spent(model),
         )
+    }
+
+    /// Whether the counter that governs `model` is knowably out for the current provider day.
+    ///
+    /// This is the evidence half of the strict boundary, and it exists so a declared domain
+    /// member that this request could not dispatch -- excluded by fit, or blocked -- can
+    /// still be judged. [`DailyRequestAllowance::spent_today`] answers in three states and
+    /// only the affirmative one counts: a readable counter at zero is spent, a readable
+    /// counter with room is not, and a counter that cannot be read is unknown. The third must
+    /// not collapse into either neighbour -- an unreadable ledger also reports a remainder of
+    /// zero, so reading the figure alone would turn "this deployment cannot say" into "the
+    /// budget is spent" and buy the local tier on a broken file.
+    ///
+    /// A target with no counter is unknown for a different reason: a metered target has no
+    /// daily allowance to exhaust, so its exhaustion can only ever come from the provider's
+    /// own answer within this request.
+    fn allowance_spent(&self, model: &ModelId) -> bool {
+        self.daily_allowances
+            .get(model)
+            .is_some_and(|allowance| allowance.spent_today() == Some(true))
     }
 
     /// Whether a quota-scoped block covers `model`.
@@ -2430,6 +2498,7 @@ mod terminal_authorization_tests {
             &[],
             |model| credentials.get(model).cloned(),
             |_| false,
+            |_| false,
         )
     }
 
@@ -2458,6 +2527,7 @@ mod terminal_authorization_tests {
             &[],
             |model| credentials.get(model).cloned(),
             quota_blocked,
+            |_| false,
         )
     }
 
@@ -2476,6 +2546,7 @@ mod terminal_authorization_tests {
             TerminalPolicy::Availability,
             &[],
             |model| credentials.get(model).cloned(),
+            |_| false,
             |_| false,
         )
     }
@@ -2806,6 +2877,7 @@ mod terminal_authorization_tests {
                 &[],
                 |model| credentials.get(model).cloned(),
                 |_| false,
+                |_| false,
             ),
             Some("primary_pool_blocked")
         );
@@ -3111,6 +3183,7 @@ mod strict_allowance_boundary_tests {
             &[],
             |model| credentials.get(model).cloned(),
             |_| false,
+            |_| false,
         )
     }
 
@@ -3239,15 +3312,157 @@ mod strict_allowance_boundary_tests {
             domains,
             |model| credentials.get(model).cloned(),
             |_| false,
+            |_| false,
         )
+    }
+
+    /// The refusals, and the positive controls that prove they are refusals and not dead
+    /// code. `spent` stands for the authoritative counter state: only a readable counter with
+    /// no remainder for the current provider day may appear in it.
+    fn authorize_with_state(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+        domains: &[Vec<ModelId>],
+        spent: &[&str],
+    ) -> Option<&'static str> {
+        let spent: HashSet<&str> = spent.iter().copied().collect();
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::AllowanceOnly,
+            domains,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+            |model| spent.contains(model.as_str()),
+        )
+    }
+
+    /// The reviewed counterexample, reversed: a domain whose members did not fit this request
+    /// is still part of the claim. `b` is absent from `capable` because the request is larger
+    /// than its window, and nothing has established that its allowance is spent -- so the
+    /// boundary is not provable and the local tier must not be spent.
+    #[test]
+    fn a_domain_excluded_by_fit_is_still_part_of_the_claim() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let only_a_capable = vec![ModelId::from("a")];
+        let attempts = vec![attempt("a", "daily_allowance_exhausted")];
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        assert_eq!(
+            authorize_with_state(
+                &only_a_capable,
+                &dispatchable(&only_a_capable),
+                &attempts,
+                &credentials,
+                &domains,
+                &[],
+            ),
+            None,
+            "a domain that only skipped the request has not spent its allowance"
+        );
+        // Control: the same request shape authorizes once the excluded domain's own counter
+        // says its day is spent. Nothing is dispatched to the ineligible leg to learn this.
+        assert_eq!(
+            authorize_with_state(
+                &only_a_capable,
+                &dispatchable(&only_a_capable),
+                &attempts,
+                &credentials,
+                &domains,
+                &["b"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+        assert!(
+            models.len() == 2,
+            "both domains are declared even when one cannot fit"
+        );
+    }
+
+    /// The all-blocked branch had the same capable-subset defect: it asked whether every
+    /// dispatchable leg was blocked, which cannot see a domain that contributed no
+    /// dispatchable leg at all. The declared domains decide it, on the same evidence.
+    #[test]
+    fn the_all_blocked_branch_judges_the_declared_domains() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        let nothing_dispatchable = HashSet::new();
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &nothing_dispatchable,
+                &[],
+                &credentials,
+                &domains,
+                &["a"],
+            ),
+            None,
+            "one spent domain and one unknown domain is not a blocked pool"
+        );
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &nothing_dispatchable,
+                &[],
+                &credentials,
+                &domains,
+                &["a", "b"],
+            ),
+            Some("primary_pool_blocked")
+        );
+    }
+
+    /// A mixed pool: every domain affirmatively spent by the provider, none of them
+    /// dispatchable, and one leg rejected rather than exhausted. The rejected leg keeps its
+    /// domain unknown, so the boundary does not open on a deployment fault.
+    #[test]
+    fn a_mixed_pool_does_not_open_on_a_rejected_leg() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        let attempts = vec![
+            attempt("a", "daily_allowance_exhausted"),
+            attempt("b", "http_401"),
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &[],
+            ),
+            None
+        );
+    }
+
+    /// A group that declares no members exhausts nothing: reading it as spent would let a
+    /// misconfigured pool buy the local tier on its first request.
+    #[test]
+    fn a_declared_group_with_no_members_is_never_spent() {
+        let (models, credentials) = legs(&[("a", "A")]);
+        let attempts = vec![attempt("a", "daily_allowance_exhausted")];
+        let domains = vec![vec![ModelId::from("a")], Vec::new()];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &[],
+            ),
+            None
+        );
     }
 
     /// The defect this rule was rewritten for: a leg dropped from `dispatchable` by a
     /// rejected credential is still a member of its allowance domain, and nobody looked at
     /// its allowance. The old shape judged only the dispatchable remainder, so one exhausted
     /// domain plus one un-checkable sibling read as "both domains spent" and bought the local
-    /// tier. The domain is judged over its capable members instead, and an unproven member is
-    /// not exhaustion.
+    /// tier.
     #[test]
     fn a_sibling_dropped_for_a_rejected_credential_keeps_its_domain_unknown() {
         let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
@@ -3297,6 +3512,7 @@ mod strict_allowance_boundary_tests {
                 &domains,
                 |model| credentials.get(model).cloned(),
                 |model| model.as_str() == "b",
+                |_| false,
             ),
             Some("primary_pool_exhausted")
         );
@@ -3325,20 +3541,40 @@ mod strict_allowance_boundary_tests {
         );
     }
 
-    /// A domain that contributed no capable leg could not have served this request, so its
-    /// allowance is not part of the claim. Only the domains that could answer are judged.
+    /// Google allocates its free daily requests per model inside one project, so two models
+    /// behind the same API key do not share a budget. A spent model therefore says nothing
+    /// about its sibling: promoting a per-model exhaustion to the credential would let one
+    /// spent model buy the local tier while the second one still had its whole day.
     #[test]
-    fn a_domain_with_no_capable_member_is_not_part_of_the_claim() {
-        let (models, credentials) = legs(&[("a", "A")]);
-        let attempts = vec![attempt("a", "daily_allowance_exhausted")];
-        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("z")]];
+    fn a_per_model_exhaustion_is_not_a_credential_exhaustion() {
+        // Both legs draw on the same credential, which is the deployed Google shape.
+        let (models, credentials) = legs(&[("g-model-a", "GOOGLE"), ("g-model-b", "GOOGLE")]);
+        let attempts = vec![attempt("g-model-a", "daily_allowance_exhausted")];
+        let domains = vec![
+            vec![ModelId::from("g-model-a")],
+            vec![ModelId::from("g-model-b")],
+        ];
         assert_eq!(
-            authorize_with_domains(
+            authorize_with_state(
                 &models,
                 &dispatchable(&models),
                 &attempts,
                 &credentials,
-                &domains
+                &domains,
+                &[],
+            ),
+            None,
+            "the second model's own day was never established"
+        );
+        // Control: the same pool opens once the second model is provably spent itself.
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &["g-model-b"],
             ),
             Some("primary_pool_exhausted")
         );
@@ -3357,6 +3593,7 @@ mod strict_allowance_boundary_tests {
             &[],
             |model| credentials.get(model).cloned(),
             |_| false,
+            |_| false,
         );
         assert_eq!(
             blocked, None,
@@ -3371,6 +3608,7 @@ mod strict_allowance_boundary_tests {
             &[],
             |model| credentials.get(model).cloned(),
             |_| true,
+            |_| false,
         );
         assert_eq!(allowed, Some("primary_pool_blocked"));
     }

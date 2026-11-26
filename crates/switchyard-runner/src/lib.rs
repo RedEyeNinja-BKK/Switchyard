@@ -25,6 +25,7 @@ pub use algorithm::{
 pub use config::RouteReasoningPolicy;
 pub use config::{
     BillingKind, ClientLocality, CompositeCrossPolicy, QuotaProvider, SelectionPolicy,
+    TerminalPolicy,
 };
 pub use facts::{ClientFacts, DeploymentFacts, RouteFacts, TargetFacts};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};

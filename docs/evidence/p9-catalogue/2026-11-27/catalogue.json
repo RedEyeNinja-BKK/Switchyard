@@ -18,9 +18,10 @@
   "routes_not_advertised": [],
   "advertised_not_declared": [],
   "composites_advertised": [],
-  "targets_shared_by_routes": 30,
-  "targets_used_by_one_route": 36,
+  "targets_shared": 30,
+  "targets_single_use": 29,
   "targets_unreferenced": [],
+  "targets_partition_holds": true,
   "targets_reached_by_a_lane_only": [
    "direct-google-gemini-decision-1",
    "direct-htpc-jev-style",
@@ -28,6 +29,41 @@
    "direct-openrouter-span-01-lite",
    "direct-openrouter-stephen-span-01-lite"
   ],
+  "non_target_references": {
+   "composite_child": [
+    "ST_Free",
+    "ST_Paid",
+    "direct-deepseek-deepseek-flash-nt",
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-openai-gpt-6-luna-nt",
+    "direct-openrouter-glm-5_3-flash",
+    "direct-openrouter-openrouter-free",
+    "vc-paid-core"
+   ]
+  },
+  "capability_client_models_not_targets": [
+   "Qwen3-Embedding-0.6B",
+   "gemini-2.5-flash-native-audio-latest",
+   "gemini-2.5-flash-preview-tts",
+   "gemini-3.1-flash-live-preview",
+   "gemini-3.1-flash-tts-preview",
+   "gemini-3.5-live-translate-preview",
+   "gemini-3.5-transcribe",
+   "gemini-3.5-transcribe-live",
+   "gemini-3.8-flash-lite-tts",
+   "gemini-3.8-flash-tts",
+   "gemini-3.8-live",
+   "gemini-3.8-live-extended-thinking",
+   "gemini-embedding-001",
+   "gemini-embedding-2",
+   "gemini-robotics-er-2-preview",
+   "lyria-realtime-exp",
+   "nvidia/nemotron-3.5-embed-8b:free",
+   "nvidia/nemotron-3.5-rerank-8b:free",
+   "qwen3-reranker-0.6b-q8_0"
+  ],
+  "capability_clients": 21,
   "registry_rows": 91,
   "routes_with_consumer": 58,
   "consumer_rows_addressed_here": 69,
@@ -2716,7 +2752,8 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-comfyninja-qwen3_8-27b-q4-mtp",
+     "owner": "direct-comfyninja-qwen3_8-27b-q4-mtp",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -2737,17 +2774,20 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-comfyninja-qwen3_8-27b-q4-mtp-vl",
+     "owner": "direct-comfyninja-qwen3_8-27b-q4-mtp-vl",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartlocal",
+     "owner": "smartlocal",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smartlocal-nt",
+     "owner": "smartlocal-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -2770,22 +2810,26 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-deepseek-deepseek-flash",
+     "owner": "direct-deepseek-deepseek-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart",
+     "owner": "smart",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-deepseek",
+     "owner": "smart-deepseek",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -2806,17 +2850,20 @@
    "reasoning_policy": "disabled",
    "reached_by": [
     {
-     "route": "direct-deepseek-deepseek-flash-nt",
+     "owner": "direct-deepseek-deepseek-flash-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 1
     },
     {
-     "route": "smart-deepseek-nt",
+     "owner": "smart-deepseek-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -2839,17 +2886,20 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-deepseek",
+     "owner": "smart-deepseek",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-deepseek-deepseek-v4-pro",
+     "owner": "direct-deepseek-deepseek-v4-pro",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -2876,7 +2926,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-gemini-3-flash",
+     "owner": "direct-google-gemini-3-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -2906,38 +2957,39 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-google-gemini-3.1-flash-lite",
+     "owner": "direct-google-gemini-3.1-flash-lite",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
-     "tier": null
-    },
-    {
-     "route": "smart-nt-bounded-trial",
-     "role": "composite_child",
      "tier": null
     }
    ]
@@ -2966,43 +3018,45 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-google-gemini-3.5-flash-lite",
+     "owner": "direct-google-gemini-3.5-flash-lite",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "primary",
-     "tier": null
-    },
-    {
-     "route": "smart-nt-bounded-trial",
-     "role": "composite_child",
      "tier": null
     }
    ]
@@ -3030,22 +3084,26 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-google-gemini-3.6-flash",
+     "owner": "direct-google-gemini-3.6-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3074,22 +3132,26 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-google-gemini-3.8-flash",
+     "owner": "direct-google-gemini-3.8-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3118,22 +3180,26 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-google-gemini-4-hydrogen",
+     "owner": "direct-google-gemini-4-hydrogen",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3156,7 +3222,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "google-decision",
+     "owner": "google-decision",
+     "owner_kind": "decision_lane",
      "role": "decision_lane",
      "tier": null
     }
@@ -3186,27 +3253,32 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-google-gemma-4-26b-a4b-it",
+     "owner": "direct-google-gemma-4-26b-a4b-it",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3236,27 +3308,32 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-google-gemma-4-31b-it",
+     "owner": "direct-google-gemma-4-31b-it",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3273,7 +3350,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smartlocal-decision",
+     "owner": "smartlocal-decision",
+     "owner_kind": "decision_lane",
      "role": "decision_lane",
      "tier": null
     }
@@ -3290,7 +3368,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smartlocal-decision",
+     "owner": "smartlocal-decision",
+     "owner_kind": "decision_lane",
      "role": "decision_lane",
      "tier": null
     }
@@ -3307,7 +3386,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smartfree-decision",
+     "owner": "smartfree-decision",
+     "owner_kind": "decision_lane",
      "role": "decision_lane",
      "tier": null
     }
@@ -3324,7 +3404,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "ST_Decisions",
+     "owner": "ST_Decisions",
+     "owner_kind": "decision_lane",
      "role": "decision_lane",
      "tier": null
     }
@@ -3345,7 +3426,8 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-htpc-qwen3_5-9b",
+     "owner": "direct-htpc-qwen3_5-9b",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3366,17 +3448,20 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-htpc-qwen3_5-9b-mtp",
+     "owner": "direct-htpc-qwen3_5-9b-mtp",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartlocal",
+     "owner": "smartlocal",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartlocal-nt",
+     "owner": "smartlocal-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3397,17 +3482,20 @@
    "reasoning_policy": "disabled",
    "reached_by": [
     {
-     "route": "direct-htpc-qwen3_5-9b-mtp-nt",
+     "owner": "direct-htpc-qwen3_5-9b-mtp-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     }
@@ -3428,7 +3516,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-openai-gpt-6-luna",
+     "owner": "direct-openai-gpt-6-luna",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3454,22 +3543,26 @@
    "reasoning_policy": "disabled",
    "reached_by": [
     {
-     "route": "direct-openai-gpt-6-luna-nt",
+     "owner": "direct-openai-gpt-6-luna-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-openai-nt",
+     "owner": "smart-openai-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3490,7 +3583,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-openai-gpt-6-sol",
+     "owner": "direct-openai-gpt-6-sol",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3511,7 +3605,8 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-deepseek-v4.1-flash-1017",
+     "owner": "direct-openrouter-deepseek-v4.1-flash-1017",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3534,7 +3629,8 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-dots-3-note-preview-free",
+     "owner": "direct-openrouter-dots-3-note-preview-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3559,22 +3655,26 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-ernie-5_5-flash-preview-free",
+     "owner": "direct-openrouter-ernie-5_5-flash-preview-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-openrouter-free",
+     "owner": "smart-openrouter-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3597,7 +3697,8 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-flint-v1-0-free",
+     "owner": "direct-openrouter-flint-v1-0-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3620,17 +3721,20 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-openrouter-glm-5_3-flash",
+     "owner": "direct-openrouter-glm-5_3-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-openrouter-paid",
+     "owner": "smart-openrouter-paid",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3654,7 +3758,8 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-gemma-4-26b-a4b-it-free",
+     "owner": "direct-openrouter-gemma-4-26b-a4b-it-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3678,7 +3783,8 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-gemma-4-31b-it-free",
+     "owner": "direct-openrouter-gemma-4-31b-it-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3704,22 +3810,26 @@
    "reasoning_policy": "disabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-ling-3_2-flash-free",
+     "owner": "direct-openrouter-ling-3_2-flash-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-openrouter-free",
+     "owner": "smart-openrouter-free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3746,22 +3856,26 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-nemotron-3_5-super-vl-free",
+     "owner": "direct-openrouter-nemotron-3_5-super-vl-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-openrouter-free",
+     "owner": "smart-openrouter-free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
@@ -3784,12 +3898,14 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-openrouter-free",
+     "owner": "direct-openrouter-openrouter-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3810,7 +3926,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-openrouter-qwen3_7-flash",
+     "owner": "direct-openrouter-qwen3_7-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3831,7 +3948,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-openrouter-qwen3_8-flash",
+     "owner": "direct-openrouter-qwen3_8-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3854,22 +3972,26 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "direct-openrouter-tencent-hy4-flash",
+     "owner": "direct-openrouter-tencent-hy4-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart",
+     "owner": "smart",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-openrouter-paid",
+     "owner": "smart-openrouter-paid",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3894,12 +4016,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-dots-3-note-preview-free",
+     "owner": "direct-openrouter-stephen-dots-3-note-preview-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3924,12 +4048,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-ernie-5_5-flash-preview-free",
+     "owner": "direct-openrouter-stephen-ernie-5_5-flash-preview-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3954,12 +4080,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-flint-v1-0-free",
+     "owner": "direct-openrouter-stephen-flint-v1-0-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -3985,12 +4113,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free",
+     "owner": "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4016,12 +4146,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-google-gemma-4-31b-it-free",
+     "owner": "direct-openrouter-stephen-google-gemma-4-31b-it-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4048,7 +4180,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-stephen-gemini-3-flash-preview",
+     "owner": "direct-google-stephen-gemini-3-flash-preview",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4075,7 +4208,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-stephen-gemini-3.1-flash-lite",
+     "owner": "direct-google-stephen-gemini-3.1-flash-lite",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4104,17 +4238,20 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "ST_Gemini_Free",
+     "owner": "ST_Gemini_Free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-google-stephen-gemini-3.5-flash-lite",
+     "owner": "direct-google-stephen-gemini-3.5-flash-lite",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4141,7 +4278,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-stephen-gemini-3.6-flash",
+     "owner": "direct-google-stephen-gemini-3.6-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4168,7 +4306,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-stephen-gemini-3.8-flash",
+     "owner": "direct-google-stephen-gemini-3.8-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4195,7 +4334,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-stephen-gemini-4-hydrogen",
+     "owner": "direct-google-stephen-gemini-4-hydrogen",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4222,7 +4362,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-stephen-gemma-4-26b-a4b-it",
+     "owner": "direct-google-stephen-gemma-4-26b-a4b-it",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4249,7 +4390,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-google-stephen-gemma-4-31b-it",
+     "owner": "direct-google-stephen-gemma-4-31b-it",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4275,12 +4417,14 @@
    "reasoning_policy": "disabled",
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-ling-3_2-flash-free",
+     "owner": "direct-openrouter-stephen-ling-3_2-flash-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4307,12 +4451,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-nemotron-3-5-super-vl-free",
+     "owner": "direct-openrouter-stephen-nemotron-3-5-super-vl-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4335,12 +4481,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Paid",
+     "owner": "ST_Paid",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-deepseek-v4-1-flash-1017",
+     "owner": "direct-openrouter-stephen-deepseek-v4-1-flash-1017",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4365,12 +4513,14 @@
    "reasoning_policy": "enabled",
    "reached_by": [
     {
-     "route": "ST_Paid",
+     "owner": "ST_Paid",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-glm-5-3-flash",
+     "owner": "direct-openrouter-stephen-glm-5-3-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4391,7 +4541,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-thaillm-openthaigpt",
+     "owner": "direct-thaillm-openthaigpt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4412,7 +4563,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-thaillm-qwen3_5-9b",
+     "owner": "direct-thaillm-qwen3_5-9b",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4433,7 +4585,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-thaillm-qwen3_6-35b-a3b",
+     "owner": "direct-thaillm-qwen3_6-35b-a3b",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4454,7 +4607,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-thaillm-thalle",
+     "owner": "direct-thaillm-thalle",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4475,7 +4629,8 @@
    "reasoning_policy": null,
    "reached_by": [
     {
-     "route": "direct-thaillm-typhoon",
+     "owner": "direct-thaillm-typhoon",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
@@ -4486,587 +4641,671 @@
   "shared": {
    "comfyninja-qwen3_8-27b-q4-mtp-vl": [
     {
-     "route": "direct-comfyninja-qwen3_8-27b-q4-mtp-vl",
+     "owner": "direct-comfyninja-qwen3_8-27b-q4-mtp-vl",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartlocal",
+     "owner": "smartlocal",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smartlocal-nt",
+     "owner": "smartlocal-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "deepseek-deepseek-flash": [
     {
-     "route": "direct-deepseek-deepseek-flash",
+     "owner": "direct-deepseek-deepseek-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart",
+     "owner": "smart",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-deepseek",
+     "owner": "smart-deepseek",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "deepseek-deepseek-flash-nt": [
     {
-     "route": "direct-deepseek-deepseek-flash-nt",
+     "owner": "direct-deepseek-deepseek-flash-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-deepseek-nt",
+     "owner": "smart-deepseek-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 1
     }
    ],
    "deepseek-deepseek-v4-pro": [
     {
-     "route": "direct-deepseek-deepseek-v4-pro",
+     "owner": "direct-deepseek-deepseek-v4-pro",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-deepseek",
+     "owner": "smart-deepseek",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "direct-google-gemini-3.1-flash-lite": [
     {
-     "route": "direct-google-gemini-3.1-flash-lite",
+     "owner": "direct-google-gemini-3.1-flash-lite",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-nt-bounded-trial",
-     "role": "composite_child",
-     "tier": null
-    },
-    {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "direct-google-gemini-3.5-flash-lite": [
     {
-     "route": "direct-google-gemini-3.5-flash-lite",
+     "owner": "direct-google-gemini-3.5-flash-lite",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-nt-bounded-trial",
-     "role": "composite_child",
-     "tier": null
-    },
-    {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     }
    ],
    "direct-google-gemini-3.6-flash": [
     {
-     "route": "direct-google-gemini-3.6-flash",
+     "owner": "direct-google-gemini-3.6-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "direct-google-gemini-3.8-flash": [
     {
-     "route": "direct-google-gemini-3.8-flash",
+     "owner": "direct-google-gemini-3.8-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "direct-google-gemini-4-hydrogen": [
     {
-     "route": "direct-google-gemini-4-hydrogen",
+     "owner": "direct-google-gemini-4-hydrogen",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-chat",
+     "owner": "smart-gemini-chat",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "direct-google-gemma-4-26b-a4b-it": [
     {
-     "route": "direct-google-gemma-4-26b-a4b-it",
+     "owner": "direct-google-gemma-4-26b-a4b-it",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "direct-google-gemma-4-31b-it": [
     {
-     "route": "direct-google-gemma-4-31b-it",
+     "owner": "direct-google-gemma-4-31b-it",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-gemini-bounded",
+     "owner": "smart-gemini-bounded",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart_gemini",
+     "owner": "smart_gemini",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "htpc-qwen3_5-9b-mtp": [
     {
-     "route": "direct-htpc-qwen3_5-9b-mtp",
+     "owner": "direct-htpc-qwen3_5-9b-mtp",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartlocal",
+     "owner": "smartlocal",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartlocal-nt",
+     "owner": "smartlocal-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "htpc-qwen3_5-9b-mtp-nt": [
     {
-     "route": "direct-htpc-qwen3_5-9b-mtp-nt",
+     "owner": "direct-htpc-qwen3_5-9b-mtp-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     }
    ],
    "openai-gpt-6-luna-nt": [
     {
-     "route": "direct-openai-gpt-6-luna-nt",
+     "owner": "direct-openai-gpt-6-luna-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-judge",
+     "owner": "smart-judge",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-nt",
+     "owner": "smart-nt",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-openai-nt",
+     "owner": "smart-openai-nt",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "openrouter-ernie-5_5-flash-preview-free": [
     {
-     "route": "direct-openrouter-ernie-5_5-flash-preview-free",
+     "owner": "direct-openrouter-ernie-5_5-flash-preview-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-openrouter-free",
+     "owner": "smart-openrouter-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "openrouter-glm-5_3-flash": [
     {
-     "route": "direct-openrouter-glm-5_3-flash",
+     "owner": "direct-openrouter-glm-5_3-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-openrouter-paid",
+     "owner": "smart-openrouter-paid",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "openrouter-ling-3_2-flash-free": [
     {
-     "route": "direct-openrouter-ling-3_2-flash-free",
+     "owner": "direct-openrouter-ling-3_2-flash-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-openrouter-free",
+     "owner": "smart-openrouter-free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "openrouter-nemotron-3_5-super-vl-free": [
     {
-     "route": "direct-openrouter-nemotron-3_5-super-vl-free",
+     "owner": "direct-openrouter-nemotron-3_5-super-vl-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-openrouter-free",
+     "owner": "smart-openrouter-free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "openrouter-openrouter-free": [
     {
-     "route": "direct-openrouter-openrouter-free",
+     "owner": "direct-openrouter-openrouter-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smartfree",
+     "owner": "smartfree",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "openrouter-tencent-hy4-flash": [
     {
-     "route": "direct-openrouter-tencent-hy4-flash",
+     "owner": "direct-openrouter-tencent-hy4-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart",
+     "owner": "smart",
+     "owner_kind": "route",
      "role": "terminal",
      "tier": 0
     },
     {
-     "route": "smart-openrouter-paid",
+     "owner": "smart-openrouter-paid",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "smart-route",
+     "owner": "smart-route",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     }
    ],
    "stephen-dots-3-note-preview-free": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-dots-3-note-preview-free",
+     "owner": "direct-openrouter-stephen-dots-3-note-preview-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-ernie-5_5-flash-preview-free": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-ernie-5_5-flash-preview-free",
+     "owner": "direct-openrouter-stephen-ernie-5_5-flash-preview-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-flint-v1-0-free": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-flint-v1-0-free",
+     "owner": "direct-openrouter-stephen-flint-v1-0-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-gemma-4-26b-a4b-it-free": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free",
+     "owner": "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-gemma-4-31b-it-free": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-google-gemma-4-31b-it-free",
+     "owner": "direct-openrouter-stephen-google-gemma-4-31b-it-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-google-gemini-3.5-flash-lite": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "ST_Gemini_Free",
+     "owner": "ST_Gemini_Free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-google-stephen-gemini-3.5-flash-lite",
+     "owner": "direct-google-stephen-gemini-3.5-flash-lite",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-ling-3_2-flash-free": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-ling-3_2-flash-free",
+     "owner": "direct-openrouter-stephen-ling-3_2-flash-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-nemotron-3-5-super-vl-free": [
     {
-     "route": "ST_Free",
+     "owner": "ST_Free",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-nemotron-3-5-super-vl-free",
+     "owner": "direct-openrouter-stephen-nemotron-3-5-super-vl-free",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-paid-deepseek-v4-1-flash-1017": [
     {
-     "route": "ST_Paid",
+     "owner": "ST_Paid",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-deepseek-v4-1-flash-1017",
+     "owner": "direct-openrouter-stephen-deepseek-v4-1-flash-1017",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ],
    "stephen-paid-glm-5-3-flash": [
     {
-     "route": "ST_Paid",
+     "owner": "ST_Paid",
+     "owner_kind": "route",
      "role": "candidate",
      "tier": null
     },
     {
-     "route": "direct-openrouter-stephen-glm-5-3-flash",
+     "owner": "direct-openrouter-stephen-glm-5-3-flash",
+     "owner_kind": "route",
      "role": "primary",
      "tier": null
     }
    ]
   },
   "single_use": [
-   "ST_Free",
-   "ST_Paid",
    "comfyninja-qwen3_8-27b-q4-mtp",
-   "direct-deepseek-deepseek-flash-nt",
    "direct-google-gemini-3-flash",
    "direct-google-gemini-decision-1",
    "direct-htpc-jev-style",
    "direct-htpc-laya",
-   "direct-openai-gpt-6-luna-nt",
-   "direct-openrouter-glm-5_3-flash",
-   "direct-openrouter-openrouter-free",
    "direct-openrouter-span-01-lite",
    "direct-openrouter-stephen-span-01-lite",
    "htpc-qwen3_5-9b",
@@ -5090,9 +5329,93 @@
    "thaillm-qwen3_5-9b",
    "thaillm-qwen3_6-35b-a3b",
    "thaillm-thalle",
-   "thaillm-typhoon",
-   "vc-paid-core"
-  ]
+   "thaillm-typhoon"
+  ],
+  "unreferenced": [],
+  "partition": {
+   "declared_targets": 59,
+   "shared": 30,
+   "single_use": 29,
+   "unreferenced": 0,
+   "sums_to_declared": true,
+   "disjoint": true
+  },
+  "non_target_references": {
+   "composite_child": [
+    {
+     "owner": "ST_Route",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "ST_Free",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "ST_Route",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "ST_Paid",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "VC_Paid",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "vc-paid-core",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "VC_Paid",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "direct-openrouter-glm-5_3-flash",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "VC_Paid",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "direct-openrouter-openrouter-free",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "smart-nt-bounded-trial",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "direct-google-gemini-3.5-flash-lite",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "smart-nt-bounded-trial",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "direct-google-gemini-3.1-flash-lite",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "smart-nt-bounded-trial",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "direct-openai-gpt-6-luna-nt",
+     "resolves_to": "route"
+    },
+    {
+     "owner": "smart-nt-bounded-trial",
+     "owner_kind": "composite",
+     "role": "composite_child",
+     "tier": null,
+     "reference": "direct-deepseek-deepseek-flash-nt",
+     "resolves_to": "route"
+    }
+   ]
+  }
  },
  "consumers": {
   "bindings": {

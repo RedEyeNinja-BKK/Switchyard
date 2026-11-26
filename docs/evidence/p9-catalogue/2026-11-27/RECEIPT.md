@@ -31,8 +31,8 @@ No traffic was sampled. Every cell below comes from one of those documents.
 | direct routes | 54 |
 | targets | 59 |
 | composites / decision lanes / lane compositions | 3 / 4 / 2 |
-| targets shared between routes | 30 |
-| targets used by exactly one route | 36 |
+| targets shared between owners | **30** |
+| targets used by exactly one owner | **29** *(CORRECTED — was published as 36; see below)* |
 | targets referenced by nothing | 0 |
 | targets reached only by a decision lane | 5 |
 | registry rows addressed to this router | 69 |
@@ -42,9 +42,35 @@ No traffic was sampled. Every cell below comes from one of those documents.
 | capabilities whose `target` names no declared capability client | 0 of 21 |
 
 The 69 rows addressed here divide as 58 routes, 2 composites, 4 decision lanes, 2 lane
-compositions and 3 capabilities. The 22 addressed elsewhere divide as 13 OpenRouter, 4
-private engines, 3 OpenAI, 1 DeepSeek and 1 ThaiLLM — they are registry rows, not consumers of
-this manifest, and the catalogue does not credit them to it.
+compositions and 3 capabilities.
+
+### CORRECTION — the single-use count was published as 36; it is 29
+
+The first publication reported 36 single-use entries inside a set of 59 declared targets, which
+cannot both be true: 59 was the right total and 36 was the wrong class.
+
+Cause: composite children were folded into the same reverse map the routes use. A composite names
+**routes**, so seven route names (`ST_Free`, `ST_Paid`, `direct-deepseek-deepseek-flash-nt`,
+`direct-openai-gpt-6-luna-nt`, `direct-openrouter-glm-5_3-flash`,
+`direct-openrouter-openrouter-free`, `vc-paid-core`) were recorded as if they were targets and
+counted as single-use. Two further composite children (`direct-google-gemini-3.1-flash-lite`,
+`direct-google-gemini-3.5-flash-lite`) share a name with a declared target, so they did not invent
+an entry — they inflated an existing target's owner count instead. Nine composite-child references
+in total: seven phantom entries plus two merged.
+
+Fix: a reference is now resolved against the declared `[targets.*]` set before it is recorded. A
+name that does not resolve is kept under the section that made it, in `non_target_references`, and
+never becomes a target. The three classes are asserted to be a partition
+(`targets_partition_holds`, exit 2 on failure), so `30 + 29 + 0 == 59` is a checked fact rather than
+a coincidence of three independent filters.
+
+The corrected split is **30 shared + 29 single-use + 0 unreferenced = 59**. The nine composite
+children are listed in the catalogue's *References that are not targets* section, resolved to
+`route`, so a reader can see the call path without it entering a cardinality claim.
+
+The 22 rows addressed elsewhere divide as 13 OpenRouter, 4 private engines, 3 OpenAI, 1 DeepSeek
+and 1 ThaiLLM — they are registry rows, not consumers of this manifest, and the catalogue does not
+credit them to it.
 
 Sixteen rows name an **upstream model id** (`gpt-6-luna`, `qwen/qwen3.8-flash`,
 `comfyninja/qwen3.8-27b-q4-mtp`, …) rather than a route id; all sixteen address a provider

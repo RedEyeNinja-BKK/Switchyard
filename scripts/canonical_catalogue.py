@@ -27,8 +27,6 @@ Usage:
     canonical_catalogue.py <routes.toml> \
         [--capabilities capabilities.json] [--models v1-models.json] \
         [--registry registry-effective.json] --out-dir <dir>
-
-    canonical_catalogue.py --self-test
 """
 
 from __future__ import annotations
@@ -109,48 +107,67 @@ def main() -> int:
     capabilities = load_json(args.capabilities)
 
     # --- target reuse ------------------------------------------------------------------
-    # Every edge of "route -> target" is recorded once, from the manifest itself, so the
-    # reverse map cannot disagree with the forward one.
+    # Only a name declared in a ``[targets.*]`` table is a target. A reference made by
+    # another section is resolved against that set; one that does not resolve is recorded
+    # under the section that made it, never counted as a target. An earlier version of this
+    # script fed composite children into the same map, so seven ROUTE names were published
+    # as single-use targets and the single-use count read 36 for 29 real targets.
     used_by: dict[str, list[dict]] = {name: [] for name in targets}
+    non_target_references: dict[str, list[dict]] = {}
+
+    def reference(owner: str, owner_kind: str, name: str, role: str, tier: int | None = None) -> None:
+        entry = {"owner": owner, "owner_kind": owner_kind, "role": role, "tier": tier}
+        if name in targets:
+            used_by[name].append(entry)
+        else:
+            non_target_references.setdefault(owner_kind, []).append(
+                {**entry, "reference": name, "resolves_to": "nothing declared"}
+            )
+
     for name, route in routes.items():
         primary, tiers = route_targets(route)
         for position, target in enumerate(primary):
-            used_by.setdefault(target, []).append(
-                {"route": name, "role": "primary" if position == 0 else "candidate", "tier": None}
-            )
+            reference(name, "route", target, "primary" if position == 0 else "candidate")
         for tier_index, tier in enumerate(tiers):
             for target in tier:
-                used_by.setdefault(target, []).append(
-                    {"route": name, "role": "terminal", "tier": tier_index}
-                )
-        # A composite names routes, not targets; it is recorded separately so a target count
-        # is never inflated by a nested call path.
+                reference(name, "route", target, "terminal", tier_index)
+    # A composite names ROUTES, never targets: its children are a call path, not a failure
+    # domain. They are recorded separately so a target count cannot be inflated by nesting.
     for name, composite in composites.items():
         for child in composite.get("children") or composite.get("candidates") or []:
-            used_by.setdefault(child, []).append({"route": name, "role": "composite_child", "tier": None})
-    # Decision lanes reach a target without being a chat route, and a capability client can
-    # name one too. Leaving them out would report a live target as unreferenced, which is the
-    # kind of absence that gets quoted and then acted on.
+            non_target_references.setdefault("composite_child", []).append(
+                {
+                    "owner": name,
+                    "owner_kind": "composite",
+                    "role": "composite_child",
+                    "tier": None,
+                    "reference": child,
+                    "resolves_to": "route" if child in routes else "composite" if child in composites else "nothing declared",
+                }
+            )
+    # Decision lanes reach a target without being a chat route. Leaving them out would report
+    # a live target as unreferenced, which is the kind of absence that gets quoted and then
+    # acted on.
     for name, lane in lanes.items():
         for target in lane.get("targets") or []:
-            used_by.setdefault(target, []).append(
-                {"route": name, "role": "decision_lane", "tier": None}
-            )
-    # A rerank or embedding capability names a capability CLIENT, not a chat target: it has its
-    # own namespace with its own base_url and model string. Recording it against ``targets``
-    # would invent target entries that no [targets.*] table declares, so the reference is
-    # checked for resolution instead of being counted as reuse.
+            reference(name, "decision_lane", target, "decision_lane")
+    # A rerank or embedding capability names a capability CLIENT, not a chat target: it has
+    # its own namespace with its own base_url and model string. Recording it against
+    # ``targets`` would invent target entries no ``[targets.*]`` table declares, so the
+    # reference is checked for resolution instead of being counted as reuse.
     capability_targets_undeclared = sorted(
         name
         for name, capability in capability_lanes.items()
         if capability.get("target") not in (document.get("capability_clients") or {})
     )
-    for name, client in (document.get("capability_clients") or {}).items():
-        model = client.get("model")
-        if isinstance(model, str) and model in targets:
-            used_by.setdefault(model, []).append(
-                {"route": name, "role": "capability_client", "tier": None}
-            )
+    capability_client_count = len(document.get("capability_clients") or {})
+    capability_client_models_not_targets = sorted(
+        {
+            client.get("model")
+            for client in (document.get("capability_clients") or {}).values()
+            if isinstance(client.get("model"), str) and client["model"] not in targets
+        }
+    )
 
     declared_groups: dict[str, list[str]] = {}
     for name, target in targets.items():
@@ -289,8 +306,28 @@ def main() -> int:
             }
         )
 
-    shared = {name: entries for name, entries in used_by.items() if len({e["route"] for e in entries}) > 1}
-    single = sorted(name for name, entries in used_by.items() if len({e["route"] for e in entries}) == 1)
+    # The three reuse classes are a partition of the declared targets, not three independent
+    # filters over a map that may hold other things. Asserted, because a count that silently
+    # includes a non-target is exactly the error this replaces.
+    referenced_by: dict[str, set[str]] = {
+        name: {entry["owner"] for entry in entries} for name, entries in used_by.items()
+    }
+    shared = {name: entries for name, entries in used_by.items() if len(referenced_by[name]) > 1}
+    single = sorted(name for name in used_by if len(referenced_by[name]) == 1)
+    unreferenced = sorted(name for name in used_by if not referenced_by[name])
+    partition = {
+        "shared": set(shared),
+        "single_use": set(single),
+        "unreferenced": set(unreferenced),
+    }
+    if not (
+        partition["shared"] | partition["single_use"] | partition["unreferenced"] == set(targets)
+        and not (partition["shared"] & partition["single_use"])
+        and not (partition["shared"] & partition["unreferenced"])
+        and not (partition["single_use"] & partition["unreferenced"])
+    ):
+        print("PARTITION FAIL: the reuse classes do not partition the declared targets", file=sys.stderr)
+        return 2
 
     counts = {
         "routes": len(routes),
@@ -312,14 +349,21 @@ def main() -> int:
         "composites_advertised": (
             None if advertised is None else sorted(n for n in composites if n in advertised)
         ),
-        "targets_shared_by_routes": len(
-            {name: e for name, e in shared.items() if any(x["role"] != "decision_lane" for x in e)}
+        "targets_shared": len(shared),
+        "targets_single_use": len(single),
+        "targets_unreferenced": unreferenced,
+        "targets_partition_holds": (
+            len(shared) + len(single) + len(unreferenced) == len(targets)
         ),
-        "targets_used_by_one_route": len(single),
-        "targets_unreferenced": sorted(n for n, e in used_by.items() if not e),
         "targets_reached_by_a_lane_only": sorted(
             n for n, e in used_by.items() if e and all(x["role"] == "decision_lane" for x in e)
         ),
+        "non_target_references": {
+            kind: sorted({entry["reference"] for entry in entries})
+            for kind, entries in sorted(non_target_references.items())
+        },
+        "capability_client_models_not_targets": capability_client_models_not_targets,
+        "capability_clients": capability_client_count,
         "registry_rows": None if not registry else registry["rows"],
         "routes_with_consumer": (
             None
@@ -383,8 +427,21 @@ def main() -> int:
         "routes": catalogue_routes,
         "targets": catalogue_targets,
         "target_reuse": {
-            "shared": {name: sorted(entries, key=lambda e: (e["route"], e["role"])) for name, entries in sorted(shared.items())},
+            "shared": {
+                name: sorted(entries, key=lambda e: (e["owner"], e["role"]))
+                for name, entries in sorted(shared.items())
+            },
             "single_use": single,
+            "unreferenced": unreferenced,
+            "partition": {
+                "declared_targets": len(targets),
+                "shared": len(shared),
+                "single_use": len(single),
+                "unreferenced": len(unreferenced),
+                "sums_to_declared": len(shared) + len(single) + len(unreferenced) == len(targets),
+                "disjoint": True,
+            },
+            "non_target_references": non_target_references,
         },
         "consumers": {
             "bindings": {} if not registry else registry["bindings"],
@@ -459,21 +516,36 @@ def render_markdown(catalogue: dict) -> str:
     names_by_kind = counts.get("consumer_names_by_kind")
     if names_by_kind:
         lines.append("| consumer rows by name kind | " + ", ".join(f"{k}: {v}" for k, v in names_by_kind.items()) + " |")
-    lines += ["", "## Target reuse", "", "A target behind more than one route is a shared failure domain: an", "allowance, a credential or a provider incident moves every route below at once.", ""]
-    shared = catalogue["target_reuse"]["shared"]
-    if shared:
-        lines += ["| target | routes |", "|---|---|"]
-        for target, entries in shared.items():
-            routes = sorted({entry["route"] for entry in entries})
-            lines.append(f"| `{target}` | {', '.join(f'`{r}`' for r in routes)} |")
-    else:
-        lines.append("No target is reached by more than one route.")
     lines += [
         "",
-        f"Single-use targets: {len(catalogue['target_reuse']['single_use'])}. "
-        f"Unreferenced by any route, composite, decision lane, capability or capability client: "
-        f"{len(counts['targets_unreferenced'])}"
-        + (" (" + ", ".join(f"`{t}`" for t in counts["targets_unreferenced"]) + ")" if counts["targets_unreferenced"] else "")
+        "## Target reuse",
+        "",
+        "Every name here is declared by a `[targets.*]` table. The three classes are a partition of",
+        "those declarations, asserted at generation time: shared + single-use + unreferenced equals",
+        "the declared target count, and no target is in two classes. A target behind more than one",
+        "owner is a shared failure domain: an allowance, a credential or a provider incident moves",
+        "every owner below at once.",
+        "",
+        f"Declared targets: **{counts['targets']}** = {counts['targets_shared']} shared + "
+        f"{counts['targets_single_use']} single-use + {len(counts['targets_unreferenced'])} unreferenced.",
+        "",
+    ]
+    shared = catalogue["target_reuse"]["shared"]
+    if shared:
+        lines += ["| target | owners |", "|---|---|"]
+        for target, entries in shared.items():
+            owners = sorted(entry["owner"] for entry in entries)
+            lines.append(f"| `{target}` | {', '.join(f'`{o}`' for o in owners)} |")
+    else:
+        lines.append("No target is reached by more than one owner.")
+    lines += [
+        "",
+        f"Single-use targets: {len(catalogue['target_reuse']['single_use'])}"
+        + (
+            " (" + ", ".join(f"`{t}`" for t in catalogue["target_reuse"]["single_use"]) + ")"
+            if catalogue["target_reuse"]["single_use"]
+            else ""
+        )
         + "."
         + (
             " Reached only by a decision lane: "
@@ -482,6 +554,26 @@ def render_markdown(catalogue: dict) -> str:
             if counts["targets_reached_by_a_lane_only"]
             else ""
         ),
+        "",
+        "## References that are not targets",
+        "",
+        "A composite names routes, so its children are a call path rather than a failure domain.",
+        "They are listed here, resolved, and never counted as targets:",
+        "",
+    ]
+    non_target = counts["non_target_references"]
+    if non_target:
+        for kind, names in non_target.items():
+            lines.append(f"- `{kind}`: " + ", ".join(f"`{n}`" for n in names))
+    else:
+        lines.append("- none")
+    lines += [
+        "",
+        f"Capability-client models that are not `[targets.*]` entries: "
+        f"{len(counts['capability_client_models_not_targets'])} of {counts['capability_clients']}"
+        + (" — a separate namespace (a vendor model string, not a routing target), so the"
+           " target partition does not include them.")
+        + ("" if not counts["capability_client_models_not_targets"] else ""),
         "",
         "## Consumer destination",
         "",
@@ -584,7 +676,7 @@ context_window = 1000
 children = ["r1"]
 
 [decision_lanes.L]
-targets = ["t2"]
+targets = ["t2", "ghost"]
 
 [decision_lane_composition.K]
 children = ["L"]
@@ -630,6 +722,11 @@ id = "up-t3"
         "consumers_addressed_here_naming_nothing_here": ["A6"],
         "consumer_models_naming_an_upstream_id": ["up-t1"],
         "targets_unreferenced": ["t3"],
+        "targets_shared": 0,
+        "targets_single_use": 2,
+        "targets_partition_holds": True,
+        "non_target_references": {"composite_child": ["r1"], "decision_lane": ["ghost"]},
+        "targets_reached_by_a_lane_only": ["t2"],
         "capability_targets_undeclared": ["cap2"],
         "targets_reached_by_a_lane_only": ["t2"],
         "routes_with_consumer": 1,

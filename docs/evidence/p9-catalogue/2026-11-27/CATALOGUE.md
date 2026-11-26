@@ -27,10 +27,13 @@ source is recorded as absent, never inferred from a sibling.
 | routes_not_advertised | none |
 | advertised_not_declared | none |
 | composites_advertised | none |
-| targets_shared_by_routes | 30 |
-| targets_used_by_one_route | 36 |
+| targets_shared | 30 |
+| targets_single_use | 29 |
 | targets_unreferenced | none |
+| targets_partition_holds | True |
 | targets_reached_by_a_lane_only | `direct-google-gemini-decision-1`, `direct-htpc-jev-style`, `direct-htpc-laya`, `direct-openrouter-span-01-lite`, `direct-openrouter-stephen-span-01-lite` |
+| capability_client_models_not_targets | `Qwen3-Embedding-0.6B`, `gemini-2.5-flash-native-audio-latest`, `gemini-2.5-flash-preview-tts`, `gemini-3.1-flash-live-preview`, `gemini-3.1-flash-tts-preview`, `gemini-3.5-live-translate-preview`, `gemini-3.5-transcribe`, `gemini-3.5-transcribe-live`, `gemini-3.8-flash-lite-tts`, `gemini-3.8-flash-tts`, `gemini-3.8-live`, `gemini-3.8-live-extended-thinking`, `gemini-embedding-001`, `gemini-embedding-2`, `gemini-robotics-er-2-preview`, `lyria-realtime-exp`, `nvidia/nemotron-3.5-embed-8b:free`, `nvidia/nemotron-3.5-rerank-8b:free`, `qwen3-reranker-0.6b-q8_0` |
+| capability_clients | 21 |
 | registry_rows | 91 |
 | routes_with_consumer | 58 |
 | consumer_rows_addressed_here | 69 |
@@ -46,17 +49,22 @@ source is recorded as absent, never inferred from a sibling.
 
 ## Target reuse
 
-A target behind more than one route is a shared failure domain: an
-allowance, a credential or a provider incident moves every route below at once.
+Every name here is declared by a `[targets.*]` table. The three classes are a partition of
+those declarations, asserted at generation time: shared + single-use + unreferenced equals
+the declared target count, and no target is in two classes. A target behind more than one
+owner is a shared failure domain: an allowance, a credential or a provider incident moves
+every owner below at once.
 
-| target | routes |
+Declared targets: **59** = 30 shared + 29 single-use + 0 unreferenced.
+
+| target | owners |
 |---|---|
 | `comfyninja-qwen3_8-27b-q4-mtp-vl` | `direct-comfyninja-qwen3_8-27b-q4-mtp-vl`, `smartlocal`, `smartlocal-nt` |
 | `deepseek-deepseek-flash` | `direct-deepseek-deepseek-flash`, `smart`, `smart-deepseek`, `smart-route` |
 | `deepseek-deepseek-flash-nt` | `direct-deepseek-deepseek-flash-nt`, `smart-deepseek-nt`, `smart-nt` |
 | `deepseek-deepseek-v4-pro` | `direct-deepseek-deepseek-v4-pro`, `smart-deepseek`, `smart-route` |
-| `direct-google-gemini-3.1-flash-lite` | `direct-google-gemini-3.1-flash-lite`, `smart-gemini-bounded`, `smart-gemini-chat`, `smart-nt`, `smart-nt-bounded-trial`, `smart-route`, `smart_gemini` |
-| `direct-google-gemini-3.5-flash-lite` | `direct-google-gemini-3.5-flash-lite`, `smart-gemini-bounded`, `smart-gemini-chat`, `smart-nt`, `smart-nt-bounded-trial`, `smart-route`, `smart_gemini`, `smartfree` |
+| `direct-google-gemini-3.1-flash-lite` | `direct-google-gemini-3.1-flash-lite`, `smart-gemini-bounded`, `smart-gemini-chat`, `smart-nt`, `smart-route`, `smart_gemini` |
+| `direct-google-gemini-3.5-flash-lite` | `direct-google-gemini-3.5-flash-lite`, `smart-gemini-bounded`, `smart-gemini-chat`, `smart-nt`, `smart-route`, `smart_gemini`, `smartfree` |
 | `direct-google-gemini-3.6-flash` | `direct-google-gemini-3.6-flash`, `smart-gemini-chat`, `smart-route`, `smart_gemini` |
 | `direct-google-gemini-3.8-flash` | `direct-google-gemini-3.8-flash`, `smart-gemini-chat`, `smart-route`, `smart_gemini` |
 | `direct-google-gemini-4-hydrogen` | `direct-google-gemini-4-hydrogen`, `smart-gemini-chat`, `smart-route`, `smart_gemini` |
@@ -82,7 +90,16 @@ allowance, a credential or a provider incident moves every route below at once.
 | `stephen-paid-deepseek-v4-1-flash-1017` | `ST_Paid`, `direct-openrouter-stephen-deepseek-v4-1-flash-1017` |
 | `stephen-paid-glm-5-3-flash` | `ST_Paid`, `direct-openrouter-stephen-glm-5-3-flash` |
 
-Single-use targets: 36. Unreferenced by any route, composite, decision lane, capability or capability client: 0. Reached only by a decision lane: `direct-google-gemini-decision-1`, `direct-htpc-jev-style`, `direct-htpc-laya`, `direct-openrouter-span-01-lite`, `direct-openrouter-stephen-span-01-lite`.
+Single-use targets: 29 (`comfyninja-qwen3_8-27b-q4-mtp`, `direct-google-gemini-3-flash`, `direct-google-gemini-decision-1`, `direct-htpc-jev-style`, `direct-htpc-laya`, `direct-openrouter-span-01-lite`, `direct-openrouter-stephen-span-01-lite`, `htpc-qwen3_5-9b`, `openai-gpt-6-luna`, `openai-gpt-6-sol`, `openrouter-deepseek-v4_1-flash-1017`, `openrouter-dots-3-note-preview-free`, `openrouter-flint-v1-0-free`, `openrouter-google-gemma-4-26b-a4b-it-free`, `openrouter-google-gemma-4-31b-it-free`, `openrouter-qwen3_7-flash`, `openrouter-qwen3_8-flash`, `stephen-google-gemini-3-flash-preview`, `stephen-google-gemini-3.1-flash-lite`, `stephen-google-gemini-3.6-flash`, `stephen-google-gemini-3.8-flash`, `stephen-google-gemini-4-hydrogen`, `stephen-google-gemma-4-26b-a4b-it`, `stephen-google-gemma-4-31b-it`, `thaillm-openthaigpt`, `thaillm-qwen3_5-9b`, `thaillm-qwen3_6-35b-a3b`, `thaillm-thalle`, `thaillm-typhoon`). Reached only by a decision lane: `direct-google-gemini-decision-1`, `direct-htpc-jev-style`, `direct-htpc-laya`, `direct-openrouter-span-01-lite`, `direct-openrouter-stephen-span-01-lite`.
+
+## References that are not targets
+
+A composite names routes, so its children are a call path rather than a failure domain.
+They are listed here, resolved, and never counted as targets:
+
+- `composite_child`: `ST_Free`, `ST_Paid`, `direct-deepseek-deepseek-flash-nt`, `direct-google-gemini-3.1-flash-lite`, `direct-google-gemini-3.5-flash-lite`, `direct-openai-gpt-6-luna-nt`, `direct-openrouter-glm-5_3-flash`, `direct-openrouter-openrouter-free`, `vc-paid-core`
+
+Capability-client models that are not `[targets.*]` entries: 19 of 21 — a separate namespace (a vendor model string, not a routing target), so the target partition does not include them.
 
 ## Consumer destination
 

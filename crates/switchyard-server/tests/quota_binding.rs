@@ -25,7 +25,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use switchyard_runner::Runner;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -36,6 +36,9 @@ use tower::ServiceExt;
 struct Upstream {
     calls: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<String>>>,
+    /// Status every request is answered with, so a test can drive the retry path
+    /// deterministically instead of waiting for a real provider to misbehave.
+    status: Arc<AtomicU16>,
 }
 
 impl Upstream {
@@ -43,7 +46,15 @@ impl Upstream {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
             seen: Arc::new(Mutex::new(Vec::new())),
+            status: Arc::new(AtomicU16::new(200)),
         }
+    }
+
+    /// A provider that refuses every request with this status.
+    fn failing(status: u16) -> Self {
+        let upstream = Self::new();
+        upstream.status.store(status, Ordering::SeqCst);
+        upstream
     }
 
     fn calls(&self) -> usize {
@@ -57,6 +68,7 @@ impl Upstream {
     fn url(self) -> String {
         let calls = Arc::clone(&self.calls);
         let seen = Arc::clone(&self.seen);
+        let status = Arc::clone(&self.status);
         let runtime = tokio::runtime::Handle::current();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("addr");
@@ -80,9 +92,14 @@ impl Upstream {
                     .to_string();
                 runtime.block_on(async { seen.lock().await.push(model.clone()) });
                 calls.fetch_add(1, Ordering::SeqCst);
-                let payload = success(&model);
+                let code = status.load(Ordering::SeqCst);
+                let payload = if (200..300).contains(&code) {
+                    success(&model)
+                } else {
+                    json!({"error": {"code": code, "message": "upstream refused"}}).to_string()
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
                     payload.len()
                 );
                 let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
@@ -453,4 +470,114 @@ async fn binding_does_not_depend_on_declaration_order() {
         );
     }
     assert_eq!(free.calls(), 2);
+}
+
+/// A free leaf must not turn one refusal into four reservations.
+///
+/// This is the measured defect the bounded-retry policy exists for: the retry loop
+/// reserved once per attempt against the account budget, so a single client request that
+/// drew a 429 charged four reservations while the routing evidence recorded one attempt.
+/// Both numbers are asserted together - reservations in the counter file and requests the
+/// provider actually saw - because either one alone can look correct.
+///
+/// The paid control matters as much as the rule: a lane with no daily allowance must keep
+/// its configured retries, or this change silently removes recovery on the lanes that are
+/// not metered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_free_leaf_spends_one_reservation_on_a_throttle_but_a_paid_lane_keeps_retries() {
+    let dir = state_dir("retry-throttle");
+    let throttled_free = Upstream::failing(429);
+    let throttled_free_url = throttled_free.clone().url();
+    let throttled_paid = Upstream::failing(429);
+    let throttled_paid_url = throttled_paid.clone().url();
+
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n\n\
+         [llm_clients.openrouter_free]\nformat = \"openai_responses\"\n\
+         base_url = \"{throttled_free_url}\"\nquota_group = \"openrouter-free-owner\"\n\
+         quota_scope = \"account\"\nquota_reset = \"utc\"\nmax_retries = 2\n\n\
+         [llm_clients.openrouter]\nformat = \"openai_responses\"\n\
+         base_url = \"{throttled_paid_url}\"\nmax_retries = 2\n\n\
+         [targets.free-throttle]\nid = \"vendor/free-a\"\nllm_client = \"openrouter_free\"\n\
+         vision = false\nvideo = false\nfree_tier = true\ndaily_request_limit = 100\n\n\
+         [routes.free-throttle]\nid = \"free-throttle\"\ntype = \"passthrough\"\n\
+         target = \"free-throttle\"\n\n\
+         [targets.paid-control]\nid = \"vendor/paid-a\"\nllm_client = \"openrouter\"\n\
+         vision = false\nvideo = false\n\n\
+         [routes.paid-control]\nid = \"paid-control\"\ntype = \"passthrough\"\n\
+         target = \"paid-control\"\n",
+        dir.display()
+    );
+
+    // One request, one dispatch, one reservation - even though the lane allows two retries.
+    let (status, body) = call(&config, "free-throttle").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(
+        throttled_free.calls(),
+        1,
+        "a 429 must not be resent to the same quota-limited target"
+    );
+    let (counter, spent, limit) = only_counter(&dir);
+    assert_eq!(limit, 100);
+    assert_eq!(
+        spent, 1,
+        "{counter}: one dispatched attempt must reserve exactly once"
+    );
+    assert_eq!(
+        throttled_free.models().await,
+        vec!["vendor/free-a".to_string()],
+        "the provider must have seen the free target exactly once"
+    );
+
+    // The control: same status, same configured budget, no daily allowance.
+    let (status, body) = call(&config, "paid-control").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(
+        throttled_paid.calls(),
+        3,
+        "an unmetered lane must keep its configured retries"
+    );
+    let (_, spent, _) = only_counter(&dir);
+    assert_eq!(spent, 1, "the paid lane must not touch the free counter");
+}
+
+/// A transient 5xx costs a free leaf at most one extra reservation.
+///
+/// The budget is not "no retry": a single retry is what recovers from a genuinely bad
+/// second of upstream health. It is only the unbounded multiplication that the policy
+/// refuses, and the reservation is not refunded on failure - a refused attempt still
+/// reached the provider and still drew on the allowance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_free_leaf_retries_a_5xx_once_and_keeps_both_reservations() {
+    let dir = state_dir("retry-5xx");
+    let unavailable = Upstream::failing(503);
+    let unavailable_url = unavailable.clone().url();
+
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n\n\
+         [llm_clients.openrouter_free]\nformat = \"openai_responses\"\n\
+         base_url = \"{unavailable_url}\"\nquota_group = \"openrouter-free-owner\"\n\
+         quota_scope = \"account\"\nquota_reset = \"utc\"\nmax_retries = 2\n\n\
+         [targets.free-unavailable]\nid = \"vendor/free-b\"\nllm_client = \"openrouter_free\"\n\
+         vision = false\nvideo = false\nfree_tier = true\ndaily_request_limit = 100\n\n\
+         [routes.free-unavailable]\nid = \"free-unavailable\"\ntype = \"passthrough\"\n\
+         target = \"free-unavailable\"\n",
+        dir.display()
+    );
+
+    let (status, body) = call(&config, "free-unavailable").await;
+    assert!(
+        status.is_server_error(),
+        "the refusal must reach the caller, got {status}: {body}"
+    );
+    assert_eq!(
+        unavailable.calls(),
+        2,
+        "a 5xx gets exactly one further attempt on a metered leaf"
+    );
+    let (counter, spent, _) = only_counter(&dir);
+    assert_eq!(
+        spent, 2,
+        "{counter}: both dispatched attempts reserve, and neither is refunded"
+    );
 }

@@ -471,6 +471,11 @@ impl TranslatingLlmClient {
     ) -> Result<EncodedResponse> {
         let max_retries = u64::from(backend.max_retries());
         let max_attempts = max_retries + 1;
+        // A target that declares a daily request allowance charges that budget per
+        // attempt, so its retry budget is separate from a paid lane's (see
+        // AttemptFailure::retry_budget_allows). Resolved once: the backend cannot gain
+        // or lose an allowance during a call.
+        let quota_limited = backend.allowance().is_some();
         let expires_at = backend
             .timeout()
             .map(|timeout| (tokio::time::sleep(timeout).deadline(), timeout));
@@ -582,7 +587,7 @@ impl TranslatingLlmClient {
                     });
                 }
                 Err(failure) => {
-                    let will_retry = attempt < max_retries && failure.is_retryable();
+                    let will_retry = failure.may_retry(attempt, max_retries, quota_limited);
                     span.record("outcome", "error");
                     if let Some(status) = failure.status {
                         span.record("status_code", status.as_u16());
@@ -1164,6 +1169,50 @@ fn idle_timeout_error(idle: Duration) -> LlmClientError {
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
         is_transient_failure(&self.error)
+    }
+
+    /// Whether the retry loop may dispatch once more to this same target.
+    ///
+    /// One decision in one place, and it fails closed: the configured budget, whether the
+    /// failure class can clear at all, and - on a target that declares a daily request
+    /// allowance - the narrower budget that allowance implies. Keeping the conjunction
+    /// here means a caller cannot accidentally retry a 401 by checking only the budget.
+    fn may_retry(&self, attempt: u64, max_retries: u64, quota_limited: bool) -> bool {
+        if attempt >= max_retries || !self.is_retryable() {
+            return false;
+        }
+        self.retry_budget_allows(attempt, quota_limited)
+    }
+
+    /// Whether a quota-limited leaf may spend one more attempt on this same target.
+    ///
+    /// [`Self::is_retryable`] answers whether the condition is the kind that can clear;
+    /// this answers whether spending another request on the *same* target is worth it.
+    /// They are different questions on a target that declares a daily request
+    /// allowance, because every attempt reserves against that finite budget before the
+    /// provider is contacted and the reservation is never refunded on an HTTP failure.
+    /// A retry there spends the same scarce resource the retry is trying to obtain: one
+    /// 429 currently charges four reservations while the routing evidence records one
+    /// attempt.
+    ///
+    /// The budget for a quota-limited leaf is:
+    ///
+    /// * HTTP 429, any flavour: no further attempt on this target. A daily cap cannot
+    ///   clear on a backoff, and sleeping into a minute window spends the room the next
+    ///   request needs. The route decides whether an eligible sibling has headroom.
+    /// * any other retryable failure (transport, timeout, 5xx): at most ONE further
+    ///   attempt, so a bad second of upstream health costs two reservations, not four.
+    ///
+    /// A target with no allowance keeps the configured budget unchanged. Paid lanes are
+    /// not quota-limited per request and this rule must not move them.
+    fn retry_budget_allows(&self, attempt: u64, quota_limited: bool) -> bool {
+        if !quota_limited {
+            return true;
+        }
+        if self.status.is_some_and(|status| status.as_u16() == 429) {
+            return false;
+        }
+        attempt == 0
     }
 }
 
@@ -4794,6 +4843,91 @@ mod tests {
             retry_after: None,
         };
         assert!(!context_window.is_retryable());
+    }
+
+    /// A quota-limited leaf may not turn one bad response into four reservations.
+    ///
+    /// The two axes are deliberately separate. `is_retryable` still says a 429 or a 503
+    /// is the kind of failure that can clear, because the route uses that answer to
+    /// decide whether an eligible sibling is worth trying. `retry_budget_allows` says
+    /// whether *this* target may spend another reservation, because on a target with a
+    /// daily allowance each attempt charges the budget before the provider is called and
+    /// nothing refunds it.
+    ///
+    /// The first half of each case pins the class answer, so a change that quietly makes
+    /// 429s non-retryable everywhere fails here rather than passing as a tightened budget.
+    #[test]
+    fn a_quota_limited_leaf_retries_a_throttle_zero_times_and_a_5xx_once() {
+        let with_status = |status: StatusCode, body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status,
+                body: body.to_string(),
+            },
+            status: Some(status),
+            retry_after: None,
+        };
+        let transport = AttemptFailure {
+            error: LlmClientError::Transport {
+                source: std::io::Error::other("disconnected").into(),
+            },
+            status: None,
+            retry_after: None,
+        };
+
+        // Unmarked 429 and provider-pool 429 are both retryable classes, and neither may
+        // spend a second reservation on the same free target.
+        for body in [
+            "{}",
+            r#"{"error":{"code":429,"metadata":{"limit_source":"upstream_provider_shared_pool"}}}"#,
+        ] {
+            let throttle = with_status(StatusCode::TOO_MANY_REQUESTS, body);
+            assert!(throttle.is_retryable(), "{body} is still a throttle class");
+            for attempt in 0..4 {
+                assert!(
+                    !throttle.may_retry(attempt, 2, true),
+                    "429 at attempt {attempt} must not reserve again on a free leaf"
+                );
+            }
+        }
+
+        // Transient infrastructure: exactly one further attempt, whatever the configured
+        // budget says, so the worst case is two reservations rather than four.
+        for transient in [
+            with_status(StatusCode::INTERNAL_SERVER_ERROR, ""),
+            with_status(StatusCode::SERVICE_UNAVAILABLE, ""),
+            with_status(StatusCode::BAD_GATEWAY, ""),
+            transport,
+        ] {
+            assert!(transient.is_retryable());
+            assert!(
+                transient.may_retry(0, 2, true),
+                "the first attempt may still try once more"
+            );
+            for attempt in 1..4 {
+                assert!(
+                    !transient.may_retry(attempt, 2, true),
+                    "attempt {attempt} must be terminal on a free leaf"
+                );
+            }
+        }
+
+        // A non-retryable class stays non-retryable; the budget must not resurrect it.
+        let unauthorized = with_status(StatusCode::UNAUTHORIZED, "");
+        assert!(!unauthorized.may_retry(0, 2, true));
+        assert!(!unauthorized.may_retry(0, 2, false));
+
+        // Control: a lane with no daily allowance keeps today's configured behaviour
+        // exactly, so a paid request that 429s still gets both retries.
+        let throttle = with_status(StatusCode::TOO_MANY_REQUESTS, "{}");
+        assert!(throttle.may_retry(0, 2, false));
+        assert!(throttle.may_retry(1, 2, false));
+        assert!(
+            !throttle.may_retry(2, 2, false),
+            "the configured budget still bounds an unmetered lane"
+        );
+        // A lane configured with zero retries retries nothing, metered or not.
+        assert!(!throttle.may_retry(0, 0, false));
+        assert!(!throttle.may_retry(0, 0, true));
     }
 
     /// A 5xx that masks a permanent auth or billing failure is not infrastructure.

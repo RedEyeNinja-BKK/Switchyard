@@ -302,6 +302,21 @@ struct RouteConfig {
     /// no terminal leg is refused rather than ignored, because a policy that governs nothing
     /// reads as a guarantee it cannot provide.
     terminal_policy: Option<TerminalPolicy>,
+    /// Which evidence may carry the walk past each declared tier, when a tier's boundary
+    /// differs from the route's own.
+    ///
+    /// `terminal_policy` governs the claim that opens the terminal walk: what may spend the
+    /// FIRST tier. That is the right statement for a local tier behind a free pool — the
+    /// local capacity exists for allowance exhaustion and for nothing else. It is the wrong
+    /// statement for a metered tier behind that local tier: once the allowance is exhausted
+    /// and the local model cannot answer, "the local capacity is gone" is a capacity fact,
+    /// and a route that only accepts quota evidence at that boundary can never reach a tier
+    /// that exists precisely for the local outage.
+    ///
+    /// So each boundary may state its own policy, aligned with the declared tiers and
+    /// defaulting to `terminal_policy`. It cannot widen what any tier accepts: the request
+    /// still has to pass every gate of the tier it is leaving.
+    terminal_policies: Option<Vec<TerminalPolicy>>,
     /// Whether a request no primary candidate can hold may be escalated to the declared
     /// tiers.
     ///
@@ -388,6 +403,24 @@ pub enum SelectionPolicy {
     /// still decided by declared tariff, never by position: a `Peer` pool excludes every
     /// candidate that is not stated free before it ranks anything.
     Peer,
+    /// Treat the declared `pool_groups` as groups, not as one peer set.
+    ///
+    /// `Peer` still compares candidates leaf by leaf, which is honest while every leaf is
+    /// measured on the same yardstick. Across two providers it is not: one provider states a
+    /// daily request budget and the other states none, so "more requests left" would make the
+    /// budget-declaring provider win every comparison and the pool would silently become a
+    /// priority list. A group whose membership is four leaves against another's one also wins
+    /// a per-leaf count for a reason nobody chose.
+    ///
+    /// `Grouped` chooses the group first, on evidence that is comparable between providers —
+    /// whether the group has anything left to spend, whether it has been measured failing, and
+    /// how fast it has answered — with a rotation floor so two equally-evidenced groups are
+    /// both used. Inside the chosen group the `Peer` leaf keys still decide, including the
+    /// daily budget, because there the budget is the same provider's yardstick.
+    ///
+    /// Requires at least two `pool_groups`; a single group is a `Peer` pool written the long
+    /// way, and accepting it here would make the policy look like it does something.
+    Grouped,
 }
 
 /// One declared terminal leg: either a single target or one tier of peers.
@@ -554,6 +587,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let pool_groups = take_optional(&mut table, "pool_groups")?;
         let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
         let terminal_policy = take_optional(&mut table, "terminal_policy")?;
+        let terminal_policies = take_optional(&mut table, "terminal_policies")?;
         let fit_escalation = take_optional(&mut table, "fit_escalation")?;
         let capability_escalation = take_optional(&mut table, "capability_escalation")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
@@ -575,6 +609,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             pool_groups,
             terminal_fallback,
             terminal_policy,
+            terminal_policies,
             fit_escalation,
             capability_escalation,
             escalation_target,
@@ -1055,6 +1090,57 @@ impl DeploymentConfig {
             if let Some(groups) = &config.pool_groups {
                 self.validate_route_pool(route_name, config, groups)?;
             }
+            // A grouped pool exists to compare groups, so a route that declares the policy
+            // without two groups would be a `Peer` pool in disguise. Refusing it is the only
+            // honest answer: silently treating it as `Peer` would let an operator believe a
+            // boundary exists that the deployment never draws.
+            if config.selection == SelectionPolicy::Grouped {
+                match config.pool_groups.as_ref() {
+                    Some(groups) if groups.len() >= 2 => {}
+                    Some(_) => {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares selection = \"grouped\" with fewer than two pool_groups; a grouped pool compares groups, and one group is a peer pool"
+                        )))
+                    }
+                    None => {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares selection = \"grouped\" but no pool_groups; a grouped pool compares groups, and one group is a peer pool"
+                        )))
+                    }
+                }
+            }
+            // The groups as model sets, resolved once here so the dispatch path never has to
+            // re-derive membership from labels. Members are ordered by target name, the same
+            // order the load-time membership check reads, so the plan and the check cannot
+            // disagree about who is in a group.
+            let group_plan = config.pool_groups.as_ref().map(|groups| {
+                let callable = config.callable_target_names();
+                crate::selection::GroupPlan {
+                    groups: groups
+                        .iter()
+                        .map(|group| {
+                            let mut names: Vec<&str> = self
+                                .targets
+                                .iter()
+                                .filter(|(name, target)| {
+                                    callable.iter().any(|candidate| candidate == name)
+                                        && target.groups.iter().any(|label| label == group)
+                                })
+                                .map(|(name, _target)| name.as_str())
+                                .collect();
+                            names.sort_unstable();
+                            crate::selection::GroupMembers {
+                                name: group.clone(),
+                                members: names
+                                    .into_iter()
+                                    .filter_map(|name| self.targets.get(name))
+                                    .map(|target| target.id.clone())
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                }
+            });
             // A terminal leg is a last resort, so its declaration has to be unambiguous: it
             // must name real targets, none of them a candidate of this route, and none of
             // them held. A terminal target that was also a candidate would be ranked as a
@@ -1178,6 +1264,7 @@ impl DeploymentConfig {
                 Some(terminal) => route
                     .with_terminal_fallback(terminal)
                     .with_terminal_policy(config.terminal_policy.unwrap_or_default())
+                    .with_terminal_policies(config.terminal_policies.clone().unwrap_or_default())
                     .with_fit_escalation(config.fit_escalation.unwrap_or(false))
                     .with_capability_escalation(config.capability_escalation.unwrap_or(false)),
                 None => route,
@@ -1196,6 +1283,13 @@ impl DeploymentConfig {
                 crate::config::SelectionPolicy::Peer => route
                     .with_measured_selection(Arc::clone(&measured_selector))
                     .with_pool_groups(config.pool_groups.clone().unwrap_or_default()),
+                // A grouped pool needs both the selector that supplies the evidence and the
+                // resolved groups themselves; without either it would degrade to the flat
+                // peer ranking this policy exists to replace.
+                crate::config::SelectionPolicy::Grouped => route
+                    .with_measured_selection(Arc::clone(&measured_selector))
+                    .with_pool_groups(config.pool_groups.clone().unwrap_or_default())
+                    .with_group_plan(group_plan.clone().unwrap_or_default()),
                 crate::config::SelectionPolicy::Declared => route,
             };
             routes.push((config.id.clone(), route));
@@ -1447,6 +1541,12 @@ impl DeploymentConfig {
                      policy that governs no leg would read as a guarantee it cannot provide"
                 )));
             }
+            if config.terminal_policies.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares terminal_policies but no terminal_fallback; a \
+                     policy that governs no leg would read as a guarantee it cannot provide"
+                )));
+            }
             if config.fit_escalation == Some(true) {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} declares fit_escalation but no terminal_fallback; a \
@@ -1468,6 +1568,20 @@ impl DeploymentConfig {
             return Err(RunnerError::configuration(format!(
                 "route {route_name} declares terminal_fallback but names no target"
             )));
+        }
+        // A boundary policy is aligned with the tiers it governs. Declaring fewer policies
+        // than tiers would silently leave the rest on the route policy, and declaring more
+        // would name a boundary that does not exist; both are states an operator cannot read
+        // back, so both are refused.
+        if let Some(policies) = &config.terminal_policies {
+            if policies.len() != tiers.len() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares {} terminal_policies for {} terminal tiers; a \
+                     boundary policy must state one value per tier",
+                    policies.len(),
+                    tiers.len()
+                )));
+            }
         }
         let candidates = config.callable_target_names();
         let mut resolved: Vec<Vec<ModelId>> = Vec::new();

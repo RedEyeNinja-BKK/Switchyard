@@ -761,6 +761,12 @@ pub struct Route {
     /// rather than a boolean means the trace can name the groups the pool was built from,
     /// and a pool route is recognisable at runtime, not only in the manifest that created it.
     pool_groups: Option<Vec<String>>,
+    /// The declared groups as model sets, when this route orders by group before by leaf.
+    ///
+    /// Empty for every other route. The membership is resolved at load rather than at request
+    /// time so the dispatch path never re-derives it from labels, and so a group the manifest
+    /// does not describe cannot be invented mid-request.
+    group_plan: crate::selection::GroupPlan,
     /// Targets this route may reach only when every eligible primary candidate is
     /// verifiably unavailable, grouped into ordered tiers.
     ///
@@ -777,6 +783,14 @@ pub struct Route {
     /// Which evidence may spend `terminal`. Configuration sets this per route; the default
     /// is the historical capacity rule, so a route that names no policy behaves as before.
     terminal_policy: TerminalPolicy,
+    /// Per-boundary evidence policy, aligned with `terminal`; empty means every boundary uses
+    /// `terminal_policy`.
+    ///
+    /// The entry boundary is the claim that opens the walk and stays the route's own. Each
+    /// later boundary is a claim about the tier being left, and a route may need a different
+    /// one there: a local tier is entered on quota evidence, but the metered tier behind it
+    /// exists for the local outage, which is not quota evidence.
+    terminal_policies: Vec<TerminalPolicy>,
     /// Whether a request that no primary candidate can hold may be escalated to the declared
     /// tiers.
     ///
@@ -853,8 +867,10 @@ impl Route {
             daily_allowances: Arc::new(HashMap::new()),
             held: None,
             pool_groups: None,
+            group_plan: crate::selection::GroupPlan::default(),
             terminal: Vec::new(),
             terminal_policy: TerminalPolicy::default(),
+            terminal_policies: Vec::new(),
             fit_escalation: false,
             capability_escalation: false,
         }
@@ -880,6 +896,24 @@ impl Route {
     pub fn with_terminal_policy(mut self, policy: TerminalPolicy) -> Self {
         self.terminal_policy = policy;
         self
+    }
+
+    /// Declares the evidence policy that governs each declared tier's own boundary.
+    ///
+    /// Aligned with the tiers and validated at load. An absent or short list is not a silent
+    /// downgrade: configuration refuses a count that does not match the tiers, so what the
+    /// route stores is either the full declaration or nothing.
+    pub fn with_terminal_policies(mut self, policies: Vec<TerminalPolicy>) -> Self {
+        self.terminal_policies = policies;
+        self
+    }
+
+    /// The policy that governs the boundary leaving `tier`.
+    fn terminal_policy_leaving(&self, tier: usize) -> TerminalPolicy {
+        self.terminal_policies
+            .get(tier)
+            .copied()
+            .unwrap_or(self.terminal_policy)
     }
 
     /// Declares whether a request no primary candidate can hold may reach the tiers.
@@ -940,11 +974,33 @@ impl Route {
         attempts: &[AttemptTrace],
         blocks: &[switchyard_llm_client::CredentialBlock],
     ) -> Option<&'static str> {
+        self.terminal_authorization_under(
+            capable,
+            dispatchable,
+            attempts,
+            blocks,
+            self.terminal_policy,
+        )
+    }
+
+    /// [`Self::terminal_authorization`] under an explicit boundary policy.
+    ///
+    /// The policy is a parameter rather than a field read so the boundary that is being
+    /// crossed decides it: the entry claim is the route's own, and every later claim is about
+    /// the tier being left.
+    fn terminal_authorization_under(
+        &self,
+        capable: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        blocks: &[switchyard_llm_client::CredentialBlock],
+        policy: TerminalPolicy,
+    ) -> Option<&'static str> {
         authorize_terminal(
             capable,
             dispatchable,
             attempts,
-            self.terminal_policy,
+            policy,
             |model| self.target_credential(model).map(str::to_string),
             |model| self.quota_blocked(model, blocks),
         )
@@ -995,6 +1051,21 @@ impl Route {
     pub fn with_pool_groups(mut self, groups: Vec<String>) -> Self {
         self.pool_groups = Some(groups);
         self
+    }
+
+    /// Declares the groups' membership, making the group a level of the order.
+    ///
+    /// Set only for a route whose selection policy compares groups; an empty plan leaves the
+    /// pool flat, and the dispatch path decides between the two by whether a plan exists, so
+    /// a route can never claim grouped selection while ranking leaf by leaf.
+    pub fn with_group_plan(mut self, plan: crate::selection::GroupPlan) -> Self {
+        self.group_plan = plan;
+        self
+    }
+
+    /// Whether this route chooses a group before it chooses a leaf.
+    pub fn is_grouped_pool(&self) -> bool {
+        self.group_plan.groups.len() >= 2
     }
 
     /// The ranking policy this route uses.
@@ -1411,6 +1482,14 @@ impl Route {
         // compete one tier below the free candidates and then serve whenever the free pool
         // was busy, which is a paid escalation nobody approved. `unknown` fails closed for
         // the same reason: an undeclared tariff is not evidence of free entitlement.
+        // A ranked pool is a *free* pool. The rule guards the ranking, not the last resort:
+        // a declared terminal tier is never ranked, never reached by a busy pool, and may
+        // legitimately be metered - a paid NT leg behind an exhausted free allowance is the
+        // shape the owner asked for, and refusing it here would leave that tier unreachable.
+        // Terminal targets are already forbidden from being candidates at load, so exempting
+        // them cannot smuggle a paid leg into the ranking.
+        let terminal_models: std::collections::HashSet<switchyard_protocol::ModelId> =
+            self.terminal_models().into_iter().collect();
         let pool_members_only_free = self.is_peer_pool();
         // The block gate and the capability gate are separate questions, and the terminal
         // leg's exhaustion rule needs both answers. `capability_gate` asks "could this
@@ -1428,7 +1507,8 @@ impl Route {
                     Ok(())
                 };
             };
-            if pool_members_only_free && !facts.tariff.is_free() {
+            if pool_members_only_free && !terminal_models.contains(model) && !facts.tariff.is_free()
+            {
                 return Err("not_free_entitled");
             }
             // Physical fit, judged on facts the deployment states about one backing
@@ -1646,8 +1726,13 @@ impl Route {
                     })
                     .collect();
                 let declared = self.models.all_models();
-                scores =
-                    selector.explain_with(&candidates, demand, &declared, self.ranking_policy());
+                scores = if self.is_grouped_pool() {
+                    // One request, one rotation step: the group decision is recorded here,
+                    // where the dispatch order is actually decided.
+                    selector.explain_grouped(&candidates, demand, &declared, &self.group_plan)
+                } else {
+                    selector.explain_with(&candidates, demand, &declared, self.ranking_policy())
+                };
                 let ordered: Vec<switchyard_protocol::ModelId> =
                     scores.iter().map(|score| score.model.clone()).collect();
                 let unchanged = candidates
@@ -1897,11 +1982,12 @@ impl Route {
                         .or(capability_escalation
                             .filter(|_| tier_capability_incompatible(&terminal_verdicts[index])))
                         .or_else(|| {
-                            self.terminal_authorization(
+                            self.terminal_authorization_under(
                                 &terminal_capable[index],
                                 &terminal_servable[index],
                                 &attempts.lock().clone(),
                                 blocks,
+                                self.terminal_policy_leaving(index),
                             )
                         });
                     continue;
@@ -1931,11 +2017,12 @@ impl Route {
                 // This tier answered with a failure. Whether the next one may be consulted is
                 // a fact about THIS tier's legs and this request's attempts at them, so the
                 // claim is re-derived rather than carried over from the boundary above.
-                authorization = self.terminal_authorization(
+                authorization = self.terminal_authorization_under(
                     &terminal_capable[index],
                     &terminal_servable[index],
                     &attempts.lock().clone(),
                     blocks,
+                    self.terminal_policy_leaving(index),
                 );
             }
         }

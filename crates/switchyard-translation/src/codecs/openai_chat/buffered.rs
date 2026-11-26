@@ -24,7 +24,7 @@ use crate::llm::{
     MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
     SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
-use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
+use crate::policy::{DeterministicIdPolicy, ReasoningDetailsReplay, TranslationPolicy};
 use crate::util::{
     capture_request_preservation, capture_response_preservation, embed_preservation,
     exact_preserved_request, exact_preserved_response, json_string, object, push_lossy,
@@ -190,6 +190,7 @@ impl FormatCodec for OpenAiChatCodec {
     ) -> Result<EncodedRequest> {
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiChat, policy)
+                .filter(|body| !withholds_replayed_details(body, policy))
         {
             return Ok(EncodedRequest {
                 body,
@@ -981,7 +982,7 @@ fn encode_message_without_tool_results_to_openai(
         "role": role,
         "content": encode_openai_content(&content_blocks, message.role, diagnostics, policy)?,
     });
-    encode_openai_message_reasoning(&mut message_json, &message.content);
+    encode_openai_message_reasoning(&mut message_json, &message.content, policy);
     if !tool_calls.is_empty() {
         message_json["tool_calls"] = Value::Array(tool_calls);
         if message_json["content"] == Value::String(String::new()) {
@@ -991,8 +992,42 @@ fn encode_message_without_tool_results_to_openai(
     Ok(message_json)
 }
 
-// Adds either plaintext reasoning or structured details to an OpenAI Chat message.
-fn encode_openai_message_reasoning(message: &mut Value, content: &[ContentBlock]) {
+// Whether a preserved body must be re-encoded rather than replayed.
+//
+// The preserved-body path exists so fields the IR cannot represent survive a same-format trip,
+// so it is kept for every request that needs no narrowing. It is bypassed only when replaying
+// it would hand this target another provider's opaque reasoning state: the normalised path is
+// the only one that applies the replay policy, so it has to run in exactly that case.
+fn withholds_replayed_details(body: &Value, policy: &TranslationPolicy) -> bool {
+    policy.reasoning_details_replay == ReasoningDetailsReplay::PlaintextOnly
+        && body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("reasoning_details")
+                        .and_then(Value::as_array)
+                        .is_some_and(|details| !details.is_empty())
+                })
+            })
+}
+
+// Adds reasoning to an OpenAI Chat message, honouring the target's replay policy.
+fn encode_openai_message_reasoning(
+    message: &mut Value,
+    content: &[ContentBlock],
+    policy: &TranslationPolicy,
+) {
+    if policy.reasoning_details_replay == ReasoningDetailsReplay::PlaintextOnly {
+        // Structured details and signatures are opaque state belonging to the provider that
+        // issued them. A target that did not issue them must not receive them: another
+        // provider's private blob is not a field it understands, and a signature replayed to
+        // a different signer is worse than useless. Only unsigned reasoning text survives, and
+        // the plaintext encoder already excludes signed blocks.
+        encode_openai_message_plaintext_reasoning(message, content);
+        return;
+    }
     let details = reasoning_details_from_blocks(content);
     if details.is_empty() {
         encode_openai_message_plaintext_reasoning(message, content);

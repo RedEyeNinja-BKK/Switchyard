@@ -1713,13 +1713,26 @@ fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> Reques
 // and which marker the upstream uses for reasoning it writes inline in the message. They are
 // assembled here rather than at each encode/decode site because a decode path that forgets
 // the marker silently returns the provider's monologue to the caller.
+//
+// The third fact is where opaque reasoning state may be replayed. `reasoning_details` and a
+// `signature` belong to the provider that issued them: OpenRouter hands them back and expects
+// them returned intact, while a native provider has no field for them and must not be given
+// another provider's private blob. Tying this to the dialect means one target cannot be told
+// to replay and another told to withhold by accident.
 fn translation_policy(backend: &Backend) -> TranslationPolicy {
+    let reasoning_details_replay = match backend.reasoning_dialect() {
+        switchyard_protocol::ReasoningDialect::OpenRouterEnabled => {
+            switchyard_translation::ReasoningDetailsReplay::Verbatim
+        }
+        _ => switchyard_translation::ReasoningDetailsReplay::PlaintextOnly,
+    };
     TranslationPolicy {
         target_capabilities: TargetCapabilities {
             requires_list_input: Some(backend.requires_list_input()),
             ..TargetCapabilities::default()
         },
         hosted_reasoning: backend.hosted_reasoning(),
+        reasoning_details_replay,
         ..TranslationPolicy::default()
     }
 }
@@ -2489,6 +2502,34 @@ mod tests {
             Backend::OpenAiResponses(backend),
             None,
         )]
+    }
+
+    // Opaque reasoning state follows the dialect, not the format: only the OpenRouter wire is
+    // given back the `reasoning_details` it issued. A native target is narrowed so it can never
+    // receive another provider's signed blob, and the default (Verbatim) is never what a real
+    // target resolves to by accident.
+    #[test]
+    fn replay_policy_follows_the_target_dialect() {
+        let mut base = config("http://stub");
+        base.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+        assert_eq!(
+            translation_policy(&Backend::OpenAiChat(base.clone())).reasoning_details_replay,
+            switchyard_translation::ReasoningDetailsReplay::Verbatim,
+            "the issuing wire gets its own details back"
+        );
+        for dialect in [
+            ReasoningDialect::OpenAiEffort,
+            ReasoningDialect::LlamaCppEnableThinking,
+            ReasoningDialect::Unspecified,
+        ] {
+            let mut narrowed = base.clone();
+            narrowed.reasoning_dialect = dialect;
+            assert_eq!(
+                translation_policy(&Backend::OpenAiChat(narrowed)).reasoning_details_replay,
+                switchyard_translation::ReasoningDetailsReplay::PlaintextOnly,
+                "{dialect:?} must not replay opaque provider state"
+            );
+        }
     }
 
     fn chat_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {

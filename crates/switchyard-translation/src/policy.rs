@@ -74,6 +74,22 @@ pub struct ProviderProfile {
     pub capabilities: TargetCapabilities,
 }
 
+/// Controls whether provider-private reasoning state is replayed to an upstream.
+///
+/// `reasoning_details` and a `signature` are opaque state belonging to the provider that issued
+/// them. OpenRouter hands them back and expects them returned verbatim; a native provider
+/// (DeepSeek, Google, a local llama.cpp) either does not understand them or would be receiving
+/// another provider's private state. This is a per-target wire fact, not a global preference, so
+/// the runner derives it from the target's `reasoning_dialect`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReasoningDetailsReplay {
+    /// Replay structured details and signatures exactly as received.
+    #[default]
+    Verbatim,
+    /// Drop structured details and signatures; carry only the reasoning text.
+    PlaintextOnly,
+}
+
 /// End-to-end policy applied by request, response, and stream translation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TranslationPolicy {
@@ -89,6 +105,12 @@ pub struct TranslationPolicy {
     /// writes those tokens as text. `None` leaves response text untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_reasoning: Option<crate::codecs::openai_chat::HostedReasoningMarker>,
+    /// Whether opaque provider reasoning state may be replayed to this target.
+    ///
+    /// Defaults to `Verbatim`, the pre-existing behaviour, so a policy built without target
+    /// knowledge never silently changes what is sent. The runner narrows it per target.
+    #[serde(default)]
+    pub reasoning_details_replay: ReasoningDetailsReplay,
 }
 
 impl Default for TranslationPolicy {
@@ -102,6 +124,7 @@ impl Default for TranslationPolicy {
             preservation: PreservationPolicy::InMemory,
             target_capabilities: TargetCapabilities::default(),
             hosted_reasoning: None,
+            reasoning_details_replay: ReasoningDetailsReplay::default(),
         }
     }
 }

@@ -837,6 +837,77 @@ fn a_known_exhaustion_still_refuses_after_the_reading_goes_stale() {
     );
 }
 
+/// A retained exhaustion refuses a send; it does not assert that the allowance is spent.
+///
+/// The two questions are answered by different readings of the same counter, and the
+/// difference decides where the next request goes: `try_reserve` answers "may I send", while
+/// `spent_today` answers "is there affirmative evidence this free domain is empty" and is
+/// what authorises spending the local tier. A reading that has stopped being current
+/// describes the past, so it may refuse the send and must not license the spend.
+#[test]
+fn a_retained_exhaustion_refuses_the_send_without_claiming_the_allowance_is_spent() {
+    let allowance = account_allowance(&scratch("retained-not-spent"), 1000)
+        .with_provider_tolerance(Duration::from_secs(60));
+    allowance
+        .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
+        .expect("the reading is applied");
+
+    assert_eq!(
+        allowance.spent_today_at(at(LATE_UTC_DAY)),
+        Some(true),
+        "a current reading with no headroom is affirmative evidence"
+    );
+
+    let stale = LATE_UTC_DAY + 120;
+    assert!(
+        matches!(
+            allowance.try_reserve_at(at(stale)),
+            Err(ReserveError::ProviderExhausted { limit: 1000 })
+        ),
+        "the send must still be refused: dispatch behaviour is not what this changes"
+    );
+    assert_eq!(
+        allowance.spent_today_at(at(stale)),
+        None,
+        "a retained refusal describes the past, so it cannot be quoted as spent today"
+    );
+
+    let recovered = LATE_UTC_DAY + 3600;
+    assert_eq!(
+        allowance.spent_today_at(at(recovered)),
+        Some(false),
+        "past the retention the budget governs again, and it has room"
+    );
+}
+
+/// Retention never masks a local budget that is genuinely spent: that reading is current and
+/// belongs to this deployment, so it stays affirmative while the retention is alive.
+#[test]
+fn a_spent_local_budget_stays_affirmative_under_a_retention() {
+    let allowance = account_allowance(&scratch("retained-local-spent"), 1)
+        .with_provider_tolerance(Duration::from_secs(60));
+    allowance
+        .try_reserve_at(at(LATE_UTC_DAY))
+        .expect("the day's only request");
+    allowance
+        .reconcile(provider(1000, 1000, 0, LATE_UTC_DAY))
+        .expect("the reading is applied and starts a retention");
+
+    let stale = LATE_UTC_DAY + 120;
+    assert!(matches!(
+        allowance.provider_state_at(at(stale)),
+        ProviderState::Exhausted {
+            basis: ExhaustionBasis::Retained,
+            ..
+        }
+    ));
+    assert_eq!(
+        allowance.spent_today_at(at(stale)),
+        Some(true),
+        "this deployment's own counter is current, and it says the day is spent"
+    );
+}
+
 /// The retention ends, so a recovered account serves again without requiring a new reading
 /// to arrive first. Bounded in both directions: no storm, no permanent wall.
 #[test]

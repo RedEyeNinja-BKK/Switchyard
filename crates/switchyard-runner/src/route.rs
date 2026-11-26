@@ -1138,6 +1138,11 @@ impl Route {
     /// zero, so reading the figure alone would turn "this deployment cannot say" into "the
     /// budget is spent" and buy the local tier on a broken file.
     ///
+    /// A *retained* exhaustion is the second way into that third state. Admission keeps
+    /// refusing while a past "the pool is empty" is honoured past its freshness, so the
+    /// remainder still reads zero, but the statement describes the past: it must not buy the
+    /// local tier any more than an unreadable file may.
+    ///
     /// A target with no counter is unknown for a different reason: a metered target has no
     /// daily allowance to exhaust, so its exhaustion can only ever come from the provider's
     /// own answer within this request.

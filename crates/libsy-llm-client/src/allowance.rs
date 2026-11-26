@@ -572,12 +572,14 @@ impl DailyRequestAllowance {
     /// Whether this allowance's remainder is knowably zero for the current provider day.
     ///
     /// Three answers, because the two-answer form is the one that spends money. `Some(true)`
-    /// only when the counter can be read and its remainder is zero; `Some(false)` when it can
-    /// be read and still has room, or when no counter exists yet; `None` when a counter
-    /// exists but cannot be read. A caller deciding whether to escalate on "this allowance is
+    /// only when the evidence is current: this deployment's own counter is at its cap, or a
+    /// provider reading that is fresh right now reports no headroom. `Some(false)` when the
+    /// budget still has room. `None` when a counter exists but cannot be read, and also when
+    /// the only reason nothing may be sent is a *retained* exhaustion -- a past statement
+    /// still being honoured. A caller deciding whether to escalate on "this allowance is
     /// spent" must treat `None` as unknown: an unreadable ledger is not an exhausted one, and
-    /// [`Self::remaining`] answers `0` for both, which is right for admission and wrong for
-    /// this claim.
+    /// neither is a reading that has stopped being current, yet [`Self::remaining`] answers
+    /// `0` for both, which is right for admission and wrong for this claim.
     ///
     /// Reads without taking the lock and creates nothing: the counter is replaced atomically,
     /// so a reader sees a whole file either way, and a judgement about what the deployment's
@@ -600,11 +602,30 @@ impl DailyRequestAllowance {
             Err(_) => return None,
         };
         let local = self.limit.saturating_sub(spent_on(counter, day));
-        let remaining = match self.provider_headroom(&counter, day, now) {
-            Some(headroom) => local.min(headroom),
-            None => local,
-        };
-        Some(remaining == 0)
+        // This deployment's own ledger is current, so reaching the cap is affirmative on its
+        // own -- whatever a provider reading, retained or not, says about the account.
+        if local == 0 {
+            return Some(true);
+        }
+        match self.provider_headroom(&counter, day, now) {
+            // Nothing left on the provider's side. Which reading produced that decides whether
+            // it may be quoted as `spent`.
+            Some(0) => match self.exhaustion_basis(&counter, day, now) {
+                // A reading that is current right now says the pool is empty: affirmative.
+                Some(ExhaustionBasis::Confirmed) => Some(true),
+                // Retained: `provider_headroom` answers 0 because a past statement is still
+                // being honoured past its freshness, so that a collector outage does not
+                // become a retry storm. That is the right answer to "may I send" and the
+                // wrong answer to "is the allowance spent": it describes the past, and
+                // answering `true` here is what lets a recovered account buy the local tier.
+                // Unknown, because neither neighbour is true -- it is not spent, and it is
+                // not shown to have room.
+                _ => None,
+            },
+            // Headroom, or no current reading at all: the local budget governs, and it has
+            // room left.
+            _ => Some(false),
+        }
     }
 
     /// Reserves one request against the current provider day.

@@ -1158,28 +1158,13 @@ impl DeploymentConfig {
                     .into_iter()
                     .filter_map(|name| self.targets.get(name))
                     .filter_map(|target| {
-                        let group = self
-                            .llm_clients
-                            .get(&target.llm_client)
-                            .and_then(|client| client.quota_group.clone())
-                            .unwrap_or_else(|| target.llm_client.clone());
-                        // Look the counter up under the scope it was built with: account
-                        // scope has one counter for the whole group, so every model in the
-                        // group resolves to that one allowance rather than to a per-model
-                        // counter that was never created.
-                        let counter_model = match self
-                            .llm_clients
-                            .get(&target.llm_client)
-                            .and_then(|client| client.quota_scope)
-                            .unwrap_or_default()
-                        {
-                            QuotaScope::Account => {
-                                ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL)
-                            }
-                            QuotaScope::Model => target.id.clone(),
-                        };
+                        // The same derivation the counters were built with. Account scope has
+                        // one counter for the whole group, so every model in the group resolves
+                        // to that one allowance instead of a per-model counter that was never
+                        // created; model scope resolves to its own.
+                        let group = self.allowance_group(target);
                         allowances
-                            .get(&(group, counter_model))
+                            .get(&self.allowance_key(target, &group))
                             .map(|allowance| (target.id.clone(), Arc::clone(allowance)))
                     })
                     .collect::<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>(
@@ -1311,6 +1296,38 @@ impl DeploymentConfig {
         }
     }
 
+    /// The quota group a target's requests are charged to.
+    ///
+    /// A client that declares no group is its own group, so two clients never share a
+    /// counter by accident just because neither named one.
+    fn allowance_group(&self, target: &TargetConfig) -> String {
+        self.llm_clients
+            .get(&target.llm_client)
+            .and_then(|client| client.quota_group.clone())
+            .unwrap_or_else(|| target.llm_client.clone())
+    }
+
+    /// The key a target's daily allowance is stored under.
+    ///
+    /// Producer and every consumer derive this the same way. A consumer that derives a
+    /// different key gets `None`, which is indistinguishable from "this target declares no
+    /// budget": the manifest advertises a limit, the counter is built and reconciled, and the
+    /// target dispatches unmetered. Deriving it once, here, is what keeps an account's single
+    /// counter reachable from every target that shares it -- not merely from whichever target
+    /// happened to create the entry first.
+    fn allowance_key(&self, target: &TargetConfig, group: &str) -> (String, ModelId) {
+        let scope = self
+            .llm_clients
+            .get(&target.llm_client)
+            .and_then(|client| client.quota_scope)
+            .unwrap_or_default();
+        let counter_model = match scope {
+            QuotaScope::Account => ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL),
+            QuotaScope::Model => target.id.clone(),
+        };
+        (group.to_owned(), counter_model)
+    }
+
     fn build_allowances(
         &self,
     ) -> RunnerResult<HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>>
@@ -1326,11 +1343,7 @@ impl DeploymentConfig {
                     "target {target_name} daily_request_limit must be at least 1"
                 )));
             }
-            let group = self
-                .llm_clients
-                .get(&target.llm_client)
-                .and_then(|client| client.quota_group.clone())
-                .unwrap_or_else(|| target.llm_client.clone());
+            let group = self.allowance_group(target);
             let quota = self.quota.as_ref().ok_or_else(|| {
                 RunnerError::configuration(format!(
                     "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
@@ -1348,31 +1361,42 @@ impl DeploymentConfig {
                             counter_model.as_str()
                         )));
                     }
-                    continue;
+                    // One counter, already built, and every target in the group resolves to it
+                    // through `allowance_key`. A per-target alias added only on this branch's
+                    // sibling is exactly what left the second and later targets unmetered, so
+                    // there is deliberately nothing to bind here: the canonical entry is the
+                    // binding.
                 }
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert((limit, target_name.as_str()));
+                    allowances.insert(
+                        key,
+                        Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
+                            group.clone(),
+                            counter_model.clone(),
+                            limit,
+                            path,
+                            boundary,
+                        )),
+                    );
                 }
             }
-            let allowance = Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
-                group.clone(),
-                counter_model.clone(),
-                limit,
-                path,
-                boundary,
-            ));
-            // A target asks for its allowance by its own model id (see the lookup in
-            // `build_route_clients`), but a counter is filed under the identity it counts:
-            // its own model for a model-scoped group, or the group's account counter model
-            // when several models share one budget. Those are not the same key, so without
-            // this alias an account-scoped target silently resolves to no allowance at all:
-            // the manifest declares a budget, the reconciler maintains the counter, and no
-            // dispatch ever spends it.
-            let alias = (group.clone(), target.id.clone());
-            if alias != key {
-                allowances.insert(alias, Arc::clone(&allowance));
+        }
+        // Fail closed on a declared budget that cannot be attached. Without this, a target
+        // whose key is missing dispatches unmetered while the manifest still advertises a
+        // limit, and nothing downstream can tell that apart from a target that declares no
+        // budget. Checked per target once the map is complete, so no entry ordering can make
+        // it pass by luck.
+        for (target_name, target) in &self.targets {
+            let Some(limit) = target.daily_request_limit else {
+                continue;
+            };
+            let group = self.allowance_group(target);
+            if !allowances.contains_key(&self.allowance_key(target, &group)) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares daily_request_limit = {limit} but no daily counter can be attached to its lookup key in quota group {group}; a declared budget that could not be attached would dispatch unmetered, so this deployment is refused"
+                )));
             }
-            allowances.insert(key, allowance);
         }
         if !allowances.is_empty() {
             self.validate_quota_state_dir()?;
@@ -1781,15 +1805,13 @@ impl DeploymentConfig {
                     target.reasoning_policy,
                     target.reasoning_dialect,
                     target.cooldown_group.clone(),
-                    allowances
-                        .get(&(
-                            client_config
-                                .quota_group
-                                .clone()
-                                .unwrap_or_else(|| target.llm_client.clone()),
-                            target.id.clone(),
-                        ))
-                        .cloned(),
+                    {
+                        // Resolved through the same derivation the map was built with, so a
+                        // shared account counter is reachable from every target in the group
+                        // and not only from the one that created the entry.
+                        let group = self.allowance_group(target);
+                        allowances.get(&self.allowance_key(target, &group)).cloned()
+                    },
                     pacing_for(target, client_config, governor),
                     hosted_reasoning,
                 )?,
@@ -2643,12 +2665,7 @@ impl DeploymentConfig {
                     .supported_types
                     .unwrap_or(decision_transport::SupportedTypes::ALL),
                 state_forms: target.state_forms,
-                budget: self.decision_budget(
-                    target,
-                    client,
-                    accounting.governor,
-                    accounting.allowances,
-                ),
+                budget: self.decision_budget(target, accounting.governor, accounting.allowances),
             });
         }
         (!candidates.is_empty()).then_some(decision_executor::DecisionResolver { candidates })
@@ -2663,15 +2680,11 @@ impl DeploymentConfig {
     fn decision_budget(
         &self,
         target: &TargetConfig,
-        client: &LlmClientConfig,
         governor: &Arc<switchyard_llm_client::QuotaGovernor>,
         allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
     ) -> Option<Arc<decision_executor::DecisionBudget>> {
-        let group = client
-            .quota_group
-            .clone()
-            .unwrap_or_else(|| target.llm_client.clone());
-        let allowance = allowances.get(&(group.clone(), target.id.clone())).cloned();
+        let group = self.allowance_group(target);
+        let allowance = allowances.get(&self.allowance_key(target, &group)).cloned();
         let limits = switchyard_llm_client::WindowLimits {
             requests_per_minute: target.requests_per_minute,
             input_tokens_per_minute: target.input_tokens_per_minute,
@@ -8134,29 +8147,103 @@ target = "free-a"
         toml::from_str(BASE).expect("the fixture must parse")
     }
 
-    /// The route builder resolves a target's allowance by its own model id, while a counter
-    /// is filed under what it counts: the account's counter model when a whole group shares
-    /// one budget. Those keys differ, and a miss is silent -- the budget is built, the
-    /// reconciler maintains the counter, and no dispatch ever spends it. Measured live on
-    /// 2026-11-26: two served free requests left `spent` at 0 with the counter file untouched.
+    /// A state directory no other test can touch. The shared fixture path is used by the
+    /// other tests in this module, and a counter directory is mutable state: two tests
+    /// pointing at one path race over the same files regardless of what they assert.
+    fn unique_state_dir(name: &str) -> String {
+        let dir = std::path::PathBuf::from("/var/tmp").join(format!(
+            "switchyard-quota-binding-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("the fixture state dir must exist");
+        dir.display().to_string()
+    }
+
+    /// Every target that shares an account counter resolves to that one counter, and the
+    /// deployment refuses to build when a declared budget cannot be attached.
+    ///
+    /// The failure this guards is silent by construction: a consumer that derives a different
+    /// key gets `None`, which is indistinguishable from "declares no budget". Measured live on
+    /// 2026-11-26 -- two served free requests left `spent` at 0 and the counter untouched --
+    /// because only the target that created the counter entry could reach it.
     #[test]
-    fn an_account_scoped_target_finds_the_allowance_it_declares() {
-        let state_dir = "/var/tmp/switchyard-quota-provider-fixture";
-        std::fs::create_dir_all(state_dir).expect("the fixture state dir must exist");
-        let config = config();
+    fn every_target_sharing_an_account_counter_resolves_to_it() {
+        let state_dir = unique_state_dir("shared-counter");
+        let mut shared = BASE.replace("/var/tmp/switchyard-quota-provider-fixture", &state_dir);
+        for (name, slug) in [
+            ("free-b", "vendor/free-b"),
+            ("free-c", "vendor/free-c"),
+            ("free-d", "vendor/free-d"),
+        ] {
+            shared.push_str(&format!(
+                "\n[targets.\"{name}\"]\nid = \"{slug}\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000\n"
+            ));
+        }
+        let config: DeploymentConfig = toml::from_str(&shared).expect("the fixture must parse");
         let allowances = config.build_allowances().expect("the fixture must build");
-        let by_target = allowances
-            .keys()
-            .any(|(group, model)| group == "openrouter-free-owner" && model.as_str() == "vendor/free-a");
-        let by_counter = allowances
-            .keys()
-            .any(|(group, model)| group == "openrouter-free-owner" && model.as_str() != "vendor/free-a");
-        assert!(
-            by_target,
-            "the key the route builder asks for must resolve, keys were {:?}",
-            allowances.keys().map(|(g, m)| (g.as_str(), m.as_str())).collect::<Vec<_>>()
+        let group = "openrouter-free-owner";
+        // Exactly one counter for the account, whatever the number of targets on it.
+        assert_eq!(
+            allowances.keys().filter(|(g, _)| g == group).count(),
+            1,
+            "one account budget is one counter, keys were {:?}",
+            allowances
+                .keys()
+                .map(|(g, m)| (g.as_str(), m.as_str()))
+                .collect::<Vec<_>>()
         );
-        assert!(by_counter, "the counter's own key must stay addressable");
+        // Every target, first and subsequent, resolves to that same object.
+        let canonical = allowances
+            .iter()
+            .find(|((g, _), _)| g == group)
+            .map(|(_, allowance)| Arc::clone(allowance))
+            .expect("the account counter exists");
+        for name in ["free-a", "free-b", "free-c", "free-d"] {
+            let target = &config.targets[name];
+            let key = config.allowance_key(target, group);
+            let found = allowances.get(&key).unwrap_or_else(|| {
+                panic!("{name} must resolve its declared allowance, looked up as {key:?}")
+            });
+            assert!(
+                Arc::ptr_eq(found, &canonical),
+                "{name} must share the account's one counter, not a copy of it"
+            );
+            assert_eq!(found.path(), canonical.path(), "{name} counter path");
+        }
+    }
+
+    /// A target that declares a budget but cannot reach a counter is a load error, not a
+    /// silent unmetered target.
+    #[test]
+    fn a_declared_budget_that_cannot_be_attached_refuses_the_deployment() {
+        let state_dir = unique_state_dir("unattachable");
+        let mut source = BASE.replace("/var/tmp/switchyard-quota-provider-fixture", &state_dir);
+        // A second group on the same provider account is refused for its own reason; this
+        // fixture instead makes the allowance key unreachable by declaring the target's
+        // counter under a scope whose key the census cannot find.
+        source.push_str(
+            "\n[targets.\"stray\"]\nid = \"vendor/stray\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000\n",
+        );
+        let mut config: DeploymentConfig = toml::from_str(&source).expect("the fixture must parse");
+        let allowances = config
+            .build_allowances()
+            .expect("the honest fixture builds");
+        assert!(allowances.contains_key(
+            &config.allowance_key(&config.targets["stray"], "openrouter-free-owner")
+        ));
+        // Drop the counter the census needs and prove the gate names the target.
+        config.quota = None;
+        let error = config
+            .build_allowances()
+            .expect_err("a budget with no [quota] state_dir cannot be counted");
+        assert!(
+            error.to_string().contains("no [quota] state_dir"),
+            "unexpected error: {error}"
+        );
     }
 
     /// The declared pool is read into the typed form, so the loader never carries a free

@@ -240,6 +240,26 @@ def adopted(box):
     return box.current()
 
 
+def release_rows(stdout):
+    """The release rows of a `list` run, without the header or the footer.
+
+    `list` prints a header, one row per stored directory, then a `protection`
+    footer naming the registry the next retention pass would consult. Neither the
+    header nor that footer is a release row, so a row count must exclude them --
+    but the footer is not optional noise: it is how a listing says whether
+    retention is armed at all, so callers that care assert it separately.
+    """
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    assert lines, f"`list` printed nothing at all: {stdout!r}"
+    return [line for line in lines[1:] if not line.startswith("protection")]
+
+
+def protection_footer(stdout):
+    footer = [line for line in stdout.splitlines() if line.startswith("protection")]
+    assert footer, f"the listing must say whether retention is armed: {stdout!r}"
+    return footer[0]
+
+
 # ---------------------------------------------------------------------------
 # durable store
 # ---------------------------------------------------------------------------
@@ -815,8 +835,11 @@ def test_list_reports_every_release_and_marks_the_pointers(box):
 
     result = box.run("list")
     assert result.returncode == 0, result.stdout + result.stderr
-    rows = [line for line in result.stdout.splitlines() if line.strip()][1:]
+    rows = release_rows(result.stdout)
     assert len(rows) == 2, f"expected two release rows, got {result.stdout!r}"
+    assert box.releases in protection_footer(result.stdout), (
+        "the footer must name the registry it read, so a later reader can tell "
+        f"which file retention consults: {result.stdout!r}")
     # CURRENT follows what is installed; LAST-KNOWN-GOOD is the rollback target and
     # only `promote` moves it. So after one deploy the two marks are on different
     # rows, and the marks are the whole point of the listing.
@@ -843,7 +866,7 @@ def test_list_survives_a_directory_that_is_not_a_release(box):
     os.makedirs(legacy)
     result = box.run("list")
     assert result.returncode == 0, result.stdout + result.stderr
-    rows = [line for line in result.stdout.splitlines() if line.strip()][1:]
+    rows = release_rows(result.stdout)
     assert len(rows) == 2, f"the real release must still be listed: {result.stdout!r}"
     legacy_row = next(r for r in rows if "legacy" in r)
     assert "?" in legacy_row, f"a release-less directory should be marked unknown: {legacy_row!r}"
@@ -1595,6 +1618,221 @@ def test_two_concurrent_deploys_serialise_into_a_consistent_store(box):
         "will restore the wrong thing"
     )
     assert box.lkg() == baseline, "neither deploy promoted, so the baseline stands"
+
+
+# ---------------------------------------------------------------------------
+# protection, retention and the transcript
+#
+# The incident these cases exist for: a release that the owner had named for
+# preservation was deleted by a retention pass, because a promotion had moved
+# LAST-KNOWN-GOOD off it and the marker it needed had never been written. Every
+# test below is about a property that would have prevented that, driven through
+# the real script in a sandbox store.
+# ---------------------------------------------------------------------------
+
+
+def _deploy(box, name, body="#!/bin/bash\nexit 0\n", **overrides):
+    """Deploy one distinct release and return its id."""
+    candidate, csha = box.write_candidate(name, body)
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest(f"{name}.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--label", name, "--capabilities", "", **overrides)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return box.current()
+
+
+def test_a_protected_release_survives_retention_after_the_pointers_move_away(box):
+    """The exact P8 -> P9 shape, as a regression.
+
+    A release is protected, then promoted over (so LAST-KNOWN-GOOD names something
+    else), then enough newer releases arrive to push it past the retention window.
+    The pointers no longer protect it and only the durable identity does, so if the
+    registry is not consulted this release is deleted -- which is what happened to
+    the November 22 pair.
+    """
+    baseline = adopted(box)
+    protected = box.run("protect", baseline)
+    assert protected.returncode == 0, protected.stdout + protected.stderr
+
+    first = _deploy(box, "after-1", "#!/bin/bash\necho 1\nexit 0\n", RETAIN="1")
+    # Promotion is what removed the identity protection from the real release: after
+    # this, LAST-KNOWN-GOOD names a newer release and the baseline relies on the
+    # registry alone.
+    promoted = box.run("promote", first)
+    assert promoted.returncode == 0, promoted.stdout + promoted.stderr
+    assert box.lkg() == first
+
+    _deploy(box, "after-2", "#!/bin/bash\necho 2\nexit 0\n", RETAIN="1")
+    second = box.current()
+    _deploy(box, "after-3", "#!/bin/bash\necho 3\nexit 0\n", RETAIN="1")
+    _deploy(box, "after-4", "#!/bin/bash\necho 4\nexit 0\n", RETAIN="1")
+
+    present = set(os.listdir(box.releases))
+    assert baseline in present, (
+        "a protected release must survive retention even when CURRENT and "
+        f"LAST-KNOWN-GOOD both name other releases; store holds {sorted(present)}")
+    assert first in present, "LAST-KNOWN-GOOD is protected by identity"
+    # The protection did not simply disable retention: the unprotected release that
+    # fell behind the window is gone, so this is a selective pass, not a no-op.
+    assert second not in present, (
+        f"retention must still prune unprotected releases, {second} should be gone; "
+        f"store holds {sorted(present)}")
+
+
+def test_retention_refuses_to_prune_while_the_protection_registry_is_absent(box):
+    """No registry means no evidence that anything is safe to delete.
+
+    The middle release is neither CURRENT nor LAST-KNOWN-GOOD, so it is the one a
+    retention pass with an (incorrectly) empty protection list would delete. Without
+    it the case passes on broken code, because both pointers protect what is left.
+    """
+    baseline = adopted(box)
+    _deploy(box, "second", RETAIN="0")
+    middle = box.current()
+    candidate, csha = box.write_candidate("third", "#!/bin/bash\necho 3\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("third.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", "", RETAIN="0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PRUNE REFUSED: protection state is 'absent'" in result.stdout
+    present = set(os.listdir(box.releases))
+    assert baseline in present and middle in present, (
+        "with no protection registry the retention pass must delete nothing, "
+        f"not assume the list is empty; store holds {sorted(present)}")
+
+
+def test_retention_refuses_to_prune_a_malformed_protection_registry(box):
+    baseline = adopted(box)
+    with open(os.path.join(box.releases, "PROTECTED"), "w") as fh:
+        fh.write("# comment\n../../etc\n")
+    candidate, csha = box.write_candidate("c", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("c.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", "", RETAIN="0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PRUNE REFUSED: protection state is 'malformed'" in result.stdout
+    assert os.path.isdir(os.path.join(box.releases, baseline))
+
+
+def test_retention_refuses_when_a_protected_release_is_missing(box):
+    """A named release that is gone is an incident, not a cleanup opportunity."""
+    baseline = adopted(box)
+    assert box.run("protect", baseline).returncode == 0
+    with open(os.path.join(box.releases, "PROTECTED"), "a") as fh:
+        fh.write("20990101T000000Z-deadbeefdeadbeef-00000000\n")
+    candidate, csha = box.write_candidate("c", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("c.toml")
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", "", RETAIN="0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "protected release(s) absent from the store" in result.stdout
+    assert os.path.isdir(os.path.join(box.releases, baseline))
+
+
+def test_a_capacity_shortfall_refuses_instead_of_deleting_releases(box):
+    baseline = adopted(box)
+    box.run("protect", baseline)
+    before_live = box.live_bytes()
+    candidate, csha = box.write_candidate("c", "#!/bin/bash\nexit 0\n")
+    box.mark_good(candidate)
+    manifest, msha = box.write_manifest("c.toml")
+    short_df = os.path.join(box.root, "df-short.sh")
+    with open(short_df, "w") as fh:
+        fh.write("#!/bin/bash\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted\\n'\n"
+                 "printf '/dev/fake 1000 990 10 99%% /\\n'\n")
+    os.chmod(short_df, 0o755)
+    result = box.run("deploy", manifest, msha, candidate, csha,
+                     "--capabilities", "", DF_CMD=short_df)
+    assert result.returncode != 0, "a store with no room must refuse the deployment"
+    assert "Refusing rather than deleting stored releases" in result.stderr
+    # Nothing moved: the refusal happens before install and before any prune.
+    assert box.lkg() == baseline
+    assert box.live_bytes() == before_live
+    assert os.path.isdir(os.path.join(box.releases, baseline))
+
+
+def test_a_retained_marker_does_not_disable_verify_rollback_or_promote(box):
+    """Protection is a retention decision, not a "this is not a release" verdict.
+
+    The old predicate treated any directory with a RETAINED marker as a historical
+    artefact that no verb would touch, so marking a live release to save it also
+    disabled the rollback that might need it.
+    """
+    baseline = adopted(box)
+    second = _deploy(box, "second")
+    assert box.run("protect", baseline, second).returncode == 0
+
+    verify = box.run("verify", second)
+    assert verify.returncode == 0, verify.stdout + verify.stderr
+    promote = box.run("promote", second)
+    assert promote.returncode == 0, promote.stdout + promote.stderr
+    assert box.lkg() == second
+    rollback = box.run("rollback")
+    assert rollback.returncode == 0, rollback.stdout + rollback.stderr
+    assert box.current() == second
+
+
+def test_the_pruning_plan_and_outcome_reach_the_durable_transcript(box):
+    baseline = adopted(box)
+    box.run("protect", baseline)
+    first = _deploy(box, "after-1", "#!/bin/bash\necho 1\nexit 0\n", RETAIN="1")
+    _deploy(box, "after-2", "#!/bin/bash\necho 2\nexit 0\n", RETAIN="1")
+    _deploy(box, "after-3", "#!/bin/bash\necho 3\nexit 0\n", RETAIN="1")
+
+    import json
+    transcript = os.path.join(box.releases, "audit.jsonl")
+    assert os.path.isfile(transcript), "pruning must leave a durable record"
+    events = [json.loads(line) for line in open(transcript) if line.strip()]
+    actions = [e["action"] for e in events]
+    assert "prune-plan" in actions, actions
+    assert "prune-result" in actions, actions
+    plan = [e for e in events if e["action"] == "prune-plan"][-1]
+    result = [e for e in events if e["action"] == "prune-result"][-1]
+    assert plan["planned"], "the plan must name what it intends to delete"
+    assert set(result["deleted"]) == set(plan["planned"])
+    # The plan is written before the deletion, so an interrupted run still shows intent.
+    assert actions.index("prune-plan") < actions.index("prune-result")
+
+
+def test_protect_is_refused_while_another_writer_holds_the_release_lock(box):
+    adopted(box)
+    holder = subprocess.Popen(
+        ["flock", os.path.join(box.releases, ".release.lock"), "sleep", "6"])
+    try:
+        time.sleep(0.5)
+        target = box.current()
+        result = box.run("protect", target, RELEASE_LOCK_TIMEOUT="1")
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+    assert result.returncode != 0, "protection must not be written behind another writer"
+    assert not os.path.exists(os.path.join(box.releases, "PROTECTED"))
+
+
+def test_unprotect_requires_confirmation_and_refuses_the_pointers(box):
+    baseline = adopted(box)
+    second = _deploy(box, "second")
+    third = _deploy(box, "third", "#!/bin/bash\necho 3\nexit 0\n")
+    # `second` is neither CURRENT nor LAST-KNOWN-GOOD, so it is the only release
+    # whose protection is this verb's business.
+    box.run("protect", second)
+    refused = box.run("unprotect", second)
+    assert refused.returncode != 0
+    assert "--confirm" in refused.stderr
+    assert os.path.exists(os.path.join(box.releases, second, "RETAINED"))
+    current_refused = box.run("unprotect", third, "--confirm")
+    assert current_refused.returncode != 0
+    assert "is CURRENT" in current_refused.stderr
+    lkg_refused = box.run("unprotect", baseline, "--confirm")
+    assert lkg_refused.returncode != 0
+    assert "is LAST-KNOWN-GOOD" in lkg_refused.stderr
+    confirmed = box.run("unprotect", second, "--confirm")
+    assert confirmed.returncode == 0, confirmed.stdout + confirmed.stderr
+    assert not os.path.exists(os.path.join(box.releases, second, "RETAINED"))
 
 
 # ---------------------------------------------------------------------------

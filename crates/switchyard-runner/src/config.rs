@@ -529,6 +529,30 @@ pub enum TerminalPolicy {
     /// out -- because those are the ways a healthy deployment legitimately cannot serve right
     /// now.
     Availability,
+    /// Allowance evidence only, in the strictest sense: the terminal leg is spent when every
+    /// primary leg reports that an allowance domain is *exhausted*, and on nothing else.
+    ///
+    /// This is the rule the owner stated for the NT and judge lanes: the local tier sits behind
+    /// "both primary allowances are exhausted", not behind "the pool is temporarily unable".
+    /// The distinction matters because the two answers look alike in a decision record and cost
+    /// very different things:
+    ///
+    /// * A minute window regains room by itself within the same minute. Crossing on it spends a
+    ///   local or metered request to solve a problem that would have solved itself.
+    /// * A bare `429` is unclassified. It may be a per-minute throttle, an account cap, a
+    ///   concurrency limit, or a provider policy that says nothing about allowance. Reading it
+    ///   as exhaustion is an inference the evidence does not support.
+    /// * `daily_allowance_unavailable` is an unreadable ledger, i.e. *unknown*, and an unknown
+    ///   allowance is not an exhausted one.
+    /// * An outage, a transport fault, a timeout, a rejected key, a refused balance, a malformed
+    ///   request or a policy answer are all facts about the deployment or the request. None of
+    ///   them is evidence that an allowance ran out.
+    ///
+    /// Only `daily_allowance_exhausted` and `provider_allowance_exhausted` survive: both are
+    /// affirmative statements, from the provider's own accounting, that a domain is at zero for
+    /// the current window. A stale retained reading is reported as unavailable by the same code
+    /// path, so it cannot reach here as exhaustion.
+    AllowanceOnly,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -1097,8 +1121,44 @@ impl DeploymentConfig {
             // agree. Disagreeing would either silently narrow the pool (a member forgotten in
             // the list) or advertise a member the route cannot call (a stale entry). Both are
             // startup errors, because a pool whose membership is unclear is not a policy.
+            // The group shape is a deployment decision, not a synonym for `Grouped`: the same
+            // membership can be deployed as equal peers or as a declared cost sequence. An
+            // unknown word is a refusal rather than a default, and `flat` is refused because a
+            // route that declares groups cannot then rank leaf by leaf.
+            //
+            // Read before the pool is validated, because the shape decides one membership
+            // rule: an equal-peer pool is a free pool, while an ordered pool is a cost ladder
+            // whose later groups are deliberately metered.
+            let group_ordering = match config.group_ordering.as_deref() {
+                None => crate::selection::Grouping::Adaptive,
+                Some(name) => {
+                    if config.selection != SelectionPolicy::Grouped {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares group_ordering = \"{name}\" without selection = \"grouped\"; group ordering only describes a grouped pool"
+                        )));
+                    }
+                    match crate::selection::Grouping::from_name(name) {
+                        Some(crate::selection::Grouping::Flat) => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares group_ordering = \"flat\"; a grouped pool always orders by group"
+                            )));
+                        }
+                        Some(ordering) => ordering,
+                        None => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares unknown group_ordering = \"{name}\"; expected \"adaptive\" or \"ordered\""
+                            )));
+                        }
+                    }
+                }
+            };
             if let Some(groups) = &config.pool_groups {
-                self.validate_route_pool(route_name, config, groups)?;
+                self.validate_route_pool(
+                    route_name,
+                    config,
+                    groups,
+                    group_ordering != crate::selection::Grouping::Ordered,
+                )?;
             }
             // A grouped pool exists to compare groups, so a route that declares the policy
             // without two groups would be a `Peer` pool in disguise. Refusing it is the only
@@ -1119,33 +1179,8 @@ impl DeploymentConfig {
                     }
                 }
             }
-            // The group shape is a deployment decision, not a synonym for `Grouped`: the same
-            // membership can be deployed as equal peers or as a declared cost sequence. An
-            // unknown word is a refusal rather than a default, and `flat` is refused because a
-            // route that declares groups cannot then rank leaf by leaf.
-            let group_ordering = match config.group_ordering.as_deref() {
-                None => crate::selection::Grouping::Adaptive,
-                Some(name) => {
-                    if config.selection != SelectionPolicy::Grouped {
-                        return Err(RunnerError::configuration(format!(
-                            "route {route_name} declares group_ordering = \"{name}\" without selection = \"grouped\"; group ordering only describes a grouped pool"
-                        )));
-                    }
-                    match crate::selection::Grouping::from_name(name) {
-                        Some(crate::selection::Grouping::Flat) => {
-                            return Err(RunnerError::configuration(format!(
-                                "route {route_name} declares group_ordering = \"flat\"; a grouped pool always orders by group"
-                            )))
-                        }
-                        Some(ordering) => ordering,
-                        None => {
-                            return Err(RunnerError::configuration(format!(
-                                "route {route_name} declares unknown group_ordering = \"{name}\"; expected \"adaptive\" or \"ordered\""
-                            )))
-                        }
-                    }
-                }
-            };
+            // The group shape was read above; membership keeps the label/candidate agreement
+            // check and only the tariff rule depends on the shape.
             // The groups as model sets, resolved once here so the dispatch path never has to
             // re-derive membership from labels. Members are ordered by target name, the same
             // order the load-time membership check reads, so the plan and the check cannot
@@ -1674,6 +1709,7 @@ impl DeploymentConfig {
         route_name: &str,
         config: &RouteConfig,
         groups: &[String],
+        requires_free_members: bool,
     ) -> RunnerResult<()> {
         if groups.is_empty() {
             return Err(RunnerError::configuration(format!(
@@ -1700,12 +1736,20 @@ impl DeploymentConfig {
                     .targets
                     .get(name)
                     .expect("group membership was read from this map");
-                // The pool is a free pool by definition, so membership implies a positive
-                // free declaration. `Unknown` is refused for the same reason it is excluded
-                // at request time.
-                // One authority for the question, so the load gate and the request-time gate
-                // cannot disagree about whether a tariff is free.
-                if !switchyard_llm_client::Tariff::from_declaration(target.free_tier).is_free() {
+                // An equal-peer pool is a free pool by definition, so membership implies a
+                // positive free declaration. `Unknown` is refused for the same reason it is
+                // excluded at request time, and one authority answers the question so the load
+                // gate and the request-time gate cannot disagree about whether a tariff is
+                // free.
+                //
+                // An ORDERED pool is a different shape: its groups are a declared cost
+                // sequence, and the later ones exist precisely to be metered. Demanding a free
+                // declaration there would refuse the ladder it describes. The spending
+                // boundary for a metered group is the group ahead of it plus the existing
+                // metered admission gates, not a tariff check that would delete the group.
+                if requires_free_members
+                    && !switchyard_llm_client::Tariff::from_declaration(target.free_tier).is_free()
+                {
                     return Err(RunnerError::configuration(format!(
                         "route {route_name} pool_groups names group {group}, whose member                          {name} does not declare free_tier = true; a free peer pool cannot                          contain a target whose tariff is not positively free"
                     )));

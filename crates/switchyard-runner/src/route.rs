@@ -554,6 +554,18 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
                 | "minute_window"
                 | "http_429"
         ),
+        // The strict reading: only an affirmative statement that an allowance domain is at
+        // zero for the current window. `QuotaOnly` above also accepts a minute throttle and a
+        // bare 429, which is right for a lane whose terminal leg is a local model that costs
+        // nothing to try; it is wrong for a lane that promises to cross only once BOTH primary
+        // allowances are genuinely spent. A minute window regains room on its own, and an
+        // unclassified 429 may be a concurrency limit or a policy answer - neither is a
+        // measured exhaustion, and a stale retained reading arrives here as
+        // `daily_allowance_unavailable` rather than as exhaustion, so it is excluded too.
+        TerminalPolicy::AllowanceOnly => matches!(
+            outcome,
+            "daily_allowance_exhausted" | "provider_allowance_exhausted"
+        ),
         // Everything `Capacity` accepts except the two authentication outcomes, the two
         // faults that are about this deployment's accounting or this request's size, and a
         // delivered-stream timeout. A rejected key or a refused balance is not a capacity
@@ -1087,6 +1099,15 @@ impl Route {
         self.group_plan.groups.len() >= 2
     }
 
+    /// Whether this pool's groups are a declared cost sequence rather than equal peers.
+    ///
+    /// The two grouped shapes differ in one membership rule, not in how they rank: an
+    /// equal-peer pool is a free pool, while an ordered pool's later groups are meant to be
+    /// metered and would be deleted by a free-only gate.
+    pub fn is_ordered_pool(&self) -> bool {
+        self.is_grouped_pool() && self.group_ordering == crate::selection::Grouping::Ordered
+    }
+
     /// The ranking policy this route uses.
     ///
     /// A pool route ranks peers: no group is a stage, and the manifest's order is not a
@@ -1509,7 +1530,12 @@ impl Route {
         // them cannot smuggle a paid leg into the ranking.
         let terminal_models: std::collections::HashSet<switchyard_protocol::ModelId> =
             self.terminal_models().into_iter().collect();
-        let pool_members_only_free = self.is_peer_pool();
+        // A ranked pool is a free pool - unless its groups are a declared cost sequence. An
+        // ORDERED pool names its spending boundary in the group order itself: the metered
+        // group sits after the free ones and is offered only once they have no eligible member
+        // left, which is the protected-spend shape rather than an accident of ranking. Applying
+        // the free-only rule there would delete the very groups it describes.
+        let pool_members_only_free = self.is_peer_pool() && !self.is_ordered_pool();
         // The block gate and the capability gate are separate questions, and the terminal
         // leg's exhaustion rule needs both answers. `capability_gate` asks "could this
         // target serve this request at all"; `verdict` adds "and is it allowed to right
@@ -2969,5 +2995,200 @@ mod capability_escalation_tests {
             Err("tool_call_replay"),
             Err("daily_allowance_exhausted")
         ]));
+    }
+}
+
+/// The strict allowance boundary the NT and judge lanes deploy.
+///
+/// `QuotaOnly` is the historical "the free allowance ran out or we are being throttled"
+/// rule, which is right for a lane whose terminal leg is a local model that costs nothing
+/// to try. The NT and judge lanes promise something narrower: the local tier opens only once
+/// *both* primary allowances are genuinely spent. These tests pin the difference, because the
+/// two rules look identical in a decision record and differ by real money and real service.
+#[cfg(test)]
+mod strict_allowance_boundary_tests {
+    use super::{AttemptTrace, HashSet, ModelId, authorize_terminal};
+    use crate::config::TerminalPolicy;
+    use std::collections::HashMap;
+
+    fn legs(ids: &[(&str, &str)]) -> (Vec<ModelId>, HashMap<ModelId, String>) {
+        let mut models = Vec::new();
+        let mut credentials = HashMap::new();
+        for (model, credential) in ids {
+            let id = ModelId::from(*model);
+            models.push(id.clone());
+            credentials.insert(id, (*credential).to_string());
+        }
+        (models, credentials)
+    }
+
+    fn attempt(model: &str, outcome: &'static str) -> AttemptTrace {
+        AttemptTrace {
+            model: model.to_string(),
+            phase: "routing",
+            outcome,
+            duration_ms: 1,
+            prompt_tokens: 1,
+            completion_tokens: 0,
+        }
+    }
+
+    fn dispatchable(models: &[ModelId]) -> HashSet<ModelId> {
+        models.iter().cloned().collect()
+    }
+
+    fn authorize(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+    ) -> Option<&'static str> {
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::AllowanceOnly,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+        )
+    }
+
+    /// Two primary groups, each on its own credential: the deployed NT and judge shape.
+    fn two_domains() -> (Vec<ModelId>, HashMap<ModelId, String>) {
+        legs(&[("google", "GOOGLE"), ("openai", "OPENAI")])
+    }
+
+    /// The boundary the owner asked for: both allowance domains at zero is the one condition
+    /// that may spend the local tier.
+    #[test]
+    fn both_allowance_domains_exhausted_opens_the_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "provider_allowance_exhausted"),
+        ];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// A minute window regains room inside the same minute. Crossing on it buys a local
+    /// request to solve a problem that would have solved itself.
+    #[test]
+    fn a_minute_window_alone_never_opens_the_strict_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "minute_window"),
+        ];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None,
+            "one domain throttled is not two domains exhausted"
+        );
+    }
+
+    /// A bare 429 is unclassified: it may be a concurrency limit or a policy answer, so it
+    /// cannot stand as evidence that an allowance is spent.
+    #[test]
+    fn a_bare_429_never_opens_the_strict_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "http_429"),
+        ];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None
+        );
+    }
+
+    /// An unreadable ledger is *unknown*, and unknown is not exhausted. Earlier code folded
+    /// this into the same class, which is how a stale reading could have bought a local call.
+    #[test]
+    fn an_unreadable_ledger_never_opens_the_strict_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "daily_allowance_unavailable"),
+        ];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None
+        );
+    }
+
+    /// Everything that is a fact about the deployment or the request stops at the pool. The
+    /// list is closed on purpose: `Availability` accepts the outage classes, this rule does
+    /// not, because neither says an allowance ran out.
+    #[test]
+    fn deployment_and_request_faults_never_open_the_strict_boundary() {
+        for outcome in [
+            "http_5xx",
+            "transport",
+            "unavailable",
+            "attempt_timeout",
+            "http_401",
+            "http_402",
+            "http_400",
+            "invalid_request",
+            "unsupported_feature",
+            "empty_answer",
+            "context_window",
+            "minute_window_too_small",
+        ] {
+            let (models, credentials) = two_domains();
+            let attempts = vec![
+                attempt("google", "daily_allowance_exhausted"),
+                attempt("openai", outcome),
+            ];
+            assert_eq!(
+                authorize(&models, &dispatchable(&models), &attempts, &credentials),
+                None,
+                "{outcome} is not allowance evidence"
+            );
+        }
+    }
+
+    /// One exhausted domain does not explain a sibling on another credential that was never
+    /// tried. The other group's allowance is unknown, so the boundary is not provable.
+    #[test]
+    fn an_unattempted_second_domain_is_not_exhaustion() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![attempt("google", "daily_allowance_exhausted")];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None
+        );
+    }
+
+    /// A pool wholly blocked still needs allowance evidence, and only a quota-scoped block
+    /// counts as that. This is the "not just a generic credential block" half of the rule.
+    #[test]
+    fn a_credential_block_only_opens_the_boundary_when_it_is_allowance_scoped() {
+        let (models, credentials) = two_domains();
+        let blocked = authorize_terminal(
+            &models,
+            &HashSet::new(),
+            &[],
+            TerminalPolicy::AllowanceOnly,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+        );
+        assert_eq!(
+            blocked, None,
+            "a block that is not allowance-scoped is not exhaustion"
+        );
+
+        let allowed = authorize_terminal(
+            &models,
+            &HashSet::new(),
+            &[],
+            TerminalPolicy::AllowanceOnly,
+            |model| credentials.get(model).cloned(),
+            |_| true,
+        );
+        assert_eq!(allowed, Some("primary_pool_blocked"));
     }
 }

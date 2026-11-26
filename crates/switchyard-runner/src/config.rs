@@ -1354,16 +1354,25 @@ impl DeploymentConfig {
                     slot.insert((limit, target_name.as_str()));
                 }
             }
-            allowances.insert(
-                key,
-                Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
-                    group.clone(),
-                    counter_model,
-                    limit,
-                    path,
-                    boundary,
-                )),
-            );
+            let allowance = Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
+                group.clone(),
+                counter_model.clone(),
+                limit,
+                path,
+                boundary,
+            ));
+            // A target asks for its allowance by its own model id (see the lookup in
+            // `build_route_clients`), but a counter is filed under the identity it counts:
+            // its own model for a model-scoped group, or the group's account counter model
+            // when several models share one budget. Those are not the same key, so without
+            // this alias an account-scoped target silently resolves to no allowance at all:
+            // the manifest declares a budget, the reconciler maintains the counter, and no
+            // dispatch ever spends it.
+            let alias = (group.clone(), target.id.clone());
+            if alias != key {
+                allowances.insert(alias, Arc::clone(&allowance));
+            }
+            allowances.insert(key, allowance);
         }
         if !allowances.is_empty() {
             self.validate_quota_state_dir()?;
@@ -8123,6 +8132,31 @@ target = "free-a"
 
     fn config() -> DeploymentConfig {
         toml::from_str(BASE).expect("the fixture must parse")
+    }
+
+    /// The route builder resolves a target's allowance by its own model id, while a counter
+    /// is filed under what it counts: the account's counter model when a whole group shares
+    /// one budget. Those keys differ, and a miss is silent -- the budget is built, the
+    /// reconciler maintains the counter, and no dispatch ever spends it. Measured live on
+    /// 2026-11-26: two served free requests left `spent` at 0 with the counter file untouched.
+    #[test]
+    fn an_account_scoped_target_finds_the_allowance_it_declares() {
+        let state_dir = "/var/tmp/switchyard-quota-provider-fixture";
+        std::fs::create_dir_all(state_dir).expect("the fixture state dir must exist");
+        let config = config();
+        let allowances = config.build_allowances().expect("the fixture must build");
+        let by_target = allowances
+            .keys()
+            .any(|(group, model)| group == "openrouter-free-owner" && model.as_str() == "vendor/free-a");
+        let by_counter = allowances
+            .keys()
+            .any(|(group, model)| group == "openrouter-free-owner" && model.as_str() != "vendor/free-a");
+        assert!(
+            by_target,
+            "the key the route builder asks for must resolve, keys were {:?}",
+            allowances.keys().map(|(g, m)| (g.as_str(), m.as_str())).collect::<Vec<_>>()
+        );
+        assert!(by_counter, "the counter's own key must stay addressable");
     }
 
     /// The declared pool is read into the typed form, so the loader never carries a free

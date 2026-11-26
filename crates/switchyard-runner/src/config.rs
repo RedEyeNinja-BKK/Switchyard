@@ -276,6 +276,14 @@ struct RouteConfig {
     escalation_max_input_tokens: Option<u64>,
     /// Groups whose members form this route's candidate pool, when it declares one.
     pool_groups: Option<Vec<String>>,
+    /// How a grouped pool orders its groups against each other.
+    ///
+    /// `adaptive` (the default) treats them as equal peers whose order follows readiness,
+    /// completion rate and latency; `ordered` treats the declared sequence as the priority
+    /// order and exhausts each group before offering the next. `flat` is refused here: a
+    /// grouped pool always groups, and the word exists only so the shared vocabulary can say
+    /// what the other policies are.
+    group_ordering: Option<String>,
     /// Targets this route may reach only after its entire eligible primary pool is
     /// verifiably unavailable, in declared order.
     ///
@@ -585,6 +593,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let pool_groups = take_optional(&mut table, "pool_groups")?;
+        let group_ordering = take_optional::<String, _>(&mut table, "group_ordering")?;
         let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
         let terminal_policy = take_optional(&mut table, "terminal_policy")?;
         let terminal_policies = take_optional(&mut table, "terminal_policies")?;
@@ -607,6 +616,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
             pool_groups,
+            group_ordering,
             terminal_fallback,
             terminal_policy,
             terminal_policies,
@@ -1109,6 +1119,33 @@ impl DeploymentConfig {
                     }
                 }
             }
+            // The group shape is a deployment decision, not a synonym for `Grouped`: the same
+            // membership can be deployed as equal peers or as a declared cost sequence. An
+            // unknown word is a refusal rather than a default, and `flat` is refused because a
+            // route that declares groups cannot then rank leaf by leaf.
+            let group_ordering = match config.group_ordering.as_deref() {
+                None => crate::selection::Grouping::Adaptive,
+                Some(name) => {
+                    if config.selection != SelectionPolicy::Grouped {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares group_ordering = \"{name}\" without selection = \"grouped\"; group ordering only describes a grouped pool"
+                        )));
+                    }
+                    match crate::selection::Grouping::from_name(name) {
+                        Some(crate::selection::Grouping::Flat) => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares group_ordering = \"flat\"; a grouped pool always orders by group"
+                            )))
+                        }
+                        Some(ordering) => ordering,
+                        None => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares unknown group_ordering = \"{name}\"; expected \"adaptive\" or \"ordered\""
+                            )))
+                        }
+                    }
+                }
+            };
             // The groups as model sets, resolved once here so the dispatch path never has to
             // re-derive membership from labels. Members are ordered by target name, the same
             // order the load-time membership check reads, so the plan and the check cannot
@@ -1289,7 +1326,8 @@ impl DeploymentConfig {
                 crate::config::SelectionPolicy::Grouped => route
                     .with_measured_selection(Arc::clone(&measured_selector))
                     .with_pool_groups(config.pool_groups.clone().unwrap_or_default())
-                    .with_group_plan(group_plan.clone().unwrap_or_default()),
+                    .with_group_plan(group_plan.clone().unwrap_or_default())
+                    .with_group_ordering(group_ordering),
                 crate::config::SelectionPolicy::Declared => route,
             };
             routes.push((config.id.clone(), route));

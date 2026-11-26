@@ -476,3 +476,109 @@ fn a_boundary_policy_list_must_match_the_tiers() {
     let error = load_error(&config);
     assert!(error.contains("one value per tier"), "{error}");
 }
+
+/// An ordered pool is the cost shape: the declared group sequence is the priority, so the
+/// second group is not offered while the first still has an eligible member - and, unlike the
+/// equal-peer pool, repeated requests do not rotate between them.
+#[tokio::test]
+async fn an_ordered_pool_walks_its_first_group_before_the_second() {
+    let first = Upstream::new(|model| Some((200, success(model))));
+    let second = Upstream::new(|model| Some((200, success(model))));
+    let first_url = first.clone().server();
+    let second_url = second.clone().server();
+    let quota = tempfile::tempdir().expect("quota dir");
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n{}{}{}{}{}\n\
+         [routes.smart-route]\nid = \"smart-route\"\ntype = \"passthrough\"\n\
+         selection = \"grouped\"\ngroup_ordering = \"ordered\"\n\
+         pool_groups = [\"smart-gemini-chat\", \"smart-openrouter-free\"]\n\
+         target = \"c1\"\ncandidates = [\"c2\", \"f1\"]\n",
+        quota.path().display(),
+        client("google", &first_url),
+        client("openrouter", &second_url),
+        grouped_leaf("c1", "google", "vendor/c1", "smart-gemini-chat", 500),
+        grouped_leaf("c2", "google", "vendor/c2", "smart-gemini-chat", 500),
+        grouped_leaf("f1", "openrouter", "free/f1", "smart-openrouter-free", 500),
+    );
+    std::mem::forget(quota);
+    let state = switchyard_server::ServerState::from_runner(runner(&config)).expect("state");
+    let router = switchyard_server::build_switchyard_router(state);
+
+    for _ in 0..3 {
+        let (status, body) = call(&router, "smart-route", "hi").await;
+        assert!(status.is_success(), "{body}");
+        assert!(
+            body["model"].as_str().unwrap_or_default().starts_with("vendor/"),
+            "the cheap group answers while it can: {body}"
+        );
+    }
+    assert_eq!(
+        second.calls(),
+        0,
+        "the paid group is not offered while the cheap group has a member left"
+    );
+    assert_eq!(
+        first.calls(),
+        3,
+        "no rotation between ordered groups: every request starts at the first group"
+    );
+}
+
+/// The group shape is a deployment decision with two exact words; anything else is refused
+/// rather than defaulted, because a typo would silently deploy the other policy.
+#[test]
+fn an_unknown_group_ordering_is_refused() {
+    let quota = tempfile::tempdir().expect("quota dir");
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n{}{}{}\n\
+         [routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\n\
+         selection = \"grouped\"\ngroup_ordering = \"cheapest\"\n\
+         pool_groups = [\"smart-gemini-bounded\", \"smart-openai-nt\"]\n\
+         target = \"g1\"\ncandidates = [\"o1\"]\n",
+        quota.path().display(),
+        client("google", "http://127.0.0.1:1/v1"),
+        grouped_leaf("g1", "google", "vendor/g1", "smart-gemini-bounded", 500),
+        grouped_leaf("o1", "google", "vendor/o1", "smart-openai-nt", 500),
+    );
+    std::mem::forget(quota);
+    let error = load_error(&config);
+    assert!(error.contains("unknown group_ordering"), "{error}");
+}
+
+/// `flat` is the absence of grouping, so it cannot be stated for a grouped pool.
+#[test]
+fn a_flat_group_ordering_is_refused() {
+    let quota = tempfile::tempdir().expect("quota dir");
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n{}{}{}\n\
+         [routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\n\
+         selection = \"grouped\"\ngroup_ordering = \"flat\"\n\
+         pool_groups = [\"smart-gemini-bounded\", \"smart-openai-nt\"]\n\
+         target = \"g1\"\ncandidates = [\"o1\"]\n",
+        quota.path().display(),
+        client("google", "http://127.0.0.1:1/v1"),
+        grouped_leaf("g1", "google", "vendor/g1", "smart-gemini-bounded", 500),
+        grouped_leaf("o1", "google", "vendor/o1", "smart-openai-nt", 500),
+    );
+    std::mem::forget(quota);
+    let error = load_error(&config);
+    assert!(error.contains("always orders by group"), "{error}");
+}
+
+/// A group ordering on a route that does not group would be read by nobody; refusing it
+/// keeps the manifest from claiming a policy the route does not have.
+#[test]
+fn a_group_ordering_without_grouped_selection_is_refused() {
+    let quota = tempfile::tempdir().expect("quota dir");
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n{}{}\n\
+         [routes.smart-nt]\nid = \"smart-nt\"\ntype = \"passthrough\"\n\
+         group_ordering = \"ordered\"\ntarget = \"g1\"\ncandidates = []\n",
+        quota.path().display(),
+        client("google", "http://127.0.0.1:1/v1"),
+        grouped_leaf("g1", "google", "vendor/g1", "smart-gemini-bounded", 500),
+    );
+    std::mem::forget(quota);
+    let error = load_error(&config);
+    assert!(error.contains("without selection"), "{error}");
+}

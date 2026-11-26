@@ -107,6 +107,18 @@ pub struct RankingPolicy {
     pub grouping: Grouping,
 }
 
+/// The ranking policy a grouped pool of the given shape uses.
+///
+/// Kept as a free function so the dispatch path cannot ask for the adaptive policy and then
+/// rank with a different one: the [`Grouping`] value the group order was computed with is the
+/// same value that selects the leaf keys.
+pub fn grouped_policy(grouping: Grouping) -> RankingPolicy {
+    match grouping {
+        Grouping::Ordered => RankingPolicy::ORDERED_GROUPS,
+        Grouping::Flat | Grouping::Adaptive => RankingPolicy::GROUPED,
+    }
+}
+
 impl RankingPolicy {
     /// The historical policy: declared order breaks ties, and an undeclared budget is
     /// treated as `u64::MAX` claimed requests for ordering purposes.
@@ -134,12 +146,26 @@ impl RankingPolicy {
     /// share a request budget, so "more requests left" is not a common yardstick, and a group
     /// with four leaves would win a per-leaf count for reasons that have nothing to do with
     /// which provider is the better choice. The group order is computed separately from
-    /// readiness, measured health and measured latency, with a rotation floor so that two
+    /// readiness, measured completion rate, measured latency, and a rotation floor so that two
     /// equally-evidenced groups are actually both used.
     pub const GROUPED: Self = Self {
         tie_break: TieBreak::CanonicalId,
         unknown_headroom: UnknownHeadroom::AfterKnown,
         grouping: Grouping::Adaptive,
+    };
+
+    /// The policy a pool of ORDERED groups uses: the declared group sequence is the priority
+    /// order, and a group is exhausted before the next one is offered.
+    ///
+    /// This is the cost-efficiency shape rather than the equal-peer shape. Its groups are not
+    /// interchangeable - the later ones cost more - so no evidence may let an expensive group
+    /// jump ahead of a cheap group that can still answer. Inside a group the leaf keys still
+    /// choose the best member for the request, which is what keeps the preference order from
+    /// becoming a fixed leaf order.
+    pub const ORDERED_GROUPS: Self = Self {
+        tie_break: TieBreak::CanonicalId,
+        unknown_headroom: UnknownHeadroom::AfterKnown,
+        grouping: Grouping::Ordered,
     };
 }
 
@@ -150,8 +176,35 @@ pub enum Grouping {
     #[default]
     Flat,
     /// Candidates keep their group; the group is chosen first and the leaf keys order its
-    /// members. Only meaningful with a [`GroupPlan`].
+    /// members. Equal peers: the group order adapts to measured readiness, completion rate and
+    /// latency, and rotates between equals. Only meaningful with a [`GroupPlan`].
     Adaptive,
+    /// Candidates keep their group, and the declared group sequence is the order. A group is
+    /// exhausted before the next is offered; evidence may reorder leaves inside a group but
+    /// never promotes a later group over an earlier one. Only meaningful with a [`GroupPlan`].
+    Ordered,
+}
+
+impl Grouping {
+    /// The manifest spelling, and the inverse of [`Self::from_name`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Adaptive => "adaptive",
+            Self::Ordered => "ordered",
+        }
+    }
+
+    /// Reads a manifest spelling. `None` for an unknown word rather than a default, so a
+    /// misspelling is a load refusal instead of a silent behaviour change.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "flat" => Some(Self::Flat),
+            "adaptive" => Some(Self::Adaptive),
+            "ordered" => Some(Self::Ordered),
+            _ => None,
+        }
+    }
 }
 
 /// One declared group of a grouped pool.
@@ -510,13 +563,14 @@ impl MeasuredSelector {
         demand: Demand,
         declared: &[ModelId],
         plan: &GroupPlan,
+        grouping: Grouping,
     ) -> Vec<CandidateScore> {
-        let ranks = self.group_ranks(candidates, plan, true);
+        let ranks = self.group_ranks(candidates, plan, grouping, true);
         self.explain_with_ranks(
             candidates,
             demand,
             declared,
-            RankingPolicy::GROUPED,
+            grouped_policy(grouping),
             Some(&ranks),
         )
     }
@@ -528,40 +582,49 @@ impl MeasuredSelector {
         demand: Demand,
         declared: &[ModelId],
         plan: &GroupPlan,
+        grouping: Grouping,
     ) -> Vec<CandidateScore> {
-        let ranks = self.group_ranks(candidates, plan, false);
+        let ranks = self.group_ranks(candidates, plan, grouping, false);
         self.explain_with_ranks(
             candidates,
             demand,
             declared,
-            RankingPolicy::GROUPED,
+            grouped_policy(grouping),
             Some(&ranks),
         )
     }
 
     /// Orders the declared groups and returns each admitted model's group rank.
     ///
-    /// The group comparison uses only what is comparable between two providers: whether the
-    /// group has anything left to offer at all, whether every one of its measured members is
-    /// failing, and how fast its measured members have been. Request budgets are deliberately
-    /// absent: a declared daily budget is a fact about one provider's allowance, and using it
-    /// to order *between* providers would turn "we can count this one" into "prefer this
-    /// one", which is the four-leaf-first defect in another spelling.
+    /// The adaptive comparison uses only what is comparable between two providers: whether
+    /// the group has anything left to offer at all, whether every one of its measured members
+    /// is failing, its measured completion rate, and how fast its measured members have been.
+    /// Request budgets are deliberately absent: a declared daily budget is a fact about one
+    /// provider's allowance, and using it to order *between* providers would turn "we can count
+    /// this one" into "prefer this one", which is the four-leaf-first defect in another
+    /// spelling.
+    ///
+    /// An ordered pool does not compare groups at all: the declared sequence is the priority
+    /// order, so a later group is never offered while an earlier one has a member left. That is
+    /// the cost-efficiency shape, where the groups differ in price rather than in quality.
     ///
     /// `advance` records the chosen head so the next request starts from the other group when
-    /// the evidence cannot separate them.
+    /// the evidence cannot separate them. Only an adaptive pool rotates; an ordered pool has
+    /// nothing to rotate between.
     fn group_ranks(
         &self,
         candidates: &[Candidate],
         plan: &GroupPlan,
+        grouping: Grouping,
         advance: bool,
     ) -> HashMap<ModelId, u32> {
         let evidence = self.evidence.lock();
         let by_model: HashMap<&ModelId, &Candidate> =
             candidates.iter().map(|c| (&c.model, c)).collect();
         let mut rotation = self.rotation.lock();
-        let mut order: Vec<(bool, bool, u64, u64, String)> = Vec::new();
-        for group in &plan.groups {
+        let ordered = grouping == Grouping::Ordered;
+        let mut order: Vec<(u32, bool, u32, u64, u64, String)> = Vec::new();
+        for (index, group) in plan.groups.iter().enumerate() {
             let members: Vec<&Candidate> = group
                 .members
                 .iter()
@@ -576,47 +639,72 @@ impl MeasuredSelector {
             let ready = members
                 .iter()
                 .any(|candidate| candidate.remaining_today != Some(0));
-            // Only a group whose every measured member is failing is demoted. A group with
-            // no sample at all keeps its place: no data is not bad data, and demoting it
-            // would make the first few requests of a process a self-fulfilling prophecy.
-            let measured: Vec<(bool, u64)> = members
+            // A group's measured completion rate, as per-mille with the same prior the leaf
+            // keys use, averaged over its MEASURED members. A group with no sample at all
+            // reads 1000: no data is not bad data, and demoting it would make the first
+            // requests of a process a self-fulfilling prophecy.
+            //
+            // This one key replaces the "every measured member is failing" flag the first
+            // draft carried. That flag could never change an order once this number exists:
+            // a group whose members all sit below the 500-per-mille unhealthy threshold has a
+            // mean below 500 too, so the flag was a dead key that looked like a safeguard.
+            // The mean is taken over members rather than calls so a group with more leaves
+            // does not get a louder voice for having more leaves.
+            let measured: Vec<(u32, u64)> = members
                 .iter()
                 .filter_map(|candidate| {
-                    evidence
-                        .get(&candidate.model)
-                        .filter(|e| e.is_measured())
-                        .map(|e| (e.is_unhealthy(), e.latency_millis()))
+                    evidence.get(&candidate.model).filter(|e| e.is_measured()).map(|e| {
+                        (
+                            ((e.reliability() * 1000.0).round() as u32).min(1000),
+                            e.latency_millis(),
+                        )
+                    })
                 })
                 .collect();
-            let all_measured_unhealthy =
-                !measured.is_empty() && measured.iter().all(|(unhealthy, _)| *unhealthy);
+            let completion = if measured.is_empty() {
+                1000
+            } else {
+                measured.iter().map(|(permille, _)| *permille).sum::<u32>()
+                    / measured.len() as u32
+            };
             let mean_latency = if measured.is_empty() {
                 u64::MAX
             } else {
                 measured.iter().map(|(_, latency)| *latency).sum::<u64>()
                     / measured.len() as u64
             };
-            let last_served = rotation.last_served.get(&group.name).copied().unwrap_or(0);
+            let last_served = if ordered {
+                0
+            } else {
+                rotation.last_served.get(&group.name).copied().unwrap_or(0)
+            };
+            // An ordered pool keeps the declared index ahead of every evidence key: the
+            // groups are a price sequence, and a cheap group that is measurably worse is
+            // still the one the deployment chose to spend first. The leaf keys inside the
+            // group are what pick a fast member when the group has one.
+            let declared_rank = if ordered { index as u32 } else { 0 };
+            let readiness = if ordered { false } else { !ready };
             order.push((
-                !ready,
-                all_measured_unhealthy,
+                declared_rank,
+                readiness,
+                1000u32.saturating_sub(completion),
                 mean_latency,
                 last_served,
                 group.name.clone(),
             ));
         }
         order.sort();
-        if advance {
+        if advance && !ordered {
             if let Some(head) = order.first() {
                 rotation.tick = rotation.tick.saturating_add(1);
                 let tick = rotation.tick;
-                rotation.last_served.insert(head.4.clone(), tick);
+                rotation.last_served.insert(head.5.clone(), tick);
             }
         }
         let rank_of: HashMap<&str, u32> = order
             .iter()
             .enumerate()
-            .map(|(rank, entry)| (entry.4.as_str(), rank as u32))
+            .map(|(rank, entry)| (entry.5.as_str(), rank as u32))
             .collect();
         plan.groups
             .iter()
@@ -1083,7 +1171,7 @@ mod tests {
         let declared = models(&["g1", "g2", "g3", "g4", "o1"]);
         let heads: Vec<&'static str> = (0..6)
             .map(|_| {
-                let scores = selector.explain_grouped(&candidates, small(), &declared, &plan);
+                let scores = selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
                 group_of(scores[0].model.as_str())
             })
             .collect();
@@ -1102,7 +1190,7 @@ mod tests {
             selector.observe(&call("g1", true, 4_000));
             selector.observe(&call("o1", true, 400));
         }
-        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan);
+        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
         assert_eq!(
             scores[0].model.as_str(),
             "o1",
@@ -1130,7 +1218,7 @@ mod tests {
             ("smart-openai-nt", &["o1"]),
         ]);
         let declared = models(&["g1", "g2", "g3", "g4", "o1"]);
-        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan);
+        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
         assert_eq!(scores[0].model.as_str(), "o1");
     }
 
@@ -1150,7 +1238,7 @@ mod tests {
             ("smart-openai-nt", &["o1"]),
         ]);
         let declared = models(&["g1", "g2", "g3", "o1"]);
-        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan);
+        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
         let position = |model: &str| {
             scores
                 .iter()
@@ -1178,19 +1266,19 @@ mod tests {
         let fast = vec![free("g1", 5, 250_000), free_unknown("o1")];
         let spent = vec![free("g1", 0, 250_000), free_unknown("o1")];
         assert_eq!(
-            selector.explain_grouped(&fast, small(), &declared, &plan)[0]
+            selector.explain_grouped(&fast, small(), &declared, &plan, Grouping::Adaptive)[0]
                 .model
                 .as_str(),
             "g1"
         );
         assert_eq!(
-            selector.explain_grouped(&spent, small(), &declared, &plan)[0]
+            selector.explain_grouped(&spent, small(), &declared, &plan, Grouping::Adaptive)[0]
                 .model
                 .as_str(),
             "o1"
         );
         assert_eq!(
-            selector.explain_grouped(&fast, small(), &declared, &plan)[0]
+            selector.explain_grouped(&fast, small(), &declared, &plan, Grouping::Adaptive)[0]
                 .model
                 .as_str(),
             "g1",
@@ -1208,7 +1296,7 @@ mod tests {
                 selector.observe(&call(leaf, false, 50));
             }
         }
-        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan);
+        let scores = selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
         assert_eq!(
             scores[0].model.as_str(),
             "o1",
@@ -1221,16 +1309,129 @@ mod tests {
         let selector = MeasuredSelector::new();
         let (candidates, plan) = four_google_one_openai();
         let declared = models(&["g1", "g2", "g3", "g4", "o1"]);
-        let once = selector.explain_grouped_preview(&candidates, small(), &declared, &plan);
-        let twice = selector.explain_grouped_preview(&candidates, small(), &declared, &plan);
+        let once = selector.explain_grouped_preview(&candidates, small(), &declared, &plan, Grouping::Adaptive);
+        let twice = selector.explain_grouped_preview(&candidates, small(), &declared, &plan, Grouping::Adaptive);
         assert_eq!(once[0].model, twice[0].model);
         // And the real dispatch path still rotates afterwards.
-        let dispatched = selector.explain_grouped(&candidates, small(), &declared, &plan);
-        let next = selector.explain_grouped(&candidates, small(), &declared, &plan);
+        let dispatched = selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
+        let next = selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
         assert_eq!(dispatched[0].model, once[0].model);
         assert_ne!(
             next[0].model, dispatched[0].model,
             "the first real dispatch consumed the rotation step"
+        );
+    }
+
+    #[test]
+    fn an_ordered_pool_exhausts_the_preferred_group_before_the_next() {
+        // The cost shape: the groups are a price sequence, not peers. The second group is
+        // measurably faster and healthier, and it must still wait, because the deployment
+        // chose to spend the cheap group first. Inside the cheap group the leaf keys do
+        // decide, so the weaker cheap leaf is not forced to the front.
+        let selector = MeasuredSelector::new();
+        let candidates = vec![
+            free("c1", 500, 250_000),
+            free("c2", 500, 250_000),
+            free("x1", 500, 250_000),
+        ];
+        let plan = plan(&[("cheap", &["c1", "c2"]), ("expensive", &["x1"])]);
+        let declared = models(&["c1", "c2", "x1"]);
+        for _ in 0..4 {
+            selector.observe(&call("c1", false, 9_000));
+            selector.observe(&call("c2", true, 8_000));
+            selector.observe(&call("x1", true, 100));
+        }
+        let scores =
+            selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Ordered);
+        let position = |model: &str| {
+            scores
+                .iter()
+                .position(|score| score.model.as_str() == model)
+                .expect("candidate is ranked")
+        };
+        assert!(position("c1") < position("x1"));
+        assert!(position("c2") < position("x1"));
+        assert!(
+            position("c2") < position("c1"),
+            "the leaf keys still choose the better member inside the group"
+        );
+    }
+
+    #[test]
+    fn ordered_groups_do_not_rotate_between_equals() {
+        // Rotation exists to share traffic between interchangeable groups. A price sequence
+        // has nothing to share: repeated dispatches must keep landing on the cheap group.
+        let selector = MeasuredSelector::new();
+        let candidates = vec![free("c1", 500, 250_000), free("x1", 500, 250_000)];
+        let plan = plan(&[("cheap", &["c1"]), ("expensive", &["x1"])]);
+        let declared = models(&["c1", "x1"]);
+        let heads: Vec<String> = (0..4)
+            .map(|_| {
+                selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Ordered)
+                    [0]
+                .model
+                .as_str()
+                .to_string()
+            })
+            .collect();
+        assert_eq!(heads, vec!["c1", "c1", "c1", "c1"]);
+    }
+
+    #[test]
+    fn an_ordered_dispatch_does_not_spend_a_rotation_step() {
+        // The rotation map is process-wide and keyed by group label, so two routes that name
+        // the same groups share it. An ordered route picks the same head every time and has
+        // nothing to share: recording it as served would bias an adaptive route over those
+        // labels away from a group that was never given a turn it could have used.
+        let selector = MeasuredSelector::new();
+        let candidates = vec![free("a1", 500, 250_000), free("b1", 500, 250_000)];
+        let declared = models(&["a1", "b1"]);
+        let plan = plan(&[("a", &["a1"]), ("b", &["b1"])]);
+        selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Ordered);
+        let preview =
+            selector.explain_grouped_preview(&candidates, small(), &declared, &plan, Grouping::Adaptive);
+        assert_eq!(
+            preview[0].model.as_str(),
+            "a1",
+            "the ordered dispatch left the adaptive rotation untouched"
+        );
+    }
+
+    #[test]
+    fn a_group_with_a_worse_completion_rate_yields_to_a_healthier_one() {
+        // Neither group is wholly failing, so the all-unhealthy key cannot separate them.
+        // The completion rate has to, or a group that answers two calls in three would keep
+        // winning on a rotation floor while a peer answers every call.
+        let selector = MeasuredSelector::new();
+        let candidates = vec![
+            free("g1", 500, 250_000),
+            free("g2", 500, 250_000),
+            free("o1", 500, 250_000),
+        ];
+        let plan = plan(&[
+            ("google", &["g1", "g2"]),
+            ("openai", &["o1"]),
+        ]);
+        let declared = models(&["g1", "g2", "o1"]);
+        for _ in 0..3 {
+            selector.observe(&call("g1", false, 100));
+            selector.observe(&call("g2", true, 100));
+            selector.observe(&call("o1", true, 100));
+        }
+        let scores =
+            selector.explain_grouped(&candidates, small(), &declared, &plan, Grouping::Adaptive);
+        assert_eq!(
+            scores[0].model.as_str(),
+            "o1",
+            "the group answering every call outranks the one answering half of them"
+        );
+        assert!(
+            !scores
+                .iter()
+                .find(|score| score.model.as_str() == "g2")
+                .expect("g2 is ranked")
+                .unhealthy,
+            "the healthy member is not what demoted its group"
         );
     }
 }

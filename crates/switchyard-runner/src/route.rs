@@ -767,6 +767,12 @@ pub struct Route {
     /// time so the dispatch path never re-derives it from labels, and so a group the manifest
     /// does not describe cannot be invented mid-request.
     group_plan: crate::selection::GroupPlan,
+    /// How the declared groups order the pool: equal peers that adapt and rotate, or a
+    /// declared cost sequence in which each group is exhausted before the next.
+    ///
+    /// Carried beside the plan rather than inside it because the same membership can be
+    /// deployed under either reading, and the reading is what a deployment decides.
+    group_ordering: crate::selection::Grouping,
     /// Targets this route may reach only when every eligible primary candidate is
     /// verifiably unavailable, grouped into ordered tiers.
     ///
@@ -868,6 +874,7 @@ impl Route {
             held: None,
             pool_groups: None,
             group_plan: crate::selection::GroupPlan::default(),
+            group_ordering: crate::selection::Grouping::Adaptive,
             terminal: Vec::new(),
             terminal_policy: TerminalPolicy::default(),
             terminal_policies: Vec::new(),
@@ -1064,6 +1071,18 @@ impl Route {
     }
 
     /// Whether this route chooses a group before it chooses a leaf.
+    /// Declares how the groups are ordered against each other.
+    ///
+    /// `Adaptive` is the equal-peer reading: readiness, completion rate, latency and a
+    /// rotation floor decide between interchangeable groups. `Ordered` is the cost reading:
+    /// the declared sequence is the priority, and a later group is offered only once the
+    /// earlier one has no eligible member left. `Flat` is refused for a grouped pool by the
+    /// loader, so a route cannot hold a plan and rank leaf by leaf.
+    pub fn with_group_ordering(mut self, ordering: crate::selection::Grouping) -> Self {
+        self.group_ordering = ordering;
+        self
+    }
+
     pub fn is_grouped_pool(&self) -> bool {
         self.group_plan.groups.len() >= 2
     }
@@ -1729,7 +1748,13 @@ impl Route {
                 scores = if self.is_grouped_pool() {
                     // One request, one rotation step: the group decision is recorded here,
                     // where the dispatch order is actually decided.
-                    selector.explain_grouped(&candidates, demand, &declared, &self.group_plan)
+                    selector.explain_grouped(
+                        &candidates,
+                        demand,
+                        &declared,
+                        &self.group_plan,
+                        self.group_ordering,
+                    )
                 } else {
                     selector.explain_with(&candidates, demand, &declared, self.ranking_policy())
                 };

@@ -581,3 +581,57 @@ async fn a_free_leaf_retries_a_5xx_once_and_keeps_both_reservations() {
         "{counter}: both dispatched attempts reserve, and neither is refunded"
     );
 }
+
+/// A route advances to a sibling on a throttle, and both dispatches are accounted once.
+///
+/// This is the live shape the retry policy was written for: a route whose first
+/// candidate answers 429 must not spend further requests on that candidate, must still
+/// try the sibling the route names, and must charge the shared account exactly once per
+/// provider dispatch. Asserting only the caller's status would pass while the counter
+/// drifted, and asserting only the counter would pass while the route gave up early.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_throttled_candidate_yields_to_its_sibling_and_each_dispatch_is_counted_once() {
+    let dir = state_dir("sibling");
+    let throttled = Upstream::failing(429);
+    let throttled_url = throttled.clone().url();
+    let healthy = Upstream::new();
+    let healthy_url = healthy.clone().url();
+
+    // Two clients sharing one quota group, because the two candidates are two models on
+    // the same free account: the budget is one counter, and both legs draw on it.
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n\n\
+         [llm_clients.free_a]\nformat = \"openai_responses\"\nbase_url = \"{throttled_url}\"\n\
+         quota_group = \"openrouter-free-owner\"\nquota_scope = \"account\"\n\
+         quota_reset = \"utc\"\nmax_retries = 2\n\n\
+         [llm_clients.free_b]\nformat = \"openai_responses\"\nbase_url = \"{healthy_url}\"\n\
+         quota_group = \"openrouter-free-owner\"\nquota_scope = \"account\"\n\
+         quota_reset = \"utc\"\nmax_retries = 2\n\n\
+         [targets.free-a]\nid = \"vendor/free-a\"\nllm_client = \"free_a\"\n\
+         vision = false\nvideo = false\ndaily_request_limit = 100\n\n\
+         [targets.free-b]\nid = \"vendor/free-b\"\nllm_client = \"free_b\"\n\
+         vision = false\nvideo = false\ndaily_request_limit = 100\n\n\
+         [routes.pair]\nid = \"pair\"\ntype = \"passthrough\"\ntarget = \"free-a\"\n\
+         candidates = [\"free-b\"]\n",
+        dir.display()
+    );
+
+    let (status, body) = call(&config, "pair").await;
+    assert_eq!(status, StatusCode::OK, "the sibling should have served: {body}");
+    assert_eq!(
+        throttled.calls(),
+        1,
+        "a 429 must not be resent to the same metered target"
+    );
+    assert_eq!(healthy.calls(), 1, "the sibling must be tried exactly once");
+    assert_eq!(
+        healthy.models().await,
+        vec!["vendor/free-b".to_string()],
+        "the served answer must come from the sibling"
+    );
+    let (counter, spent, _) = only_counter(&dir);
+    assert_eq!(
+        spent, 2,
+        "{counter}: one reservation per provider dispatch, and no more"
+    );
+}

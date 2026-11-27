@@ -55,6 +55,19 @@ use switchyard_protocol::ModelId;
 /// on it would make routing order noisy exactly when a deployment is newest.
 const MIN_OBSERVATIONS: u32 = 3;
 
+/// How many rotation ticks a ready group may be starved behind a healthier peer before it
+/// is offered one bounded recovery opportunity on ordinary traffic.
+///
+/// Without this, a group that failed during an outage (e.g. allowance exhaustion) carries
+/// its old negative Evidence forever: `completion < 1000` keeps it behind a healthy peer,
+/// it is never dispatched, so it never earns the new observations that would restore its
+/// ranking, and rotation (the last sort key) never breaks the tie because the groups are
+/// not tied. The recovery window ages out that starvation for exactly one dispatch, after
+/// which the group must earn its place again from what that dispatch measured. It is not a
+/// background probe and not a forced allowance spend: the recovery dispatch is an ordinary
+/// request the route was already going to make.
+const RECOVERY_WINDOW: u64 = 8;
+
 /// Weight of the newest latency sample in the average.
 ///
 /// A slow minute should move the ranking without erasing everything measured before it,
@@ -232,6 +245,11 @@ pub struct GroupPlan {
 struct GroupRotation {
     tick: u64,
     last_served: HashMap<String, u64>,
+    /// The tick at which each group was last observed ready-but-starved behind a healthier
+    /// peer. A group whose starvation exceeds [`RECOVERY_WINDOW`] is offered one recovery
+    /// dispatch. Cleared when the group is served, so recovery is bounded per starvation
+    /// episode rather than a permanent reset.
+    starved_since: HashMap<String, u64>,
 }
 
 /// What separates two candidates the facts and the evidence cannot order.
@@ -618,7 +636,7 @@ impl MeasuredSelector {
         grouping: Grouping,
         advance: bool,
     ) -> HashMap<ModelId, u32> {
-        let evidence = self.evidence.lock();
+        let mut evidence = self.evidence.lock();
         let by_model: HashMap<&ModelId, &Candidate> =
             candidates.iter().map(|c| (&c.model, c)).collect();
         let mut rotation = self.rotation.lock();
@@ -667,6 +685,34 @@ impl MeasuredSelector {
                 measured.iter().map(|(permille, _)| *permille).sum::<u32>()
                     / measured.len() as u32
             };
+            // Bounded recovery: a ready group whose measured completion is being outranked by
+            // a healthier peer, and which has been starved longer than RECOVERY_WINDOW, is
+            // treated as unmeasured for THIS dispatch so it gets one ordinary-traffic chance
+            // to earn fresh evidence. The starvation clock is keyed on the group and cleared
+            // when it is served, so recovery is bounded per episode, not a permanent reset.
+            let completion = if !ordered && ready && completion < 1000 {
+                let now = rotation.tick;
+                let starved = rotation
+                    .starved_since
+                    .get(&group.name)
+                    .copied()
+                    .unwrap_or(now);
+                if now.saturating_sub(starved) >= RECOVERY_WINDOW {
+                    // Age out the stale evidence for this group's members so the recovery
+                    // dispatch is judged on fresh data, not old failures. Bounded per episode:
+                    // the clock resets when the group is served.
+                    for member in &members {
+                        evidence.insert(member.model.clone(), Evidence::default());
+                    }
+                    rotation.starved_since.insert(group.name.clone(), now);
+                    1000
+                } else {
+                    rotation.starved_since.entry(group.name.clone()).or_insert(starved);
+                    completion
+                }
+            } else {
+                completion
+            };
             let mean_latency = if measured.is_empty() {
                 u64::MAX
             } else {
@@ -699,6 +745,9 @@ impl MeasuredSelector {
                 rotation.tick = rotation.tick.saturating_add(1);
                 let tick = rotation.tick;
                 rotation.last_served.insert(head.5.clone(), tick);
+                // The head group was served, so any starvation episode for it ends here;
+                // recovery is bounded per episode, not permanent.
+                rotation.starved_since.remove(&head.5);
             }
         }
         let rank_of: HashMap<&str, u32> = order
@@ -1304,6 +1353,76 @@ mod tests {
         );
     }
 
+    // STARVATION + RECOVERY (reviewer hypothesis, source-confirmed): a group that failed
+    // during a genuine outage (e.g. allowance exhaustion) accumulates negative Evidence with
+    // no observation-age field. When the outage clears and the group's allowance recovers, the
+    // old failures persist and `completion < 1000` would keep the group ranked behind a healthy
+    // peer forever, never dispatched, never earning new observations. The fix offers a bounded
+    // recovery opportunity after RECOVERY_WINDOW ticks of starvation, on ordinary traffic.
+    #[test]
+    fn a_recovered_group_with_old_failures_gets_a_bounded_recovery_opportunity() {
+        let selector = MeasuredSelector::new();
+        let plan = plan(&[
+            ("smart-gemini-bounded", &["g1"]),
+            ("smart-openai-nt", &["o1"]),
+        ]);
+        let declared = models(&["g1", "o1"]);
+        // During the outage: Luna (o1) fails repeatedly; Google (g1) serves successfully.
+        for _ in 0..5 {
+            selector.observe(&call("g1", true, 100));
+            selector.observe(&call("o1", false, 50));
+        }
+        let recovered = vec![free("g1", 5, 250_000), free_unknown("o1")];
+        // Before the recovery window elapses, healthy Google stays ahead (no premature reset).
+        let early = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(early, "g1", "before the window, the healthy peer keeps its place");
+        // Drive ordinary dispatches (each consumes a rotation tick) past the recovery window.
+        for _ in 0..RECOVERY_WINDOW {
+            selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive);
+        }
+        let head = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        // FIX: the recovered Luna group is offered its bounded recovery dispatch.
+        assert_eq!(
+            head, "o1",
+            "RECOVERY: starved group gets a bounded recovery opportunity after the window"
+        );
+        // The recovery is one-shot per starvation episode: the recovery dispatch ages out the
+        // stale evidence, so the group re-enters as unmeasured (no sample) and is offered the
+        // dispatch. A second recovery cannot trigger until the group is starved again for a
+        // full window, so recovery is bounded, not a permanent reset.
+        let after = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(
+            after, "o1",
+            "the recovery dispatch ages out stale evidence; the group re-enters unmeasured"
+        );
+        // The group now has fresh (unmeasured) evidence; it must earn its place from new
+        // observations rather than staying permanently preferred. Record a failure and verify
+        // the healthy peer can retake the head once the group is measured failing again.
+        for _ in 0..3 {
+            selector.observe(&call("o1", false, 50));
+        }
+        let re_evaluated = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(
+            re_evaluated, "g1",
+            "recovery is bounded: fresh failures re-demote the group"
+        );
+    }
     #[test]
     fn asking_what_the_grouped_order_would_be_does_not_spend_a_turn() {
         let selector = MeasuredSelector::new();

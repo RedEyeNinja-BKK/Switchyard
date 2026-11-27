@@ -1605,3 +1605,133 @@ fn a_conclusive_uncharge_is_reclaimed_immediately() {
         "a new provider day has nothing to release"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What a reading may claim (review: unwatermarked behaviour, double release,
+// and the timer as an accounting-lag floor rather than proof).
+// ---------------------------------------------------------------------------
+
+/// A reading with no watermark cannot separate requests still travelling from requests the
+/// provider refused. It therefore states no claim: the difference it sees is not recorded, and
+/// the provider's later silence reclaims nothing. Headroom stays understated, never over-issued.
+#[test]
+fn an_unwatermarked_reading_declares_no_claim() {
+    let allowance = account_allowance(&scratch("settlement-unwatermarked"), 1000);
+    for _ in 0..10 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    allowance
+        .reconcile(provider(4, 1000, 996, LATE_UTC_DAY))
+        .expect("the reading is applied");
+
+    let later = LATE_UTC_DAY + 600;
+    allowance
+        .reconcile(provider(4, 1000, 996, later))
+        .expect("the second reading is applied");
+
+    assert_eq!(
+        allowance.remaining_at(at(later)),
+        986,
+        "ten sends stay subtracted from the provider's 996: six uncounted units are never \
+         reclaimed on a timer alone, because this caller could not attribute them"
+    );
+}
+
+/// A caller that took no watermark still cannot erase a claim another caller established.
+/// The claim survives its reading, and a later watermarked reading settles it.
+#[test]
+fn an_unwatermarked_reading_does_not_erase_a_pending_claim() {
+    let allowance = account_allowance(&scratch("settlement-preserve"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let first = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            first,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+
+    // A routine collector pass, too early to settle and carrying no watermark of its own.
+    let routine = LATE_UTC_DAY + 60;
+    allowance
+        .reconcile(provider(984, 1000, 16, routine))
+        .expect("the routine reading is applied");
+
+    let later = LATE_UTC_DAY + 600;
+    let second = allowance
+        .begin_observation_at(at(later))
+        .expect("the counter is readable");
+    allowance
+        .reconcile_at(provider(984, 1000, 16, later), second, at(later))
+        .expect("the second reading is applied");
+
+    assert_eq!(
+        allowance.remaining_at(at(later)),
+        11,
+        "the claim survived the unwatermarked pass and settled once: the six are reclaimed and \
+         the five sent during the first read are still subtracted"
+    );
+}
+
+/// A unit released as conclusively uncharged is not also reclaimed from the pending claim.
+/// The claim shrinks with the release, so the same six cannot lower the count twice.
+#[test]
+fn a_conclusive_release_shrinks_the_pending_claim() {
+    let allowance = account_allowance(&scratch("settlement-double-release"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let first = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            first,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+
+    assert_eq!(
+        allowance
+            .release_uncharged_at(6, at(LATE_UTC_DAY))
+            .expect("the counter is writable"),
+        6
+    );
+
+    let later = LATE_UTC_DAY + 600;
+    let second = allowance
+        .begin_observation_at(at(later))
+        .expect("the counter is readable");
+    allowance
+        .reconcile_at(provider(984, 1000, 16, later), second, at(later))
+        .expect("the second reading is applied");
+
+    assert_eq!(
+        allowance.remaining_at(at(later)),
+        11,
+        "six released once leaves eleven; the claim was discharged by the release, not \
+         reclaimed a second time into sixteen"
+    );
+}

@@ -389,6 +389,8 @@ fn recording_observer(
                     .as_ref()
                     .and_then(|usage| usage.output_tokens)
                     .unwrap_or(0),
+                reason: call.reason,
+                scope: call.scope,
             });
         }
         if let Some(inner) = inner.as_ref() {
@@ -2504,6 +2506,8 @@ mod terminal_authorization_tests {
             duration_ms: 1,
             prompt_tokens: 1,
             completion_tokens: 0,
+            reason: None,
+            scope: None,
         }
     }
 
@@ -3190,6 +3194,8 @@ mod strict_allowance_boundary_tests {
             duration_ms: 1,
             prompt_tokens: 1,
             completion_tokens: 0,
+            reason: None,
+            scope: None,
         }
     }
 

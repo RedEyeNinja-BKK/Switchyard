@@ -1350,6 +1350,8 @@ mod tests {
                         ..Usage::default()
                     }),
                     outcome: None,
+                    reason: None,
+                    scope: None,
                 }),
                 RunObservation::RoutingOverhead(std::time::Duration::from_millis(3)),
             ],
@@ -1447,6 +1449,8 @@ mod tests {
                 cost_currency: None,
             }),
             outcome: None,
+            reason: None,
+            scope: None,
         };
 
         let routing = token_usage_metrics("routing", &call, &json!({"session_id": "session"}));
@@ -1504,6 +1508,8 @@ mod tests {
                     duration: std::time::Duration::from_millis(2),
                     usage: None,
                     outcome: None,
+                    reason: None,
+                    scope: None,
                 }),
                 RunObservation::AnswerCall(LlmCallObservation {
                     selected_model: ModelId::from("strong-target"),
@@ -1514,6 +1520,8 @@ mod tests {
                         ..Usage::default()
                     }),
                     outcome: None,
+                    reason: None,
+                    scope: None,
                 }),
             ],
             &json!({}),

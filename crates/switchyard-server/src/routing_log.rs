@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use humantime::format_rfc3339_millis;
 use serde::{Deserialize, Serialize};
-use switchyard_llm_client::SelectionTrace;
+use switchyard_llm_client::{ProviderReason, ProviderScope, SelectionTrace};
 use switchyard_protocol::{Metadata, ModelId, Usage};
 
 use crate::usage_metrics::token_usage;
@@ -286,6 +286,15 @@ struct AttemptDecision {
     /// Stable outcome code, `served` when the call completed.
     outcome: &'static str,
     duration_ms: u64,
+    /// The provider's own typed reason for a refused attempt, when it gave one.
+    ///
+    /// Absent on a served attempt: the field states what a refusal was, so writing it on a
+    /// call that produced an answer would invent a failure the provider never stated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// How far that reason reaches (`account`, `free_allowance`, `model`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'static str>,
 }
 
 impl<'a> RoutingDecisionRecord<'a> {
@@ -329,6 +338,8 @@ impl<'a> RoutingDecisionRecord<'a> {
                     phase: attempt.phase,
                     outcome: attempt.outcome,
                     duration_ms: attempt.duration_ms,
+                    reason: attempt.reason.map(ProviderReason::as_str),
+                    scope: attempt.scope.map(ProviderScope::as_str),
                 })
                 .collect(),
         }
@@ -525,14 +536,28 @@ mod tests {
                 },
             ],
             dispatched: vec!["healthy".to_string()],
-            attempts: vec![AttemptTrace {
-                model: "healthy".to_string(),
-                phase: "answer",
-                outcome: "served",
-                duration_ms: 412,
-                prompt_tokens: 900,
-                completion_tokens: 20,
-            }],
+            attempts: vec![
+                AttemptTrace {
+                    model: "spent".to_string(),
+                    phase: "routing",
+                    outcome: "provider_account_allowance_exhausted",
+                    duration_ms: 88,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    reason: Some(ProviderReason::AccountAllowanceExhausted),
+                    scope: Some(ProviderScope::Account),
+                },
+                AttemptTrace {
+                    model: "healthy".to_string(),
+                    phase: "answer",
+                    outcome: "served",
+                    duration_ms: 412,
+                    prompt_tokens: 900,
+                    completion_tokens: 20,
+                    reason: None,
+                    scope: None,
+                },
+            ],
             served: Some("healthy".to_string()),
             outcome: "served",
             demand_tokens: 1_234,
@@ -569,8 +594,19 @@ mod tests {
         assert_eq!(record["skipped"]["gated"], "privacy_refused");
         assert_eq!(record["demoted"], serde_json::json!({}));
         assert_eq!(record["dispatched"][0], "healthy");
-        assert_eq!(record["attempts"][0]["outcome"], "served");
-        assert_eq!(record["attempts"][0]["duration_ms"], 412);
+        assert_eq!(record["attempts"][1]["outcome"], "served");
+        assert_eq!(record["attempts"][1]["duration_ms"], 412);
+        // A refused attempt names the provider's reason and the scope it covers, so a reader can
+        // tell a spent account from a spent free allowance without re-parsing a provider body.
+        assert_eq!(record["attempts"][0]["model"], "spent");
+        assert_eq!(
+            record["attempts"][0]["reason"],
+            "provider_account_allowance_exhausted"
+        );
+        assert_eq!(record["attempts"][0]["scope"], "account");
+        // Control: the served attempt states no refusal, so neither field is emitted for it.
+        assert!(record["attempts"][1].get("reason").is_none());
+        assert!(record["attempts"][1].get("scope").is_none());
         // Control: the attempt stream is a different file, so a decision line can never be
         // summed into token totals by a session snapshot.
         assert!(

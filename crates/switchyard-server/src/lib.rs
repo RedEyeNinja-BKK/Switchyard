@@ -2896,6 +2896,8 @@ mod tests {
                     ..Usage::default()
                 }),
                 outcome: None,
+                reason: None,
+                scope: None,
             };
             if answer {
                 RunObservation::AnswerCall(observation)

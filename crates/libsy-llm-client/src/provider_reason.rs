@@ -80,6 +80,97 @@ impl ProviderReason {
     }
 }
 
+/// How much of a credential a provider's refusal covers.
+///
+/// Kept separate from [`ProviderReason`] because the two answer different questions: the reason
+/// says what the provider refused, the scope says how far the refusal reaches. A spent free-tier
+/// allowance and a spent account balance are both "exhausted", and they block very different
+/// sets of models.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderScope {
+    /// Every model on the credential.
+    Account,
+    /// The free-model allowance only; paid models on the same credential still serve.
+    FreeAllowance,
+    /// One model's own allocation.
+    Model,
+    /// The provider stated no scope this code can substantiate.
+    Unknown,
+}
+
+impl ProviderScope {
+    /// The stable, value-free code carried into logs and decision records.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::FreeAllowance => "free_allowance",
+            Self::Model => "model",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify a refusal together with the scope the provider itself stated.
+///
+/// The scope is taken only from a marker the provider publishes: Google's structured
+/// `DailyQuota` condition, OpenRouter's `limit_source`, or a billing code whose published
+/// meaning is the account. A scope that is not stated stays [`ProviderScope::Unknown`], and no
+/// block is derived from it, because guessing the scope upward is how one model's spent budget
+/// takes a whole credential down.
+pub fn classify_with_scope(status: u16, body: &str) -> (ProviderReason, ProviderScope) {
+    let limit_source = limit_source(body);
+    // Google states the scope structurally: its daily quota is allocated either to the project
+    // or to one model. That is a configuration fact the body carries, so it is read from the
+    // condition rather than inferred from the status or the slug.
+    if let Some(google) = crate::google::parse(Some(status), body)
+        && google.condition == crate::google::GoogleCondition::DailyQuota
+    {
+        return match google.quota_scope {
+            crate::google::GoogleQuotaScope::Project => (
+                ProviderReason::AccountAllowanceExhausted,
+                ProviderScope::Account,
+            ),
+            _ => (ProviderReason::ModelQuotaExhausted, ProviderScope::Model),
+        };
+    }
+    // A 403 that names a budget is an account cap, not a rejected key. Treating it as an auth
+    // failure would let a policy refusal be evaded by trying another credential.
+    if status == 403
+        && let Some(source) = limit_source.as_deref()
+    {
+        let scope = if source.starts_with("openrouter_free_tier") {
+            ProviderScope::FreeAllowance
+        } else {
+            ProviderScope::Account
+        };
+        return (ProviderReason::AccountAllowanceExhausted, scope);
+    }
+
+    let reason = classify(status, body);
+    let scope = match reason {
+        ProviderReason::AccountAllowanceExhausted => match limit_source.as_deref() {
+            Some(source) if source.starts_with("openrouter_free_tier") => {
+                ProviderScope::FreeAllowance
+            }
+            _ => ProviderScope::Account,
+        },
+        ProviderReason::ModelQuotaExhausted => ProviderScope::Model,
+        _ => ProviderScope::Unknown,
+    };
+    (reason, scope)
+}
+
+/// The provider's own name for the allowance a refusal drew on, when it published one.
+fn limit_source(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value["error"]["metadata"]["limit_source"]
+                .as_str()
+                .map(str::to_ascii_lowercase)
+        })
+}
+
 /// Codes providers publish for a request they consider malformed.
 ///
 /// Closed and drawn from published documentation. A 400 carrying something else is not
@@ -450,5 +541,84 @@ mod tests {
             None,
             "a local throttle is not a provider statement"
         );
+    }
+
+    #[test]
+    fn an_openrouter_free_allowance_is_scoped_to_the_free_pool() {
+        let (reason, scope) = classify_with_scope(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"rate limited","metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#,
+        );
+        assert_eq!(reason, ProviderReason::AccountAllowanceExhausted);
+        assert_eq!(scope, ProviderScope::FreeAllowance);
+    }
+
+    #[test]
+    fn a_billing_code_is_scoped_to_the_account() {
+        let (reason, scope) = classify_with_scope(
+            429,
+            r#"{"error":{"code":"insufficient_quota","message":"spent"}}"#,
+        );
+        assert_eq!(reason, ProviderReason::AccountAllowanceExhausted);
+        assert_eq!(scope, ProviderScope::Account);
+    }
+
+    #[test]
+    fn a_bare_throttle_names_no_scope() {
+        let (reason, scope) =
+            classify_with_scope(429, r#"{"error":{"code":"rate_limit_exceeded"}}"#);
+        assert_eq!(reason, ProviderReason::Throttled);
+        assert_eq!(scope, ProviderScope::Unknown);
+    }
+
+    #[test]
+    fn a_google_daily_quota_carries_the_scope_google_stated() {
+        let model_scoped = r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+            {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+              {"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+               "quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+               "quotaDimensions":{"location":"global","model":"gemini-3.6-flash"}}]}]}}"#;
+        let (reason, scope) = classify_with_scope(429, model_scoped);
+        assert_eq!(reason, ProviderReason::ModelQuotaExhausted);
+        assert_eq!(scope, ProviderScope::Model);
+
+        let project_scoped = r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+            {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+              {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier",
+               "quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+               "quotaDimensions":{"location":"global"}}]}]}}"#;
+        let (reason, scope) = classify_with_scope(429, project_scoped);
+        assert_eq!(reason, ProviderReason::AccountAllowanceExhausted);
+        assert_eq!(
+            scope,
+            ProviderScope::Account,
+            "Google stated the project, so the whole credential is blocked"
+        );
+    }
+
+    #[test]
+    fn a_403_that_names_a_budget_is_an_account_cap_not_a_rejected_key() {
+        let (reason, scope) = classify_with_scope(
+            403,
+            r#"{"error":{"code":"forbidden","metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#,
+        );
+        assert_eq!(reason, ProviderReason::AccountAllowanceExhausted);
+        assert_eq!(scope, ProviderScope::FreeAllowance);
+        assert_ne!(
+            reason,
+            ProviderReason::AuthenticationFailed,
+            "a guardrail must not be evadable by trying another credential"
+        );
+
+        let (reason, scope) = classify_with_scope(403, r#"{"error":{"code":"content_policy"}}"#);
+        assert_ne!(reason, ProviderReason::AccountAllowanceExhausted);
+        assert_eq!(scope, ProviderScope::Unknown);
+    }
+
+    #[test]
+    fn a_rejected_key_names_no_scope() {
+        let (reason, scope) = classify_with_scope(401, r#"{"error":{"message":"bad key"}}"#);
+        assert_eq!(reason, ProviderReason::AuthenticationFailed);
+        assert_eq!(scope, ProviderScope::Unknown);
     }
 }

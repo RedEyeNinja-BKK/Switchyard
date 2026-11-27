@@ -946,6 +946,8 @@ mod tests {
             duration: Duration::from_millis(millis),
             usage: None,
             outcome: None,
+            reason: None,
+            scope: None,
         })
     }
 
@@ -1158,6 +1160,8 @@ mod tests {
             duration: Duration::from_millis(10),
             usage: None,
             outcome: Some(code),
+            reason: None,
+            scope: None,
         })
     }
 

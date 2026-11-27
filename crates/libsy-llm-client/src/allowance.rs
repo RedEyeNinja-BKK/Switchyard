@@ -843,6 +843,18 @@ impl DailyRequestAllowance {
             drop(lock);
             return Ok(0);
         }
+        // A unit released here is conclusively uncharged. Any pending gap for the same day may
+        // still be claiming that same unit on the strength of the provider's silence, so the
+        // claim shrinks with the release. Without this the unit is reclaimed twice: once now,
+        // once when the gap settles. The claim's provider baseline is left alone because it
+        // describes a provider figure, not a local count.
+        let pending = counter.pending.and_then(|pending| {
+            if pending.day != day {
+                return Some(pending);
+            }
+            let amount = pending.amount.saturating_sub(released);
+            (amount > 0).then(|| PendingGap { amount, ..pending })
+        });
         let next = Counter {
             day: counter.day,
             spent: counter.spent,
@@ -850,7 +862,7 @@ impl DailyRequestAllowance {
             provider_anchor: counter.provider_anchor,
             retention: counter.retention,
             uncharged: counter.uncharged.saturating_add(released),
-            pending: counter.pending,
+            pending,
         };
         self.persist(next)?;
         drop(lock);
@@ -978,14 +990,27 @@ impl DailyRequestAllowance {
         // No further cap is needed: a gap is only ever recorded against the watermark that
         // revealed it, so `pending.used + pending.amount <= spent` holds by construction and
         // the residual can never take the counter below the provider's own figure.
-        let reclaim = match counter.pending.filter(|pending| pending.day == reading_day) {
-            Some(pending) if reading.observed_at >= pending.observed_at + SETTLEMENT_DELAY => {
-                let explained = reading.used.saturating_sub(pending.used);
-                pending.amount.saturating_sub(explained)
-            }
-            // No gap, or one this reading is too soon to settle: nothing is reclaimed.
-            _ => 0,
-        };
+        //
+        // `SETTLEMENT_DELAY` is a floor on the provider's accounting lag, not proof that an
+        // uncounted attempt was free: a genuinely slow request can still be in flight when the
+        // window closes. What the reclaim rests on is the provider's own later figure failing
+        // to account for units already reserved - the same kind of evidence a conclusive
+        // refusal gives, observed one window later. A settled gap is therefore discharged: the
+        // units are reclaimed once, and anything still missing is measured afresh against this
+        // reading instead of being claimed again against the same baseline.
+        let (reclaim, discharged) =
+            match counter.pending.filter(|pending| pending.day == reading_day) {
+                Some(pending) if reading.observed_at >= pending.observed_at + SETTLEMENT_DELAY => {
+                    let explained = reading.used.saturating_sub(pending.used);
+                    (pending.amount.saturating_sub(explained), None)
+                }
+                // No gap, or one this reading is too soon to settle: nothing is reclaimed and the
+                // claim survives, because a reading that cannot settle it must not erase it.
+                _ => (
+                    0,
+                    counter.pending.filter(|pending| pending.day == reading_day),
+                ),
+            };
         let uncharged = already_uncharged.saturating_add(reclaim).min(counter.spent);
         let settled = spent.saturating_sub(reclaim);
 
@@ -1008,14 +1033,26 @@ impl DailyRequestAllowance {
         // sent after the read began are never counted as possibly-uncharged. They are
         // preserved by the anchor above instead, which is a statement about the provider's
         // remainder rather than a claim that they cost nothing.
-        let attributable = watermark.unwrap_or(settled).min(settled);
-        let gap = attributable.saturating_sub(reading.used);
-        let pending = (gap > 0).then(|| PendingGap {
-            day: reading_day,
-            used: reading.used,
-            amount: gap,
-            observed_at: reading.observed_at,
-        });
+        //
+        // Only a watermarked reading may declare a gap. Without one, the difference between
+        // the counter and the provider's figure mixes requests still in flight with requests
+        // the provider refused, and recording that as claimable would forgive exactly the
+        // in-flight traffic this exists to protect. Such a caller keeps whatever claim is
+        // already pending - it can still settle that one, because settling compares two
+        // provider figures - but it states nothing new.
+        let pending = match watermark {
+            Some(spent_then) => {
+                let attributable = spent_then.min(settled);
+                let gap = attributable.saturating_sub(reading.used);
+                (gap > 0).then(|| PendingGap {
+                    day: reading_day,
+                    used: reading.used,
+                    amount: gap,
+                    observed_at: reading.observed_at,
+                })
+            }
+            None => discharged,
+        };
 
         let retention = (reading
             .remaining

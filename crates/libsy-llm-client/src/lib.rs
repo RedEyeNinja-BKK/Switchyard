@@ -38,7 +38,10 @@ pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
 pub mod provider_reason;
-pub use provider_reason::{ProviderReason, classify as classify_provider_error};
+pub use provider_reason::{
+    ProviderReason, ProviderScope, classify as classify_provider_error,
+    classify_with_scope as classify_provider_error_with_scope,
+};
 
 pub use observation::{
     AttemptTrace, CandidateTrace, LlmCallObservation, RunObservation, RunObserver, SelectionTrace,

@@ -465,6 +465,10 @@ async fn call_one(
     } else {
         result
     };
+    let (reason, scope) = match result.as_ref().err() {
+        Some(error) => provider_reason_of(error),
+        None => (None, None),
+    };
     observe(LlmCallObservation {
         selected_model: model_id.clone(),
         is_success: result.is_ok(),
@@ -480,6 +484,8 @@ async fn call_one(
             .as_ref()
             .err()
             .map(crate::observation::library_outcome_code),
+        reason,
+        scope,
     });
     result
 }
@@ -751,31 +757,6 @@ fn account_allowance_refusal(error: &LibsyError) -> Option<&str> {
     }
 }
 
-/// The scope of an exhausted allowance: which models on the credential it blocks.
-///
-/// `openrouter_free_tier_daily` is an allowance over `:free` slugs only — a paid slug
-/// on the same credential draws on the account balance, not this cap. An unnamed or
-/// unrecognized scope is treated as the whole credential.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QuotaScope {
-    /// Free slugs only; paid slugs on the same credential remain servable.
-    FreeOnly,
-    /// Every model on the credential.
-    Credential,
-}
-
-/// The quota scope an OpenRouter error body names, when any is named.
-fn quota_scope(body: &str) -> QuotaScope {
-    let value = serde_json::from_str::<Value>(body).ok();
-    match value
-        .as_ref()
-        .and_then(|value| value["error"]["metadata"]["limit_source"].as_str())
-    {
-        Some("openrouter_free_tier_daily") => QuotaScope::FreeOnly,
-        _ => QuotaScope::Credential,
-    }
-}
-
 /// A credential-level block a whole-route composite acts on.
 ///
 /// The wire error cannot name the credential — it names the failing target slug — so
@@ -971,6 +952,29 @@ impl Tariff {
     }
 }
 
+/// The provider's typed reason and scope for a failed call, when it gave one.
+///
+/// A local failure - a spent local budget, a translation error - has its own code and no
+/// provider statement behind it, so it carries no reason here.
+fn provider_reason_of(
+    error: &LibsyError,
+) -> (
+    Option<crate::provider_reason::ProviderReason>,
+    Option<crate::provider_reason::ProviderScope>,
+) {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return (None, None);
+    };
+    match source {
+        LlmClientError::UpstreamHttp { status, body } => {
+            let (reason, scope) =
+                crate::provider_reason::classify_with_scope(status.as_u16(), body);
+            (Some(reason), Some(scope))
+        }
+        _ => (None, None),
+    }
+}
+
 /// Reads the credential-level block a failure carries, if any.
 ///
 /// Returns the block KIND and the failing target slug. The composite pairs the kind
@@ -1001,13 +1005,17 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
     // which would leave a per-model exhaustion both unrecorded and fatal to a mixed pool:
     // unrecorded because no block is produced, fatal because a composite with
     // `cross_on = "credential_block"` treats "no block" as terminal and returns.
-    if let LlmClientError::UpstreamHttp { status, body } = source
-        && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
-        && google.condition == crate::google::GoogleCondition::DailyQuota
-    {
-        let kind = match google.quota_scope {
+    let LlmClientError::UpstreamHttp { status, body } = source else {
+        return None;
+    };
+    // The block kind is the provider's typed reason and scope rather than a second reading of
+    // the same body: one classifier serves the log line, the decision record and this block, so
+    // a marker cannot teach one of them a scope the others do not know about.
+    let (reason, scope) = crate::provider_reason::classify_with_scope(status.as_u16(), body);
+    if reason == crate::provider_reason::ProviderReason::ModelQuotaExhausted {
+        let kind = match scope {
             // Positively project-wide: every model behind the project shares the budget.
-            crate::google::GoogleQuotaScope::Project => CredentialBlockKind::WholeQuota,
+            crate::provider_reason::ProviderScope::Account => CredentialBlockKind::WholeQuota,
             // Per-model, per-feature, or a scope the body never named. Only the exact
             // reporting target is retired; an unproven scope is never promoted to
             // project-wide, which is what the owner's per-model RPD allocation needs.
@@ -1015,15 +1023,12 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
         };
         return Some((kind, target));
     }
-    // Account-wide quota first: a 429 with the free-tier marker is a quota, not a
-    // throttle, and its scope decides how much of the credential is blocked.
+    // Account-wide quota: a 429 with the free-tier marker is a quota, not a throttle, and its
+    // scope decides how much of the credential is blocked.
     if crate::client::is_account_wide_quota(source) {
-        let LlmClientError::UpstreamHttp { body, .. } = source else {
-            return Some((CredentialBlockKind::WholeQuota, target));
-        };
-        let kind = match quota_scope(body) {
-            QuotaScope::FreeOnly => CredentialBlockKind::FreeQuota,
-            QuotaScope::Credential => CredentialBlockKind::WholeQuota,
+        let kind = match scope {
+            crate::provider_reason::ProviderScope::FreeAllowance => CredentialBlockKind::FreeQuota,
+            _ => CredentialBlockKind::WholeQuota,
         };
         return Some((kind, target));
     }
@@ -2557,6 +2562,8 @@ mod tests {
                     duration: std::time::Duration::ZERO,
                     usage: None,
                     outcome: None,
+                    reason: None,
+                    scope: None,
                 })
                 .into(),
         )));
@@ -4778,6 +4785,65 @@ mod account_quota_tests {
         assert!(
             !block.crosses_to_paid(),
             "an unnamed scope never spends the owner's money"
+        );
+    }
+
+    /// The block kind is the typed scope, and the log reason is the same classification.
+    ///
+    /// Google states the scope of its daily quota structurally. A project-wide one may block
+    /// the credential; a per-model one may not, and must not authorize a paid leg. The block
+    /// and the provider reason are read from one classifier so they cannot disagree.
+    #[test]
+    fn a_google_daily_quota_blocks_exactly_the_scope_it_states() {
+        let model_scoped = r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+            {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+              {"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+               "quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+               "quotaDimensions":{"location":"global","model":"gemini-3.6-flash"}}]}]}}"#;
+        let error = LibsyError::client_call(
+            "gemini-3.6-flash",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: model_scoped.to_string(),
+            },
+        );
+        let (kind, slug) = credential_block(&error).expect("a daily quota carries a block");
+        assert_eq!(kind, CredentialBlockKind::ModelQuota);
+        assert_eq!(slug, "gemini-3.6-flash");
+        assert!(
+            !super::CredentialBlock {
+                credential: "google_free".to_string(),
+                kind,
+                target: slug,
+            }
+            .crosses_to_paid(),
+            "one model's daily allocation does not authorize the owner's paid leg"
+        );
+        assert_eq!(
+            crate::provider_reason::classify_with_scope(429, model_scoped)
+                .0
+                .as_str(),
+            "provider_model_quota_exhausted",
+            "the log reason and the block come from one classification"
+        );
+
+        let project_scoped = r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+            {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+              {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier",
+               "quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+               "quotaDimensions":{"location":"global"}}]}]}}"#;
+        let error = LibsyError::client_call(
+            "gemini-3.5-flash-lite",
+            LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: project_scoped.to_string(),
+            },
+        );
+        let (kind, _) = credential_block(&error).expect("a project quota carries a block");
+        assert_eq!(
+            kind,
+            CredentialBlockKind::WholeQuota,
+            "Google stated the project, so the credential is what is spent"
         );
     }
 

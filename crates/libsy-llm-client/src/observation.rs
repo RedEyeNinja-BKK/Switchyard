@@ -9,6 +9,8 @@ use std::time::Duration;
 use switchyard_libsy::OutcomeMetadata;
 use switchyard_protocol::{ModelId, Usage};
 
+use crate::provider_reason::{ProviderReason, ProviderScope};
+
 /// One completed model call observed while serving an algorithm run.
 #[derive(Clone, Debug)]
 pub struct LlmCallObservation {
@@ -27,6 +29,14 @@ pub struct LlmCallObservation {
     /// difference. The vocabulary is deliberately closed and value-free: it names a
     /// classification, never a payload.
     pub outcome: Option<&'static str>,
+    /// The provider's own typed reason for the refusal, when it was a refusal.
+    ///
+    /// Populated at the adapter boundary where the response body still exists, and only for
+    /// reasons the provider stated. `None` for a successful call and for a local outcome that
+    /// no provider spoke to.
+    pub reason: Option<ProviderReason>,
+    /// How far that refusal reaches, in the provider's own terms.
+    pub scope: Option<ProviderScope>,
 }
 
 /// One candidate's verdict in a route's selection decision.
@@ -69,6 +79,14 @@ pub struct AttemptTrace {
     pub prompt_tokens: u64,
     /// Completion tokens the provider reported, when it reported any.
     pub completion_tokens: u64,
+    /// The provider's own typed reason for a refused attempt, when it gave one.
+    ///
+    /// Carried here so a decision record can say why an attempt failed in the provider's
+    /// vocabulary, instead of only that it did. `None` when the attempt succeeded or the
+    /// failure was local.
+    pub reason: Option<ProviderReason>,
+    /// The scope that reason covers.
+    pub scope: Option<ProviderScope>,
 }
 
 /// The selection decision and dispatch record for one request.

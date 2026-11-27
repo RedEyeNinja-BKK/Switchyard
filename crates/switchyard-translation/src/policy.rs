@@ -77,17 +77,64 @@ pub struct ProviderProfile {
 /// Controls whether provider-private reasoning state is replayed to an upstream.
 ///
 /// `reasoning_details` and a `signature` are opaque state belonging to the provider that issued
-/// them. OpenRouter hands them back and expects them returned verbatim; a native provider
-/// (DeepSeek, Google, a local llama.cpp) either does not understand them or would be receiving
-/// another provider's private state. This is a per-target wire fact, not a global preference, so
-/// the runner derives it from the target's `reasoning_dialect`.
+/// them. A matching wire format is not enough to make a replay sound: the same provider reached
+/// on two accounts, or two native models behind one account, are different issuers. The runner
+/// therefore derives this per target, and the default target shape uses [`Self::ProvenanceBound`]
+/// so nothing is replayed on an unproven guess.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReasoningDetailsReplay {
     /// Replay structured details and signatures exactly as received.
-    #[default]
+    ///
+    /// The pre-existing behaviour, kept so a caller that explicitly wants it does not change.
+    /// It is never what a target resolves to by default in the runner.
     Verbatim,
     /// Drop structured details and signatures; carry only the reasoning text.
     PlaintextOnly,
+    /// Replay opaque state only when this request carries proof that the target issued it.
+    ///
+    /// The proof is a [`ReasoningAdmission`]: digests of state Switchyard recorded as issued by
+    /// this exact target, resolved before dispatch. Unproven state is never sent: state on the
+    /// active continuation edge that cannot be proven is refused with a typed error, and the
+    /// rest is treated as completed history whose opaque parts are dropped.
+    #[default]
+    ProvenanceBound,
+}
+
+/// Proof, resolved before dispatch, that state in this request was issued by this target.
+///
+/// Built by the runner from [`crate::provenance::ProvenanceRegistry`]; the encoder stays a pure
+/// function of the request and this policy. Digests are separated by what the state is *for*,
+/// because active continuation state and completed history are treated differently:
+///
+/// * `admitted` — proven to have been issued by `issuer` in this lineage, so replay is a
+///   continuation that can be defended and the state is sent.
+/// * `active_unproven` — on the active continuation edge but not proven. Dropping it would send
+///   a continuation the provider's own contract cannot accept, so the request is refused with a
+///   typed error rather than silently altered.
+/// * anything else carrying opaque state is completed history: its opaque parts are removed and
+///   the portable reasoning text is kept.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningAdmission {
+    /// The target this request is being dispatched to.
+    pub issuer: crate::provenance::ReasoningIssuer,
+    /// Digests of opaque state proven to have been issued by `issuer` in this lineage.
+    #[serde(default)]
+    pub admitted: Vec<String>,
+    /// Digests of opaque state on the active continuation edge that could not be proven.
+    #[serde(default)]
+    pub active_unproven: Vec<String>,
+}
+
+impl ReasoningAdmission {
+    /// Whether the state identified by `digest` is proven replayable to this target.
+    pub fn admits(&self, digest: &str) -> bool {
+        self.admitted.iter().any(|admitted| admitted == digest)
+    }
+
+    /// Whether the state identified by `digest` is required and unproven, so it is refused.
+    pub fn refuses(&self, digest: &str) -> bool {
+        self.active_unproven.iter().any(|active| active == digest)
+    }
 }
 
 /// End-to-end policy applied by request, response, and stream translation.
@@ -107,10 +154,16 @@ pub struct TranslationPolicy {
     pub hosted_reasoning: Option<crate::codecs::openai_chat::HostedReasoningMarker>,
     /// Whether opaque provider reasoning state may be replayed to this target.
     ///
-    /// Defaults to `Verbatim`, the pre-existing behaviour, so a policy built without target
-    /// knowledge never silently changes what is sent. The runner narrows it per target.
+    /// Defaults to [`ReasoningDetailsReplay::ProvenanceBound`]: a policy built without target
+    /// knowledge replays nothing it cannot prove. The runner sets it per target.
     #[serde(default)]
     pub reasoning_details_replay: ReasoningDetailsReplay,
+    /// Proof that opaque state in this request was issued by the target being dispatched to.
+    ///
+    /// `None` under [`ReasoningDetailsReplay::ProvenanceBound`] means nothing is admitted, so
+    /// every opaque block is treated as completed history and its opaque parts are withheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_admission: Option<ReasoningAdmission>,
 }
 
 impl Default for TranslationPolicy {
@@ -125,6 +178,7 @@ impl Default for TranslationPolicy {
             target_capabilities: TargetCapabilities::default(),
             hosted_reasoning: None,
             reasoning_details_replay: ReasoningDetailsReplay::default(),
+            reasoning_admission: None,
         }
     }
 }

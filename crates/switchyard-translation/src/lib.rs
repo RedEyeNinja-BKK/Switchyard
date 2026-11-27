@@ -15,6 +15,7 @@ pub mod engine;
 pub mod error;
 mod helpers;
 pub mod policy;
+pub mod provenance;
 mod sse;
 pub mod stream;
 pub mod util;

@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -17,14 +18,15 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value, json};
 use switchyard_protocol::correlation;
 use switchyard_protocol::{
-    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
-    ModelId, Request, Response, RoutedLlmClient,
+    AggLlmResponse, ContentBlock, LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream,
+    LlmResponseStreamEvent, Metadata, ModelId, Request, Response, Role, RoutedLlmClient,
 };
 use switchyard_translation::{
-    TargetCapabilities, TranslationError, TranslationPolicy, WireFormat,
-    decode_aggregated_response_with_policy, decode_request, decode_stream_with_policy,
-    encode_aggregated_response_with_extensions, encode_request_with_policy,
-    encode_stream_with_extensions,
+    ReasoningAdmission, ReasoningDetailsReplay, TargetCapabilities, TranslationError,
+    TranslationPolicy, WireFormat, decode_aggregated_response_with_policy, decode_request,
+    decode_stream_with_policy, encode_aggregated_response_with_extensions,
+    encode_request_with_policy, encode_stream_with_extensions,
+    provenance::{ProvenanceRegistry, ReasoningIssuer, ReasoningLineage, opaque_digest},
 };
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -142,6 +144,9 @@ pub struct TranslatingLlmClient {
     // The HTTP status that armed each cooldown, so a skipped call can report the
     // real failure instead of a generic unavailability. Zero means "no status".
     cooldown_status: HashMap<String, AtomicU32>,
+    // Which identity issued each piece of opaque reasoning state this process saw arrive.
+    // Bounded and process-local; see `switchyard_translation::provenance`.
+    provenance: Arc<ProvenanceRegistry>,
 }
 
 /// The key a model's failure cooldown is recorded under.
@@ -199,7 +204,16 @@ impl TranslatingLlmClient {
             cooldown_epoch: Instant::now(),
             unavailable_until,
             cooldown_status,
+            provenance: Arc::new(ProvenanceRegistry::default()),
         })
+    }
+
+    /// The process-local record of which target issued opaque reasoning state.
+    ///
+    /// Exposed for observability and tests. A restart begins empty, which degrades every
+    /// unproven replay to "withhold" rather than to a wrong target.
+    pub fn provenance(&self) -> &Arc<ProvenanceRegistry> {
+        &self.provenance
     }
 
     /// The backend serving `model` over `format` — the default backend when its
@@ -342,7 +356,18 @@ impl TranslatingLlmClient {
         // A Responses upstream may declare that it requires a list-shaped `input`, and a
         // hosted upstream may embed reasoning behind a marker. Both are per-target wire
         // facts, so one helper supplies them to every translation site.
-        let policy = translation_policy(backend);
+        let mut policy = translation_policy(backend);
+        // Provenance is resolved here, before the request is encoded and therefore before the
+        // preserved-body fast path can replay anything: the encoder decides what "proven" means,
+        // but this is the only place where the registry and this request's target meet.
+        apply_reasoning_admission(
+            &mut policy,
+            backend,
+            model,
+            &llm_request,
+            metadata,
+            &self.provenance,
+        );
         let mut body = encode_request_with_policy(&llm_request, wire_format, &policy)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -919,7 +944,20 @@ impl TranslatingLlmClient {
                 chunks,
                 upstream_headers,
                 ..
-            } => (LlmResponse::Stream(chunks), upstream_headers),
+            } => (
+                LlmResponse::Stream(
+                    // Streamed state is recorded from the assembled response when the stream
+                    // ends: the same accumulator the consumer uses, so the recorded details are
+                    // the ones the caller will actually see.
+                    tap_streamed_provenance(
+                        chunks,
+                        Arc::clone(&self.provenance),
+                        reasoning_issuer(backend, &model_id),
+                        request_lineage(metadata.as_ref()),
+                    ),
+                ),
+                upstream_headers,
+            ),
             EncodedResponse::Buffered {
                 body,
                 upstream_headers,
@@ -945,6 +983,15 @@ impl TranslatingLlmClient {
                         }
                         error => LlmClientError::ResponseTranslation(error.to_string()),
                     })?;
+                // Retain which target issued this response's opaque reasoning state, so a later
+                // request can be proven a continuation rather than assumed one.
+                record_reasoning_provenance(
+                    &agg,
+                    backend,
+                    &model_id,
+                    metadata.as_ref(),
+                    &self.provenance,
+                );
                 (LlmResponse::Agg(agg), upstream_headers)
             }
         };
@@ -1720,11 +1767,14 @@ fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> Reques
 // another provider's private blob. Tying this to the dialect means one target cannot be told
 // to replay and another told to withhold by accident.
 fn translation_policy(backend: &Backend) -> TranslationPolicy {
+    // An OpenRouter-shaped target can *accept* opaque details, but acceptance is not proof: the
+    // same wire reached on another account is another issuer. Such a target is provenance-bound,
+    // and a target with no structured reasoning wire gets the plaintext form only.
     let reasoning_details_replay = match backend.reasoning_dialect() {
         switchyard_protocol::ReasoningDialect::OpenRouterEnabled => {
-            switchyard_translation::ReasoningDetailsReplay::Verbatim
+            ReasoningDetailsReplay::ProvenanceBound
         }
-        _ => switchyard_translation::ReasoningDetailsReplay::PlaintextOnly,
+        _ => ReasoningDetailsReplay::PlaintextOnly,
     };
     TranslationPolicy {
         target_capabilities: TargetCapabilities {
@@ -1735,6 +1785,222 @@ fn translation_policy(backend: &Backend) -> TranslationPolicy {
         reasoning_details_replay,
         ..TranslationPolicy::default()
     }
+}
+
+// The `HttpBackendConfig` behind any backend variant.
+fn backend_config(backend: &Backend) -> &crate::backend::HttpBackendConfig {
+    match backend {
+        Backend::OpenAiChat(config)
+        | Backend::OpenAiResponses(config)
+        | Backend::Anthropic(config) => config,
+    }
+}
+
+// The host part of a base URL, used as the human-readable provider name.
+fn url_host(base_url: &str) -> String {
+    let without_scheme = base_url.split_once("://").map_or(base_url, |(_, rest)| rest);
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .to_string()
+}
+
+// A stable, non-secret identifier for one credential domain.
+//
+// This is what "the same account" means for provenance: two targets with the same base URL but
+// different keys are different domains, and a forwarding target is a different domain again
+// because the credential is the caller's, not ours. The key itself never leaves this function.
+fn credential_domain(config: &crate::backend::HttpBackendConfig) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"switchyard.credential-domain.v1\0");
+    hasher.update(config.base_url.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(config.api_key.as_deref().unwrap_or(""));
+    if config.forward_auth {
+        hasher.update(b"\0forwarded");
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+// The identity that would issue opaque reasoning state on this target.
+fn reasoning_issuer(backend: &Backend, model: &ModelId) -> ReasoningIssuer {
+    let config = backend_config(backend);
+    let provider = url_host(&config.base_url);
+    ReasoningIssuer {
+        client: format!("{provider}#{}", credential_domain(config)),
+        model: model.as_str().to_string(),
+        provider,
+        wire: backend.wire_format().to_string(),
+    }
+}
+
+// The lineage facts a request carries about itself.
+fn request_lineage(metadata: Option<&Metadata>) -> ReasoningLineage {
+    ReasoningLineage {
+        consumer: metadata.and_then(|metadata| metadata.agent_id.clone()),
+        conversation: metadata.and_then(|metadata| metadata.session_id.clone()),
+        response: None,
+    }
+}
+
+// Message indexes forming the active continuation edge.
+//
+// The most recent assistant turn is what the next call continues, provided nothing but tool
+// results follows it. Its opaque state cannot be dropped without changing the request the
+// provider is being asked to continue; older assistant turns are completed history.
+fn active_message_indexes(request: &LlmRequest) -> BTreeSet<usize> {
+    let mut active = BTreeSet::new();
+    let Some(last_assistant) = request
+        .messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant)
+    else {
+        return active;
+    };
+    if request.messages[last_assistant + 1..]
+        .iter()
+        .all(|message| message.role == Role::Tool)
+    {
+        active.insert(last_assistant);
+    }
+    active
+}
+
+// Resolves, before dispatch, which opaque state in this request this target may replay.
+//
+// This is the one place the registry and a request meet. The encoder is then a pure function of
+// the request and the policy, so the same decision is enforced on the normalised path and on the
+// preserved-body fast path alike.
+fn apply_reasoning_admission(
+    policy: &mut TranslationPolicy,
+    backend: &Backend,
+    model: &ModelId,
+    request: &LlmRequest,
+    metadata: Option<&Metadata>,
+    registry: &ProvenanceRegistry,
+) {
+    if policy.reasoning_details_replay != ReasoningDetailsReplay::ProvenanceBound {
+        return;
+    }
+    let issuer = reasoning_issuer(backend, model);
+    let lineage = request_lineage(metadata);
+    let active = active_message_indexes(request);
+    let mut admitted = Vec::new();
+    let mut active_unproven = Vec::new();
+    for (index, message) in request.messages.iter().enumerate() {
+        for block in &message.content {
+            let ContentBlock::Reasoning {
+                details, signature, ..
+            } = block
+            else {
+                continue;
+            };
+            if details.is_empty() && signature.is_none() {
+                continue;
+            }
+            let digest = opaque_digest(details, signature.as_deref());
+            let proven = registry.resolve(&digest).is_some_and(|(recorded, recorded_lineage)| {
+                recorded.permits_replay_to(&issuer) && recorded_lineage.permits_replay_in(&lineage)
+            });
+            if proven {
+                admitted.push(digest);
+            } else if active.contains(&index) {
+                active_unproven.push(digest);
+            }
+        }
+    }
+    policy.reasoning_admission = Some(ReasoningAdmission {
+        issuer,
+        admitted,
+        active_unproven,
+    });
+}
+
+// Records, for every opaque state block in a decoded response, which target issued it.
+fn record_reasoning_provenance(
+    response: &AggLlmResponse,
+    backend: &Backend,
+    model: &ModelId,
+    metadata: Option<&Metadata>,
+    registry: &ProvenanceRegistry,
+) {
+    let issuer = reasoning_issuer(backend, model);
+    let mut lineage = request_lineage(metadata);
+    lineage.response = response.id.clone();
+    for output in &response.outputs {
+        for block in &output.content {
+            let ContentBlock::Reasoning {
+                details, signature, ..
+            } = block
+            else {
+                continue;
+            };
+            if details.is_empty() && signature.is_none() {
+                continue;
+            }
+            let digest = opaque_digest(details, signature.as_deref());
+            registry.record(digest, issuer.clone(), lineage.clone());
+        }
+    }
+}
+
+// Records the provenance of a streamed response when the stream ends.
+//
+// The tap folds the same `ResponseAccumulator` the consumer uses, so the details it records are
+// the assembled ones and cannot diverge from what the caller receives.
+fn tap_streamed_provenance(
+    chunks: LlmResponseStream,
+    registry: Arc<ProvenanceRegistry>,
+    issuer: ReasoningIssuer,
+    lineage: ReasoningLineage,
+) -> LlmResponseStream {
+    use switchyard_protocol::stream::ResponseAccumulator;
+
+    let state = (chunks, ResponseAccumulator::new(), registry, issuer, lineage);
+    Box::pin(stream::unfold(state, |state| async move {
+        let (mut chunks, mut accumulator, registry, issuer, mut lineage) = state;
+        match chunks.next().await {
+            Some(Ok(event)) => {
+                for chunk in event.normalized() {
+                    accumulator.push(chunk.clone());
+                }
+                Some((Ok(event), (chunks, accumulator, registry, issuer, lineage)))
+            }
+            Some(Err(error)) => Some((Err(error), (chunks, accumulator, registry, issuer, lineage))),
+            None => {
+                let response = accumulator.finish();
+                lineage.response = response.id.clone();
+                for output in &response.outputs {
+                    for block in &output.content {
+                        let ContentBlock::Reasoning {
+                            details, signature, ..
+                        } = block
+                        else {
+                            continue;
+                        };
+                        if details.is_empty() && signature.is_none() {
+                            continue;
+                        }
+                        registry.record(
+                            opaque_digest(details, signature.as_deref()),
+                            issuer.clone(),
+                            lineage.clone(),
+                        );
+                    }
+                }
+                None
+            }
+        }
+    }))
 }
 
 // The caller's own Responses body, when this request arrived in that format.
@@ -2504,18 +2770,19 @@ mod tests {
         )]
     }
 
-    // Opaque reasoning state follows the dialect, not the format: only the OpenRouter wire is
-    // given back the `reasoning_details` it issued. A native target is narrowed so it can never
-    // receive another provider's signed blob, and the default (Verbatim) is never what a real
-    // target resolves to by accident.
+    // Opaque reasoning state follows the dialect, not the format: only the OpenRouter wire may
+    // be given back `reasoning_details`, and even then only state this exact target was proven
+    // to have issued. A native target is narrowed so it can never receive another provider's
+    // signed blob, and the default (ProvenanceBound) is never what a real target resolves to by
+    // accident.
     #[test]
     fn replay_policy_follows_the_target_dialect() {
         let mut base = config("http://stub");
         base.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
         assert_eq!(
             translation_policy(&Backend::OpenAiChat(base.clone())).reasoning_details_replay,
-            switchyard_translation::ReasoningDetailsReplay::Verbatim,
-            "the issuing wire gets its own details back"
+            switchyard_translation::ReasoningDetailsReplay::ProvenanceBound,
+            "the issuing wire may replay only state it can prove it issued"
         );
         for dialect in [
             ReasoningDialect::OpenAiEffort,

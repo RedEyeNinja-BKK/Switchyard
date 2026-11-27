@@ -8,8 +8,9 @@ pub mod common;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
-    ContentBlock, FormatId, LossyConversionPolicy, TranslationEngine, TranslationError,
-    TranslationPolicy, WireFormat, prepare_request_for_target, sanitize_anthropic_tool_use_id,
+    ContentBlock, FormatId, LossyConversionPolicy, ReasoningDetailsReplay, TranslationEngine,
+    TranslationError, TranslationPolicy, WireFormat, prepare_request_for_target,
+    sanitize_anthropic_tool_use_id,
 };
 
 use common::{REASONING_MODEL, normalized_policy, shell_tool_call};
@@ -2366,8 +2367,14 @@ fn responses_reasoning_item_merges_into_next_assistant_message_for_openai_chat()
 #[test]
 fn openai_chat_reasoning_details_round_trip_in_assistant_history() -> TestResult {
     let engine = TranslationEngine::default();
-    // Exercise the normalized IR path instead of replaying the original JSON.
-    let policy = normalized_policy();
+    // Exercise the normalized IR path instead of replaying the original JSON, under the
+    // explicit `Verbatim` mode. The default is `ProvenanceBound`, which withholds state the
+    // target was not proven to have issued; that behaviour is covered in
+    // `reasoning_replay_boundary.rs`.
+    let policy = TranslationPolicy {
+        reasoning_details_replay: ReasoningDetailsReplay::Verbatim,
+        ..normalized_policy()
+    };
     let details = json!([
         {
             "type": "reasoning.summary",
@@ -2417,7 +2424,12 @@ fn openai_chat_reasoning_details_round_trip_in_assistant_history() -> TestResult
 #[test]
 fn openai_chat_encrypted_reasoning_details_retain_fallback() -> TestResult {
     let engine = TranslationEngine::default();
-    let policy = normalized_policy();
+    // `Verbatim` is asserted explicitly: the default `ProvenanceBound` drops opaque state this
+    // target was not proven to have issued, which is covered in `reasoning_replay_boundary.rs`.
+    let policy = TranslationPolicy {
+        reasoning_details_replay: ReasoningDetailsReplay::Verbatim,
+        ..normalized_policy()
+    };
     let details = json!([{
         "type": "reasoning.encrypted",
         "data": "opaque-encrypted-reasoning",

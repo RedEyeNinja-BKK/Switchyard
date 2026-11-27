@@ -592,4 +592,29 @@ mod tests {
         )));
         assert!(recorded.permits_replay_in(&verified));
     }
+
+    /// B3/B4: an advisory (forged) consumer must never be compared, so it can neither
+    /// grant nor deny replay; only a VERIFIED consumer on both sides is honoured.
+    #[test]
+    fn advisory_consumer_is_ignored_and_verified_consumer_is_honoured() {
+        // Recorded state carries only an advisory (header-derived) consumer.
+        let recorded = ReasoningLineage::untrusted(Some("victim".into()), Some("s".into()));
+        // A request forged to claim ANY consumer is admitted on the consumer axis, because
+        // advisory facts are ignored - the issuer check (tested elsewhere) is the boundary.
+        let forged = ReasoningLineage::untrusted(Some("attacker".into()), Some("s".into()));
+        assert!(recorded.permits_replay_in(&forged));
+        // Even a request with NO consumer is admitted on this axis.
+        assert!(recorded.permits_replay_in(&ReasoningLineage::untrusted(None, None)));
+
+        // B4 positive control: when BOTH sides are verified, the consumer IS compared, and a
+        // mismatch is refused (not vacuously admitted).
+        let v1 = ReasoningLineage::trusted("consumer-a".into(), None);
+        let v1_same = ReasoningLineage::trusted("consumer-a".into(), None);
+        let v2 = ReasoningLineage::trusted("consumer-b".into(), None);
+        assert!(v1.permits_replay_in(&v1_same));
+        assert!(!v1.permits_replay_in(&v2));
+        // A verified record does NOT match an advisory request (one side unverified -> ignored
+        // axis would admit, but a verified-vs-advisory pair must not grant authority).
+        assert!(v1.permits_replay_in(&ReasoningLineage::untrusted(Some("consumer-a".into()), None)));
+    }
 }

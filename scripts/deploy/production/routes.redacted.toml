@@ -49,6 +49,15 @@ base_url = "https://reninja.tailnet-example.ts.net:8446/v1"
 api_key_env = "SWITCHYARD_COMFYNINJA_API_KEY"
 max_retries = 2
 
+# Google AI Studio (owner credential). Serves the native Gemini decision lane and the
+# Gemini embedding spaces. The key is the owner's; Stephen's Google routes, when present,
+# sit on their own credential and never fall back to this one.
+[llm_clients.google_gemini]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+max_retries = 0
+
 # ---- completion targets ----
 [targets.comfyninja-qwen3_8-27b-q4-mtp]
 id = "comfyninja/qwen3.8-27b-q4-mtp"
@@ -593,6 +602,38 @@ state_forms = { plain_string = true, structured = false }
 [decision_lanes.ST_Decisions]
 targets = ["direct-openrouter-stephen-span-01-lite"]
 
+# ---- Gemini native decision lane (owner Google credential) ----
+# Google's own /v1beta/decisions surface. All three question kinds are served; the
+# state form is structured only, matching what the endpoint accepts.
+[targets.direct-google-gemini-decision-1]
+id = "gemini-decision-1"
+llm_client = "google_gemini"
+decision_transport = "google_decisions"
+decision_path = "/v1beta/decisions"
+decision_base_url = "https://generativelanguage.googleapis.com"
+decision_api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+free_tier = true
+
+[targets.direct-google-gemini-decision-1.supported_types]
+noul = true
+choice = true
+score = true
+
+[targets.direct-google-gemini-decision-1.state_forms]
+plain_string = false
+structured = true
+
+[decision_lanes.smart-gemini-decision]
+targets = ["direct-google-gemini-decision-1"]
+
+# smart-gemini-decision COMPOSES the Gemini lane with the existing tier1 policy, so a
+# caller that names smart-gemini-decision gets the native Google engine first and the
+# established free/local families as capability-first fallbacks. Composition references
+# lanes, not targets, so each family stays independently addressable.
+[decision_lane_composition.smart-gemini-decision]
+children = ["smart-gemini-decision", "tier1-decision"]
+selection = "capability_first"
+
 # ---- embeddings and reranking ----
 [capability_clients.embedding-local]
 format = "openai_embeddings"
@@ -613,6 +654,9 @@ base_url = "https://openrouter.ai/api"
 model = "nvidia/nemotron-3.5-embed-8b:free"
 api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
 timeout_seconds = 120
+# Third-party free tier: OpenRouter may retain or train on submitted content, so this
+# endpoint only receives payloads the caller explicitly declares public or synthetic.
+privacy = "third_party_free"
 
 [capability_clients.reranker-local]
 format = "cohere_jina_rerank"
@@ -629,6 +673,8 @@ base_url = "https://openrouter.ai/api"
 model = "nvidia/nemotron-3.5-rerank-8b:free"
 api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
 timeout_seconds = 120
+# Third-party free tier: only public/synthetic documents may be reranked here.
+privacy = "third_party_free"
 
 [capabilities.smartlocal-embedding]
 id = "smartlocal-embedding"
@@ -664,6 +710,50 @@ max_candidates = 64
 top_n = 64
 max_doc_chars = 1024
 max_query_chars = 512
+
+# Local-first rerank selector: the internal engine answers first, and the third-party free
+# engine is a fallback only for payloads the caller declared public or synthetic. The free
+# candidate is never reached for an unstated class, so private documents stay inside the
+# boundary while public ones still get the faster free engine when the local one is down.
+[capabilities.smart-rerank]
+id = "smart-rerank"
+target = "reranker-local"
+candidates = ["reranker-free"]
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+# ---- Gemini embedding spaces (owner Google credential) ----
+# gemini-embedding-2 speaks the v2 codec: output width is a request field and vectors
+# below full width are auto-normalised, so this is a different space from the 001 lane.
+[capability_clients.embedding-google2]
+format = "google_embed_content_v2"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-embedding-2"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+
+[capabilities.gemini-embedding-2]
+id = "gemini-embedding-2"
+target = "embedding-google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+
+# smart-gemini-embedding is an ALIAS over the existing gemini-embedding-2 client and its
+# existing space: one client, one contract, no new space and no cross-space fallback. It
+# exists so a caller can name the Gemini embedding lane without duplicating the endpoint.
+[capabilities.smart-gemini-embedding]
+id = "smart-gemini-embedding"
+target = "embedding-google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
 
 # =====================================================================
 # STEPHEN (OpenRouter, dedicated credential)
@@ -738,6 +828,8 @@ base_url = "https://openrouter.ai/api"
 model = "nvidia/nemotron-3.5-embed-8b:free"
 api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
 timeout_seconds = 120
+# Third-party free tier on Stephen's credential: same restriction as the owner's free lane.
+privacy = "third_party_free"
 
 [capability_clients.reranker-stephen]
 format = "cohere_jina_rerank"
@@ -745,6 +837,8 @@ base_url = "https://openrouter.ai/api"
 model = "nvidia/nemotron-3.5-rerank-8b:free"
 api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
 timeout_seconds = 120
+# Third-party free tier on Stephen's credential: same restriction as the owner's free lane.
+privacy = "third_party_free"
 
 [capabilities.ST_Embed]
 id = "ST_Embed"

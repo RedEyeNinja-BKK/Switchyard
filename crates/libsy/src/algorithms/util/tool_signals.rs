@@ -1365,6 +1365,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: String::new(),
                 name: name.to_string(),
                 arguments: json!({}),
@@ -1377,6 +1378,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: String::new(),
                 name: "Bash".to_string(),
                 arguments: json!({"command": command}),
@@ -1619,6 +1621,7 @@ mod tests {
         let call = |id: &str, name: &str, arguments: Value| Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments,
@@ -1884,6 +1887,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: String::new(),
                 name: "exec_command".to_string(),
                 arguments: cmd,
@@ -2168,6 +2172,7 @@ mod tests {
             let call = Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: String::new(),
                     name: "str_replace_based_edit_tool".to_string(),
                     arguments,

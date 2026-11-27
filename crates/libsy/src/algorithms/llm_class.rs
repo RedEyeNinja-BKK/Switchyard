@@ -1527,6 +1527,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: id.to_string(),
                 name: "search".to_string(),
                 arguments: Value::Null,

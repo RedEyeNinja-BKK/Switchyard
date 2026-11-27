@@ -200,6 +200,30 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed tool arguments.
     pub arguments: Value,
+    /// Continuation state the issuing provider requires on a replay, kept verbatim.
+    ///
+    /// Opaque by construction: this type must never interpret the value. Google returns a
+    /// `thought_signature` beside a `functionCall` part and refuses (HTTP 400
+    /// `INVALID_ARGUMENT`) a replayed part that lacks it, so a call passing through
+    /// Switchyard must carry that signature back to the wire that issued it. On the
+    /// OpenAI-compatible surface the same value travels as `tool_calls[].extra_content`,
+    /// which is what is captured here. `None` means the call arrived without such state —
+    /// either the issuer has none or the caller dropped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state: Option<Value>,
+}
+
+impl ToolCall {
+    /// A call with no provider continuation state, which is what an issuer that carries no
+    /// signatures produces.
+    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+            provider_state: None,
+        }
+    }
 }
 
 /// Normalized tool result message content.
@@ -522,6 +546,7 @@ mod tests {
         assert_eq!(request.messages[0], Message::text(Role::User, "hello"));
 
         let tool_call = ContentBlock::ToolCall(ToolCall {
+            provider_state: None,
             id: "call-1".to_string(),
             name: "lookup".to_string(),
             arguments: json!({"query": "rust"}),

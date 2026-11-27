@@ -750,6 +750,7 @@ fn random_state_with_retries(
     max_retries: u32,
 ) -> TestResult<ServerState> {
     let backend = Backend::OpenAiChat(HttpBackendConfig {
+        tool_signature_placeholder: None,
         base_url: base_url.to_string(),
         api_key: Some("test-key".to_string()),
         forward_auth: false,

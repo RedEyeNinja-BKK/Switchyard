@@ -756,6 +756,7 @@ fn request_with_tool_lineage() -> LlmRequest {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolCall(switchyard_protocol::ToolCall {
+                    provider_state: None,
                     id: "call_1".to_string(),
                     name: "get_weather".to_string(),
                     arguments: serde_json::json!({"city": "Paris"}),

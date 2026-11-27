@@ -3460,6 +3460,19 @@ struct LlmClientConfig {
     /// advertised inbound formats. Ignored by the Chat and Anthropic formats.
     #[serde(default)]
     requires_list_input: bool,
+    /// The signature this wire accepts for a replayed tool call it did not issue.
+    ///
+    /// Declaring it states two things at once: the wire validates a provider signature on
+    /// the first replayed `functionCall` part of each step, and this is the placeholder it
+    /// accepts for a call another model issued. Google documents the literal
+    /// `skip_thought_signature_validator` for exactly that case ("history transferred from a
+    /// model that does not include thought signatures"), at a stated cost in fidelity. A
+    /// client that declares it echoes [`switchyard_protocol::ToolCall::provider_state`] when
+    /// the call has it and substitutes this value when it does not, which is what makes a
+    /// request carrying another provider's tool lineage servable here. A client that omits
+    /// it sends no continuation state, and targets on it must keep `tool_call_replay` off.
+    #[serde(default)]
+    tool_signature_placeholder: Option<String>,
     /// How this client's usage is billed.
     ///
     /// Stated rather than inferred, because the difference decides whether a per-token
@@ -4004,6 +4017,22 @@ fn build_backend(
     pacing: Option<Arc<switchyard_llm_client::PacedQuota>>,
     hosted_reasoning: Option<HostedReasoningMarker>,
 ) -> RunnerResult<Backend> {
+    // A declared placeholder is a promise that this wire can absorb foreign tool lineage.
+    // An empty value would encode `extra_content.google.thought_signature: ""`, which is
+    // neither a signature nor the documented placeholder, and the wire would refuse it with
+    // the very 400 the declaration exists to prevent.
+    if let Some(placeholder) = config.tool_signature_placeholder.as_deref() {
+        if placeholder.trim().is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} tool_signature_placeholder must not be empty"
+            )));
+        }
+        if !matches!(config.format, ClientFormat::OpenAiChat) {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} tool_signature_placeholder is only meaningful for the openai_chat format"
+            )));
+        }
+    }
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} max_retries must be at most {MAX_CONFIGURED_RETRIES}"
@@ -4084,6 +4113,7 @@ fn build_backend(
         allowance,
         pacing,
         hosted_reasoning,
+        tool_signature_placeholder: config.tool_signature_placeholder.clone(),
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),

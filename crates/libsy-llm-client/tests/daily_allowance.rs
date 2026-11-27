@@ -53,6 +53,7 @@ fn client_for(
     allowance: Option<Arc<DailyRequestAllowance>>,
 ) -> Result<TranslatingLlmClient, Box<dyn Error + Send + Sync>> {
     let backend = HttpBackendConfig {
+        tool_signature_placeholder: None,
         base_url: base_url.to_string(),
         api_key: Some("secret".to_string()),
         forward_auth: false,
@@ -522,6 +523,95 @@ fn provider_headroom_bounds_the_local_budget() {
     assert!(matches!(
         allowance.try_reserve_at(at(LATE_UTC_DAY)),
         Err(ReserveError::ProviderExhausted { limit: 1000 })
+    ));
+}
+
+/// A reservation is taken before the request leaves, so an attempt the provider refuses
+/// costs this counter a unit the provider never charged. Left alone that difference is
+/// permanent: the local figure stays above the account's for the rest of the day and the
+/// headroom the provider still reports can never be spent, because the counter believes it
+/// has already been. Measured on the OpenRouter free pool: local 1000 against a provider
+/// figure of 984, the sixteen units being exactly that day's refused attempts.
+#[test]
+fn uncharged_reservations_are_returned_to_the_budget() {
+    let directory = scratch("provider-uncharged");
+    let allowance = account_allowance(&directory, 1000);
+    for _ in 0..1000 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the local budget");
+    }
+    assert!(matches!(
+        allowance.try_reserve_at(at(LATE_UTC_DAY)),
+        Err(ReserveError::Exhausted)
+    ));
+
+    allowance
+        .reconcile(provider(984, 1000, 16, LATE_UTC_DAY))
+        .expect("the reading is durable");
+
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        16,
+        "the local figure was sixteen above the account, so the provider's own count wins"
+    );
+    for _ in 0..16 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("the provider says sixteen remain");
+    }
+    assert!(matches!(
+        allowance.try_reserve_at(at(LATE_UTC_DAY)),
+        Err(ReserveError::ProviderExhausted { limit: 1000 })
+    ));
+}
+
+/// The correction is of this counter, not of the account: it never lifts the figure the
+/// provider reports. When the provider counted more than this counter did - another client
+/// on the account spent - the local figure is already the smaller one and stays.
+#[test]
+fn the_correction_only_ever_moves_the_numerator_down_to_the_provider() {
+    let allowance = account_allowance(&scratch("provider-correction-bound"), 1000);
+    for _ in 0..10 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("room for ten");
+    }
+    allowance
+        .reconcile(provider(940, 1000, 60, LATE_UTC_DAY))
+        .expect("the reading is durable");
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        50,
+        "the local ten are subtracted from the provider's sixty; nothing is added back"
+    );
+}
+
+/// The corrected figure is what a restart sees, so the headroom it returns is not a property
+/// of the process that happened to receive the reading.
+#[test]
+fn the_corrected_figure_survives_a_restart() {
+    let directory = scratch("provider-correction-restart");
+    let allowance = account_allowance(&directory, 1000);
+    for _ in 0..1000 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the local budget");
+    }
+    allowance
+        .reconcile(provider(984, 1000, 16, LATE_UTC_DAY))
+        .expect("the reading is durable");
+
+    let after_restart = account_allowance(&directory, 1000);
+    assert_eq!(after_restart.remaining_at(at(LATE_UTC_DAY)), 16);
+    for _ in 0..16 {
+        after_restart
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("the provider says sixteen remain");
+    }
+    assert!(matches!(
+        after_restart.try_reserve_at(at(LATE_UTC_DAY)),
+        Err(ReserveError::ProviderExhausted { .. })
     ));
 }
 

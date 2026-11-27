@@ -57,6 +57,7 @@ fn backend(
     pacing: Option<Arc<PacedQuota>>,
 ) -> Backend {
     Backend::OpenAiChat(HttpBackendConfig {
+        tool_signature_placeholder: None,
         base_url: base_url.to_string(),
         api_key: Some("secret".to_string()),
         forward_auth: false,

@@ -145,6 +145,14 @@ pub struct HttpBackendConfig {
     /// `None` leaves response text untouched, which is what a model that legitimately writes
     /// those tokens as text requires.
     pub hosted_reasoning: Option<switchyard_translation::HostedReasoningMarker>,
+    /// The value this wire accepts for a replayed tool call it did not issue.
+    ///
+    /// `Some` states that the wire validates a provider signature on the first replayed
+    /// `functionCall` part of each step, and names the placeholder it accepts for a call
+    /// issued elsewhere (Google documents `skip_thought_signature_validator`). It also turns
+    /// on echo of genuine [`switchyard_protocol::ToolCall::provider_state`]. `None` sends no
+    /// continuation state, which is what every other wire requires of us.
+    pub tool_signature_placeholder: Option<String>,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -174,6 +182,10 @@ impl fmt::Debug for HttpBackendConfig {
             )
             .field("minute_limits", &self.pacing.as_ref().map(|p| p.limits()))
             .field("hosted_reasoning", &self.hosted_reasoning)
+            .field(
+                "tool_signature_placeholder",
+                &self.tool_signature_placeholder,
+            )
             .finish()
     }
 }
@@ -450,6 +462,11 @@ impl Backend {
         self.config().hosted_reasoning
     }
 
+    /// The placeholder this wire accepts in place of a provider signature it did not issue.
+    pub fn tool_signature_placeholder(&self) -> Option<&str> {
+        self.config().tool_signature_placeholder.as_deref()
+    }
+
     /// The cooldown group this backend belongs to, when its targets share one.
     pub fn cooldown_group(&self) -> Option<&str> {
         self.config().cooldown_group.as_deref()
@@ -589,6 +606,7 @@ mod tests {
             allowance: None,
             pacing: None,
             hosted_reasoning: None,
+            tool_signature_placeholder: None,
         }
     }
 

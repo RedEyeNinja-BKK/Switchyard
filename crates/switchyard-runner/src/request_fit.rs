@@ -42,9 +42,10 @@ pub fn unsupported_capability(
     }
     // Narrower than `tool_calling`, and separate because the two answers differ: a surface
     // can accept tool definitions and still be unable to continue a transaction. Google's
-    // OpenAI-compatibility endpoint requires a provider-issued signature on every replayed
-    // function call and refuses the request without it, so a request carrying tool lineage
-    // must not be sent to a target that states it cannot replay.
+    // OpenAI-compatibility endpoint requires a provider-issued signature on a replayed
+    // function call and refuses the request without one, unless the target also declares the
+    // documented placeholder for foreign calls; a request carrying tool lineage must not be
+    // sent to a target that states neither.
     if capabilities.tool_call_replay == Some(false) && replays_tool_call(request, body) {
         return Some("tool_call_replay");
     }

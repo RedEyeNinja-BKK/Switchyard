@@ -833,15 +833,45 @@ impl DailyRequestAllowance {
             }
             _ => 0,
         };
+        // The provider is the authority on its own day. When its figure is LOWER than this
+        // deployment's, the difference is spend this counter recorded for attempts the
+        // provider never charged: a reservation is taken before the request leaves, so a
+        // refusal it returns costs the local counter a unit the provider never counted.
+        // Measured on OpenRouter's free pool: local 1000 against a provider figure of 984,
+        // the sixteen units being exactly that day's refused attempts.
+        //
+        // Adopting the provider's number is the only correction that is both evidence-based
+        // and bounded by the account. It can re-admit at most what the provider itself says
+        // is unspent, it never raises the figure, and a wrong guess is caught by the
+        // provider's next refusal rather than becoming an over-issue the counter cannot see.
+        //
+        // The anchor moves with the figure it is subtracted from. Effective headroom is
+        // `reading.remaining - (spent - anchor)`, so replacing `spent` without replacing the
+        // anchor would subtract the provider's whole count from its own remainder and keep
+        // reporting zero. Anchoring at the corrected figure says what is now true: every
+        // request the provider counted is accounted for by the reading, and only requests
+        // admitted after it still consume the remainder.
+        //
+        // The bound this gives up is small and was already given up by an unwatermarked
+        // reading: requests admitted between the observation and this call are forgiven
+        // rather than subtracted. That window is one collection round, and the alternative
+        // - refusing for the rest of the day against headroom the provider still reports -
+        // is the larger error, and the one actually measured.
+        let corrected = if reading.used < spent {
+            reading.used
+        } else {
+            spent
+        };
+        let anchor = if corrected < spent { corrected } else { anchor };
         let retention = (reading
             .remaining
-            .saturating_sub(spent.saturating_sub(anchor))
+            .saturating_sub(corrected.saturating_sub(anchor))
             == 0)
             .then(|| self.retention_for(&reading))
             .filter(|retention| retention.until > now);
         let next = Counter {
             day: reading_day,
-            spent,
+            spent: corrected,
             provider: Some(reading),
             provider_anchor: anchor,
             retention,

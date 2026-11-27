@@ -2483,6 +2483,7 @@ mod tests {
                 let mut clients = HashMap::new();
                 for model in ["weak", "strong"] {
                     let config = HttpBackendConfig {
+                        tool_signature_placeholder: None,
                         base_url: server.uri(),
                         api_key: None,
                         forward_auth: false,
@@ -2640,6 +2641,7 @@ mod tests {
             TranslatingLlmClient::new(&[ModelConfig::new(
                 "weak",
                 Backend::Anthropic(HttpBackendConfig {
+                    tool_signature_placeholder: None,
                     base_url: server.uri(),
                     api_key: None,
                     forward_auth: false,
@@ -3790,6 +3792,7 @@ mod tests {
         let client_with_cooldown = |cooldown| {
             let backend = || {
                 Backend::OpenAiChat(HttpBackendConfig {
+                    tool_signature_placeholder: None,
                     base_url: format!("{}/v1", server.uri()),
                     api_key: None,
                     forward_auth: false,
@@ -3885,6 +3888,7 @@ mod tests {
 
         let build = |group: Option<&'static str>| {
             Backend::OpenAiChat(HttpBackendConfig {
+                tool_signature_placeholder: None,
                 base_url: format!("{}/v1", server.uri()),
                 api_key: None,
                 forward_auth: false,
@@ -4040,6 +4044,7 @@ mod tests {
 
         let build = || {
             Backend::OpenAiChat(HttpBackendConfig {
+                tool_signature_placeholder: None,
                 base_url: format!("{}/v1", server.uri()),
                 api_key: None,
                 forward_auth: false,
@@ -4183,6 +4188,7 @@ mod tests {
 
         let backend = || {
             Backend::OpenAiChat(HttpBackendConfig {
+                tool_signature_placeholder: None,
                 base_url: format!("{}/v1", server.uri()),
                 api_key: None,
                 forward_auth: false,

@@ -33,6 +33,7 @@ fn request_for(case: CapabilityCase) -> LlmRequest {
     let mut request = LlmRequest::default();
     let content = match case {
         CapabilityCase::Tools => Some(ContentBlock::ToolCall(ToolCall {
+            provider_state: None,
             id: "call_1".to_string(),
             name: "lookup".to_string(),
             arguments: json!({}),

@@ -991,10 +991,17 @@ fn decode_responses_input(
                             }
                             None => name,
                         };
+                        // A Responses item may carry the issuing provider's continuation state,
+                        // echoed from the `extra_content` a Google-backed chat turn returned. It
+                        // is opaque and required on replay, so it is carried rather than rebuilt.
                         pending_tool_calls.push(ToolCall {
                             id,
                             name,
                             arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                            provider_state: item
+                                .get("extra_content")
+                                .filter(|state| !state.is_null())
+                                .cloned(),
                         });
                     }
                     kind @ (Some("function_call_output") | Some("custom_tool_call_output")) => {
@@ -1068,6 +1075,10 @@ fn decode_responses_input(
                             id,
                             name,
                             arguments: json!({crate::codex_custom_tools::INPUT_ARGUMENT: input}),
+                            provider_state: item
+                                .get("extra_content")
+                                .filter(|state| !state.is_null())
+                                .cloned(),
                         });
                     }
                     None => {
@@ -2192,6 +2203,7 @@ fn decode_responses_output_item(
             url_citations: Vec::new(),
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -2210,6 +2222,7 @@ fn decode_responses_output_item(
             url_citations: Vec::new(),
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: item
                     .get("call_id")
                     .and_then(Value::as_str)

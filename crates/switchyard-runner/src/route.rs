@@ -91,13 +91,19 @@ pub struct ModelCapabilities {
     ///
     /// A target wire fact, never a route promise: no route declaration feeds it, which is
     /// why [`ModelCapabilities::default`] leaves it `None`. Google's OpenAI-compatibility
-    /// surface requires a provider-issued `thought_signature` on every replayed
-    /// `functionCall` part and answers HTTP 400 `INVALID_ARGUMENT` without one — measured
-    /// 2026-11-26, where a call that surface had just issued was refused once the signature
-    /// was stripped, and a call issued elsewhere was refused as well. Switchyard cannot
-    /// manufacture the signature and cannot tell whether a caller echoed it, so a target
-    /// stating `false` is skipped for any request that carries tool lineage. Its
-    /// definitional call stays eligible, because offering tools needs no signature.
+    /// surface requires a provider-issued `thought_signature` on the first replayed
+    /// `functionCall` part of each step and answers HTTP 400 `INVALID_ARGUMENT` without one —
+    /// measured 2026-11-26, where a call that surface had just issued was refused once the
+    /// signature was stripped.
+    ///
+    /// A client that declares `tool_signature_placeholder` changes that answer, and only in
+    /// the way Google documents: a call the wire did not issue is replayed with the literal
+    /// `skip_thought_signature_validator` instead of a signature it never produced, and a
+    /// call that does carry state echoes it verbatim. Such a target may state `true`, because
+    /// Switchyard is no longer sending replayed lineage bare. A target stating `false` is
+    /// skipped for any request carrying tool lineage, which stays the correct declaration for
+    /// a wire with no documented stand-in. Its definitional call stays eligible either way,
+    /// because offering tools needs no signature.
     pub tool_call_replay: Option<bool>,
 }
 

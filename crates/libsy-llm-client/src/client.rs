@@ -1717,6 +1717,7 @@ fn translation_policy(backend: &Backend) -> TranslationPolicy {
     TranslationPolicy {
         target_capabilities: TargetCapabilities {
             requires_list_input: Some(backend.requires_list_input()),
+            tool_signature_placeholder: backend.tool_signature_placeholder().map(str::to_owned),
             ..TargetCapabilities::default()
         },
         hosted_reasoning: backend.hosted_reasoning(),
@@ -2328,6 +2329,7 @@ mod tests {
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
+            tool_signature_placeholder: None,
             base_url: base_url.to_string(),
             api_key: Some("secret".to_string()),
             forward_auth: false,
@@ -2414,6 +2416,7 @@ mod tests {
 
     fn config_with_retries(base_url: &str, max_retries: u32) -> HttpBackendConfig {
         HttpBackendConfig {
+            tool_signature_placeholder: None,
             max_retries,
             ..config(base_url)
         }
@@ -2421,6 +2424,7 @@ mod tests {
 
     fn forwarding_config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
+            tool_signature_placeholder: None,
             api_key: None,
             forward_auth: true,
             ..config(base_url)
@@ -4361,6 +4365,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let backend = HttpBackendConfig {
+                tool_signature_placeholder: None,
                 forward_auth,
                 failure_cooldown: Duration::from_secs(60),
                 cooldown_group: None,

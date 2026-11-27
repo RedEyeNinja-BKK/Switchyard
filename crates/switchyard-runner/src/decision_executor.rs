@@ -184,6 +184,12 @@ impl DecisionFailure {
                      provider day"
                         .to_string()
                 }
+                "provider_allowance_exhausted" => {
+                    "the provider reports this account's daily allowance is spent; a local \
+                     budget with room cannot reopen it, and it clears at the provider's own \
+                     day boundary"
+                        .to_string()
+                }
                 "daily_allowance_unavailable" => {
                     "this model's daily request counter cannot be accounted, so no budget may be \
                      spent"
@@ -368,12 +374,36 @@ fn reserve_decision_call(
                     retryable: true,
                 });
             }
+            Err(switchyard_llm_client::ReserveError::ProviderExhausted { .. }) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                // The provider closed the account's allowance, not this lane's own
+                // budget. Retryable on the same basis as a local exhaustion: another
+                // candidate draws on a different allowance. The label stays distinct so
+                // the decision record says which authority refused.
+                return Err(DecisionFailure::Serving {
+                    reason: "provider_allowance_exhausted",
+                    retryable: true,
+                });
+            }
             Err(switchyard_llm_client::ReserveError::Unusable(_)) => {
                 if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
                     pacing.release(ticket);
                 }
                 // The counter cannot be trusted, so no budget may be spent. This is a
                 // deployment fault: trying a sibling would hide it.
+                return Err(DecisionFailure::Serving {
+                    reason: "daily_allowance_unavailable",
+                    retryable: false,
+                });
+            }
+            // A reservation path never orders an observation. Handled as a closed refusal
+            // rather than a panic, so a broken invariant cannot spend budget unaccounted.
+            Err(switchyard_llm_client::ReserveError::ObservationRejected { .. }) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
                 return Err(DecisionFailure::Serving {
                     reason: "daily_allowance_unavailable",
                     retryable: false,
@@ -539,11 +569,17 @@ fn aggregate_attempts(
                 "minute_allowance_throttled"
                 | "input_exceeds_minute_window"
                 | "daily_allowance_exhausted"
+                | "provider_allowance_exhausted"
                 | "daily_allowance_unavailable" => {
                     // Keep the most severe: an unusable counter outranks an exhausted one,
                     // which outranks a minute window that refills shortly.
                     let rank = |reason: &'static str| match reason {
-                        "daily_allowance_unavailable" => 3,
+                        "daily_allowance_unavailable" => 4,
+                        // The provider closing the account outranks this deployment's own
+                        // budget: a sibling's local counter looking unspent cannot serve a
+                        // request the account has no allowance left for, so if any attempt
+                        // was refused by the provider that is the answer reported.
+                        "provider_allowance_exhausted" => 3,
                         "daily_allowance_exhausted" => 2,
                         "minute_allowance_throttled" => 1,
                         _ => 0,

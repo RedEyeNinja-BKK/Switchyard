@@ -22,7 +22,7 @@
 //!   balance series, which is absent rather than zero.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use opentelemetry::{KeyValue, global};
 
@@ -153,6 +153,65 @@ pub struct AccountObservation {
     /// The reset time of a provider-reported window, by pool name, as a duration
     /// from the observation.
     pub allowance_reset_seconds: BTreeMap<String, f64>,
+    /// Request counts the provider reported for named pools, with their windows.
+    ///
+    /// Separate from [`Self::allowance_remaining_percent`] because a percentage cannot
+    /// be reconciled with a local counter: the deployment needs the used, limit and
+    /// remaining figures the provider actually stated, plus when it stated them, in
+    /// order to tell a confirmed exhaustion from a stale reading. A percentage loses
+    /// all three.
+    pub request_allowances: Vec<RequestAllowanceReading>,
+}
+
+/// One provider-reported request pool: how many of its daily requests are spent.
+///
+/// This is the provider's own statement about the account, and the only figure that can
+/// confirm an *account* is empty, because it counts traffic this deployment never saw.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestAllowanceReading {
+    /// The pool this count belongs to, as the provider names it.
+    pub pool: String,
+    /// Requests the provider counted in the pool's current window.
+    pub used: u64,
+    /// The pool's stated limit for that window.
+    pub limit: u64,
+    /// Requests the provider says remain.
+    pub remaining: u64,
+    /// When this reading was taken, on this host's clock.
+    pub observed_at: SystemTime,
+    /// When the provider says the window resets, when it states one.
+    pub reset_at: Option<SystemTime>,
+}
+
+impl RequestAllowanceReading {
+    /// Builds one reading of a provider-reported pool.
+    pub fn new(
+        pool: impl Into<String>,
+        used: u64,
+        limit: u64,
+        remaining: u64,
+        observed_at: SystemTime,
+        reset_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            pool: pool.into(),
+            used,
+            limit,
+            remaining,
+            observed_at,
+            reset_at,
+        }
+    }
+
+    /// Whether the provider's own numbers are self-consistent enough to act on.
+    ///
+    /// A reading whose parts contradict each other is not usable evidence. The check is
+    /// deliberately one-directional: `remaining` must not exceed `limit`, and `used` must
+    /// not exceed `limit` either, but a provider may legitimately report `used + remaining
+    /// < limit` (a partial reset), so that is accepted rather than treated as a fault.
+    pub fn is_consistent(&self) -> bool {
+        self.remaining <= self.limit && self.used <= self.limit
+    }
 }
 
 impl AccountObservation {
@@ -164,6 +223,7 @@ impl AccountObservation {
             && self.usage.is_empty()
             && self.allowance_remaining_percent.is_empty()
             && self.allowance_reset_seconds.is_empty()
+            && self.request_allowances.is_empty()
     }
 }
 

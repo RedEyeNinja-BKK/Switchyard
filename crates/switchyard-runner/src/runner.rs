@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use libsy::RoutingOutcome;
 use serde_json::Value;
@@ -36,6 +37,16 @@ pub struct Runner {
     composite_capabilities: BTreeMap<String, ModelCapabilities>,
     /// The configuration facts an economics surface needs, extracted at load.
     deployment_facts: crate::facts::DeploymentFacts,
+    /// Every daily request counter the deployment built, keyed by (quota group, counter).
+    ///
+    /// The routes each hold their own view of this map, filtered to the targets they serve.
+    /// The economics collector needs the unfiltered one: it writes provider readings into
+    /// counters by quota group, and a counter reached only through a route would be
+    /// invisible whenever that route was not the one being reconciled.
+    daily_allowances: std::collections::HashMap<
+        (String, ModelId),
+        Arc<switchyard_llm_client::DailyRequestAllowance>,
+    >,
 }
 
 /// One configured lane: its resolver and the kinds it serves.
@@ -116,6 +127,7 @@ impl Runner {
             composites: BTreeMap::new(),
             composite_capabilities: BTreeMap::new(),
             deployment_facts: crate::facts::DeploymentFacts::default(),
+            daily_allowances: std::collections::HashMap::new(),
         }
     }
 
@@ -214,6 +226,28 @@ impl Runner {
     /// Returns the configuration facts an economics surface needs.
     pub fn deployment_facts(&self) -> &crate::facts::DeploymentFacts {
         &self.deployment_facts
+    }
+
+    /// Every daily request counter this deployment built, keyed by quota group and counter.
+    pub fn daily_allowances(
+        &self,
+    ) -> &std::collections::HashMap<
+        (String, ModelId),
+        Arc<switchyard_llm_client::DailyRequestAllowance>,
+    > {
+        &self.daily_allowances
+    }
+
+    /// Registers the counters so a component outside the route path can reconcile them.
+    pub(crate) fn with_daily_allowance_registry(
+        mut self,
+        allowances: std::collections::HashMap<
+            (String, ModelId),
+            Arc<switchyard_llm_client::DailyRequestAllowance>,
+        >,
+    ) -> Self {
+        self.daily_allowances = allowances;
+        self
     }
 
     /// The URL unmatched requests may fall through to, when configured.

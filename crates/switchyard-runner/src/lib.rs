@@ -23,7 +23,10 @@ pub use algorithm::{
     ClassifierPolicyConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
 pub use config::RouteReasoningPolicy;
-pub use config::{BillingKind, ClientLocality, CompositeCrossPolicy, SelectionPolicy};
+pub use config::{
+    BillingKind, ClientLocality, CompositeCrossPolicy, QuotaProvider, SelectionPolicy,
+    TerminalPolicy,
+};
 pub use facts::{ClientFacts, DeploymentFacts, RouteFacts, TargetFacts};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 // Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.

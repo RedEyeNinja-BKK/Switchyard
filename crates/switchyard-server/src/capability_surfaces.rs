@@ -288,7 +288,37 @@ fn reserve_physical_call(
                     "daily_allowance_exhausted",
                 )));
             }
+            Err(ReserveError::ProviderExhausted { limit }) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                return Err(Box::new(error_body(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "the provider reports the account allowance for capability {} ({}) is \
+                         spent ({limit} per provider day); a local budget with room cannot \
+                         reopen it, and it clears at the provider's own day boundary",
+                        capability.id, capability.model
+                    ),
+                    "provider_allowance_exhausted",
+                )));
+            }
             Err(ReserveError::Unusable(reason)) => {
+                if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
+                    pacing.release(ticket);
+                }
+                return Err(Box::new(error_body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "daily request allowance for capability {} cannot be accounted: {reason}",
+                        capability.id
+                    ),
+                    "daily_allowance_unavailable",
+                )));
+            }
+            // A reservation path never orders an observation. Refused rather than
+            // unwrapped: an accounting invariant that broke must not spend budget.
+            Err(ReserveError::ObservationRejected { reason }) => {
                 if let (Some(pacing), Some(ticket)) = (&budget.pacing, &ticket) {
                     pacing.release(ticket);
                 }
@@ -307,7 +337,10 @@ fn reserve_physical_call(
 }
 
 /// Releases a minute slot for a request that never reached the provider.
-pub(crate) fn release_physical_call(capability: &ResolvedCapability, ticket: &Option<PacingTicket>) {
+pub(crate) fn release_physical_call(
+    capability: &ResolvedCapability,
+    ticket: &Option<PacingTicket>,
+) {
     if let (Some(budget), Some(ticket)) = (&capability.budget, ticket)
         && let Some(pacing) = &budget.pacing
     {

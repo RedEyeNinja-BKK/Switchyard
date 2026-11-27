@@ -97,6 +97,28 @@ pub enum LlmClientError {
         reason: String,
     },
 
+    /// The provider reported that the account's allowance is spent for the current day.
+    ///
+    /// Distinct from [`Self::DailyRequestAllowanceExhausted`], which is a statement about
+    /// this deployment's own counter. This one is the provider's answer about the whole
+    /// account: it counts traffic from every client and every key, so a local budget with
+    /// room left cannot make the account servable, and the leg must not be retried. It
+    /// also must not be confused with an unusable counter - a stale or unreadable reading
+    /// is [`Self::DailyRequestAllowanceUnavailable`], never this.
+    ///
+    /// The route may advance on it, exactly as for a per-target exhaustion: every other
+    /// candidate on a *different* allowance is untouched, which is the whole point of
+    /// keeping the account's cap separate from each leg's.
+    #[error(
+        "provider reports the account allowance for {model} is spent ({limit} per provider day); it resets at the provider's own day boundary"
+    )]
+    ProviderAllowanceExhausted {
+        /// Model whose account allowance is spent.
+        model: ModelId,
+        /// The account pool's stated daily limit.
+        limit: u64,
+    },
+
     /// The target's own per-minute budget has no room for this request yet.
     ///
     /// A different fact from both the daily allowance above and an account-wide cap: the

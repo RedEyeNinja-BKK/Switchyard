@@ -404,6 +404,7 @@ fn start_economics(state: &ServerState) -> std::thread::JoinHandle<()> {
         state.runner.deployment_facts(),
         Arc::clone(&state.calendar),
         &env,
+        state.runner.daily_allowances(),
     )
 }
 

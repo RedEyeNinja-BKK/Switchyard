@@ -269,6 +269,79 @@ fn tier_cannot_hold(gates: &[Result<(), &'static str>]) -> bool {
         })
 }
 
+/// The exclusion codes that say this *target's* wire cannot carry a request it was given.
+///
+/// Closed vocabulary, and deliberately narrow. Every code here is a measured property of one
+/// provider's wire rather than a judgement about the request: the request is portable, the
+/// leg is not, and another leg in a later declared group may be. Codes outside this list are
+/// not, and the distinction is the whole safety of capability escalation:
+///
+/// * a size code is the caller's prompt, and is handled by its own escalation axis;
+/// * a credential, allowance or block code is the deployment's capacity;
+/// * a malformed, unsafe or unverifiable continuation is a defect in the request, and sending
+///   it to a second provider would re-learn the same refusal with a bill attached;
+/// * an authentication, billing or policy refusal is a fact about the deployment or the
+///   account, and spending another group on it hides the fault the caller needs to see.
+///
+/// `tool_call_replay` is the only entry because it is the only one measured as a per-wire
+/// property with a portable counterpart. Measured 2026-11-26 on the loopback deployment: each
+/// Google chat leg accepted a definitional tool call and refused that same call replayed with
+/// the signature stripped (HTTP 400 naming `thought_signature`), while a DeepSeek leg served
+/// the same replayed transcript. Adding a code here is a new claim about a wire and needs its
+/// own measurement and its own test.
+fn is_target_capability_exclusion(code: &str) -> bool {
+    matches!(code, "tool_call_replay")
+}
+
+/// Whether a pool that admitted nothing did so only because every leg's *wire* cannot carry
+/// this otherwise valid request, and the route is authorized to look further.
+///
+/// This is the capability counterpart of [`authorize_fit_escalation`] and answers the same
+/// shape of question about a different fact. A size refusal says the pool cannot hold the
+/// request; this says the pool cannot carry it, and a later declared group might.
+///
+/// Three conditions, all required:
+///
+/// * `route_accepts` -- the lane's own declaration permits the request. A request the route
+///   never promised to serve is the caller's problem, not a missing capability in a group.
+/// * every candidate is excluded, and
+/// * every exclusion is a target wire fact from the closed vocabulary above.
+///
+/// The answer authorizes *consideration* of the next declared group and nothing else: the
+/// target's own credential, allowance, fit, privacy and continuation gates are evaluated
+/// exactly as before when that group is reached, so an escalation cannot by itself spend a
+/// metered request.
+pub(crate) fn authorize_capability_escalation(
+    route_accepts: bool,
+    gates: &[Result<(), &'static str>],
+) -> Option<&'static str> {
+    if !route_accepts || gates.is_empty() {
+        return None;
+    }
+    if !gates.iter().all(|gate| match gate {
+        Err(code) => is_target_capability_exclusion(code),
+        Ok(()) => false,
+    }) {
+        return None;
+    }
+    Some("primary_pool_capability_incompatible")
+}
+
+/// Whether every target in one declared tier was excluded only by its own wire.
+///
+/// The tier-level form of [`authorize_capability_escalation`]: a tier that admitted nothing
+/// keeps the walk alive only when its own targets are the reason, so the next group is asked
+/// about capacity rather than asked to settle something about the request. A tier that has a
+/// capable leg blocked by a credential is not this claim, and is judged by
+/// [`authorize_terminal`] instead.
+fn tier_capability_incompatible(gates: &[Result<(), &'static str>]) -> bool {
+    !gates.is_empty()
+        && gates.iter().all(|gate| match gate {
+            Err(code) => is_target_capability_exclusion(code),
+            Ok(()) => false,
+        })
+}
+
 /// Hands the route's decision record to whichever observer the caller supplied.
 ///
 /// Cloning only when someone is listening keeps the cost of the record to the routes that
@@ -349,6 +422,35 @@ fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrie
     }
 }
 
+/// Whether every declared allowance domain is affirmatively spent.
+///
+/// The claim is about the deployment's allowance domains, so neither `capable` nor
+/// `dispatchable` can bound it: both are what survived gates, and a member excluded by fit,
+/// by a rejected key or by an unreadable ledger is precisely a member whose allowance still
+/// has to be established. `domains` is the declared membership; a route that declares none
+/// is one domain over its capable set, because that is the only pool the deployment named.
+///
+/// An empty declared domain is a configuration fault and is never read as spent: a claim
+/// about a pool with no members is a claim about nothing, and answering it "yes" is how a
+/// misconfigured pool would buy the local tier on the first request.
+fn declared_domains_exhausted(
+    domains: &[Vec<ModelId>],
+    ungrouped: &[ModelId],
+    exhausted: impl Fn(&ModelId) -> bool,
+) -> bool {
+    let single: Vec<Vec<ModelId>>;
+    let judged: &[Vec<ModelId>] = if domains.is_empty() {
+        single = vec![ungrouped.to_vec()];
+        &single
+    } else {
+        domains
+    };
+    !judged.is_empty()
+        && judged
+            .iter()
+            .all(|domain| !domain.is_empty() && domain.iter().all(&exhausted))
+}
+
 /// Decides whether the terminal leg may be spent, and names why.
 ///
 /// This is the whole policy, kept as a free function so its decision table can be
@@ -360,25 +462,73 @@ fn combine_carrier_facts(no_remote: bool, no_inline: bool) -> Option<MediaCarrie
 /// * `dispatchable` - of those, the ones no credential block excludes right now;
 /// * `attempts` - every upstream call this request actually made;
 /// * `policy` - which evidence this route accepts as "the pool cannot serve this";
+/// * `domains` - the declared primary groups: the allowance domains the strict policy
+///   makes a claim about, judged over their whole declared membership rather than over the
+///   legs this request happened to be able to try. Empty means "one domain, the capable
+///   set", which is the strongest statement available when the deployment never declared
+///   which targets share a budget;
 /// * `credential_of` - the credential that serves a target, when configuration says;
 /// * `quota_blocked` - whether a block excludes a target because its allowance is spent,
-///   rather than because the credential was rejected.
+///   rather than because the credential was rejected;
+/// * `allowance_spent` - whether the counter governing a target reports no remainder for
+///   the current provider day and can be read at all.
 ///
 /// Returns `None` when the pool's unavailability is not provable, which is the safe
 /// answer: the caller gets the primary error instead of a paid escalation.
+#[allow(clippy::too_many_arguments)] // Each argument is one piece of evidence, varied independently in tests.
 pub(crate) fn authorize_terminal(
     capable: &[ModelId],
     dispatchable: &HashSet<ModelId>,
     attempts: &[AttemptTrace],
     policy: TerminalPolicy,
+    domains: &[Vec<ModelId>],
     credential_of: impl Fn(&ModelId) -> Option<String>,
     quota_blocked: impl Fn(&ModelId) -> bool,
+    allowance_spent: impl Fn(&ModelId) -> bool,
 ) -> Option<&'static str> {
     // Nothing in the pool could serve this request even with unlimited capacity, so
     // "exhausted" would be a different claim from the true one. Refuse.
     if capable.is_empty() {
         return None;
     }
+    // The strict boundary is decided here, before the block and attempt branches, because
+    // it is the one judgement that must not be narrowed by them: a member dropped for fit,
+    // for a rejected key or for an unreadable ledger is still a member of its domain, and
+    // its allowance still has to be established before the local tier may be spent.
+    //
+    // Only affirmative current-window evidence counts:
+    //   * this request saw the target answer that its daily allowance is spent;
+    //   * a quota-scoped credential block covers it -- a block `credential_block` builds
+    //     only from a provider quota statement, never from a bare 429, a cooldown or a
+    //     rejected key, and scoped so a per-model block covers only that model;
+    //   * the counter governing it reports no remainder for the current provider day and
+    //     can be read at all.
+    // A rejected credential, an unreadable or stale ledger, a leg skipped for fit and a leg
+    // nobody looked at leave the domain unknown, and unknown is not spent. A per-model
+    // exhaustion is never promoted to its credential: Google allocates that budget per model
+    // inside the project, so a spent sibling says nothing about this one.
+    let strict = (policy == TerminalPolicy::AllowanceOnly).then(|| {
+        let spent_here: HashSet<&str> = attempts
+            .iter()
+            .filter(|attempt| capable.iter().any(|model| model.as_str() == attempt.model))
+            .filter(|attempt| is_capacity_outcome(attempt.outcome, policy))
+            // A provider-confirmed refusal is raised by the pre-send reservation, never by
+            // this request's own answer: the reservation runs before anything leaves, so the
+            // outcome inherits the basis of the reading behind it and the string cannot carry
+            // that distinction. Ask the counter again here -- a current zero is evidence the
+            // domain is spent, a retained statement about the past is not, and the two arrive
+            // as the same outcome. The local refusal is not re-asked: this deployment's own
+            // ledger is current by construction.
+            .filter(|attempt| {
+                attempt.outcome != "provider_allowance_exhausted"
+                    || allowance_spent(&ModelId::from(attempt.model.as_str()))
+            })
+            .map(|attempt| attempt.model.as_str())
+            .collect();
+        declared_domains_exhausted(domains, capable, |model| {
+            spent_here.contains(model.as_str()) || quota_blocked(model) || allowance_spent(model)
+        })
+    });
     if dispatchable.is_empty() {
         // Every capable leg is covered by a credential block, so the pool is provably out
         // of capacity without a single request being made. A route that escalates only on
@@ -389,16 +539,26 @@ pub(crate) fn authorize_terminal(
         // deployment fault, and answering it with a further call spends money on a
         // configuration error instead of surfacing it. Only the historical `Capacity` rule
         // reads every block as exhaustion.
-        if policy != TerminalPolicy::Capacity && !capable.iter().all(quota_blocked) {
-            return None;
+        //
+        // The strict policy keeps its own reading of "blocked": the block kind alone is not
+        // proof, so the declared domains are judged as they are on every other path, and a
+        // domain whose members are merely rejected stays unknown rather than spent.
+        match strict {
+            Some(true) => return Some("primary_pool_blocked"),
+            Some(false) => return None,
+            None => {
+                if policy != TerminalPolicy::Capacity && !capable.iter().all(quota_blocked) {
+                    return None;
+                }
+                return Some("primary_pool_blocked");
+            }
         }
-        return Some("primary_pool_blocked");
     }
     let primary_attempts: Vec<&AttemptTrace> = attempts
         .iter()
         .filter(|attempt| capable.iter().any(|model| model.as_str() == attempt.model))
         .collect();
-    if primary_attempts.is_empty() {
+    if primary_attempts.is_empty() && strict.is_none() {
         return None;
     }
     // One leg failing for a reason that is about the request - a policy answer, a
@@ -409,6 +569,12 @@ pub(crate) fn authorize_terminal(
         .all(|attempt| is_capacity_outcome(attempt.outcome, policy))
     {
         return None;
+    }
+    if let Some(spent) = strict {
+        // The domain judgement above already accounts for every declared member, including
+        // the ones this request never dispatched and the ones it could not fit, so there is
+        // no coverage gap left to explain by a dead credential.
+        return spent.then_some("primary_pool_exhausted");
     }
     let attempted: HashSet<&str> = primary_attempts
         .iter()
@@ -455,6 +621,7 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         TerminalPolicy::Capacity => matches!(
             outcome,
             "daily_allowance_exhausted"
+                | "provider_allowance_exhausted"
                 | "daily_allowance_unavailable"
                 | "minute_window"
                 | "minute_window_too_small"
@@ -475,7 +642,28 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         // policy lets the terminal leg be spent on.
         TerminalPolicy::QuotaOnly => matches!(
             outcome,
-            "daily_allowance_exhausted" | "minute_window" | "http_429"
+            "daily_allowance_exhausted"
+                | "provider_allowance_exhausted"
+                | "minute_window"
+                | "http_429"
+        ),
+        // The strict reading: only an affirmative statement that an allowance domain is at
+        // zero for the current window. `QuotaOnly` above also accepts a minute throttle and a
+        // bare 429, which is right for a lane whose terminal leg is a local model that costs
+        // nothing to try; it is wrong for a lane that promises to cross only once BOTH primary
+        // allowances are genuinely spent. A minute window regains room on its own, and an
+        // unclassified 429 may be a concurrency limit or a policy answer - neither is a
+        // measured exhaustion.
+        //
+        // `provider_allowance_exhausted` is accepted here only because a *current* provider
+        // zero is affirmative evidence. The string is also produced by a refusal that is only
+        // being retained past its reading's freshness, and it cannot say which. Acceptance
+        // therefore only says the class is eligible: `authorize_terminal`'s strict branch asks
+        // the counter again before an attempt of this class may authorise the local tier, and
+        // a retained statement about the past fails that second question.
+        TerminalPolicy::AllowanceOnly => matches!(
+            outcome,
+            "daily_allowance_exhausted" | "provider_allowance_exhausted"
         ),
         // Everything `Capacity` accepts except the two authentication outcomes, the two
         // faults that are about this deployment's accounting or this request's size, and a
@@ -499,6 +687,7 @@ fn is_capacity_outcome(outcome: &str, policy: TerminalPolicy) -> bool {
         TerminalPolicy::Availability => matches!(
             outcome,
             "daily_allowance_exhausted"
+                | "provider_allowance_exhausted"
                 | "minute_window"
                 | "http_429"
                 | "http_5xx"
@@ -683,6 +872,18 @@ pub struct Route {
     /// rather than a boolean means the trace can name the groups the pool was built from,
     /// and a pool route is recognisable at runtime, not only in the manifest that created it.
     pool_groups: Option<Vec<String>>,
+    /// The declared groups as model sets, when this route orders by group before by leaf.
+    ///
+    /// Empty for every other route. The membership is resolved at load rather than at request
+    /// time so the dispatch path never re-derives it from labels, and so a group the manifest
+    /// does not describe cannot be invented mid-request.
+    group_plan: crate::selection::GroupPlan,
+    /// How the declared groups order the pool: equal peers that adapt and rotate, or a
+    /// declared cost sequence in which each group is exhausted before the next.
+    ///
+    /// Carried beside the plan rather than inside it because the same membership can be
+    /// deployed under either reading, and the reading is what a deployment decides.
+    group_ordering: crate::selection::Grouping,
     /// Targets this route may reach only when every eligible primary candidate is
     /// verifiably unavailable, grouped into ordered tiers.
     ///
@@ -699,6 +900,14 @@ pub struct Route {
     /// Which evidence may spend `terminal`. Configuration sets this per route; the default
     /// is the historical capacity rule, so a route that names no policy behaves as before.
     terminal_policy: TerminalPolicy,
+    /// Per-boundary evidence policy, aligned with `terminal`; empty means every boundary uses
+    /// `terminal_policy`.
+    ///
+    /// The entry boundary is the claim that opens the walk and stays the route's own. Each
+    /// later boundary is a claim about the tier being left, and a route may need a different
+    /// one there: a local tier is entered on quota evidence, but the metered tier behind it
+    /// exists for the local outage, which is not quota evidence.
+    terminal_policies: Vec<TerminalPolicy>,
     /// Whether a request that no primary candidate can hold may be escalated to the declared
     /// tiers.
     ///
@@ -708,6 +917,19 @@ pub struct Route {
     /// capacity exhaustion -- it is a different claim, recorded under its own reason, and the
     /// tier that receives the request is judged on its own gates.
     fit_escalation: bool,
+    /// Whether a request that no primary candidate's *wire* can carry may be escalated to the
+    /// declared tiers.
+    ///
+    /// The third axis, and the narrowest. `terminal_policy` governs a pool that failed;
+    /// `fit_escalation` governs a request too large for the pool; this governs a request the
+    /// pool's targets cannot carry at the wire level while a later group's can. It is off
+    /// unless a route declares it, so a lane that has never been measured for this keeps
+    /// refusing rather than quietly spending a downstream group.
+    ///
+    /// It authorizes consideration, never expenditure: the group that receives the request is
+    /// judged on its own credential, allowance, fit, privacy and continuation gates, so an
+    /// escalation cannot by itself buy a metered call.
+    capability_escalation: bool,
 }
 
 /// A route whose targets are all held out of service, with the evidence for holding it.
@@ -762,9 +984,13 @@ impl Route {
             daily_allowances: Arc::new(HashMap::new()),
             held: None,
             pool_groups: None,
+            group_plan: crate::selection::GroupPlan::default(),
+            group_ordering: crate::selection::Grouping::Adaptive,
             terminal: Vec::new(),
             terminal_policy: TerminalPolicy::default(),
+            terminal_policies: Vec::new(),
             fit_escalation: false,
+            capability_escalation: false,
         }
     }
 
@@ -790,6 +1016,24 @@ impl Route {
         self
     }
 
+    /// Declares the evidence policy that governs each declared tier's own boundary.
+    ///
+    /// Aligned with the tiers and validated at load. An absent or short list is not a silent
+    /// downgrade: configuration refuses a count that does not match the tiers, so what the
+    /// route stores is either the full declaration or nothing.
+    pub fn with_terminal_policies(mut self, policies: Vec<TerminalPolicy>) -> Self {
+        self.terminal_policies = policies;
+        self
+    }
+
+    /// The policy that governs the boundary leaving `tier`.
+    fn terminal_policy_leaving(&self, tier: usize) -> TerminalPolicy {
+        self.terminal_policies
+            .get(tier)
+            .copied()
+            .unwrap_or(self.terminal_policy)
+    }
+
     /// Declares whether a request no primary candidate can hold may reach the tiers.
     ///
     /// Only meaningful beside `with_terminal_fallback`; configuration refuses the option
@@ -802,6 +1046,22 @@ impl Route {
     /// walk with the same refusal.
     pub fn with_fit_escalation(mut self, enabled: bool) -> Self {
         self.fit_escalation = enabled;
+        self
+    }
+
+    /// Declares whether a request no primary candidate's wire can carry may reach the tiers.
+    ///
+    /// Only meaningful beside `with_terminal_fallback`; configuration refuses the option
+    /// without a leg to escalate to. Off is the historical behaviour: a pool whose targets
+    /// cannot carry the request refuses, and no further group is contacted.
+    ///
+    /// On does not widen any tier and does not authorize spend. It changes one thing: a pool
+    /// that dispatched nothing because every target refused the request *at its own wire* is
+    /// allowed to ask the next declared group the same question, instead of being refused
+    /// before the groups are looked at. A group that cannot carry it either ends the walk with
+    /// the primary pool's refusal.
+    pub fn with_capability_escalation(mut self, enabled: bool) -> Self {
+        self.capability_escalation = enabled;
         self
     }
 
@@ -832,14 +1092,81 @@ impl Route {
         attempts: &[AttemptTrace],
         blocks: &[switchyard_llm_client::CredentialBlock],
     ) -> Option<&'static str> {
+        // The primary pool's allowance domains are its declared groups, and the strict policy
+        // judges them over their whole declared membership -- a member excluded by fit or by
+        // a block is exactly a member whose allowance still has to be accounted for.
+        //
+        // A route that declares no groups is one domain over its capable set, which is the
+        // strongest statement its configuration supports. That residual is stated rather than
+        // hidden: an ungrouped strict route cannot account for a sibling the request did not
+        // fit, because nothing declares that the sibling shares a budget with the legs that
+        // were tried. Every strict route in this deployment is grouped.
+        let domains: Vec<Vec<ModelId>> = self
+            .group_plan
+            .groups
+            .iter()
+            .map(|group| group.members.clone())
+            .collect();
+        self.terminal_authorization_under(
+            capable,
+            dispatchable,
+            attempts,
+            blocks,
+            self.terminal_policy,
+            &domains,
+        )
+    }
+
+    /// [`Self::terminal_authorization`] under an explicit boundary policy.
+    ///
+    /// The policy is a parameter rather than a field read so the boundary that is being
+    /// crossed decides it: the entry claim is the route's own, and every later claim is about
+    /// the tier being left. A terminal tier is one domain, so callers judging a tier pass
+    /// nothing and the tier's capable set is judged whole.
+    fn terminal_authorization_under(
+        &self,
+        capable: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        blocks: &[switchyard_llm_client::CredentialBlock],
+        policy: TerminalPolicy,
+        domains: &[Vec<ModelId>],
+    ) -> Option<&'static str> {
         authorize_terminal(
             capable,
             dispatchable,
             attempts,
-            self.terminal_policy,
+            policy,
+            domains,
             |model| self.target_credential(model).map(str::to_string),
             |model| self.quota_blocked(model, blocks),
+            |model| self.allowance_spent(model),
         )
+    }
+
+    /// Whether the counter that governs `model` is knowably out for the current provider day.
+    ///
+    /// This is the evidence half of the strict boundary, and it exists so a declared domain
+    /// member that this request could not dispatch -- excluded by fit, or blocked -- can
+    /// still be judged. [`DailyRequestAllowance::spent_today`] answers in three states and
+    /// only the affirmative one counts: a readable counter at zero is spent, a readable
+    /// counter with room is not, and a counter that cannot be read is unknown. The third must
+    /// not collapse into either neighbour -- an unreadable ledger also reports a remainder of
+    /// zero, so reading the figure alone would turn "this deployment cannot say" into "the
+    /// budget is spent" and buy the local tier on a broken file.
+    ///
+    /// A *retained* exhaustion is the second way into that third state. Admission keeps
+    /// refusing while a past "the pool is empty" is honoured past its freshness, so the
+    /// remainder still reads zero, but the statement describes the past: it must not buy the
+    /// local tier any more than an unreadable file may.
+    ///
+    /// A target with no counter is unknown for a different reason: a metered target has no
+    /// daily allowance to exhaust, so its exhaustion can only ever come from the provider's
+    /// own answer within this request.
+    fn allowance_spent(&self, model: &ModelId) -> bool {
+        self.daily_allowances
+            .get(model)
+            .is_some_and(|allowance| allowance.spent_today() == Some(true))
     }
 
     /// Whether a quota-scoped block covers `model`.
@@ -887,6 +1214,42 @@ impl Route {
     pub fn with_pool_groups(mut self, groups: Vec<String>) -> Self {
         self.pool_groups = Some(groups);
         self
+    }
+
+    /// Declares the groups' membership, making the group a level of the order.
+    ///
+    /// Set only for a route whose selection policy compares groups; an empty plan leaves the
+    /// pool flat, and the dispatch path decides between the two by whether a plan exists, so
+    /// a route can never claim grouped selection while ranking leaf by leaf.
+    pub fn with_group_plan(mut self, plan: crate::selection::GroupPlan) -> Self {
+        self.group_plan = plan;
+        self
+    }
+
+    /// Whether this route chooses a group before it chooses a leaf.
+    /// Declares how the groups are ordered against each other.
+    ///
+    /// `Adaptive` is the equal-peer reading: readiness, completion rate, latency and a
+    /// rotation floor decide between interchangeable groups. `Ordered` is the cost reading:
+    /// the declared sequence is the priority, and a later group is offered only once the
+    /// earlier one has no eligible member left. `Flat` is refused for a grouped pool by the
+    /// loader, so a route cannot hold a plan and rank leaf by leaf.
+    pub fn with_group_ordering(mut self, ordering: crate::selection::Grouping) -> Self {
+        self.group_ordering = ordering;
+        self
+    }
+
+    pub fn is_grouped_pool(&self) -> bool {
+        self.group_plan.groups.len() >= 2
+    }
+
+    /// Whether this pool's groups are a declared cost sequence rather than equal peers.
+    ///
+    /// The two grouped shapes differ in one membership rule, not in how they rank: an
+    /// equal-peer pool is a free pool, while an ordered pool's later groups are meant to be
+    /// metered and would be deleted by a free-only gate.
+    pub fn is_ordered_pool(&self) -> bool {
+        self.is_grouped_pool() && self.group_ordering == crate::selection::Grouping::Ordered
     }
 
     /// The ranking policy this route uses.
@@ -1140,6 +1503,46 @@ impl Route {
         false
     }
 
+    /// The capability a pool with no eligible leg owed the request, named from the targets that
+    /// were excluded rather than from the route's own declaration.
+    ///
+    /// The route's declaration may be silent while a specific target was the blocker — the live
+    /// case is a lane whose own `tool_call_replay` is undeclared (permitted) over a pool of
+    /// Google legs that each refuse a replayed call — so naming the route's capabilities alone
+    /// would report "an eligible route" for a request that was refused for a concrete reason.
+    /// The target facts are read exactly as the eligibility predicate reads them, or the refusal
+    /// would name a different capability than the one that excluded the candidate.
+    ///
+    /// Order is deliberate: a capability a target lacked, then the route's own declaration, then
+    /// the binding size limit. The size limit is last because it is the only answer that is not
+    /// about a capability, and it is reported only when no candidate fits at all.
+    fn missing_capability(&self, request: &Request, raw: &serde_json::Value) -> &'static str {
+        self.clients
+            .target_capabilities()
+            .iter()
+            .find_map(|(_model, facts)| {
+                let capabilities = crate::ModelCapabilities {
+                    vision: Some(!facts.no_vision),
+                    tool_calling: Some(!facts.no_tool_calling),
+                    tool_call_replay: Some(!facts.no_tool_call_replay),
+                    video: Some(!facts.no_video),
+                    video_carrier: carrier_from_facts(facts),
+                    image_carrier: image_carrier_from_facts(facts),
+                    ..crate::ModelCapabilities::default()
+                };
+                crate::request_fit::unsupported_capability(capabilities, &request.llm_request, raw)
+            })
+            .or_else(|| {
+                crate::request_fit::unsupported_capability(
+                    self.capabilities,
+                    &request.llm_request,
+                    raw,
+                )
+            })
+            .or_else(|| self.physical_ineligibility(request))
+            .unwrap_or("an eligible route")
+    }
+
     /// Whether no candidate of this route can hold the request, and why.
     ///
     /// The physical counterpart of [`Self::payload_refused`]: a composite needs to know
@@ -1263,7 +1666,20 @@ impl Route {
         // compete one tier below the free candidates and then serve whenever the free pool
         // was busy, which is a paid escalation nobody approved. `unknown` fails closed for
         // the same reason: an undeclared tariff is not evidence of free entitlement.
-        let pool_members_only_free = self.is_peer_pool();
+        // A ranked pool is a *free* pool. The rule guards the ranking, not the last resort:
+        // a declared terminal tier is never ranked, never reached by a busy pool, and may
+        // legitimately be metered - a paid NT leg behind an exhausted free allowance is the
+        // shape the owner asked for, and refusing it here would leave that tier unreachable.
+        // Terminal targets are already forbidden from being candidates at load, so exempting
+        // them cannot smuggle a paid leg into the ranking.
+        let terminal_models: std::collections::HashSet<switchyard_protocol::ModelId> =
+            self.terminal_models().into_iter().collect();
+        // A ranked pool is a free pool - unless its groups are a declared cost sequence. An
+        // ORDERED pool names its spending boundary in the group order itself: the metered
+        // group sits after the free ones and is offered only once they have no eligible member
+        // left, which is the protected-spend shape rather than an accident of ranking. Applying
+        // the free-only rule there would delete the very groups it describes.
+        let pool_members_only_free = self.is_peer_pool() && !self.is_ordered_pool();
         // The block gate and the capability gate are separate questions, and the terminal
         // leg's exhaustion rule needs both answers. `capability_gate` asks "could this
         // target serve this request at all"; `verdict` adds "and is it allowed to right
@@ -1280,7 +1696,8 @@ impl Route {
                     Ok(())
                 };
             };
-            if pool_members_only_free && !facts.tariff.is_free() {
+            if pool_members_only_free && !terminal_models.contains(model) && !facts.tariff.is_free()
+            {
                 return Err("not_free_entitled");
             }
             // Physical fit, judged on facts the deployment states about one backing
@@ -1449,6 +1866,14 @@ impl Route {
             .fit_escalation
             .then(|| authorize_fit_escalation(route_accepts, &verdicts))
             .flatten();
+        // The same computation over the other closed vocabulary. The two cannot both be
+        // `Some` (a gate is excluded for one reason), so a chain is unambiguous, but they are
+        // kept as separate values because the reason they are recorded under is different and
+        // an operator reads that reason to decide what to fix.
+        let capability_escalation = self
+            .capability_escalation
+            .then(|| authorize_capability_escalation(route_accepts, &verdicts))
+            .flatten();
         let models = self.models.filtered(&|model| verdict(model).is_ok());
         // Among candidates that survived every hard gate, a route may prefer what this
         // deployment has actually observed. This reorders one already-admitted list and
@@ -1490,8 +1915,19 @@ impl Route {
                     })
                     .collect();
                 let declared = self.models.all_models();
-                scores =
-                    selector.explain_with(&candidates, demand, &declared, self.ranking_policy());
+                scores = if self.is_grouped_pool() {
+                    // One request, one rotation step: the group decision is recorded here,
+                    // where the dispatch order is actually decided.
+                    selector.explain_grouped(
+                        &candidates,
+                        demand,
+                        &declared,
+                        &self.group_plan,
+                        self.group_ordering,
+                    )
+                } else {
+                    selector.explain_with(&candidates, demand, &declared, self.ranking_policy())
+                };
                 let ordered: Vec<switchyard_protocol::ModelId> =
                     scores.iter().map(|score| score.model.clone()).collect();
                 let unchanged = candidates
@@ -1632,55 +2068,16 @@ impl Route {
             // a gate being evaluated is not the same as a boundary being crossed.
             terminal_skipped: Vec::new(),
         };
-        if models.is_empty() && fit_escalation.is_none() {
+        if models.is_empty() && fit_escalation.is_none() && capability_escalation.is_none() {
             // Nothing was dispatched, so the record is the whole story: exclusion codes and
             // an empty attempt list. Emitted before either refusal so the caller and the
             // routing log name the same reason.
             emit_selection(observer.as_ref(), &trace);
             // Nothing in this route can serve the request, which is the caller's request
             // rather than a deployment fault. The skipped targets get no provider call.
-            // Name what the request needs, not what the route happens to lack: the route's
-            // own declaration may be silent while a specific target was the blocker.
-            let capability = self
-                .clients
-                .target_capabilities()
-                .iter()
-                .find_map(|(_model, facts)| {
-                    // Mirror the eligibility predicate's reading of these facts, or the
-                    // refusal would name a different capability than the one that
-                    // actually excluded the candidate.
-                    let capabilities = crate::ModelCapabilities {
-                        vision: Some(!facts.no_vision),
-                        tool_calling: Some(!facts.no_tool_calling),
-                        tool_call_replay: Some(!facts.no_tool_call_replay),
-                        video: Some(!facts.no_video),
-                        video_carrier: carrier_from_facts(facts),
-                        image_carrier: image_carrier_from_facts(facts),
-                        ..crate::ModelCapabilities::default()
-                    };
-                    crate::request_fit::unsupported_capability(
-                        capabilities,
-                        &request.llm_request,
-                        &raw,
-                    )
-                })
-                .or_else(|| {
-                    crate::request_fit::unsupported_capability(
-                        self.capabilities,
-                        &request.llm_request,
-                        &raw,
-                    )
-                })
-                // A request that fits every capability and still found nothing was excluded
-                // on size. Naming the binding limit is the difference between a caller who
-                // knows to send less and one who reads "ineligible" and retries the same
-                // payload: the physical gate is the only other reason a candidate drops out,
-                // and it is reported only when no candidate fits at all.
-                .or_else(|| self.physical_ineligibility(&request))
-                .unwrap_or("an eligible route");
             return Err(RunnerError::unsupported_capability(
                 self.algorithm.name(),
-                capability,
+                self.missing_capability(&request, &raw),
             ));
         }
         // The measurement rides on the observation the run already emits, so no separate
@@ -1703,10 +2100,13 @@ impl Route {
         // request either; `attempts` stays empty, which is what makes the record say
         // `no_eligible_candidate` rather than `failed`.
         let mut result = if models.is_empty() {
+            // The walk may still reach a declared group, but this is what the caller gets if
+            // no group can carry the request. It names the same capability the direct refusal
+            // would have named, so an escalation that finds nothing does not change the answer
+            // into a vaguer one.
             Err(RunnerError::unsupported_capability(
                 self.algorithm.name(),
-                self.physical_ineligibility(&request)
-                    .unwrap_or("an eligible route"),
+                self.missing_capability(&request, &raw),
             ))
         } else {
             switchyard_llm_client::run(
@@ -1733,7 +2133,7 @@ impl Route {
             // against the union: tier 2 is only reachable once tier 1 has itself been proved
             // out, which is the entire difference between an ordered declaration and a peer
             // pool. The union would let "the second tier looks cheaper" skip the first.
-            let mut authorization = fit_escalation.or_else(|| {
+            let mut authorization = fit_escalation.or(capability_escalation).or_else(|| {
                 self.terminal_authorization(
                     &capable_legs,
                     &dispatchable_legs,
@@ -1766,14 +2166,24 @@ impl Route {
                     // reported, and the next tier is asked the same question; any other
                     // refusal ends the walk, because the next tier would be asked to settle
                     // something about the request rather than about capacity.
+                    //
+                    // The capability boundary does the same for its own vocabulary: a tier
+                    // that admitted nothing because every one of its wires refused this
+                    // request keeps the walk alive, and a tier that had a capable leg blocked
+                    // by a credential falls through to the exhaustion rule below, which is the
+                    // only one entitled to call that exhaustion.
                     authorization = fit_escalation
                         .filter(|_| tier_cannot_hold(&terminal_verdicts[index]))
+                        .or(capability_escalation
+                            .filter(|_| tier_capability_incompatible(&terminal_verdicts[index])))
                         .or_else(|| {
-                            self.terminal_authorization(
+                            self.terminal_authorization_under(
                                 &terminal_capable[index],
                                 &terminal_servable[index],
                                 &attempts.lock().clone(),
                                 blocks,
+                                self.terminal_policy_leaving(index),
+                                &[],
                             )
                         });
                     continue;
@@ -1803,11 +2213,13 @@ impl Route {
                 // This tier answered with a failure. Whether the next one may be consulted is
                 // a fact about THIS tier's legs and this request's attempts at them, so the
                 // claim is re-derived rather than carried over from the boundary above.
-                authorization = self.terminal_authorization(
+                authorization = self.terminal_authorization_under(
                     &terminal_capable[index],
                     &terminal_servable[index],
                     &attempts.lock().clone(),
                     blocks,
+                    self.terminal_policy_leaving(index),
+                    &[],
                 );
             }
         }
@@ -2000,6 +2412,67 @@ mod carrier_tests {
     }
 }
 
+/// A provider-confirmed allowance refusal must mean exactly what the local one means to
+/// every routing decision, and nothing less.
+///
+/// The two labels are separate so the record can say which authority refused, but the
+/// consequence is identical: the leg has no allowance today, so the route may advance and
+/// a terminal leg may be spent on it. Keeping them aligned by hand across three policy
+/// lists is exactly the change that goes wrong quietly -- a new error class with no policy
+/// arm ends the route with a refusal even when a sibling could answer. So the invariant is
+/// asserted mechanically, for every policy, rather than trusted to review.
+#[cfg(test)]
+mod allowance_label_parity_tests {
+    use super::{TerminalPolicy, is_capacity_outcome};
+
+    const LOCAL: &str = "daily_allowance_exhausted";
+    const PROVIDER: &str = "provider_allowance_exhausted";
+
+    const POLICIES: [TerminalPolicy; 3] = [
+        TerminalPolicy::Capacity,
+        TerminalPolicy::QuotaOnly,
+        TerminalPolicy::Availability,
+    ];
+
+    #[test]
+    fn the_provider_label_is_accepted_wherever_the_local_one_is() {
+        for policy in POLICIES {
+            assert_eq!(
+                is_capacity_outcome(LOCAL, policy),
+                is_capacity_outcome(PROVIDER, policy),
+                "policy {policy:?} treats the provider-confirmed refusal differently from the \
+                 local one; a route would then refuse instead of advancing, or spend a \
+                 terminal leg on a class it was told to ignore"
+            );
+        }
+    }
+
+    /// The parity above would also hold if BOTH labels were wrongly rejected, so the
+    /// allowance class is pinned to being accepted where it must be.
+    #[test]
+    fn the_allowance_refusal_is_accepted_by_every_policy() {
+        for policy in POLICIES {
+            assert!(
+                is_capacity_outcome(LOCAL, policy),
+                "policy {policy:?} must accept an allowance refusal"
+            );
+            assert!(
+                is_capacity_outcome(PROVIDER, policy),
+                "policy {policy:?} must accept a provider-confirmed allowance refusal"
+            );
+        }
+    }
+
+    /// And the label must stay distinguishable: folding it into the local one would make
+    /// the decision record unable to say which authority refused.
+    #[test]
+    fn the_two_labels_are_different_strings() {
+        assert_ne!(LOCAL, PROVIDER);
+        assert!(LOCAL.contains("daily_allowance"));
+        assert!(PROVIDER.contains("provider_allowance"));
+    }
+}
+
 #[cfg(test)]
 mod terminal_authorization_tests {
     use super::{AttemptTrace, HashSet, ModelId, authorize_terminal};
@@ -2044,7 +2517,9 @@ mod terminal_authorization_tests {
             dispatchable,
             attempts,
             TerminalPolicy::Capacity,
+            &[],
             |model| credentials.get(model).cloned(),
+            |_| false,
             |_| false,
         )
     }
@@ -2071,8 +2546,10 @@ mod terminal_authorization_tests {
             dispatchable,
             attempts,
             TerminalPolicy::QuotaOnly,
+            &[],
             |model| credentials.get(model).cloned(),
             quota_blocked,
+            |_| false,
         )
     }
 
@@ -2089,7 +2566,9 @@ mod terminal_authorization_tests {
             dispatchable,
             attempts,
             TerminalPolicy::Availability,
+            &[],
             |model| credentials.get(model).cloned(),
+            |_| false,
             |_| false,
         )
     }
@@ -2417,7 +2896,9 @@ mod terminal_authorization_tests {
                 &HashSet::new(),
                 &[],
                 TerminalPolicy::Capacity,
+                &[],
                 |model| credentials.get(model).cloned(),
+                |_| false,
                 |_| false,
             ),
             Some("primary_pool_blocked")
@@ -2529,5 +3010,700 @@ mod fit_escalation_tests {
             Err("max_input_tokens"),
             Err("tool_calling")
         ]));
+    }
+}
+
+#[cfg(test)]
+mod capability_escalation_tests {
+    use super::{
+        authorize_capability_escalation, is_target_capability_exclusion,
+        tier_capability_incompatible,
+    };
+
+    /// Closed on purpose, and deliberately one entry. Each additional code here is a claim that
+    /// some *wire* cannot carry a request another wire can, which is a measurement, not a
+    /// judgement. Everything a second group would re-learn at a price -- a malformed or unsafe
+    /// continuation, a credential, an allowance, a policy or billing refusal, a size fact this
+    /// axis does not own, or a request the route never promised -- must stay out.
+    #[test]
+    fn the_vocabulary_is_exactly_the_measured_wire_facts() {
+        assert!(is_target_capability_exclusion("tool_call_replay"));
+        for code in [
+            "tool_calling",
+            "vision",
+            "video",
+            "video_carrier",
+            "image_carrier",
+            "reasoning",
+            "unsupported_reasoning_effort",
+            "context_window",
+            "max_input_tokens",
+            "minute_window_too_small",
+            "output_budget_below_thinking_floor",
+            "credential_missing",
+            "credential_rejected",
+            "daily_allowance_exhausted",
+            "provider_allowance_exhausted",
+            "account_balance",
+            "malformed_tool_call",
+            "unsafe_tool_continuation",
+            "invalid_request",
+            "policy_refused",
+            "no_eligible_candidate",
+            "primary_pool_blocked",
+            "",
+        ] {
+            assert!(
+                !is_target_capability_exclusion(code),
+                "{code} must not authorize a capability escalation"
+            );
+        }
+    }
+
+    /// The exact live case the option was added for: five Google chat legs, every one of them
+    /// refusing a replayed tool call at its own wire.
+    #[test]
+    fn a_pool_emptied_only_by_wire_facts_authorizes_the_group_walk() {
+        let five_google = [
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+            Err("tool_call_replay"),
+        ];
+        assert_eq!(
+            authorize_capability_escalation(true, &five_google),
+            Some("primary_pool_capability_incompatible")
+        );
+    }
+
+    #[test]
+    fn a_request_the_route_never_promised_is_not_authorized() {
+        // A lane that declares it does not serve this request has no missing capability to
+        // make up for; escalating would hand a request the deployment refused to a metered
+        // group.
+        assert_eq!(
+            authorize_capability_escalation(false, &[Err("tool_call_replay")]),
+            None
+        );
+    }
+
+    #[test]
+    fn one_candidate_that_could_carry_it_ends_the_claim() {
+        assert_eq!(
+            authorize_capability_escalation(true, &[Err("tool_call_replay"), Ok(())]),
+            None
+        );
+    }
+
+    /// Every other class of refusal must not open the boundary, and the list is the owner's
+    /// exclusion list rather than an inviting vocabulary.
+    #[test]
+    fn request_validity_and_deployment_faults_do_not_open_the_walk() {
+        for code in [
+            "malformed_tool_call",
+            "invalid_request",
+            "credential_missing",
+            "daily_allowance_exhausted",
+            "account_balance",
+            "vision",
+            "context_window",
+        ] {
+            assert_eq!(
+                authorize_capability_escalation(true, &[Err(code)]),
+                None,
+                "{code} must end the walk"
+            );
+            // Mixed with a real wire fact, the other reason still ends it: one leg failing
+            // for a reason about the request means the next group would settle the same
+            // question again.
+            assert_eq!(
+                authorize_capability_escalation(true, &[Err("tool_call_replay"), Err(code)]),
+                None,
+                "{code} mixed with the wire fact must end the walk"
+            );
+        }
+    }
+
+    #[test]
+    fn no_candidates_at_all_is_not_a_capability_claim() {
+        assert_eq!(authorize_capability_escalation(true, &[]), None);
+        assert_eq!(authorize_capability_escalation(false, &[]), None);
+    }
+
+    /// A tier is passed over on this axis only when every target in it refused at its wire.
+    /// A tier with a capable-but-blocked leg is a capacity question and belongs to
+    /// `authorize_terminal`, which is a different claim in the record.
+    #[test]
+    fn a_tier_is_passed_over_only_when_every_target_refused_at_its_wire() {
+        assert!(tier_capability_incompatible(&[
+            Err("tool_call_replay"),
+            Err("tool_call_replay")
+        ]));
+        assert!(!tier_capability_incompatible(&[]));
+        assert!(!tier_capability_incompatible(&[
+            Err("tool_call_replay"),
+            Ok(())
+        ]));
+        assert!(!tier_capability_incompatible(&[
+            Err("tool_call_replay"),
+            Err("daily_allowance_exhausted")
+        ]));
+    }
+}
+
+/// The strict allowance boundary the NT and judge lanes deploy.
+///
+/// `QuotaOnly` is the historical "the free allowance ran out or we are being throttled"
+/// rule, which is right for a lane whose terminal leg is a local model that costs nothing
+/// to try. The NT and judge lanes promise something narrower: the local tier opens only once
+/// *both* primary allowances are genuinely spent. These tests pin the difference, because the
+/// two rules look identical in a decision record and differ by real money and real service.
+#[cfg(test)]
+mod strict_allowance_boundary_tests {
+    use super::{AttemptTrace, HashSet, ModelId, authorize_terminal};
+    use crate::config::TerminalPolicy;
+    use std::collections::HashMap;
+
+    fn legs(ids: &[(&str, &str)]) -> (Vec<ModelId>, HashMap<ModelId, String>) {
+        let mut models = Vec::new();
+        let mut credentials = HashMap::new();
+        for (model, credential) in ids {
+            let id = ModelId::from(*model);
+            models.push(id.clone());
+            credentials.insert(id, (*credential).to_string());
+        }
+        (models, credentials)
+    }
+
+    fn attempt(model: &str, outcome: &'static str) -> AttemptTrace {
+        AttemptTrace {
+            model: model.to_string(),
+            phase: "routing",
+            outcome,
+            duration_ms: 1,
+            prompt_tokens: 1,
+            completion_tokens: 0,
+        }
+    }
+
+    fn dispatchable(models: &[ModelId]) -> HashSet<ModelId> {
+        models.iter().cloned().collect()
+    }
+
+    fn authorize(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+    ) -> Option<&'static str> {
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::AllowanceOnly,
+            &[],
+            |model| credentials.get(model).cloned(),
+            |_| false,
+            |_| false,
+        )
+    }
+
+    /// Two primary groups, each on its own credential: the deployed NT and judge shape.
+    fn two_domains() -> (Vec<ModelId>, HashMap<ModelId, String>) {
+        legs(&[("google", "GOOGLE"), ("openai", "OPENAI")])
+    }
+
+    /// The boundary the owner asked for: both allowance domains at zero is the one condition
+    /// that may spend the local tier.
+    ///
+    /// The provider-confirmed refusal is backed by the counter here, because that is where the
+    /// refusal came from: the pre-send reservation reads the counter, so "the provider's pool
+    /// is empty" is only ever as good as the reading behind it.
+    #[test]
+    fn both_allowance_domains_exhausted_opens_the_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "provider_allowance_exhausted"),
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &["openai"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// A retained refusal reaches this judgement as the same outcome string as a current one,
+    /// because the reservation error cannot carry the basis. The counter can, so the attempt
+    /// is evidence only while the counter affirms it: a statement about the past may refuse
+    /// the send and must not buy the local tier.
+    #[test]
+    fn a_retained_provider_refusal_is_not_spent_evidence() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "provider_allowance_exhausted"),
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &[],
+            ),
+            None,
+            "the counter cannot affirm this domain is spent, so the attempt cannot either"
+        );
+        // Control: the same attempt opens the boundary once the counter is current.
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &["openai"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// This deployment's own ledger is always current, so a local refusal is evidence on its
+    /// own. Asking the counter about it would be harmless today and wrong the moment the two
+    /// questions drift apart again.
+    #[test]
+    fn a_local_refusal_needs_no_counter_to_be_evidence() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "daily_allowance_exhausted"),
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &[],
+                &[],
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// A minute window regains room inside the same minute. Crossing on it buys a local
+    /// request to solve a problem that would have solved itself.
+    #[test]
+    fn a_minute_window_alone_never_opens_the_strict_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "minute_window"),
+        ];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None,
+            "one domain throttled is not two domains exhausted"
+        );
+    }
+
+    /// A bare 429 is unclassified: it may be a concurrency limit or a policy answer, so it
+    /// cannot stand as evidence that an allowance is spent.
+    #[test]
+    fn a_bare_429_never_opens_the_strict_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "http_429"),
+        ];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None
+        );
+    }
+
+    /// An unreadable ledger is *unknown*, and unknown is not exhausted. Earlier code folded
+    /// this into the same class, which is how a stale reading could have bought a local call.
+    #[test]
+    fn an_unreadable_ledger_never_opens_the_strict_boundary() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![
+            attempt("google", "daily_allowance_exhausted"),
+            attempt("openai", "daily_allowance_unavailable"),
+        ];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None
+        );
+    }
+
+    /// Everything that is a fact about the deployment or the request stops at the pool. The
+    /// list is closed on purpose: `Availability` accepts the outage classes, this rule does
+    /// not, because neither says an allowance ran out.
+    #[test]
+    fn deployment_and_request_faults_never_open_the_strict_boundary() {
+        for outcome in [
+            "http_5xx",
+            "transport",
+            "unavailable",
+            "attempt_timeout",
+            "http_401",
+            "http_402",
+            "http_400",
+            "invalid_request",
+            "unsupported_feature",
+            "empty_answer",
+            "context_window",
+            "minute_window_too_small",
+        ] {
+            let (models, credentials) = two_domains();
+            let attempts = vec![
+                attempt("google", "daily_allowance_exhausted"),
+                attempt("openai", outcome),
+            ];
+            assert_eq!(
+                authorize(&models, &dispatchable(&models), &attempts, &credentials),
+                None,
+                "{outcome} is not allowance evidence"
+            );
+        }
+    }
+
+    /// One exhausted domain does not explain a sibling on another credential that was never
+    /// tried. The other group's allowance is unknown, so the boundary is not provable.
+    #[test]
+    fn an_unattempted_second_domain_is_not_exhaustion() {
+        let (models, credentials) = two_domains();
+        let attempts = vec![attempt("google", "daily_allowance_exhausted")];
+        assert_eq!(
+            authorize(&models, &dispatchable(&models), &attempts, &credentials),
+            None
+        );
+    }
+
+    fn authorize_with_domains(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+        domains: &[Vec<ModelId>],
+    ) -> Option<&'static str> {
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::AllowanceOnly,
+            domains,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+            |_| false,
+        )
+    }
+
+    /// The refusals, and the positive controls that prove they are refusals and not dead
+    /// code. `spent` stands for the authoritative counter state: only a readable counter with
+    /// no remainder for the current provider day may appear in it.
+    fn authorize_with_state(
+        models: &[ModelId],
+        dispatchable: &HashSet<ModelId>,
+        attempts: &[AttemptTrace],
+        credentials: &HashMap<ModelId, String>,
+        domains: &[Vec<ModelId>],
+        spent: &[&str],
+    ) -> Option<&'static str> {
+        let spent: HashSet<&str> = spent.iter().copied().collect();
+        authorize_terminal(
+            models,
+            dispatchable,
+            attempts,
+            TerminalPolicy::AllowanceOnly,
+            domains,
+            |model| credentials.get(model).cloned(),
+            |_| false,
+            |model| spent.contains(model.as_str()),
+        )
+    }
+
+    /// The reviewed counterexample, reversed: a domain whose members did not fit this request
+    /// is still part of the claim. `b` is absent from `capable` because the request is larger
+    /// than its window, and nothing has established that its allowance is spent -- so the
+    /// boundary is not provable and the local tier must not be spent.
+    #[test]
+    fn a_domain_excluded_by_fit_is_still_part_of_the_claim() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let only_a_capable = vec![ModelId::from("a")];
+        let attempts = vec![attempt("a", "daily_allowance_exhausted")];
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        assert_eq!(
+            authorize_with_state(
+                &only_a_capable,
+                &dispatchable(&only_a_capable),
+                &attempts,
+                &credentials,
+                &domains,
+                &[],
+            ),
+            None,
+            "a domain that only skipped the request has not spent its allowance"
+        );
+        // Control: the same request shape authorizes once the excluded domain's own counter
+        // says its day is spent. Nothing is dispatched to the ineligible leg to learn this.
+        assert_eq!(
+            authorize_with_state(
+                &only_a_capable,
+                &dispatchable(&only_a_capable),
+                &attempts,
+                &credentials,
+                &domains,
+                &["b"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+        assert!(
+            models.len() == 2,
+            "both domains are declared even when one cannot fit"
+        );
+    }
+
+    /// The all-blocked branch had the same capable-subset defect: it asked whether every
+    /// dispatchable leg was blocked, which cannot see a domain that contributed no
+    /// dispatchable leg at all. The declared domains decide it, on the same evidence.
+    #[test]
+    fn the_all_blocked_branch_judges_the_declared_domains() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        let nothing_dispatchable = HashSet::new();
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &nothing_dispatchable,
+                &[],
+                &credentials,
+                &domains,
+                &["a"],
+            ),
+            None,
+            "one spent domain and one unknown domain is not a blocked pool"
+        );
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &nothing_dispatchable,
+                &[],
+                &credentials,
+                &domains,
+                &["a", "b"],
+            ),
+            Some("primary_pool_blocked")
+        );
+    }
+
+    /// A mixed pool: every domain affirmatively spent by the provider, none of them
+    /// dispatchable, and one leg rejected rather than exhausted. The rejected leg keeps its
+    /// domain unknown, so the boundary does not open on a deployment fault.
+    #[test]
+    fn a_mixed_pool_does_not_open_on_a_rejected_leg() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        let attempts = vec![
+            attempt("a", "daily_allowance_exhausted"),
+            attempt("b", "http_401"),
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &[],
+            ),
+            None
+        );
+    }
+
+    /// A group that declares no members exhausts nothing: reading it as spent would let a
+    /// misconfigured pool buy the local tier on its first request.
+    #[test]
+    fn a_declared_group_with_no_members_is_never_spent() {
+        let (models, credentials) = legs(&[("a", "A")]);
+        let attempts = vec![attempt("a", "daily_allowance_exhausted")];
+        let domains = vec![vec![ModelId::from("a")], Vec::new()];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &[],
+            ),
+            None
+        );
+    }
+
+    /// The defect this rule was rewritten for: a leg dropped from `dispatchable` by a
+    /// rejected credential is still a member of its allowance domain, and nobody looked at
+    /// its allowance. The old shape judged only the dispatchable remainder, so one exhausted
+    /// domain plus one un-checkable sibling read as "both domains spent" and bought the local
+    /// tier.
+    #[test]
+    fn a_sibling_dropped_for_a_rejected_credential_keeps_its_domain_unknown() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let only_a_dispatchable: HashSet<ModelId> = [ModelId::from("a")].into_iter().collect();
+        let attempts = vec![attempt("a", "daily_allowance_exhausted")];
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        assert_eq!(
+            authorize_with_domains(
+                &models,
+                &only_a_dispatchable,
+                &attempts,
+                &credentials,
+                &domains
+            ),
+            None,
+            "b's allowance was never established, so the boundary is not provable"
+        );
+        // The undeclared form is one domain over every capable leg, and it must not be a
+        // weaker claim: a route that names no groups is still not allowed to read one
+        // exhausted leg as the whole pool being spent.
+        assert_eq!(
+            authorize(&models, &only_a_dispatchable, &attempts, &credentials),
+            None
+        );
+        // The old reading -- judge only what is still dispatchable -- is what the declared
+        // form exists to replace: there the sibling vanishes from the question instead of
+        // being answered.
+    }
+
+    /// The unproven sibling stops being unproven once the ledger says its allowance is
+    /// spent. That is the ordinary shape of a metered pool after the free budget is used
+    /// up, and it must still open the boundary.
+    #[test]
+    fn a_sibling_with_a_spent_ledger_closes_its_domain() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![attempt("a", "daily_allowance_exhausted")];
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        // A spent allowance also contributes a credential block, so b is not dispatchable;
+        // the ledger, not a request, is what establishes it.
+        let only_a_dispatchable: HashSet<ModelId> = [ModelId::from("a")].into_iter().collect();
+        assert_eq!(
+            authorize_terminal(
+                &models,
+                &only_a_dispatchable,
+                &attempts,
+                TerminalPolicy::AllowanceOnly,
+                &domains,
+                |model| credentials.get(model).cloned(),
+                |model| model.as_str() == "b",
+                |_| false,
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// The positive control for the same shape: when the second domain is also provably
+    /// spent -- here because this request saw it answer with an exhaustion -- the boundary
+    /// opens.
+    #[test]
+    fn every_declared_domain_spent_opens_the_boundary() {
+        let (models, credentials) = legs(&[("a", "A"), ("b", "B")]);
+        let attempts = vec![
+            attempt("a", "daily_allowance_exhausted"),
+            attempt("b", "provider_allowance_exhausted"),
+        ];
+        let domains = vec![vec![ModelId::from("a")], vec![ModelId::from("b")]];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &["b"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// Google allocates its free daily requests per model inside one project, so two models
+    /// behind the same API key do not share a budget. A spent model therefore says nothing
+    /// about its sibling: promoting a per-model exhaustion to the credential would let one
+    /// spent model buy the local tier while the second one still had its whole day.
+    #[test]
+    fn a_per_model_exhaustion_is_not_a_credential_exhaustion() {
+        // Both legs draw on the same credential, which is the deployed Google shape.
+        let (models, credentials) = legs(&[("g-model-a", "GOOGLE"), ("g-model-b", "GOOGLE")]);
+        let attempts = vec![attempt("g-model-a", "daily_allowance_exhausted")];
+        let domains = vec![
+            vec![ModelId::from("g-model-a")],
+            vec![ModelId::from("g-model-b")],
+        ];
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &[],
+            ),
+            None,
+            "the second model's own day was never established"
+        );
+        // Control: the same pool opens once the second model is provably spent itself.
+        assert_eq!(
+            authorize_with_state(
+                &models,
+                &dispatchable(&models),
+                &attempts,
+                &credentials,
+                &domains,
+                &["g-model-b"],
+            ),
+            Some("primary_pool_exhausted")
+        );
+    }
+
+    /// A pool wholly blocked still needs allowance evidence, and only a quota-scoped block
+    /// counts as that. This is the "not just a generic credential block" half of the rule.
+    #[test]
+    fn a_credential_block_only_opens_the_boundary_when_it_is_allowance_scoped() {
+        let (models, credentials) = two_domains();
+        let blocked = authorize_terminal(
+            &models,
+            &HashSet::new(),
+            &[],
+            TerminalPolicy::AllowanceOnly,
+            &[],
+            |model| credentials.get(model).cloned(),
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(
+            blocked, None,
+            "a block that is not allowance-scoped is not exhaustion"
+        );
+
+        let allowed = authorize_terminal(
+            &models,
+            &HashSet::new(),
+            &[],
+            TerminalPolicy::AllowanceOnly,
+            &[],
+            |model| credentials.get(model).cloned(),
+            |_| true,
+            |_| false,
+        );
+        assert_eq!(allowed, Some("primary_pool_blocked"));
     }
 }

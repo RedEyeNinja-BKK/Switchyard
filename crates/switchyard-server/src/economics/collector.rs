@@ -10,9 +10,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::providers::{AccountApi, AccountPublisher, FetchOutcome};
+use super::reconcile::Reconcilers;
 
 /// How often the collector reads the provider accounts.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
@@ -34,6 +35,8 @@ pub struct AccountCollector {
     /// Whether a shadowing collision has already been reported, so the warning is
     /// emitted once per pair rather than once per round.
     reported: BTreeSet<(String, String)>,
+    /// The counters a provider reading is written into, bound by account.
+    reconcilers: Reconcilers,
 }
 
 impl AccountCollector {
@@ -47,7 +50,23 @@ impl AccountCollector {
             owner_of: BTreeMap::new(),
             shadowed: BTreeSet::new(),
             reported: BTreeSet::new(),
+            reconcilers: Reconcilers::default(),
         }
+    }
+
+    /// Binds the counters this collector writes provider readings into.
+    ///
+    /// A deployment that configures no provider pool supplies an empty set, which makes
+    /// this a pass-through: the collector still reads and publishes the account, exactly
+    /// as before, but no counter is reconciled.
+    pub fn with_reconcilers(mut self, reconcilers: Reconcilers) -> Self {
+        self.reconcilers = reconcilers;
+        self
+    }
+
+    /// How many counters are reconciled by this collector.
+    pub fn reconciled_counters(&self) -> usize {
+        self.reconcilers.len()
     }
 
     /// Overrides the collection interval.
@@ -73,6 +92,10 @@ impl AccountCollector {
     /// than a duplicate to be discarded.
     fn shadow(&mut self, label: &str, owner: &str) {
         self.shadowed.insert(label.to_string());
+        // The counters bound to this label follow the label that now reads the account.
+        // Without this they would stop being reconciled the moment this label stops being
+        // polled, and admit on their local budget for the rest of the day.
+        self.reconcilers.absorb(label, owner);
         if self.reported.insert((label.to_string(), owner.to_string())) {
             tracing::warn!(
                 account = %label,
@@ -113,6 +136,9 @@ impl AccountCollector {
                  its second credential is polled again"
             );
         }
+        // The counters that followed the failing label return to their own, which is about
+        // to be polled again. Entries genuinely bound to the owner are unchanged.
+        self.reconcilers.release(owner);
     }
 
     /// Runs one collection round, reading every provider once.
@@ -131,8 +157,32 @@ impl AccountCollector {
                 continue;
             }
             let started = Instant::now();
+            // The watermark is taken before the network call. Requests sent while it is
+            // outstanding are absent from the provider's count, so the application must
+            // measure them from this point rather than from the moment it writes.
+            let pending = self
+                .reconcilers
+                .begin_observation(provider, SystemTime::now());
             match api.fetch().await {
                 FetchOutcome::Ok(observation) => {
+                    // The provider's own allowance statement is written into every counter
+                    // bound to this account before anything else looks at the reading. It
+                    // happens ahead of the shadow check on purpose: two credentials for one
+                    // account are the same account, so both counters are entitled to the
+                    // same figure even though only one of them keeps being polled.
+                    let applied = self.reconcilers.apply_at(
+                        provider,
+                        observation.as_ref(),
+                        &pending,
+                        SystemTime::now(),
+                    );
+                    if applied.written > 0 {
+                        tracing::debug!(
+                            account = %provider,
+                            counters = applied.written,
+                            "reconciled a provider allowance reading"
+                        );
+                    }
                     // An account the provider identified, whose figures are already
                     // published under a different label, is the same money twice.
                     // Publishing it would double the account's reported balance,

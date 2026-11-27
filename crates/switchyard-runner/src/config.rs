@@ -276,6 +276,14 @@ struct RouteConfig {
     escalation_max_input_tokens: Option<u64>,
     /// Groups whose members form this route's candidate pool, when it declares one.
     pool_groups: Option<Vec<String>>,
+    /// How a grouped pool orders its groups against each other.
+    ///
+    /// `adaptive` (the default) treats them as equal peers whose order follows readiness,
+    /// completion rate and latency; `ordered` treats the declared sequence as the priority
+    /// order and exhausts each group before offering the next. `flat` is refused here: a
+    /// grouped pool always groups, and the word exists only so the shared vocabulary can say
+    /// what the other policies are.
+    group_ordering: Option<String>,
     /// Targets this route may reach only after its entire eligible primary pool is
     /// verifiably unavailable, in declared order.
     ///
@@ -302,6 +310,21 @@ struct RouteConfig {
     /// no terminal leg is refused rather than ignored, because a policy that governs nothing
     /// reads as a guarantee it cannot provide.
     terminal_policy: Option<TerminalPolicy>,
+    /// Which evidence may carry the walk past each declared tier, when a tier's boundary
+    /// differs from the route's own.
+    ///
+    /// `terminal_policy` governs the claim that opens the terminal walk: what may spend the
+    /// FIRST tier. That is the right statement for a local tier behind a free pool — the
+    /// local capacity exists for allowance exhaustion and for nothing else. It is the wrong
+    /// statement for a metered tier behind that local tier: once the allowance is exhausted
+    /// and the local model cannot answer, "the local capacity is gone" is a capacity fact,
+    /// and a route that only accepts quota evidence at that boundary can never reach a tier
+    /// that exists precisely for the local outage.
+    ///
+    /// So each boundary may state its own policy, aligned with the declared tiers and
+    /// defaulting to `terminal_policy`. It cannot widen what any tier accepts: the request
+    /// still has to pass every gate of the tier it is leaving.
+    terminal_policies: Option<Vec<TerminalPolicy>>,
     /// Whether a request no primary candidate can hold may be escalated to the declared
     /// tiers.
     ///
@@ -320,6 +343,25 @@ struct RouteConfig {
     /// It cannot widen what any tier accepts: each tier is judged on its own gates, and a
     /// request that fails them ends the walk with the refusal the primary pool gave.
     fit_escalation: Option<bool>,
+    /// Whether a request no primary candidate's *wire* can carry may be escalated to the
+    /// declared tiers.
+    ///
+    /// Absent is the historical behaviour and stays the default: a pool whose targets cannot
+    /// carry the request refuses, and the caller is told what the deployment lacks rather than
+    /// having a later group asked the same question. Declared, it is a third and narrower claim
+    /// beside `terminal_policy` and `fit_escalation`, and the three are deliberately separate
+    /// axes: capacity, size, and the wire.
+    ///
+    /// It authorizes consideration of the next declared group, not expenditure. Every group is
+    /// judged on its own credential, allowance, fit, privacy and continuation gates, so a
+    /// metered group reached this way still has to admit the request on its own terms, or it is
+    /// skipped exactly as before.
+    ///
+    /// Only a closed vocabulary of measured per-target wire facts may open this boundary
+    /// (`tool_call_replay` today). A malformed or unsafe continuation, an authentication,
+    /// billing or policy refusal, and a request the route never promised to serve all fail
+    /// outside it and end the walk with the pool's own refusal.
+    capability_escalation: Option<bool>,
     /// Target this route prefers once it is under context pressure.
     ///
     /// Named rather than inferred: a target's context window is not a fact this config
@@ -369,6 +411,24 @@ pub enum SelectionPolicy {
     /// still decided by declared tariff, never by position: a `Peer` pool excludes every
     /// candidate that is not stated free before it ranks anything.
     Peer,
+    /// Treat the declared `pool_groups` as groups, not as one peer set.
+    ///
+    /// `Peer` still compares candidates leaf by leaf, which is honest while every leaf is
+    /// measured on the same yardstick. Across two providers it is not: one provider states a
+    /// daily request budget and the other states none, so "more requests left" would make the
+    /// budget-declaring provider win every comparison and the pool would silently become a
+    /// priority list. A group whose membership is four leaves against another's one also wins
+    /// a per-leaf count for a reason nobody chose.
+    ///
+    /// `Grouped` chooses the group first, on evidence that is comparable between providers —
+    /// whether the group has anything left to spend, whether it has been measured failing, and
+    /// how fast it has answered — with a rotation floor so two equally-evidenced groups are
+    /// both used. Inside the chosen group the `Peer` leaf keys still decide, including the
+    /// daily budget, because there the budget is the same provider's yardstick.
+    ///
+    /// Requires at least two `pool_groups`; a single group is a `Peer` pool written the long
+    /// way, and accepting it here would make the policy look like it does something.
+    Grouped,
 }
 
 /// One declared terminal leg: either a single target or one tier of peers.
@@ -469,6 +529,30 @@ pub enum TerminalPolicy {
     /// out -- because those are the ways a healthy deployment legitimately cannot serve right
     /// now.
     Availability,
+    /// Allowance evidence only, in the strictest sense: the terminal leg is spent when every
+    /// primary leg reports that an allowance domain is *exhausted*, and on nothing else.
+    ///
+    /// This is the rule the owner stated for the NT and judge lanes: the local tier sits behind
+    /// "both primary allowances are exhausted", not behind "the pool is temporarily unable".
+    /// The distinction matters because the two answers look alike in a decision record and cost
+    /// very different things:
+    ///
+    /// * A minute window regains room by itself within the same minute. Crossing on it spends a
+    ///   local or metered request to solve a problem that would have solved itself.
+    /// * A bare `429` is unclassified. It may be a per-minute throttle, an account cap, a
+    ///   concurrency limit, or a provider policy that says nothing about allowance. Reading it
+    ///   as exhaustion is an inference the evidence does not support.
+    /// * `daily_allowance_unavailable` is an unreadable ledger, i.e. *unknown*, and an unknown
+    ///   allowance is not an exhausted one.
+    /// * An outage, a transport fault, a timeout, a rejected key, a refused balance, a malformed
+    ///   request or a policy answer are all facts about the deployment or the request. None of
+    ///   them is evidence that an allowance ran out.
+    ///
+    /// Only `daily_allowance_exhausted` and `provider_allowance_exhausted` survive: both are
+    /// affirmative statements, from the provider's own accounting, that a domain is at zero for
+    /// the current window. A stale retained reading is reported as unavailable by the same code
+    /// path, so it cannot reach here as exhaustion.
+    AllowanceOnly,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -533,9 +617,12 @@ impl<'de> Deserialize<'de> for RouteConfig {
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
         let pool_groups = take_optional(&mut table, "pool_groups")?;
+        let group_ordering = take_optional::<String, _>(&mut table, "group_ordering")?;
         let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
         let terminal_policy = take_optional(&mut table, "terminal_policy")?;
+        let terminal_policies = take_optional(&mut table, "terminal_policies")?;
         let fit_escalation = take_optional(&mut table, "fit_escalation")?;
+        let capability_escalation = take_optional(&mut table, "capability_escalation")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
         let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -553,9 +640,12 @@ impl<'de> Deserialize<'de> for RouteConfig {
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
             pool_groups,
+            group_ordering,
             terminal_fallback,
             terminal_policy,
+            terminal_policies,
             fit_escalation,
+            capability_escalation,
             escalation_target,
             selection: selection.unwrap_or_default(),
             algorithm,
@@ -747,6 +837,8 @@ impl DeploymentConfig {
                     base_url: client.base_url.as_str().to_string(),
                     api_key_env: client.api_key_env.clone(),
                     billing: client.billing,
+                    quota_group: Some(client.quota_group.clone().unwrap_or_else(|| name.clone())),
+                    quota_provider: client.quota_provider,
                 },
             );
         }
@@ -850,6 +942,7 @@ impl DeploymentConfig {
         // selection reads the same remainder, so one budget has one source of truth.
         let allowances = self.build_allowances()?;
         self.validate_minute_windows()?;
+        self.validate_quota_providers()?;
         // One governor for the whole deployment. Its key is (quota group, physical model),
         // so every alias of one model draws on one window — which is what the provider
         // counts, and the only way `smart-nt`, `smart_gemini` and a direct leaf cannot each
@@ -1028,9 +1121,98 @@ impl DeploymentConfig {
             // agree. Disagreeing would either silently narrow the pool (a member forgotten in
             // the list) or advertise a member the route cannot call (a stale entry). Both are
             // startup errors, because a pool whose membership is unclear is not a policy.
+            // The group shape is a deployment decision, not a synonym for `Grouped`: the same
+            // membership can be deployed as equal peers or as a declared cost sequence. An
+            // unknown word is a refusal rather than a default, and `flat` is refused because a
+            // route that declares groups cannot then rank leaf by leaf.
+            //
+            // Read before the pool is validated, because the shape decides one membership
+            // rule: an equal-peer pool is a free pool, while an ordered pool is a cost ladder
+            // whose later groups are deliberately metered.
+            let group_ordering = match config.group_ordering.as_deref() {
+                None => crate::selection::Grouping::Adaptive,
+                Some(name) => {
+                    if config.selection != SelectionPolicy::Grouped {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares group_ordering = \"{name}\" without selection = \"grouped\"; group ordering only describes a grouped pool"
+                        )));
+                    }
+                    match crate::selection::Grouping::from_name(name) {
+                        Some(crate::selection::Grouping::Flat) => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares group_ordering = \"flat\"; a grouped pool always orders by group"
+                            )));
+                        }
+                        Some(ordering) => ordering,
+                        None => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares unknown group_ordering = \"{name}\"; expected \"adaptive\" or \"ordered\""
+                            )));
+                        }
+                    }
+                }
+            };
             if let Some(groups) = &config.pool_groups {
-                self.validate_route_pool(route_name, config, groups)?;
+                self.validate_route_pool(
+                    route_name,
+                    config,
+                    groups,
+                    group_ordering != crate::selection::Grouping::Ordered,
+                )?;
             }
+            // A grouped pool exists to compare groups, so a route that declares the policy
+            // without two groups would be a `Peer` pool in disguise. Refusing it is the only
+            // honest answer: silently treating it as `Peer` would let an operator believe a
+            // boundary exists that the deployment never draws.
+            if config.selection == SelectionPolicy::Grouped {
+                match config.pool_groups.as_ref() {
+                    Some(groups) if groups.len() >= 2 => {}
+                    Some(_) => {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares selection = \"grouped\" with fewer than two pool_groups; a grouped pool compares groups, and one group is a peer pool"
+                        )))
+                    }
+                    None => {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares selection = \"grouped\" but no pool_groups; a grouped pool compares groups, and one group is a peer pool"
+                        )))
+                    }
+                }
+            }
+            // The group shape was read above; membership keeps the label/candidate agreement
+            // check and only the tariff rule depends on the shape.
+            // The groups as model sets, resolved once here so the dispatch path never has to
+            // re-derive membership from labels. Members are ordered by target name, the same
+            // order the load-time membership check reads, so the plan and the check cannot
+            // disagree about who is in a group.
+            let group_plan = config.pool_groups.as_ref().map(|groups| {
+                let callable = config.callable_target_names();
+                crate::selection::GroupPlan {
+                    groups: groups
+                        .iter()
+                        .map(|group| {
+                            let mut names: Vec<&str> = self
+                                .targets
+                                .iter()
+                                .filter(|(name, target)| {
+                                    callable.iter().any(|candidate| candidate == name)
+                                        && target.groups.iter().any(|label| label == group)
+                                })
+                                .map(|(name, _target)| name.as_str())
+                                .collect();
+                            names.sort_unstable();
+                            crate::selection::GroupMembers {
+                                name: group.clone(),
+                                members: names
+                                    .into_iter()
+                                    .filter_map(|name| self.targets.get(name))
+                                    .map(|target| target.id.clone())
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                }
+            });
             // A terminal leg is a last resort, so its declaration has to be unambiguous: it
             // must name real targets, none of them a candidate of this route, and none of
             // them held. A terminal target that was also a candidate would be ranked as a
@@ -1134,13 +1316,13 @@ impl DeploymentConfig {
                     .into_iter()
                     .filter_map(|name| self.targets.get(name))
                     .filter_map(|target| {
-                        let group = self
-                            .llm_clients
-                            .get(&target.llm_client)
-                            .and_then(|client| client.quota_group.clone())
-                            .unwrap_or_else(|| target.llm_client.clone());
+                        // The same derivation the counters were built with. Account scope has
+                        // one counter for the whole group, so every model in the group resolves
+                        // to that one allowance instead of a per-model counter that was never
+                        // created; model scope resolves to its own.
+                        let group = self.allowance_group(target);
                         allowances
-                            .get(&(group, target.id.clone()))
+                            .get(&self.allowance_key(target, &group))
                             .map(|allowance| (target.id.clone(), Arc::clone(allowance)))
                     })
                     .collect::<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>(
@@ -1154,7 +1336,9 @@ impl DeploymentConfig {
                 Some(terminal) => route
                     .with_terminal_fallback(terminal)
                     .with_terminal_policy(config.terminal_policy.unwrap_or_default())
-                    .with_fit_escalation(config.fit_escalation.unwrap_or(false)),
+                    .with_terminal_policies(config.terminal_policies.clone().unwrap_or_default())
+                    .with_fit_escalation(config.fit_escalation.unwrap_or(false))
+                    .with_capability_escalation(config.capability_escalation.unwrap_or(false)),
                 None => route,
             };
             // A measured route ranks candidates only after it has evidence, and shares that
@@ -1171,6 +1355,14 @@ impl DeploymentConfig {
                 crate::config::SelectionPolicy::Peer => route
                     .with_measured_selection(Arc::clone(&measured_selector))
                     .with_pool_groups(config.pool_groups.clone().unwrap_or_default()),
+                // A grouped pool needs both the selector that supplies the evidence and the
+                // resolved groups themselves; without either it would degrade to the flat
+                // peer ranking this policy exists to replace.
+                crate::config::SelectionPolicy::Grouped => route
+                    .with_measured_selection(Arc::clone(&measured_selector))
+                    .with_pool_groups(config.pool_groups.clone().unwrap_or_default())
+                    .with_group_plan(group_plan.clone().unwrap_or_default())
+                    .with_group_ordering(group_ordering),
                 crate::config::SelectionPolicy::Declared => route,
             };
             routes.push((config.id.clone(), route));
@@ -1182,6 +1374,7 @@ impl DeploymentConfig {
         // compatibility surface, so Decision has one implementation.
 
         let mut runner = Runner::new(routes)
+            .with_daily_allowance_registry(allowances.clone())
             .with_fallback_url(fallback_base_url)
             .with_provider_api_keys(provider_api_keys)
             .with_deployment_facts(facts)
@@ -1227,6 +1420,81 @@ impl DeploymentConfig {
     /// one budget, and keying them apart would hand the deployment twice the allowance it
     /// actually has. A client that declares no group is its own group, which leaves a
     /// single-client deployment unchanged.
+    /// The counter a target's declared daily limit is counted on, and the clock it resets on.
+    ///
+    /// Model scope — the default — keys the counter by the target's model id, which is
+    /// correct for a provider that budgets each model separately. Account scope collapses
+    /// every model in the group onto one counter and one sentinel, because the provider
+    /// states one allowance for the whole account; under model scope each free model would
+    /// be granted the full budget and the fleet could spend several times the real cap
+    /// before any counter reported exhaustion.
+    fn quota_counter(
+        &self,
+        target: &TargetConfig,
+        group: &str,
+        state_dir: &std::path::Path,
+    ) -> (
+        ModelId,
+        std::path::PathBuf,
+        switchyard_llm_client::DayBoundary,
+    ) {
+        let client = self.llm_clients.get(&target.llm_client);
+        let boundary = match client
+            .and_then(|client| client.quota_reset)
+            .unwrap_or_default()
+        {
+            QuotaReset::Pacific => switchyard_llm_client::DayBoundary::Pacific,
+            QuotaReset::Utc => switchyard_llm_client::DayBoundary::Utc,
+        };
+        match client
+            .and_then(|client| client.quota_scope)
+            .unwrap_or_default()
+        {
+            QuotaScope::Account => (
+                ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL),
+                switchyard_llm_client::account_allowance_path(state_dir, group),
+                boundary,
+            ),
+            QuotaScope::Model => (
+                target.id.clone(),
+                switchyard_llm_client::allowance_path(state_dir, group, target.id.as_str()),
+                boundary,
+            ),
+        }
+    }
+
+    /// The quota group a target's requests are charged to.
+    ///
+    /// A client that declares no group is its own group, so two clients never share a
+    /// counter by accident just because neither named one.
+    fn allowance_group(&self, target: &TargetConfig) -> String {
+        self.llm_clients
+            .get(&target.llm_client)
+            .and_then(|client| client.quota_group.clone())
+            .unwrap_or_else(|| target.llm_client.clone())
+    }
+
+    /// The key a target's daily allowance is stored under.
+    ///
+    /// Producer and every consumer derive this the same way. A consumer that derives a
+    /// different key gets `None`, which is indistinguishable from "this target declares no
+    /// budget": the manifest advertises a limit, the counter is built and reconciled, and the
+    /// target dispatches unmetered. Deriving it once, here, is what keeps an account's single
+    /// counter reachable from every target that shares it -- not merely from whichever target
+    /// happened to create the entry first.
+    fn allowance_key(&self, target: &TargetConfig, group: &str) -> (String, ModelId) {
+        let scope = self
+            .llm_clients
+            .get(&target.llm_client)
+            .and_then(|client| client.quota_scope)
+            .unwrap_or_default();
+        let counter_model = match scope {
+            QuotaScope::Account => ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL),
+            QuotaScope::Model => target.id.clone(),
+        };
+        (group.to_owned(), counter_model)
+    }
+
     fn build_allowances(
         &self,
     ) -> RunnerResult<HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>>
@@ -1242,45 +1510,60 @@ impl DeploymentConfig {
                     "target {target_name} daily_request_limit must be at least 1"
                 )));
             }
-            let group = self
-                .llm_clients
-                .get(&target.llm_client)
-                .and_then(|client| client.quota_group.clone())
-                .unwrap_or_else(|| target.llm_client.clone());
-            let key = (group.clone(), target.id.clone());
-            match limits.entry(key) {
-                std::collections::hash_map::Entry::Occupied(existing) => {
-                    let (first_limit, first_name) = existing.get();
-                    if *first_limit != limit {
-                        return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} share model {} in quota group {group} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
-                            target.id
-                        )));
-                    }
-                    continue;
-                }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert((limit, target_name.as_str()));
-                }
-            }
+            let group = self.allowance_group(target);
             let quota = self.quota.as_ref().ok_or_else(|| {
                 RunnerError::configuration(format!(
                     "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
                 ))
             })?;
-            allowances.insert(
-                (group.clone(), target.id.clone()),
-                Arc::new(switchyard_llm_client::DailyRequestAllowance::new(
-                    group.clone(),
-                    target.id.clone(),
-                    limit,
-                    switchyard_llm_client::allowance_path(
-                        &quota.state_dir,
-                        &group,
-                        target.id.as_str(),
-                    ),
-                )),
-            );
+            let (counter_model, path, boundary) =
+                self.quota_counter(target, &group, &quota.state_dir);
+            let key = (group.clone(), counter_model.clone());
+            match limits.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let (first_limit, first_name) = existing.get();
+                    if *first_limit != limit {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} draw on the same daily counter ({}) in quota group {group} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
+                            counter_model.as_str()
+                        )));
+                    }
+                    // One counter, already built, and every target in the group resolves to it
+                    // through `allowance_key`. A per-target alias added only on this branch's
+                    // sibling is exactly what left the second and later targets unmetered, so
+                    // there is deliberately nothing to bind here: the canonical entry is the
+                    // binding.
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((limit, target_name.as_str()));
+                    allowances.insert(
+                        key,
+                        Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
+                            group.clone(),
+                            counter_model.clone(),
+                            limit,
+                            path,
+                            boundary,
+                        )),
+                    );
+                }
+            }
+        }
+        // Fail closed on a declared budget that cannot be attached. Without this, a target
+        // whose key is missing dispatches unmetered while the manifest still advertises a
+        // limit, and nothing downstream can tell that apart from a target that declares no
+        // budget. Checked per target once the map is complete, so no entry ordering can make
+        // it pass by luck.
+        for (target_name, target) in &self.targets {
+            let Some(limit) = target.daily_request_limit else {
+                continue;
+            };
+            let group = self.allowance_group(target);
+            if !allowances.contains_key(&self.allowance_key(target, &group)) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares daily_request_limit = {limit} but no daily counter can be attached to its lookup key in quota group {group}; a declared budget that could not be attached would dispatch unmetered, so this deployment is refused"
+                )));
+            }
         }
         if !allowances.is_empty() {
             self.validate_quota_state_dir()?;
@@ -1331,10 +1614,23 @@ impl DeploymentConfig {
                      policy that governs no leg would read as a guarantee it cannot provide"
                 )));
             }
+            if config.terminal_policies.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares terminal_policies but no terminal_fallback; a \
+                     policy that governs no leg would read as a guarantee it cannot provide"
+                )));
+            }
             if config.fit_escalation == Some(true) {
                 return Err(RunnerError::configuration(format!(
                     "route {route_name} declares fit_escalation but no terminal_fallback; a \
                      size refusal would have no wider tier to escalate to, so the option would \
+                     read as a guarantee it cannot provide"
+                )));
+            }
+            if config.capability_escalation == Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares capability_escalation but no terminal_fallback; a \
+                     wire refusal would have no later group to consider, so the option would \
                      read as a guarantee it cannot provide"
                 )));
             }
@@ -1345,6 +1641,20 @@ impl DeploymentConfig {
             return Err(RunnerError::configuration(format!(
                 "route {route_name} declares terminal_fallback but names no target"
             )));
+        }
+        // A boundary policy is aligned with the tiers it governs. Declaring fewer policies
+        // than tiers would silently leave the rest on the route policy, and declaring more
+        // would name a boundary that does not exist; both are states an operator cannot read
+        // back, so both are refused.
+        if let Some(policies) = &config.terminal_policies {
+            if policies.len() != tiers.len() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares {} terminal_policies for {} terminal tiers; a \
+                     boundary policy must state one value per tier",
+                    policies.len(),
+                    tiers.len()
+                )));
+            }
         }
         let candidates = config.callable_target_names();
         let mut resolved: Vec<Vec<ModelId>> = Vec::new();
@@ -1399,6 +1709,7 @@ impl DeploymentConfig {
         route_name: &str,
         config: &RouteConfig,
         groups: &[String],
+        requires_free_members: bool,
     ) -> RunnerResult<()> {
         if groups.is_empty() {
             return Err(RunnerError::configuration(format!(
@@ -1425,12 +1736,20 @@ impl DeploymentConfig {
                     .targets
                     .get(name)
                     .expect("group membership was read from this map");
-                // The pool is a free pool by definition, so membership implies a positive
-                // free declaration. `Unknown` is refused for the same reason it is excluded
-                // at request time.
-                // One authority for the question, so the load gate and the request-time gate
-                // cannot disagree about whether a tariff is free.
-                if !switchyard_llm_client::Tariff::from_declaration(target.free_tier).is_free() {
+                // An equal-peer pool is a free pool by definition, so membership implies a
+                // positive free declaration. `Unknown` is refused for the same reason it is
+                // excluded at request time, and one authority answers the question so the load
+                // gate and the request-time gate cannot disagree about whether a tariff is
+                // free.
+                //
+                // An ORDERED pool is a different shape: its groups are a declared cost
+                // sequence, and the later ones exist precisely to be metered. Demanding a free
+                // declaration there would refuse the ladder it describes. The spending
+                // boundary for a metered group is the group ahead of it plus the existing
+                // metered admission gates, not a tariff check that would delete the group.
+                if requires_free_members
+                    && !switchyard_llm_client::Tariff::from_declaration(target.free_tier).is_free()
+                {
                     return Err(RunnerError::configuration(format!(
                         "route {route_name} pool_groups names group {group}, whose member                          {name} does not declare free_tier = true; a free peer pool cannot                          contain a target whose tariff is not positively free"
                     )));
@@ -1499,6 +1818,99 @@ impl DeploymentConfig {
                 quota.state_dir.display()
             ))
         })?;
+        Ok(())
+    }
+
+    /// Rejects a provider-pool mapping that could not be applied honestly.
+    ///
+    /// Three rules, each of which prevents a specific wrong admission rather than a
+    /// stylistic preference:
+    ///
+    /// * The pool is account-wide, so the counter it reconciles must be account-scoped. A
+    ///   per-model counter fed an account total would refuse model B on the account's
+    ///   spend and then refuse model A again on the same number -- one account's figure
+    ///   spent as though it were several budgets.
+    /// * The boundary must be the pool's own. A reading is placed in a day on the
+    ///   counter's clock; an OpenRouter reading counted on the Pacific clock lands in the
+    ///   wrong day for eight hours a night, so exhaustion from yesterday could refuse the
+    ///   new UTC day or, worse, a fresh reading could be ignored as belonging to another
+    ///   day.
+    /// * The client must actually have a counter. Naming a pool for a client whose targets
+    ///   declare no `daily_request_limit` would authorize a reconciliation with nowhere to
+    ///   write, so the mapping would read as configured while doing nothing.
+    /// * One pool names one counter. Two clients on one pool with different groups produce
+    ///   two counters fed the same account figure, each admitting the full reported
+    ///   remainder; there is no way to merge those reservations after the fact, so the
+    ///   mapping is refused rather than reconciled.
+    fn validate_quota_providers(&self) -> RunnerResult<()> {
+        // One provider account is one budget, so it may name exactly one counter.
+        let mut accounts: BTreeMap<&'static str, (&str, String)> = BTreeMap::new();
+        for (name, client) in &self.llm_clients {
+            let Some(provider) = client.quota_provider else {
+                continue;
+            };
+            let scope = client.quota_scope.unwrap_or_default();
+            if scope != QuotaScope::Account {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but quota_scope is \
+                     {:?}; {} reports one allowance for the whole account, so the counter it \
+                     reconciles must be account-scoped (quota_scope = \"account\") or several \
+                     model counters would each spend the one account figure",
+                    provider.as_str(),
+                    scope,
+                    provider.as_str()
+                )));
+            }
+            let reset = client.quota_reset.unwrap_or_default();
+            if reset != provider.reset() {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but quota_reset is {:?}; \
+                     {} turns over at midnight {} ({}), so the counter must use the same \
+                     clock or a reading lands in a day the provider does not recognise",
+                    provider.as_str(),
+                    reset,
+                    provider.as_str(),
+                    provider.reset().as_str(),
+                    provider.pool()
+                )));
+            }
+            let holds_counter = self.targets.values().any(|target| {
+                target.llm_client == *name
+                    && target.daily_request_limit.is_some_and(|limit| limit > 0)
+            });
+            if !holds_counter {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but none of its targets \
+                     declares daily_request_limit, so there is no counter to reconcile and \
+                     the mapping would read as configured while admitting on nothing",
+                    provider.as_str()
+                )));
+            }
+            // Two clients naming one pool resolve to two counters whenever they name
+            // different groups, and both counters are then fed the same account figure. Each
+            // admits the full reported remainder, so the account is spent twice over -- and
+            // no runtime bookkeeping can merge reservations that live in two files. One
+            // account is one counter, therefore one group.
+            let group = client.quota_group.clone().unwrap_or_else(|| name.clone());
+            match accounts.entry(provider.as_str()) {
+                std::collections::btree_map::Entry::Occupied(existing) => {
+                    let (first_client, first_group) = existing.get();
+                    if *first_group != group {
+                        return Err(RunnerError::configuration(format!(
+                            "llm clients {first_client} and {name} both name quota_provider = \
+                             \"{}\" but resolve to different quota groups ({first_group} and \
+                             {group}); one provider account is one budget, so both counters \
+                             would spend the same reported remainder -- give them one \
+                             quota_group, or name the pool on only one of them",
+                            provider.as_str()
+                        )));
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((name.as_str(), group));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1589,15 +2001,13 @@ impl DeploymentConfig {
                     target.reasoning_policy,
                     target.reasoning_dialect,
                     target.cooldown_group.clone(),
-                    allowances
-                        .get(&(
-                            client_config
-                                .quota_group
-                                .clone()
-                                .unwrap_or_else(|| target.llm_client.clone()),
-                            target.id.clone(),
-                        ))
-                        .cloned(),
+                    {
+                        // Resolved through the same derivation the map was built with, so a
+                        // shared account counter is reachable from every target in the group
+                        // and not only from the one that created the entry.
+                        let group = self.allowance_group(target);
+                        allowances.get(&self.allowance_key(target, &group)).cloned()
+                    },
                     pacing_for(target, client_config, governor),
                     hosted_reasoning,
                 )?,
@@ -2451,12 +2861,7 @@ impl DeploymentConfig {
                     .supported_types
                     .unwrap_or(decision_transport::SupportedTypes::ALL),
                 state_forms: target.state_forms,
-                budget: self.decision_budget(
-                    target,
-                    client,
-                    accounting.governor,
-                    accounting.allowances,
-                ),
+                budget: self.decision_budget(target, accounting.governor, accounting.allowances),
             });
         }
         (!candidates.is_empty()).then_some(decision_executor::DecisionResolver { candidates })
@@ -2471,15 +2876,11 @@ impl DeploymentConfig {
     fn decision_budget(
         &self,
         target: &TargetConfig,
-        client: &LlmClientConfig,
         governor: &Arc<switchyard_llm_client::QuotaGovernor>,
         allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
     ) -> Option<Arc<decision_executor::DecisionBudget>> {
-        let group = client
-            .quota_group
-            .clone()
-            .unwrap_or_else(|| target.llm_client.clone());
-        let allowance = allowances.get(&(group.clone(), target.id.clone())).cloned();
+        let group = self.allowance_group(target);
+        let allowance = allowances.get(&self.allowance_key(target, &group)).cloned();
         let limits = switchyard_llm_client::WindowLimits {
             requests_per_minute: target.requests_per_minute,
             input_tokens_per_minute: target.input_tokens_per_minute,
@@ -3086,6 +3487,117 @@ struct LlmClientConfig {
     /// as it was.
     #[serde(default)]
     quota_group: Option<String>,
+    /// Whether this client's daily cap is stated per model or for the whole account.
+    ///
+    /// Model scope is the historical behaviour and stays the default, because it is
+    /// correct for a provider that budgets each model separately (Google's free tier).
+    /// Account scope exists for providers that publish one free-request allowance for the
+    /// whole account (OpenRouter): under model scope every free model would be given the
+    /// full daily budget as its own, and the fleet would collectively spend several times
+    /// the real cap before any counter reported exhaustion.
+    #[serde(default)]
+    quota_scope: Option<QuotaScope>,
+    /// Which midnight this client's daily counter turns over on.
+    ///
+    /// Pacific by default, which is the historical behaviour and is correct for Google's
+    /// AI Studio free tier. OpenRouter's free-model counter turns over at midnight UTC;
+    /// counting it on the Pacific clock would either spend the new day's budget hours
+    /// early or refuse traffic the provider has already restored.
+    #[serde(default)]
+    quota_reset: Option<QuotaReset>,
+    /// The provider-reported request pool this client's counter reconciles against.
+    ///
+    /// A local counter sees only this deployment's traffic. On a shared free tier another
+    /// client -- or the same person in a browser -- can spend the account's allowance while
+    /// our counter still shows room. Naming a pool here authorizes the economics collector
+    /// to write the provider's own figure into this client's counter, so admission is
+    /// decided on the account rather than on our own slice of it.
+    ///
+    /// Omitted means the local budget is the only authority, which is the historical
+    /// behaviour and is correct for a provider that exposes no such reading.
+    #[serde(default)]
+    quota_provider: Option<QuotaProvider>,
+}
+
+/// A provider-reported request pool a counter may reconcile against.
+///
+/// A closed set rather than a free string: each variant names a pool whose wire shape and
+/// reset semantics this code knows, so a configuration cannot ask for a mapping the
+/// parser does not implement and then silently admit on a reading that never arrives.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaProvider {
+    /// OpenRouter's account-wide free-model daily request counter, reported by
+    /// `GET /api/v1/key` as `data.free_model_daily_requests`. It resets at midnight UTC.
+    ///
+    /// The spelling is pinned rather than derived from the variant name: serde's snake_case
+    /// rule would render `OpenRouterFreeModels` as `open_router_free_models`, which is not
+    /// how the provider's name is written anywhere else in this codebase and would become a
+    /// second spelling for one thing.
+    #[serde(rename = "openrouter_free_models")]
+    OpenRouterFreeModels,
+}
+
+impl QuotaProvider {
+    /// The pool name the provider itself uses.
+    ///
+    /// This must match the `pool` an account reader publishes, because reconciliation
+    /// selects the reading by that string. The two are joined here rather than written
+    /// out twice, so a rename cannot leave the reader and the config disagreeing.
+    pub fn pool(self) -> &'static str {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => "free_model_daily_requests",
+        }
+    }
+
+    /// The stable spelling used in configuration and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => "openrouter_free_models",
+        }
+    }
+
+    /// The day boundary the pool turns over on.
+    ///
+    /// Not configurable: the provider states when its own window resets, and counting it
+    /// on a different clock would place a reading in a day the provider does not recognise.
+    pub fn reset(self) -> QuotaReset {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => QuotaReset::Utc,
+        }
+    }
+}
+
+/// How a client's daily request cap is scoped.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaScope {
+    /// One counter per model within the quota group.
+    #[default]
+    Model,
+    /// One counter for the whole quota group: every model draws on one account budget.
+    Account,
+}
+
+/// Which midnight a client's daily counter turns over on.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaReset {
+    /// Midnight Pacific — Google's AI Studio free tier.
+    #[default]
+    Pacific,
+    /// Midnight UTC — OpenRouter's free-model daily counter.
+    Utc,
+}
+
+impl QuotaReset {
+    /// The stable spelling used in configuration and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaReset::Pacific => "pacific",
+            QuotaReset::Utc => "utc",
+        }
+    }
 }
 
 /// Where a client's traffic terminates.
@@ -7570,5 +8082,541 @@ candidates = []
 fit_escalation = false
 "#;
         runner_from_toml(config).expect("fit_escalation = false is the default behaviour");
+    }
+
+    /// The capability axis refuses the same unfillable promise: a route that says a wire
+    /// refusal will still be answered must name the group that would answer it.
+    #[test]
+    fn capability_escalation_without_a_terminal_leg_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+capability_escalation = true
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("capability_escalation"),
+            "refusal must name the option, got: {message}"
+        );
+        assert!(
+            message.contains("terminal_fallback"),
+            "refusal must name the missing declaration, got: {message}"
+        );
+    }
+
+    /// Control for the refusal above: the guard bites on the missing declaration, not on the
+    /// option.
+    #[test]
+    fn capability_escalation_with_a_terminal_leg_loads() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[targets.portable]
+id = "portable/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+terminal_fallback = [["portable"]]
+capability_escalation = true
+"#;
+        runner_from_toml(config).expect("a route with a later group may declare the option");
+    }
+
+    /// Off is the default and needs no tier, exactly as the fit axis does. This is the
+    /// invariant that keeps the option from widening any existing route at load.
+    #[test]
+    fn capability_escalation_off_does_not_require_a_tier() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+capability_escalation = false
+"#;
+        runner_from_toml(config).expect("capability_escalation = false is the default behaviour");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daily quota scope: one counter per account, or one per model
+// ---------------------------------------------------------------------------
+
+/// Two free models drawing on one provider account.
+///
+/// The account scope exists because the OpenRouter free-model allowance is stated once per
+/// account (`free_model_daily_requests: 1000`), so a per-model counter would hand the fleet
+/// one 1000-request budget per model and the fleet could spend several times the real cap
+/// before any counter refused it.
+#[cfg(test)]
+mod daily_quota_scope_tests {
+    use super::*;
+
+    const SHARED_ACCOUNT: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "/var/tmp/switchyard-quota-scope-fixture"
+
+[llm_clients.openrouter_free]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+
+[targets."free-a"]
+id = "vendor/free-a"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[routes."free"]
+id = "free"
+type = "passthrough"
+target = "free-a"
+candidates = ["free-b"]
+"#;
+
+    fn shared_account_config() -> DeploymentConfig {
+        toml::from_str(SHARED_ACCOUNT).expect("the fixture must parse")
+    }
+
+    /// Every model in an account-scoped group resolves to the one sentinel counter, at one
+    /// path, on the client's declared clock. A regression that keyed by target id would
+    /// give each model its own budget while the manifest still read `quota_scope = "account"`.
+    #[test]
+    fn account_scope_collapses_every_model_onto_one_counter() {
+        let config = shared_account_config();
+        let state_dir = std::path::Path::new("/var/tmp/switchyard-quota-scope-fixture");
+        let group = "openrouter-free-owner";
+
+        let (model_a, path_a, boundary_a) =
+            config.quota_counter(&config.targets["free-a"], group, state_dir);
+        let (model_b, path_b, boundary_b) =
+            config.quota_counter(&config.targets["free-b"], group, state_dir);
+
+        assert_eq!(
+            model_a.as_str(),
+            switchyard_llm_client::ACCOUNT_SCOPE_MODEL,
+            "an account-scoped target must count against the account sentinel"
+        );
+        assert_eq!(model_a, model_b, "two models, one account counter");
+        assert_eq!(path_a, path_b, "one counter means one file");
+        assert_eq!(
+            boundary_a,
+            switchyard_llm_client::DayBoundary::Utc,
+            "the OpenRouter free-model counter turns over at midnight UTC"
+        );
+        assert_eq!(boundary_a, boundary_b);
+    }
+
+    /// One counter cannot serve two budgets: two targets on the same account counter that
+    /// declare different limits are refused, and the refusal names both targets and both
+    /// numbers so the operator can decide which one is meant.
+    #[test]
+    fn differing_limits_on_one_account_counter_refuse_the_deployment() {
+        let source = SHARED_ACCOUNT.replace(
+            "id = \"vendor/free-b\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000",
+            "id = \"vendor/free-b\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 250",
+        );
+        assert!(
+            source.contains("daily_request_limit = 250"),
+            "the fixture edit must apply, or this test proves nothing"
+        );
+
+        let message = match runner_from_toml(&source) {
+            Ok(_) => panic!("a shared counter with two different limits must be refused"),
+            Err(error) => format!("{error}"),
+        };
+
+        assert!(
+            message.contains("free-a") && message.contains("free-b"),
+            "the refusal must name both targets, got: {message}"
+        );
+        assert!(
+            message.contains("1000") && message.contains("250"),
+            "the refusal must name both limits, got: {message}"
+        );
+        assert!(
+            message.contains("one counter serves one budget"),
+            "the refusal must say why it is refused, got: {message}"
+        );
+    }
+
+    /// The default is per model: a client that names no scope keeps a counter per target,
+    /// so declaring a daily limit today cannot silently change meaning.
+    #[test]
+    fn a_client_naming_no_scope_keeps_one_counter_per_model() {
+        let source = SHARED_ACCOUNT
+            .replace("quota_scope = \"account\"\n", "")
+            .replace("quota_reset = \"utc\"\n", "");
+        let config: DeploymentConfig = toml::from_str(&source).expect("the fixture must parse");
+        let state_dir = std::path::Path::new("/var/tmp/switchyard-quota-scope-fixture");
+        let group = "openrouter-free-owner";
+
+        let (model_a, path_a, boundary_a) =
+            config.quota_counter(&config.targets["free-a"], group, state_dir);
+        let (model_b, path_b, _) =
+            config.quota_counter(&config.targets["free-b"], group, state_dir);
+
+        assert_eq!(model_a.as_str(), "vendor/free-a");
+        assert_eq!(model_b.as_str(), "vendor/free-b");
+        assert_ne!(path_a, path_b, "per-model counters are separate files");
+        assert_eq!(
+            boundary_a,
+            switchyard_llm_client::DayBoundary::Pacific,
+            "Pacific stays the default boundary"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quota_provider_tests {
+    use super::*;
+
+    const BASE: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "/var/tmp/switchyard-quota-provider-fixture"
+
+[llm_clients.openrouter_free]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-a"]
+id = "vendor/free-a"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[routes."free"]
+id = "free"
+type = "passthrough"
+target = "free-a"
+"#;
+
+    fn config() -> DeploymentConfig {
+        toml::from_str(BASE).expect("the fixture must parse")
+    }
+
+    /// A state directory no other test can touch. The shared fixture path is used by the
+    /// other tests in this module, and a counter directory is mutable state: two tests
+    /// pointing at one path race over the same files regardless of what they assert.
+    fn unique_state_dir(name: &str) -> String {
+        let dir = std::path::PathBuf::from("/var/tmp").join(format!(
+            "switchyard-quota-binding-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("the fixture state dir must exist");
+        dir.display().to_string()
+    }
+
+    /// Every target that shares an account counter resolves to that one counter, and the
+    /// deployment refuses to build when a declared budget cannot be attached.
+    ///
+    /// The failure this guards is silent by construction: a consumer that derives a different
+    /// key gets `None`, which is indistinguishable from "declares no budget". Measured live on
+    /// 2026-11-26 -- two served free requests left `spent` at 0 and the counter untouched --
+    /// because only the target that created the counter entry could reach it.
+    #[test]
+    fn every_target_sharing_an_account_counter_resolves_to_it() {
+        let state_dir = unique_state_dir("shared-counter");
+        let mut shared = BASE.replace("/var/tmp/switchyard-quota-provider-fixture", &state_dir);
+        for (name, slug) in [
+            ("free-b", "vendor/free-b"),
+            ("free-c", "vendor/free-c"),
+            ("free-d", "vendor/free-d"),
+        ] {
+            shared.push_str(&format!(
+                "\n[targets.\"{name}\"]\nid = \"{slug}\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000\n"
+            ));
+        }
+        let config: DeploymentConfig = toml::from_str(&shared).expect("the fixture must parse");
+        let allowances = config.build_allowances().expect("the fixture must build");
+        let group = "openrouter-free-owner";
+        // Exactly one counter for the account, whatever the number of targets on it.
+        assert_eq!(
+            allowances.keys().filter(|(g, _)| g == group).count(),
+            1,
+            "one account budget is one counter, keys were {:?}",
+            allowances
+                .keys()
+                .map(|(g, m)| (g.as_str(), m.as_str()))
+                .collect::<Vec<_>>()
+        );
+        // Every target, first and subsequent, resolves to that same object.
+        let canonical = allowances
+            .iter()
+            .find(|((g, _), _)| g == group)
+            .map(|(_, allowance)| Arc::clone(allowance))
+            .expect("the account counter exists");
+        for name in ["free-a", "free-b", "free-c", "free-d"] {
+            let target = &config.targets[name];
+            let key = config.allowance_key(target, group);
+            let found = allowances.get(&key).unwrap_or_else(|| {
+                panic!("{name} must resolve its declared allowance, looked up as {key:?}")
+            });
+            assert!(
+                Arc::ptr_eq(found, &canonical),
+                "{name} must share the account's one counter, not a copy of it"
+            );
+            assert_eq!(found.path(), canonical.path(), "{name} counter path");
+        }
+    }
+
+    /// A target that declares a budget but cannot reach a counter is a load error, not a
+    /// silent unmetered target.
+    #[test]
+    fn a_declared_budget_that_cannot_be_attached_refuses_the_deployment() {
+        let state_dir = unique_state_dir("unattachable");
+        let mut source = BASE.replace("/var/tmp/switchyard-quota-provider-fixture", &state_dir);
+        // A second group on the same provider account is refused for its own reason; this
+        // fixture instead makes the allowance key unreachable by declaring the target's
+        // counter under a scope whose key the census cannot find.
+        source.push_str(
+            "\n[targets.\"stray\"]\nid = \"vendor/stray\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000\n",
+        );
+        let mut config: DeploymentConfig = toml::from_str(&source).expect("the fixture must parse");
+        let allowances = config
+            .build_allowances()
+            .expect("the honest fixture builds");
+        assert!(allowances.contains_key(
+            &config.allowance_key(&config.targets["stray"], "openrouter-free-owner")
+        ));
+        // Drop the counter the census needs and prove the gate names the target.
+        config.quota = None;
+        let error = config
+            .build_allowances()
+            .expect_err("a budget with no [quota] state_dir cannot be counted");
+        assert!(
+            error.to_string().contains("no [quota] state_dir"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The declared pool is read into the typed form, so the loader never carries a free
+    /// string that a reader might not implement.
+    #[test]
+    fn a_declared_pool_parses_and_names_the_providers_own_bucket() {
+        let config = config();
+        let client = &config.llm_clients["openrouter_free"];
+        let provider = client.quota_provider.expect("the pool must parse");
+        assert_eq!(provider, QuotaProvider::OpenRouterFreeModels);
+        assert_eq!(provider.pool(), "free_model_daily_requests");
+        assert_eq!(provider.reset(), QuotaReset::Utc);
+    }
+
+    /// A pool name the code does not implement is refused at load. Accepting it would
+    /// authorize a mapping that never produces a reading, which reads as configured and
+    /// admits on the local budget forever.
+    #[test]
+    fn an_unknown_pool_name_refuses_the_deployment() {
+        let source = BASE.replace(
+            "quota_provider = \"openrouter_free_models\"",
+            "quota_provider = \"some_other_pool\"",
+        );
+        assert!(source.contains("some_other_pool"), "the edit must apply");
+        assert!(
+            toml::from_str::<DeploymentConfig>(&source).is_err(),
+            "an unimplemented pool must not deserialize"
+        );
+    }
+
+    /// An account-wide pool cannot feed a per-model counter: one account figure spent as
+    /// though it were several budgets would refuse each model on the same number.
+    #[test]
+    fn a_pool_on_a_model_scoped_counter_refuses_the_deployment() {
+        let source = BASE.replace("quota_scope = \"account\"", "quota_scope = \"model\"");
+        assert!(
+            source.contains("quota_scope = \"model\""),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a model-scoped counter must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("quota_scope") && message.contains("openrouter_free_models"),
+            "the refusal must name the pool and the rule: {message}"
+        );
+    }
+
+    /// The counter must turn over on the pool's own clock. An OpenRouter reading counted on
+    /// the Pacific boundary lands in the wrong day for eight hours a night.
+    #[test]
+    fn a_pool_on_the_wrong_reset_clock_refuses_the_deployment() {
+        let source = BASE.replace("quota_reset = \"utc\"", "quota_reset = \"pacific\"");
+        assert!(
+            source.contains("quota_reset = \"pacific\""),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a counter on the wrong clock must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("quota_reset") && message.contains("utc"),
+            "the refusal must name the clock the pool requires: {message}"
+        );
+    }
+
+    /// A pool named for a client whose targets declare no daily limit has nowhere to write,
+    /// so the mapping would read as configured while doing nothing.
+    #[test]
+    fn a_pool_without_a_counter_refuses_the_deployment() {
+        let source = BASE.replace("daily_request_limit = 1000\n", "");
+        assert!(
+            !source.contains("daily_request_limit"),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a pool with no counter must be refused");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("daily_request_limit"),
+            "the refusal must say what is missing: {message}"
+        );
+    }
+
+    /// Two clients naming one pool must resolve to one counter. With different groups they
+    /// get two, both fed the same account figure, and each admits the full reported
+    /// remainder -- the account is spent twice over with nothing to detect it.
+    #[test]
+    fn two_groups_on_one_provider_account_are_refused() {
+        let second = r#"
+[llm_clients.openrouter_free_second]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-second"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free_second"
+daily_request_limit = 1000
+"#;
+        let source = format!("{BASE}\n{second}");
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("two counters on one account must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("openrouter_free_models")
+                && message.contains("openrouter-free-owner")
+                && message.contains("openrouter-free-second"),
+            "the refusal must name the pool and both groups: {message}"
+        );
+    }
+
+    /// A second client on the same group is the same counter, which is the shape a second
+    /// credential for one account must use.
+    #[test]
+    fn a_second_client_on_the_same_group_shares_one_counter() {
+        let second = r#"
+[llm_clients.openrouter_free_second]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free_second"
+daily_request_limit = 1000
+"#;
+        let source = format!("{BASE}\n{second}");
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        config
+            .validate_quota_providers()
+            .expect("one account may be read by more than one credential label");
+    }
+
+    /// The valid shape passes, so the three refusals above are about the rule and not about
+    /// the fixture being invalid in every direction.
+    #[test]
+    fn a_valid_pool_mapping_is_accepted() {
+        config()
+            .validate_quota_providers()
+            .expect("the documented shape must be accepted");
+    }
+
+    /// The facts carry the resolved group and the pool, so a consumer outside the route path
+    /// can find the counter without repeating the loader's defaults.
+    #[test]
+    fn the_facts_carry_the_group_and_the_pool() {
+        let config = config();
+        let facts = config.deployment_facts();
+        let client = &facts.clients["openrouter_free"];
+        assert_eq!(client.quota_group.as_deref(), Some("openrouter-free-owner"));
+        assert_eq!(
+            client.quota_provider,
+            Some(QuotaProvider::OpenRouterFreeModels)
+        );
+
+        // A client that names no group is its own group, so a consumer never has to
+        // reproduce that default.
+        let source = BASE.replace("quota_group = \"openrouter-free-owner\"\n", "")
+            + "\n[llm_clients.other]\nformat = \"openai_chat\"\nbase_url = \"https://x.test/v1\"\n";
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let facts = config.deployment_facts();
+        assert_eq!(facts.clients["other"].quota_group.as_deref(), Some("other"));
+        assert_eq!(facts.clients["other"].quota_provider, None);
     }
 }

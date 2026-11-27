@@ -71,6 +71,42 @@ use switchyard_protocol::ModelId;
 /// Length of one civil day.
 const DAY_SECONDS: i64 = 86_400;
 
+/// How long a provider-reported request count stays actionable.
+///
+/// Two collection intervals, not one. The collector in this deployment reads accounts
+/// every 300 s, so a tolerance equal to that interval would expire a good reading in the
+/// window between the instant it ages out and the instant the next one is written --
+/// including whenever a single round is slow or fails. The reading would then be discarded
+/// for being stale, which is the one thing the three-state design exists to avoid.
+///
+/// It stays bounded rather than generous: a collector that has been dead for ten minutes
+/// should stop being the authority, because the provider's day may have rolled over and
+/// nothing here would know. Two intervals tolerate exactly one missed round.
+///
+/// See [`DailyRequestAllowance::provider_tolerance`] for the state this produces and why
+/// it is always reported rather than assumed.
+const DEFAULT_PROVIDER_TOLERANCE: Duration = Duration::from_secs(600);
+
+/// How long a confirmed exhaustion keeps refusing after readings stop arriving.
+///
+/// A reading that says the account is empty is the only thing standing between this lane
+/// and a retry storm: once it ages out the counter falls back to its local budget, which
+/// still looks unspent, and every retry earns another provider 429. The retention is
+/// therefore kept for a bounded time after the reading's own freshness ends.
+///
+/// Bounded, because the opposite failure is a wall that outlives the outage: a collector
+/// that dies while the account is empty must not refuse the lane until someone notices.
+/// Two collection intervals is long enough to ride out a missing round and short enough
+/// that a recovered account serves again within minutes of the provider restoring it.
+const EXHAUSTION_RETENTION: Duration = Duration::from_secs(600);
+
+/// How far ahead of the local clock a reading may be stamped and still be believed.
+///
+/// A reading is stamped by the collector on this host, so a genuine one is never future.
+/// The allowance exists for clock adjustment between the two threads and nothing else;
+/// beyond it the reading describes an instant that has not happened.
+const OBSERVATION_SKEW: Duration = Duration::from_secs(60);
+
 /// Offset of Pacific standard time from UTC, in seconds (negative: west of Greenwich).
 const PACIFIC_STANDARD_SECONDS: i64 = -8 * 3_600;
 
@@ -169,13 +205,187 @@ pub fn provider_day_label(day: u64) -> String {
     format!("{year:04}-{month:02}-{date:02}")
 }
 
+/// The UTC civil day number containing `now`.
+///
+/// A second day boundary exists because provider families do not agree on when "today"
+/// starts. Google's free tier turns over at midnight Pacific; OpenRouter's free-model
+/// counter turns over at midnight UTC. Counting one on the other's clock either spends
+/// the new day's budget a few hours early or refuses traffic the provider has already
+/// restored, so the boundary belongs to the allowance rather than being a global
+/// constant.
+pub fn utc_day(now: SystemTime) -> u64 {
+    let seconds = now
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+    u64::try_from(seconds.div_euclid(DAY_SECONDS)).unwrap_or(0)
+}
+
+/// Which midnight a daily counter turns over on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DayBoundary {
+    /// Midnight Pacific — Google's AI Studio free tier. The historical default, so a
+    /// deployment that names no boundary keeps exactly its previous behaviour.
+    #[default]
+    Pacific,
+    /// Midnight UTC — OpenRouter's free-model daily counter.
+    Utc,
+}
+
+impl DayBoundary {
+    /// The civil day number containing `now` on this boundary's clock.
+    pub fn day(self, now: SystemTime) -> u64 {
+        match self {
+            DayBoundary::Pacific => provider_day(now),
+            DayBoundary::Utc => utc_day(now),
+        }
+    }
+
+    /// The `YYYY-MM-DD` date of `day` on this boundary's clock.
+    ///
+    /// Both boundaries count whole civil days from the epoch, so the calendar date of a
+    /// day number is the same arithmetic; only which day `now` falls in differs.
+    pub fn label(self, day: u64) -> String {
+        provider_day_label(day)
+    }
+
+    /// The stable spelling used in configuration and telemetry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DayBoundary::Pacific => "pacific",
+            DayBoundary::Utc => "utc",
+        }
+    }
+}
+
 /// Why a reservation could not be granted.
 #[derive(Debug)]
 pub enum ReserveError {
-    /// The allowance for the current provider day is spent.
+    /// This deployment's own budget for the current provider day is spent.
+    ///
+    /// A statement about the counter this process keeps: the requests it has itself
+    /// reserved. It says nothing about what anyone else spent on the same account.
     Exhausted,
+    /// The provider itself reported that the account's allowance for the current day
+    /// is spent.
+    ///
+    /// A stronger and different claim from [`Self::Exhausted`]: the provider is the
+    /// authority on the account, it counts traffic from anywhere, and a local budget
+    /// that still looks unspent cannot make the account servable again. Kept separate
+    /// so that a reader can tell "we spent our share" from "the account is empty", and
+    /// so a stale or unknown reading can never be reported as confirmed exhaustion.
+    ProviderExhausted {
+        /// The pool's stated daily limit, for the refusal message.
+        limit: u64,
+    },
     /// The accounting state could not be read or written, so no budget may be spent.
     Unusable(String),
+    /// An observation was offered that cannot be applied without making the counter
+    /// disagree with the provider: it is stamped in the future, it describes a provider day
+    /// that has ended, or the counter already holds a later reading for the same day.
+    ///
+    /// Refusing is the whole point. Adopting a delayed observation resets the spend of the
+    /// day that replaced it; adopting an older one restores headroom that has been used.
+    /// Neither is recoverable once the counter has been written, so the write is the place
+    /// to say no.
+    ObservationRejected {
+        /// Why the reading was not applied, in the terms of the rule that refused it.
+        reason: &'static str,
+    },
+}
+
+/// A request-count the provider itself reported for one account pool.
+///
+/// This is the provider's own answer, not this deployment's bookkeeping. It counts
+/// every request the account made, including other clients and other keys, so it is
+/// the only figure that can confirm an *account* is empty. It is also a snapshot: the
+/// provider reports it when asked, and it is wrong the moment anything else spends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProviderReading {
+    /// Requests the provider counted against the pool for its current day.
+    pub used: u64,
+    /// The pool's stated daily limit.
+    pub limit: u64,
+    /// Requests the provider says the pool still permits.
+    pub remaining: u64,
+    /// When this reading was taken, on this host's clock.
+    pub observed_at: SystemTime,
+    /// When the provider says the pool resets, when it states one.
+    pub reset_at: Option<SystemTime>,
+}
+
+impl ProviderReading {
+    /// Whether this reading is recent enough to act on.
+    ///
+    /// A reading older than the tolerance is not evidence of anything: the provider
+    /// may have served a thousand requests since. Treating a stale "0 remaining" as
+    /// exhaustion would refuse a lane that has recovered, and treating a stale "500
+    /// remaining" as headroom would spend budget that is already gone. Stale is
+    /// therefore neither, and the local budget governs.
+    pub fn is_fresh_at(&self, now: SystemTime, tolerance: Duration) -> bool {
+        match now.duration_since(self.observed_at) {
+            Ok(age) => age <= tolerance,
+            // `now` before the reading: the clock moved backwards. Not fresh, because
+            // nothing here can tell how old the reading really is.
+            Err(_) => false,
+        }
+    }
+
+    /// Seconds until the provider's stated reset, when it stated one in the future.
+    pub fn seconds_to_reset_at(&self, now: SystemTime) -> Option<u64> {
+        self.reset_at
+            .and_then(|reset| reset.duration_since(now).ok())
+            .map(|left| left.as_secs())
+    }
+}
+
+/// Why an exhaustion is being reported.
+///
+/// The two are kept apart because they licence different decisions. [`Self::Confirmed`] is
+/// the provider saying, in a reading that is still current, that the pool has no headroom
+/// left. [`Self::Retained`] is that same statement carried past the point where the reading
+/// is current, for a bounded time, so that a collection round which never arrives does not
+/// turn into a retry storm.
+///
+/// A retained refusal is still a refusal: data this stale is never a reason to spend. But it
+/// is not evidence about the account *now*, so nothing outside the decision to send may read
+/// it as a confirmed exhaustion -- in particular, a recovered account must not be described
+/// as empty on the strength of a reading that has stopped being current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExhaustionBasis {
+    /// A current reading reports no headroom.
+    Confirmed,
+    /// A confirmed exhaustion held past the freshness of the reading that reported it.
+    Retained,
+}
+
+/// What is known about the provider's own accounting for this allowance.
+///
+/// Three states, kept apart because collapsing any two of them produces a wrong
+/// admission decision: an unknown reading cannot refute a local budget, and a stale
+/// one cannot confirm exhaustion. Only [`Self::Exhausted`] may refuse on the
+/// provider's behalf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderState {
+    /// No reading, or one older than the tolerance. The provider has not told us
+    /// anything current, which is not the same as telling us there is headroom.
+    Unknown,
+    /// The provider reported headroom, recently enough to act on.
+    Available {
+        /// Requests the provider said remained at that moment.
+        remaining: u64,
+    },
+    /// The provider reported no headroom, recently enough to act on, or recently enough that
+    /// its statement is still being honoured.
+    Exhausted {
+        /// The pool's stated limit, for the refusal message.
+        limit: u64,
+        /// Whether the provider said so in a current reading, or whether that statement is
+        /// being retained past its freshness. Reported because a retained refusal describes
+        /// the past, not the account.
+        basis: ExhaustionBasis,
+    },
 }
 
 /// Counts requests against one target's daily allowance.
@@ -183,21 +393,94 @@ pub enum ReserveError {
 pub struct DailyRequestAllowance {
     /// The quota group the allowance belongs to — the provider-side project whose counter
     /// this is. Every client that bills to the same project shares one group, and so one
-    /// counter per model.
+    /// counter per model — or one counter for the whole group when the cap is stated at
+    /// account scope.
     group: String,
-    /// The target model whose allowance this is.
+    /// The target model whose allowance this is. At account scope this is the group
+    /// sentinel rather than a model, because one counter serves every model in the group.
     model: ModelId,
     /// Requests permitted per provider day.
     limit: u64,
     /// Where this allowance's counter lives.
     path: PathBuf,
+    /// Which midnight the counter turns over on.
+    boundary: DayBoundary,
+    /// How old a provider reading may be and still be acted on.
+    ///
+    /// Five minutes is a deliberate trade: shorter, and a provider that is briefly
+    /// unreachable leaves the lane admitting on local bookkeeping while the account is
+    /// actually empty; longer, and a recovered account stays refused after the provider
+    /// has restored it. Neither error is silent -- [`Self::provider_state_at`] exposes
+    /// which of the three states was in force -- so the trade is visible rather than
+    /// baked in.
+    provider_tolerance: Duration,
 }
 
 /// The persisted counter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Counter {
     day: u64,
     spent: u64,
+    /// The provider's last reported request count for this pool, if one was taken.
+    ///
+    /// Persisted beside the local count on purpose: the two answer different questions
+    /// and a restart must not forget what the provider said. It is stored in the same
+    /// file under the same lock, so a reading and the reservations made against it
+    /// cannot disagree about ordering.
+    provider: Option<ProviderReading>,
+    /// This deployment's own `spent` at the instant `provider` was recorded.
+    ///
+    /// A provider reading is a snapshot: `spent` minus this anchor is exactly the number
+    /// of requests made since it was taken, and those are requests the provider has not
+    /// yet counted. Subtracting them is what stops the deployment admitting
+    /// `remaining` fresh requests *on top of* the ones it has already sent since the
+    /// last collection -- an over-admission bounded only by the poll interval, which is
+    /// precisely the traffic pattern that empties an account.
+    provider_anchor: u64,
+    /// How long a confirmed exhaustion keeps refusing after its reading ages out.
+    ///
+    /// Kept beside the reading rather than derived from it so the retention outlives the
+    /// freshness window without the reading being treated as current. Its day is stored
+    /// with it: yesterday's retention says nothing about today.
+    retention: Option<Retention>,
+}
+
+/// A confirmed exhaustion, and the day it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Retention {
+    /// The provider day the exhaustion was observed in.
+    day: u64,
+    /// The instant after which the retention no longer refuses anything.
+    until: SystemTime,
+}
+
+/// The local spend at the moment an account read was started.
+///
+/// Taken before the network call and applied after it. A reading is a snapshot, so any
+/// request this deployment sends while the read is outstanding is absent from the
+/// provider's count; anchoring at the *pre-read* figure is what keeps those requests
+/// subtracted instead of forgiven. Anchoring at application time would hand back one
+/// request of headroom per in-flight send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservationTicket {
+    /// `(provider day, spend on that day)` when the read began.
+    watermark: Option<(u64, u64)>,
+}
+
+impl ObservationTicket {
+    /// A ticket for a reading taken without a pre-read watermark.
+    ///
+    /// Deliberately conservative: with no watermark the whole of the current day's spend
+    /// is treated as unsent by the provider, so the headroom is understated rather than
+    /// overstated. Used by callers that read the provider themselves and by tests.
+    pub fn unwatermarked() -> Self {
+        Self { watermark: None }
+    }
+
+    /// What the ticket captured, when it captured anything.
+    fn watermark(self) -> Option<(u64, u64)> {
+        self.watermark
+    }
 }
 
 impl DailyRequestAllowance {
@@ -209,6 +492,26 @@ impl DailyRequestAllowance {
             model,
             limit,
             path,
+            boundary: DayBoundary::Pacific,
+            provider_tolerance: DEFAULT_PROVIDER_TOLERANCE,
+        }
+    }
+
+    /// [`Self::new`] with an explicit day boundary.
+    pub fn new_on(
+        group: impl Into<String>,
+        model: ModelId,
+        limit: u64,
+        path: PathBuf,
+        boundary: DayBoundary,
+    ) -> Self {
+        Self {
+            group: group.into(),
+            model,
+            limit,
+            path,
+            boundary,
+            provider_tolerance: DEFAULT_PROVIDER_TOLERANCE,
         }
     }
 
@@ -227,9 +530,14 @@ impl DailyRequestAllowance {
         &self.group
     }
 
+    /// Which midnight this counter turns over on.
+    pub fn boundary(&self) -> DayBoundary {
+        self.boundary
+    }
+
     /// The provider-day number the counter currently belongs to.
     pub fn current_day(&self) -> u64 {
-        provider_day(SystemTime::now())
+        self.boundary.day(SystemTime::now())
     }
 
     /// Requests this counter still permits in the current provider day.
@@ -244,10 +552,79 @@ impl DailyRequestAllowance {
 
     /// [`Self::remaining`] against an explicit clock, for tests and replays.
     pub fn remaining_at(&self, now: SystemTime) -> u64 {
-        let day = provider_day(now);
+        let day = self.boundary.day(now);
         match self.read_under_lock() {
-            Ok(counter) => self.limit.saturating_sub(spent_on(counter, day)),
+            Ok(counter) => {
+                let local = self.limit.saturating_sub(spent_on(counter, day));
+                // The stricter of the two, never the looser. Callers of this method
+                // decide whether a leg is worth attempting, so answering with the local
+                // remainder while the provider reports fewer would advertise capacity
+                // that does not exist. A stale or absent reading contributes nothing.
+                match self.provider_headroom(&counter, day, now) {
+                    Some(headroom) => local.min(headroom),
+                    None => local,
+                }
+            }
             Err(_) => 0,
+        }
+    }
+
+    /// Whether this allowance's remainder is knowably zero for the current provider day.
+    ///
+    /// Three answers, because the two-answer form is the one that spends money. `Some(true)`
+    /// only when the evidence is current: this deployment's own counter is at its cap, or a
+    /// provider reading that is fresh right now reports no headroom. `Some(false)` when the
+    /// budget still has room. `None` when a counter exists but cannot be read, and also when
+    /// the only reason nothing may be sent is a *retained* exhaustion -- a past statement
+    /// still being honoured. A caller deciding whether to escalate on "this allowance is
+    /// spent" must treat `None` as unknown: an unreadable ledger is not an exhausted one, and
+    /// neither is a reading that has stopped being current, yet [`Self::remaining`] answers
+    /// `0` for both, which is right for admission and wrong for this claim.
+    ///
+    /// Reads without taking the lock and creates nothing: the counter is replaced atomically,
+    /// so a reader sees a whole file either way, and a judgement about what the deployment's
+    /// accounting says must not write to the directory it is judging.
+    pub fn spent_today(&self) -> Option<bool> {
+        self.spent_today_at(SystemTime::now())
+    }
+
+    /// [`Self::spent_today`] against an explicit clock, for tests and replays.
+    pub fn spent_today_at(&self, now: SystemTime) -> Option<bool> {
+        let day = self.boundary.day(now);
+        let counter = match fs::read(&self.path) {
+            Ok(bytes) => match parse_counter(&bytes) {
+                Ok(counter) => counter,
+                Err(_) => return None,
+            },
+            // No counter yet: the day's allowance is untouched, which is a fact about this
+            // deployment rather than an absence of evidence.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        let local = self.limit.saturating_sub(spent_on(counter, day));
+        // This deployment's own ledger is current, so reaching the cap is affirmative on its
+        // own -- whatever a provider reading, retained or not, says about the account.
+        if local == 0 {
+            return Some(true);
+        }
+        match self.provider_headroom(&counter, day, now) {
+            // Nothing left on the provider's side. Which reading produced that decides whether
+            // it may be quoted as `spent`.
+            Some(0) => match self.exhaustion_basis(&counter, day, now) {
+                // A reading that is current right now says the pool is empty: affirmative.
+                Some(ExhaustionBasis::Confirmed) => Some(true),
+                // Retained: `provider_headroom` answers 0 because a past statement is still
+                // being honoured past its freshness, so that a collector outage does not
+                // become a retry storm. That is the right answer to "may I send" and the
+                // wrong answer to "is the allowance spent": it describes the past, and
+                // answering `true` here is what lets a recovered account buy the local tier.
+                // Unknown, because neither neighbour is true -- it is not spent, and it is
+                // not shown to have room.
+                _ => None,
+            },
+            // Headroom, or no current reading at all: the local budget governs, and it has
+            // room left.
+            _ => Some(false),
         }
     }
 
@@ -262,26 +639,369 @@ impl DailyRequestAllowance {
 
     /// [`Self::try_reserve`] against an explicit clock, for tests and for replays.
     pub fn try_reserve_at(&self, now: SystemTime) -> Result<(), ReserveError> {
-        let day = provider_day(now);
+        let day = self.boundary.day(now);
         // The lock is held across the read, the decision and the write. Without it two
         // processes sharing a state directory would each read the same count, each decide
         // it may spend, and together exceed the budget by one request per race.
         let lock = self.lock()?;
         let counter = self.read()?;
+        // The provider's own statement comes first. When it says the pool is empty, a
+        // local counter that still has room is simply wrong about the account -- it
+        // counts this deployment's requests, not everyone's -- and admitting on it would
+        // spend requests that do not exist. Checked before the local budget so the
+        // refusal names the authority that decided.
+        if let Some(headroom) = self.provider_headroom(&counter, day, now)
+            && headroom == 0
+        {
+            let limit = counter.provider.map(|reading| reading.limit).unwrap_or(0);
+            drop(lock);
+            return Err(ReserveError::ProviderExhausted { limit });
+        }
         let spent = spent_on(counter, day);
         if spent >= self.limit {
             drop(lock);
             return Err(ReserveError::Exhausted);
         }
+        // A reservation is not an observation: the provider reading keeps whatever it said
+        // and its age keeps growing, so it expires on its own schedule instead of being
+        // refreshed by traffic that did not check it.
+        let provider = counter.provider.filter(|reading| {
+            // Drop a reading from a previous provider day: it describes a window
+            // that has ended and cannot constrain this one.
+            self.boundary.day(reading.observed_at) == day
+        });
+        // A reservation can be what empties the pool: the provider's figure was current
+        // when it said three remained, and this deployment has now sent all three. Arming
+        // the same bounded retention here is what stops the next request, once that reading
+        // ages out, from being admitted into a pool that is already empty. Without it the
+        // protection covers only a provider that volunteers the zero, and misses the very
+        // common case where the last unit is spent locally.
+        let mut retention = counter.retention.filter(|retention| retention.day == day);
+        if retention.is_none()
+            && let Some(reading) = provider
+            && reading.is_fresh_at(now, self.provider_tolerance)
+        {
+            let sent_since = if counter.day == day {
+                (spent + 1).saturating_sub(counter.provider_anchor)
+            } else {
+                0
+            };
+            if reading.remaining.saturating_sub(sent_since) == 0 {
+                retention =
+                    Some(self.retention_for(&reading)).filter(|retention| retention.until > now);
+            }
+        }
         let next = Counter {
             day,
             spent: spent + 1,
+            provider,
+            provider_anchor: counter.provider_anchor,
+            retention,
         };
         // Persist before sending. A counter that disagrees with the provider is the
         // failure this exists to prevent, so a failed write must also undo the spend.
         self.persist(next)?;
         drop(lock);
         Ok(())
+    }
+
+    /// Requests spent on the current provider day, as this counter records them.
+    ///
+    /// This is the local figure only: it says what this deployment sent, not what the
+    /// account has spent. Reported for diagnostics beside the provider's own figure.
+    pub fn spent_at(&self, now: SystemTime) -> u64 {
+        self.read_under_lock()
+            .map(|counter| spent_on(counter, self.boundary.day(now)))
+            .unwrap_or(0)
+    }
+
+    /// Takes the watermark for an account read that is about to start.
+    ///
+    /// The lock is held for the read and released before returning, so no network call
+    /// ever happens under it. What the ticket carries is the position of the counter at
+    /// this instant; applying the reading against it is what keeps requests made while the
+    /// read is outstanding subtracted from the provider's figure.
+    pub fn begin_observation(&self) -> Result<ObservationTicket, ReserveError> {
+        self.begin_observation_at(SystemTime::now())
+    }
+
+    /// [`Self::begin_observation`] against an explicit clock, for tests and replays.
+    pub fn begin_observation_at(&self, now: SystemTime) -> Result<ObservationTicket, ReserveError> {
+        let counter = self.read_under_lock()?;
+        let day = self.boundary.day(now);
+        Ok(ObservationTicket {
+            watermark: Some((day, spent_on(counter, day))),
+        })
+    }
+
+    /// How old a provider reading may be and still be acted on.
+    pub fn provider_tolerance(&self) -> Duration {
+        self.provider_tolerance
+    }
+
+    /// The counter file this allowance governs.
+    ///
+    /// Two reconcilers that resolve to the same path are the same budget, however many
+    /// credential labels name them. A reading is applied to that budget once, not once per
+    /// label: applying it twice would report a duplicate write as a refusal and, worse,
+    /// invites the belief that the labels hold separate budgets when they do not.
+    pub fn counter_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Sets the tolerance for provider readings, for tests and for a deployment whose
+    /// collector runs on a known cadence.
+    pub fn with_provider_tolerance(mut self, tolerance: Duration) -> Self {
+        self.provider_tolerance = tolerance;
+        self
+    }
+
+    /// Records what the provider reported about this pool.
+    ///
+    /// This is the only way provider truth reaches admission, and it is deliberately a
+    /// separate call from both [`Self::try_reserve`] and selection: the collector that
+    /// reads the provider runs on its own schedule, and writing through this method keeps
+    /// the reading durable and ordered with the reservations made against it. A reading
+    /// for a pool this allowance does not govern is refused rather than stored, because
+    /// accepting it would let one pool's exhaustion refuse another's traffic.
+    pub fn reconcile(&self, reading: ProviderReading) -> Result<(), ReserveError> {
+        self.reconcile_at(
+            reading,
+            ObservationTicket::unwatermarked(),
+            reading.observed_at,
+        )
+    }
+
+    /// [`Self::reconcile`] with the watermark taken before the read, and an explicit clock.
+    ///
+    /// A reading is applied only when it can be ordered against what the counter already
+    /// holds. Four shapes are refused, each for a different reason:
+    ///
+    /// * Stamped in the future — it cannot have been observed.
+    /// * Belonging to a provider day that has ended — applying it would move the counter
+    ///   back a day and discard the spend made since the boundary.
+    /// * Not newer than the reading already held for this day — an older figure restores
+    ///   headroom that has already been spent, and a duplicate would move the anchor.
+    /// * The counter itself already ahead of `now` — the clock moved backwards and nothing
+    ///   here can tell which spend is real.
+    ///
+    /// The anchor comes from `ticket`, not from the counter at application time, so a
+    /// request sent while the read was outstanding is still subtracted from the provider's
+    /// figure instead of being forgiven.
+    pub fn reconcile_at(
+        &self,
+        reading: ProviderReading,
+        ticket: ObservationTicket,
+        now: SystemTime,
+    ) -> Result<(), ReserveError> {
+        let lock = self.lock()?;
+        let counter = self.read()?;
+        let now_day = self.boundary.day(now);
+        let reading_day = self.boundary.day(reading.observed_at);
+
+        let reject = if reading.observed_at > now + OBSERVATION_SKEW {
+            Some("the reading is stamped in the future")
+        } else if reading_day != now_day {
+            Some("the reading belongs to a provider day that has ended")
+        } else if counter.day > now_day {
+            Some("the counter has advanced past the reading's day")
+        } else if counter.provider.is_some_and(|existing| {
+            self.boundary.day(existing.observed_at) == reading_day
+                && existing.observed_at >= reading.observed_at
+        }) {
+            Some("the counter already holds a later reading for this provider day")
+        } else {
+            None
+        };
+        if let Some(reason) = reject {
+            drop(lock);
+            return Err(ReserveError::ObservationRejected { reason });
+        }
+
+        // Spend on the day the reading describes. A counter still holding an earlier day
+        // has none for this one, so the figure is zero rather than yesterday's.
+        let spent = spent_on(counter, reading_day);
+        // The anchor is the pre-read watermark when the read began on the same day the
+        // counter is on. Anything else — a read that straddled the boundary, or a caller
+        // with no watermark — anchors at zero, which subtracts the whole day's spend and
+        // therefore understates headroom instead of overstating it.
+        let anchor = match ticket.watermark() {
+            Some((ticket_day, spent_then))
+                if ticket_day == reading_day && counter.day == reading_day =>
+            {
+                spent_then.min(spent)
+            }
+            _ => 0,
+        };
+        let retention = (reading
+            .remaining
+            .saturating_sub(spent.saturating_sub(anchor))
+            == 0)
+            .then(|| self.retention_for(&reading))
+            .filter(|retention| retention.until > now);
+        let next = Counter {
+            day: reading_day,
+            spent,
+            provider: Some(reading),
+            provider_anchor: anchor,
+            retention,
+        };
+        self.persist(next)?;
+        drop(lock);
+        Ok(())
+    }
+
+    /// Requests the provider's reading still permits, after subtracting local traffic
+    /// sent since that reading was taken.
+    ///
+    /// `None` when nothing current is known, which is not zero: a caller must not treat
+    /// an absent reading as an empty account.
+    fn provider_headroom(&self, counter: &Counter, day: u64, now: SystemTime) -> Option<u64> {
+        // A confirmed exhaustion keeps refusing after its reading ages out. Without this a
+        // collector that stops answering turns a known-empty account into a retry storm:
+        // the reading becomes Unknown, the local budget looks unspent, and every retry
+        // earns another provider 429.
+        if let Some(retention) = counter.retention
+            && retention.day == day
+            && now < retention.until
+        {
+            return Some(0);
+        }
+        let reading = counter.provider?;
+        if !reading.is_fresh_at(now, self.provider_tolerance) {
+            return None;
+        }
+        self.effective_headroom(counter, &reading, day)
+    }
+
+    /// The headroom one reading still permits, after subtracting local traffic.
+    ///
+    /// `None` when the reading describes another provider day, where the anchor means
+    /// nothing.
+    fn effective_headroom(
+        &self,
+        counter: &Counter,
+        reading: &ProviderReading,
+        day: u64,
+    ) -> Option<u64> {
+        if self.boundary.day(reading.observed_at) != day {
+            return None;
+        }
+        // `spent` on a different day belongs to a window that has ended; the anchor is
+        // only meaningful beside the same day's spend.
+        let sent_since = if counter.day == day {
+            counter.spent.saturating_sub(counter.provider_anchor)
+        } else {
+            0
+        };
+        Some(reading.remaining.saturating_sub(sent_since))
+    }
+
+    /// Which of the two reasons is producing an exhaustion.
+    ///
+    /// [`ExhaustionBasis::Confirmed`] requires a reading that is current *and* whose
+    /// adjusted headroom is zero. Anything else that still refuses is a retention, which
+    /// describes a past observation rather than the account.
+    fn exhaustion_basis(
+        &self,
+        counter: &Counter,
+        day: u64,
+        now: SystemTime,
+    ) -> Option<ExhaustionBasis> {
+        if let Some(reading) = counter.provider
+            && reading.is_fresh_at(now, self.provider_tolerance)
+            && self.effective_headroom(counter, &reading, day) == Some(0)
+        {
+            return Some(ExhaustionBasis::Confirmed);
+        }
+        counter
+            .retention
+            .filter(|retention| retention.day == day && now < retention.until)
+            .map(|_| ExhaustionBasis::Retained)
+    }
+
+    /// The bounded retention for a pool confirmed to have no headroom.
+    ///
+    /// Measured from the END OF THE READING'S FRESHNESS, not from `now`. A retention counted
+    /// from `now` expires at the same instant the reading does whenever the reading is
+    /// applied promptly -- which is the normal case -- so it would protect nothing against
+    /// exactly the failure it exists for: one collection round that never arrives. Counting
+    /// from the end of freshness gives a full retention window of protection *after* the
+    /// reading stops being current.
+    ///
+    /// Capped by the provider's own stated reset, because a window that has ended cannot
+    /// refuse the next one. The provider day is the second cap, and it is enforced where the
+    /// retention is read: a retention belongs to the day it was recorded in.
+    fn retention_for(&self, reading: &ProviderReading) -> Retention {
+        let day = self.boundary.day(reading.observed_at);
+        let until = reading.observed_at + self.provider_tolerance + EXHAUSTION_RETENTION;
+        let until = match reading.reset_at {
+            Some(reset) => reset.min(until),
+            None => until,
+        };
+        Retention { day, until }
+    }
+
+    /// What the provider last reported, adjusted for traffic sent since.
+    ///
+    /// Three states, never two. [`ProviderState::Unknown`] covers both "no reading" and
+    /// "a reading that is too old", and neither may be used to refuse traffic: a daemon
+    /// that never asked the provider is not evidence that the account is empty.
+    ///
+    /// The remainder reported is the *effective* headroom -- the provider's figure less
+    /// the requests this counter has sent since that figure was taken. Preselection reads
+    /// this, so answering with the raw figure would advertise requests that have already
+    /// gone out. [`Self::provider_reading_at`] exposes the unadjusted observation for
+    /// telemetry.
+    pub fn provider_state_at(&self, now: SystemTime) -> ProviderState {
+        let counter = match self.read_under_lock() {
+            Ok(counter) => counter,
+            // An unreadable counter is reported by the reservation path as Unusable.
+            // Here it is simply nothing known about the provider, so admission does not
+            // claim an exhaustion it cannot substantiate.
+            Err(_) => return ProviderState::Unknown,
+        };
+        let day = self.boundary.day(now);
+        match self.provider_headroom(&counter, day, now) {
+            None => ProviderState::Unknown,
+            Some(0) => ProviderState::Exhausted {
+                limit: counter
+                    .provider
+                    .map(|reading| reading.limit)
+                    .unwrap_or(self.limit),
+                // A refusal answers the same question either way, but a caller reading the
+                // state is told which: a current reading, or a statement retained past its
+                // freshness. Defaulting to `Retained` is the conservative answer for a state
+                // this function cannot attribute.
+                basis: self
+                    .exhaustion_basis(&counter, day, now)
+                    .unwrap_or(ExhaustionBasis::Retained),
+            },
+            Some(remaining) => ProviderState::Available { remaining },
+        }
+    }
+
+    /// The provider's own figure, exactly as it was reported, while it is fresh.
+    ///
+    /// Not adjusted for local traffic and not the admission answer: this is the observation
+    /// a dashboard shows and a reconciliation is written from, kept separate so the raw
+    /// number and the headroom it produces can be compared.
+    pub fn provider_reading_at(&self, now: SystemTime) -> Option<ProviderReading> {
+        let counter = self.read_under_lock().ok()?;
+        let reading = counter.provider?;
+        reading
+            .is_fresh_at(now, self.provider_tolerance)
+            .then_some(reading)
+    }
+
+    /// [`Self::provider_reading_at`] against the current clock.
+    pub fn provider_reading(&self) -> Option<ProviderReading> {
+        self.provider_reading_at(SystemTime::now())
+    }
+
+    /// [`Self::provider_state_at`] against the current clock.
+    pub fn provider_state(&self) -> ProviderState {
+        self.provider_state_at(SystemTime::now())
     }
 
     /// Whether both of this allowance's files can be used *by this process*, without
@@ -388,9 +1108,13 @@ impl DailyRequestAllowance {
             }),
             // A missing file is a fresh allowance, not a fault: the first reservation of a
             // deployment's life creates it.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Counter { day: 0, spent: 0 })
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Counter {
+                day: 0,
+                spent: 0,
+                provider: None,
+                provider_anchor: 0,
+                retention: None,
+            }),
             Err(error) => Err(ReserveError::Unusable(format!(
                 "{} cannot be read: {error}",
                 self.path.display()
@@ -410,13 +1134,46 @@ impl DailyRequestAllowance {
     fn persist(&self, counter: Counter) -> Result<(), ReserveError> {
         self.create_parent()?;
         // A body the operator can read without this code: the numbers are the record.
+        // `basis` states which authority the admission decision rests on, so a reader
+        // can tell a locally-budgeted counter from one reconciled with the provider.
+        let basis = if counter.provider.is_some() {
+            "local_budget+provider_reconciled"
+        } else {
+            "local_budget"
+        };
+        let provider = match counter.provider {
+            None => "null".to_string(),
+            Some(reading) => format!(
+                "{{\"used\":{},\"limit\":{},\"remaining\":{},\"observed_at_secs\":{},\"reset_at_secs\":{},\"spent_at_observation\":{}}}",
+                reading.used,
+                reading.limit,
+                reading.remaining,
+                unix_secs(reading.observed_at),
+                reading
+                    .reset_at
+                    .map(|at| unix_secs(at).to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                counter.provider_anchor,
+            ),
+        };
+        let retention = match counter.retention {
+            None => "null".to_string(),
+            Some(retention) => format!(
+                "{{\"day\":{},\"until_secs\":{}}}",
+                retention.day,
+                unix_secs(retention.until)
+            ),
+        };
         let body = format!(
-            "{{\"day\":{},\"spent\":{},\"limit\":{},\"group\":{},\"model\":{},\"basis\":\"local_budget\",\"provider_remaining\":null}}\n",
+            "{{\"day\":{},\"spent\":{},\"limit\":{},\"group\":{},\"model\":{},\"basis\":{},\"provider\":{},\"retention\":{}}}\n",
             counter.day,
             counter.spent,
             self.limit,
             serde_json::Value::String(self.group.clone()),
             serde_json::Value::String(self.model.to_string()),
+            serde_json::Value::String(basis.to_string()),
+            provider,
+            retention,
         );
         // Same-directory temporary name so the rename is a replace, never a cross-device
         // copy that could leave a truncated counter behind.
@@ -487,7 +1244,92 @@ fn parse_counter(bytes: &[u8]) -> Result<Counter, String> {
         .get("spent")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "missing or non-numeric \"spent\"".to_string())?;
-    Ok(Counter { day, spent })
+    // A counter written before provider reconciliation existed has no `provider` key,
+    // which is an absence of information rather than a fault. A key that IS present but
+    // unreadable is a fault: it means the account's authority figure was written by
+    // something that disagrees with this reader, and admitting on a half-read counter
+    // would silently ignore an exhaustion it may be carrying.
+    let (provider, provider_anchor) = match value.get("provider") {
+        None | Some(serde_json::Value::Null) => (None, 0),
+        Some(block) => {
+            let reading = parse_provider(block)?;
+            let anchor = block
+                .get("spent_at_observation")
+                .and_then(serde_json::Value::as_u64)
+                // A block written without the anchor cannot be reconciled against local
+                // traffic. Treat the anchor as the current spend, which makes the reading
+                // conservative: it claims no extra headroom rather than over-admitting.
+                .unwrap_or(spent);
+            (Some(reading), anchor)
+        }
+    };
+    // A counter written before the retention existed has no `retention` key, which is an
+    // absence of a hold rather than a fault: nothing was known to be exhausted.
+    let retention = match value.get("retention") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(block) => Some(parse_retention(block)?),
+    };
+    Ok(Counter {
+        day,
+        spent,
+        provider,
+        provider_anchor,
+        retention,
+    })
+}
+
+/// Reads the retention block of a counter file.
+///
+/// A malformed block is a fault rather than a missing hold: a counter that says it was
+/// holding an exhaustion but cannot say when the hold ends must not be trusted to admit.
+fn parse_retention(block: &serde_json::Value) -> Result<Retention, String> {
+    let day = block
+        .get("day")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "retention.\"day\" is missing or not a whole number".to_string())?;
+    let until = block
+        .get("until_secs")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "retention.\"until_secs\" is missing or not a whole number".to_string())?;
+    Ok(Retention {
+        day,
+        until: UNIX_EPOCH + Duration::from_secs(until),
+    })
+}
+
+/// Reads the provider block of a counter file.
+fn parse_provider(block: &serde_json::Value) -> Result<ProviderReading, String> {
+    let number = |key: &str| -> Result<u64, String> {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("provider.\"{key}\" is missing or not a whole number"))
+    };
+    let seconds = |key: &str| -> Result<u64, String> {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("provider.\"{key}\" is missing or not a whole number"))
+    };
+    let observed = seconds("observed_at_secs")?;
+    let reset_at = match block.get("reset_at_secs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(_) => Some(UNIX_EPOCH + Duration::from_secs(seconds("reset_at_secs")?)),
+    };
+    Ok(ProviderReading {
+        used: number("used")?,
+        limit: number("limit")?,
+        remaining: number("remaining")?,
+        observed_at: UNIX_EPOCH + Duration::from_secs(observed),
+        reset_at,
+    })
+}
+
+/// Seconds since the epoch for a clock reading, saturating rather than panicking.
+fn unix_secs(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 /// The counter file for one (quota group, model) pair under `directory`.
@@ -507,6 +1349,19 @@ pub fn allowance_path(directory: &Path, group: &str, model: &str) -> PathBuf {
         legible(model),
         fnv1a(&key)
     ))
+}
+
+/// The model component an account-scoped counter uses.
+///
+/// A provider that caps free requests per *account* shares one budget across every model,
+/// so that counter must not be keyed by model. The sentinel is spelled so it cannot
+/// collide with a real model id: provider model ids use `[a-z0-9./:_-]` and never begin
+/// with `*`.
+pub const ACCOUNT_SCOPE_MODEL: &str = "*account*";
+
+/// The counter file for an account-scoped allowance: one per quota group, not per model.
+pub fn account_allowance_path(directory: &Path, group: &str) -> PathBuf {
+    allowance_path(directory, group, ACCOUNT_SCOPE_MODEL)
 }
 
 /// `value` reduced to characters that are safe in a path component.
@@ -1220,6 +2075,57 @@ mod tests {
         allowance(&directory, 5).try_reserve().expect("first");
         let restarted = allowance(&directory, 5);
         assert_eq!(restarted.remaining(), 4);
+    }
+
+    /// The three-state reading: absent is untouched, spent is spent, and a counter that cannot
+    /// be parsed is neither. The last case is why the two-state form is unusable as evidence —
+    /// `remaining` answers `0` for it, which a caller would read as exhaustion.
+    #[test]
+    fn spent_today_separates_unknown_from_spent() {
+        let directory = scratch("spent-today");
+        let counted = allowance(&directory, 1);
+        assert_eq!(
+            counted.spent_today(),
+            Some(false),
+            "no counter yet is an untouched day, not an absent answer"
+        );
+        assert_eq!(
+            counted.remaining(),
+            1,
+            "and the same day is visible to admission"
+        );
+
+        counted.try_reserve().expect("the day's only request");
+        assert_eq!(counted.spent_today(), Some(true));
+        assert_eq!(counted.remaining(), 0);
+
+        let corrupt = scratch("spent-today-corrupt");
+        let unreadable = allowance(&corrupt, 1);
+        fs::create_dir_all(unreadable.path().parent().expect("a parent")).expect("directory");
+        fs::write(unreadable.path(), b"{not json").expect("a broken counter");
+        assert_eq!(
+            unreadable.spent_today(),
+            None,
+            "a counter that cannot be read is unknown, never spent"
+        );
+        assert_eq!(
+            unreadable.remaining(),
+            0,
+            "the two-state reading collapses unknown into spent, which is the defect"
+        );
+    }
+
+    /// Judging the evidence must not change what it judges: no counter, no lock file.
+    #[test]
+    fn spent_today_creates_nothing() {
+        let directory = scratch("spent-today-inert");
+        let judged = allowance(&directory, 1);
+        let lock = judged.lock_path();
+        assert_eq!(judged.spent_today(), Some(false));
+        assert!(
+            !judged.path().exists() && !lock.exists(),
+            "a decision about the accounting must not write the accounting"
+        );
     }
 
     /// Two instances over one file cannot both spend the last request, however they race.

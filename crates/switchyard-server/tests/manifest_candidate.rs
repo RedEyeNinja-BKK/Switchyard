@@ -91,7 +91,18 @@ fn the_smart_decision_composition_gains_the_gemini_leaf() {
     );
     assert!(names.contains(&"smartlocal-decision"), "local retained");
     assert!(names.contains(&"smartfree-decision"), "free retained");
-    assert!(names.contains(&"google-decision"), "google retained");
+    // google-decision stays a standalone compatibility alias; it is NOT composed into
+    // smart-decision, because it shares the same physical Google target as the Gemini leaf and
+    // would double the selection weight / attempt the same canonical target twice.
+    assert!(
+        !names.contains(&"google-decision"),
+        "google-decision must not be composed: {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        3,
+        "exactly the three intended families: {names:?}"
+    );
 }
 
 #[test]

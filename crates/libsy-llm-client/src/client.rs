@@ -6607,18 +6607,25 @@ mod tests {
             &registry,
         );
         let admission = policy.reasoning_admission.expect("provenance-bound sets one");
+        // The recorded lineage is untrusted (no verified caller boundary), and the assistant
+        // message is the active continuation edge, so admission fails closed: unproven active
+        // state is refused rather than replayed.
         assert!(
-            admission.admits(&reasoning_digest()),
-            "state this target issued is replayable to the same issuer"
+            !admission.admits(&reasoning_digest()),
+            "untrusted active state must not be replayable"
         );
-        assert!(admission.active_unproven.is_empty());
+        assert!(
+            admission.active_unproven.contains(&reasoning_digest()),
+            "the active digest is recorded as unproven"
+        );
     }
 
     // Ingress-to-egress trust boundary. Switchyard has no inbound authentication, so `agent_id`
-    // and `session_id` are advisory headers a caller can forge. A consumer or conversation that
-    // differs only in those headers must NOT change the admission decision: the state is still
-    // admitted to the same issuer, because the issuer check is the only trustworthy fact. This is
-    // the regression that fails if header matching is (re)introduced as if it were auth.
+    // and `session_id` are advisory headers a caller can forge. Without a verified caller
+    // boundary the recorded lineage is untrusted, and untrusted active state fails closed: a
+    // spoofed, absent, or mismatched caller identity must NOT authorise replay of the active
+    // continuation edge. This is the regression that fails if header matching is (re)introduced
+    // as if it were auth, or if the untrusted path is made permissive again.
     #[test]
     fn advisory_headers_do_not_change_admission() {
         let backend = openrouter_backend();
@@ -6665,8 +6672,12 @@ mod tests {
             );
             let admission = policy.reasoning_admission.expect("admission");
             assert!(
-                admission.admits(&reasoning_digest()),
-                "{label} must not change the decision: the issuer is the only trusted fact"
+                !admission.admits(&reasoning_digest()),
+                "{label} must not authorise replay: untrusted active state fails closed"
+            );
+            assert!(
+                admission.active_unproven.contains(&reasoning_digest()),
+                "{label}: the active digest is unproven"
             );
         }
     }

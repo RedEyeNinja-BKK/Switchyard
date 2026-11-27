@@ -138,17 +138,19 @@ impl ReasoningLineage {
     /// Whether state issued under `self` may be used in a request with `request` lineage.
     ///
     /// The consumer fact is honoured only when BOTH the recorded fact and the request fact were
-    /// established by a verified boundary. An advisory (header-derived) consumer on either side
-    /// is ignored rather than matched, because a forged header can copy any string. The
-    /// conversation fact is advisory for the same reason and is never compared. What remains is
-    /// the issuer check in [`ReasoningIssuer::permits_replay_to`], which depends on no
-    /// caller-supplied value.
+    /// established by a verified boundary. Switchyard has no inbound authentication, so
+    /// production always builds an [`ReasoningLineage::untrusted`] lineage; without a verified
+    /// consumer on both sides this fails closed, because an advisory (header-derived) consumer
+    /// can be forged and proves nothing. The conversation fact is advisory for the same reason
+    /// and is never compared. The issuer check in [`ReasoningIssuer::permits_replay_to`] is a
+    /// separate, necessary condition; it cannot substitute for a verified consumer here.
     pub fn permits_replay_in(&self, request: &Self) -> bool {
         match (&self.verified_consumer, &request.verified_consumer) {
             (Some(recorded), Some(requested)) => recorded == requested,
-            // No verified consumer on either side: nothing caller-derived is compared. The
-            // issuer (credential domain, model, wire) is the whole of what is provable here.
-            _ => true,
+            // No verified consumer on either side: fail closed. An untrusted lineage cannot
+            // authorise active continuation, so a matching issuer+digest from another
+            // unverified conversation must not pass.
+            _ => false,
         }
     }
 }
@@ -561,16 +563,16 @@ mod tests {
 
     #[test]
     fn advisory_lineage_never_authorises_and_verified_consumer_must_match() {
-        // Untrusted (header-derived) lineages compare nothing caller-supplied: a forged header
-        // can copy any string, so only the issuer check governs. Two untrusted lineages are
-        // therefore consistent, and a spoofed id changes nothing.
+        // Untrusted (header-derived) lineages fail closed: a forged header can copy any string,
+        // so an untrusted lineage authorises nothing. A spoofed id changes nothing because it is
+        // never honoured.
         let recorded = ReasoningLineage::untrusted(Some("agent-7".into()), Some("conv-1".into()));
-        assert!(recorded.permits_replay_in(&ReasoningLineage::untrusted(
+        assert!(!recorded.permits_replay_in(&ReasoningLineage::untrusted(
             Some("attacker-controlled".into()),
             Some("conv-2".into()),
         )));
-        assert!(recorded.permits_replay_in(&ReasoningLineage::untrusted(None, None)));
-        assert!(ReasoningLineage::untrusted(None, None).permits_replay_in(&recorded));
+        assert!(!recorded.permits_replay_in(&ReasoningLineage::untrusted(None, None)));
+        assert!(!ReasoningLineage::untrusted(None, None).permits_replay_in(&recorded));
 
         // A verified boundary on both sides does compare the consumer, and a mismatch is
         // refused. This is the only shape that carries consumer authority.
@@ -583,28 +585,27 @@ mod tests {
             !verified.permits_replay_in(&ReasoningLineage::trusted("gateway-user-99".into(), None)),
             "a different verified consumer is refused"
         );
-        // A verified record and an untrusted request: the caller cannot prove identity, but the
-        // issuer is the only fact that ever governed admission, so the untrusted side neither
-        // gains nor loses anything. The decision is the issuer's, unchanged.
-        assert!(verified.permits_replay_in(&ReasoningLineage::untrusted(
+        // A verified record and an untrusted request: the caller cannot prove identity, so it
+        // fails closed. The untrusted side never gains authority.
+        assert!(!verified.permits_replay_in(&ReasoningLineage::untrusted(
             Some("gateway-user-42".into()),
             None,
         )));
-        assert!(recorded.permits_replay_in(&verified));
+        assert!(!recorded.permits_replay_in(&verified));
     }
 
-    /// B3/B4: an advisory (forged) consumer must never be compared, so it can neither
-    /// grant nor deny replay; only a VERIFIED consumer on both sides is honoured.
+    /// B3/B4: without a verified consumer on BOTH sides, replay fails closed. An advisory
+    /// (header-derived) consumer can be forged, so an untrusted lineage authorises nothing;
+    /// only a VERIFIED consumer on both sides is honoured, and a mismatch is refused.
     #[test]
-    fn advisory_consumer_is_ignored_and_verified_consumer_is_honoured() {
+    fn unverified_lineage_fails_closed_and_verified_consumer_is_honoured() {
         // Recorded state carries only an advisory (header-derived) consumer.
         let recorded = ReasoningLineage::untrusted(Some("victim".into()), Some("s".into()));
-        // A request forged to claim ANY consumer is admitted on the consumer axis, because
-        // advisory facts are ignored - the issuer check (tested elsewhere) is the boundary.
+        // A request forged to claim ANY consumer is REFUSED: advisory facts prove nothing.
         let forged = ReasoningLineage::untrusted(Some("attacker".into()), Some("s".into()));
-        assert!(recorded.permits_replay_in(&forged));
-        // Even a request with NO consumer is admitted on this axis.
-        assert!(recorded.permits_replay_in(&ReasoningLineage::untrusted(None, None)));
+        assert!(!recorded.permits_replay_in(&forged));
+        // Even a request with NO consumer is refused on this axis.
+        assert!(!recorded.permits_replay_in(&ReasoningLineage::untrusted(None, None)));
 
         // B4 positive control: when BOTH sides are verified, the consumer IS compared, and a
         // mismatch is refused (not vacuously admitted).
@@ -613,8 +614,7 @@ mod tests {
         let v2 = ReasoningLineage::trusted("consumer-b".into(), None);
         assert!(v1.permits_replay_in(&v1_same));
         assert!(!v1.permits_replay_in(&v2));
-        // A verified record does NOT match an advisory request (one side unverified -> ignored
-        // axis would admit, but a verified-vs-advisory pair must not grant authority).
-        assert!(v1.permits_replay_in(&ReasoningLineage::untrusted(Some("consumer-a".into()), None)));
+        // A verified record does NOT match an advisory request: one side unverified fails closed.
+        assert!(!v1.permits_replay_in(&ReasoningLineage::untrusted(Some("consumer-a".into()), None)));
     }
 }

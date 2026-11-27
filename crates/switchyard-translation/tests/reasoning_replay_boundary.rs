@@ -240,13 +240,15 @@ fn provenance_bound_does_not_admit_state_whose_bytes_differ() -> TestResult {
     let request = decode_request(&engine, &body_with_signed_reasoning(), &source)?;
 
     let mut bound = policy(ReasoningDetailsReplay::ProvenanceBound);
-    // Admit a digest that belongs to some other signature entirely.
-    let elsewhere = opaque_digest(
-        body_with_signed_reasoning()["messages"][1]["reasoning_details"]
-            .as_array()
-            .unwrap(),
-        Some("a-different-signature"),
-    );
+    // Admit the digest of genuinely different state: the same shape with a different blob.
+    // (Passing a contradictory signature argument is not different state -- the inline
+    // signature is part of the bytes, so it cannot redefine them.)
+    let mut foreign_details = body_with_signed_reasoning()["messages"][1]["reasoning_details"]
+        .as_array()
+        .unwrap()
+        .clone();
+    foreign_details[1]["data"] = json!("opaque-blob-somewhere-else");
+    let elsewhere = opaque_digest(&foreign_details, Some("sig-issuer-only"));
     bound.reasoning_admission = Some(admission(vec![elsewhere], Vec::new()));
 
     let output = engine
@@ -328,6 +330,132 @@ fn the_preserved_body_path_obeys_provenance() -> TestResult {
     assert_eq!(
         reencoded["messages"][1]["reasoning"], "consider wavelengths",
         "the portable prose survives the normalised path"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Native (`PlaintextOnly`) path: the active continuation edge is pinned or refused, never
+// silently stripped.
+//
+// A target with no structured reasoning wire cannot carry opaque state, so completed history is
+// stripped (the prose survives, and the drop is reported as lossy). The active continuation is
+// different: the state is what the provider is being asked to continue, so removing it sends a
+// request that quietly says less than the caller meant. The runner marks that edge, and the
+// encoder refuses instead of narrowing.
+// ---------------------------------------------------------------------------------------------
+
+/// A continuation still in flight: the last assistant turn carries a tool call and the only
+/// thing after it is the tool result, which is exactly the active continuation edge.
+fn active_body_with_signed_reasoning() -> Value {
+    json!({
+        "model": "route",
+        "messages": [
+            {"role": "user", "content": "read the config"},
+            {
+                "role": "assistant",
+                "content": null,
+                "reasoning_details": [
+                    {"type": "reasoning.text", "text": "consider wavelengths", "index": 0},
+                    {"type": "reasoning.encrypted", "data": "opaque-blob-7f3a", "index": 0,
+                     "signature": "sig-issuer-only"}
+                ],
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"config.toml\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "port = 8080"}
+        ]
+    })
+}
+
+/// The digest of the opaque state carried by [`active_body_with_signed_reasoning`].
+fn active_issued_digest() -> String {
+    let details = active_body_with_signed_reasoning()["messages"][1]["reasoning_details"]
+        .as_array()
+        .expect("fixture carries details")
+        .clone();
+    opaque_digest(&details, Some("sig-issuer-only"))
+}
+
+// The runner marked this state as required by the continuation and unproven, so a native target
+// refuses with a typed error rather than sending a stripped continuation.
+#[test]
+fn plaintext_only_refuses_active_state_the_continuation_requires() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = active_body_with_signed_reasoning();
+    let source = policy(ReasoningDetailsReplay::Verbatim);
+    let request = decode_request(&engine, &body, &source)?;
+
+    let mut plain = policy(ReasoningDetailsReplay::PlaintextOnly);
+    plain.reasoning_admission = Some(admission(Vec::new(), vec![active_issued_digest()]));
+
+    let error = engine
+        .encode_request(WireFormat::OpenAiChat, &request, &plain)
+        .expect_err("required active state must not be silently stripped on a native path");
+    assert_eq!(
+        error.kind(),
+        "LossyConversion",
+        "the refusal is typed, not a generic failure"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("refusing rather than replaying unproven"),
+        "the refusal names what it refused to do: {error}"
+    );
+    Ok(())
+}
+
+// The same native target, same body: when the state is not on the active edge it is still
+// withheld — and withheld quietly, because completed history legitimately loses its blob.
+#[test]
+fn plaintext_only_still_withholds_completed_history_state() -> TestResult {
+    let engine = TranslationEngine::default();
+    let source = policy(ReasoningDetailsReplay::Verbatim);
+    // This fixture's assistant turn is followed by a user turn, so it is history.
+    let request = decode_request(&engine, &body_with_signed_reasoning(), &source)?;
+
+    let mut plain = policy(ReasoningDetailsReplay::PlaintextOnly);
+    plain.reasoning_admission = Some(admission(Vec::new(), Vec::new()));
+
+    let output = engine
+        .encode_request(WireFormat::OpenAiChat, &request, &plain)?
+        .body;
+    let encoded = serde_json::to_string(&output)?;
+    assert!(
+        !encoded.contains("opaque-blob-7f3a") && !encoded.contains("sig-issuer-only"),
+        "history must not carry another provider's opaque state: {encoded}"
+    );
+    assert_eq!(
+        output["messages"][1]["reasoning"], "consider wavelengths",
+        "the portable prose survives"
+    );
+    Ok(())
+}
+
+// Admission cannot make a native target replay: the wire has no field for the state, so treating
+// "proven" as "sendable" would be a false attestation. `PlaintextOnly` never replays.
+#[test]
+fn plaintext_only_never_replays_even_admitted_state() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = active_body_with_signed_reasoning();
+    let source = policy(ReasoningDetailsReplay::Verbatim);
+    let request = decode_request(&engine, &body, &source)?;
+
+    let mut plain = policy(ReasoningDetailsReplay::PlaintextOnly);
+    plain.reasoning_admission = Some(admission(vec![active_issued_digest()], Vec::new()));
+
+    // Admitted state on the active edge is not a refusal, but it is still not replayed.
+    let output = engine
+        .encode_request(WireFormat::OpenAiChat, &request, &plain)?
+        .body;
+    let encoded = serde_json::to_string(&output)?;
+    assert!(
+        !encoded.contains("opaque-blob-7f3a") && !encoded.contains("sig-issuer-only"),
+        "a native wire cannot carry opaque state even when its provenance is proven: {encoded}"
     );
     Ok(())
 }

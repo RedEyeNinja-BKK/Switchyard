@@ -1035,8 +1035,9 @@ fn withholds_replayed_details(body: &Value, policy: &TranslationPolicy) -> bool 
                     // Only the state this request cannot prove is withheld; admitted state may
                     // keep the caller's exact body, which is the whole point of this path.
                     ReasoningDetailsReplay::ProvenanceBound => {
-                        let signature = standalone_signature(details);
-                        let digest = opaque_digest(details, signature.as_deref());
+                        // `opaque_digest` already resolves the inline signature, so the body
+                        // digests exactly as a decoded block would.
+                        let digest = opaque_digest(details, None);
                         !policy
                             .reasoning_admission
                             .as_ref()
@@ -1045,19 +1046,6 @@ fn withholds_replayed_details(body: &Value, policy: &TranslationPolicy) -> bool 
                     ReasoningDetailsReplay::Verbatim => false,
                 }
             })
-        })
-}
-
-// The signature a provider records inline in its own reasoning detail, if any.
-fn standalone_signature(details: &[Value]) -> Option<String> {
-    details
-        .iter()
-        .find_map(|detail| {
-            detail
-                .get("signature")
-                .and_then(Value::as_str)
-                .filter(|signature| !signature.is_empty())
-                .map(ToOwned::to_owned)
         })
 }
 
@@ -1097,6 +1085,19 @@ fn encode_openai_message_reasoning_from_blocks(
     }
 }
 
+// The typed refusal for opaque state the active continuation cannot do without.
+//
+// One wording for both policies: the reason is not which replay mode the target uses, but that
+// the request is a continuation whose required state cannot be honoured. Only the digest prefix
+// is reported, so a refusal never puts provider state in a log line.
+fn active_state_refusal(digest: &str) -> crate::TranslationError {
+    crate::TranslationError::LossyConversion(format!(
+        "opaque reasoning state this target did not provably issue is required by the active \
+         continuation; refusing rather than replaying unproven provider state (digest {})",
+        &digest[..digest.len().min(16)]
+    ))
+}
+
 // Splits reasoning blocks into those whose opaque state may be sent to this target and a count
 // of the blocks that carried state and were denied it.
 //
@@ -1122,7 +1123,22 @@ fn partition_replayable_reasoning(
         let carries_opaque = !details.is_empty() || signature.is_some();
         let digest = carries_opaque.then(|| opaque_digest(details, signature.as_deref()));
         let permitted = match policy.reasoning_details_replay {
-            ReasoningDetailsReplay::PlaintextOnly => false,
+            ReasoningDetailsReplay::PlaintextOnly => {
+                // A target with no structured reasoning wire cannot be given opaque state, but
+                // that is only true of state it does not need. State on the active
+                // continuation edge is required by the request this target is being asked to
+                // continue, so stripping it would send a request that quietly says less than
+                // the caller meant. Refuse instead, exactly as `ProvenanceBound` does.
+                if let Some(digest) = digest.as_deref()
+                    && policy
+                        .reasoning_admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.refuses(digest))
+                {
+                    return Err(active_state_refusal(digest));
+                }
+                false
+            }
             ReasoningDetailsReplay::Verbatim => true,
             ReasoningDetailsReplay::ProvenanceBound => {
                 let admission = policy.reasoning_admission.as_ref();
@@ -1133,12 +1149,7 @@ fn partition_replayable_reasoning(
                     && let Some(digest) = digest.as_deref()
                     && admission.is_some_and(|a| a.refuses(digest))
                 {
-                    return Err(crate::TranslationError::LossyConversion(format!(
-                        "opaque reasoning state this target did not provably issue is required \
-                         by the active continuation; refusing rather than replaying unproven \
-                         provider state (digest {})",
-                        &digest[..digest.len().min(16)]
-                    )));
+                    return Err(active_state_refusal(digest));
                 }
                 admitted
             }

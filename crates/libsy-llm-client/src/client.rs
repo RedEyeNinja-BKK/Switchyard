@@ -1888,7 +1888,12 @@ fn apply_reasoning_admission(
     metadata: Option<&Metadata>,
     registry: &ProvenanceRegistry,
 ) {
-    if policy.reasoning_details_replay != ReasoningDetailsReplay::ProvenanceBound {
+    // `Verbatim` replays everything by construction, so there is nothing to resolve. Every
+    // other mode needs the active continuation edge identified, because that edge may not be
+    // quietly narrowed: `PlaintextOnly` never admits opaque state, but it still has to refuse
+    // active state rather than strip it.
+    let mode = policy.reasoning_details_replay;
+    if mode == ReasoningDetailsReplay::Verbatim {
         return;
     }
     let issuer = reasoning_issuer(backend, model);
@@ -1908,9 +1913,15 @@ fn apply_reasoning_admission(
                 continue;
             }
             let digest = opaque_digest(details, signature.as_deref());
-            let proven = registry.resolve(&digest).is_some_and(|(recorded, recorded_lineage)| {
-                recorded.permits_replay_to(&issuer) && recorded_lineage.permits_replay_in(&lineage)
-            });
+            // Only `ProvenanceBound` can admit; `PlaintextOnly` has no notion of proof and
+            // therefore leaves every digest unproven.
+            let proven = mode == ReasoningDetailsReplay::ProvenanceBound
+                && registry
+                    .resolve(&digest)
+                    .is_some_and(|(recorded, recorded_lineage)| {
+                        recorded.permits_replay_to(&issuer)
+                            && recorded_lineage.permits_replay_in(&lineage)
+                    });
             if proven {
                 admitted.push(digest);
             } else if active.contains(&index) {
@@ -2540,7 +2551,10 @@ mod tests {
     use std::thread::JoinHandle;
 
     use serde_json::json;
-    use switchyard_protocol::{ContentBlock, completion_text, text_request};
+    use switchyard_protocol::{
+        ContentBlock, LlmResponseChunk, Message, PreservationMetadata, ProviderExtensions,
+        ResponseOutput, Usage, completion_text, text_request,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -6444,4 +6458,433 @@ mod tests {
             .await?;
         Ok(())
     }
+
+    // -------------------------------------------------------------------------------------
+    // Provenance at the dispatch layer.
+    //
+    // The encoder tests prove what happens once a policy carries an admission. These prove the
+    // runner produces that admission from the registry, the request's own lineage and the
+    // target's canonical identity -- and that the active continuation edge is what decides
+    // between "strip" and "refuse".
+    // -------------------------------------------------------------------------------------
+
+    fn reasoning_details() -> Value {
+        json!([
+            {"type": "reasoning.text", "text": "consider wavelengths", "index": 0},
+            {"type": "reasoning.encrypted", "data": "opaque-blob-7f3a", "index": 0,
+             "signature": "sig-issuer-only"}
+        ])
+    }
+
+    fn reasoning_digest() -> String {
+        let details = reasoning_details();
+        opaque_digest(
+            details.as_array().expect("array"),
+            Some("sig-issuer-only"),
+        )
+    }
+
+    fn reasoning_message() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Reasoning {
+                text: "consider wavelengths".to_string(),
+                signature: Some("sig-issuer-only".to_string()),
+                details: reasoning_details().as_array().expect("array").clone(),
+            }],
+        }
+    }
+
+    fn metadatum(agent: Option<&str>, session: Option<&str>) -> Metadata {
+        Metadata {
+            agent_id: agent.map(ToOwned::to_owned),
+            session_id: session.map(ToOwned::to_owned),
+            ..Metadata::default()
+        }
+    }
+
+    fn backend_with_key(base_url: &str, api_key: &str) -> Backend {
+        let mut config = config(base_url);
+        config.api_key = Some(api_key.to_string());
+        Backend::OpenAiChat(config)
+    }
+
+    fn openrouter_backend() -> Backend {
+        let mut backend = backend_with_key("https://openrouter.ai/api/v1", "key-a");
+        if let Backend::OpenAiChat(config) = &mut backend {
+            config.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+        }
+        backend
+    }
+
+    fn model() -> ModelId {
+        ModelId::from("deepseek/deepseek-v4.1-flash-1017")
+    }
+
+    // Two accounts on one wire are two issuers: the credential is part of the identity even
+    // though the base URL is not. The key itself must never appear in the identifier.
+    #[test]
+    fn credential_domain_separates_accounts_on_the_same_wire() {
+        let first = backend_with_key("https://openrouter.ai/api/v1", "key-a");
+        let second = backend_with_key("https://openrouter.ai/api/v1", "key-b");
+        assert_ne!(
+            credential_domain(backend_config(&first)),
+            credential_domain(backend_config(&second)),
+            "two keys on one base URL are two credential domains"
+        );
+
+        let repeat = backend_with_key("https://openrouter.ai/api/v1", "key-a");
+        assert_eq!(
+            credential_domain(backend_config(&first)),
+            credential_domain(backend_config(&repeat)),
+            "the same key and URL are the same domain"
+        );
+
+        // A different endpoint on the same provider is also a different domain.
+        let other_host = backend_with_key("https://api.deepseek.com/v1", "key-a");
+        assert_ne!(
+            credential_domain(backend_config(&first)),
+            credential_domain(backend_config(&other_host))
+        );
+
+        let issuer = reasoning_issuer(&first, &model());
+        assert!(
+            !issuer.client.contains("key-a") && !issuer.client.contains("key-b"),
+            "the identifier must not carry the credential: {}",
+            issuer.client
+        );
+        assert!(
+            issuer.client.starts_with("openrouter.ai#"),
+            "the identifier names the endpoint then the domain: {}",
+            issuer.client
+        );
+    }
+
+    // A blob recorded from this exact target, in this conversation, for this consumer is
+    // admitted; it is the only case where the encoder may replay.
+    #[test]
+    fn admission_admits_state_this_issuer_recorded_in_this_lineage() {
+        let backend = openrouter_backend();
+        let registry = ProvenanceRegistry::default();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+
+        // Record by decoding a response that carries the state.
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "consider wavelengths".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &backend, &model(), Some(&metadata), &registry);
+
+        let request = LlmRequest {
+            messages: vec![Message::text(Role::User, "hi"), reasoning_message()],
+            ..LlmRequest::default()
+        };
+        let mut policy = translation_policy(&backend);
+        apply_reasoning_admission(
+            &mut policy,
+            &backend,
+            &model(),
+            &request,
+            Some(&metadata),
+            &registry,
+        );
+        let admission = policy.reasoning_admission.expect("provenance-bound sets one");
+        assert!(
+            admission.admits(&reasoning_digest()),
+            "state this target issued in this conversation is replayable"
+        );
+        assert!(admission.active_unproven.is_empty());
+    }
+
+    // The consumer is part of the lineage: another agent holding the same bytes is a different
+    // conversation partner, so the state is not admitted and the active edge is refused.
+    #[test]
+    fn admission_refuses_a_different_consumer() {
+        let backend = openrouter_backend();
+        let registry = ProvenanceRegistry::default();
+        let recorded = metadatum(Some("agent-7"), Some("conv-1"));
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "consider wavelengths".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &backend, &model(), Some(&recorded), &registry);
+
+        let request = LlmRequest {
+            messages: vec![Message::text(Role::User, "hi"), reasoning_message()],
+            ..LlmRequest::default()
+        };
+
+        for (label, metadata) in [
+            ("another consumer", metadatum(Some("agent-8"), Some("conv-1"))),
+            ("another conversation", metadatum(Some("agent-7"), Some("conv-2"))),
+            ("unidentified caller", metadatum(None, None)),
+        ] {
+            let mut policy = translation_policy(&backend);
+            apply_reasoning_admission(
+                &mut policy,
+                &backend,
+                &model(),
+                &request,
+                Some(&metadata),
+                &registry,
+            );
+            let admission = policy.reasoning_admission.expect("admission");
+            assert!(
+                !admission.admits(&reasoning_digest()),
+                "{label} must not be admitted"
+            );
+            assert!(
+                admission.refuses(&reasoning_digest()),
+                "{label} must land on the active edge as required-and-unproven"
+            );
+        }
+    }
+
+    // Cross-account and cross-model are refused even with an identical conversation.
+    #[test]
+    fn admission_refuses_another_account_or_model() {
+        let registry = ProvenanceRegistry::default();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+        let issuer = openrouter_backend();
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "consider wavelengths".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &issuer, &model(), Some(&metadata), &registry);
+
+        let request = LlmRequest {
+            messages: vec![Message::text(Role::User, "hi"), reasoning_message()],
+            ..LlmRequest::default()
+        };
+
+        let other_account = {
+            let mut backend = backend_with_key("https://openrouter.ai/api/v1", "key-b");
+            if let Backend::OpenAiChat(config) = &mut backend {
+                config.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+            }
+            backend
+        };
+        let other_model = ModelId::from("deepseek/deepseek-v4-pro");
+
+        for (label, backend, target) in [
+            ("another account", &other_account, model()),
+            ("another model", &issuer, other_model),
+        ] {
+            let mut policy = translation_policy(backend);
+            apply_reasoning_admission(
+                &mut policy,
+                backend,
+                &target,
+                &request,
+                Some(&metadata),
+                &registry,
+            );
+            let admission = policy.reasoning_admission.expect("admission");
+            assert!(
+                !admission.admits(&reasoning_digest()),
+                "{label} must not replay another issuer's state"
+            );
+        }
+    }
+
+    // Lineage for the response id is recorded too, so the fact is available rather than merely
+    // implied: the recorded entry carries the provider response id it arrived with.
+    #[test]
+    fn recorded_lineage_carries_the_provider_response_id() {
+        let backend = openrouter_backend();
+        let registry = ProvenanceRegistry::default();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "t".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &backend, &model(), Some(&metadata), &registry);
+
+        let (recorded, lineage) = registry
+            .resolve(&reasoning_digest())
+            .expect("the decoded state is recorded");
+        assert_eq!(lineage.consumer.as_deref(), Some("agent-7"));
+        assert_eq!(lineage.conversation.as_deref(), Some("conv-1"));
+        assert_eq!(lineage.response.as_deref(), Some("resp-9"));
+        assert_eq!(recorded, reasoning_issuer(&backend, &model()));
+    }
+
+    // Tool lineage decides the edge: the assistant turn that issued the state is active while
+    // only tool results follow it, and becomes completed history once a user turn follows.
+    #[test]
+    fn active_edge_follows_tool_lineage() {
+        let tool_result = Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::Text {
+                text: "port = 8080".to_string(),
+            }],
+        };
+        let user_turn = Message::text(Role::User, "and now?");
+
+        let in_flight = LlmRequest {
+            messages: vec![
+                Message::text(Role::User, "read the config"),
+                reasoning_message(),
+                tool_result.clone(),
+            ],
+            ..LlmRequest::default()
+        };
+        assert_eq!(
+            active_message_indexes(&in_flight),
+            BTreeSet::from([1]),
+            "an assistant turn followed only by tool results is the continuation"
+        );
+
+        let completed = LlmRequest {
+            messages: vec![
+                Message::text(Role::User, "read the config"),
+                reasoning_message(),
+                tool_result,
+                user_turn,
+            ],
+            ..LlmRequest::default()
+        };
+        assert!(
+            active_message_indexes(&completed).is_empty(),
+            "once a user turn follows, the assistant turn is completed history"
+        );
+    }
+
+    // The native path is marked too: `PlaintextOnly` may never replay, but required active state
+    // is pinned as unproven so the encoder refuses instead of stripping it.
+    #[test]
+    fn plaintext_only_runner_marks_active_state_as_required() {
+        let backend = backend_with_key("https://api.deepseek.com/v1", "key-a");
+        let registry = ProvenanceRegistry::default();
+        let request = LlmRequest {
+            messages: vec![
+                Message::text(Role::User, "read the config"),
+                reasoning_message(),
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::Text {
+                        text: "port = 8080".to_string(),
+                    }],
+                },
+            ],
+            ..LlmRequest::default()
+        };
+
+        let mut policy = translation_policy(&backend);
+        assert_eq!(
+            policy.reasoning_details_replay,
+            ReasoningDetailsReplay::PlaintextOnly,
+            "a native dialect has no structured reasoning wire"
+        );
+        apply_reasoning_admission(&mut policy, &backend, &model(), &request, None, &registry);
+        let admission = policy.reasoning_admission.expect("native paths are marked too");
+        assert!(
+            admission.refuses(&reasoning_digest()),
+            "required active state is refused rather than silently stripped"
+        );
+        assert!(
+            admission.admitted.is_empty(),
+            "a native wire can never admit opaque state"
+        );
+    }
+
+    // Streaming: the tap folds the same accumulator the consumer receives, so what is recorded
+    // is the assembled state, not a partial frame.
+    #[tokio::test]
+    async fn streamed_reasoning_is_recorded_from_the_assembled_response() {
+        let registry = Arc::new(ProvenanceRegistry::default());
+        let backend = openrouter_backend();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+
+        // The details arrive as a stream delta, exactly as a provider sends them: the
+        // accumulator is what turns them into the assembled block the caller receives.
+        let details = reasoning_details().as_array().expect("array").clone();
+        let events: Vec<std::result::Result<LlmResponseStreamEvent, LlmClientError>> = vec![
+            Ok(LlmResponseStreamEvent::from(
+                LlmResponseChunk::MessageStart {
+                    id: Some("resp-9".to_string()),
+                    model: None,
+                },
+            )),
+            Ok(LlmResponseStreamEvent::from(
+                LlmResponseChunk::ReasoningDetailsDelta {
+                    index: 0,
+                    details,
+                    text: "consider wavelengths".to_string(),
+                },
+            )),
+        ];
+        let stream: LlmResponseStream = Box::pin(stream::iter(events));
+
+        let tapped = tap_streamed_provenance(
+            stream,
+            Arc::clone(&registry),
+            reasoning_issuer(&backend, &model()),
+            request_lineage(Some(&metadata)),
+        );
+        let drained: Vec<_> = tapped.collect().await;
+        assert!(
+            drained.iter().all(|event| event.is_ok()),
+            "the tap must not alter the stream"
+        );
+
+        let (recorded, lineage) = registry
+            .resolve(&reasoning_digest())
+            .expect("streamed state is recorded once the stream completes");
+        assert_eq!(recorded, reasoning_issuer(&backend, &model()));
+        assert_eq!(lineage.consumer.as_deref(), Some("agent-7"));
+    }
+
 }

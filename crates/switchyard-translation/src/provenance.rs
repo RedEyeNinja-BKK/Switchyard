@@ -99,11 +99,30 @@ impl ReasoningLineage {
     }
 }
 
+/// The signature a provider records inline in its own reasoning detail, if any.
+///
+/// Providers disagree on where the signature lives: some hoist it to a sibling field, while
+/// OpenRouter-compatible wires leave it inside the detail object. Both are the same state, so
+/// the digest is computed over the inline form when one exists and falls back to the separate
+/// field otherwise. Without this, a stream-accumulated block (which has no sibling field) would
+/// digest differently from the same state decoded from a request, and its record could never be
+/// discharged.
+pub fn inline_signature(details: &[Value]) -> Option<String> {
+    details.iter().find_map(|detail| {
+        detail
+            .get("signature")
+            .and_then(Value::as_str)
+            .filter(|signature| !signature.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
 /// The digest identifying one piece of opaque reasoning state.
 ///
 /// Computed over the provider's structured details and any standalone signature, so the same
 /// bytes produce the same digest whether they are read from a decoded block or from a
-/// preserved request body.
+/// preserved request body. The signature is resolved through [`inline_signature`] first, so a
+/// hoisted copy and an inline copy of the same state agree.
 pub fn opaque_digest(details: &[Value], signature: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN);
@@ -112,7 +131,7 @@ pub fn opaque_digest(details: &[Value], signature: Option<&str>) -> String {
     let encoded = serde_json::to_vec(&Value::Array(details.to_vec())).unwrap_or_default();
     hasher.update((encoded.len() as u64).to_le_bytes());
     hasher.update(&encoded);
-    match signature {
+    match inline_signature(details).as_deref().or(signature) {
         Some(signature) => {
             hasher.update([1u8]);
             hasher.update(signature.as_bytes());
@@ -367,6 +386,31 @@ mod tests {
             first,
             opaque_digest(&details, Some("other-sig")),
             "the signature value changes the digest"
+        );
+    }
+
+    // Providers put the signature in different places: some hoist it to a sibling field, a
+    // stream-accumulated block has no sibling field at all, and OpenRouter-compatible wires
+    // leave it inside the detail object. All three are the same state.
+    #[test]
+    fn where_the_signature_sits_does_not_change_the_identity() {
+        let inline = vec![json!({
+            "type": "reasoning.encrypted",
+            "data": "blob",
+            "signature": "sig"
+        })];
+        assert_eq!(
+            opaque_digest(&inline, None),
+            opaque_digest(&inline, Some("sig")),
+            "an inline signature and a hoisted copy of the same signature agree"
+        );
+
+        // A state with no inline signature still distinguishes signed from unsigned.
+        let bare = vec![json!({"type": "reasoning.encrypted", "data": "blob"})];
+        assert_ne!(
+            opaque_digest(&bare, None),
+            opaque_digest(&bare, Some("sig")),
+            "a signed state is not the same state as an unsigned one"
         );
     }
 

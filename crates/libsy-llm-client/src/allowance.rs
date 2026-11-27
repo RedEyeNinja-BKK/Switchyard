@@ -525,9 +525,21 @@ impl DailyRequestAllowance {
         &self.model
     }
 
-    /// The quota group this allowance belongs to.
+    /// The quota group this counter belongs to.
+    ///
+    /// Two allowances with the same group and the same account scope are the same
+    /// budget: one provider-side project's cap, shared by every model that bills to it.
     pub fn group(&self) -> &str {
         &self.group
+    }
+
+    /// Whether this counter is shared by every model in its group.
+    ///
+    /// Account scope means one counter serves the whole group, so a refusal from it is a
+    /// statement about every member, not about the slug that reached it. Model scope
+    /// leaves the other members their own budgets.
+    pub fn is_account_scope(&self) -> bool {
+        self.model.as_str() == ACCOUNT_SCOPE_MODEL
     }
 
     /// Which midnight this counter turns over on.

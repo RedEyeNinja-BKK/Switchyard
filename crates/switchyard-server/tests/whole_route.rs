@@ -516,6 +516,75 @@ async fn an_exhausted_child_lets_the_parent_cross_and_says_why() {
     assert!(healthy.calls() >= 1, "the healthy child served");
 }
 
+/// A provider that refuses a REPLAYED tool call for want of its own continuation text is
+/// naming a fact about itself, so the next leg in the same child must be tried.
+///
+/// Measured live 2026-11-27: with every free leg spent and Google unable to replay a
+/// foreign call, `smart-route` ended on DeepSeek's 400 instead of reaching a leg that
+/// answers the same request. The paired case is the control: a generic 400 stays terminal,
+/// because handing a genuinely malformed request to another provider is evasion, not
+/// recovery.
+#[tokio::test]
+async fn a_replay_requirement_refusal_moves_on_but_a_malformed_request_does_not() {
+    let upstream = Upstream::new();
+    let url = upstream.clone().server();
+
+    // Two leaves on one upstream so the scripted refusal is attributable by model name.
+    let config = format!(
+        "schema_version = 1\n{}{}",
+        leaf_scoped(
+            "replay",
+            &url,
+            &["always-400-prose-id", "healthy"],
+            "",
+            "replay"
+        ),
+        leaf_scoped(
+            "malformed",
+            &url,
+            &["always-400", "healthy"],
+            "",
+            "malformed"
+        ),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "replay",
+        json!({"model": "replay", "input": "ping"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the leg with a different continuation contract must answer: {body}"
+    );
+    assert_eq!(body["model"], "healthy", "{body}");
+    assert_eq!(
+        seen_models(&upstream).await,
+        vec!["always-400-prose-id".to_string(), "healthy".to_string()],
+        "the refused leg was tried once and the sibling answered"
+    );
+
+    let before = seen_models(&upstream).await.len();
+    let (status, body) = call(
+        runner(&config),
+        "malformed",
+        json!({"model": "malformed", "input": "ping"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an ordinary bad request is the caller's to fix: {body}"
+    );
+    assert_eq!(
+        seen_models(&upstream).await.len(),
+        before + 1,
+        "the sibling of a malformed request must not be contacted"
+    );
+}
+
 /// A terminal failure is a defect in the child, not an opportunity for another route.
 /// Retrying elsewhere would hide a contract or credential fault behind another answer.
 #[tokio::test]

@@ -116,9 +116,15 @@ async fn a_spent_allowance_stops_the_request_before_it_is_sent()
     let refused = client.call_rewrite_model(request(), None).await;
 
     match refused {
-        Err(LlmClientError::DailyRequestAllowanceExhausted { limit, model }) => {
+        Err(LlmClientError::DailyRequestAllowanceExhausted {
+            limit,
+            model,
+            group,
+        }) => {
             assert_eq!(limit, 1);
             assert_eq!(model.as_str(), "gpt");
+            // Model scope: this refusal says nothing about any sibling's budget.
+            assert_eq!(group, None);
         }
         Ok(_) => panic!("expected the allowance to refuse the second request"),
         Err(other) => panic!("expected the allowance, got {other:?}"),

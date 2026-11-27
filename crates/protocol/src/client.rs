@@ -81,6 +81,14 @@ pub enum LlmClientError {
         model: ModelId,
         /// The exhausted daily limit.
         limit: u64,
+        /// The quota group whose single counter refused, when that counter is
+        /// account-scoped.
+        ///
+        /// `Some` states a shared fact, not a per-model one: every target that draws on
+        /// this group is refused by the same counter, so a route may skip its siblings
+        /// instead of asking each of them and reading the same zero. `None` is a
+        /// model-scoped budget and says nothing about any other model.
+        group: Option<String>,
     },
 
     /// The target's daily request allowance is configured but its accounting state is
@@ -117,6 +125,14 @@ pub enum LlmClientError {
         model: ModelId,
         /// The account pool's stated daily limit.
         limit: u64,
+        /// The quota group the provider's reading governs, when the counter it was
+        /// applied to is account-scoped.
+        ///
+        /// This is the authoritative identity of the exhausted pool: the reading was
+        /// reconciled onto one counter for the whole group, so every model in it is out,
+        /// not merely the slug the request happened to reach. `None` means the reading
+        /// governs one model's allowance and condemns nothing else.
+        group: Option<String>,
     },
 
     /// The target's own per-minute budget has no room for this request yet.

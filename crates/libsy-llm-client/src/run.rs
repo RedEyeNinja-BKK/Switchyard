@@ -291,6 +291,32 @@ async fn call_first_available(
                 return Err(error);
             }
             Err(error) => {
+                // An account-scoped daily counter refused the send. The refusal belongs
+                // to the quota group, not to the slug that happened to be next: every
+                // other candidate drawing on the same counter would read the same zero,
+                // and advancing one leg at a time also risks ending the route on a
+                // sibling's unrelated fault while another group is still servable. Skip
+                // the whole group, and end here when the rest of the list is that group.
+                if let Some(group) = account_allowance_refusal(&error) {
+                    let survivor = models[index + 1..]
+                        .iter()
+                        .position(|next| clients.allowance_group_for(next) != Some(group))
+                        .map(|offset| index + 1 + offset);
+                    match survivor {
+                        Some(next) => {
+                            tracing::info!(
+                                from = %target,
+                                to = %models[next],
+                                skipped = next - index - 1,
+                                reason = "account_allowance",
+                                "account allowance is spent; skipping candidates on the same pool"
+                            );
+                            index = next;
+                            continue;
+                        }
+                        None => return Err(error),
+                    }
+                }
                 // A statement about the credential that produced this failure says
                 // nothing about a candidate on a DIFFERENT credential. A free pool spans
                 // providers, so a rejected Google key or an exhausted OpenRouter
@@ -703,6 +729,26 @@ fn credential_scoped_stop(error: &LibsyError) -> bool {
         return recovery.stop_candidate_list && !recovery.keep_outcome;
     }
     false
+}
+
+/// The account-scoped allowance group a failure says is spent, when it names one.
+///
+/// Only a counter that speaks for its whole group qualifies. A model-scoped budget
+/// (`group: None`) is a statement about one slug and must leave its siblings alone, so
+/// it returns `None` here and takes the ordinary one-leg-at-a-time path.
+fn account_allowance_refusal(error: &LibsyError) -> Option<&str> {
+    let LibsyError::ClientCall { source, .. } = error else {
+        return None;
+    };
+    match source {
+        LlmClientError::DailyRequestAllowanceExhausted {
+            group: Some(group), ..
+        }
+        | LlmClientError::ProviderAllowanceExhausted {
+            group: Some(group), ..
+        } => Some(group.as_str()),
+        _ => None,
+    }
 }
 
 /// The scope of an exhausted allowance: which models on the credential it blocks.
@@ -1243,6 +1289,20 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         {
             Some(RoutingFallbackReason::Unavailable)
         }
+        // A provider stating that a REPLAYED tool call is missing the continuation text it
+        // issued is a fact about that target's continuation contract, not about the
+        // request: another candidate that does not require it serves the same request.
+        // Measured 2026-11-27 on DeepSeek Flash in thinking mode, chat and Responses wires
+        // alike: HTTP 400 `invalid_request_error`, "The `reasoning_text` in the thinking
+        // mode must be passed back to the API". This deployment strips provider reasoning
+        // by policy, so that leg can never accept the replay; declaring
+        // `tool_call_replay = false` keeps it out of the dispatch, and this arm keeps an
+        // undeclared target from ending the route with a 400.
+        LlmClientError::UpstreamHttp { status, body }
+            if *status == StatusCode::BAD_REQUEST && missing_reasoning_replay(body) =>
+        {
+            Some(RoutingFallbackReason::Unavailable)
+        }
         LlmClientError::UpstreamHttp { status, .. }
             if matches!(
                 *status,
@@ -1253,6 +1313,23 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         }
         _ => None,
     }
+}
+
+/// Whether a provider refused the request because a replayed tool call omitted the
+/// continuation text the provider itself issued.
+///
+/// Deliberately narrow: the provider must name `reasoning_text` and the requirement to
+/// pass it back. A generic 400 stays terminal, so a genuinely malformed request is still
+/// the caller's to fix rather than something the route hands to another provider.
+fn missing_reasoning_replay(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(message) = value["error"]["message"].as_str() else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("reasoning_text") && message.contains("passed back")
 }
 
 /// Refuses a request whose tool results cannot be matched to a tool call.
@@ -1497,6 +1574,13 @@ struct ClientRouting {
     /// only here: a target absent from this map makes a failure unattributable, and an
     /// unattributable block condemns nothing rather than guessing.
     target_credentials: HashMap<ModelId, String>,
+    /// The account-scoped allowance group each target draws on, keyed by model id.
+    ///
+    /// Present only for targets whose daily counter is shared by the whole quota group.
+    /// A model-scoped budget is deliberately absent: it states nothing about its
+    /// siblings, so it must never cause one to be skipped. Absence here therefore means
+    /// "not known to share", never "shares nothing".
+    target_allowance_groups: HashMap<ModelId, String>,
 }
 
 /// The request requirements a candidate target is checked against.
@@ -1670,6 +1754,28 @@ impl ClientRouter {
             .map(String::as_str)
     }
 
+    /// Declares which account-scoped allowance group serves each target model.
+    ///
+    /// A quota group is one provider-side project's counter. When the counter is
+    /// account-scoped, a refusal from it is a statement about every model in the group,
+    /// so the route can skip the rest instead of asking each one and reading the same
+    /// zero. Model-scoped counters are deliberately not declared: their refusal belongs
+    /// to one slug and must not condemn a sibling.
+    pub fn with_target_allowance_groups(mut self, groups: HashMap<ModelId, String>) -> Self {
+        let routing =
+            Arc::get_mut(&mut self.inner).expect("client router is not yet shared when configured");
+        routing.target_allowance_groups = groups;
+        self
+    }
+
+    /// The account-scoped allowance group `model` draws on, when this router was told.
+    pub fn allowance_group_for(&self, model: &ModelId) -> Option<&str> {
+        self.inner
+            .target_allowance_groups
+            .get(model)
+            .map(String::as_str)
+    }
+
     /// Supplies the host that fulfils routing-time decision calls.
     ///
     /// Without one, a decision call is answered as unsupported.
@@ -1736,6 +1842,7 @@ impl ClientRouter {
                 decision_handler: None,
                 target_capabilities: HashMap::new(),
                 target_credentials: HashMap::new(),
+                target_allowance_groups: HashMap::new(),
             }),
         }
     }
@@ -1756,6 +1863,7 @@ impl ClientRouter {
                 decision_handler: None,
                 target_capabilities: HashMap::new(),
                 target_credentials: HashMap::new(),
+                target_allowance_groups: HashMap::new(),
             }),
         }
     }
@@ -3615,6 +3723,40 @@ mod tests {
         }
     }
 
+    /// A 400 that names a missing continuation artifact is a target fact, not a bad request.
+    ///
+    /// Measured live 2026-11-27: with every free leg spent and Google unable to replay a
+    /// foreign tool call, `smart-route` ended on DeepSeek's refusal instead of reaching the
+    /// paid leg that answers it. The recognizer must stay narrow: a generic 400 is still the
+    /// caller's to fix.
+    #[test]
+    fn a_provider_naming_missing_reasoning_replay_is_routable_not_terminal() {
+        let error = |body: &str| {
+            LibsyError::client_call(
+                "deepseek-flash",
+                LlmClientError::UpstreamHttp {
+                    status: StatusCode::BAD_REQUEST,
+                    body: body.to_string(),
+                },
+            )
+        };
+        assert_eq!(
+            fallback_reason(&error(
+                r#"{"error":{"message":"The `reasoning_text` in the thinking mode must be passed back to the API. (request_id: 10a817ba)","type":"upstream_error","code":"invalid_request_error"}}"#
+            )),
+            Some(RoutingFallbackReason::Unavailable),
+            "another candidate with a different continuation contract may serve"
+        );
+        for body in [
+            r#"{"error":{"message":"Invalid request body"}}"#,
+            r#"{"error":{"message":"reasoning_text is too long"}}"#,
+            r#"{"error":{"message":"state must be passed back"}}"#,
+            "not json",
+        ] {
+            assert_eq!(fallback_reason(&error(body)), None, "{body}");
+        }
+    }
+
     #[tokio::test]
     async fn candidate_failures_follow_the_fallback_policy() -> Result<()> {
         // Context overflow is retryable across candidates.
@@ -3665,6 +3807,162 @@ mod tests {
             serde_json::json!(response_id),
         );
         request
+    }
+
+    /// A pool client whose first member is spent, or whose members all answer.
+    struct PoolClient {
+        model: &'static str,
+        spend: Option<&'static str>,
+        calls: Arc<Mutex<Vec<ModelId>>>,
+    }
+
+    #[async_trait]
+    impl RoutedLlmClient for PoolClient {
+        async fn call(&self, request: Request) -> std::result::Result<Response, LlmClientError> {
+            let model = request.model_id().unwrap_or_default();
+            self.calls.lock().push(model);
+            if self.spend == Some(self.model) {
+                return Err(LlmClientError::DailyRequestAllowanceExhausted {
+                    model: ModelId::from(self.model),
+                    limit: 1_000,
+                    group: Some("shared-free-pool".to_string()),
+                });
+            }
+            Ok(Response {
+                llm_response: LlmResponse::Agg(text_response(Some(self.model.to_string()), "ok")),
+                metadata: None,
+                upstream_headers: http::HeaderMap::new(),
+            })
+        }
+    }
+
+    /// One account-scoped counter is one fact, however many slugs sit on it.
+    ///
+    /// Measured live 2026-11-27: a spent free pool was read once per member -- three
+    /// `daily_allowance_exhausted` attempts at 0 ms in one request -- and the record
+    /// then looked like three provider refusals rather than one account fact. The
+    /// walk skips the rest of the group, and a member outside it still serves.
+    #[tokio::test]
+    async fn an_account_allowance_refusal_skips_the_rest_of_its_pool() -> Result<()> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let build = |spend: Option<&'static str>| {
+            let client = |model: &'static str| {
+                Arc::new(PoolClient {
+                    model,
+                    spend,
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn RoutedLlmClient>
+            };
+            ClientRouter::new(std::collections::HashMap::from([
+                (ModelId::from("ernie:free"), client("ernie:free")),
+                (ModelId::from("ling:free"), client("ling:free")),
+                (ModelId::from("deepseek"), client("deepseek")),
+            ]))
+            .with_target_allowance_groups(std::collections::HashMap::from([
+                (ModelId::from("ernie:free"), "shared-free-pool".to_string()),
+                (ModelId::from("ling:free"), "shared-free-pool".to_string()),
+                (ModelId::from("deepseek"), "paid-pool".to_string()),
+            ]))
+        };
+        let models = vec![
+            ModelId::from("ernie:free"),
+            ModelId::from("ling:free"),
+            ModelId::from("deepseek"),
+        ];
+        let observe = |_observation| {};
+
+        // Control: nothing is spent, so every member is offered in order and the first
+        // answers. Without this the skip below could be the walk never reaching them.
+        let clients = build(None);
+        let response =
+            call_first_available(&clients, "candidate_test", &request(), &models, &observe).await?;
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("ernie:free")
+        );
+        assert_eq!(
+            calls.lock().clone(),
+            vec![ModelId::from("ernie:free")],
+            "the first healthy member answers and the rest are not called"
+        );
+
+        // The spent pool: its second member is never called, and the leg on another
+        // pool still serves.
+        calls.lock().clear();
+        let clients = build(Some("ernie:free"));
+        let response =
+            call_first_available(&clients, "candidate_test", &request(), &models, &observe).await?;
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("deepseek")
+        );
+        assert_eq!(
+            calls.lock().clone(),
+            vec![ModelId::from("ernie:free"), ModelId::from("deepseek")],
+            "the sibling on the same account is skipped instead of reading the same zero"
+        );
+        Ok(())
+    }
+
+    /// A model-scoped budget is one model's fact and must not condemn a sibling.
+    #[tokio::test]
+    async fn a_model_scoped_refusal_still_advances_one_leg_at_a_time() -> Result<()> {
+        struct ModelScoped {
+            model: &'static str,
+            calls: Arc<Mutex<Vec<ModelId>>>,
+        }
+
+        #[async_trait]
+        impl RoutedLlmClient for ModelScoped {
+            async fn call(
+                &self,
+                request: Request,
+            ) -> std::result::Result<Response, LlmClientError> {
+                let model = request.model_id().unwrap_or_default();
+                self.calls.lock().push(model);
+                if self.model == "spent" {
+                    return Err(LlmClientError::DailyRequestAllowanceExhausted {
+                        model: ModelId::from("spent"),
+                        limit: 20,
+                        group: None,
+                    });
+                }
+                Ok(Response {
+                    llm_response: LlmResponse::Agg(text_response(
+                        Some(self.model.to_string()),
+                        "ok",
+                    )),
+                    metadata: None,
+                    upstream_headers: http::HeaderMap::new(),
+                })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let client = |model: &'static str| {
+            Arc::new(ModelScoped {
+                model,
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn RoutedLlmClient>
+        };
+        let clients = ClientRouter::new(std::collections::HashMap::from([
+            (ModelId::from("spent"), client("spent")),
+            (ModelId::from("healthy"), client("healthy")),
+        ]));
+        let models = vec![ModelId::from("spent"), ModelId::from("healthy")];
+        let observe = |_observation| {};
+        let response =
+            call_first_available(&clients, "candidate_test", &request(), &models, &observe).await?;
+        assert_eq!(
+            response.served_model().map(ModelId::as_str),
+            Some("healthy")
+        );
+        assert_eq!(
+            calls.lock().clone(),
+            vec![ModelId::from("spent"), ModelId::from("healthy")],
+            "a per-model budget leaves its sibling servable and reachable"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -4406,6 +4704,7 @@ mod account_quota_tests {
             LlmClientError::ProviderAllowanceExhausted {
                 model: ModelId::from("baidu/ernie-5.5-flash-preview:free"),
                 limit: 1_000,
+                group: Some("openrouter-free-owner".to_string()),
             },
         );
 
@@ -4464,6 +4763,7 @@ mod account_quota_tests {
             LlmClientError::ProviderAllowanceExhausted {
                 model: ModelId::from("z-ai/glm-5.3-flash"),
                 limit: 1_000,
+                group: None,
             },
         );
         let (kind, slug) = credential_block(&error).expect("the refusal carries a block");

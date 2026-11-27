@@ -617,7 +617,11 @@ async fn a_throttled_candidate_yields_to_its_sibling_and_each_dispatch_is_counte
     );
 
     let (status, body) = call(&config, "pair").await;
-    assert_eq!(status, StatusCode::OK, "the sibling should have served: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the sibling should have served: {body}"
+    );
     assert_eq!(
         throttled.calls(),
         1,
@@ -633,5 +637,121 @@ async fn a_throttled_candidate_yields_to_its_sibling_and_each_dispatch_is_counte
     assert_eq!(
         spent, 2,
         "{counter}: one reservation per provider dispatch, and no more"
+    );
+}
+
+/// A spent account counter is one fact, and the route must read it once.
+///
+/// Measured live 2026-11-27: `smart-route` recorded the same `daily_allowance_exhausted`
+/// three times at 0 ms, once per free member, before reaching the paid leg. Every one of
+/// those is the account's single counter answering the same zero -- no provider was
+/// contacted, but the record read as three provider refusals and the walk had three more
+/// chances to stop on an unrelated fault. The second member must not be dispatched at all,
+/// and the leg on another budget must still serve.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_account_skips_its_own_members_before_they_are_dispatched() {
+    let dir = state_dir("account-skip");
+    let free = Upstream::new();
+    let paid = Upstream::new();
+    let free_url = free.clone().url();
+    let paid_url = paid.clone().url();
+
+    // Two members of one account-scoped budget, and one leg on a different credential.
+    // The limit is one request, so the second request finds the account spent.
+    let config = format!(
+        "schema_version = 1\n\n[quota]\nstate_dir = \"{}\"\n\n\
+         [llm_clients.free]\nformat = \"openai_responses\"\nbase_url = \"{free_url}\"\n\
+         quota_group = \"openrouter-free-owner\"\nquota_scope = \"account\"\n\
+         quota_reset = \"utc\"\n\n\
+         [llm_clients.paid]\nformat = \"openai_responses\"\nbase_url = \"{paid_url}\"\n\n\
+         [targets.free-a]\nid = \"vendor/free-a\"\nllm_client = \"free\"\n\
+         vision = false\nvideo = false\ndaily_request_limit = 1\n\n\
+         [targets.free-b]\nid = \"vendor/free-b\"\nllm_client = \"free\"\n\
+         vision = false\nvideo = false\ndaily_request_limit = 1\n\n\
+         [targets.paid-a]\nid = \"vendor/paid-a\"\nllm_client = \"paid\"\n\
+         vision = false\nvideo = false\n\n\
+         [routes.mix]\nid = \"mix\"\ntype = \"passthrough\"\ntarget = \"free-a\"\n\
+         candidates = [\"free-b\", \"paid-a\"]\n",
+        dir.display()
+    );
+
+    // First request spends the account's only unit on the first member.
+    let (status, body) = call(&config, "mix").await;
+    assert_eq!(status, StatusCode::OK, "first request should serve: {body}");
+    assert_eq!(free.calls(), 1);
+    assert_eq!(free.models().await, vec!["vendor/free-a".to_string()]);
+    let (_, spent, limit) = only_counter(&dir);
+    assert_eq!((spent, limit), (1, 1), "the account's only unit is spent");
+
+    // Second request: the first member is refused locally, the sibling on the same
+    // account must not be attempted, and the other credential serves. The decision record
+    // is the evidence, because a local refusal never reaches the provider: counting
+    // upstream calls alone cannot tell "skipped" from "refused a second time".
+    let directory = tempfile::tempdir().expect("tempdir");
+    let decisions = directory.path().join("routing.decisions.jsonl");
+    let state = switchyard_server::ServerState::from_runner(
+        Runner::from_toml(&config).expect("deployment builds"),
+    )
+    .expect("state builds")
+    .with_routing_log(&directory.path().join("routing.jsonl"))
+    .expect("log opens");
+    let router = switchyard_server::build_switchyard_router(state);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model": "mix", "input": "ping"}).to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the leg on another budget should serve: {body}"
+    );
+    assert_eq!(
+        free.calls(),
+        1,
+        "the sibling on the spent account must not be dispatched"
+    );
+    assert_eq!(
+        paid.models().await,
+        vec!["vendor/paid-a".to_string()],
+        "the answer must come from the leg on another budget"
+    );
+    let (_, spent, _) = only_counter(&dir);
+    assert_eq!(
+        spent, 1,
+        "a refusal before the send costs nothing and must not charge the counter"
+    );
+
+    let text = std::fs::read_to_string(&decisions).expect("decision log was written");
+    let record: Value =
+        serde_json::from_str(text.lines().last().expect("one record")).expect("record parses");
+    assert_eq!(record["served"], "vendor/paid-a", "{record}");
+    let attempts = record["attempts"].as_array().expect("attempts array");
+    let refused = attempts
+        .iter()
+        .filter(|attempt| attempt["outcome"] == "daily_allowance_exhausted")
+        .count();
+    assert_eq!(
+        refused, 1,
+        "one account counter is read once, not once per member: {record}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt["model"] != "vendor/free-b"),
+        "the spent account's second member must not be attempted: {record}"
     );
 }

@@ -2309,7 +2309,7 @@ fn client_error(error: &LlmClientError) -> Response {
         // A spent daily budget is not an outage: this leg cannot serve until the
         // provider day rolls over, and the reset is stated so a caller does not retry
         // into the same refusal. Every other candidate keeps its own budget.
-        LlmClientError::DailyRequestAllowanceExhausted { model, limit } => error_response(
+        LlmClientError::DailyRequestAllowanceExhausted { model, limit, .. } => error_response(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "daily request allowance for {model} is spent ({limit} per provider day); \
@@ -2324,7 +2324,7 @@ fn client_error(error: &LlmClientError) -> Response {
         // refusal falls into the generic internal-error arm, which tells a caller the
         // deployment is broken and tells an operator to look for a fault -- measured live
         // 2026-11-27 on a single-target free route, which reported 500 for a spent pool.
-        LlmClientError::ProviderAllowanceExhausted { model, limit } => error_response(
+        LlmClientError::ProviderAllowanceExhausted { model, limit, .. } => error_response(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "provider reports the account allowance for {model} is spent ({limit} per \
@@ -2455,16 +2455,36 @@ impl ApiError {
         response
             .extensions_mut()
             .insert(RequestLogError(self.message.clone()));
-        // Errors the router itself rejected (invalid body, unknown capability,
-        // malformed role) carry no upstream RequestLogFailure, so classify them
-        // here: `upstream_rejected` marks a request the upstream answered 4xx,
-        // while these are local validation failures that never left the building.
+        // Errors the router itself rendered carry no upstream RequestLogFailure, so
+        // classify them here. `upstream_rejected` marks a request the upstream answered
+        // 4xx; these never left the building, and the class says WHY they were refused.
+        // One label for all of them was wrong in a way that mattered: a spent provider
+        // allowance (429), an unavailable deployment (5xx) and a malformed body (400) all
+        // read `local_invalid_request`, so a throttle looked like a caller mistake and a
+        // real fault was indistinguishable from one. The vocabulary is closed; each value
+        // names a refusal class, never a payload.
         response.extensions_mut().insert(RequestLogFailure {
-            error_class: "local_invalid_request",
+            error_class: local_error_class(self.status),
             upstream_request_id: None,
         });
         response.extensions_mut().insert(self);
         response
+    }
+}
+
+/// The class a locally rendered refusal is recorded under.
+///
+/// The status decides, because the status is what the caller was told and what a dashboard
+/// aggregates. `local_invalid_request` keeps its old meaning -- the router refused the
+/// request's shape -- and is no longer borrowed by throttles and outages.
+fn local_error_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        429 => "local_throttled",
+        500..=599 => "local_unavailable",
+        401 | 403 => "local_auth",
+        404 => "local_not_found",
+        400 | 405..=499 => "local_invalid_request",
+        _ => "local_rejected",
     }
 }
 
@@ -3187,6 +3207,7 @@ mod tests {
         let error = LlmClientError::ProviderAllowanceExhausted {
             model: ModelId::from("baidu/ernie-5.5-flash-preview:free"),
             limit: 1_000,
+            group: Some("openrouter-free-owner".to_string()),
         };
         let response = client_error(&error);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -3358,6 +3379,37 @@ mod tests {
             "{}",
             events[0].1
         );
+    }
+
+    #[test]
+    fn a_locally_rendered_refusal_is_classified_by_what_it_says() {
+        // One label for every local refusal made a throttle read like a caller mistake and
+        // an outage read like one too. Measured 2026-11-27: a spent provider allowance and
+        // a 503 both logged `local_invalid_request`.
+        for (status, expected) in [
+            (StatusCode::TOO_MANY_REQUESTS, "local_throttled"),
+            (StatusCode::SERVICE_UNAVAILABLE, "local_unavailable"),
+            (StatusCode::BAD_GATEWAY, "local_unavailable"),
+            (StatusCode::BAD_REQUEST, "local_invalid_request"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "local_invalid_request"),
+            (StatusCode::NOT_FOUND, "local_not_found"),
+            (StatusCode::UNAUTHORIZED, "local_auth"),
+            (StatusCode::FORBIDDEN, "local_auth"),
+        ] {
+            let response = error_response(status, "refused", "test_error", "test_code");
+            let events = captured_events(|| request_log_context().emit(&response));
+            assert_eq!(events.len(), 1);
+            assert!(
+                events[0].1.contains(expected),
+                "{status} should log {expected}: {}",
+                events[0].1
+            );
+            assert!(
+                !events[0].1.contains("local_invalid_request") || expected == "local_invalid_request",
+                "{status} must not be folded into local_invalid_request: {}",
+                events[0].1
+            );
+        }
     }
 
     #[test]

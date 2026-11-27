@@ -1474,6 +1474,31 @@ impl DeploymentConfig {
             .unwrap_or_else(|| target.llm_client.clone())
     }
 
+    /// Targets whose daily counter is account-scoped, mapped to their quota group.
+    ///
+    /// Only an account-scoped counter speaks for its whole group, so only those targets
+    /// are declared. A model-scoped budget is left out on purpose: its refusal belongs to
+    /// one slug, and declaring it here would let one model's spent budget skip a sibling
+    /// that still has its own.
+    fn target_allowance_groups(
+        &self,
+        route: &RouteConfig,
+    ) -> std::collections::HashMap<ModelId, String> {
+        route
+            .served_target_names()
+            .into_iter()
+            .filter_map(|name| self.targets.get(name))
+            .filter(|target| {
+                self.llm_clients
+                    .get(&target.llm_client)
+                    .and_then(|client| client.quota_scope)
+                    .unwrap_or_default()
+                    == QuotaScope::Account
+            })
+            .map(|target| (target.id.clone(), self.allowance_group(target)))
+            .collect()
+    }
+
     /// The key a target's daily allowance is stored under.
     ///
     /// Producer and every consumer derive this the same way. A consumer that derives a
@@ -3072,6 +3097,10 @@ impl DeploymentConfig {
         // route's first target. A mixed-provider free pool is exactly the case where
         // those two differ.
         let router = router.with_target_credentials(target_credentials(route, &self.targets));
+        // The account-scoped allowance group each target draws on travels with the
+        // router too, so a refusal from one group's counter skips that group's other
+        // candidates instead of reading the same zero once per leg.
+        let router = router.with_target_allowance_groups(self.target_allowance_groups(route));
 
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.

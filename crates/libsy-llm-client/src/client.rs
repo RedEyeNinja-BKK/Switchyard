@@ -684,6 +684,11 @@ impl TranslatingLlmClient {
                         error: LlmClientError::DailyRequestAllowanceExhausted {
                             model: model.clone(),
                             limit: allowance.limit(),
+                            // An account-scoped counter speaks for its whole group; a
+                            // model-scoped one speaks only for this model.
+                            group: allowance
+                                .is_account_scope()
+                                .then(|| allowance.group().to_owned()),
                         },
                         status: None,
                         retry_after: None,
@@ -697,6 +702,12 @@ impl TranslatingLlmClient {
                         error: LlmClientError::ProviderAllowanceExhausted {
                             model: model.clone(),
                             limit,
+                            // The provider's reading was applied to one counter. When
+                            // that counter is account-scoped the reading is the group's,
+                            // and every member of the group is out.
+                            group: allowance
+                                .is_account_scope()
+                                .then(|| allowance.group().to_owned()),
                         },
                         status: None,
                         retry_after: None,

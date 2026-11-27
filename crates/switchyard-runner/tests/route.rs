@@ -1156,6 +1156,7 @@ impl RoutedLlmClient for SpentClient {
         Err(LlmClientError::DailyRequestAllowanceExhausted {
             model: ModelId::from(self.model),
             limit: 20,
+            group: None,
         })
     }
 }
@@ -1181,6 +1182,7 @@ impl RoutedLlmClient for ProviderExhaustedClient {
         Err(LlmClientError::ProviderAllowanceExhausted {
             model: ModelId::from(self.model),
             limit: 1_000,
+            group: None,
         })
     }
 }

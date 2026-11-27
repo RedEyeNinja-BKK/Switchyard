@@ -2318,6 +2318,21 @@ fn client_error(error: &LlmClientError) -> Response {
             "invalid_request_error",
             "daily_allowance_exhausted",
         ),
+        // The reconciled provider figure refused the send: the account's allowance is
+        // spent, not the request. 429 with the reset stated, because retrying now spends
+        // nothing and learns nothing until the provider day rolls over. Without this arm the
+        // refusal falls into the generic internal-error arm, which tells a caller the
+        // deployment is broken and tells an operator to look for a fault -- measured live
+        // 2026-11-27 on a single-target free route, which reported 500 for a spent pool.
+        LlmClientError::ProviderAllowanceExhausted { model, limit } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "provider reports the account allowance for {model} is spent ({limit} per \
+                 provider day); it resets at the provider's own day boundary"
+            ),
+            "rate_limit_error",
+            "provider_allowance_exhausted",
+        ),
         // Accounting that cannot be read is a deployment fault, and a silent one would
         // leave a cap unenforced. Refused fail-closed, reported as unavailable rather
         // than as something the caller did wrong.
@@ -3165,6 +3180,31 @@ mod tests {
     // arm: an uncleared payload is the caller's to fix, a spent budget resets on the
     // provider's day, and unreadable accounting is a deployment fault under which a
     // cap is unenforced. Each is asserted by status and wire code.
+    #[test]
+    fn a_provider_allowance_refusal_renders_as_a_throttle_not_a_server_fault() {
+        // Measured live 2026-11-27: this refusal reached the generic arm and a single-target
+        // free route answered 500 `server_error` for a pool that was merely spent.
+        let error = LlmClientError::ProviderAllowanceExhausted {
+            model: ModelId::from("baidu/ernie-5.5-flash-preview:free"),
+            limit: 1_000,
+        };
+        let response = client_error(&error);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let api_error = response
+            .extensions()
+            .get::<ApiError>()
+            .expect("ApiError extension");
+        assert_eq!(api_error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api_error.error_type, "rate_limit_error");
+        assert_eq!(api_error.code, "provider_allowance_exhausted");
+        assert!(
+            api_error
+                .message
+                .contains("baidu/ernie-5.5-flash-preview:free"),
+            "the caller is told which pool is spent: {}",
+            api_error.message
+        );
+    }
 
     // The provider's message can quote request content, so the request log
     // records only the error class while the client still sees the message.

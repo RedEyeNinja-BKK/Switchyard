@@ -916,7 +916,7 @@ children = ["smartfree-decision", "smartlocal-decision"]
 # therefore serves only structured requests. That is request fit, not a preference:
 # it is excluded when it cannot serve, and equally eligible when it can.
 [decision_lane_composition.smart-decision]
-children = ["smart-gemini-decision", "smartlocal-decision", "smartfree-decision", "google-decision"]
+children = ["smart-gemini-decision", "smartlocal-decision", "smartfree-decision"]
 selection = "capability_first"
 
 

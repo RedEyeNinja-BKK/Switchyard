@@ -1,0 +1,16 @@
+# sha256  bytes  name
+15b3e5fff676a71c2b943197c4e59757649453b2c7c4875f3fa14cf735f4fd1b      3501  PATCH.diff
+b2b235efa99445f3943111190b861285ca16145f51b4d829965940b0075ac93d      5645  RECEIPT.md
+5d65192125eeba017c0e8e1f90a515cd8dc017feded3b9017d8929852b5a9b1c      2981  projection.smart-route.json
+2a20067bf3041f9fd1e624821944891bbe12f0219b67bef7ea363f61b8309b53    132140  routes.2a20067b.toml
+9069fe66ebfefdb7769fd59619dccae8f4be023ba833ecd543baa693c1dc1ea5    133371  routes.9069fe66.toml
+16a974194ea4bffc67822676d457a41dbb614b7caa7132ca654fdd3da3678290    134321  routes.successor.16a97419.toml
+
+# referenced artifacts
+ea018e2d825cd68ecb1ea8056a0a015f01ef2cae53d6a9ef7b9cd3b07ad33d5f  crates/switchyard-server/tests/cost_containment.rs
+9069fe66ebfefdb7769fd59619dccae8f4be023ba833ecd543baa693c1dc1ea5  crates/switchyard-server/tests/fixtures/routes.cost-containment-20261127.toml
+fb12d2881387e3380d44142d69865cd3ba1e0c03293bae8d4da23dd9785ea169  'deployed binary fb12d288'
+aaf1bec88835acaca1d9dbff556fb74cbd1647a719f32ddfd3aafd26b6f01dcf  'successor binary aaf1bec8'
+ad3a7c00f232f7268efaf94f7cf8fdd6762e86432a7e3bc404ac6f36a33cc968  'deployed capabilities ad3a7c00'
+5312e9307f68d46bd0969ebf15b096347d6741ad2ef7884ee0623e332a0bf67b  'successor capabilities 5312e930'
+72838c340dc55f8ca6958ad0c15a1e7afaac623649d78335b3b7b61865835877  'P9 checker 72838c34'

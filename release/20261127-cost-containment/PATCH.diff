@@ -1,0 +1,89 @@
+--- live-routes.toml	2026-11-27 13:28:38.817710577 +0700
++++ routes.toml	2026-11-27 13:29:18.052046718 +0700
+@@ -122,7 +122,7 @@
+ 
+ # Pool membership label. A route that names this group ranks the whole group before it
+ # ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+-groups = ["smart-deepseek"]
++groups = ["smart-deepseek-flash"]
+ 
+ video = false
+ tool_calling = true
+@@ -1606,7 +1606,9 @@
+ #
+ #   smart-gemini-chat      Google free chat models, in quality order
+ #   smart-openrouter-free  OpenRouter free models
+-#   smart-deepseek         DeepSeek direct, which bills per call
++#   smart-deepseek-flash   DeepSeek Flash direct, which bills per call. SINGLE MEMBER:
++#                          V4 Pro was removed from this ladder on 2026-11-27 and is not
++#                          reachable from smart-route by any path.
+ #   smart-openrouter-paid  OpenRouter metered models, the most expensive leg
+ #
+ # `group_ordering = "ordered"` is what makes this a ladder rather than a peer set. The group
+@@ -1643,7 +1645,6 @@
+     "openrouter-ling-3_2-flash-free",
+     "openrouter-nemotron-3_5-super-vl-free",
+     "deepseek-deepseek-flash",
+-    "deepseek-deepseek-v4-pro",
+     "openrouter-tencent-hy4-flash",
+     "openrouter-glm-5_3-flash",
+ ]
+@@ -1652,7 +1653,7 @@
+ pool_groups = [
+     "smart-gemini-chat",
+     "smart-openrouter-free",
+-    "smart-deepseek",
++    "smart-deepseek-flash",
+     "smart-openrouter-paid",
+ ]
+ context_window = 262144
+@@ -1698,12 +1699,32 @@
+ video_carrier = "inline"
+ image_carrier = "inline"
+ 
+-# Stage 3 as a route.
++# Stage 3 as a route: SINGLE MEMBER. Owner directive 2026-11-27 removed the
++# DeepSeek V4 Pro escalation from this group for cost containment; Flash
++# exhaustion, congestion, incompatibility or provider failure must not select a
++# more expensive sibling, and there is no sibling left to select. A singleton
++# group route carries no `candidates`, so the group and the pool cannot drift.
++[routes.smart-deepseek-flash]
++id = "smart-deepseek-flash"
++type = "passthrough"
++target = "deepseek-deepseek-flash"
++candidates = []
++selection = "declared"
++context_window = 1048576
++tool_calling = true
++reasoning = true
++vision = true
++video = false
++
++# Compatibility alias, same singleton membership as the group above. Kept so an
++# existing consumer of `smart-deepseek` keeps answering instead of 404ing; it
++# cannot reach V4 Pro either, because the target carries no pool membership and
++# this route names no candidate.
+ [routes.smart-deepseek]
+ id = "smart-deepseek"
+ type = "passthrough"
+ target = "deepseek-deepseek-flash"
+-candidates = ["deepseek-deepseek-v4-pro"]
++candidates = []
+ selection = "declared"
+ context_window = 1048576
+ tool_calling = true
+@@ -2194,9 +2215,11 @@
+ # Flash sibling.
+ [targets.deepseek-deepseek-v4-pro]
+ 
+-# Pool membership label. A route that names this group ranks the whole group before it
+-# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+-groups = ["smart-deepseek"]
++# Deliberately NOT a member of any pool group. Owner directive 2026-11-27: V4 Pro
++# must be unreachable through smart-route on every path, including group membership,
++# because a pool is built from this label and not from the route's candidate list.
++# Still reachable for explicit, deliberate use through direct-deepseek-deepseek-v4-pro
++# and through vc-paid-core / VC_Paid, which are separate consumers and are unchanged.
+ 
+ video = false
+ tool_calling = true

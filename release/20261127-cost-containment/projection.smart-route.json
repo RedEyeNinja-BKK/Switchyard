@@ -1,0 +1,95 @@
+{
+  "deployed_9069fe66": {
+    "target": "direct-google-gemini-4-hydrogen",
+    "candidates": [
+      "direct-google-gemini-3.8-flash",
+      "direct-google-gemini-3.6-flash",
+      "direct-google-gemini-3.5-flash-lite",
+      "direct-google-gemini-3.1-flash-lite",
+      "openrouter-ernie-5_5-flash-preview-free",
+      "openrouter-ling-3_2-flash-free",
+      "openrouter-nemotron-3_5-super-vl-free",
+      "deepseek-deepseek-flash",
+      "openrouter-tencent-hy4-flash",
+      "openrouter-glm-5_3-flash"
+    ],
+    "pool_groups": [
+      "smart-gemini-chat",
+      "smart-openrouter-free",
+      "smart-deepseek-flash",
+      "smart-openrouter-paid"
+    ],
+    "group_members": {
+      "smart-gemini-chat": [
+        "direct-google-gemini-3.1-flash-lite",
+        "direct-google-gemini-3.5-flash-lite",
+        "direct-google-gemini-3.6-flash",
+        "direct-google-gemini-3.8-flash",
+        "direct-google-gemini-4-hydrogen"
+      ],
+      "smart-openrouter-free": [
+        "openrouter-ernie-5_5-flash-preview-free",
+        "openrouter-ling-3_2-flash-free",
+        "openrouter-nemotron-3_5-super-vl-free"
+      ],
+      "smart-deepseek-flash": [
+        "deepseek-deepseek-flash"
+      ],
+      "smart-openrouter-paid": [
+        "openrouter-glm-5_3-flash",
+        "openrouter-tencent-hy4-flash"
+      ]
+    },
+    "effective_candidates": 11,
+    "v4_pro_present": false
+  },
+  "desired_16a97419": {
+    "target": "direct-google-gemini-4-hydrogen",
+    "candidates": [
+      "direct-google-gemini-3.8-flash",
+      "direct-google-gemini-3.6-flash",
+      "direct-google-gemini-3.5-flash-lite",
+      "direct-google-gemini-3.1-flash-lite",
+      "openrouter-ernie-5_5-flash-preview-free",
+      "openrouter-ling-3_2-flash-free",
+      "openrouter-nemotron-3_5-super-vl-free",
+      "openrouter-nemotron-3-ultra-free",
+      "deepseek-deepseek-flash",
+      "openrouter-tencent-hy4-flash",
+      "openrouter-glm-5_3-flash"
+    ],
+    "pool_groups": [
+      "smart-gemini-chat",
+      "smart-openrouter-free",
+      "smart-deepseek-flash",
+      "smart-openrouter-paid"
+    ],
+    "group_members": {
+      "smart-gemini-chat": [
+        "direct-google-gemini-3.1-flash-lite",
+        "direct-google-gemini-3.5-flash-lite",
+        "direct-google-gemini-3.6-flash",
+        "direct-google-gemini-3.8-flash",
+        "direct-google-gemini-4-hydrogen"
+      ],
+      "smart-openrouter-free": [
+        "openrouter-ernie-5_5-flash-preview-free",
+        "openrouter-ling-3_2-flash-free",
+        "openrouter-nemotron-3-ultra-free",
+        "openrouter-nemotron-3_5-super-vl-free"
+      ],
+      "smart-deepseek-flash": [
+        "deepseek-deepseek-flash"
+      ],
+      "smart-openrouter-paid": [
+        "openrouter-glm-5_3-flash",
+        "openrouter-tencent-hy4-flash"
+      ]
+    },
+    "effective_candidates": 12,
+    "v4_pro_present": false
+  },
+  "held": {
+    "nemotron_ultra": "source-qualified only; chat TargetConfig has no targeted third-party-free admission"
+  }
+}

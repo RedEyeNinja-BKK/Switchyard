@@ -1,0 +1,3316 @@
+# Switchyard V6 release candidate. Generated and validated; do not hand-edit.
+schema_version = 1
+
+[llm_clients.deepseek]
+format = "openai_responses"
+base_url = "https://api.deepseek.com"
+locality = "external"
+api_key_env = "SWITCHYARD_DEEPSEEK_API_KEY"
+max_retries = 2
+
+[llm_clients.deepseek_nt]
+format = "openai_responses"
+base_url = "https://api.deepseek.com"
+locality = "external"
+api_key_env = "SWITCHYARD_DEEPSEEK_API_KEY"
+max_retries = 2
+
+[llm_clients.htpc]
+format = "openai_responses"
+base_url = "http://htpc-wsl.tailc8ef7b.ts.net:8889/v1"
+locality = "local"
+api_key_env = "SWITCHYARD_HTPC_API_KEY"
+max_retries = 2
+
+billing = "local"
+
+# The no-thinking local leg. Same transport as `htpc`, separate client on purpose: the loader
+# refuses two targets that name one model on one client with different reasoning policies, and
+# the third tier exists precisely because the thinking leg's budget is the reason it cannot
+# answer a strict-JSON verdict in time.
+[llm_clients.htpc-nt]
+format = "openai_responses"
+base_url = "http://htpc-wsl.tailc8ef7b.ts.net:8889/v1"
+locality = "local"
+api_key_env = "SWITCHYARD_HTPC_API_KEY"
+max_retries = 2
+billing = "local"
+# One physical machine, one account. Both HTPC clients reach the same server and the same
+# weights, so the accounting unit is the machine rather than the client entry.
+quota_group = "htpc"
+
+[llm_clients.thaillm]
+format = "openai_responses"
+base_url = "https://thaillm.or.th/api/v1"
+locality = "external"
+api_key_env = "SWITCHYARD_THAILLM_API_KEY"
+max_retries = 2
+
+[llm_clients.openai]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+locality = "external"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+requires_list_input = true
+max_retries = 2
+
+[llm_clients.openai_nt]
+format = "openai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+locality = "external"
+api_key_env = "SY_OPENAI_OAUTH_TOKEN"
+requires_list_input = true
+max_retries = 2
+
+[llm_clients.openrouter]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+locality = "external"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+max_retries = 2
+
+# The owner OpenRouter account's FREE-model domain.
+#
+# Same credential as the paid client above -- one account, one key -- and a different quota
+# domain. Every target whose model is a :free slug bills against the account's free-model
+# daily cap, which the provider reports as ONE figure for the whole account. Leaving those
+# targets on the paid client would leave that cap uncounted; here, under an account-scoped
+# counter, the cap is counted once and enforced once.
+#
+# A separate client rather than a quota_group on the paid client, because
+# with_daily_allowances attaches a client's account counter to every target it serves: a
+# group there would gate the paid glm/qwen/hy4 targets on the free-model ceiling.
+[llm_clients.openrouter_free]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+locality = "external"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+max_retries = 2
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[llm_clients.comfyninja]
+format = "openai_responses"
+base_url = "https://reninja.tailc8ef7b.ts.net:8446/v1"
+locality = "local"
+api_key_env = "SWITCHYARD_COMFYNINJA_API_KEY"
+max_retries = 2
+
+# ---- completion targets ----
+billing = "local"
+[targets.comfyninja-qwen3_8-27b-q4-mtp]
+video = false
+tool_calling = true
+id = "comfyninja/qwen3.8-27b-q4-mtp"
+llm_client = "comfyninja"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.comfyninja-qwen3_8-27b-q4-mtp-vl]
+video = false
+tool_calling = true
+id = "comfyninja/qwen3.8-27b-q4-mtp-vl"
+llm_client = "comfyninja"
+vision = true
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.deepseek-deepseek-flash]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-deepseek-flash"]
+
+video = false
+tool_calling = true
+id = "deepseek-flash"
+llm_client = "deepseek"
+vision = true
+reasoning_effort = "high"
+
+[targets.deepseek-deepseek-flash-nt]
+video = false
+tool_calling = true
+id = "deepseek-flash"
+llm_client = "deepseek_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[targets.htpc-qwen3_5-9b]
+video = false
+tool_calling = true
+id = "Qwen3.5-9B-Q4_0"
+llm_client = "htpc"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.htpc-qwen3_5-9b-mtp]
+video = false
+tool_calling = true
+id = "Qwen3.5-9B-MTP"
+llm_client = "htpc"
+vision = false
+reasoning_policy = "enabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+# The same local model asked not to think. `llama_cpp_enable_thinking` renders the refusal as
+# `chat_template_kwargs.enable_thinking = false`, which is what the llama.cpp-family server
+# behind this target reads. The policy is on the TARGET, not the route, because a route's
+# terminal leg is resolved from target names: a route-level override could not reach it.
+#
+# The three capability flags are target FACTS, measured on the live deployment rather than
+# copied from the sibling or from a model card; the receipt is
+# `evidence/smart-judge-three-tier-20261123/htpc-nt-wire-evidence.json`. The server reports
+# `modalities = {vision: false, video: false, audio: false}` AND refuses an image and a video
+# request in its own words, which is what `vision = false` and `video = false` state.
+# `tool_calling = true` was called, not inferred: a request with `tools` + `tool_choice =
+# "auto"` and `enable_thinking = false` came back with `finish_reason = "tool_calls"`, a
+# populated `tool_calls` array and `content = null`.
+[targets.htpc-qwen3_5-9b-mtp-nt]
+id = "Qwen3.5-9B-MTP"
+llm_client = "htpc-nt"
+vision = false
+video = false
+tool_calling = true
+reasoning_policy = "disabled"
+reasoning_dialect = "llama_cpp_enable_thinking"
+
+[targets.openai-gpt-6-luna]
+tool_calling = true
+video = false
+id = "gpt-6-luna"
+llm_client = "openai"
+# The Codex backend behind this target refuses a caller-pinned temperature
+# (`Unsupported parameter: temperature`, HTTP 400) -- measured 2026-11-22, and the
+# 400 was masking the leg's real 429 `usage limit has been reached`. The field is
+# omitted so the provider default applies and the true outcome stays visible.
+omit_body_fields = ["temperature"]
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_effort = "high"
+
+[targets.openai-gpt-6-luna-nt]
+tool_calling = true
+video = false
+id = "gpt-6-luna"
+llm_client = "openai_nt"
+# The Codex backend behind this target refuses a caller-pinned temperature
+# (`Unsupported parameter: temperature`, HTTP 400) -- measured 2026-11-22, and the
+# 400 was masking the leg's real 429 `usage limit has been reached`. The field is
+# omitted so the provider default applies and the true outcome stays visible.
+omit_body_fields = ["temperature"]
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+# A primary GROUP, not a paid escalation: the Codex subscription is recovered, a request
+# inside its allowance is not billed per call, and the lane must not be ranked behind the
+# Google free allowance merely because Google states a countable daily budget. No
+# daily_request_limit is declared because the subscription states none this deployment can
+# read; an undeclared budget keeps the group ready instead of inventing an exhaustion.
+free_tier = true
+# Pool membership label. A route that names this group compares the group before it
+# compares any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-openai-nt", "smart-openai-judge"]
+
+[targets.openai-gpt-6-sol]
+tool_calling = true
+video = false
+id = "gpt-6-sol"
+llm_client = "openai"
+vision = true
+extra_body = { store = false, stream = true }
+reasoning_effort = "high"
+
+[targets.openrouter-glm-5_3-flash]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-openrouter-paid"]
+
+video = false
+tool_calling = true
+id = "z-ai/glm-5.3-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "high"
+
+[targets.openrouter-qwen3_7-flash]
+video = false
+tool_calling = true
+id = "qwen/qwen3.7-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+[targets.openrouter-qwen3_8-flash]
+video = false
+tool_calling = true
+id = "qwen/qwen3.8-flash"
+llm_client = "openrouter"
+vision = true
+reasoning_effort = "medium"
+reasoning_dialect = "openai_effort"
+
+# Nemotron 3.5 Super VL is smartfree's R2 leg and its multimodal escalation.
+# MEASURED 2026-11-11 on this free endpoint, per CARRIER:
+#   * inline image (data: URL, 64px and 256px) -> 200, answered "Red"
+#   * remote image URL -> 404 "No endpoints found that support image URLs"
+#   * inline video (data: video/mp4) -> 200; remote video URL -> 404 "No endpoints
+#     found that support video URLs"
+# Video is TRUE with video_carrier = "inline": the carrier axis is what makes this
+# declaration honest. It admits inline video, which this endpoint answers 200, and
+# still refuses a remote video URL locally, which this endpoint answers with a
+# terminal 404. The refusal names the carrier, not the modality.
+[targets.openrouter-nemotron-3_5-super-vl-free]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-openrouter-free"]
+
+id = "nvidia/nemotron-3.5-super-vl:free"
+llm_client = "openrouter_free"
+vision = true
+video = true
+video_carrier = "inline"
+# Measured 2026-11-11: a data: image and a data: video return 200; a remote
+# image_url and a remote video_url both return 404 "No endpoints found that support
+# video URLs". The endpoint reads inline bytes only, for images as well as video, so
+# the remote carrier must be refused here instead of forwarded into a provider 404.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+# Part of the shared free pool: these eight :free legs all draw on the same
+# one-account budget, so they carry the same number.
+daily_request_limit = 1000
+
+[targets.openrouter-ernie-5_5-flash-preview-free]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-openrouter-free"]
+
+id = "baidu/ernie-5.5-flash-preview:free"
+llm_client = "openrouter_free"
+# Baidu ERNIE 5.5 Flash Preview, free tier. Measured 2026-11-11 through the
+# Responses wire this deployment uses: plain 200, tool call 200 with a real
+# function_call item, streaming 200, and image input rejected with
+# "No endpoints found that support image input" (404). So it is declared
+# text-only here -- no vision/video -- and route-level filtering keeps
+# multimodal requests on the Nemotron candidate. Reasoning is emitted by
+# default upstream, hence "enabled"/openrouter_enabled, matching how the other
+# OpenRouter targets carry it.
+# vision/video must be EXPLICIT false: an omitted capability is "undeclared" and
+# the runner treats undeclared vision as permitted, so only an explicit refusal
+# keeps image requests off this text-only target.
+vision = false
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+daily_request_limit = 1000
+[targets.openrouter-ling-3_2-flash-free]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-openrouter-free"]
+
+id = "inclusionai/ling-3.2-flash:free"
+llm_client = "openrouter_free"
+vision = true
+video = false
+image_carrier = "inline"
+tool_calling = true
+# Thinking is switchable on Ling; this lane disables it because the 2026-11-16
+# measurements showed ~17.5 s with thinking versus ~1.4 s without for the same
+# prompt, and a 430k-token smartfree request spent ~120 s on Ling. The native
+# OpenRouter Ling row is unaffected; this is the Switchyard free-ladder lane.
+reasoning_policy = "disabled"
+reasoning_dialect = "openrouter_enabled"
+daily_request_limit = 1000
+[targets.thaillm-openthaigpt]
+video = false
+tool_calling = true
+id = "openthaigpt-thaillm-8b-instruct-v7.2"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-qwen3_5-9b]
+video = false
+tool_calling = false
+id = "qwen3.5-9b"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-qwen3_6-35b-a3b]
+video = false
+tool_calling = false
+id = "qwen3.6-35b-a3b"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-thalle]
+video = false
+tool_calling = true
+id = "thalle-0.2-thaillm-8b-fa"
+llm_client = "thaillm"
+vision = false
+
+[targets.thaillm-typhoon]
+video = false
+tool_calling = true
+id = "typhoon-s-thaillm-8b-instruct"
+llm_client = "thaillm"
+vision = false
+
+# ---- direct target routes (for independent qualification) ----
+[routes.direct-comfyninja-qwen3_8-27b-q4-mtp]
+video = false
+id = "direct-comfyninja-qwen3_8-27b-q4-mtp"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q4-mtp"
+candidates = []
+context_window = 179712
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-comfyninja-qwen3_8-27b-q4-mtp-vl]
+video = false
+id = "direct-comfyninja-qwen3_8-27b-q4-mtp-vl"
+type = "passthrough"
+target = "comfyninja-qwen3_8-27b-q4-mtp-vl"
+candidates = []
+context_window = 152832
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-deepseek-deepseek-flash]
+video = false
+id = "direct-deepseek-deepseek-flash"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-htpc-qwen3_5-9b]
+video = false
+id = "direct-htpc-qwen3_5-9b"
+type = "passthrough"
+target = "htpc-qwen3_5-9b"
+candidates = []
+context_window = 81920
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-htpc-qwen3_5-9b-mtp]
+video = false
+id = "direct-htpc-qwen3_5-9b-mtp"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+candidates = []
+context_window = 81920
+tool_calling = true
+reasoning = true
+vision = false
+
+# The third tier's own alias, so the leg can be exercised directly instead of only through a
+# whole cascade. `reasoning = false` states the contract the target enforces. The capability
+# flags repeat the target's facts because the load validates route against target, and a route
+# has to say explicitly what it narrows.
+[routes.direct-htpc-qwen3_5-9b-mtp-nt]
+id = "direct-htpc-qwen3_5-9b-mtp-nt"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp-nt"
+candidates = []
+context_window = 81920
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+[routes.direct-openai-gpt-6-luna]
+video = false
+id = "direct-openai-gpt-6-luna"
+type = "passthrough"
+target = "openai-gpt-6-luna"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openai-gpt-6-luna-nt]
+video = false
+id = "direct-openai-gpt-6-luna-nt"
+type = "passthrough"
+target = "openai-gpt-6-luna-nt"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openai-gpt-6-sol]
+video = false
+id = "direct-openai-gpt-6-sol"
+type = "passthrough"
+target = "openai-gpt-6-sol"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-glm-5_3-flash]
+video = false
+id = "direct-openrouter-glm-5_3-flash"
+type = "passthrough"
+target = "openrouter-glm-5_3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-qwen3_7-flash]
+video = false
+id = "direct-openrouter-qwen3_7-flash"
+type = "passthrough"
+target = "openrouter-qwen3_7-flash"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-qwen3_8-flash]
+video = false
+id = "direct-openrouter-qwen3_8-flash"
+type = "passthrough"
+target = "openrouter-qwen3_8-flash"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+
+[routes.direct-openrouter-nemotron-3_5-super-vl-free]
+id = "direct-openrouter-nemotron-3_5-super-vl-free"
+type = "passthrough"
+target = "openrouter-nemotron-3_5-super-vl-free"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-ernie-5_5-flash-preview-free]
+video = false
+vision = false
+id = "direct-openrouter-ernie-5_5-flash-preview-free"
+type = "passthrough"
+target = "openrouter-ernie-5_5-flash-preview-free"
+candidates = []
+context_window = 1024000
+tool_calling = true
+reasoning = true
+
+[routes.direct-openrouter-ling-3_2-flash-free]
+video = false
+id = "direct-openrouter-ling-3_2-flash-free"
+type = "passthrough"
+target = "openrouter-ling-3_2-flash-free"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+image_carrier = "inline"
+
+[routes.direct-deepseek-deepseek-flash-nt]
+video = false
+id = "direct-deepseek-deepseek-flash-nt"
+type = "passthrough"
+target = "deepseek-deepseek-flash-nt"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+
+[routes.direct-thaillm-openthaigpt]
+video = false
+id = "direct-thaillm-openthaigpt"
+type = "passthrough"
+target = "thaillm-openthaigpt"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-qwen3_5-9b]
+video = false
+id = "direct-thaillm-qwen3_5-9b"
+type = "passthrough"
+target = "thaillm-qwen3_5-9b"
+candidates = []
+context_window = 32768
+tool_calling = false
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-qwen3_6-35b-a3b]
+video = false
+id = "direct-thaillm-qwen3_6-35b-a3b"
+type = "passthrough"
+target = "thaillm-qwen3_6-35b-a3b"
+candidates = []
+context_window = 32768
+tool_calling = false
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-thalle]
+video = false
+id = "direct-thaillm-thalle"
+type = "passthrough"
+target = "thaillm-thalle"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+[routes.direct-thaillm-typhoon]
+video = false
+id = "direct-thaillm-typhoon"
+type = "passthrough"
+target = "thaillm-typhoon"
+candidates = []
+context_window = 16384
+tool_calling = true
+reasoning = true
+vision = false
+
+# ---- Tencent Hy4 Flash: the metered OpenRouter failover for `smart` (owner, 2026-11-25) ----
+# Native id `tencent/hy4-flash`, advertised by OpenRouter at 1,048,576 tokens, text and
+# image input, tools accepted, $0.035/$0.1405 per million tokens (upstream list read
+# 2026-11-25). The model advertises the OpenRouter reasoning switch (`reasoning`,
+# `include_reasoning`) and no `reasoning_effort`, so the dialect below is the same
+# `openrouter_enabled` form Ling and Nemotron already carry, not the effort form GLM uses.
+[targets.openrouter-tencent-hy4-flash]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-openrouter-paid"]
+
+id = "tencent/hy4-flash"
+llm_client = "openrouter"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[routes.direct-openrouter-tencent-hy4-flash]
+video = false
+id = "direct-openrouter-tencent-hy4-flash"
+type = "passthrough"
+target = "openrouter-tencent-hy4-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+
+# ---- prime primitives ----
+# `smart`: DeepSeek Flash at rank 1, Tencent Hy4 Flash as the metered failover, per the
+# owner's 2026-11-25 correction. The former GLM and Qwen peers are removed from THIS
+# route only; their targets and direct aliases stay registered and addressable, so no
+# unrelated consumer loses a model.
+#
+# Hy4 is a terminal TIER rather than a candidate, deliberately. A candidate is a peer:
+# with declared order it would still be consulted after DeepSeek failed for ANY reason,
+# including a malformed request or a refused balance. A terminal tier under
+# `terminal_policy = "availability"` is spendable only on allowance exhaustion, a closed
+# minute window, a 429, a retryable 5xx, a transport fault, an unavailable leg or an
+# attempt timeout -- so a defect in the request never becomes a paid call.
+#
+# Advertised context is 1000000 (owner). Both legs hold far more than that, so the
+# promise is conservative rather than aspirational. Turnstone keeps its own 262144 on
+# this alias by the owner's decision and is NOT widened here.
+[routes.smart]
+id = "smart"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = []
+terminal_fallback = [["openrouter-tencent-hy4-flash"]]
+terminal_policy = "availability"
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "inherit"
+
+# ---------------------------------------------------------------------
+# smart-nt: equal primary groups, then local, then the metered terminal
+# ---------------------------------------------------------------------
+# The primary pool is two GROUPS of unequal size: smart-gemini-bounded holds four Google
+# leaves and smart-openai-nt holds the OpenAI subscription leaf. Grouping is what keeps the
+# four leaves from being four votes: the group is chosen before any leaf fact, so a group's
+# leaf count cannot become provider priority and a countable Google daily budget cannot
+# outrank an allowance this deployment cannot count.
+#
+# The primary groups are EQUAL, not a sequence. Order between them follows readiness, measured
+# completion rate and measured latency, with a rotation floor when the evidence cannot separate
+# them: no fixed 50/50 split and no mandatory Google-first ranking.
+#
+# `terminal_policy = "allowance_only"` is what the walk out of the pool is judged by: the
+# local tier is entered only when BOTH primary allowance domains are EXHAUSTED, on the
+# provider's own accounting. The strict reading is deliberate. `quota_only` also accepted a
+# closed minute window and a bare 429, and those are not exhaustion: the minute regains room
+# by itself, and an unclassified 429 may be a concurrency limit or a policy answer. It also
+# means no untried sibling can be explained away by another leg's failure, because exhaustion
+# is not credential-scoped -- every capable, unblocked primary leg must have been attempted
+# and must have reported exhaustion.
+#
+# The metered NT terminal behind the local tier carries its own boundary ("availability"),
+# because it exists for the case where the allowance is exhausted AND the local tier has no
+# eligible capacity. A rejected credential, a refused balance, a context-window refusal, an
+# empty answer or a policy 400 opens neither: those are facts about the deployment or the
+# request.
+[routes.smart-nt]
+id = "smart-nt"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemma-4-31b-it",
+    "direct-google-gemma-4-26b-a4b-it",
+    "openai-gpt-6-luna-nt",
+]
+selection = "grouped"
+pool_groups = ["smart-gemini-bounded", "smart-openai-nt"]
+# Local and metered stay OUT of the ranked pool. A terminal leg written as a candidate would
+# be ranked with its peers and would serve whenever the pool was busy, which is the escalation
+# this route exists to prevent; naming it here means the exhaustion rule is the only way in.
+terminal_fallback = [
+    ["htpc-qwen3_5-9b-mtp-nt"],
+    ["deepseek-deepseek-flash-nt"],
+]
+terminal_policy = "allowance_only"
+# One value per tier, and `terminal_policies[i]` governs the boundary LEAVING tier i: the
+# route-level policy above decides entry into tier 1, and this list decides whether tier 2 may
+# be consulted once tier 1 failed. So the local tier is entered on allowance evidence only, and
+# the metered tier is entered when local itself fails for a capacity reason -- a local outage is
+# not allowance evidence, and demanding it there would leave tier 2 unreachable in practice
+# while the "availability" value sat in a slot no walk ever reads.
+terminal_policies = ["availability", "quota_only"]
+context_window = 65536
+tool_calling = true
+reasoning = true
+# vision stays false although the OpenAI primary group can read images. No image request has
+# been measured through this route, and declaring the capability on the strength of a
+# neighbour route's measurement would promise a path with no receipt. Recorded as a gap.
+vision = false
+
+# ---------------------------------------------------------------------
+# smart-judge: equal primary groups, local only after the allowances are gone
+# ---------------------------------------------------------------------
+# A judge verdict is a short, strict-JSON answer over a bounded prompt. The lane is built from
+# the two Gemma 4 targets the project serves inside its free allowance plus the OpenAI
+# subscription leg, as two equal primary GROUPS: smart-gemini-judge (both Gemma target ids) and
+# smart-openai-judge (the same Luna NT target smart-nt uses). Grouping keeps the two Gemma
+# leaves from outvoting one OpenAI leaf, and keeps a countable Google budget from deciding the
+# order between providers.
+#
+# The local no-thinking leg is the only terminal tier, entered when both primary allowance
+# domains are exhausted with evidence. It is deliberately NOT a fit escalation: a prompt too
+# large for a primary leg is refused with a typed fit refusal rather than routed to the local
+# model, which is a loss of the previous fit-escalation behaviour and is disclosed as such.
+#
+# Advertised input ceiling is the binding target limit (16,000 TPM padded by 1,300 per mille),
+# not the 262,144 model window: a judge prompt sized to the window would be refused by
+# admission on every large verdict.
+[routes.smart-judge]
+id = "smart-judge"
+type = "passthrough"
+target = "direct-google-gemma-4-26b-a4b-it"
+candidates = ["direct-google-gemma-4-31b-it", "openai-gpt-6-luna-nt"]
+selection = "grouped"
+pool_groups = ["smart-gemini-judge", "smart-openai-judge"]
+terminal_fallback = [["htpc-qwen3_5-9b-mtp-nt"]]
+terminal_policy = "allowance_only"
+context_window = 12307
+# The lane serves the judge's tool-bearing turns; a request that needs vision or a
+# reasoning control is not this lane's work.
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+[routes.smartlocal]
+id = "smartlocal"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+candidates = ["comfyninja-qwen3_8-27b-q4-mtp-vl"]
+# Owner-set advertised maximum = the R2 escalation leg, NOT the R1 capacity.
+# R1 (HTPC) still serves 81920 and the switch below is unchanged at >61440
+# estimated input tokens. context_window is a projection here: a passthrough
+# route performs no admission check against it, so this does not widen what
+# the route will execute. No 152832-token request has been measured.
+context_window = 152832
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "medium"
+escalation_max_input_tokens = 61440
+escalation_target = "comfyninja-qwen3_8-27b-q4-mtp-vl"
+
+[routes.smartlocal-nt]
+id = "smartlocal-nt"
+type = "passthrough"
+target = "htpc-qwen3_5-9b-mtp"
+candidates = ["comfyninja-qwen3_8-27b-q4-mtp-vl"]
+# Same projection as smartlocal, with thinking disabled.
+context_window = 152832
+tool_calling = true
+reasoning = true
+vision = true
+route_reasoning_policy = "none"
+escalation_max_input_tokens = 61440
+escalation_target = "comfyninja-qwen3_8-27b-q4-mtp-vl"
+
+# r1 = ERNIE 5.5 Flash Preview (free), r2 = Nemotron 3.5 Super VL (free).
+# Crouton Alpha was retired upstream on 2026-11-11 (its provider tombstone
+# redirects to meta/muse-ember, which is PAID), so the free lane was rebuilt on
+# two free models instead of one. ERNIE has the larger context (1,024,000) and
+# is text-only; Nemotron is smaller (1,000,000) and carries the vision leg.
+#
+# 2026-11-19: `openrouter/free` is appended as the terminal leg on the GLOBAL
+# credential, so a request still has an eligible zero-price model after the
+# three named free models are exhausted. It spends the same account-wide free
+# allowance and never pays; once that allowance is gone this route fails
+# rather than escalating to a metered model. The
+# route keeps context_window = 1000000 so both fit. Route::execute drops the
+# text-only ERNIE target before dispatch, so an image request lands on Nemotron
+# instead of being sent to a model that cannot read it. No paid model is ever a
+# candidate.
+#
+# Vision is true because Nemotron serves INLINE images (data: URLs), proven live
+# through this route on 2026-11-11 (driver logged model=nemotron, answer "Red").
+# Remote image URLs are not fetchable on this free endpoint (upstream 404), so the
+# route declares image_carrier = "inline". Video follows the same measurement:
+# inline video is 200 on this endpoint family, remote video URL is 404, so the route
+# declares video = true with video_carrier = "inline" and refuses a remote video URL
+# locally instead of emitting a late provider 404.
+[routes.smartfree]
+id = "smartfree"
+type = "passthrough"
+target = "openrouter-ernie-5_5-flash-preview-free"
+candidates = ["openrouter-ling-3_2-flash-free", "openrouter-nemotron-3_5-super-vl-free", "openrouter-openrouter-free"]
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+image_carrier = "inline"
+route_reasoning_policy = "inherit"
+# Under context pressure the wider, faster Nemotron leg is offered first. Ling
+# was measured at ~120 s on a 430k-token request, while Nemotron handled the
+# same context in seconds before Ling joined the ladder. Below the threshold
+# the owner's R1 ERNIE -> R2 Ling -> R3 Nemotron order is unchanged.
+escalation_max_input_tokens = 200000
+escalation_target = "openrouter-nemotron-3_5-super-vl-free"
+# Owner-approved free terminal (2026-11-26 direction): the OpenRouter free
+# ladder above is unchanged and is tried first; only when every OR leg is
+# ineligible or exhausted does the request reach the owner's Google free
+# tier. It is a separate stage, not a fourth OR candidate, so the two
+# accounts' daily counters are never conflated and a free->paid crossing is
+# not created. Vision/video requests skip it: that target declares both
+# false, and the terminal stage is subject to the same per-target fit test.
+terminal_fallback = [["direct-google-gemini-3.5-flash-lite"]]
+terminal_policy = "availability"
+
+
+
+[targets.direct-htpc-laya]
+id = "laya-rl-agent"
+llm_client = "htpc"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "http://100.105.20.36:8011"
+decision_api_key_env = "SWITCHYARD_LAYA_API_KEY"
+
+[targets.direct-htpc-jev-style]
+id = "jev-style-0.8b-decision-v3"
+llm_client = "htpc"
+decision_transport = "system_one"
+decision_path = "/v1/systemone"
+decision_base_url = "http://100.105.20.36:8765"
+decision_api_key_env = "SWITCHYARD_JEV_STYLE_API_KEY"
+
+[targets.direct-openrouter-span-01-lite]
+id = "respan/span-01-lite"
+llm_client = "openrouter"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "https://openrouter.ai"
+decision_api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+supported_types = { noul = true, choice = false, score = false }
+state_forms = { plain_string = true, structured = false }
+
+# ---- decision lanes (order is configuration, from the requalification) ----
+# ---- decision DIRECT foundations -> SMART families -> TIER policy ----
+# No default_decision_lane is declared. The field only accepts a configured
+# [decision_lanes.*] name, and the previous value named the COMPOSITION
+# tier1-decision, which the binary rejects at load time. It sat inside a
+# decision target's supported_types map, where it was inert. /v1/decisions
+# requires an explicit `model`, so nothing falls back to a default lane.
+[decision_lanes.smartfree-decision]
+targets = ["direct-openrouter-span-01-lite"]
+
+[decision_lanes.smartlocal-decision]
+targets = ["direct-htpc-jev-style", "direct-htpc-laya"]
+
+# GENERATED: tier1-decision COMPOSES the two SMART policy lanes above.
+# It does not copy their targets, so each family stays independently
+# addressable and a family change is inherited rather than duplicated.
+[decision_lane_composition.tier1-decision]
+children = ["smartfree-decision", "smartlocal-decision"]
+
+# The owner's provider-neutral selector. It composes the three qualified owner
+# decision families and lets request fit decide which of their PHYSICAL targets may
+# serve, then enters that eligible pool at a rotating position so no declared
+# position - and therefore no provider - is offered the request first.
+#
+# This is not tier1-decision renamed: tier1-decision stays ordered over its two
+# children for existing callers, while this lane tests every child's candidates
+# against the request before anything is dispatched.
+#
+# `google-decision` is a constituent even though it refuses a bare-string state and
+# therefore serves only structured requests. That is request fit, not a preference:
+# it is excluded when it cannot serve, and equally eligible when it can.
+[decision_lane_composition.smart-decision]
+children = ["smart-gemini-decision", "smartlocal-decision", "smartfree-decision"]
+selection = "capability_first"
+
+
+[targets."direct-openrouter-stephen-span-01-lite"]
+id = "respan/span-01-lite"
+llm_client = "openrouter_stephen"
+decision_transport = "open_router_alpha"
+decision_path = "/api/alpha/decisions"
+decision_base_url = "https://openrouter.ai"
+decision_api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+supported_types = { noul = true, choice = false, score = false }
+state_forms = { plain_string = true, structured = false }
+
+# ---- ST_Decisions: Stephen-only decision lane (additive) ----
+# Mirrors smartfree-decision's two targets but uses Stephen's OpenRouter
+# credential exclusively. Global openrouter credential is never a fallback.
+[decision_lanes.ST_Decisions]
+targets = ["direct-openrouter-stephen-span-01-lite"]
+
+# The Google Decisions lane. Kept separate from smartfree-decision and
+# smartlocal-decision: those two are the local policy lanes that tier1-decision
+# composes, and adding a provider to either would silently change what that composition
+# means. This lane is addressable on its own and is not in any composition.
+[decision_lanes.google-decision]
+targets = ["direct-google-gemini-decision-1"]
+
+# ---- embeddings and reranking ----
+[capability_clients.embedding-local]
+format = "openai_embeddings"
+base_url = "https://reninja.tailc8ef7b.ts.net:8448"
+model = "Qwen3-Embedding-0.6B"
+
+# Free embedding lane on the GLOBAL credential. Nemotron's free embed model is not
+# listed in /api/v1/models (it is an alpha/programme model) but answers on the
+# standard embeddings wire. Verified 2026-11-11 on both credentials: 4096 dims,
+# L2-normalised, byte-identical vectors across credentials (cosine 1.000000).
+# The contract is nevertheless named for THIS lane: config requires every
+# embedding contract to belong to exactly one client, and this client holds the
+# global credential, which has its own free-tier cap. Vectors are comparable
+# with ST_Embed's, so a consumer may reuse an index across the two.
+[capability_clients.embedding-free-nemotron]
+privacy = "third_party_free"
+format = "openai_embeddings"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-embed-8b:free"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capability_clients.reranker-local]
+format = "cohere_jina_rerank"
+base_url = "https://reninja.tailc8ef7b.ts.net:8449"
+model = "qwen3-reranker-0.6b-q8_0"
+timeout_seconds = 120
+
+# Free rerank lane on the GLOBAL credential. Same model family as Stephen's
+# ST_Rerank and the same scores cross-credential; measured 0.85s for 20 documents
+# where smartlocal-rerank took 11.0s.
+[capability_clients.reranker-free]
+privacy = "third_party_free"
+format = "cohere_jina_rerank"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-rerank-8b:free"
+api_key_env = "SWITCHYARD_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+# Google's own embedding model, on the GEMINI credential. This ADAPTER sends one content
+# per request: model named in the path, key presented as x-goog-api-key. A batch is a
+# bounded fan-out of single-input calls, so max_batch below is a call budget rather than a
+# payload limit.
+#
+# Google's API does have bulk forms — synchronous `:batchEmbedContents` (a `requests`
+# array) and an asynchronous Batch API. Neither is used here: their entitlement on this
+# Free project and their response shapes are unqualified, and a fan-out that already
+# preserves input order does not need a second, unproven wire. That is a decision about
+# this adapter, not a statement about what Google supports.
+#
+# No task_type is declared, which asks for the model's generic space. RETRIEVAL_DOCUMENT
+# and RETRIEVAL_QUERY each produce a DIFFERENT space, so either would need its own
+# capability id and its own contract rather than being switched underneath this one.
+#
+# Quota: 100 RPM / 30,000 input TPM / 1,000 RPD are the owner's Free-tier LIMITS for this
+# physical model, taken from the owner's AI Studio record and recorded in
+# docs/evidence/gemini-r3/2026-11-21/OWNER-CONTROLLING-ALL-FREE-CAPABILITIES.md (the 26-row
+# table, columns RPM / input TPM / RPD). They are enforced per physical call.
+#
+# Those denominators are rate CEILINGS for the account, project and tier at capture, not
+# remaining allowance, and this deployment's own counter is not a provider balance: the
+# ledger records what this process spent today, which is a lower bound on what the project
+# spent. They are also project- and model-scoped, so 1,000 is not a share of one combined
+# daily pool shared with the chat models. Minute and day counters are keyed on (quota group,
+# physical model) and charged once per physical call, so a 16-input batch spends 16 of the
+# day's 1,000.
+[capability_clients.embedding-google]
+format = "google_embed_content"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-embedding-001"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 100
+input_tokens_per_minute = 30000
+daily_request_limit = 1000
+
+# The Embedding 2 client. Its own counters, independent of 001 — two different physical
+# models on one project, so two counters, not one shared pool.
+#
+# HELD at load until the project-key path and the authenticated response shape are
+# qualified (see the capability block below). Held still validates this client, and the
+# budgets are declared now because a held lane that becomes serving must not become
+# serving with an invented quota. Nothing can dispatch while the capability is held, so
+# these limits cost nothing until qualification removes the hold.
+#
+# QUALIFIED 2026-11-22: the hold is lifted for text after four authenticated calls.
+#
+# Quota: the same owner-recorded limits as 001 — 100 RPM / 30,000 input TPM / 1,000 RPD —
+# with the same caveat: rate ceilings at capture, not remaining allowance, and this
+# deployment's counter is a local ledger rather than a provider balance.
+[capability_clients.embedding-google2]
+format = "google_embed_content_v2"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-embedding-2"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 100
+input_tokens_per_minute = 30000
+daily_request_limit = 1000
+
+[capabilities.smartlocal-embedding]
+id = "smartlocal-embedding"
+target = "embedding-local"
+contract = "local-embedding-space:v1"
+dimensions = 1024
+normalization = "L2"
+max_batch = 64
+
+# Replaces the retired 1024-dim free embedding lane (its upstream
+# liquid/lfm-2.5-embedding-350m:free model is no longer in the catalogue and no
+# consumer referenced the lane).
+[capabilities.smartfree-embedding]
+id = "smartfree-embedding"
+target = "embedding-free-nemotron"
+contract = "openrouter-embedding-space:nemotron3.5-embed8b-v1"
+dimensions = 4096
+normalization = "L2"
+max_batch = 64
+
+[capabilities.smartlocal-rerank]
+id = "smartlocal-rerank"
+target = "reranker-local"
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+[capabilities.smartfree-rerank]
+id = "smartfree-rerank"
+target = "reranker-free"
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+# Published figures for the architecture, measured for the value space: gemini-embedding-001
+# declares 3,072 output dimensions and a 2,048-token input limit. Both are declared so the
+# surface refuses an input past the limit instead of truncating it.
+#
+# `normalization = "L2"` is now MEASURED, not assumed: the qualification call on
+# 2026-11-22 returned 3,072 finite values with an L2 norm of 1.000000, so the surface
+# verifies that property on every response instead of leaving it an unproven claim.
+[capabilities.gemini-embedding]
+id = "gemini-embedding"
+target = "embedding-google"
+contract = "google-embedding-space:gemini-embedding-001-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 16
+max_input_tokens = 2048
+
+# Embedding 2 is a different codec and a different value space, not a newer version of the
+# lane above: width is a request field here, a task travels as a text prefix instead of
+# task_type, and vectors are not comparable with 001 or with the 1024-dim Qwen index.
+#
+# QUALIFIED 2026-11-22 on the project key, text only, four physical `:embedContent` calls:
+# one single-input call with `output_dimensionality: 3072` and one caller batch of two
+# inputs that fanned out to two calls. Every response was an authenticated 2xx with
+# `embedding.values` of exactly 3,072 finite numbers and L2 norm 1.000000, and the two
+# batch vectors were distinct and in input order. The hold has been lifted for TEXT ONLY.
+#
+# Still unqualified and therefore unclaimed: `:batchEmbedContents` (the codec uses bounded
+# fan-out instead), media carriers (image/audio/video/PDF would need their own evidence),
+# and any width other than 3,072 (a narrower lane would be a separate capability id with
+# its own contract, because vectors of different widths cannot share an index).
+#
+# Text only. This codec sends content.parts[].text and nothing else; it does not accept
+# images, audio, video or PDF, and nothing here should be read as claiming that it does.
+[capabilities.gemini-embedding-2]
+id = "gemini-embedding-2"
+target = "embedding-google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+
+# =====================================================================
+# GOOGLE SPEECH (TTS) AND TRANSCRIPTION — native typed lanes
+# =====================================================================
+# These are not chat lanes with a different output type. A speech lane sends text plus a
+# voice and receives one raw-PCM blob; a transcription lane sends a typed audio payload and
+# receives text. Each carries its own budget, scoped per physical model.
+#
+# QUALIFIED 2026-11-22, one authenticated call per lane against the live API: all four speech
+# lanes answered 200 with a RIFF/WAVE container reported at 24 kHz and voice Kore, and the
+# transcription lane answered 200 with the spoken sentence returned exactly. The four speech
+# bodies were 182,444–201,672 bytes and the transcription measured 3.931 s for a 188,730-byte
+# container, which is the same duration the headers imply to the millisecond — the container
+# written here and the container measured there agree. What that establishes is that each
+# wire works end to end. It does not establish output quality, latency distribution, a
+# provider limit, or that these four engines sound alike.
+#
+# The four TTS models each carry 3 RPM / 10,000 input TPM / 10 RPD and the transcription
+# model 3 RPM / 10,000 input TPM / 25 RPD. Those are the owner's Free-tier limits for these
+# physical models, from the same 26-row table
+# (docs/evidence/gemini-r3/2026-11-21/OWNER-CONTROLLING-ALL-FREE-CAPABILITIES.md), enforced
+# per physical call. They are rate ceilings at capture, not remaining allowance. One call per
+# model proved nothing about where the ceilings actually bite — no lane reached its per-minute
+# or per-day bound — so the enforcement is real but its headroom is unmeasured.
+#
+# Held is inventory, never a fallback: a request naming an unqualified lane is refused locally
+# with zero Google egress, and no request may be answered from a chat model instead.
+#
+# `audio_format = "wav"` means: the engine returns PCM, and this surface writes the RIFF
+# header itself. `pcm` returns the same samples bare. A compressed container is refused
+# rather than mislabelled, because this deployment ships no encoder.
+[capability_clients.speech-2-5-flash]
+format = "google_speech"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-2.5-flash-preview-tts"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 3
+input_tokens_per_minute = 10000
+daily_request_limit = 10
+
+[capability_clients.speech-3-1-flash]
+format = "google_speech"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.1-flash-tts-preview"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 3
+input_tokens_per_minute = 10000
+daily_request_limit = 10
+
+[capability_clients.speech-3-8-flash-lite]
+format = "google_speech"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.8-flash-lite-tts"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 3
+input_tokens_per_minute = 10000
+daily_request_limit = 10
+
+[capability_clients.speech-3-8-flash]
+format = "google_speech"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.8-flash-tts"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 3
+input_tokens_per_minute = 10000
+daily_request_limit = 10
+
+[capability_clients.transcribe-3-5]
+format = "google_transcribe"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.5-transcribe"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 3
+input_tokens_per_minute = 10000
+daily_request_limit = 25
+
+# One capability per physical model, so a caller chooses the model and each budget stays
+# attached to the model that spends it.
+#
+# No `contract` is declared. A contract exists to say that two outputs are comparable — that
+# is what it means for an embedding space — and audio from four different engines is not a
+# shared space. The audio's measurable properties are declared instead, per capability:
+# audio_format and audio_sample_rate, which the surface enforces on the response rather than
+# asking the caller to trust them. Declaring a shared contract here would have claimed
+# comparability that nothing verifies, and the loader's own uniqueness rule refused it
+# outright, which is the right answer.
+[capabilities.gemini-tts-2-5-flash]
+id = "gemini-tts-2.5-flash"
+target = "speech-2-5-flash"
+voice = "Kore"
+audio_format = "wav"
+audio_sample_rate = 24000
+max_input_tokens = 8192
+
+[capabilities.gemini-tts-3-1-flash]
+id = "gemini-tts-3.1-flash"
+target = "speech-3-1-flash"
+voice = "Kore"
+audio_format = "wav"
+audio_sample_rate = 24000
+max_input_tokens = 8192
+
+[capabilities.gemini-tts-3-8-flash-lite]
+id = "gemini-tts-3.8-flash-lite"
+target = "speech-3-8-flash-lite"
+voice = "Kore"
+audio_format = "wav"
+audio_sample_rate = 24000
+max_input_tokens = 8192
+
+[capabilities.gemini-tts-3-8-flash]
+id = "gemini-tts-3.8-flash"
+target = "speech-3-8-flash"
+voice = "Kore"
+audio_format = "wav"
+audio_sample_rate = 24000
+max_input_tokens = 8192
+
+# `audio/wav` only, and 300 seconds: the duration bound is what spends the 10,000-token
+# minute window at the 32-input-tokens-per-second conversion this deployment assumes
+# (300 s x 32 = 9,600 tokens). That conversion is an assumption, not a measurement —
+# if the provider charges audio differently, the duration bound is what would have to
+# change with it. max_audio_bytes is the inline request ceiling; 15 MiB of raw audio stays
+# inside Google's 20 MB inline request cap once base64 inflates it by four thirds.
+# Omitted deliberately: a declared max_input_tokens, because the enforced token bound here
+# is duration, not bytes.
+[capabilities.gemini-transcribe]
+id = "gemini-transcribe"
+target = "transcribe-3-5"
+task_prefix = "Transcribe this recording verbatim."
+max_audio_seconds = 300
+max_audio_bytes = 15728640
+
+# =====================================================================
+# GOOGLE LIVE — BidiGenerateContent over WebSocket (stateful sessions)
+# =====================================================================
+# All six Live variants speak Google's stateful BidiGenerateContent WebSocket
+# protocol (wss://generativelanguage.googleapis.com/ws/...BidiGenerateContent).
+# The first frame is a BidiGenerateContentSetup built from the capability
+# declaration; the caller never supplies one. "Unlimited" RPM/RPD means no finite
+# provider limit displayed for this project — not infinite concurrency, duration,
+# or sessions. Local bounded resource control is applied separately per owner
+# instruction: concurrent sessions, handshake deadline, buffer/frames, audio sizes
+# and backpressure are bounded at this surface.
+#
+# Model-specific setup (response modalities, system instruction, thinking control)
+# is declared per capability so the caller cannot change the session shape. The
+# thinking control differs by family and is NOT interchangeable: Gemini 2.5 takes
+# generationConfig.thinkingConfig.thinkingBudget, Gemini 3.x rejects thinkingBudget
+# (close 1007 "Thinking budget is not supported for this model") and takes
+# thinkingLevel instead. The Google API key travels only in the upstream WebSocket
+# URL's `key=` query parameter; it is never rendered into client-visible frames or
+# logs.
+#
+# MEASURED 2026-11-22 (direct BidiGenerateContent, one setup per variant). Google
+# delivers JSON in BINARY WebSocket frames; a client must decode them as UTF-8.
+#   gemini-3.5-live-translate-preview   [TEXT]                        setupComplete
+#   gemini-3.5-transcribe-live          [TEXT]                        setupComplete
+#   gemini-3.8-live                     [AUDIO]                       setupComplete + audio + outputTranscription
+#                                       [TEXT] / [AUDIO,TEXT] / thinkingBudget -> close 1007
+#   gemini-3.8-live-extended-thinking   [AUDIO] + thinkingLevel HIGH  setupComplete + audio + outputTranscription
+#                                       thinkingLevel MINIMAL         -> close 1007 (level not published)
+#                                       thinkingBudget                 -> close 1007
+#   gemini-2.5-flash-native-audio-latest [AUDIO]                      setupComplete + audio
+#   gemini-3.1-flash-live-preview       [AUDIO]                       setupComplete + audio
+#                                       [TEXT] / [AUDIO,TEXT]         -> close 1007
+
+# --- Resolved IDs: qualified model IDs, serving ---
+# Gemini 3.5 Live Translate — owner-qualified ID, unlimited RPD, 20,000 input TPM.
+[capability_clients.live-3-5-translate]
+format = "google_live"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.5-live-translate-preview"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 300
+
+[capabilities.gemini-live-3-5-translate]
+id = "gemini-live-3-5-translate"
+target = "live-3-5-translate"
+response_modalities = ["TEXT"]
+system_instruction = "You translate between languages. Respond only with the translation."
+thinking_budget = 0
+
+# Gemini 3.5 Transcribe Live — owner-qualified ID, unlimited RPD, 20,000 input TPM.
+[capability_clients.live-3-5-transcribe]
+format = "google_live"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.5-transcribe-live"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 300
+
+[capabilities.gemini-live-3-5-transcribe]
+id = "gemini-live-3-5-transcribe"
+target = "live-3-5-transcribe"
+response_modalities = ["TEXT"]
+system_instruction = "Transcribe the audio verbatim."
+
+# Gemini 3.8 Live — owner-qualified ID, unlimited RPD, 65,000 input TPM.
+[capability_clients.live-3-8-flash]
+format = "google_live"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.8-live"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 300
+
+[capabilities.gemini-live-3-8-flash]
+id = "gemini-live-3-8-flash"
+target = "live-3-8-flash"
+response_modalities = ["AUDIO"]
+system_instruction = "You are a helpful, live conversational assistant."
+
+# Gemini 3.8 Live Extended Thinking — owner-qualified ID, unlimited RPD, 65,000 input TPM.
+[capability_clients.live-3-8-flash-extended-thinking]
+format = "google_live"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.8-live-extended-thinking"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 300
+
+[capabilities.gemini-live-3-8-flash-extended-thinking]
+id = "gemini-live-3-8-flash-extended-thinking"
+target = "live-3-8-flash-extended-thinking"
+response_modalities = ["AUDIO"]
+system_instruction = "Think through the problem before answering."
+thinking_level = "HIGH"
+
+# --- Resolved IDs: qualified model IDs, serving, measured 2026-11-22 ---
+# Both IDs below were resolved from the project's own models.list (each advertises
+# bidiGenerateContent) and then answered a live session. The former hold reason
+# ("exact model ID unresolved") no longer applies, so the hold is withdrawn —
+# inventory stays, and the measured contract is what is declared.
+#
+# Gemini 2.5 Flash Native Audio Dialog — gemini-2.5-flash-native-audio-latest.
+# Unlimited / 1,000,000 / Unlimited (owner table, row 21).
+[capability_clients.live-2-5-flash-native-audio]
+format = "google_live"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-2.5-flash-native-audio-latest"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 300
+
+[capabilities.gemini-live-2-5-flash-native-audio]
+id = "gemini-live-2-5-flash-native-audio"
+target = "live-2-5-flash-native-audio"
+response_modalities = ["AUDIO"]
+system_instruction = "You are a helpful, live conversational assistant."
+
+# Gemini 3 Flash Live — gemini-3.1-flash-live-preview. Unlimited / 65,000 / Unlimited.
+# [AUDIO] only: [TEXT] and [AUDIO,TEXT] are refused with close 1007.
+[capability_clients.live-3-flash]
+format = "google_live"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.1-flash-live-preview"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 300
+
+[capabilities.gemini-live-3-flash]
+id = "gemini-live-3-flash"
+target = "live-3-flash"
+response_modalities = ["AUDIO"]
+system_instruction = "You are a helpful, live conversational assistant."
+
+# =====================================================================
+# GOOGLE AI STUDIO -- REALTIME MUSIC AND ROBOTICS
+# =====================================================================
+# The last two services in the owner's Free-tier table (rows 20 and 17) and the last
+# two of the 26-model set. Neither is a chat lane, so neither gets a route: one is a
+# WebSocket music session and one is an image-plus-instruction call whose answer is a
+# JSON geometry contract.
+#
+# Quota is the owner-recorded Free-tier ceiling at capture, not a remaining balance.
+# The counters are this deployment's own ledger: minute and day counters are keyed on
+# (quota group, physical model) and charged once per physical call, so a music session
+# is one charge per connection and a spatial request is one charge per image.
+#
+# Both ceilings below are this deployment's own bounds, chosen so a caller cannot hold
+# a bounded resource open indefinitely; they are not provider limits. A music session
+# has no request boundary, which is why its ceiling has to be declared at all: the
+# surface stops forwarding the frame that would cross it and reports the running total
+# beside every audio chunk, so a client never has to guess.
+
+# Lyria Realtime -- lyria-realtime-exp. 15 RPM / no input TPM / 1,500 RPD, 1,048,576
+# context. The setup frame carries the model and nothing else; prompts, generation
+# config and playback control are per-message.
+[capability_clients.music-lyria-realtime]
+format = "google_music"
+base_url = "https://generativelanguage.googleapis.com"
+model = "lyria-realtime-exp"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 300
+quota_group = "google-ai-studio-free"
+requests_per_minute = 15
+daily_request_limit = 1500
+
+[capabilities.gemini-music-lyria-realtime]
+id = "gemini-music-lyria-realtime"
+target = "music-lyria-realtime"
+
+# 32 MiB of delivered audio per session. The surface accounts the decoded length of
+# every audio chunk it forwards, so this is a real ceiling rather than a hope; the
+# first qualified session measures the delivered byte rate, and this number divided by
+# that rate is how many seconds a session may play.
+max_session_audio_bytes = 33554432
+
+# Gemini Robotics ER 2 Preview -- gemini-robotics-er-2-preview. 5 RPM / 250,000 input
+# TPM / 20 RPD, 131,072 context. A plain generateContent call that is asked for one
+# specific geometry contract per task: normalized [y, x] points in 0..1000, boxes, or
+# a trajectory. Prose is refused rather than returned, because a caller that asked for
+# coordinates cannot use a sentence.
+[capability_clients.robotics-er-2]
+format = "google_robotics_spatial"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-robotics-er-2-preview"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+timeout_seconds = 120
+quota_group = "google-ai-studio-free"
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+daily_request_limit = 20
+
+[capabilities.gemini-robotics-er-2-spatial]
+id = "gemini-robotics-er-2-spatial"
+target = "robotics-er-2"
+max_input_tokens = 131072
+
+# 8 MiB of scene per request: a local admission bound, so an oversize image is refused
+# here instead of over the network. The surface reads the PNG/JPEG/WebP header to know
+# the scene's dimensions, so its token estimate is measured from the image itself.
+max_image_bytes = 8388608
+
+# =====================================================================
+# STEPHEN (OpenRouter, dedicated credential)
+# =====================================================================
+# One llm_client, one credential. Every target below it resolves to
+# SWITCHYARD_STEPHEN_OPENROUTER_API_KEY and to nothing else. Clients are
+# built per llm_client and each route's router is populated from that
+# route's targets only, so a target on this client can never be served by
+# the global `openrouter` credential.
+#
+# max_retries = 0 is deliberate. OpenRouter's free-tier daily cap is
+# ACCOUNT-WIDE ("openrouter_free_tier_daily"): once it is exhausted every
+# free model returns 429. Retrying inside one candidate would multiply the
+# attempts against a cap that cannot be satisfied by retrying, and would
+# spend the route's whole fallback budget on the same exhausted account.
+# The ordered candidate list is the retry strategy instead: one attempt per
+# candidate, then an honest failure.
+#
+# attempt_timeout_ms bounds "this candidate is producing nothing" so a hung
+# upstream advances to the next candidate instead of consuming the call.
+[llm_clients.openrouter_stephen]
+format = "openai_responses"
+base_url = "https://openrouter.ai/api/v1"
+locality = "external"
+api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+max_retries = 0
+attempt_timeout_ms = 120000
+
+[llm_clients.google_gemini_stephen]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+api_key_env = "SWITCHYARD_GEMINI_STEPHEN_API_KEY"
+quota_group = "google-ai-studio-free-stephen"
+max_retries = 0
+
+[llm_clients.google_gemma_31b_stephen]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+api_key_env = "SWITCHYARD_GEMINI_STEPHEN_API_KEY"
+quota_group = "google-ai-studio-free-stephen"
+max_retries = 0
+failure_cooldown_ms = 300000
+
+# ---- Stephen completion targets ----
+[targets.stephen-nemotron-3-5-super-vl-free]
+id = "nvidia/nemotron-3.5-super-vl:free"
+llm_client = "openrouter_stephen"
+free_tier = true
+groups = ["ST_OR_Free"]
+vision = true
+video = true
+video_carrier = "inline"
+# Same upstream model as the global Nemotron target, measured the same way on this
+# credential: inline image 200, remote image 404. Inline is the only proven carrier.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.stephen-flint-v1-0-free]
+video = false
+id = "recursive/flint-v1.0:free"
+llm_client = "openrouter_stephen"
+free_tier = true
+groups = ["ST_OR_Free"]
+vision = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.stephen-ernie-5_5-flash-preview-free]
+id = "baidu/ernie-5.5-flash-preview:free"
+llm_client = "openrouter_stephen"
+free_tier = true
+groups = ["ST_OR_Free"]
+# Explicit false: an omitted capability is "undeclared", which the runner treats
+# as permitted, so only an explicit refusal keeps images off this text-only target.
+vision = false
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[targets.stephen-ling-3_2-flash-free]
+id = "inclusionai/ling-3.2-flash:free"
+llm_client = "openrouter_stephen"
+free_tier = true
+groups = ["ST_OR_Free"]
+vision = true
+video = false
+image_carrier = "inline"
+tool_calling = true
+# Thinking is off on this lane for the latency reason measured on the global lane:
+# ~17.5 s with thinking against ~1.4 s without for the same prompt, and ~120 s on a
+# 430k-token request. The native OpenRouter Ling row is unaffected; this is the
+# Switchyard free-ladder lane.
+reasoning_policy = "disabled"
+reasoning_dialect = "openrouter_enabled"
+
+# ---- Stephen primitive routes ----
+# ---- ST_Free: Stephen free ladder ----------------------------------------
+# Ordered cheapest-capable-first across Stephen's own credential. A caller's
+# modality narrows the list before any provider is contacted: an image skips the
+# text-only targets, and video reaches only the leg that declares it.
+[routes.ST_Free]
+id = "ST_Free"
+type = "passthrough"
+selection = "peer"
+pool_groups = ["ST_OR_Free", "ST_Gemini_Free"]
+target = "stephen-ernie-5_5-flash-preview-free"
+candidates = [
+  "stephen-ling-3_2-flash-free",
+  "stephen-nemotron-3-5-super-vl-free",
+  "stephen-flint-v1-0-free",
+  "stephen-dots-3-note-preview-free",
+  "stephen-gemma-4-26b-a4b-it-free",
+  "stephen-gemma-4-31b-it-free",
+  "stephen-google-gemini-3.5-flash-lite",
+]
+# 262144 is this route's promise, not a limit any leg imposes: the leaf routes each
+# carry their provider-published window (ERNIE 1,024,000; Ling 1,048,576; Nemotron
+# 1,000,000). Raising this number is a separate, qualified decision about what ST_Free
+# callers may be admitted with.
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+image_carrier = "inline"
+route_reasoning_policy = "inherit"
+# The measured learning carries over: Ling took ~120 s on a 430k-token request while
+# Nemotron handled it in ~50 s, so above 200k tokens the proven wide-context leg is
+# offered first instead of the narrow one being tried and failing.
+escalation_max_input_tokens = 200000
+escalation_target = "stephen-nemotron-3-5-super-vl-free"
+
+# ---------------------------------------------------------------------
+# smart-route: the cost-efficiency ladder
+# ---------------------------------------------------------------------
+# Four GROUPS in a declared cost sequence, cheapest first:
+#
+#   smart-gemini-chat      Google free chat models, in quality order
+#   smart-openrouter-free  OpenRouter free models
+#   smart-deepseek-flash   DeepSeek Flash direct, which bills per call. SINGLE MEMBER:
+#                          V4 Pro was removed from this ladder on 2026-11-27 and is not
+#                          reachable from smart-route by any path.
+#   smart-openrouter-paid  OpenRouter metered models, the most expensive leg
+#
+# `group_ordering = "ordered"` is what makes this a ladder rather than a peer set. The group
+# index is the first ranking key and nothing measured outranks it, so a later group is never
+# offered while an earlier one still has an eligible member; a ready free group cannot be
+# displaced by a paid group that merely measures faster. Inside a group the leaf keys decide,
+# so "best eligible model for this job" is still answered by evidence rather than by row order
+# -- a member that cannot hold the request is skipped and its sibling answers.
+#
+# Why not `terminal_fallback`: a terminal tier is entered only by an exhaustion rule and is
+# never ranked, which is the right shape for a last resort with a fixed boundary. Here the
+# groups ARE the ladder, each with its own price, and the pool walk already tries every
+# member of one group before the next. Writing the paid groups as terminal tiers instead
+# would make the free OpenRouter and DeepSeek groups reachable only on exhaustion evidence,
+# which is not what they are for -- they are the next cheapest thing to try, not a rescue.
+#
+# `capability_escalation` leaves with the terminal tiers it could reach. The measured case it
+# covered -- every Google leg refusing a replayed function call for want of a provider
+# signature -- is now answered before dispatch by the `tool_call_replay = false` fact on each
+# Google target, which skips that leg and lets the ladder advance on a fact rather than on a
+# 400. A provider-discovered capability refusal on an undeclared field no longer has a
+# dedicated terminal; it is reported as the caller's error, and that is recorded as a gap
+# rather than papered over.
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "direct-google-gemini-4-hydrogen"
+candidates = [
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+    "openrouter-ernie-5_5-flash-preview-free",
+    "openrouter-ling-3_2-flash-free",
+    "openrouter-nemotron-3_5-super-vl-free",
+    "deepseek-deepseek-flash",
+    "openrouter-tencent-hy4-flash",
+    "openrouter-glm-5_3-flash",
+]
+selection = "grouped"
+group_ordering = "ordered"
+pool_groups = [
+    "smart-gemini-chat",
+    "smart-openrouter-free",
+    "smart-deepseek-flash",
+    "smart-openrouter-paid",
+]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes.smart-gemini-chat]
+id = "smart-gemini-chat"
+type = "passthrough"
+target = "direct-google-gemini-4-hydrogen"
+candidates = [
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+]
+selection = "declared"
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+# Stage 2 as a route. Three named free models, in the owner's order. The older
+# `smartfree` route keeps its own fourth leg (`openrouter/free`); this group states
+# exactly the three the owner named and is not a replacement for that consumer.
+[routes.smart-openrouter-free]
+id = "smart-openrouter-free"
+type = "passthrough"
+target = "openrouter-ernie-5_5-flash-preview-free"
+candidates = [
+    "openrouter-ling-3_2-flash-free",
+    "openrouter-nemotron-3_5-super-vl-free",
+]
+selection = "declared"
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+image_carrier = "inline"
+
+# Stage 3 as a route: SINGLE MEMBER. Owner directive 2026-11-27 removed the
+# DeepSeek V4 Pro escalation from this group for cost containment; Flash
+# exhaustion, congestion, incompatibility or provider failure must not select a
+# more expensive sibling, and there is no sibling left to select. A singleton
+# group route carries no `candidates`, so the group and the pool cannot drift.
+[routes.smart-deepseek-flash]
+id = "smart-deepseek-flash"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = []
+selection = "declared"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# Compatibility alias, same singleton membership as the group above. Kept so an
+# existing consumer of `smart-deepseek` keeps answering instead of 404ing; it
+# cannot reach V4 Pro either, because the target carries no pool membership and
+# this route names no candidate.
+[routes.smart-deepseek]
+id = "smart-deepseek"
+type = "passthrough"
+target = "deepseek-deepseek-flash"
+candidates = []
+selection = "declared"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# Stage 4 as a route.
+[routes.smart-openrouter-paid]
+id = "smart-openrouter-paid"
+type = "passthrough"
+target = "openrouter-tencent-hy4-flash"
+candidates = ["openrouter-glm-5_3-flash"]
+selection = "declared"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# ---- SMART-NT terminal groups ----
+# Luna NT and DeepSeek Flash NT keep the NT wire they already carry: both targets state
+# `reasoning_policy = "disabled"` with their client's own dialect, so the lane is not a
+# reasoning model wearing a suffix.
+[routes.smart-openai-nt]
+id = "smart-openai-nt"
+type = "passthrough"
+target = "openai-gpt-6-luna-nt"
+candidates = []
+context_window = 1050000
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.smart-deepseek-nt]
+id = "smart-deepseek-nt"
+type = "passthrough"
+target = "deepseek-deepseek-flash-nt"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# ---- ST_Route: Stephen's stable OpenClaw alias ---------------------------
+# Two children on ONE credential. `credential_block` is the whole point: the parent
+# moves to ST_Paid only when the free child reported the account's daily free
+# allowance exhausted -- a credential-scoped block that leaves the paid scope
+# servable. An ordinary 20/min throttle, a timeout, a provider fault, a 402, a
+# per-model refusal or a wrong carrier carries no such block and crosses nowhere,
+# so none of them can spend a paid call.
+[composites.ST_Route]
+children = ["ST_Free", "ST_Paid"]
+cross_on = "credential_block"
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+
+# ---- Stephen embedding and reranking capabilities ----
+[capability_clients.embedding-stephen]
+privacy = "third_party_free"
+format = "openai_embeddings"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-embed-8b:free"
+api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capability_clients.reranker-stephen]
+privacy = "third_party_free"
+format = "cohere_jina_rerank"
+base_url = "https://openrouter.ai/api"
+model = "nvidia/nemotron-3.5-rerank-8b:free"
+api_key_env = "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY"
+timeout_seconds = 120
+
+[capabilities.ST_Embed]
+id = "ST_Embed"
+target = "embedding-stephen"
+contract = "stephen-embedding-space:nemotron3.5-embed8b-v1"
+dimensions = 4096
+normalization = "L2"
+max_batch = 64
+
+[capabilities.ST_Rerank]
+id = "ST_Rerank"
+target = "reranker-stephen"
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+# =====================================================================
+# ST tier hierarchy (Stephen's dedicated OpenRouter credential)
+# =====================================================================
+# Only genuinely new targets are declared here. nemotron / flint already
+# exist with correct capability facts. Every ST target resolves to
+# SWITCHYARD_STEPHEN_OPENROUTER_API_KEY and nothing else, because clients are
+# built per [llm_clients.*].
+
+[targets.stephen-dots-3-note-preview-free]
+id = "dots-studio/dots-3-note-preview:free"
+llm_client = "openrouter_stephen"
+free_tier = true
+groups = ["ST_OR_Free"]
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+# Both Gemma routes sit on one Google AI Studio pool, so a pool-wide 429 is one
+# fact about the pool rather than about either model. Declaring the shared group
+# makes the first failure stand for both: the sibling is skipped instead of
+# spending a second request the pool has already refused. The skip replays the
+# upstream status, so a caller still sees 429 rather than a generic outage.
+[targets.stephen-gemma-4-26b-a4b-it-free]
+id = "google/gemma-4-26b-a4b-it:free"
+llm_client = "openrouter_stephen"
+free_tier = true
+groups = ["ST_OR_Free"]
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+cooldown_group = "google-ai-studio"
+
+[targets.stephen-gemma-4-31b-it-free]
+id = "google/gemma-4-31b-it:free"
+llm_client = "openrouter_stephen"
+free_tier = true
+groups = ["ST_OR_Free"]
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+cooldown_group = "google-ai-studio"
+[targets.stephen-paid-glm-5-3-flash]
+id = "z-ai/glm-5.3-flash"
+llm_client = "openrouter_stephen"
+groups = ["ST_OR_Paid"]
+vision = true
+video = true
+# Measured 2026-11-11 through this deployment's Responses wire: text, inline image,
+# remote image, inline video and remote video each returned 200. This is the only
+# target proven on both carriers for both media, so both are declared explicitly
+# rather than left to the pre-carrier default.
+video_carrier = "both"
+image_carrier = "both"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+# deepseek/deepseek-v4.1-flash-1017 is the 2026-10-17 snapshot of the same
+# model family, verified in the provider catalogue on 2026-10-28 (ctx
+# 1048576, text+image -> text, tools). It shares the Stephen credential and
+# therefore never appears on the global client in the same route.
+[targets.stephen-paid-deepseek-v4-1-flash-1017]
+id = "deepseek/deepseek-v4.1-flash-1017"
+llm_client = "openrouter_stephen"
+groups = ["ST_OR_Paid"]
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[routes.ST_Paid]
+id = "ST_Paid"
+type = "passthrough"
+target = "stephen-paid-deepseek-v4-1-flash-1017"
+candidates = ["stephen-paid-glm-5-3-flash"]
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+# Only the GLM child declares a video carrier below this route, so the route
+# promise is that child's carrier rather than an open "any carrier". Without
+# this the route advertised video = true with no carrier, which is a promise
+# nothing downstream could honour.
+video_carrier = "both"
+image_carrier = "both"
+route_reasoning_policy = "inherit"
+
+# ---- global catalog addition: recursive/flint-v1.0:free ----
+# Same upstream model as the Stephen free tier's Flint candidate, different
+# client and different credential. The two targets coexist because execution is keyed by
+# (llm_client, model id): a route may not mix two clients for one model id,
+# and these two models never share a route.
+[targets.openrouter-flint-v1-0-free]
+video = false
+id = "recursive/flint-v1.0:free"
+llm_client = "openrouter_free"
+vision = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+daily_request_limit = 1000
+[routes.direct-openrouter-flint-v1-0-free]
+video = false
+id = "direct-openrouter-flint-v1-0-free"
+type = "passthrough"
+target = "openrouter-flint-v1-0-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+
+
+# =====================================================================
+# Stephen direct routes - one addressable route per Stephen model
+# =====================================================================
+# Every Stephen model is reachable on its own, so it can be called directly,
+# pinned in a client, or measured individually, instead of only existing as a
+# leg inside a tier. These are leaves: a passthrough route names ONE target and
+# declares no candidates, because its whole job is to expose exactly that model.
+#
+# NAMING - every Stephen route is `direct-openrouter-stephen-<model>`. The
+# `stephen` token sits in one fixed position for all eight, so the set is
+# contiguous when sorted and the credential is readable from the name alone.
+#
+# The primitives (ST_Tier1/2/3, ST_Paid) keep their own target+candidate
+# ladder. The engine does NOT let a route reference another route, and nested
+# composites are rejected at config load ("child routes must be leaves"), so the
+# ladder is layered by responsibility rather than by reference:
+#
+#   direct-*  (one model, no fallback)
+#     -> ST_Tier1/2/3 + ST_Paid  (ordered fallback within one capability class)
+#       -> ST_Route              (composite; free tiers only, never ST_Paid)
+
+[routes.direct-openrouter-stephen-deepseek-v4-1-flash-1017]
+id = "direct-openrouter-stephen-deepseek-v4-1-flash-1017"
+type = "passthrough"
+target = "stephen-paid-deepseek-v4-1-flash-1017"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-stephen-dots-3-note-preview-free]
+id = "direct-openrouter-stephen-dots-3-note-preview-free"
+type = "passthrough"
+target = "stephen-dots-3-note-preview-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free]
+id = "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free"
+type = "passthrough"
+target = "stephen-gemma-4-26b-a4b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-stephen-google-gemma-4-31b-it-free]
+id = "direct-openrouter-stephen-google-gemma-4-31b-it-free"
+type = "passthrough"
+target = "stephen-gemma-4-31b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-stephen-flint-v1-0-free]
+id = "direct-openrouter-stephen-flint-v1-0-free"
+type = "passthrough"
+target = "stephen-flint-v1-0-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes.direct-openrouter-stephen-ernie-5_5-flash-preview-free]
+id = "direct-openrouter-stephen-ernie-5_5-flash-preview-free"
+type = "passthrough"
+target = "stephen-ernie-5_5-flash-preview-free"
+candidates = []
+context_window = 1024000
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes.direct-openrouter-stephen-ling-3_2-flash-free]
+id = "direct-openrouter-stephen-ling-3_2-flash-free"
+type = "passthrough"
+target = "stephen-ling-3_2-flash-free"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+image_carrier = "inline"
+
+[routes.direct-openrouter-stephen-glm-5-3-flash]
+id = "direct-openrouter-stephen-glm-5-3-flash"
+type = "passthrough"
+target = "stephen-paid-glm-5-3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+# Matches the target declaration, so the route promise is expressible.
+video_carrier = "both"
+image_carrier = "both"
+
+[routes.direct-openrouter-stephen-nemotron-3-5-super-vl-free]
+id = "direct-openrouter-stephen-nemotron-3-5-super-vl-free"
+type = "passthrough"
+target = "stephen-nemotron-3-5-super-vl-free"
+candidates = []
+context_window = 1000000
+tool_calling = true
+reasoning = true
+vision = true
+video = true
+video_carrier = "inline"
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+# =====================================================================
+# Global (non-Stephen) counterparts for Stephen models that had none
+# =====================================================================
+# Four Stephen models had no route on the GLOBAL `openrouter` credential. Each
+# gets a target and a direct route here so the model is reachable with the
+# global key as well as Stephen's. Targets must be declared per client - one
+# route may not mix two credentials - so these are separate targets pointing at
+# the same upstream ids as their Stephen counterparts.
+#
+# Pricing note: deepseek/deepseek-v4.1-flash is a METERED model, unlike the
+# `:free` slugs around it. It is reachable on the global key by name only; the
+# gateway, not the route, is what bounds spend.
+
+[targets.openrouter-dots-3-note-preview-free]
+id = "dots-studio/dots-3-note-preview:free"
+llm_client = "openrouter_free"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+daily_request_limit = 1000
+[targets.openrouter-google-gemma-4-26b-a4b-it-free]
+id = "google/gemma-4-26b-a4b-it:free"
+llm_client = "openrouter_free"
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+daily_request_limit = 1000
+[targets.openrouter-google-gemma-4-31b-it-free]
+id = "google/gemma-4-31b-it:free"
+llm_client = "openrouter_free"
+vision = true
+video = false
+# Unverified: every probe on 2026-11-11 was refused upstream (429 / 503), so neither
+# carrier is proven. Inline stays admitted and remote is refused, because a skipped
+# candidate is recoverable while a remote fetch the endpoint cannot make surfaces as
+# a provider 404 the caller cannot act on.
+image_carrier = "inline"
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+daily_request_limit = 1000
+[routes.direct-openrouter-dots-3-note-preview-free]
+id = "direct-openrouter-dots-3-note-preview-free"
+type = "passthrough"
+target = "openrouter-dots-3-note-preview-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+[routes.direct-openrouter-gemma-4-26b-a4b-it-free]
+id = "direct-openrouter-gemma-4-26b-a4b-it-free"
+type = "passthrough"
+target = "openrouter-google-gemma-4-26b-a4b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+[routes.direct-openrouter-gemma-4-31b-it-free]
+id = "direct-openrouter-gemma-4-31b-it-free"
+type = "passthrough"
+target = "openrouter-google-gemma-4-31b-it-free"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+# Narrowed to what its targets serve: the measured vision target on this route
+# answers inline media only and 404s a remote URL, so advertising "both" here
+# would promise a carrier nothing below the route can deliver.
+image_carrier = "inline"
+
+# =====================================================================
+# V7.44 additions — 2026-11-19
+# =====================================================================
+
+# Versioned global OpenRouter DeepSeek leaf on the owner (global) key.
+# Replaces the retired unversioned `direct-openrouter-deepseek-v4_1-flash`:
+# naming the snapshot keeps the alias from silently following a provider
+# re-point, which is what the unversioned leaf allowed.
+[targets.openrouter-deepseek-v4_1-flash-1017]
+id = "deepseek/deepseek-v4.1-flash-1017"
+llm_client = "openrouter"
+vision = true
+video = false
+tool_calling = true
+reasoning_policy = "enabled"
+reasoning_dialect = "openrouter_enabled"
+
+[routes."direct-openrouter-deepseek-v4.1-flash-1017"]
+id = "direct-openrouter-deepseek-v4.1-flash-1017"
+type = "passthrough"
+target = "openrouter-deepseek-v4_1-flash-1017"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# DeepSeek V4 Pro on the owner's own DeepSeek credential — the same
+# SWITCHYARD_DEEPSEEK_API_KEY client the Flash lanes already use, so this adds
+# no account and no new secret. The provider's own /models list reports the
+# model as TEXT-ONLY (input_modalities = ["text"]), unlike V4.1 Flash which
+# accepts images, so vision is declared false instead of inherited from its
+# Flash sibling.
+[targets.deepseek-deepseek-v4-pro]
+
+# Deliberately NOT a member of any pool group. Owner directive 2026-11-27: V4 Pro
+# must be unreachable through smart-route on every path, including group membership,
+# because a pool is built from this label and not from the route's candidate list.
+# Still reachable for explicit, deliberate use through direct-deepseek-deepseek-v4-pro
+# and through vc-paid-core / VC_Paid, which are separate consumers and are unchanged.
+
+video = false
+tool_calling = true
+id = "deepseek-v4-pro"
+llm_client = "deepseek"
+vision = false
+reasoning_effort = "high"
+
+[routes.direct-deepseek-deepseek-v4-pro]
+id = "direct-deepseek-deepseek-v4-pro"
+type = "passthrough"
+target = "deepseek-deepseek-v4-pro"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+# OpenRouter's Free Models Router on the GLOBAL key. It spends the account-wide
+# free allowance without carrying a `:free` suffix, which is exactly why the
+# client's free-scope predicate names `openrouter/free` explicitly. Terminal
+# fallback only: when the allowance is spent this route fails; it never pays.
+[targets.openrouter-openrouter-free]
+id = "openrouter/free"
+llm_client = "openrouter_free"
+vision = true
+video = false
+tool_calling = true
+daily_request_limit = 1000
+[routes.direct-openrouter-openrouter-free]
+id = "direct-openrouter-openrouter-free"
+type = "passthrough"
+target = "openrouter-openrouter-free"
+candidates = []
+context_window = 200000
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# ---------------------------------------------------------------------
+# VC_Paid — cost-aware selection, then credentialed failover
+# ---------------------------------------------------------------------
+#
+# `vc-paid-core` uses Switchyard's native `auto` algorithm, which is a
+# stage_router preset (picker = efficient_first, confidence 0.5). It starts on
+# the cheap DeepSeek Flash leg and promotes to V4 Pro only when the scored
+# tool-result signals say the cheap leg is not converging, holding the capable
+# tier afterwards when configured. That is a real selection mechanism with
+# deterministic limits — not an ordered candidate list wearing a new name.
+#
+# It is NOT OpenRouter's `openrouter/auto`: both legs are fixed DeepSeek models
+# on the owner's own credential, so nothing here can reach an arbitrary model or
+# a third-party paid account.
+#
+# Known limit, stated plainly: the stage router scores tool-result signals. It
+# does not model tokens, price or task outcome, and this deployment emits no
+# per-request cost metric, so "cost per completed task" cannot be measured — it
+# can only be approximated by buying the cheap leg first.
+[routes.vc-paid-core]
+id = "vc-paid-core"
+type = "auto"
+capable_target = "deepseek-deepseek-v4-pro"
+efficient_target = "deepseek-deepseek-flash"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# VC_Paid = the selection core, then a credential-diverse failover ladder.
+# `failure_class` (not `credential_block`) is correct here: the three children
+# draw on three different credentials — owner DeepSeek, global OpenRouter, then
+# the global free allowance — so a transient failure in one is worth trying in
+# the next. A child whose credential is known exhausted is skipped without a
+# provider call, so a spent free allowance is not retried through the same key.
+[composites.VC_Paid]
+children = ["vc-paid-core", "direct-openrouter-glm-5_3-flash", "direct-openrouter-openrouter-free"]
+cross_on = "failure_class"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# =====================================================================
+# GEMINI FREE TIER — bounded lane R1 (release candidate, append-only)
+# =====================================================================
+# This section is additive: every table above is byte-identical to the
+# deployed manifest (sha256 20b77869…, 42 targets / 47 routes). Nothing
+# existing changes meaning, so replacing this file is reversible by
+# restoring those bytes.
+#
+# WHAT IS AND IS NOT CLAIMED
+#
+#   Claimed: the tables parse, every name resolves, and load-time
+#   validation accepts them (dry-run receipt attached to the release).
+#
+#   NOT claimed: any dispatch behaviour on real Gemini traffic. Passing
+#   --dry-run proves configuration, not routing. Fallback order, 429
+#   handling and quota admission are exercised offline
+#   against a mock provider only. The first real Google request is a
+#   post-release observation, not a precondition.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# Client: Google AI Studio, OpenAI-compatible surface
+# ---------------------------------------------------------------------
+# This fork has no native Google wire format (openai_chat,
+# openai_responses, anthropic_messages only), so the OpenAI-compatible
+# endpoint is the only path. It was exercised in the R0 work.
+#
+# Traffic on the free tier may be used to improve Google's products.
+# That is a property of the provider, not of one model, and it is
+# recorded as an operational fact: this deployment carries no client-side
+# payload-clearance gate, so the acceptance is the owner's, made once.
+#
+# max_retries = 0: a retry is a second request against a daily budget
+# this deployment cannot observe. One attempt, one reservation.
+[llm_clients.google_gemini]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+# One AI Studio project serves both models below; naming the group lets a
+# second client on the same project share the counter instead of each
+# believing it owns the whole budget.
+quota_group = "google-ai-studio-free"
+max_retries = 0
+
+# ---------------------------------------------------------------------
+# Targets: only models with a qualified serving receipt
+# ---------------------------------------------------------------------
+# vision = false and video = false are both stated rather than omitted:
+# omission means "undeclared" for vision, and a text-only lane should say
+# what it is instead of relying on a default.
+#
+# daily_request_limit is the owner-supplied request-per-day BUDGET for
+# this model on this project. It is not a balance: nothing here can
+# observe how many requests Google has already counted today, and the
+# counter file records basis = "local_budget" so no reader mistakes it
+# for a remaining quota.
+#
+# No reasoning_policy is declared. Gemini's thinking cannot be turned off
+# on this family (thinkingBudget 0 is 2.5-only, and 2.5-flash-lite 404s on
+# generateContent in this project), so claiming "disabled" would be
+# false and sending a disable instruction would be refused upstream.
+[targets."direct-google-gemini-3.5-flash-lite"]
+tool_calling = true
+# Measured on the twin of this model (stephen-google-gemini-3.5-flash-lite):
+# a replayed tool call without its Google thought_signature is refused 400.
+# The signature is a model/wire property, not a credential one, so the same
+# declaration belongs here. Definitional tool calls are unaffected.
+tool_call_replay = false
+id = "gemini-3.5-flash-lite"
+llm_client = "google_gemini"
+# The Google OpenAI-compatibility surface rejects three Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for all three.
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+daily_request_limit = 500
+# Capacity and admission are two different numbers and both are stated here.
+# The window is the model's: 1,048,576 tokens. The ceiling is the project's free-tier
+# allowance of 250,000 tokens per minute -- a single request larger than the minute is
+# one the provider cannot complete, so it is refused locally instead of being charged.
+context_window = 1048576
+max_input_tokens = 250000
+# A selection fact: requests served here cost nothing inside the allowance, so no metered
+# leg may be ordered ahead of this one. Without it the router could only use declared order.
+free_tier = true
+
+# Second and last eligible Gemini leg. Included on the owner's explicit
+# directive, at position 2. Its measured record is not clean — a 503, a
+# JSON grader miss, a >90s timeout and a 24.5s tool-result retry — so it
+# sits behind 3.5 and any failure of those classes crosses onward rather
+# than being retried in place. Scheduled for 2027-05-07 retirement.
+# The free-tier row: 15 requests and 250,000 input tokens a minute, 500 a day.
+# A burst is what actually spends a day, so the minute is declared.
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+
+# Pool membership label. A route that names this group compares the group before it
+# compares any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-gemini-bounded", "smart-gemini-chat"]
+
+[targets."direct-google-gemini-3.1-flash-lite"]
+tool_calling = true
+tool_call_replay = false
+id = "gemini-3.1-flash-lite"
+llm_client = "google_gemini"
+# The Google OpenAI-compatibility surface rejects three Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for all three.
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+daily_request_limit = 500
+# Capacity and admission are two different numbers and both are stated here.
+# The window is the model's: 1,048,576 tokens. The ceiling is the project's free-tier
+# allowance of 250,000 tokens per minute -- a single request larger than the minute is
+# one the provider cannot complete, so it is refused locally instead of being charged.
+context_window = 1048576
+max_input_tokens = 250000
+# A selection fact: requests served here cost nothing inside the allowance, so no metered
+# leg may be ordered ahead of this one. Without it the router could only use declared order.
+free_tier = true
+
+# The 31B answers 503 while it spins up, and the lane's default failure cooldown is five
+# seconds -- short enough to spend the whole free-minute budget re-asking a model that is
+# still starting. It therefore gets its own client entry, identical to the shared one except
+# for the cooldown, rather than a group: `cooldown_group` would make a capacity fact about
+# the large model cool the small one down with it, and the small one is this lane's default.
+# The daily counter is still shared, because it is the same project and the same allowance.
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+
+# Pool membership label. A route that names this group compares the group before it
+# compares any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-gemini-bounded", "smart-gemini-chat"]
+
+[llm_clients.google_gemma_31b]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+quota_group = "google-ai-studio-free"
+max_retries = 0
+
+# Gemma 4, added for bounded tasks. Native ids from the owner's AI Studio listing; the
+# serving receipt is what `smart-gemini-bounded` exists to collect, so nothing else depends
+# on them yet.
+#
+# The 262,144-token window is the model's physical capacity. The 16,000-token ceiling is
+# the free-tier tokens-per-minute allowance for this project, and it is the number that
+# binds: a bounded lane that accepted more would be spending calls Google refuses.
+#
+# daily_request_limit is the model's own RPD allowance (14,400). It is a local budget, not
+# an observed balance -- see the note on the Lite targets above.
+[targets."direct-google-gemma-4-31b-it"]
+tool_calling = true
+id = "gemma-4-31b-it"
+llm_client = "google_gemma_31b"
+# The Google OpenAI-compatibility surface rejects Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for them.
+#
+# `temperature` belongs to the same class and was measured separately: a Responses
+# caller pinning 1.0 is answered `Unsupported parameter: temperature` (HTTP 400), so
+# the field is omitted here instead of relayed with a value the provider refuses.
+# Omitting it lets the surface apply its own default; it is not a low-temperature
+# steering choice, and no leg depends on a caller-chosen value.
+omit_body_fields = ["store", "metadata", "prompt_cache_key", "temperature"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+# Free inside the allowance, and unable to carry a caller's reasoning control: the measured
+# wire refuses `reasoning_effort` with HTTP 400. Stating both lets selection prefer this leg
+# for small work and skip it for a request that carries a control, instead of forwarding a
+# parameter the provider rejects.
+free_tier = true
+accepts_reasoning_control = false
+# Hosted Gemma writes its chain of thought into the visible message: the measured body is
+# `<thought>...</thought>` followed by the answer, with `completion_tokens` counting only the
+# answer and `total_tokens` counting both. Declaring the marker is what keeps the monologue
+# out of the caller's text; without it the whole block is returned as output.
+hosted_reasoning = "thought_tag"
+
+# Measured 2026-11-21: 61-328 thinking tokens for prompts of 49-438 tokens, and no
+# visible text at all below a 512-token reservation, because the thought is charged
+# against the caller's budget. A smaller request is skipped before dispatch instead of
+# spending a provider call to rediscover a limit the deployment already knows.
+min_output_tokens = 512
+# The free-tier row for this project: 30 requests and 16,000 input tokens a
+# minute, 14,400 requests a day. Admission pads every reservation by 1,300 per
+# mille, because the estimator under-counted this lane once already -- 15,202
+# estimated against 18,054 provider tokens -- and a request that cannot fit the
+# minute must be refused before dispatch rather than after it. The ceiling is the
+# largest estimate the padded window admits, not the window itself: a ceiling the
+# governor refuses on every large request states capacity that does not exist.
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+# The pad the estimator's measured under-count on this lane requires.
+admission_margin_permille = 1300
+
+
+# Pool membership label. A route that names this group compares the group before it
+# compares any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-gemini-bounded", "smart-gemini-judge"]
+
+[targets."direct-google-gemma-4-26b-a4b-it"]
+tool_calling = true
+id = "gemma-4-26b-a4b-it"
+llm_client = "google_gemini"
+# The Google OpenAI-compatibility surface rejects Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for them.
+#
+# `temperature` belongs to the same class and was measured separately: a Responses
+# caller pinning 1.0 is answered `Unsupported parameter: temperature` (HTTP 400), so
+# the field is omitted here instead of relayed with a value the provider refuses.
+# Omitting it lets the surface apply its own default; it is not a low-temperature
+# steering choice, and no leg depends on a caller-chosen value.
+omit_body_fields = ["store", "metadata", "prompt_cache_key", "temperature"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+
+# Measured 2026-11-21: 61-328 thinking tokens for prompts of 49-438 tokens, and no
+# visible text at all below a 512-token reservation, because the thought is charged
+# against the caller's budget. A smaller request is skipped before dispatch instead of
+# spending a provider call to rediscover a limit the deployment already knows.
+min_output_tokens = 512
+
+# ---------------------------------------------------------------------
+# Direct leaves: one target each, no hidden fallback
+# ---------------------------------------------------------------------
+# A direct leaf is addressable by name and is subject to the same
+# per-model admission filter as a composite child, so naming it bypasses
+# no gate.
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+# The pad the estimator's measured under-count on this lane requires.
+admission_margin_permille = 1300
+
+
+
+# ---------------------------------------------------------------------
+# Remaining six chat targets from the owner's 26-actionable Free-tier dossier
+# ---------------------------------------------------------------------
+# Serving targets (qualified for routing):
+#   gemini-3.6-flash    - 5 RPM / 250K TPM / 20 RPD  - serving
+#   gemini-3.8-flash    - 5 RPM / 250K TPM / 20 RPD  - serving
+#   gemini-2.5-flash    - 5 RPM / 250K TPM / 20 RPD  - serving
+#   gemini-4-hydrogen   - 5 RPM / 250K TPM / 20 RPD  - serving
+#
+# Held targets (catalogued, NOT serving - retained as non-serving records):
+#   gemini-2.5-flash-lite - historically 404s on generateContent in this project
+#   gemini-3-flash        - native ID unresolved (gemini-3-flash-preview)
+# These two have daily_request_limit = 0 and no TPM window, so they are excluded
+# from routing by the admission gates and never advertised as callable.
+#
+
+# Pool membership label. A route that names this group compares the group before it
+# compares any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-gemini-bounded", "smart-gemini-judge"]
+
+[targets."direct-google-gemini-3.6-flash"]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-gemini-chat"]
+
+tool_calling = true
+tool_call_replay = false
+id = "gemini-3.6-flash"
+llm_client = "google_gemini"
+# The Google OpenAI-compatibility surface rejects three Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for all three.
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+
+[targets."direct-google-gemini-3.8-flash"]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-gemini-chat"]
+
+tool_calling = true
+tool_call_replay = false
+id = "gemini-3.8-flash"
+llm_client = "google_gemini"
+# The Google OpenAI-compatibility surface rejects three Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for all three.
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+
+[targets."direct-google-gemini-4-hydrogen"]
+
+# Pool membership label. A route that names this group ranks the whole group before it
+# ranks any leaf; the label is the manifest's only record of which pool a leaf serves.
+groups = ["smart-gemini-chat"]
+
+tool_calling = true
+tool_call_replay = false
+id = "gemini-4-hydrogen"
+llm_client = "google_gemini"
+# The Google OpenAI-compatibility surface rejects three Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for all three.
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+
+[targets."direct-google-gemini-3-flash"]
+tool_calling = true
+id = "gemini-3-flash-preview"
+llm_client = "google_gemini"
+# The Google OpenAI-compatibility surface rejects three Responses-format fields as
+# unknown (`Unknown name "store": Cannot find field`, HTTP 400 INVALID_ARGUMENT),
+# and an existing Responses client sends `store: false` on every call. Dropping
+# them is what lets a Responses caller reach a Gemini chat target at all; the
+# provider supplies its own defaults for all three.
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+# `none` is not a value this surface accepts: it answers 400
+# INVALID_ARGUMENT while minimal, low, medium and high are all served.
+# Dropping it here is the last word on effort, after every override.
+unsupported_reasoning_effort = ["none"]
+vision = false
+video = false
+# Quota: 5 RPM / 250,000 input TPM / 20 RPD are the owner's Free-tier LIMITS for this
+# physical model, taken from the owner's AI Studio record and recorded in
+# docs/evidence/gemini-r3/2026-11-21/OWNER-CONTROLLING-ALL-FREE-CAPABILITIES.md (the
+# "Gemini 3 Flash" row). They are rate CEILINGS at capture, not remaining allowance.
+# Declaring none was the earlier state and it left this lane unpaced on a 20-RPD model,
+# which is a defect: a caller could spend a fifth of the day's allowance in one burst
+# with no local gate. Enforced per physical call, like every other Google chat target.
+#
+# max_input_tokens is required beside input_tokens_per_minute: a per-request ceiling at
+# or below the minute budget is what keeps one oversized request from being unservable no
+# matter how long it waits. 250,000 matches the owner's input TPM for this model and the
+# value every other Gemini chat target on this surface declares.
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+max_input_tokens = 250000
+daily_request_limit = 20
+# The native id resolves: gemini-3-flash-preview answered HTTP 200 on 2026-11-21.
+# Its output floor is measured, not inferred: an 8-token reservation returns HTTP
+# 500 with an empty completion, and 600 answers normally. The true boundary lies
+# somewhere between, and has not been bisected; 600 is the smallest reservation
+# observed to work, so it is the one declared. Under the floor the request is
+# ineligible rather than attempted, which is what keeps a caller's tiny budget
+# from being recorded as a failure of the model.
+min_output_tokens = 600
+free_tier = true
+
+# ---------------------------------------------------------------
+# Gemini Decision 1 - the Decisions API, not a chat lane
+# ---------------------------------------------------------------
+# `POST /v1beta/decisions`. The method is NOT `:createDecision`: that path answers a
+# bare 404 on both v1 and v1beta, while `:generateContent` on the same model returns a
+# proper 400, which is the paired control that tells a routing refusal from a bad URL.
+#
+# Qualified 2026-11-22 with authenticated 200s for all three question kinds: noul
+# (probability the question holds), choice (a criteria OBJECT of option id -> label)
+# and score (an ORDERED ARRAY of level labels). Two asymmetries in Google's own
+# validator are worth keeping: `choice.criteria` must be an object while
+# `score.criteria` must be an array, and `noul` needs only `instructions`.
+#
+# The shared input is `input`, a list of typed content blocks whose `type` is one of
+# audio, document, image, text, video. Only the text form is qualified here, so this
+# target accepts a structured context and refuses a bare string locally rather than
+# spending a provider call on a shape that cannot work.
+#
+# The transport is already compiled into the deployed binary (decision_transport.rs,
+# DecisionTransport::GoogleDecisions), so this is a configuration addition, not a new
+# codec. The lane is not a chat target: it carries no chat capabilities, no
+# reasoning policy and no model-pool entry, so it cannot be selected for a chat turn.
+#
+# Usage note from the probe: `usage.total_output_tokens` is always 0. The model's
+# declared one output token is not billed in the response, so input TPM is the only
+# metered axis.
+#
+# Budget: 200 RPM / 50,000 input TPM / 10,000 RPD are the owner's Free-tier LIMITS for
+# this physical model from the same 26-row record. They are declared here for the same
+# reason as every other lane, with one honest caveat: the decision path does not yet
+# pass through the pacing governor, so these numbers are a declaration of the ceiling
+# and not yet an enforced gate. Enforcing them is the next code change; nothing in this
+# file claims otherwise.
+[targets."direct-google-gemini-decision-1"]
+id = "gemini-decision-1"
+llm_client = "google_gemini"
+decision_transport = "google_decisions"
+decision_base_url = "https://generativelanguage.googleapis.com"
+decision_path = "/v1beta/decisions"
+decision_api_key_env = "SWITCHYARD_GEMINI_API_KEY"
+supported_types = { noul = true, choice = true, score = true }
+# Measured 2026-11-22 against the live service: Google accepts `input` as a bare
+# string (200 for noul, choice, score and mixed questions) and rejects an object
+# with 400 "The 'type' parameter is required at 'input[0]'" unless it carries a
+# `type`. The earlier declaration had these two forms inverted, so the lane
+# refused locally what Google accepts and forwarded what Google rejects.
+state_forms = { plain_string = true, structured = false }
+free_tier = true
+requests_per_minute = 200
+input_tokens_per_minute = 50000
+# The model declares a 262,144-token window, but a single request larger than the
+# minute budget could never be admitted, so the per-request ceiling is the budget
+# itself. Refusing a 200k-token document locally is the truth; advertising the window
+# here would promise a request this project cannot serve.
+max_input_tokens = 50000
+daily_request_limit = 10000
+
+
+# ---------------------------------------------------------------------
+# Direct leaves: one target each, no hidden fallback
+# ---------------------------------------------------------------------
+# A direct leaf is addressable by name and is subject to the same
+# per-model admission filter as a composite child, so naming it bypasses
+# no gate.
+#
+
+[routes."direct-google-gemini-3.6-flash"]
+id = "direct-google-gemini-3.6-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.6-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.8-flash"]
+id = "direct-google-gemini-3.8-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.8-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-4-hydrogen"]
+id = "direct-google-gemini-4-hydrogen"
+type = "passthrough"
+target = "direct-google-gemini-4-hydrogen"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+# Held routes: not advertised as callable. A route with daily_request_limit = 0
+# is excluded from dispatch by the admission gates before any provider call.
+[routes."direct-google-gemini-3-flash"]
+id = "direct-google-gemini-3-flash"
+type = "passthrough"
+target = "direct-google-gemini-3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.5-flash-lite"]
+id = "direct-google-gemini-3.5-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.1-flash-lite"]
+id = "direct-google-gemini-3.1-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.1-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+# Direct leaves, one target each, so a caller that wants 31B gets 31B. A direct leaf is
+# subject to the same payload gate, physical fit and daily budget as a composite child.
+[routes."direct-google-gemma-4-31b-it"]
+id = "direct-google-gemma-4-31b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-31b-it"
+candidates = []
+context_window = 262144
+# Receipt 2026-11-23: `tools` accepted and a `read_file` function call returned on
+# this target's own client. reasoning stays unclaimed -- no receipt for a reasoning
+# control on this lane, and claiming one would forward a parameter the free tier
+# may refuse.
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemma-4-26b-a4b-it"]
+id = "direct-google-gemma-4-26b-a4b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-26b-a4b-it"
+candidates = []
+context_window = 262144
+# Receipt 2026-11-22: the project's OpenAI-compatible surface accepted a `tools`
+# array on this model and returned a real function call (`read_file`), twice, on
+# this target's client. `tool_calling` was previously withheld for want of a wire
+# receipt; the receipt now exists, so the flag states what the wire does.
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+# ---------------------------------------------------------------------
+# smart-gemini-bounded: the bounded Gemini group as an addressable route.
+#
+# The owner's group 1 for smart-nt is 3.5 Lite, 3.1 Lite, Gemma 31B, Gemma 26B. This
+# route states that order once so the lane and the group cannot drift: declared order,
+# no measured reordering, because quality-first is the stated preference.
+#
+# The 16,000-token per-request ceiling on the Gemma legs is not repeated here: it is a
+# per-target admission fact enforced at dispatch, which is the only place that knows
+# which model a request would have reached.
+[routes."smart-gemini-bounded"]
+id = "smart-gemini-bounded"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemma-4-31b-it",
+    "direct-google-gemma-4-26b-a4b-it",
+]
+selection = "declared"
+context_window = 262144
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+# ---------------------------------------------------------------------
+# smart_gemini: ordered composite over the complete Gemini pool
+# ---------------------------------------------------------------------
+# Complete pool, in preference order. The 2.5 models are absent: Google
+# answers 404 for them in this project, so listing them would put a
+# known-dead leg in the ordering. Their models, targets and direct routes
+# were removed entirely on 2026-11-23 by owner order, so no held record
+# remains to audit. 3.6-flash and 3.8-flash are listed and are NOT held:
+# the previous comment claimed the opposite of what this route does.
+#
+# Children share one credential and one project quota. cross_on is left
+# unstated rather than guessed: the eventual right answer for a
+# shared-credential pool is a scope question this release does not
+# measure.
+[routes.smart_gemini]
+id = "smart_gemini"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-4-hydrogen",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+]
+selection = "measured"
+# Kept at the pool's widest real window: the Lite leaves can hold a 1,048,576-token request,
+# and the per-target fit gate skips a Gemma for anything above its own ceiling, so the
+# request still reaches a target that can serve it. Lowering this would reduce what the
+# alias advertises rather than describe the pool.
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+# ---------------------------------------------------------------------
+# smart-nt-bounded-trial: the bounded contract under a name nobody calls
+# ---------------------------------------------------------------------
+# New name, deliberately. The live smart-nt alias keeps its current
+# meaning, targets and reasoning policy until a consumer migration is
+# accepted; this route exists so the contract can be reviewed and
+# rehearsed without moving a consumer. (The older `smart-bounded` alias
+# was retired and its route deleted; `smart-nt` is its successor.)
+#
+# ORDER: 3.5-flash-lite -> 3.1-flash-lite -> 3.6-flash -> 3.8-flash ->
+#        2.5-flash -> 4-hydrogen -> gemma-4-26b -> gemma-4-31b ->
+#        Luna-NT -> DeepSeek Flash-NT
+#
+# Expressed as a composite over whole child routes rather than a
+# passthrough with three candidates, for one reason: legs 3 and 4 must
+# keep the exact behaviour they have today. `direct-openai-gpt-6-luna-nt`
+# and `direct-deepseek-deepseek-flash-nt` are the existing leaf routes, so
+# the NT legs are not re-declared here and cannot drift from the aliases
+# consumers already use. A passthrough would carry one
+# route_reasoning_policy across all four legs, and "none" would be sent to
+# Gemini, which cannot honour it.
+#
+# cross_on = "failure_class" because the four children sit on three
+# different credentials (Google AI Studio, OpenAI Codex OAuth, DeepSeek).
+# That is the historical rule for a credential-diverse ladder, and it is
+# what VC_Paid above states for the same reason. A child whose credential
+# is known exhausted is skipped without a provider call, so one dead
+# credential is not re-dialled three times.
+#
+# WHAT CROSSES, MEASURED FROM THE CLASSIFIER RATHER THAN ASSUMED:
+#   transport, timeout, rate limit, temporarily unavailable, 5xx,
+#   account quota, retired model   -> next child
+#   a spent DAILY BUDGET           -> next child, and no provider call is
+#                                     made for the leg that is out
+#   auth failure                   -> terminal, so a broken credential is
+#                                     not silently answered by a paid leg
+#
+# One consequence worth stating plainly: a per-minute 429 is not
+# distinguishable from a daily one at this layer, so a transient limit
+# advances the chain. The local daily budget is the control that bounds
+# spend; it is why both Gemini targets declare one.
+#
+# context_window = 262144 matches the promise smart-nt already makes, so a
+# later consumer migration would not silently widen or narrow what a caller
+# may send.
+[composites.smart-nt-bounded-trial]
+children = [
+    "direct-google-gemini-3.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-openai-gpt-6-luna-nt",
+    "direct-deepseek-deepseek-flash-nt",
+]
+cross_on = "failure_class"
+context_window = 262144
+tool_calling = true
+reasoning = true
+# vision is kept by the Luna and DeepSeek children. A vision request skips
+# both Gemini children on capability before any provider call and is served
+# by leg 3, which is the intended behaviour rather than an error.
+vision = true
+video = false
+
+# ---------------------------------------------------------------------
+# Daily allowance accounting
+# ---------------------------------------------------------------------
+# Required as soon as a target declares daily_request_limit: a budget
+# whose counter cannot be written is a cap nobody is enforcing, so an
+# unwritable directory is a load failure rather than a silently
+# unenforced limit.
+#
+# Outside /var/log/switchyard on purpose. The unit runs with
+# ProtectSystem=strict and ReadWritePaths=/var/log/switchyard, so this
+# path needs its own ReadWritePaths entry (drop-in 91-quota-state.conf)
+# rather than being parked in the log directory, where log retention
+# could delete a counter and silently restore a spent budget.
+
+[targets."stephen-google-gemini-3.5-flash-lite"]
+tool_calling = true
+tool_call_replay = false
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+id = "gemini-3.5-flash-lite"
+vision = false
+video = false
+context_window = 1048576
+free_tier = true
+daily_request_limit = 500
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+max_input_tokens = 250000
+llm_client = "google_gemini_stephen"
+groups = ["ST_Gemini_Free"]
+
+[targets."stephen-google-gemini-3.1-flash-lite"]
+tool_calling = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+id = "gemini-3.1-flash-lite"
+vision = false
+video = false
+context_window = 1048576
+free_tier = true
+daily_request_limit = 500
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+max_input_tokens = 250000
+llm_client = "google_gemini_stephen"
+
+[targets."stephen-google-gemini-3.6-flash"]
+tool_calling = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+id = "gemini-3.6-flash"
+vision = false
+video = false
+context_window = 1048576
+free_tier = true
+daily_request_limit = 20
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+max_input_tokens = 250000
+llm_client = "google_gemini_stephen"
+
+[targets."stephen-google-gemini-3.8-flash"]
+tool_calling = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+id = "gemini-3.8-flash"
+vision = false
+video = false
+context_window = 1048576
+free_tier = true
+daily_request_limit = 20
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+max_input_tokens = 250000
+llm_client = "google_gemini_stephen"
+
+[targets."stephen-google-gemini-4-hydrogen"]
+tool_calling = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+id = "gemini-4-hydrogen"
+vision = false
+video = false
+context_window = 1048576
+free_tier = true
+daily_request_limit = 20
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+max_input_tokens = 250000
+llm_client = "google_gemini_stephen"
+
+[targets."stephen-google-gemma-4-26b-a4b-it"]
+tool_calling = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key", "temperature"]
+unsupported_reasoning_effort = ["none"]
+id = "gemma-4-26b-a4b-it"
+vision = false
+video = false
+context_window = 262144
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+admission_margin_permille = 1300
+daily_request_limit = 14400
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 12307
+llm_client = "google_gemini_stephen"
+
+[targets."stephen-google-gemma-4-31b-it"]
+tool_calling = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key", "temperature"]
+unsupported_reasoning_effort = ["none"]
+id = "gemma-4-31b-it"
+vision = false
+video = false
+context_window = 262144
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+admission_margin_permille = 1300
+daily_request_limit = 14400
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 12307
+llm_client = "google_gemma_31b_stephen"
+
+[targets."stephen-google-gemini-3-flash-preview"]
+tool_calling = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+id = "gemini-3-flash-preview"
+vision = false
+video = false
+free_tier = true
+min_output_tokens = 600
+daily_request_limit = 20
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+max_input_tokens = 250000
+llm_client = "google_gemini_stephen"
+
+[routes.ST_Gemini_Free]
+id = "ST_Gemini_Free"
+type = "passthrough"
+target = "stephen-google-gemini-3.5-flash-lite"
+selection = "peer"
+pool_groups = ["ST_Gemini_Free"]
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+
+# Pool delta: ST_Free becomes the unified free pool.
+#   pool_groups += "ST_Gemini_Free"
+#   candidates  += ["stephen-google-gemini-3.5-flash-lite"]
+
+
+# ---------------------------------------------------------------------------
+# DIRECT STEPHEN GOOGLE AI STUDIO ROUTES -- one per Stephen-credential target.
+#
+# These are per-model direct routes on Stephen's own Google AI Studio key
+# (llm_client google_gemini_stephen / google_gemma_31b_stephen,
+# api_key_env SWITCHYARD_GEMINI_STEPHEN_API_KEY, quota group
+# google-ai-studio-free-stephen). They are NOT the OpenRouter Stephen routes
+# (direct-openrouter-stephen-*) and NOT the owner-credential Google routes
+# (direct-google-*).
+#
+# Capability flags are copied from each model's owner-side route, so a model
+# declares the same tool/vision/video/reasoning support on either account.
+# The 2.5 pair is absent, not held: its routes and targets were removed on
+# 2026-11-23 by owner order.
+# ---------------------------------------------------------------------------
+
+[routes."direct-google-stephen-gemini-3-flash-preview"]
+id = "direct-google-stephen-gemini-3-flash-preview"
+type = "passthrough"
+target = "stephen-google-gemini-3-flash-preview"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-stephen-gemini-3.1-flash-lite"]
+id = "direct-google-stephen-gemini-3.1-flash-lite"
+type = "passthrough"
+target = "stephen-google-gemini-3.1-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-stephen-gemini-3.5-flash-lite"]
+id = "direct-google-stephen-gemini-3.5-flash-lite"
+type = "passthrough"
+target = "stephen-google-gemini-3.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-stephen-gemini-3.6-flash"]
+id = "direct-google-stephen-gemini-3.6-flash"
+type = "passthrough"
+target = "stephen-google-gemini-3.6-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-stephen-gemini-3.8-flash"]
+id = "direct-google-stephen-gemini-3.8-flash"
+type = "passthrough"
+target = "stephen-google-gemini-3.8-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-stephen-gemini-4-hydrogen"]
+id = "direct-google-stephen-gemini-4-hydrogen"
+type = "passthrough"
+target = "stephen-google-gemini-4-hydrogen"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-stephen-gemma-4-26b-a4b-it"]
+id = "direct-google-stephen-gemma-4-26b-a4b-it"
+type = "passthrough"
+target = "stephen-google-gemma-4-26b-a4b-it"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-stephen-gemma-4-31b-it"]
+id = "direct-google-stephen-gemma-4-31b-it"
+type = "passthrough"
+target = "stephen-google-gemma-4-31b-it"
+candidates = []
+context_window = 262144
+tool_calling = true
+reasoning = false
+vision = false
+video = false
+
+[quota]
+state_dir = "/var/lib/switchyard/quota"
+
+# Candidate: native Gemini decision leaf. A leaf over the existing
+# direct-google-gemini-decision-1 target; no self-reference. Used inside the
+# smart-decision capability_first composition; tier1-decision is unchanged.
+[decision_lanes.smart-gemini-decision]
+targets = ["direct-google-gemini-decision-1"]
+
+# Candidate: local-first rerank with a third_party_free fallback.
+[capabilities.smart-rerank]
+id = "smart-rerank"
+target = "reranker-local"
+candidates = ["reranker-free"]
+max_candidates = 64
+top_n = 64
+max_doc_chars = 1024
+max_query_chars = 512
+
+# Candidate: Gemini embedding alias over embedding-google2 (same space/client).
+[capabilities.smart-gemini-embedding]
+id = "smart-gemini-embedding"
+target = "embedding-google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192

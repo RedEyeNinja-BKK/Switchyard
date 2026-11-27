@@ -400,6 +400,7 @@ mod tests {
             system_instruction: Some("You are a helpful assistant.".to_string()),
             thinking_budget: Some(1024),
             thinking_level: None,
+            targets: Vec::new(),
         }
     }
 

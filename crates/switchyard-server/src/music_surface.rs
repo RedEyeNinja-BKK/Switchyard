@@ -1064,6 +1064,7 @@ mod tests {
             system_instruction: None,
             thinking_budget: None,
             thinking_level: None,
+            targets: Vec::new(),
         };
         assert_eq!(
             build_setup(&capability),
@@ -1105,6 +1106,7 @@ mod tests {
             system_instruction: None,
             thinking_budget: None,
             thinking_level: None,
+            targets: Vec::new(),
         };
         let url = upstream_ws_url(&capability, "server-key");
         assert_eq!(

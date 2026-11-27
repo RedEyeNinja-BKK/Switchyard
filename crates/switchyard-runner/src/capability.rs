@@ -33,6 +33,95 @@ pub const GEMINI_EMBEDDING_V2_INPUT_TOKENS: u32 = 8192;
 /// Maximum thinking budget Google's Live API accepts, in tokens.
 pub const GEMINI_LIVE_MAX_THINKING_BUDGET: u32 = 32768;
 
+/// How an endpoint treats the data handed to it.
+///
+/// Declared per endpoint, never inferred from a URL or a host name. The declaration is the
+/// operator's statement about the provider's data handling; Switchyard only enforces it. It
+/// exists because a third party's free tier may retain or train on what it receives, which is a
+/// different risk from the same bytes reaching an operator-controlled engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointPrivacy {
+    /// The endpoint runs inside the operator's own boundary.
+    Internal,
+    /// A third party's free tier, which may retain or train on submitted content.
+    ThirdPartyFree,
+}
+
+/// What the caller states about the data it is sending.
+///
+/// Deliberately a declaration, not a classifier: the broad content-based filter was removed in
+/// 2026-11-21 after it refused 27 of 29 otherwise eligible requests and mistook `ssh user@host`
+/// for an email address. Nothing here inspects the payload. A caller that states nothing is
+/// `Unknown`, and `Unknown` is never good enough for an endpoint that may retain the data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CallerDataClass {
+    /// Published or otherwise unrestricted material.
+    Public,
+    /// Generated material with no real subject, such as test fixtures.
+    Synthetic,
+    /// The operator's own working material, not intended for third parties.
+    Internal,
+    /// Personal or confidential material.
+    Private,
+    /// Material whose release is separately gated.
+    Restricted,
+    /// The caller stated nothing.
+    #[default]
+    Unknown,
+}
+
+impl CallerDataClass {
+    /// Parse the caller's declaration.
+    ///
+    /// An unrecognised value is `Unknown` rather than an error: refusing the request for a
+    /// misspelt header would hide the real outcome (whether the endpoint may receive it), and
+    /// `Unknown` is already the refused class on an endpoint that needs a statement.
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "public" => Self::Public,
+            "synthetic" => Self::Synthetic,
+            "internal" => Self::Internal,
+            "private" => Self::Private,
+            "restricted" => Self::Restricted,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The class as it appears on the wire and in a refusal.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Synthetic => "synthetic",
+            Self::Internal => "internal",
+            Self::Private => "private",
+            Self::Restricted => "restricted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether a payload of `class` may be sent to an endpoint declared `privacy`.
+///
+/// An endpoint that declares nothing is not restricted: this gate adds a rule for endpoints
+/// that say they are a third party's free tier, and leaves every other endpoint's behaviour
+/// exactly as it was. A third-party free endpoint admits only unrestricted classes, so
+/// `internal` -- the operator's ordinary working material -- is refused along with private and
+/// restricted, and an unstated class is refused rather than assumed harmless.
+pub fn admit_egress(privacy: Option<EndpointPrivacy>, class: CallerDataClass) -> Result<(), String> {
+    match privacy {
+        None | Some(EndpointPrivacy::Internal) => Ok(()),
+        Some(EndpointPrivacy::ThirdPartyFree) => match class {
+            CallerDataClass::Public | CallerDataClass::Synthetic => Ok(()),
+            other => Err(format!(
+                "data class {} is not admitted to a third-party free endpoint; declare \
+                 public or synthetic, or send this work to an endpoint that keeps it internal",
+                other.as_str()
+            )),
+        },
+    }
+}
+
 /// Whether a string is shaped like a prebuilt voice name.
 ///
 /// The catalogue belongs to the provider, so this checks shape only: a non-empty
@@ -96,6 +185,13 @@ pub struct CapabilityClientConfig {
     /// token count, so the window is never over-spent by an estimate that undercounts.
     #[serde(default)]
     pub input_tokens_per_minute: Option<u64>,
+    /// How this endpoint treats the data handed to it.
+    ///
+    /// Omitted means no restriction is declared, which is the unchanged behaviour of every
+    /// existing endpoint. An endpoint on a third party's free tier declares
+    /// `third_party_free`, and then only explicitly unrestricted payloads reach it.
+    #[serde(default)]
+    pub privacy: Option<EndpointPrivacy>,
 }
 
 impl CapabilityClientConfig {
@@ -426,6 +522,19 @@ pub struct CapabilityConfig {
     /// about the session's shape.
     #[serde(default)]
     pub thinking_level: Option<String>,
+    /// Additional clients this capability may dispatch to, in declared order, after `target`.
+    ///
+    /// A selector over interchangeable engines, not a composition of capabilities: every
+    /// candidate must speak the same wire format, and an embedding candidate must also produce
+    /// the same contract, width and normalization. Anything else is refused at load, because
+    /// vectors from another space are not a degraded answer to the same question -- they are a
+    /// different question's answer, and silently storing them corrupts an index.
+    ///
+    /// Only reranking may declare candidates. Rerank scores are consumed per request and never
+    /// stored, so a second engine answering the same ordering question is a genuine fallback;
+    /// embeddings have no such property, and there is deliberately no way to express one.
+    #[serde(default)]
+    pub candidates: Vec<String>,
 }
 
 /// Configured capability endpoints and the capabilities that name them.
@@ -456,6 +565,47 @@ impl CapabilityDeployment {
                     "capability {name} references unknown capability client {client_name}"
                 ));
             };
+            if !capability.candidates.is_empty() {
+                // A selector exists for interchangeable engines. Only reranking qualifies:
+                // scores are consumed per request, so a second engine answering the same
+                // ordering question is a fallback. An embedding's output is stored and
+                // compared against, so a second engine would be a second vector space wearing
+                // one capability's name.
+                if client.format != CapabilityFormat::CohereJinaRerank {
+                    return Err(format!(
+                        "capability {name} declares candidates but serves {:?}; only a rerank \
+                         capability may select among engines, because a vector from another \
+                         engine is a different space rather than a fallback",
+                        client.format
+                    ));
+                }
+                if capability.candidates.iter().any(|c| c == client_name) {
+                    return Err(format!(
+                        "capability {name} lists its own target {client_name} as a candidate"
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for candidate_name in &capability.candidates {
+                    let Some(candidate) = self.clients.get(candidate_name) else {
+                        return Err(format!(
+                            "capability {name} lists unknown candidate client {candidate_name}"
+                        ));
+                    };
+                    if !seen.insert(candidate_name) {
+                        return Err(format!(
+                            "capability {name} lists candidate {candidate_name} more than once"
+                        ));
+                    }
+                    if candidate.format != client.format {
+                        return Err(format!(
+                            "capability {name} candidate {candidate_name} speaks {:?} but the \
+                             declared target speaks {:?}; a selector may only walk engines that \
+                             answer the same request shape",
+                            candidate.format, client.format
+                        ));
+                    }
+                }
+            }
             match client.format {
                 CapabilityFormat::OpenaiEmbeddings => {
                     if capability.dimensions.is_none() {
@@ -1081,6 +1231,7 @@ dimensions = 1024
             daily_request_limit: None,
             requests_per_minute: None,
             input_tokens_per_minute: None,
+            privacy: None,
         };
         assert_eq!(client.url("/rerank"), "https://service.test/v1/rerank");
 
@@ -1164,6 +1315,37 @@ pub struct ResolvedCapability {
     pub thinking_budget: Option<u32>,
     /// Thinking level for variants that take a level instead of a budget (`MINIMAL`..`HIGH`).
     pub thinking_level: Option<String>,
+    /// Engines this capability may dispatch to, the declared target first.
+    ///
+    /// One entry for an ordinary capability. A rerank capability that declares `candidates`
+    /// has one entry per engine in declared order, and the surface walks them.
+    pub targets: Vec<CapabilityTarget>,
+}
+
+/// One dispatchable engine behind a capability.
+///
+/// A capability resolves to its declared endpoint first and, for reranking, to any ordered
+/// candidates after it. Everything a physical call needs lives here, so the selector can walk
+/// the list without re-reading configuration and without one candidate's resolution leaking
+/// into another's.
+#[derive(Clone, Debug)]
+pub struct CapabilityTarget {
+    /// Configuration name of the client.
+    pub client: String,
+    /// Wire contract this engine speaks.
+    pub format: CapabilityFormat,
+    /// Full request URL.
+    pub url: String,
+    /// Provider-side model or engine id.
+    pub model: String,
+    /// Environment variable holding the credential, when the engine needs one.
+    pub api_key_env: Option<String>,
+    /// Deadline for one call to this engine.
+    pub timeout_seconds: Option<u64>,
+    /// The budgets this engine's physical calls are charged to.
+    pub budget: Option<Arc<CapabilityBudget>>,
+    /// How this engine treats the data handed to it.
+    pub privacy: Option<EndpointPrivacy>,
 }
 
 /// The budgets one capability's physical calls draw on.
@@ -1217,6 +1399,30 @@ pub fn resolve_with_budget(
         };
         let default_path = client.format.default_path(&client.model);
         let budget = capability_budget(name, client, governor, quota_state_dir)?;
+        let mut targets = vec![capability_target(
+            &capability.target,
+            client,
+            default_path.clone(),
+            budget.clone(),
+        )];
+        // Candidate engines are resolved after the declared target so declaration order is the
+        // selector's order. A candidate that cannot be resolved is a configuration error, not a
+        // silent omission: a selector missing its fallback would report the primary's failure as
+        // the end of the road.
+        for candidate_name in &capability.candidates {
+            let Some(candidate) = deployment.clients.get(candidate_name) else {
+                return Err(format!(
+                    "capability {name} lists unknown candidate client {candidate_name}"
+                ));
+            };
+            let candidate_budget = capability_budget(name, candidate, governor, quota_state_dir)?;
+            targets.push(capability_target(
+                candidate_name,
+                candidate,
+                candidate.format.default_path(&candidate.model),
+                candidate_budget,
+            ));
+        }
         resolved.insert(
             capability.id.clone(),
             ResolvedCapability {
@@ -1250,10 +1456,30 @@ pub fn resolve_with_budget(
                 system_instruction: capability.system_instruction.clone(),
                 thinking_budget: capability.thinking_budget,
                 thinking_level: capability.thinking_level.clone(),
+                targets,
             },
         );
     }
     Ok(resolved)
+}
+
+/// Resolves one client into the dispatchable form.
+fn capability_target(
+    client_name: &str,
+    client: &CapabilityClientConfig,
+    default_path: String,
+    budget: Option<Arc<CapabilityBudget>>,
+) -> CapabilityTarget {
+    CapabilityTarget {
+        client: client_name.to_string(),
+        format: client.format,
+        url: client.url(&default_path),
+        model: client.model.clone(),
+        api_key_env: client.api_key_env.clone(),
+        timeout_seconds: client.timeout_seconds,
+        budget,
+        privacy: client.privacy,
+    }
 }
 
 /// The budget one capability draws on, from its client's declarations.

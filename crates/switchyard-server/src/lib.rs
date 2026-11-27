@@ -2435,6 +2435,9 @@ impl ApiError {
     }
 
     fn into_response(self, wire_format: WireFormat) -> Response {
+        // Classified before the body takes `self.code`, because the class is what a
+        // dashboard aggregates and the wire code is what the caller sees.
+        let error_class = local_error_class(self.status, &self.code);
         let body = match wire_format {
             WireFormat::AnthropicMessages => json!({
                 "type": "error",
@@ -2464,7 +2467,7 @@ impl ApiError {
         // real fault was indistinguishable from one. The vocabulary is closed; each value
         // names a refusal class, never a payload.
         response.extensions_mut().insert(RequestLogFailure {
-            error_class: local_error_class(self.status),
+            error_class,
             upstream_request_id: None,
         });
         response.extensions_mut().insert(self);
@@ -2474,17 +2477,30 @@ impl ApiError {
 
 /// The class a locally rendered refusal is recorded under.
 ///
-/// The status decides, because the status is what the caller was told and what a dashboard
-/// aggregates. `local_invalid_request` keeps its old meaning -- the router refused the
-/// request's shape -- and is no longer borrowed by throttles and outages.
-fn local_error_class(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        429 => "local_throttled",
-        500..=599 => "local_unavailable",
-        401 | 403 => "local_auth",
-        404 => "local_not_found",
-        400 | 405..=499 => "local_invalid_request",
-        _ => "local_rejected",
+/// The status is the fallback, because it is what the caller was told. Four codes say
+/// something the status cannot: 429 covers a spent provider day, a spent local day and a
+/// full minute, and a 400 covers both a malformed body and a target whose wire cannot carry
+/// a feature the request needs. Those are named from the wire code, so an operator reading
+/// the log can tell "the account is out until midnight" from "the caller sent nonsense"
+/// without opening the message. Everything else follows its status, and
+/// `local_invalid_request` keeps its old meaning: the router refused the request's shape.
+fn local_error_class(status: StatusCode, code: &str) -> &'static str {
+    match code {
+        "provider_allowance_exhausted" => "provider_allowance_exhausted",
+        "daily_allowance_exhausted" => "daily_allowance_exhausted",
+        "minute_allowance_throttled" => "minute_throttle",
+        "unsupported_feature"
+        | "unsupported_capability"
+        | "count_tokens_unsupported"
+        | "responses_auxiliary_unsupported" => "provider_incompatibility",
+        _ => match status.as_u16() {
+            429 => "local_throttled",
+            500..=599 => "local_unavailable",
+            401 | 403 => "local_auth",
+            404 => "local_not_found",
+            400 | 405..=499 => "local_invalid_request",
+            _ => "local_rejected",
+        },
     }
 }
 
@@ -3409,6 +3425,61 @@ mod tests {
                 "{status} must not be folded into local_invalid_request: {}",
                 events[0].1
             );
+        }
+
+        // A 429 is three different facts, and a 400 is two. The wire code names which, so
+        // the log does not have to be read through the message to tell them apart.
+        for (status, code, expected) in [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "provider_allowance_exhausted",
+                "provider_allowance_exhausted",
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "daily_allowance_exhausted",
+                "daily_allowance_exhausted",
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "minute_allowance_throttled",
+                "minute_throttle",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "unsupported_feature",
+                "provider_incompatibility",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "local_invalid_request",
+            ),
+        ] {
+            let response = error_response(status, "refused", "test_error", code);
+            let events = captured_events(|| request_log_context().emit(&response));
+            assert_eq!(events.len(), 1);
+            assert!(
+                events[0].1.contains(expected),
+                "{status} {code} should log {expected}: {}",
+                events[0].1
+            );
+            // The three throttle classes must stay distinct from each other, or the
+            // refinement buys nothing.
+            for other in [
+                "local_throttled",
+                "provider_allowance_exhausted",
+                "daily_allowance_exhausted",
+                "minute_throttle",
+            ] {
+                if other != expected {
+                    assert!(
+                        !events[0].1.contains(other),
+                        "{status} {code} must not also read {other}: {}",
+                        events[0].1
+                    );
+                }
+            }
         }
     }
 

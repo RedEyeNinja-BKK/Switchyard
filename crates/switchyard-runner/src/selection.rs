@@ -55,17 +55,22 @@ use switchyard_protocol::ModelId;
 /// on it would make routing order noisy exactly when a deployment is newest.
 const MIN_OBSERVATIONS: u32 = 3;
 
-/// How many rotation ticks a ready group may be starved behind a healthier peer before it
-/// is offered one bounded recovery opportunity on ordinary traffic.
+/// How many eligible adaptive opportunities a ready group may be starved behind a healthier
+/// peer before it is offered one bounded recovery dispatch.
+///
+/// An "opportunity" is a real dispatch that ranked this pool (`advance == true`), not a
+/// global tick and not a diagnostic preview: the count is scoped to the group's own pool
+/// traffic, so two routes over the same groups cannot double-spend it and a preview cannot
+/// move it.
 ///
 /// Without this, a group that failed during an outage (e.g. allowance exhaustion) carries
 /// its old negative Evidence forever: `completion < 1000` keeps it behind a healthy peer,
 /// it is never dispatched, so it never earns the new observations that would restore its
 /// ranking, and rotation (the last sort key) never breaks the tie because the groups are
-/// not tied. The recovery window ages out that starvation for exactly one dispatch, after
-/// which the group must earn its place again from what that dispatch measured. It is not a
-/// background probe and not a forced allowance spend: the recovery dispatch is an ordinary
-/// request the route was already going to make.
+/// not tied. The recovery window offers exactly one ordinary-traffic dispatch after the
+/// bound, judged on the evidence that dispatch measures; it does not reset the group's
+/// Evidence (other routes share it), is not a background probe, and is not a forced
+/// allowance spend.
 const RECOVERY_WINDOW: u64 = 8;
 
 /// Weight of the newest latency sample in the average.
@@ -243,13 +248,18 @@ pub struct GroupPlan {
 /// of them sees.
 #[derive(Default)]
 struct GroupRotation {
+    /// Monotonic dispatch counter for the rotation floor (`last_served`), so equally-evidenced
+    /// groups alternate. This is the tie-break rotation only; it is NOT the starvation clock.
     tick: u64,
     last_served: HashMap<String, u64>,
-    /// The tick at which each group was last observed ready-but-starved behind a healthier
-    /// peer. A group whose starvation exceeds [`RECOVERY_WINDOW`] is offered one recovery
-    /// dispatch. Cleared when the group is served, so recovery is bounded per starvation
-    /// episode rather than a permanent reset.
-    starved_since: HashMap<String, u64>,
+    /// Per-group count of eligible adaptive opportunities (dispatches that actually ranked
+    /// this pool) in which the group was ready but not chosen. When the count reaches
+    /// [`RECOVERY_WINDOW`] the group is offered exactly one recovery dispatch, then the
+    /// count resets. Scoped to the group's own pool opportunities, never a global tick, and
+    /// only advanced on a real dispatch (`advance == true`), so diagnostics and previews are
+    /// strictly non-mutating. Keyed by group label, so two routes over the same groups share
+    /// one recovery budget rather than each double-spending it.
+    starved_opportunities: HashMap<String, u64>,
 }
 
 /// What separates two candidates the facts and the evidence cannot order.
@@ -636,12 +646,16 @@ impl MeasuredSelector {
         grouping: Grouping,
         advance: bool,
     ) -> HashMap<ModelId, u32> {
-        let mut evidence = self.evidence.lock();
+        let evidence = self.evidence.lock();
         let by_model: HashMap<&ModelId, &Candidate> =
             candidates.iter().map(|c| (&c.model, c)).collect();
         let mut rotation = self.rotation.lock();
         let ordered = grouping == Grouping::Ordered;
         let mut order: Vec<(u32, bool, u32, u64, u64, String)> = Vec::new();
+        // Groups that are ready but measurably behind a healthier peer this dispatch: the
+        // only groups whose starvation counter advances. Collected here and applied after the
+        // sort so the counter update is gated on `advance` and never runs for a preview.
+        let mut recovery_eligible: Vec<String> = Vec::new();
         for (index, group) in plan.groups.iter().enumerate() {
             let members: Vec<&Candidate> = group
                 .members
@@ -685,39 +699,32 @@ impl MeasuredSelector {
                 measured.iter().map(|(permille, _)| *permille).sum::<u32>()
                     / measured.len() as u32
             };
-            // Bounded recovery: a ready group whose measured completion is being outranked by
-            // a healthier peer, and which has been starved longer than RECOVERY_WINDOW, is
-            // treated as unmeasured for THIS dispatch so it gets one ordinary-traffic chance
-            // to earn fresh evidence. The starvation clock is keyed on the group and cleared
-            // when it is served, so recovery is bounded per episode, not a permanent reset.
-            let completion = if !ordered && ready && completion < 1000 {
-                let now = rotation.tick;
-                let starved = rotation
-                    .starved_since
-                    .get(&group.name)
-                    .copied()
-                    .unwrap_or(now);
-                if now.saturating_sub(starved) >= RECOVERY_WINDOW {
-                    // Age out the stale evidence for this group's members so the recovery
-                    // dispatch is judged on fresh data, not old failures. Bounded per episode:
-                    // the clock resets when the group is served.
-                    for member in &members {
-                        evidence.insert(member.model.clone(), Evidence::default());
-                    }
-                    rotation.starved_since.insert(group.name.clone(), now);
-                    1000
-                } else {
-                    rotation.starved_since.entry(group.name.clone()).or_insert(starved);
-                    completion
-                }
-            } else {
-                completion
-            };
             let mean_latency = if measured.is_empty() {
                 u64::MAX
             } else {
                 measured.iter().map(|(_, latency)| *latency).sum::<u64>()
                     / measured.len() as u64
+            };
+            // Bounded recovery, computed as a RANKING OVERRIDE for this dispatch only. A ready
+            // group whose measured completion is behind a healthier peer is "starved"; once its
+            // own pool-scoped opportunity count reaches RECOVERY_WINDOW it is offered exactly one
+            // recovery dispatch, ranked as if unmeasured so it can earn fresh evidence. The
+            // group's Evidence is never touched (another route may share it), and the counter is
+            // only advanced on a real dispatch, so a preview cannot grant or spend recovery.
+            let recovering = !ordered
+                && ready
+                && completion < 1000
+                && advance
+                && rotation
+                    .starved_opportunities
+                    .get(&group.name)
+                    .copied()
+                    .unwrap_or(0)
+                    >= RECOVERY_WINDOW;
+            let (rank_completion, rank_latency) = if recovering {
+                (1000, u64::MAX)
+            } else {
+                (completion, mean_latency)
             };
             let last_served = if ordered {
                 0
@@ -730,25 +737,52 @@ impl MeasuredSelector {
             // group are what pick a fast member when the group has one.
             let declared_rank = if ordered { index as u32 } else { 0 };
             let readiness = if ordered { false } else { !ready };
+            if !ordered && ready && completion < 1000 {
+                recovery_eligible.push(group.name.clone());
+            }
             order.push((
                 declared_rank,
                 readiness,
-                1000u32.saturating_sub(completion),
-                mean_latency,
+                1000u32.saturating_sub(rank_completion),
+                rank_latency,
                 last_served,
                 group.name.clone(),
             ));
         }
         order.sort();
         if advance && !ordered {
+            rotation.tick = rotation.tick.saturating_add(1);
+            let tick = rotation.tick;
             if let Some(head) = order.first() {
-                rotation.tick = rotation.tick.saturating_add(1);
-                let tick = rotation.tick;
                 rotation.last_served.insert(head.5.clone(), tick);
-                // The head group was served, so any starvation episode for it ends here;
-                // recovery is bounded per episode, not permanent.
-                rotation.starved_since.remove(&head.5);
+                // The head group was served, so its starvation episode ends here regardless of
+                // whether this dispatch was a recovery: recovery is bounded per episode.
+                rotation.starved_opportunities.remove(&head.5);
             }
+            // Every other ready-but-behind group spent one more eligible opportunity starved.
+            // A group that is no longer eligible (recovered, exhausted, or now healthy) has its
+            // counter cleared so a later, separate outage starts a fresh window.
+            for name in &recovery_eligible {
+                if Some(name) != order.first().map(|head| &head.5) {
+                    let count = rotation
+                        .starved_opportunities
+                        .entry(name.clone())
+                        .or_insert(0);
+                    *count = count.saturating_add(1);
+                }
+            }
+            // Clear counters only for groups that belong to THIS plan but are no longer eligible
+            // (recovered, exhausted, or now healthy), so a later separate outage starts a fresh
+            // window. A group from an unrelated pool (e.g. smart-judge while evaluating
+            // smart-nt) is not in this plan and its counter must survive untouched: interleaved
+            // requests on different pools must not erase each other's accumulated opportunities.
+            let plan_groups: std::collections::HashSet<&str> =
+                plan.groups.iter().map(|g| g.name.as_str()).collect();
+            let eligible: std::collections::HashSet<&str> =
+                recovery_eligible.iter().map(String::as_str).collect();
+            rotation
+                .starved_opportunities
+                .retain(|name, _| !plan_groups.contains(name.as_str()) || eligible.contains(name.as_str()));
         }
         let rank_of: HashMap<&str, u32> = order
             .iter()
@@ -1353,14 +1387,15 @@ mod tests {
         );
     }
 
-    // STARVATION + RECOVERY (reviewer hypothesis, source-confirmed): a group that failed
-    // during a genuine outage (e.g. allowance exhaustion) accumulates negative Evidence with
-    // no observation-age field. When the outage clears and the group's allowance recovers, the
-    // old failures persist and `completion < 1000` would keep the group ranked behind a healthy
-    // peer forever, never dispatched, never earning new observations. The fix offers a bounded
-    // recovery opportunity after RECOVERY_WINDOW ticks of starvation, on ordinary traffic.
+    // STARVATION + RECOVERY: a group that failed during a genuine outage (e.g. allowance
+    // exhaustion) accumulates negative Evidence with no observation-age field. When the outage
+    // clears and the group's allowance recovers, the old failures persist and `completion < 1000`
+    // would keep the group ranked behind a healthy peer forever, never dispatched, never earning
+    // new observations. The fix offers exactly ONE bounded recovery dispatch after
+    // RECOVERY_WINDOW eligible pool opportunities, WITHOUT resetting the group's Evidence (other
+    // routes share it), and only on a real dispatch (previews never grant or spend it).
     #[test]
-    fn a_recovered_group_with_old_failures_gets_a_bounded_recovery_opportunity() {
+    fn a_recovered_group_with_old_failures_gets_one_bounded_recovery_dispatch() {
         let selector = MeasuredSelector::new();
         let plan = plan(&[
             ("smart-gemini-bounded", &["g1"]),
@@ -1373,55 +1408,279 @@ mod tests {
             selector.observe(&call("o1", false, 50));
         }
         let recovered = vec![free("g1", 5, 250_000), free_unknown("o1")];
-        // Before the recovery window elapses, healthy Google stays ahead (no premature reset).
+        // Before the recovery window elapses, healthy Google keeps its place.
         let early = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
             [0]
             .model
             .as_str()
             .to_string();
         assert_eq!(early, "g1", "before the window, the healthy peer keeps its place");
-        // Drive ordinary dispatches (each consumes a rotation tick) past the recovery window.
-        for _ in 0..RECOVERY_WINDOW {
-            selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive);
+        // Drive real dispatches (each advances the pool-scoped opportunity count) up to the
+        // window. The group is still behind on every one but the last.
+        for _ in 0..(RECOVERY_WINDOW - 1) {
+            let head = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+                [0]
+                .model
+                .as_str()
+                .to_string();
+            assert_eq!(head, "g1", "still starved before the window elapses");
         }
+        // The RECOVERY_WINDOW-th eligible opportunity grants exactly one recovery dispatch.
         let head = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
             [0]
             .model
             .as_str()
             .to_string();
-        // FIX: the recovered Luna group is offered its bounded recovery dispatch.
         assert_eq!(
             head, "o1",
-            "RECOVERY: starved group gets a bounded recovery opportunity after the window"
+            "RECOVERY: starved group gets exactly one bounded recovery dispatch after the window"
         );
-        // The recovery is one-shot per starvation episode: the recovery dispatch ages out the
-        // stale evidence, so the group re-enters as unmeasured (no sample) and is offered the
-        // dispatch. A second recovery cannot trigger until the group is starved again for a
-        // full window, so recovery is bounded, not a permanent reset.
+        // The recovery did NOT reset Evidence: o1's old failures are still on the books, so the
+        // very next dispatch is judged on that evidence and the healthy peer retakes the head.
+        // Recovery is one dispatch, not a fresh start and not a permanent preference.
         let after = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
             [0]
             .model
             .as_str()
             .to_string();
         assert_eq!(
-            after, "o1",
-            "the recovery dispatch ages out stale evidence; the group re-enters unmeasured"
+            after, "g1",
+            "recovery is one dispatch only; old failures still demote the group next time"
         );
-        // The group now has fresh (unmeasured) evidence; it must earn its place from new
-        // observations rather than staying permanently preferred. Record a failure and verify
-        // the healthy peer can retake the head once the group is measured failing again.
-        for _ in 0..3 {
+        // A second recovery cannot trigger until the group is starved for a fresh full window.
+        for _ in 0..(RECOVERY_WINDOW - 1) {
+            let head = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+                [0]
+                .model
+                .as_str()
+                .to_string();
+            assert_eq!(head, "g1", "no second recovery before a fresh window");
+        }
+        let second = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(second, "o1", "a fresh full window grants one more bounded recovery dispatch");
+    }
+
+    // The recovery dispatch is an ORDINARY request the route was already going to make, and its
+    // real observation must update the real Evidence: a recovery that succeeds restores the group
+    // from measured data, not from the override. This is the smart-nt shape (Luna NT recovers).
+    #[test]
+    fn a_recovery_dispatch_that_succeeds_restores_the_group_from_real_evidence() {
+        let selector = MeasuredSelector::new();
+        let plan = plan(&[
+            ("smart-gemini-bounded", &["g1"]),
+            ("smart-openai-nt", &["o1"]),
+        ]);
+        let declared = models(&["g1", "o1"]);
+        for _ in 0..5 {
+            selector.observe(&call("g1", true, 100));
             selector.observe(&call("o1", false, 50));
         }
-        let re_evaluated = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+        let recovered = vec![free("g1", 5, 250_000), free_unknown("o1")];
+        for _ in 0..RECOVERY_WINDOW {
+            selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive);
+        }
+        // The window's last dispatch chose o1; the outage is over, so o1 now succeeds. Record the
+        // real outcome of that recovery dispatch plus enough successes to clear MIN_OBSERVATIONS.
+        selector.observe(&call("o1", true, 80));
+        selector.observe(&call("o1", true, 80));
+        selector.observe(&call("o1", true, 80));
+        // o1's measured completion is now healthy, so it keeps the head on its own evidence.
+        let head = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(head, "o1", "a recovered group that now measures healthy keeps the head");
+    }
+
+    // A DIAGNOSTIC PREVIEW must never grant or spend recovery: asking what the order would be
+    // leaves the starvation count untouched, so a preview cannot manufacture a recovery dispatch.
+    #[test]
+    fn a_preview_does_not_advance_the_recovery_window() {
+        let selector = MeasuredSelector::new();
+        let plan = plan(&[
+            ("smart-gemini-bounded", &["g1"]),
+            ("smart-openai-nt", &["o1"]),
+        ]);
+        let declared = models(&["g1", "o1"]);
+        for _ in 0..5 {
+            selector.observe(&call("g1", true, 100));
+            selector.observe(&call("o1", false, 50));
+        }
+        let recovered = vec![free("g1", 5, 250_000), free_unknown("o1")];
+        // Many previews, more than the window, must not grant a recovery.
+        for _ in 0..(RECOVERY_WINDOW * 3) {
+            let head = selector
+                .explain_grouped_preview(&recovered, small(), &declared, &plan, Grouping::Adaptive)[0]
+                .model
+                .as_str()
+                .to_string();
+            assert_eq!(head, "g1", "a preview never grants the starved group a recovery");
+        }
+        // The first REAL dispatch after all those previews is still the first eligible
+        // opportunity: the preview did not spend the window. Recovery fires on the
+        // (RECOVERY_WINDOW + 1)-th real dispatch from a fresh counter (RECOVERY_WINDOW
+        // completed starved opportunities, then one recovery), exactly as if no preview ran.
+        let mut head = String::new();
+        for _ in 0..=RECOVERY_WINDOW {
+            head = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)[0]
+                .model
+                .as_str()
+                .to_string();
+        }
+        assert_eq!(head, "o1", "previews did not advance the window; real dispatches do");
+    }
+
+    // Recovery counters are keyed by GROUP and must survive interleaved requests on an
+    // unrelated pool. This uses the actual smart-nt and smart-judge shapes, which SHARE the
+    // canonical Luna target (gpt-6-luna): smart-nt = {smart-gemini-bounded, smart-openai-nt},
+    // smart-judge = {smart-judge-nt, smart-judge-local}. Interleaving judge dispatches between
+    // nt dispatches must not erase the nt group's accumulated starvation opportunities: the
+    // starved nt group still reaches RECOVERY_WINDOW and gets exactly one recovery dispatch.
+    #[test]
+    fn interleaved_unrelated_pool_requests_do_not_erase_recovery_counters() {
+        let selector = MeasuredSelector::new();
+        // Actual shapes. The Luna leaf o1 is shared by both pools' openai/nt group.
+        let nt_plan = plan(&[
+            ("smart-gemini-bounded", &["g1"]),
+            ("smart-openai-nt", &["o1"]),
+        ]);
+        let nt_declared = models(&["g1", "o1"]);
+        let judge_plan = plan(&[
+            ("smart-judge-nt", &["o1"]),
+            ("smart-judge-local", &["j2"]),
+        ]);
+        let judge_declared = models(&["o1", "j2"]);
+        // Evidence: g1 healthy, o1 failing (during its outage), j2 healthy. o1 is shared, so its
+        // failing evidence is real for both pools.
+        for _ in 0..5 {
+            selector.observe(&call("g1", true, 100));
+            selector.observe(&call("o1", false, 50));
+            selector.observe(&call("j2", true, 110));
+        }
+        let nt_candidates = vec![free("g1", 5, 250_000), free_unknown("o1")];
+        let judge_candidates = vec![free_unknown("o1"), free("j2", 5, 250_000)];
+        // Interleave: one nt dispatch, then several judge dispatches, repeated. The judge pool
+        // is healthy (j2 serves), so its own groups never become recovery-eligible; but the
+        // judge dispatches must NOT clear the nt group's counter. Recovery fires on the
+        // (RECOVERY_WINDOW + 1)-th nt dispatch from a fresh counter.
+        for _ in 0..RECOVERY_WINDOW {
+            let nt_head = selector.explain_grouped(&nt_candidates, small(), &nt_declared, &nt_plan, Grouping::Adaptive)
+                [0]
+                .model
+                .as_str()
+                .to_string();
+            assert_eq!(nt_head, "g1", "nt still starved before its window");
+            // Interleave unrelated judge traffic (3 judge dispatches per nt dispatch).
+            for _ in 0..3 {
+                selector.explain_grouped(&judge_candidates, small(), &judge_declared, &judge_plan, Grouping::Adaptive);
+            }
+        }
+        // The nt group's counter survived all the interleaved judge traffic and now reaches the
+        // threshold: the next nt dispatch is the bounded recovery dispatch for o1.
+        let nt_head = selector.explain_grouped(&nt_candidates, small(), &nt_declared, &nt_plan, Grouping::Adaptive)
             [0]
             .model
             .as_str()
             .to_string();
         assert_eq!(
-            re_evaluated, "g1",
-            "recovery is bounded: fresh failures re-demote the group"
+            nt_head, "o1",
+            "interleaved judge requests did not erase the nt group's recovery opportunities"
         );
+        // One bounded recovery only: the next nt dispatch is judged on o1's (still failing)
+        // real evidence, so g1 retakes the head. Historical evidence was never reset.
+        let nt_after = selector.explain_grouped(&nt_candidates, small(), &nt_declared, &nt_plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(nt_after, "g1", "one bounded recovery; old failures still demote o1 next time");
+    }
+
+    // The success-recovery witness must observe the ACTUAL recovery dispatch and distinguish a
+    // genuine evidence-based ranking from the temporary override. A single success does not
+    // erase all previous failures: the group keeps the head only once its real measured
+    // completion (with the prior) clears the healthy peer, not because the override is active.
+    #[test]
+    fn a_success_recovery_witness_distinguishes_real_evidence_from_the_override() {
+        let selector = MeasuredSelector::new();
+        let plan = plan(&[
+            ("smart-gemini-bounded", &["g1"]),
+            ("smart-openai-nt", &["o1"]),
+        ]);
+        let declared = models(&["g1", "o1"]);
+        // Outage: o1 fails 5 times, g1 succeeds 5 times.
+        for _ in 0..5 {
+            selector.observe(&call("g1", true, 100));
+            selector.observe(&call("o1", false, 50));
+        }
+        let recovered = vec![free("g1", 5, 250_000), free_unknown("o1")];
+        // Reach the recovery dispatch.
+        for _ in 0..=RECOVERY_WINDOW {
+            selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive);
+        }
+        // The recovery dispatch chose o1. Now observe its ACTUAL outcome: one success. With the
+        // Beta prior, one success is NOT enough to clear the 5 prior failures -- o1's measured
+        // completion is still below g1's, so the override is gone and g1 retakes the head. This
+        // proves the ranking is evidence-based, not override-based, and that one success does
+        // not erase all previous failures.
+        selector.observe(&call("o1", true, 80));
+        let after_one = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(
+            after_one, "g1",
+            "one success does not erase five failures; the override is gone and evidence rules"
+        );
+        // The group keeps the head on GENUINE evidence only once its real measured completion
+        // (successes+1)/(calls+2) clears g1's 6/7. With five failures fixed, that needs the
+        // successes to dominate: 5 failures + 50 successes -> 51/57 = 0.895 > 0.857. Until then
+        // the healthy peer stays ahead, which is the honest, evidence-based behaviour -- a single
+        // success never flips it and the override is never re-granted without a fresh window.
+        for _ in 0..49 {
+            selector.observe(&call("o1", true, 80));
+        }
+        let after_many = selector.explain_grouped(&recovered, small(), &declared, &plan, Grouping::Adaptive)
+            [0]
+            .model
+            .as_str()
+            .to_string();
+        assert_eq!(
+            after_many, "o1",
+            "only genuine measured evidence (not the override) restores the group from a real outage"
+        );
+    }
+
+    // A group that is NOT ready (its own allowance is exhausted) is never offered recovery:
+    // quota exhaustion is not "recovered readiness". Neither is an over-pressure or fit-excluded
+    // request. Only a ready, eligible group can recover.
+    #[test]
+    fn an_exhausted_group_is_never_offered_recovery() {
+        let selector = MeasuredSelector::new();
+        let plan = plan(&[
+            ("smart-gemini-bounded", &["g1"]),
+            ("smart-openai-nt", &["o1"]),
+        ]);
+        let declared = models(&["g1", "o1"]);
+        for _ in 0..5 {
+            selector.observe(&call("g1", true, 100));
+            selector.observe(&call("o1", false, 50));
+        }
+        // o1's allowance is exhausted (remaining_today == Some(0)): not ready, so never recovers.
+        let spent = vec![free("g1", 5, 250_000), free("o1", 0, 250_000)];
+        for _ in 0..(RECOVERY_WINDOW * 2) {
+            let head = selector.explain_grouped(&spent, small(), &declared, &plan, Grouping::Adaptive)[0]
+                .model
+                .as_str()
+                .to_string();
+            assert_eq!(head, "g1", "an exhausted group is never offered recovery");
+        }
     }
     #[test]
     fn asking_what_the_grouped_order_would_be_does_not_spend_a_turn() {

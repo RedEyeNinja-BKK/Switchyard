@@ -1844,12 +1844,16 @@ fn reasoning_issuer(backend: &Backend, model: &ModelId) -> ReasoningIssuer {
 }
 
 // The lineage facts a request carries about itself.
+//
+// Switchyard has no inbound authentication: `agent_id` and `session_id` are caller-supplied
+// headers and can be forged, so they are recorded as advisory only and never authorise replay.
+// Until a verified caller boundary exists, every production request builds an untrusted lineage,
+// and admission rests on the issuer (credential domain, model, wire) alone.
 fn request_lineage(metadata: Option<&Metadata>) -> ReasoningLineage {
-    ReasoningLineage {
-        consumer: metadata.and_then(|metadata| metadata.agent_id.clone()),
-        conversation: metadata.and_then(|metadata| metadata.session_id.clone()),
-        response: None,
-    }
+    ReasoningLineage::untrusted(
+        metadata.and_then(|metadata| metadata.agent_id.clone()),
+        metadata.and_then(|metadata| metadata.session_id.clone()),
+    )
 }
 
 // Message indexes forming the active continuation edge.
@@ -6560,10 +6564,11 @@ mod tests {
         );
     }
 
-    // A blob recorded from this exact target, in this conversation, for this consumer is
-    // admitted; it is the only case where the encoder may replay.
+    // A blob recorded from this exact target is admitted when the request is dispatched back to
+    // that same issuer. The issuer (credential domain, model, wire) is the whole of the proof;
+    // no caller-supplied header participates.
     #[test]
-    fn admission_admits_state_this_issuer_recorded_in_this_lineage() {
+    fn admission_admits_state_this_issuer_recorded() {
         let backend = openrouter_backend();
         let registry = ProvenanceRegistry::default();
         let metadata = metadatum(Some("agent-7"), Some("conv-1"));
@@ -6604,15 +6609,18 @@ mod tests {
         let admission = policy.reasoning_admission.expect("provenance-bound sets one");
         assert!(
             admission.admits(&reasoning_digest()),
-            "state this target issued in this conversation is replayable"
+            "state this target issued is replayable to the same issuer"
         );
         assert!(admission.active_unproven.is_empty());
     }
 
-    // The consumer is part of the lineage: another agent holding the same bytes is a different
-    // conversation partner, so the state is not admitted and the active edge is refused.
+    // Ingress-to-egress trust boundary. Switchyard has no inbound authentication, so `agent_id`
+    // and `session_id` are advisory headers a caller can forge. A consumer or conversation that
+    // differs only in those headers must NOT change the admission decision: the state is still
+    // admitted to the same issuer, because the issuer check is the only trustworthy fact. This is
+    // the regression that fails if header matching is (re)introduced as if it were auth.
     #[test]
-    fn admission_refuses_a_different_consumer() {
+    fn advisory_headers_do_not_change_admission() {
         let backend = openrouter_backend();
         let registry = ProvenanceRegistry::default();
         let recorded = metadatum(Some("agent-7"), Some("conv-1"));
@@ -6640,10 +6648,11 @@ mod tests {
             ..LlmRequest::default()
         };
 
+        // Same bytes, same issuer, but every caller-supplied identity is different or absent.
         for (label, metadata) in [
-            ("another consumer", metadatum(Some("agent-8"), Some("conv-1"))),
+            ("a spoofed consumer", metadatum(Some("attacker"), Some("conv-1"))),
             ("another conversation", metadatum(Some("agent-7"), Some("conv-2"))),
-            ("unidentified caller", metadatum(None, None)),
+            ("absent ids", metadatum(None, None)),
         ] {
             let mut policy = translation_policy(&backend);
             apply_reasoning_admission(
@@ -6656,19 +6665,18 @@ mod tests {
             );
             let admission = policy.reasoning_admission.expect("admission");
             assert!(
-                !admission.admits(&reasoning_digest()),
-                "{label} must not be admitted"
-            );
-            assert!(
-                admission.refuses(&reasoning_digest()),
-                "{label} must land on the active edge as required-and-unproven"
+                admission.admits(&reasoning_digest()),
+                "{label} must not change the decision: the issuer is the only trusted fact"
             );
         }
     }
 
-    // Cross-account and cross-model are refused even with an identical conversation.
+    // The same opaque bytes on a different issuer (another account or another native model) are
+    // refused even though the caller-supplied conversation is identical. This is the
+    // "same digest, different scope" case: identity comes from the credential and the model, not
+    // from anything the caller sends.
     #[test]
-    fn admission_refuses_another_account_or_model() {
+    fn same_digest_on_another_issuer_is_refused() {
         let registry = ProvenanceRegistry::default();
         let metadata = metadatum(Some("agent-7"), Some("conv-1"));
         let issuer = openrouter_backend();
@@ -6723,6 +6731,10 @@ mod tests {
                 !admission.admits(&reasoning_digest()),
                 "{label} must not replay another issuer's state"
             );
+            assert!(
+                admission.refuses(&reasoning_digest()),
+                "{label} lands on the active edge as required-and-unproven"
+            );
         }
     }
 
@@ -6755,8 +6767,8 @@ mod tests {
         let (recorded, lineage) = registry
             .resolve(&reasoning_digest())
             .expect("the decoded state is recorded");
-        assert_eq!(lineage.consumer.as_deref(), Some("agent-7"));
-        assert_eq!(lineage.conversation.as_deref(), Some("conv-1"));
+        assert_eq!(lineage.advisory_consumer(), Some("agent-7"));
+        assert_eq!(lineage.advisory_conversation(), Some("conv-1"));
         assert_eq!(lineage.response.as_deref(), Some("resp-9"));
         assert_eq!(recorded, reasoning_issuer(&backend, &model()));
     }
@@ -6884,7 +6896,7 @@ mod tests {
             .resolve(&reasoning_digest())
             .expect("streamed state is recorded once the stream completes");
         assert_eq!(recorded, reasoning_issuer(&backend, &model()));
-        assert_eq!(lineage.consumer.as_deref(), Some("agent-7"));
+        assert_eq!(lineage.advisory_consumer(), Some("agent-7"));
     }
 
 }

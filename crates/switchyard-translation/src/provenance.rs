@@ -69,33 +69,87 @@ impl ReasoningIssuer {
 /// The conversation lineage a blob was issued within.
 ///
 /// Recorded so a blob can be refused when it is replayed into a different consumer or
-/// conversation than the one that produced it. `None` means the host did not identify that
-/// fact, which is treated as "unknown" and compared strictly: a recorded consumer is never
-/// satisfied by an unidentified one.
+/// conversation than the one that produced it.
+///
+/// The consumer and conversation facts are **advisory**: Switchyard has no inbound
+/// authentication, so a caller-supplied `agent_id` or `session_id` header can be forged and
+/// proves nothing about who is calling. They are recorded for diagnostics only and are never
+/// compared during admission. A consumer fact is honoured only when it comes from a verified
+/// caller boundary, supplied through [`ReasoningLineage::trusted`]; absent that, an untrusted
+/// lineage is the only kind production builds, and it authorises nothing beyond the issuer.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReasoningLineage {
-    /// Authenticated consumer (agent or caller identity), when the host names one.
-    pub consumer: Option<String>,
-    /// Conversation/session the state was produced in, when the host names one.
-    pub conversation: Option<String>,
+    /// Advisory consumer (agent or caller identity) from an unauthenticated header, when present.
+    pub(crate) consumer: Option<String>,
+    /// Advisory conversation/session from an unauthenticated header, when present.
+    pub(crate) conversation: Option<String>,
     /// Provider response id the state arrived with, when the provider reported one.
     pub response: Option<String>,
+    /// Set only by [`ReasoningLineage::trusted`], marking the consumer as boundary-verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verified_consumer: Option<String>,
 }
 
 impl ReasoningLineage {
+    /// Lineage for a request whose caller identity has not been authenticated.
+    ///
+    /// Header-derived ids are recorded as advisory only; nothing here authorises replay.
+    pub fn untrusted(consumer: Option<String>, conversation: Option<String>) -> Self {
+        Self {
+            consumer,
+            conversation,
+            response: None,
+            verified_consumer: None,
+        }
+    }
+
+    /// Lineage whose consumer identity was established by a verified caller boundary.
+    ///
+    /// This is the only constructor that produces a lineage whose consumer fact is honoured
+    /// during admission. It exists for a future verified ingress; Switchyard has none today, so
+    /// production always builds an [`ReasoningLineage::untrusted`] lineage.
+    pub fn trusted(verified_consumer: String, conversation: Option<String>) -> Self {
+        Self {
+            consumer: Some(verified_consumer.clone()),
+            conversation,
+            response: None,
+            verified_consumer: Some(verified_consumer),
+        }
+    }
+
+    /// Advisory consumer (agent or caller identity) recorded from an unauthenticated header.
+    ///
+    /// Diagnostic only; never compared during admission. Prefer [`Self::verified_consumer`],
+    /// which is the only consumer fact that carries authority.
+    pub fn advisory_consumer(&self) -> Option<&str> {
+        self.consumer.as_deref()
+    }
+
+    /// Advisory conversation/session recorded from an unauthenticated header. Diagnostic only.
+    pub fn advisory_conversation(&self) -> Option<&str> {
+        self.conversation.as_deref()
+    }
+
+    /// The verified consumer identity, when this lineage came from a trusted caller boundary.
+    pub fn verified_consumer(&self) -> Option<&str> {
+        self.verified_consumer.as_deref()
+    }
+
     /// Whether state issued under `self` may be used in a request with `request` lineage.
     ///
-    /// A recorded fact must be matched. An unidentified request cannot satisfy a recorded
-    /// consumer or conversation, because "unknown" does not prove it is the same one.
+    /// The consumer fact is honoured only when BOTH the recorded fact and the request fact were
+    /// established by a verified boundary. An advisory (header-derived) consumer on either side
+    /// is ignored rather than matched, because a forged header can copy any string. The
+    /// conversation fact is advisory for the same reason and is never compared. What remains is
+    /// the issuer check in [`ReasoningIssuer::permits_replay_to`], which depends on no
+    /// caller-supplied value.
     pub fn permits_replay_in(&self, request: &Self) -> bool {
-        fn matches(recorded: &Option<String>, requested: &Option<String>) -> bool {
-            match recorded {
-                Some(recorded) => requested.as_deref() == Some(recorded.as_str()),
-                None => requested.is_none(),
-            }
+        match (&self.verified_consumer, &request.verified_consumer) {
+            (Some(recorded), Some(requested)) => recorded == requested,
+            // No verified consumer on either side: nothing caller-derived is compared. The
+            // issuer (credential domain, model, wire) is the whole of what is provable here.
+            _ => true,
         }
-        matches(&self.consumer, &request.consumer)
-            && matches(&self.conversation, &request.conversation)
     }
 }
 
@@ -506,32 +560,36 @@ mod tests {
     }
 
     #[test]
-    fn lineage_must_match_and_unknown_never_satisfies_a_recorded_fact() {
-        let recorded = ReasoningLineage {
-            consumer: Some("agent-7".to_string()),
-            conversation: Some("conv-1".to_string()),
-            response: Some("resp-9".to_string()),
-        };
-        assert!(recorded.permits_replay_in(&recorded));
+    fn advisory_lineage_never_authorises_and_verified_consumer_must_match() {
+        // Untrusted (header-derived) lineages compare nothing caller-supplied: a forged header
+        // can copy any string, so only the issuer check governs. Two untrusted lineages are
+        // therefore consistent, and a spoofed id changes nothing.
+        let recorded = ReasoningLineage::untrusted(Some("agent-7".into()), Some("conv-1".into()));
+        assert!(recorded.permits_replay_in(&ReasoningLineage::untrusted(
+            Some("attacker-controlled".into()),
+            Some("conv-2".into()),
+        )));
+        assert!(recorded.permits_replay_in(&ReasoningLineage::untrusted(None, None)));
+        assert!(ReasoningLineage::untrusted(None, None).permits_replay_in(&recorded));
+
+        // A verified boundary on both sides does compare the consumer, and a mismatch is
+        // refused. This is the only shape that carries consumer authority.
+        let verified = ReasoningLineage::trusted("gateway-user-42".into(), Some("conv-1".into()));
+        assert!(verified.permits_replay_in(&ReasoningLineage::trusted(
+            "gateway-user-42".into(),
+            Some("other-conv".into()),
+        )));
         assert!(
-            !recorded.permits_replay_in(&ReasoningLineage::default()),
-            "an unidentified request cannot satisfy a recorded consumer"
+            !verified.permits_replay_in(&ReasoningLineage::trusted("gateway-user-99".into(), None)),
+            "a different verified consumer is refused"
         );
-        assert!(
-            !recorded.permits_replay_in(&ReasoningLineage {
-                consumer: Some("someone-else".to_string()),
-                ..recorded.clone()
-            }),
-            "a different consumer is refused"
-        );
-        assert!(
-            !recorded.permits_replay_in(&ReasoningLineage {
-                conversation: Some("conv-2".to_string()),
-                ..recorded.clone()
-            }),
-            "a different conversation is refused"
-        );
-        // Two unidentified lineages are consistent with each other.
-        assert!(ReasoningLineage::default().permits_replay_in(&ReasoningLineage::default()));
+        // A verified record and an untrusted request: the caller cannot prove identity, but the
+        // issuer is the only fact that ever governed admission, so the untrusted side neither
+        // gains nor loses anything. The decision is the issuer's, unchanged.
+        assert!(verified.permits_replay_in(&ReasoningLineage::untrusted(
+            Some("gateway-user-42".into()),
+            None,
+        )));
+        assert!(recorded.permits_replay_in(&verified));
     }
 }

@@ -1088,14 +1088,14 @@ fn encode_openai_message_reasoning_from_blocks(
 // The typed refusal for opaque state the active continuation cannot do without.
 //
 // One wording for both policies: the reason is not which replay mode the target uses, but that
-// the request is a continuation whose required state cannot be honoured. Only the digest prefix
-// is reported, so a refusal never puts provider state in a log line.
-fn active_state_refusal(digest: &str) -> crate::TranslationError {
-    crate::TranslationError::LossyConversion(format!(
+// the request is a continuation whose required state cannot be honoured. No digest is reported:
+// a refusal must not put any provider-derived value in a log line.
+fn active_state_refusal() -> crate::TranslationError {
+    crate::TranslationError::LossyConversion(
         "opaque reasoning state this target did not provably issue is required by the active \
-         continuation; refusing rather than replaying unproven provider state (digest {})",
-        &digest[..digest.len().min(16)]
-    ))
+         continuation; refusing rather than replaying unproven provider state"
+            .to_string(),
+    )
 }
 
 // Splits reasoning blocks into those whose opaque state may be sent to this target and a count
@@ -1135,7 +1135,7 @@ fn partition_replayable_reasoning(
                         .as_ref()
                         .is_some_and(|admission| admission.refuses(digest))
                 {
-                    return Err(active_state_refusal(digest));
+                    return Err(active_state_refusal());
                 }
                 false
             }
@@ -1149,7 +1149,7 @@ fn partition_replayable_reasoning(
                     && let Some(digest) = digest.as_deref()
                     && admission.is_some_and(|a| a.refuses(digest))
                 {
-                    return Err(active_state_refusal(digest));
+                    return Err(active_state_refusal());
                 }
                 admitted
             }

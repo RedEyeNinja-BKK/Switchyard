@@ -937,6 +937,19 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
         return None;
     };
     let target = target.as_str().to_string();
+    // The reconciled provider reading refused the send: the account's own pool is empty.
+    // Only an account-scoped counter is ever reconciled from a provider, so the pool is
+    // the credential's free-model allowance, and a slug spelled as a free variant is the
+    // scope it covers. A slug outside that spelling names a pool this layer cannot state,
+    // so only the reporting target is blocked and no paid crossing is authorized.
+    if matches!(source, LlmClientError::ProviderAllowanceExhausted { .. }) {
+        let kind = if is_free_scope(&target) {
+            CredentialBlockKind::FreeQuota
+        } else {
+            CredentialBlockKind::ModelQuota
+        };
+        return Some((kind, target));
+    }
     // Google states the scope of a daily quota, so its two scopes are different facts and
     // must not be collapsed. `is_account_wide_quota` only reports the project-wide case,
     // which would leave a per-model exhaustion both unrecorded and fatal to a mixed pool:
@@ -1041,6 +1054,13 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         | LlmClientError::DailyRequestAllowanceUnavailable { .. } => {
             FailureClass::TemporarilyUnavailable
         }
+        // The provider's own reconciled figure says the account pool is empty, so the
+        // counter refused before anything left. Same family as the per-target allowance
+        // above: this leg cannot serve until the provider day rolls over, while every
+        // candidate on another allowance keeps its own budget. Measured live 2026-11-27:
+        // this arm did not exist, so the refusal fell through to `Other`, ended a
+        // smart-route request with HTTP 500 and never reached a sibling that could answer.
+        LlmClientError::ProviderAllowanceExhausted { .. } => FailureClass::TemporarilyUnavailable,
         // A full minute window is a throttle, not an outage: the leg is servable again
         // within the minute, so a composite may cross to a sibling with headroom and the
         // caller is told to retry shortly rather than to wait for tomorrow.
@@ -1167,6 +1187,11 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         source,
         LlmClientError::DailyRequestAllowanceExhausted { .. }
             | LlmClientError::DailyRequestAllowanceUnavailable { .. }
+            // The reconciled provider figure refused the send: the account's own pool is
+            // empty although this deployment's ledger may still have room. The pool is
+            // spent, not the request, and every candidate on another allowance is
+            // untouched -- so the next candidate is exactly what a free pool provides.
+            | LlmClientError::ProviderAllowanceExhausted { .. }
             // A minute window regains room on its own, so this leg is worth returning to
             // later in the same call; the route may also reach a sibling with headroom now.
             | LlmClientError::MinuteAllowanceThrottled { .. }
@@ -4312,7 +4337,7 @@ mod account_quota_tests {
     use http::StatusCode;
     use serde_json::json;
     use switchyard_libsy::LibsyError;
-    use switchyard_protocol::LlmClientError;
+    use switchyard_protocol::{LlmClientError, ModelId, RoutingFallbackReason};
 
     fn rate_limited(target: &str, limit_source: Option<&str>) -> LibsyError {
         let mut metadata = serde_json::Map::new();
@@ -4363,6 +4388,97 @@ mod account_quota_tests {
         );
         assert!(failure_class(&error).allows_cross_route());
         assert!(failure_class(&error).is_account_quota());
+    }
+
+    /// The reconciled provider counter refuses before the request leaves, because the
+    /// account's own pool is empty while this deployment's ledger may still show room.
+    ///
+    /// Measured live 2026-11-27: this refusal ended a smart-route request with HTTP 500 on
+    /// `baidu/ernie-5.5-flash-preview:free` although a paid leg and a leg on another
+    /// provider had not been tried. The refusal is a statement about ONE allowance pool, so
+    /// it is routable -- the next candidate on another allowance is untouched -- and the
+    /// block it records covers the credential's free slugs, which is the scope the
+    /// reconciled pool actually has.
+    #[test]
+    fn a_provider_allowance_refusal_is_routable_and_covers_only_free_slugs() {
+        let error = LibsyError::client_call(
+            "baidu/ernie-5.5-flash-preview:free",
+            LlmClientError::ProviderAllowanceExhausted {
+                model: ModelId::from("baidu/ernie-5.5-flash-preview:free"),
+                limit: 1_000,
+            },
+        );
+
+        assert_eq!(
+            failure_class(&error),
+            FailureClass::TemporarilyUnavailable,
+            "the pool is out until it resets; nothing about the request is invalid"
+        );
+        assert!(
+            failure_class(&error).allows_cross_route(),
+            "a composite may cross to a child on another allowance"
+        );
+        assert!(
+            !failure_class(&error).is_account_quota(),
+            "AccountQuota stops the candidate list, which is the bug this refusal caused"
+        );
+        assert_eq!(
+            fallback_reason(&error),
+            Some(RoutingFallbackReason::Unavailable),
+            "the walk must continue to a sibling on another allowance"
+        );
+
+        let (kind, slug) =
+            credential_block(&error).expect("the refusal names the allowance it exhausted");
+        assert_eq!(kind, CredentialBlockKind::FreeQuota);
+        let block = super::CredentialBlock {
+            credential: "openrouter_free".to_string(),
+            kind,
+            target: slug,
+        };
+        assert!(
+            block.blocks("openrouter_free", "openrouter/ling-3.2-flash:free"),
+            "the same free pool on the same credential is spent"
+        );
+        assert!(
+            !block.blocks("openrouter_free", "z-ai/glm-5.3-flash"),
+            "a paid slug on that credential draws on the balance, not on this pool"
+        );
+        assert!(!block.blocks("deepseek", "deepseek-v4.1-flash"));
+        assert!(
+            block.crosses_to_paid(),
+            "a spent free allowance is what authorizes spending a paid leg"
+        );
+    }
+
+    /// The same refusal reported by a slug that is not a free variant blocks that target
+    /// only.
+    ///
+    /// Provider readings are written only into account-scoped counters, so the pool is
+    /// shared by configuration; but the error itself names one model, and this layer must
+    /// not take siblings' budgets or authorize a paid crossing on a scope it cannot state.
+    #[test]
+    fn a_provider_allowance_refusal_outside_the_free_spelling_blocks_only_that_target() {
+        let error = LibsyError::client_call(
+            "z-ai/glm-5.3-flash",
+            LlmClientError::ProviderAllowanceExhausted {
+                model: ModelId::from("z-ai/glm-5.3-flash"),
+                limit: 1_000,
+            },
+        );
+        let (kind, slug) = credential_block(&error).expect("the refusal carries a block");
+        assert_eq!(kind, CredentialBlockKind::ModelQuota);
+        let block = super::CredentialBlock {
+            credential: "openrouter_paid".to_string(),
+            kind,
+            target: slug,
+        };
+        assert!(block.blocks("openrouter_paid", "z-ai/glm-5.3-flash"));
+        assert!(!block.blocks("openrouter_paid", "minimax/minimax-m3"));
+        assert!(
+            !block.crosses_to_paid(),
+            "an unnamed scope never spends the owner's money"
+        );
     }
 
     /// Provider- and model-scoped throttling must keep its existing fallthrough: the

@@ -1874,3 +1874,173 @@ async fn a_recovered_provider_reading_serves_without_spending_the_local_tier() {
     assert!(!trace.terminal_crossed);
     assert_eq!(trace.served.as_deref(), Some("o1"));
 }
+
+// ---------------------------------------------------------------------------------------
+// The provider's own account pool refusing before dispatch.
+//
+// A reconciled provider reading can say the account's allowance is spent while this
+// deployment's own ledger still has room; the counter then refuses the send and reports
+// `ProviderAllowanceExhausted`. Measured live 2026-11-27: that refusal ended a smart-route
+// request with HTTP 500 on `baidu/ernie-5.5-flash-preview:free` although a paid leg and a
+// leg on another provider had not been tried. The claims under test are about the walk, so
+// they are driven through a real route rather than through the classifier.
+// ---------------------------------------------------------------------------------------
+
+/// A flat passthrough walk: legs are offered in declared order, each on its own allowance.
+fn allowance_walk(legs: Vec<(&'static str, Arc<dyn RoutedLlmClient>)>) -> Route {
+    let mut names: Vec<&'static str> = Vec::new();
+    let mut clients: HashMap<ModelId, Arc<dyn RoutedLlmClient>> = HashMap::new();
+    for (name, client) in legs {
+        names.push(name);
+        clients.insert(ModelId::from(name), client);
+    }
+    let spec = AlgorithmSpec::Passthrough {
+        target: names[0].to_string(),
+        candidates: names[1..].iter().map(|name| name.to_string()).collect(),
+        subagents: None,
+    };
+    let targets: BTreeMap<String, ModelId> = names
+        .iter()
+        .map(|name| (name.to_string(), ModelId::from(*name)))
+        .collect();
+    let algorithm = spec
+        .build("switchyard", &targets)
+        .expect("algorithm builds");
+    Route::new(
+        algorithm,
+        ClientRouter::new(clients),
+        None,
+        ModelCapabilities::default(),
+        None,
+        None,
+        Vec::new(),
+        RuntimeModels::new(HashMap::from([(
+            Category::Any,
+            names.iter().map(|name| ModelId::from(*name)).collect(),
+        )])),
+        switchyard_runner::RouteReasoningPolicy::Inherit,
+        None,
+        None,
+    )
+}
+
+/// The reported failure, in the shape it happened: free legs whose account pool is spent
+/// refuse before the request leaves, and the walk must continue to a leg on another
+/// allowance instead of returning the refusal as the answer.
+#[tokio::test]
+async fn a_provider_allowance_refusal_walks_to_a_leg_another_allowance_answers() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let refusing = |model: &'static str| {
+        Arc::new(ProviderExhaustedClient {
+            model,
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn RoutedLlmClient>
+    };
+    let route = allowance_walk(vec![
+        ("gemini-3.6-flash", refusing("gemini-3.6-flash")),
+        (
+            "baidu/ernie-5.5-flash-preview:free",
+            refusing("baidu/ernie-5.5-flash-preview:free"),
+        ),
+        (
+            "deepseek-deepseek-flash",
+            Arc::new(EchoClient {
+                model: "deepseek-deepseek-flash",
+                calls: Arc::clone(&calls),
+            }),
+        ),
+    ]);
+    let (sink, observer) = trace_sink();
+
+    let output = route
+        .execute(
+            Request {
+                llm_request: text_request(None, "hello"),
+                ..Request::default()
+            },
+            Some(observer),
+        )
+        .await
+        .expect("a leg on another allowance can answer this request");
+
+    // The algorithm's own label for a passthrough is its declared target, so the leg that
+    // actually answered is read from the response and from the selection record.
+    assert_eq!(
+        output.response.served_model().map(ModelId::as_str),
+        Some("deepseek-deepseek-flash")
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            "gemini-3.6-flash",
+            "baidu/ernie-5.5-flash-preview:free",
+            "deepseek-deepseek-flash"
+        ],
+        "each refused leg is offered once, in declared order, and the walk reaches the leg that answers"
+    );
+    let traces = sink.lock().unwrap();
+    let trace = traces.last().expect("a selection record");
+    assert_eq!(trace.served.as_deref(), Some("deepseek-deepseek-flash"));
+    assert_eq!(trace.outcome, "served");
+}
+
+/// When every leg's allowance is out, the request is not invalid: it is refused until one of
+/// the pools resets. The classification is what tells the two apart at the edge, where a
+/// request fault becomes a 500 and an exhausted allowance must not.
+#[tokio::test]
+async fn a_route_with_no_servable_allowance_is_not_reported_as_a_request_fault() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let refusing = |model: &'static str| {
+        Arc::new(ProviderExhaustedClient {
+            model,
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn RoutedLlmClient>
+    };
+    let route = allowance_walk(vec![
+        ("gemini-3.6-flash", refusing("gemini-3.6-flash")),
+        (
+            "baidu/ernie-5.5-flash-preview:free",
+            refusing("baidu/ernie-5.5-flash-preview:free"),
+        ),
+        (
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            refusing("nvidia/nemotron-3-ultra-550b-a55b:free"),
+        ),
+    ]);
+
+    let error = match route
+        .execute(
+            Request {
+                llm_request: text_request(None, "hello"),
+                ..Request::default()
+            },
+            None,
+        )
+        .await
+    {
+        Ok(output) => panic!(
+            "every leg's allowance is spent, but {} answered",
+            output.selected_model
+        ),
+        Err(error) => error,
+    };
+
+    let switchyard_runner::RunnerError::Algorithm(inner) = error else {
+        panic!("the refusal comes from the walking client, got {error:?}");
+    };
+    assert!(
+        matches!(
+            &inner,
+            libsy::LibsyError::ClientCall {
+                source: LlmClientError::ProviderAllowanceExhausted { .. },
+                ..
+            }
+        ),
+        "{inner:?}"
+    );
+    assert_eq!(
+        switchyard_llm_client::failure_class(&inner),
+        switchyard_llm_client::FailureClass::TemporarilyUnavailable,
+        "nothing about this request is invalid; every pool is simply out until it resets"
+    );
+}

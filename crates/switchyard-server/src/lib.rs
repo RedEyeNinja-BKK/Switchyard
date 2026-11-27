@@ -2403,8 +2403,20 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
     // classification stamped when the ApiError it was built from was first turned
     // into a response; the id is whatever the provider gave (possibly nothing).
     let upstream_request_id = RequestLogFailure::from_error_body(body);
+    // The provider's own account of the refusal, reduced to a closed vocabulary at the last
+    // point where the body exists. Every upstream refusal used to be recorded as one class,
+    // which made a spent allowance, a minute throttle and a request the provider could not
+    // parse indistinguishable in the log. An unrecognised refusal keeps the generic label
+    // rather than being guessed into a quota or entitlement failure.
+    let error_class = match switchyard_llm_client::provider_reason::classify(
+        status.as_u16(),
+        body,
+    ) {
+        switchyard_llm_client::ProviderReason::Unknown => "upstream_rejected",
+        reason => reason.as_str(),
+    };
     response.extensions_mut().insert(RequestLogFailure {
-        error_class: "upstream_rejected",
+        error_class,
         upstream_request_id,
     });
     response
@@ -3270,6 +3282,46 @@ mod tests {
                 .expect("ApiError extension");
             assert!(api_error.message.contains(LEAKED), "{}", api_error.message);
             assert_eq!(api_error.code, format!("invalid_request_{LEAKED}"));
+        }
+    }
+
+    /// Every upstream refusal used to be logged as one class. The provider's own reason is
+    /// now read where the body still exists, and an unexplained refusal is not guessed into a
+    /// quota or entitlement class.
+    #[test]
+    fn an_upstream_refusal_is_logged_with_the_providers_reason() {
+        let cases = [
+            (
+                429,
+                r#"{"error":{"code":"rate_limit_exceeded","metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#,
+                "provider_account_allowance_exhausted",
+            ),
+            (
+                429,
+                r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}"#,
+                "provider_model_quota_exhausted",
+            ),
+            (429, r#"{"error":{"code":"rate_limit_exceeded"}}"#, "provider_throttled"),
+            (
+                400,
+                r#"{"error":{"code":"unsupported_parameter","message":"unknown field"}}"#,
+                "provider_incompatible",
+            ),
+            (401, r#"{"error":{"code":"invalid_api_key"}}"#, "provider_auth_failed"),
+            (503, r#"{"error":{"message":"overloaded"}}"#, "provider_unavailable"),
+            (
+                400,
+                r#"{"error":{"message":"Bad Request"}}"#,
+                "upstream_rejected",
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let response = upstream_error(StatusCode::from_u16(status).expect("a valid status"), body);
+            let failure = response
+                .extensions()
+                .get::<RequestLogFailure>()
+                .expect("every upstream refusal carries a class");
+            assert_eq!(failure.error_class, expected, "for {status} {body}");
         }
     }
 

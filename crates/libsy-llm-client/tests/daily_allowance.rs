@@ -536,8 +536,13 @@ fn provider_headroom_bounds_the_local_budget() {
 /// costs this counter a unit the provider never charged. Left alone that difference is
 /// permanent: the local figure stays above the account's for the rest of the day and the
 /// headroom the provider still reports can never be spent, because the counter believes it
-/// has already been. Measured on the OpenRouter free pool: local 1000 against a provider
+/// has already been. Measured on OpenRouter's free pool: local 1000 against a provider
 /// figure of 984, the sixteen units being exactly that day's refused attempts.
+///
+/// The reclaim is not taken on the word of one reading. At the instant a reading is taken a
+/// request it does not count may simply still be in flight, and handing those units back
+/// would admit them a second time. It is settled by a later reading that still cannot account
+/// for them.
 #[test]
 fn uncharged_reservations_are_returned_to_the_budget() {
     let directory = scratch("provider-uncharged");
@@ -552,22 +557,42 @@ fn uncharged_reservations_are_returned_to_the_budget() {
         Err(ReserveError::Exhausted)
     ));
 
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
     allowance
-        .reconcile(provider(984, 1000, 16, LATE_UTC_DAY))
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            ticket,
+            at(LATE_UTC_DAY),
+        )
         .expect("the reading is durable");
-
     assert_eq!(
         allowance.remaining_at(at(LATE_UTC_DAY)),
+        0,
+        "one reading is not proof that sixteen sends never reached the provider: the gap is \
+         held until a later observation"
+    );
+
+    let later = LATE_UTC_DAY + 180;
+    let ticket = allowance
+        .begin_observation_at(at(later))
+        .expect("the counter is readable");
+    allowance
+        .reconcile_at(provider(984, 1000, 16, later), ticket, at(later))
+        .expect("the reading is durable");
+    assert_eq!(
+        allowance.remaining_at(at(later)),
         16,
-        "the local figure was sixteen above the account, so the provider's own count wins"
+        "the provider never counted those sixteen across two observations, so they are uncharged"
     );
     for _ in 0..16 {
         allowance
-            .try_reserve_at(at(LATE_UTC_DAY))
+            .try_reserve_at(at(later))
             .expect("the provider says sixteen remain");
     }
     assert!(matches!(
-        allowance.try_reserve_at(at(LATE_UTC_DAY)),
+        allowance.try_reserve_at(at(later)),
         Err(ReserveError::ProviderExhausted { limit: 1000 })
     ));
 }
@@ -593,7 +618,7 @@ fn the_correction_only_ever_moves_the_numerator_down_to_the_provider() {
     );
 }
 
-/// The corrected figure is what a restart sees, so the headroom it returns is not a property
+/// The settled figure is what a restart sees, so the headroom it returns is not a property
 /// of the process that happened to receive the reading.
 #[test]
 fn the_corrected_figure_survives_a_restart() {
@@ -604,19 +629,33 @@ fn the_corrected_figure_survives_a_restart() {
             .try_reserve_at(at(LATE_UTC_DAY))
             .expect("within the local budget");
     }
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
     allowance
-        .reconcile(provider(984, 1000, 16, LATE_UTC_DAY))
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            ticket,
+            at(LATE_UTC_DAY),
+        )
         .expect("the reading is durable");
 
     let after_restart = account_allowance(&directory, 1000);
-    assert_eq!(after_restart.remaining_at(at(LATE_UTC_DAY)), 16);
+    let later = LATE_UTC_DAY + 180;
+    let ticket = after_restart
+        .begin_observation_at(at(later))
+        .expect("the counter is readable");
+    after_restart
+        .reconcile_at(provider(984, 1000, 16, later), ticket, at(later))
+        .expect("the reading is durable");
+    assert_eq!(after_restart.remaining_at(at(later)), 16);
     for _ in 0..16 {
         after_restart
-            .try_reserve_at(at(LATE_UTC_DAY))
+            .try_reserve_at(at(later))
             .expect("the provider says sixteen remain");
     }
     assert!(matches!(
-        after_restart.try_reserve_at(at(LATE_UTC_DAY)),
+        after_restart.try_reserve_at(at(later)),
         Err(ReserveError::ProviderExhausted { .. })
     ));
 }
@@ -1193,5 +1232,376 @@ fn the_reported_state_is_effective_headroom_not_the_raw_reading() {
         allowance.provider_reading_at(at(LATE_UTC_DAY)),
         Some(provider(990, 1000, 10, LATE_UTC_DAY)),
         "the raw observation stays available for telemetry"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Settlement of the gap between this counter and the provider: a reservation made
+// while a read is outstanding must stay subtracted, and only a later observation
+// may reclaim units the provider never counted.
+// ---------------------------------------------------------------------------
+
+/// The measured defect, as a fixture: local 990 at the watermark, five more sent while the
+/// read was outstanding, and a provider figure of 984.
+///
+/// The provider's sixteen are what it had left when it wrote 984. The five requests sent
+/// after the read began are not in that figure, so at most eleven can be admitted - and
+/// fewer if some of the six this counter counts above 984 were still travelling. What must
+/// not happen is the sixteen the previous implementation handed back.
+#[test]
+fn a_watermarked_observation_keeps_the_reservations_made_while_it_was_out() {
+    let allowance = account_allowance(&scratch("settlement-watermark"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            ticket,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+
+    let headroom = match allowance.provider_state_at(at(LATE_UTC_DAY)) {
+        ProviderState::Available { remaining } => remaining,
+        other => panic!("a current reading with sixteen reported, got {other:?}"),
+    };
+    assert_eq!(
+        headroom, 5,
+        "sixteen provider units minus the five sent during the read, and minus the six the \\
+         provider has not confirmed as uncharged"
+    );
+    assert!(
+        headroom <= 11,
+        "eleven is the ceiling once the five in-flight reservations are preserved; got {headroom}"
+    );
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        headroom,
+        "admission is the stricter of the local budget and the reading, so it cannot exceed \\
+         the provider's remaining headroom"
+    );
+    assert_ne!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        16,
+        "the previous implementation restored the provider's full remainder and admitted the \\
+         five in-flight requests a second time"
+    );
+}
+
+/// Once a later observation still cannot account for the six, they are uncharged capacity -
+/// and exactly six of them, not the five sent after the first read began.
+#[test]
+fn a_later_observation_settles_only_the_gap_that_survived() {
+    let allowance = account_allowance(&scratch("settlement-confirm"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let first = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            first,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+
+    let later = LATE_UTC_DAY + 180;
+    let second = allowance
+        .begin_observation_at(at(later))
+        .expect("the counter is readable");
+    allowance
+        .reconcile_at(provider(984, 1000, 16, later), second, at(later))
+        .expect("the second reading is applied");
+
+    assert_eq!(
+        allowance.remaining_at(at(later)),
+        11,
+        "the six are reclaimed and the five sent during the first read are still subtracted"
+    );
+}
+
+/// A provider that catches up with the requests it was merely slow to count explains the
+/// gap, and nothing is reclaimed against a figure that already includes them.
+#[test]
+fn a_provider_that_counts_the_gap_prevents_the_reclaim() {
+    let allowance = account_allowance(&scratch("settlement-caught-up"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let first = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            first,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+
+    // The six were travelling after all: the provider's own count has caught up by ten.
+    let later = LATE_UTC_DAY + 180;
+    let second = allowance
+        .begin_observation_at(at(later))
+        .expect("the counter is readable");
+    allowance
+        .reconcile_at(provider(990, 1000, 10, later), second, at(later))
+        .expect("the second reading is applied");
+
+    assert_eq!(
+        allowance.remaining_at(at(later)),
+        5,
+        "the rise is attributed to the pending requests, so nothing is reclaimed and the five \\
+         sent during the first read are still subtracted"
+    );
+}
+
+/// A gap is not settled by the observation that revealed it, however many times that
+/// observation is applied: the requests may still be on their way.
+#[test]
+fn a_gap_is_not_settled_before_the_settlement_delay() {
+    let allowance = account_allowance(&scratch("settlement-too-soon"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let first = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            first,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+
+    let soon = LATE_UTC_DAY + 60;
+    let second = allowance
+        .begin_observation_at(at(soon))
+        .expect("the counter is readable");
+    allowance
+        .reconcile_at(provider(984, 1000, 16, soon), second, at(soon))
+        .expect("the second reading is applied");
+
+    assert_eq!(
+        allowance.remaining_at(at(soon)),
+        5,
+        "a minute after the first reading is not evidence that the six never arrived"
+    );
+}
+
+/// Re-applying a reading is refused and changes nothing, which is what makes a collector
+/// that repeats itself after a timeout harmless.
+#[test]
+fn a_repeated_observation_is_refused_without_moving_the_counter() {
+    let allowance = account_allowance(&scratch("settlement-idempotent"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            ticket,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+    let after_first = allowance.remaining_at(at(LATE_UTC_DAY));
+
+    let duplicate = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    assert!(matches!(
+        allowance.reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            duplicate,
+            at(LATE_UTC_DAY)
+        ),
+        Err(ReserveError::ObservationRejected { .. })
+    ));
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        after_first,
+        "a duplicate must not reclaim anything"
+    );
+}
+
+/// A caller with no watermark gets no attributable reclaim: it cannot say which of its sends
+/// the reading covers, so every one of them keeps consuming the provider's remainder.
+#[test]
+fn an_unwatermarked_reading_reclaims_nothing_on_its_own() {
+    let allowance = account_allowance(&scratch("settlement-unwatermarked"), 1000);
+    for _ in 0..10 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("room for ten");
+    }
+    allowance
+        .reconcile(provider(940, 1000, 60, LATE_UTC_DAY))
+        .expect("the reading is applied");
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        50,
+        "the local ten are subtracted from the provider's sixty and nothing is reclaimed"
+    );
+}
+
+/// The settlement state belongs to the provider day it was recorded in. Yesterday's pending
+/// gap must not reclaim capacity from today's budget.
+#[test]
+fn a_pending_gap_does_not_cross_the_provider_day() {
+    let allowance = account_allowance(&scratch("settlement-rollover"), 1000);
+    for _ in 0..990 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    let ticket = allowance
+        .begin_observation_at(at(LATE_UTC_DAY))
+        .expect("the counter is readable");
+    for _ in 0..5 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("within the day's budget");
+    }
+    allowance
+        .reconcile_at(
+            provider(984, 1000, 16, LATE_UTC_DAY),
+            ticket,
+            at(LATE_UTC_DAY),
+        )
+        .expect("the reading is applied");
+
+    // The next UTC day starts empty, and the previous day's pending gap says nothing about it.
+    let tomorrow = EARLY_NEXT_UTC_DAY;
+    allowance
+        .reconcile(provider(0, 1000, 1000, tomorrow))
+        .expect("the new day's reading is applied");
+    assert_eq!(
+        allowance.remaining_at(at(tomorrow)),
+        1000,
+        "a new provider day begins with its own whole budget"
+    );
+    assert_eq!(
+        allowance.released_today_at(at(tomorrow)),
+        0,
+        "nothing was reclaimed on the new day"
+    );
+}
+
+/// Concurrency: the lock is held across read, decision and write, so parallel reservers can
+/// never exceed the budget between them.
+#[test]
+fn concurrent_reservations_never_exceed_the_budget() {
+    let directory = scratch("settlement-concurrent");
+    let allowance = std::sync::Arc::new(account_allowance(&directory, 100));
+    let at_once = at(LATE_UTC_DAY);
+    let grants: u64 = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let allowance = std::sync::Arc::clone(&allowance);
+                scope.spawn(move || {
+                    let mut granted = 0;
+                    for _ in 0..20 {
+                        if allowance.try_reserve_at(at_once).is_ok() {
+                            granted += 1;
+                        }
+                    }
+                    granted
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("no thread panicked"))
+            .sum()
+    });
+    assert_eq!(grants, 100, "eight threads racing for one budget of 100");
+    assert!(matches!(
+        allowance.try_reserve_at(at(LATE_UTC_DAY)),
+        Err(ReserveError::Exhausted)
+    ));
+}
+
+/// A conclusive uncharge is reclaimable at once, because nothing has to be inferred: the
+/// caller is stating that these reservations never reached the provider.
+#[test]
+fn a_conclusive_uncharge_is_reclaimed_immediately() {
+    let allowance = account_allowance(&scratch("settlement-release"), 10);
+    for _ in 0..10 {
+        allowance
+            .try_reserve_at(at(LATE_UTC_DAY))
+            .expect("room for ten");
+    }
+    assert!(matches!(
+        allowance.try_reserve_at(at(LATE_UTC_DAY)),
+        Err(ReserveError::Exhausted)
+    ));
+
+    assert_eq!(
+        allowance
+            .release_uncharged_at(4, at(LATE_UTC_DAY))
+            .expect("the counter is writable"),
+        4
+    );
+    assert_eq!(allowance.remaining_at(at(LATE_UTC_DAY)), 4);
+    assert_eq!(
+        allowance
+            .release_uncharged_at(100, at(LATE_UTC_DAY))
+            .expect("the counter is writable"),
+        6,
+        "a release can never exceed the reservations still outstanding"
+    );
+    assert_eq!(allowance.released_today_at(at(LATE_UTC_DAY)), 10);
+    assert_eq!(
+        allowance.remaining_at(at(LATE_UTC_DAY)),
+        10,
+        "every reservation released is capacity this counter may admit again"
+    );
+    assert_eq!(
+        allowance
+            .release_uncharged_at(1, at(EARLY_NEXT_UTC_DAY))
+            .expect("the counter is writable"),
+        0,
+        "a new provider day has nothing to release"
     );
 }

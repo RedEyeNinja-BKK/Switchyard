@@ -100,6 +100,16 @@ const DEFAULT_PROVIDER_TOLERANCE: Duration = Duration::from_secs(600);
 /// that a recovered account serves again within minutes of the provider restoring it.
 const EXHAUSTION_RETENTION: Duration = Duration::from_secs(600);
 
+/// How long a gap between this counter and the provider must survive before it is settled.
+///
+/// A provider's figure is a snapshot taken while this deployment may still have requests in
+/// flight. A request sent before the read is absent from that figure for one of two reasons:
+/// it was never charged, or it had not arrived yet. The difference is not observable at the
+/// instant of the reading, so it is held and re-examined by a later one. Two minutes is well
+/// past the request timeout these lanes run under, so a request still missing after it is not
+/// travelling; it is not going to be charged.
+const SETTLEMENT_DELAY: Duration = Duration::from_secs(120);
+
 /// How far ahead of the local clock a reading may be stamped and still be believed.
 ///
 /// A reading is stamped by the collector on this host, so a genuine one is never future.
@@ -443,6 +453,37 @@ struct Counter {
     /// freshness window without the reading being treated as current. Its day is stored
     /// with it: yesterday's retention says nothing about today.
     retention: Option<Retention>,
+    /// Reservations on this day that the provider is known never to have charged.
+    ///
+    /// A reservation is taken before the request leaves, so the local count runs ahead of
+    /// the provider's by every attempt the provider refused or never received. Those units
+    /// are real capacity, and leaving them in the count strands the lane for the rest of the
+    /// day against headroom the provider still reports. They are subtracted here rather than
+    /// from `spent`, so `spent` stays a monotonic record of what this deployment reserved and
+    /// a reader can see how much was reclaimed.
+    uncharged: u64,
+    /// A gap between this counter's count and the provider's, awaiting settlement.
+    ///
+    /// Held rather than acted on: at the instant a reading is taken, requests sent before it
+    /// may simply not have arrived yet. Only a later reading can say they never will.
+    pending: Option<PendingGap>,
+}
+
+/// A gap between this counter's count and the provider's own figure.
+///
+/// The requests it describes were sent before the observation that revealed the gap and were
+/// absent from the provider's count. They are either uncharged (refused, or never delivered)
+/// or still in flight. Settlement waits for a later reading before deciding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingGap {
+    /// The provider day the gap belongs to.
+    day: u64,
+    /// The provider's own figure at the observation that first showed the gap.
+    used: u64,
+    /// Requests sent before that observation's watermark that it had not counted.
+    amount: u64,
+    /// When that observation was taken; only a later one may settle it.
+    observed_at: SystemTime,
 }
 
 /// A confirmed exhaustion, and the day it belongs to.
@@ -468,11 +509,12 @@ pub struct ObservationTicket {
 }
 
 impl ObservationTicket {
-    /// A ticket for a reading taken without a pre-read watermark.
+    /// A ticket for a reading whose caller holds no watermark.
     ///
-    /// Deliberately conservative: with no watermark the whole of the current day's spend
-    /// is treated as unsent by the provider, so the headroom is understated rather than
-    /// overstated. Used by callers that read the provider themselves and by tests.
+    /// This asserts nothing about traffic sent while the read was outstanding, so nothing is
+    /// attributed to it: no capacity is reclaimed on its word, and the requests this counter
+    /// counts above the provider's figure stay counted until a later reading settles them.
+    /// Used by callers that read the provider themselves and by tests.
     pub fn unwatermarked() -> Self {
         Self { watermark: None }
     }
@@ -567,7 +609,7 @@ impl DailyRequestAllowance {
         let day = self.boundary.day(now);
         match self.read_under_lock() {
             Ok(counter) => {
-                let local = self.limit.saturating_sub(spent_on(counter, day));
+                let local = self.limit.saturating_sub(charged_on(&counter, day));
                 // The stricter of the two, never the looser. Callers of this method
                 // decide whether a leg is worth attempting, so answering with the local
                 // remainder while the provider reports fewer would advertise capacity
@@ -613,7 +655,7 @@ impl DailyRequestAllowance {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
             Err(_) => return None,
         };
-        let local = self.limit.saturating_sub(spent_on(counter, day));
+        let local = self.limit.saturating_sub(charged_on(&counter, day));
         // This deployment's own ledger is current, so reaching the cap is affirmative on its
         // own -- whatever a provider reading, retained or not, says about the account.
         if local == 0 {
@@ -669,7 +711,7 @@ impl DailyRequestAllowance {
             drop(lock);
             return Err(ReserveError::ProviderExhausted { limit });
         }
-        let spent = spent_on(counter, day);
+        let spent = charged_on(&counter, day);
         if spent >= self.limit {
             drop(lock);
             return Err(ReserveError::Exhausted);
@@ -703,12 +745,23 @@ impl DailyRequestAllowance {
                     Some(self.retention_for(&reading)).filter(|retention| retention.until > now);
             }
         }
+        // A new provider day starts with nothing carried from the old one: yesterday's
+        // spend, reclaims and pending gap describe a window that has ended.
+        let same_day = counter.day == day;
         let next = Counter {
             day,
-            spent: spent + 1,
+            // `spent` is the monotonic record of every reservation; the reclaimed units stay
+            // visible in `uncharged` rather than being subtracted from it here.
+            spent: if same_day {
+                counter.spent.saturating_add(1)
+            } else {
+                1
+            },
             provider,
-            provider_anchor: counter.provider_anchor,
+            provider_anchor: if same_day { counter.provider_anchor } else { 0 },
             retention,
+            uncharged: if same_day { counter.uncharged } else { 0 },
+            pending: if same_day { counter.pending } else { None },
         };
         // Persist before sending. A counter that disagrees with the provider is the
         // failure this exists to prevent, so a failed write must also undo the spend.
@@ -723,7 +776,26 @@ impl DailyRequestAllowance {
     /// account has spent. Reported for diagnostics beside the provider's own figure.
     pub fn spent_at(&self, now: SystemTime) -> u64 {
         self.read_under_lock()
-            .map(|counter| spent_on(counter, self.boundary.day(now)))
+            .map(|counter| charged_on(&counter, self.boundary.day(now)))
+            .unwrap_or(0)
+    }
+
+    /// Reservations on the current provider day that this counter has stopped counting
+    /// because the provider is known never to have charged them.
+    ///
+    /// Reported beside [`Self::spent_at`] so an operator can see what the difference between
+    /// this deployment's reservations and the account's own figure consists of. Reads without
+    /// taking the lock and creates nothing.
+    pub fn released_today_at(&self, now: SystemTime) -> u64 {
+        let day = self.boundary.day(now);
+        self.read_under_lock()
+            .map(|counter| {
+                if counter.day == day {
+                    counter.uncharged
+                } else {
+                    0
+                }
+            })
             .unwrap_or(0)
     }
 
@@ -742,8 +814,47 @@ impl DailyRequestAllowance {
         let counter = self.read_under_lock()?;
         let day = self.boundary.day(now);
         Ok(ObservationTicket {
-            watermark: Some((day, spent_on(counter, day))),
+            watermark: Some((day, charged_on(&counter, day))),
         })
+    }
+
+    /// Records that `count` reservations are conclusively known never to be charged.
+    ///
+    /// "Conclusively" is the whole point. A request that never left this process, or one a
+    /// provider refused with a status its own documentation says consumes no allowance, is
+    /// capacity this counter may stop counting. A request whose fate is unknown - a timeout,
+    /// a truncated response, a refusal nobody can classify - is deliberately NOT released
+    /// here; observation settles those later, because a guess in this direction spends an
+    /// allowance that is already gone.
+    ///
+    /// Returns how many units were actually reclaimed: never more than this day's outstanding
+    /// reservations, and nothing at all once the provider day has turned over.
+    pub fn release_uncharged(&self, count: u64) -> Result<u64, ReserveError> {
+        self.release_uncharged_at(count, SystemTime::now())
+    }
+
+    /// [`Self::release_uncharged`] against an explicit clock and under the counter's lock.
+    pub fn release_uncharged_at(&self, count: u64, now: SystemTime) -> Result<u64, ReserveError> {
+        let day = self.boundary.day(now);
+        let lock = self.lock()?;
+        let counter = self.read()?;
+        let released = count.min(charged_on(&counter, day));
+        if released == 0 {
+            drop(lock);
+            return Ok(0);
+        }
+        let next = Counter {
+            day: counter.day,
+            spent: counter.spent,
+            provider: counter.provider,
+            provider_anchor: counter.provider_anchor,
+            retention: counter.retention,
+            uncharged: counter.uncharged.saturating_add(released),
+            pending: counter.pending,
+        };
+        self.persist(next)?;
+        drop(lock);
+        Ok(released)
     }
 
     /// How old a provider reading may be and still be acted on.
@@ -832,61 +943,97 @@ impl DailyRequestAllowance {
 
         // Spend on the day the reading describes. A counter still holding an earlier day
         // has none for this one, so the figure is zero rather than yesterday's.
-        let spent = spent_on(counter, reading_day);
-        // The anchor is the pre-read watermark when the read began on the same day the
-        // counter is on. Anything else — a read that straddled the boundary, or a caller
-        // with no watermark — anchors at zero, which subtracts the whole day's spend and
-        // therefore understates headroom instead of overstating it.
-        let anchor = match ticket.watermark() {
-            Some((ticket_day, spent_then))
-                if ticket_day == reading_day && counter.day == reading_day =>
-            {
-                spent_then.min(spent)
+        // What this counter believes it sent on the reading's day, net of attempts already
+        // confirmed uncharged. A counter still holding an earlier day has none for this one.
+        let spent = charged_on(&counter, reading_day);
+        let already_uncharged = if counter.day == reading_day {
+            counter.uncharged
+        } else {
+            0
+        };
+        // The pre-read watermark, when it belongs to the same day the counter is on. It is
+        // the only thing that can separate requests sent before the provider's snapshot from
+        // requests sent after it — and therefore the only thing that can say which units the
+        // reading is even entitled to reclaim. A read that straddled the boundary, and a
+        // caller that took no watermark, cannot say, so nothing is reclaimed on their word.
+        let watermark = ticket
+            .watermark()
+            .filter(|(ticket_day, _)| *ticket_day == reading_day && counter.day == reading_day)
+            .map(|(_, spent_then)| spent_then.min(spent));
+
+        // Settlement of the gap a PREVIOUS observation revealed.
+        //
+        // A reservation is taken before the request leaves, so this counter runs ahead of the
+        // provider by every attempt the provider refused — and, transiently, by every attempt
+        // still in flight. The two are indistinguishable at the instant of a reading, which
+        // is exactly the mistake this replaced: adopting the provider's figure immediately
+        // reclaimed the in-flight requests too and then admitted them a second time.
+        //
+        // So a gap is held and re-examined. A later reading that still does not account for
+        // those requests, at least `SETTLEMENT_DELAY` after the reading that found them, is
+        // evidence they were never charged. A rise in the provider's own count is attributed
+        // to the pending requests FIRST, which is the conservative reading of it: the rise
+        // means those attempts did reach the provider.
+        //
+        // No further cap is needed: a gap is only ever recorded against the watermark that
+        // revealed it, so `pending.used + pending.amount <= spent` holds by construction and
+        // the residual can never take the counter below the provider's own figure.
+        let reclaim = match counter.pending.filter(|pending| pending.day == reading_day) {
+            Some(pending) if reading.observed_at >= pending.observed_at + SETTLEMENT_DELAY => {
+                let explained = reading.used.saturating_sub(pending.used);
+                pending.amount.saturating_sub(explained)
             }
+            // No gap, or one this reading is too soon to settle: nothing is reclaimed.
             _ => 0,
         };
-        // The provider is the authority on its own day. When its figure is LOWER than this
-        // deployment's, the difference is spend this counter recorded for attempts the
-        // provider never charged: a reservation is taken before the request leaves, so a
-        // refusal it returns costs the local counter a unit the provider never counted.
-        // Measured on OpenRouter's free pool: local 1000 against a provider figure of 984,
-        // the sixteen units being exactly that day's refused attempts.
+        let uncharged = already_uncharged.saturating_add(reclaim).min(counter.spent);
+        let settled = spent.saturating_sub(reclaim);
+
+        // The anchor is what the reading covers. With a watermark, that is the provider's own
+        // figure capped at what this counter believes it has sent: anything sent beyond the
+        // provider's count is traffic the reading does not include, and `effective_headroom`
+        // subtracts it from the remainder. That cap is what preserves reservations made while
+        // the read was outstanding, and reservations the provider has not caught up with yet.
         //
-        // Adopting the provider's number is the only correction that is both evidence-based
-        // and bounded by the account. It can re-admit at most what the provider itself says
-        // is unspent, it never raises the figure, and a wrong guess is caught by the
-        // provider's next refusal rather than becoming an over-issue the counter cannot see.
-        //
-        // The anchor moves with the figure it is subtracted from. Effective headroom is
-        // `reading.remaining - (spent - anchor)`, so replacing `spent` without replacing the
-        // anchor would subtract the provider's whole count from its own remainder and keep
-        // reporting zero. Anchoring at the corrected figure says what is now true: every
-        // request the provider counted is accounted for by the reading, and only requests
-        // admitted after it still consume the remainder.
-        //
-        // The bound this gives up is small and was already given up by an unwatermarked
-        // reading: requests admitted between the observation and this call are forgiven
-        // rather than subtracted. That window is one collection round, and the alternative
-        // - refusing for the rest of the day against headroom the provider still reports -
-        // is the larger error, and the one actually measured.
-        let corrected = if reading.used < spent {
-            reading.used
-        } else {
-            spent
+        // Without a watermark nothing can be attributed, so the anchor is zero: every one of
+        // today's sends is subtracted from the provider's remainder until a later reading
+        // settles the ones it never counted. That understates headroom for at most one
+        // settlement window and never over-issues.
+        let anchor = match watermark {
+            Some(spent_then) => reading.used.min(spent_then).min(settled),
+            None => 0,
         };
-        let anchor = if corrected < spent { corrected } else { anchor };
+
+        // The gap this observation shows, measured against the watermark so that requests
+        // sent after the read began are never counted as possibly-uncharged. They are
+        // preserved by the anchor above instead, which is a statement about the provider's
+        // remainder rather than a claim that they cost nothing.
+        let attributable = watermark.unwrap_or(settled).min(settled);
+        let gap = attributable.saturating_sub(reading.used);
+        let pending = (gap > 0).then(|| PendingGap {
+            day: reading_day,
+            used: reading.used,
+            amount: gap,
+            observed_at: reading.observed_at,
+        });
+
         let retention = (reading
             .remaining
-            .saturating_sub(corrected.saturating_sub(anchor))
+            .saturating_sub(settled.saturating_sub(anchor))
             == 0)
             .then(|| self.retention_for(&reading))
             .filter(|retention| retention.until > now);
+        // A counter still holding an earlier day carries nothing into this one: its spend,
+        // its reclaims and its pending gap all belong to a window that has ended.
+        let same_day = counter.day == reading_day;
         let next = Counter {
             day: reading_day,
-            spent: corrected,
+            spent: if same_day { counter.spent } else { 0 },
             provider: Some(reading),
             provider_anchor: anchor,
             retention,
+            uncharged: if same_day { uncharged } else { 0 },
+            pending,
         };
         self.persist(next)?;
         drop(lock);
@@ -932,7 +1079,7 @@ impl DailyRequestAllowance {
         // `spent` on a different day belongs to a window that has ended; the anchor is
         // only meaningful beside the same day's spend.
         let sent_since = if counter.day == day {
-            counter.spent.saturating_sub(counter.provider_anchor)
+            charged_on(counter, day).saturating_sub(counter.provider_anchor)
         } else {
             0
         };
@@ -1156,6 +1303,8 @@ impl DailyRequestAllowance {
                 provider: None,
                 provider_anchor: 0,
                 retention: None,
+                uncharged: 0,
+                pending: None,
             }),
             Err(error) => Err(ReserveError::Unusable(format!(
                 "{} cannot be read: {error}",
@@ -1206,8 +1355,20 @@ impl DailyRequestAllowance {
                 unix_secs(retention.until)
             ),
         };
+        // The settlement state is written beside the count so a restart cannot forget which
+        // reservations were reclaimed or which gap is still awaiting a later observation.
+        let pending = match counter.pending {
+            None => "null".to_string(),
+            Some(pending) => format!(
+                "{{\"day\":{},\"used\":{},\"amount\":{},\"observed_at_secs\":{}}}",
+                pending.day,
+                pending.used,
+                pending.amount,
+                unix_secs(pending.observed_at),
+            ),
+        };
         let body = format!(
-            "{{\"day\":{},\"spent\":{},\"limit\":{},\"group\":{},\"model\":{},\"basis\":{},\"provider\":{},\"retention\":{}}}\n",
+            "{{\"day\":{},\"spent\":{},\"limit\":{},\"group\":{},\"model\":{},\"basis\":{},\"provider\":{},\"retention\":{},\"uncharged\":{},\"pending\":{}}}\n",
             counter.day,
             counter.spent,
             self.limit,
@@ -1216,6 +1377,8 @@ impl DailyRequestAllowance {
             serde_json::Value::String(basis.to_string()),
             provider,
             retention,
+            counter.uncharged,
+            pending,
         );
         // Same-directory temporary name so the rename is a replace, never a cross-device
         // copy that could leave a truncated counter behind.
@@ -1269,9 +1432,17 @@ impl DailyRequestAllowance {
     }
 }
 
-/// Requests already spent on `day`, given a counter that may belong to an earlier day.
-fn spent_on(counter: Counter, day: u64) -> u64 {
-    if counter.day == day { counter.spent } else { 0 }
+/// Requests this counter has sent on `day` that the provider is still expected to charge.
+///
+/// `spent` counts every reservation ever taken; `uncharged` counts those already confirmed
+/// never to have been charged. The difference is the figure that belongs beside a provider
+/// reading, because only it is comparable to the provider's own count.
+fn charged_on(counter: &Counter, day: u64) -> u64 {
+    if counter.day == day {
+        counter.spent.saturating_sub(counter.uncharged)
+    } else {
+        0
+    }
 }
 
 /// Reads `day` and `spent` from a counter file.
@@ -1311,12 +1482,31 @@ fn parse_counter(bytes: &[u8]) -> Result<Counter, String> {
         None | Some(serde_json::Value::Null) => None,
         Some(block) => Some(parse_retention(block)?),
     };
+    // A counter written before settlement existed has neither key, which is an absence of
+    // reclaims rather than a fault. A key that IS present but unreadable is a fault: it would
+    // silently re-admit reservations the file says were never charged.
+    let uncharged = match value.get("uncharged") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(serde_json::Value::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| "\"uncharged\" is not a whole number".to_string())?,
+        Some(_) => return Err("\"uncharged\" is not a whole number".to_string()),
+    };
+    if uncharged > spent {
+        return Err("\"uncharged\" exceeds \"spent\"".to_string());
+    }
+    let pending = match value.get("pending") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(block) => Some(parse_pending_gap(block)?),
+    };
     Ok(Counter {
         day,
         spent,
         provider,
         provider_anchor,
         retention,
+        uncharged,
+        pending,
     })
 }
 
@@ -1336,6 +1526,26 @@ fn parse_retention(block: &serde_json::Value) -> Result<Retention, String> {
     Ok(Retention {
         day,
         until: UNIX_EPOCH + Duration::from_secs(until),
+    })
+}
+
+/// Reads the pending-settlement block of a counter file.
+///
+/// A malformed block is a fault rather than a fresh counter: the file states that a gap is
+/// being held, and a reader that forgot it would reclaim capacity on the next observation
+/// that the file says has not yet been settled.
+fn parse_pending_gap(block: &serde_json::Value) -> Result<PendingGap, String> {
+    let number = |key: &str| -> Result<u64, String> {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("pending.\"{key}\" is missing or not a whole number"))
+    };
+    Ok(PendingGap {
+        day: number("day")?,
+        used: number("used")?,
+        amount: number("amount")?,
+        observed_at: UNIX_EPOCH + Duration::from_secs(number("observed_at_secs")?),
     })
 }
 

@@ -21,6 +21,15 @@
 #   * LAST-KNOWN-GOOD is advanced only by an explicit `promote`. A release that
 #     merely started successfully is not thereby known good, and overwriting the
 #     rollback target on every deploy would leave nothing to roll back to.
+#   * A release can be PROTECTED independently of the pointers. Protection is a
+#     durable identity -- a registry entry in $RELEASE_ROOT/PROTECTED and a
+#     RETAINED marker in the release directory -- so a retention pass can never
+#     delete it, whatever CURRENT and LAST-KNOWN-GOOD happen to name. Protection
+#     state that is absent, unreadable, malformed, or naming a release that is no
+#     longer stored REFUSES pruning entirely rather than guessing.
+#   * Pruning is planned under the writer lock, recorded in an append-only
+#     transcript BEFORE anything is deleted and again afterwards, and refused
+#     outright when space is short: evidence is never traded for room.
 #
 # VERBS
 # -----
@@ -40,6 +49,17 @@
 #   env-files
 #       Show the environment files the unit declares, in read order, with a hash of
 #       each. Refuses rather than guessing when the unit cannot be resolved.
+#   protect <release-id> [...]
+#       Make releases permanently exempt from retention, independent of CURRENT and
+#       LAST-KNOWN-GOOD. Writes the PROTECTED registry and the per-release RETAINED
+#       marker, under the release lock. Idempotent.
+#   unprotect <release-id> --confirm
+#       Remove that exemption. Refused for CURRENT and LAST-KNOWN-GOOD, because the
+#       pointers already protect them and dropping the registry entry would only
+#       hide the fact.
+#   protection
+#       Show the protection state the next retention pass would act on: whether the
+#       registry is readable, which ids it names, and whether each still exists.
 #
 # EXIT CODES
 #   0  ok
@@ -88,6 +108,22 @@ SYSTEMCTL=${SYSTEMCTL:-systemctl}
 MANIFEST_GROUP=${MANIFEST_GROUP:-switchyard}
 RELEASE_ROOT=${RELEASE_ROOT:-/var/lib/switchyard/releases}
 RETAIN=${RETAIN:-5}
+# Protection is a separate axis from retention. `PROTECTED` is a plain text
+# registry of release ids, one per line, `#` comments allowed. It is deliberately
+# NOT derived from the pointers: the failure it exists to prevent is a release
+# losing its only protection because a pointer moved away from it. A per-release
+# RETAINED marker says the same thing beside the bytes, so a copied archive can be
+# checked without this file.
+PROTECTED_FILE=${PROTECTED_FILE:-$RELEASE_ROOT/PROTECTED}
+# Every activation, promotion, rollback and pruning decision is appended here. The
+# transcript survives the run; the terminal does not.
+AUDIT_FILE=${AUDIT_FILE:-$RELEASE_ROOT/audit.jsonl}
+# Refuse an activation that would leave the release filesystem below this floor,
+# instead of making room by deleting releases. Twice the candidate binary is
+# reserved on top, because store_release writes a full copy while the candidate is
+# still staged.
+RELEASE_MIN_FREE_MB=${RELEASE_MIN_FREE_MB:-256}
+DF_CMD=${DF_CMD:-df}
 VALIDATE_CMD=${VALIDATE_CMD:-}
 VALIDATOR=${VALIDATOR:-$SELF_DIR/release_validate.py}
 CAPABILITY_TOOL=${CAPABILITY_TOOL:-$SELF_DIR/capability_contract.py}
@@ -193,6 +229,51 @@ wait_healthy() {
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 
+# ------------------------------------------------------------------ transcript
+#
+# A decision that is only printed is a decision that is lost the moment the
+# terminal scrolls. Pruning is destructive and slow to notice, so its plan and its
+# outcome are appended to a durable file as well -- the plan BEFORE any rm, so an
+# interrupted run still leaves evidence of what it intended to delete.
+#
+# Written with >> so the file is append-only in use, and re-chmodded on every write
+# because a transcript is worthless if the next writer silently widens its mode.
+# A failed append is reported and does not abort the operation it describes: losing
+# the log is bad, failing a healthy deployment over it is worse.
+audit_append() {
+  local line=$1
+  mkdir -p "$(dirname "$AUDIT_FILE")" 2>/dev/null || true
+  printf '%s\n' "$line" >>"$AUDIT_FILE" 2>/dev/null \
+    || say "WARNING: could not append to the release transcript $AUDIT_FILE"
+  chmod 0640 "$AUDIT_FILE" 2>/dev/null || true
+}
+
+# audit <action> [<extra json fields, without the leading comma>]
+audit() {
+  local action=$1 fields=${2:-}
+  [ -n "$fields" ] && fields=",$fields"
+  audit_append "$(printf '{"ts":"%s","action":"%s","host":"%s"%s}' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$(hostname 2>/dev/null || echo unknown)" "$fields")"
+}
+
+# A JSON array of strings. Release ids and paths in this store cannot contain a
+# quote, so no escaping is invented here; the caller passes ids, not free text.
+json_list() {
+  local out="" item
+  for item in "$@"; do out="$out${out:+,}\"$item\""; done
+  printf '[%s]' "$out"
+}
+
+# Free space on the release filesystem, in MiB. Empty and non-zero exit when the
+# answer is not a number, which the caller treats as "cannot decide" rather than
+# as "no space" -- refusing an activation on a broken df would be its own outage.
+free_mb() {
+  local mb
+  mb=$($DF_CMD -Pm "$RELEASE_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+  case $mb in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$mb"
+}
+
 # ---------------------------------------------------------------- preconditions
 [ "$(id -u)" -eq 0 ] || die "must run as root"
 mkdir -p "$RELEASE_ROOT"
@@ -235,7 +316,7 @@ install_pair() {
 activate_release() {
   local dir=$1 id
   id=$(basename "$dir")
-  if is_retained "$id"; then
+  if is_artifact "$id"; then
     say "$id is a retained historical artefact, not a deployable release"
     return 1
   fi
@@ -578,46 +659,149 @@ point_at() {
   [ "$(link_target "$link")" = "$id" ] || die "could not point $link at $id"
 }
 
-# A stored directory may carry a RETAINED marker. Such an artefact is kept for the
-# record and is exempt from every automatic decision about it: retention never
-# prunes it, it never consumes a retention slot, and no verb will install, verify or
-# promote it as a release. It exists for history that cannot be re-established --
-# an artefact whose provenance predates the store, or one held deliberately because
-# it is evidence of what ran at a point in time.
-is_retained() { [ -f "$RELEASE_ROOT/$1/RETAINED" ]; }
+# --------------------------------------------------------------- protection
+#
+# Two things are recorded, because they answer different questions and fail
+# differently.
+#
+#   * The RETAINED marker sits beside the bytes. It travels with a copied or
+#     archived release, so a restored directory still says what it is without any
+#     registry, and it is what a human reads when deciding whether something may be
+#     deleted.
+#   * The PROTECTED registry is one file, written once under the release lock. It
+#     is the list a retention pass consults before it computes anything, and it is
+#     readable without mounting the store read-write.
+#
+# Both mean the same thing: permanent, independent of CURRENT and LAST-KNOWN-GOOD.
+#
+# An earlier version of this file treated ANY directory carrying RETAINED as a
+# historical artefact that no verb would install, verify or promote. That conflated
+# "keep this forever" with "this is not a release", and it made protection a trap:
+# marking a live release to save it from retention also disabled the rollback that
+# might need it. The two are separated below -- is_protected() is the retention
+# question, is_artifact() is the "not a release" question -- and only a directory
+# with a marker and NO release.json is an artefact.
+has_marker() { [ -f "$RELEASE_ROOT/$1/RETAINED" ]; }
+is_artifact() { has_marker "$1" && [ ! -f "$RELEASE_ROOT/$1/release.json" ]; }
 
-# Keeps the newest RETAIN releases plus CURRENT and LAST-KNOWN-GOOD. The two
-# pointers are protected by identity, not by age: an old release that is still the
-# rollback target must survive any amount of newer activity.
+# Set by protection_read(): one of ok, absent, unreadable, malformed.
+PROTECTION_STATE=""
+PROTECTED_IDS=()
+
+# Reads and validates the registry. Returns non-zero with PROTECTION_STATE set to a
+# name the caller can print; every caller treats non-zero as "prune nothing".
+#
+# Validation is deliberately strict. An id is a directory name, so anything that is
+# not one -- a glob, a slash, a shell metacharacter -- is a malformed line, not a
+# pattern to expand. Blank lines and `#` comments are allowed so the file can
+# explain itself.
+protection_read() {
+  PROTECTED_IDS=()
+  PROTECTION_STATE=absent
+  local file=$PROTECTED_FILE line
+  [ -e "$file" ] || return 1
+  PROTECTION_STATE=unreadable
+  [ -r "$file" ] || return 1
+  PROTECTION_STATE=ok
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    line=$(printf '%s' "$line" | tr -d '[:space:]')
+    [ -n "$line" ] || continue
+    case $line in
+      .|..|*[!A-Za-z0-9._-]*)
+        PROTECTION_STATE=malformed
+        return 1
+        ;;
+    esac
+    PROTECTED_IDS+=("$line")
+  done <"$file"
+  return 0
+}
+
+# Is this release exempt from retention? CURRENT and LAST-KNOWN-GOOD are protected
+# by identity rather than by age, so an old release that is still the rollback
+# target survives any amount of newer activity. A registry that cannot be read is
+# NOT silently treated as empty: the lazy read below is only a convenience for
+# callers that did not call protection_read() first, and the retention path itself
+# refuses before it ever gets here.
+is_protected() {
+  local id=$1 item
+  [ -n "$id" ] || return 1
+  [ "$id" = "$(link_target "$CURRENT_LINK")" ] && return 0
+  [ "$id" = "$(link_target "$LKG_LINK")" ] && return 0
+  has_marker "$id" && return 0
+  if [ "$PROTECTION_STATE" != ok ]; then protection_read >/dev/null 2>&1 || true; fi
+  for item in ${PROTECTED_IDS[@]+"${PROTECTED_IDS[@]}"}; do
+    [ "$item" = "$id" ] && return 0
+  done
+  return 1
+}
+
+# Keeps the newest RETAIN unprotected releases plus every protected one. Protected
+# releases do not consume a retention slot: otherwise marking one thing as
+# permanent would silently shorten the history of everything else.
+#
+# Nothing here may delete a protected release, and nothing here may proceed on
+# protection state it cannot read. Every refusal path returns success: the
+# activation that called this has already been verified healthy, and refusing to
+# prune must not turn a good deployment into a rollback.
 prune_releases() {
-  local keep_current keep_lkg id dir n=0 keep=()
-  keep_current=$(link_target "$CURRENT_LINK")
-  keep_lkg=$(link_target "$LKG_LINK")
+  local cur lkg id n=0 plan=() missing=() victim deleted=() failed=() mb="?"
+
+  if ! protection_read; then
+    say "PRUNE REFUSED: protection state is '$PROTECTION_STATE' ($PROTECTED_FILE); nothing in the release store was deleted"
+    audit "prune-refused" "\"reason\":\"protection-$PROTECTION_STATE\",\"protected_file\":\"$PROTECTED_FILE\""
+    return 0
+  fi
+  # A protected id whose directory is gone is an incident, not a cleanup: the
+  # release this guard exists for was lost anyway. Refuse every further deletion
+  # until a human explains it.
+  for id in ${PROTECTED_IDS[@]+"${PROTECTED_IDS[@]}"}; do
+    [ -d "$RELEASE_ROOT/$id" ] || missing+=("$id")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    say "PRUNE REFUSED: protected release(s) absent from the store: ${missing[*]}; nothing was deleted"
+    audit "prune-refused" "\"reason\":\"protected-absent\",\"absent\":$(json_list "${missing[@]}")"
+    return 0
+  fi
+
+  cur=$(link_target "$CURRENT_LINK")
+  lkg=$(link_target "$LKG_LINK")
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    # A retained artefact is never pruned, and it does not consume a retention slot:
-    # otherwise marking one thing as permanent would silently shorten the history of
-    # everything else.
-    if is_retained "$id"; then
-      keep+=("$id")
-      continue
-    fi
+    is_protected "$id" && continue
     n=$((n + 1))
-    if [ "$n" -le "$RETAIN" ] || [ "$id" = "$keep_current" ] || [ "$id" = "$keep_lkg" ]; then
-      keep+=("$id")
-    fi
+    [ "$n" -le "$RETAIN" ] && continue
+    plan+=("$id")
   done < <(list_release_ids)
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    local found=0
-    for dir in "${keep[@]:-}"; do
-      [ "$dir" = "$id" ] && { found=1; break; }
-    done
-    if [ "$found" -eq 0 ]; then
-      say "pruning release $id (retention $RETAIN)"
-      rm -rf "${RELEASE_ROOT:?}/$id"
+
+  if [ ${#plan[@]} -eq 0 ]; then
+    say "no releases to prune (retain $RETAIN, ${#PROTECTED_IDS[@]} protected)"
+    return 0
+  fi
+  # Last line of defence: the plan is re-checked against protection immediately
+  # before the rm. If these two ever disagree, the safer answer is to keep bytes.
+  for victim in "${plan[@]}"; do
+    if is_protected "$victim"; then
+      say "PRUNE REFUSED: plan names protected release $victim; nothing was deleted"
+      audit "prune-refused" "\"reason\":\"plan-names-protected\",\"release\":\"$victim\""
+      return 0
     fi
-  done < <(list_release_ids)
+  done
+
+  mb=$(free_mb || echo "?")
+  say "prune plan: ${plan[*]} (retain $RETAIN, protected ${#PROTECTED_IDS[@]}, free ${mb}MB)"
+  audit "prune-plan" "\"planned\":$(json_list "${plan[@]}"),\"retain\":$RETAIN,\"current\":\"$cur\",\"lkg\":\"$lkg\",\"free_mb\":\"$mb\",\"protected\":$(json_list ${PROTECTED_IDS[@]+"${PROTECTED_IDS[@]}"})"
+  for victim in "${plan[@]}"; do
+    if rm -rf -- "${RELEASE_ROOT:?}/$victim"; then
+      deleted+=("$victim")
+      say "pruned release $victim (retention $RETAIN)"
+    else
+      failed+=("$victim")
+      say "could not prune $victim" >&2
+    fi
+  done
+  audit "prune-result" "\"deleted\":$(json_list ${deleted[@]+"${deleted[@]}"}),\"failed\":$(json_list ${failed[@]+"${failed[@]}"})"
 }
 
 list_release_ids() {
@@ -787,6 +971,22 @@ cmd_deploy() {
     || die "the binary at $b_src changed while this deployment waited for the release lock (expected $b_want); refusing to install bytes that were not the ones approved"
   say "pinned artefact hashes re-verified under the release lock"
 
+  # Room for the release before anything is installed. This is the refusal the
+  # incident asked for: when the store is short of space the answer is to say so,
+  # not to delete the oldest evidence to make room. store_release writes a full
+  # copy of the binary, so twice the candidate is reserved on top of the floor.
+  local need_mb free_now
+  need_mb=$(( ($(stat -c %s "$b_src") + 1048575) / 1048576 ))
+  if free_now=$(free_mb); then
+    if [ "$free_now" -lt $(( need_mb * 2 + RELEASE_MIN_FREE_MB )) ]; then
+      audit "deploy-refused" "\"reason\":\"capacity\",\"free_mb\":\"$free_now\",\"need_mb\":\"$(( need_mb * 2 + RELEASE_MIN_FREE_MB ))\""
+      die "the release store filesystem has ${free_now}MB free; this ${need_mb}MB release needs $(( need_mb * 2 + RELEASE_MIN_FREE_MB ))MB (two copies plus the ${RELEASE_MIN_FREE_MB}MB floor). Refusing rather than deleting stored releases to make room"
+    fi
+    say "release store has ${free_now}MB free (need $(( need_mb * 2 + RELEASE_MIN_FREE_MB ))MB)"
+  else
+    say "WARNING: could not read free space with '$DF_CMD'; continuing without the capacity floor"
+  fi
+
   # What the service actually runs with. Resolved once, here, so the validation
   # below and the release record further on cannot disagree about the set, and so a
   # host whose unit cannot be read is refused before anything is touched.
@@ -927,6 +1127,10 @@ cmd_deploy() {
   say "binary   $(sha "$LIVE_BIN")"
   say "manifest $(sha "$LIVE_MANIFEST")"
   say "rollback target stays $prev_id until '$0 promote'"
+  # Durable receipt, after the run rather than before it: this describes what the
+  # store and the pointers hold now. The predecessor is named explicitly so a later
+  # reader never has to infer which release a rollback would undo.
+  audit "deploy" "\"release\":\"$id\",\"binary\":\"$b_want\",\"manifest\":\"$m_want\",\"predecessor\":\"$prev_id\",\"reused\":$([ "$reuse" -eq 1 ] && echo true || echo false),\"current\":\"$(link_target "$CURRENT_LINK")\",\"lkg\":\"$(link_target "$LKG_LINK")\",\"lkg_changed\":false"
   say "ACTIVATION COMPLETE"
 }
 # -------------------------------------------------------------------- rollback
@@ -948,7 +1152,7 @@ cmd_rollback() {
     esac
   fi
   [ -d "$RELEASE_ROOT/$target" ] || die "no release $target in $RELEASE_ROOT"
-  if is_retained "$target"; then
+  if is_artifact "$target"; then
     die "$target is a retained historical artefact and is not deployable"
   fi
   if [ "$target" = "$from_id" ]; then
@@ -962,6 +1166,7 @@ cmd_rollback() {
   if activate_release "$RELEASE_ROOT/$target"; then
     point_at CURRENT "$target"
     say "ROLLBACK VERIFIED: $target is live, byte-verified and healthy"
+    audit "rollback" "\"release\":\"$target\",\"from\":\"${from_id:-none}\",\"lkg\":\"$(link_target "$LKG_LINK")\",\"source\":\"$([ -n "${1:-}" ] && echo explicit || echo lkg-default)\""
     say "binary   $want_bin"
     say "manifest $want_man"
     if [ -n "$from_id" ] && [ -d "$RELEASE_ROOT/$from_id" ]; then
@@ -992,7 +1197,7 @@ cmd_promote() {
     [ -n "$id" ] || die "no CURRENT release to promote"
   fi
   [ -d "$RELEASE_ROOT/$id" ] || die "no release $id"
-  if is_retained "$id"; then
+  if is_artifact "$id"; then
     die "$id is a retained historical artefact and cannot become the rollback target"
   fi
   # Only a release that is live AND healthy may become the rollback target.
@@ -1007,8 +1212,16 @@ cmd_promote() {
     || die "$id binary does not match its record"
   [ "$(sha "$RELEASE_ROOT/$id/routes.toml")" = "$(json_field "$RELEASE_ROOT/$id/release.json" manifest sha256)" ] \
     || die "$id manifest does not match its record"
+  local previous_lkg
+  previous_lkg=$(link_target "$LKG_LINK")
   point_at LAST-KNOWN-GOOD "$id"
-  say "LAST-KNOWN-GOOD is now $id"
+  say "LAST-KNOWN-GOOD is now $id (was ${previous_lkg:-none})"
+  # An LKG change is the one pointer move that silently re-arranges which release a
+  # future retention pass protects, so it is always attributed.
+  audit "promote" "\"release\":\"$id\",\"previous_lkg\":\"${previous_lkg:-none}\",\"current\":\"$(link_target "$CURRENT_LINK")\""
+  if [ -n "$previous_lkg" ] && [ -d "$RELEASE_ROOT/$previous_lkg" ] && ! is_protected "$previous_lkg"; then
+    say "note: $previous_lkg is no longer LAST-KNOWN-GOOD and is not protected; retention may prune it once it falls behind the newest $RETAIN releases. Run '$0 protect $previous_lkg' if it must be kept."
+  fi
 }
 
 cmd_verify() {
@@ -1019,7 +1232,7 @@ cmd_verify() {
   fi
   local dir=$RELEASE_ROOT/$id
   [ -d "$dir" ] || die "no release $id"
-  if is_retained "$id"; then
+  if is_artifact "$id"; then
     die "$id is a retained historical artefact: it is kept for the record and is not \
 a release, so there is nothing to verify against a record it never had"
   fi
@@ -1073,6 +1286,7 @@ cmd_list() {
   local cur lkg id created bin mark
   cur=$(link_target "$CURRENT_LINK")
   lkg=$(link_target "$LKG_LINK")
+  protection_read >/dev/null 2>&1 || true
   printf '%-34s %-20s %-17s %s\n' RELEASE CREATED BINARY MARKS
   while IFS= read -r id; do
     [ -n "$id" ] || continue
@@ -1081,7 +1295,16 @@ cmd_list() {
     mark=""
     [ "$id" = "$cur" ] && mark="$mark CURRENT"
     [ "$id" = "$lkg" ] && mark="$mark LAST-KNOWN-GOOD"
-    is_retained "$id" && mark="$mark RETAINED"
+    # Protected is reported twice on purpose: the marker is what survives with the
+    # bytes, the registry entry is what the next retention pass reads, and a store
+    # where only one of them is set is a store that is half-preserved.
+    has_marker "$id" && mark="$mark RETAINED"
+    if [ "$PROTECTION_STATE" = ok ]; then
+      local item
+      for item in ${PROTECTED_IDS[@]+"${PROTECTED_IDS[@]}"}; do
+        [ "$item" = "$id" ] && { mark="$mark PROTECTED"; break; }
+      done
+    fi
     # Attestation is the one property an operator must not have to open release.json
     # to discover: an unattested release is a record of bytes, not of a build.
     if [ -f "$RELEASE_ROOT/$id/release.json" ] \
@@ -1090,6 +1313,146 @@ cmd_list() {
     fi
     printf '%-34s %-20s %-17s %s\n' "$id" "$created" "$bin" "${mark# }"
   done < <(list_release_ids)
+  case $PROTECTION_STATE in
+    ok) printf '\nprotection   ok, %d id(s) in %s\n' "${#PROTECTED_IDS[@]}" "$PROTECTED_FILE" ;;
+    *)  printf '\nprotection   %s (%s) -- retention refuses to prune while this is not ok\n' \
+          "$PROTECTION_STATE" "$PROTECTED_FILE" ;;
+  esac
+}
+
+# --------------------------------------------------------------------- protection
+#
+# Protecting a release is a write to shared state, so it takes the same lock as a
+# deployment: a retention pass on another terminal must not read the registry
+# halfway through this one.
+#
+# The registry is rewritten atomically (temp file in the same directory, then
+# rename) so a crash leaves either the old list or the new one. It is never
+# regenerated from the pointers: entries outlive the releases that earned them,
+# and an entry naming a release that is gone is deliberately left in place so the
+# next retention pass refuses instead of tidying the evidence away.
+protect_registry_write() {
+  local tmp=$PROTECTED_FILE.tmp.$$
+  {
+    printf '# Releases exempt from retention. One id per line, # comments allowed.\n'
+    printf '# Maintained by: %s protect\n' "$(basename "$0")"
+    local item
+    for item in "$@"; do printf '%s\n' "$item"; done
+  } >"$tmp" || { rm -f "$tmp"; die "cannot write the protection registry $PROTECTED_FILE"; }
+  chmod 0640 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$PROTECTED_FILE" || { rm -f "$tmp"; die "cannot replace the protection registry $PROTECTED_FILE"; }
+}
+
+cmd_protect() {
+  local ids=() id item existing=() wanted=() new=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -*) die "unknown option $1" ;;
+      *) ids+=("$1"); shift ;;
+    esac
+  done
+  [ ${#ids[@]} -gt 0 ] || die "usage: $0 protect <release-id> [<release-id> ...]"
+  hold_release_lock
+  # Every id is checked before anything is written: a typo must not leave a
+  # registry that refuses pruning because it names a release that never existed.
+  for id in "${ids[@]}"; do
+    [ -d "$RELEASE_ROOT/$id" ] || die "no release $id in $RELEASE_ROOT"
+  done
+  # An unreadable registry is refused rather than overwritten: replacing it would
+  # discard exactly the entries this verb exists to keep.
+  if [ -e "$PROTECTED_FILE" ]; then
+    protection_read || die "the protection registry $PROTECTED_FILE is '$PROTECTION_STATE'; repair it before adding to it (nothing was written)"
+    existing=(${PROTECTED_IDS[@]+"${PROTECTED_IDS[@]}"})
+  fi
+  wanted=(${existing[@]+"${existing[@]}"})
+  for id in "${ids[@]}"; do
+    local seen=0
+    for item in ${wanted[@]+"${wanted[@]}"}; do
+      [ "$item" = "$id" ] && { seen=1; break; }
+    done
+    if [ "$seen" -eq 1 ]; then
+      say "$id is already protected"
+    else
+      wanted+=("$id")
+      new+=("$id")
+    fi
+  done
+  if [ ${#new[@]} -gt 0 ]; then
+    protect_registry_write ${wanted[@]+"${wanted[@]}"}
+    say "protected registry updated: ${new[*]}"
+  fi
+  # The marker beside the bytes, so an archived copy still says what it is when the
+  # registry is not mounted. Written last: the registry is the authority, and a
+  # marker without an entry would be a release nothing consults.
+  for id in "${ids[@]}"; do
+    if [ ! -f "$RELEASE_ROOT/$id/RETAINED" ]; then
+      {
+        printf 'protected %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'by        activate-release.sh protect (release %s)\n' "$(cat "$RELEASE_ROOT/$id/release.json" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("release_id","?"))' 2>/dev/null || echo '?')"
+        printf 'meaning   exempt from retention; still installable, verifiable and promotable\n'
+      } >"$RELEASE_ROOT/$id/RETAINED" || die "could not write the retention marker for $id"
+      chmod 0644 "$RELEASE_ROOT/$id/RETAINED" 2>/dev/null || true
+    fi
+    say "protected $id"
+  done
+  audit "protect" "\"added\":$(json_list ${new[@]+"${new[@]}"}),\"requested\":$(json_list "${ids[@]}")"
+}
+
+cmd_unprotect() {
+  local id="" confirm=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --confirm) confirm=1; shift ;;
+      -*) die "unknown option $1" ;;
+      *) id=$1; shift ;;
+    esac
+  done
+  [ -n "$id" ] || die "usage: $0 unprotect <release-id> --confirm"
+  [ "$confirm" -eq 1 ] || die "unprotect removes a durable protection; re-run with --confirm if that is intended"
+  hold_release_lock
+  [ -d "$RELEASE_ROOT/$id" ] || die "no release $id in $RELEASE_ROOT"
+  case $id in
+    "$(link_target "$CURRENT_LINK")") die "$id is CURRENT; the pointer already protects it and removing the registry entry would only hide that" ;;
+    "$(link_target "$LKG_LINK")") die "$id is LAST-KNOWN-GOOD; the pointer already protects it and removing the registry entry would only hide that" ;;
+  esac
+  local kept=()
+  protection_read || die "the protection registry $PROTECTED_FILE is '$PROTECTION_STATE'; nothing was changed"
+  local item
+  for item in ${PROTECTED_IDS[@]+"${PROTECTED_IDS[@]}"}; do
+    [ "$item" = "$id" ] || kept+=("$item")
+  done
+  protect_registry_write ${kept[@]+"${kept[@]}"}
+  rm -f "$RELEASE_ROOT/$id/RETAINED"
+  say "unprotected $id"
+  audit "unprotect" "\"release\":\"$id\""
+}
+
+cmd_protection() {
+  protection_read || true
+  printf 'registry  %s\n' "$PROTECTED_FILE"
+  printf 'state     %s\n' "$PROTECTION_STATE"
+  case $PROTECTION_STATE in
+    ok)
+      printf 'protected %d id(s)\n' "${#PROTECTED_IDS[@]}"
+      local id rc=0
+      for id in ${PROTECTED_IDS[@]+"${PROTECTED_IDS[@]}"}; do
+        if [ -d "$RELEASE_ROOT/$id" ]; then
+          printf '  present   %s\n' "$id"
+        else
+          printf '  ABSENT    %s\n' "$id"; rc=1
+        fi
+      done
+      return $rc
+      ;;
+    absent)
+      printf 'the registry does not exist, so retention refuses to prune anything\n'
+      return 1
+      ;;
+    *)
+      printf 'the registry cannot be read, so retention refuses to prune anything\n'
+      return 1
+      ;;
+  esac
 }
 
 # ------------------------------------------------------------------------ main
@@ -1114,6 +1477,9 @@ case $verb in
   verify) shift; cmd_verify "$@" ;;
   list) shift; cmd_list "$@" ;;
   env-files) shift; cmd_env_files "$@" ;;
+  protect) shift; cmd_protect "$@" ;;
+  unprotect) shift; cmd_unprotect "$@" ;;
+  protection) shift; cmd_protection "$@" ;;
   adopt)
     shift
     label="" ; commit="" ; branch="" ; dirty=false ; basis="adopted-unattested" ; caps=""

@@ -3,7 +3,7 @@
 
 //! Buffered codec for OpenAI Responses request and response JSON.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -50,7 +50,22 @@ impl FormatCodec for OpenAiResponsesCodec {
         // reject, so drop it before preservation capture and normalization.
         let sanitized = strip_codex_compaction_markers(body);
         let body = sanitized.as_ref().unwrap_or(body);
+        // A Chat transcript carried inside a Responses request (an assistant
+        // message with nested `tool_calls`, followed by `role: "tool"` results)
+        // is restated as typed items before preservation capture. Otherwise the
+        // lossless same-format forward hands a strict upstream a
+        // `function_call_output` whose call never existed, which it rejects as
+        // `400 No tool call found for tool output`.
         let mut diagnostics = Vec::new();
+        let normalized = normalize_responses_history(body)?;
+        let body = normalized.as_ref().unwrap_or(body);
+        // A tool result whose call is absent from this body can only be
+        // answered by state this request does not carry. With no continuation
+        // reference in the body, no supported mechanism can supply that call,
+        // so the request is refused here. With a reference, the typed result is
+        // preserved for the dispatch layer, which resolves the actual state and
+        // validates the real lineage before any upstream attempt.
+        refuse_unmatched_tool_outputs(body)?;
         let response_format = decode_responses_text_format(body.get("text"));
         let mut request = LlmRequest {
             model: body
@@ -95,16 +110,9 @@ impl FormatCodec for OpenAiResponsesCodec {
                 }],
             });
         }
-        // With `previous_response_id`, the provider holds the earlier turns, so a tool output
-        // may answer a call that is not in this body.
-        let stored_state = body
-            .get("previous_response_id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty());
         let mut custom_call_outputs = Vec::new();
         let (messages, instructions) = decode_responses_input(
             body.get("input").unwrap_or(&Value::String(String::new())),
-            stored_state,
             &mut custom_call_outputs,
             &mut diagnostics,
             policy,
@@ -461,6 +469,365 @@ impl FormatCodec for OpenAiResponsesCodec {
     }
 }
 
+/// Refuses a tool result whose call is absent from the request body when no
+/// supported continuation mechanism could supply that call.
+///
+/// Two Responses mechanisms can carry lineage outside the body:
+/// `previous_response_id` and `conversation`. Either defers the check to the
+/// dispatch layer, which resolves the real state and validates identity,
+/// order, parallel grouping and consumer/account/session/target compatibility
+/// before dispatch. A reference is not proof of lineage, so this pass neither
+/// trusts it nor refuses on it: it only declines to call the body provably
+/// unmatched.
+///
+/// With no reference, an unmatched result is refused here, because nothing can
+/// supply the call and a strict upstream would answer `400 No tool call found
+/// for tool output`. Results are matched only against calls earlier in the
+/// body: a result that precedes its call is also unresolved.
+fn refuse_unmatched_tool_outputs(body: &Map<String, Value>) -> Result<()> {
+    if has_continuation_reference(body) {
+        return Ok(());
+    }
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut calls: HashSet<&str> = HashSet::new();
+    let mut unresolved: Vec<String> = Vec::new();
+    for item in items {
+        if let Some(call_ids) = item.get("tool_calls").and_then(Value::as_array) {
+            for call in call_ids {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    calls.insert(id);
+                }
+            }
+        }
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "custom_tool_call") => {
+                if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                    calls.insert(id);
+                }
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                if let Some(id) = item.get("call_id").and_then(Value::as_str)
+                    && !id.is_empty()
+                    && !calls.contains(id)
+                {
+                    unresolved.push(id.to_string());
+                }
+            }
+            _ => {
+                if let Some(id) = item.get("tool_call_id").and_then(Value::as_str)
+                    && !id.is_empty()
+                    && !calls.contains(id)
+                {
+                    unresolved.push(id.to_string());
+                }
+            }
+        }
+    }
+    unresolved.sort_unstable();
+    unresolved.dedup();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    Err(TranslationError::InvalidValue {
+        path: "$.input".to_string(),
+        message: format!(
+            "tool result(s) {} have no matching tool call in this request and it carries no \
+             continuation reference that could supply one; resend the complete tool transaction \
+             (the call, any required reasoning metadata, and every result of the parallel group)",
+            unresolved
+                .iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
+/// True when the body names continuation state that a dispatch layer resolves.
+fn has_continuation_reference(body: &Map<String, Value>) -> bool {
+    if body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return true;
+    }
+    match body.get("conversation") {
+        Some(Value::String(id)) => !id.is_empty(),
+        Some(Value::Object(object)) => object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty()),
+        _ => false,
+    }
+}
+
+/// Restates a Chat-shaped history inside a Responses request as canonical
+/// typed items.
+/// Clients legitimately carry a Chat transcript — an assistant message with a
+/// nested `tool_calls` array, followed by `role: "tool"` results — inside a
+/// Responses request, and mixed bodies where typed items and chat messages
+/// coexist. A strict upstream accepts only the typed form. Left alone, a nested
+/// call is dropped by the decoder while its `function_call_output` still names
+/// it, and the provider answers `400 No tool call found for tool output`.
+///
+/// This pass emits a `function_call` item per nested call, preserving the call
+/// id, name, arguments, order and parallel grouping, and rewrites each chat
+/// `role: "tool"` result into a `function_call_output`. Call ids and names are
+/// never invented: a call with no id, or a result with no `tool_call_id`, is
+/// refused explicitly before dispatch rather than dropped or guessed.
+///
+/// A body that carries no chat-shaped tool traffic is returned unchanged
+/// (`None`) so lossless same-format forwarding stays byte-identical.
+fn normalize_responses_history(
+    body: &Map<String, Value>,
+) -> Result<Option<Map<String, Value>>> {
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    let mut rewritten: Vec<Value> = Vec::with_capacity(items.len());
+    // Calls established so far in this body, keyed by id, holding the
+    // (name, arguments) fingerprint so a duplicate or conflicting id is caught.
+    let mut seen_calls: Vec<(String, String, String)> = Vec::new();
+
+    // Registers a call and refuses a duplicate or conflicting id. Two calls may
+    // not share an id: downstream pairing by id would then attach one result to
+    // the wrong call, so the history is ambiguous and is refused here.
+    let register = |seen: &mut Vec<(String, String, String)>,
+                    id: &str,
+                    name: &str,
+                    arguments: &str,
+                    path: &str|
+     -> Result<()> {
+        if let Some((_, existing_name, existing_arguments)) =
+            seen.iter().find(|(seen_id, _, _)| seen_id == id)
+        {
+            let conflict = existing_name != name || existing_arguments != arguments;
+            return Err(TranslationError::InvalidValue {
+                path: path.to_string(),
+                message: format!(
+                    "tool call id `{id}` is duplicated{}; tool calls must carry distinct ids",
+                    if conflict {
+                        " with a different name or arguments"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+        }
+        seen.push((id.to_string(), name.to_string(), arguments.to_string()));
+        Ok(())
+    };
+
+    for (index, item) in items.iter().enumerate() {
+        let Some(object) = item.as_object() else {
+            rewritten.push(item.clone());
+            continue;
+        };
+        let item_type = object.get("type").and_then(Value::as_str);
+        // Only bare `role:` messages are chat-shaped. A typed item always wins.
+        if item_type.is_none() {
+            match object.get("role").and_then(Value::as_str) {
+                Some("tool") => {
+                    let path = format!("$.input[{index}].tool_call_id");
+                    let call_id = object
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if call_id.is_empty() {
+                        return Err(TranslationError::InvalidValue {
+                            path,
+                            message: "chat tool result carries no tool_call_id; refusing to \
+                                      fabricate one"
+                                .to_string(),
+                        });
+                    }
+                    // An unanswered chat result is restated faithfully; whether its
+                    // call can be recovered from continuation state is decided before
+                    // dispatch, not guessed here.
+
+                    let output = object
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()));
+                    rewritten.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }));
+                    changed = true;
+                    continue;
+                }
+                Some("assistant") => {
+                    if let Some(calls) = object.get("tool_calls").and_then(Value::as_array) {
+                        if calls.is_empty() {
+                            // A present-but-empty call list is still a chat field a
+                            // strict parser can reject; drop it.
+                            let mut message = object.clone();
+                            message.remove("tool_calls");
+                            rewritten.push(Value::Object(message));
+                            changed = true;
+                            continue;
+                        }
+                        let mut message = object.clone();
+                        message.remove("tool_calls");
+                        // An assistant shell whose only payload was the call list
+                        // carries no text of its own; keep a real message otherwise.
+                        if !responses_content_is_empty(message.get("content")) {
+                            rewritten.push(Value::Object(message));
+                        }
+                        for (call_index, call) in calls.iter().enumerate() {
+                            let path = format!("$.input[{index}].tool_calls[{call_index}]");
+                            let Some(call) = call.as_object() else {
+                                return Err(TranslationError::InvalidValue {
+                                    path,
+                                    message: "tool call is not an object".to_string(),
+                                });
+                            };
+                            let call_id = call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .ok_or_else(|| TranslationError::InvalidValue {
+                                    path: format!("{path}.id"),
+                                    message: "tool call carries no id; refusing to fabricate one"
+                                        .to_string(),
+                                })?;
+                            let function = call.get("function").and_then(Value::as_object);
+                            let name = function
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                                .or_else(|| call.get("name").and_then(Value::as_str))
+                                .filter(|name| !name.is_empty())
+                                .ok_or_else(|| TranslationError::InvalidValue {
+                                    path: format!("{path}.function.name"),
+                                    message: "tool call carries no function name; refusing to \
+                                              substitute an empty one"
+                                        .to_string(),
+                                })?;
+                            // Preserve whatever argument representation the caller
+                            // used, but a call with no arguments at all is malformed:
+                            // an absent field is not the same call as `{}`.
+                            let arguments = function
+                                .and_then(|function| function.get("arguments"))
+                                .or_else(|| call.get("arguments"))
+                                .filter(|arguments| !arguments.is_null())
+                                .ok_or_else(|| TranslationError::InvalidValue {
+                                    path: format!("{path}.function.arguments"),
+                                    message: "tool call carries no arguments; refusing to \
+                                              fabricate them"
+                                        .to_string(),
+                                })?;
+                            let fingerprint = match arguments {
+                                Value::String(text) => text.clone(),
+                                other => other.to_string(),
+                            };
+                            register(
+                                &mut seen_calls,
+                                call_id,
+                                name,
+                                &fingerprint,
+                                &format!("{path}.id"),
+                            )?;
+                            rewritten.push(json!({
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": arguments,
+                            }));
+                        }
+                        changed = true;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match item_type {
+            Some("function_call") => {
+                let path = format!("$.input[{index}]");
+                let call_id = object
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| TranslationError::InvalidValue {
+                        path: format!("{path}.call_id"),
+                        message: "function call carries no call_id; refusing to fabricate one"
+                            .to_string(),
+                    })?;
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| TranslationError::InvalidValue {
+                        path: format!("{path}.name"),
+                        message: "function call carries no name; refusing to substitute an \
+                                  empty one"
+                            .to_string(),
+                    })?;
+                let arguments = object
+                    .get("arguments")
+                    .filter(|arguments| !arguments.is_null())
+                    .ok_or_else(|| TranslationError::InvalidValue {
+                        path: format!("{path}.arguments"),
+                        message: "function call carries no arguments; refusing to fabricate them"
+                            .to_string(),
+                    })?;
+                let fingerprint = match arguments {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                register(
+                    &mut seen_calls,
+                    call_id,
+                    name,
+                    &fingerprint,
+                    &format!("{path}.call_id"),
+                )?;
+            }
+            Some("function_call_output") => {
+                // Presence is required; the value itself is consumed by the
+                // dispatch-layer lineage guard, which alone can see whether a
+                // scoped continuation store answers the call.
+                object
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| TranslationError::InvalidValue {
+                        path: format!("$.input[{index}].call_id"),
+                        message: "function call output carries no call_id; refusing to fabricate \
+                                  one"
+                            .to_string(),
+                    })?;
+            }
+            _ => {}
+        }
+
+        rewritten.push(item.clone());
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let mut body = body.clone();
+    body.insert("input".to_string(), Value::Array(rewritten));
+    Ok(Some(body))
+}
+
+/// True when a message `content` field carries no payload: absent, null, an
+/// empty string, or an empty block array.
+fn responses_content_is_empty(content: Option<&Value>) -> bool {
+    match content {
+        None | Some(Value::Null) => true,
+        Some(Value::String(text)) => text.is_empty(),
+        Some(Value::Array(blocks)) => blocks.is_empty(),
+        _ => false,
+    }
+}
+
 /// Decodes Responses `input` into ordered normalized messages and inline
 /// instruction blocks.
 ///
@@ -470,7 +837,6 @@ impl FormatCodec for OpenAiResponsesCodec {
 /// item from flushing pending reasoning or disturbing tool-call grouping.
 fn decode_responses_input(
     value: &Value,
-    stored_state: bool,
     custom_call_outputs: &mut Vec<String>,
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
@@ -645,29 +1011,15 @@ fn decode_responses_input(
                                 text: output.map(json_string).unwrap_or_default(),
                             }],
                         };
-                        // An output whose call is not in this body answers a call the provider
-                        // holds behind `previous_response_id`; it stays a tool result so routing
-                        // sees a tool continuation, not a new user turn. Without stored state
-                        // the request is malformed, and the output becomes readable user text.
+                        // An output whose call is not in this body may be answered from
+                        // continuation state the serving layer verifies; it stays a tool
+                        // result either way so routing sees a tool continuation. It is
+                        // never rewritten into a user turn: tool text must not acquire the
+                        // authority of a caller instruction. Whether that lineage exists is
+                        // decided before dispatch, where the scoped state store is visible.
                         let answers_pending_call = pending_tool_calls
                             .iter()
                             .any(|call| call.id == tool_call_id);
-                        if !answers_pending_call && !stored_state {
-                            let output_text = text_from_blocks(&content, " ");
-                            let message = Message::text(
-                                Role::User,
-                                format!("Tool result {tool_call_id}: {output_text}"),
-                            );
-                            push_responses_non_tool_message(
-                                &mut messages,
-                                &mut pending_tool_calls,
-                                &mut pending_tool_outputs,
-                                &mut deferred_messages,
-                                &mut pending_reasoning,
-                                message,
-                            );
-                            continue;
-                        }
                         // The encoder types an output by the call it answers; a stored custom
                         // output has no call in this body, so its type is carried separately.
                         if !answers_pending_call && kind == Some("custom_tool_call_output") {
@@ -1639,11 +1991,28 @@ fn encode_responses_content(
                     part
                 }
                 MediaSource::Base64 { media_type, data } => {
-                    let mut video = json!({"data": data});
-                    if let Some(media_type) = media_type {
-                        video["media_type"] = Value::String(media_type.clone());
+                    // Measured against the provider's own Responses endpoint: it accepts a
+                    // video part ONLY as `input_video` with a string `video_url`, and answers
+                    // `video: {data, media_type}` with 400 "Invalid Responses API request"
+                    // (invalid_union, expected string). A `data:` URI is the same bytes in the
+                    // one shape that is accepted, so inline bytes survive translation instead
+                    // of being rejected upstream. Without a media type there is no faithful
+                    // URI, and inventing one would mislabel the payload, so the bytes are
+                    // reported as text and a lossy diagnostic is recorded -- the same choice
+                    // the image encoder makes.
+                    match media_type {
+                        Some(media_type) => {
+                            json!({"type": "input_video", "video_url": format!("data:{media_type};base64,{data}")})
+                        }
+                        None => {
+                            push_lossy(
+                                diagnostics,
+                                policy,
+                                "Responses codec could not map inline video without a media type",
+                            )?;
+                            json!({"type": "input_text", "text": format!("video: {} bytes", data.len())})
+                        }
                     }
-                    json!({"type": "input_video", "video": video})
                 }
             }),
             ContentBlock::File { source } => match responses_file_part(source) {

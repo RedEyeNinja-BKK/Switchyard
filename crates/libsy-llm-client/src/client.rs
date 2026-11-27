@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -17,14 +18,15 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value, json};
 use switchyard_protocol::correlation;
 use switchyard_protocol::{
-    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
-    ModelId, Request, Response, RoutedLlmClient,
+    AggLlmResponse, ContentBlock, LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream,
+    LlmResponseStreamEvent, Metadata, ModelId, Request, Response, Role, RoutedLlmClient,
 };
 use switchyard_translation::{
-    TargetCapabilities, TranslationError, TranslationPolicy, WireFormat,
-    decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request_with_policy,
-    encode_stream_with_extensions,
+    ReasoningAdmission, ReasoningDetailsReplay, TargetCapabilities, TranslationError,
+    TranslationPolicy, WireFormat, decode_aggregated_response_with_policy, decode_request,
+    decode_stream_with_policy, encode_aggregated_response_with_extensions,
+    encode_request_with_policy, encode_stream_with_extensions,
+    provenance::{ProvenanceRegistry, ReasoningIssuer, ReasoningLineage, opaque_digest},
 };
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -55,6 +57,9 @@ const NON_FORWARDABLE_HEADERS: &[&str] = &[
     "content-encoding",
     "accept-encoding",
     "expect",
+    // The pre-egress admission assertion header is gone with the gate. Nothing is stripped
+    // for policy reasons any more; this list is transport hygiene only.
+    "x-switchyard-privacy-clearance",
 ];
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -139,6 +144,9 @@ pub struct TranslatingLlmClient {
     // The HTTP status that armed each cooldown, so a skipped call can report the
     // real failure instead of a generic unavailability. Zero means "no status".
     cooldown_status: HashMap<String, AtomicU32>,
+    // Which identity issued each piece of opaque reasoning state this process saw arrive.
+    // Bounded and process-local; see `switchyard_translation::provenance`.
+    provenance: Arc<ProvenanceRegistry>,
 }
 
 /// The key a model's failure cooldown is recorded under.
@@ -196,7 +204,16 @@ impl TranslatingLlmClient {
             cooldown_epoch: Instant::now(),
             unavailable_until,
             cooldown_status,
+            provenance: Arc::new(ProvenanceRegistry::default()),
         })
+    }
+
+    /// The process-local record of which target issued opaque reasoning state.
+    ///
+    /// Exposed for observability and tests. A restart begins empty, which degrades every
+    /// unproven replay to "withhold" rather than to a wrong target.
+    pub fn provenance(&self) -> &Arc<ProvenanceRegistry> {
+        &self.provenance
     }
 
     /// The backend serving `model` over `format` — the default backend when its
@@ -287,6 +304,19 @@ impl TranslatingLlmClient {
         route_reasoning_policy: Option<switchyard_protocol::ReasoningPolicy>,
         route_reasoning_effort: Option<&str>,
     ) -> Result<EncodedResponse> {
+        // A caller's Responses-only feature may have no representation on this target's wire
+        // format, and the decode has already discarded it. Refused before the cooldown is even
+        // consulted, because the answer is about the request rather than the model's health.
+        // The check reads the caller's own preserved body: the normalized IR no longer carries
+        // the distinction, so this is the last point at which the loss is visible.
+        if !matches!(backend, Backend::OpenAiResponses(_))
+            && let Some(feature) = caller_responses_feature(&llm_request)
+        {
+            return Err(LlmClientError::UnsupportedFeature {
+                model: model.clone(),
+                feature: feature.message(),
+            });
+        }
         let cooldown = backend.failure_cooldown();
         let key = cooldown_key(backend, model);
         let unavailable_until =
@@ -323,15 +353,21 @@ impl TranslatingLlmClient {
             return Err(LlmClientError::TemporarilyUnavailable);
         }
 
-        // A Responses upstream may declare that it requires a list-shaped `input`; the
-        // default policy carries no target capabilities, so it is supplied here.
-        let policy = TranslationPolicy {
-            target_capabilities: TargetCapabilities {
-                requires_list_input: Some(backend.requires_list_input()),
-                ..TargetCapabilities::default()
-            },
-            ..TranslationPolicy::default()
-        };
+        // A Responses upstream may declare that it requires a list-shaped `input`, and a
+        // hosted upstream may embed reasoning behind a marker. Both are per-target wire
+        // facts, so one helper supplies them to every translation site.
+        let mut policy = translation_policy(backend);
+        // Provenance is resolved here, before the request is encoded and therefore before the
+        // preserved-body fast path can replay anything: the encoder decides what "proven" means,
+        // but this is the only place where the registry and this request's target meet.
+        apply_reasoning_admission(
+            &mut policy,
+            backend,
+            model,
+            &llm_request,
+            metadata,
+            &self.provenance,
+        );
         let mut body = encode_request_with_policy(&llm_request, wire_format, &policy)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -409,6 +445,10 @@ impl TranslatingLlmClient {
                 }
             }
         }
+        // The provider's refusal list has the final word: after every override, a value the
+        // provider rejects is removed rather than forwarded. Removing it leaves the provider's
+        // own default, which is the only other outcome that wire allows.
+        drop_unsupported_reasoning_effort(&mut body, backend.unsupported_reasoning_effort());
         if matches!(backend, Backend::Anthropic(_)) {
             enable_anthropic_prompt_caching(&mut body);
         }
@@ -426,7 +466,7 @@ impl TranslatingLlmClient {
         // Forwarded credentials can hit a user's quota while the backend remains healthy.
         if let Some(until) = unavailable_until
             && let Err(error) = &result
-            && is_transient_failure(error)
+            && rests_the_model(error)
             && !(backend.is_forwarding_auth()
                 && matches!(error, LlmClientError::UpstreamHttp { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS))
         {
@@ -456,6 +496,11 @@ impl TranslatingLlmClient {
     ) -> Result<EncodedResponse> {
         let max_retries = u64::from(backend.max_retries());
         let max_attempts = max_retries + 1;
+        // A target that declares a daily request allowance charges that budget per
+        // attempt, so its retry budget is separate from a paid lane's (see
+        // AttemptFailure::retry_budget_allows). Resolved once: the backend cannot gain
+        // or lose an allowance during a call.
+        let quota_limited = backend.allowance().is_some();
         let expires_at = backend
             .timeout()
             .map(|timeout| (tokio::time::sleep(timeout).deadline(), timeout));
@@ -567,7 +612,7 @@ impl TranslatingLlmClient {
                     });
                 }
                 Err(failure) => {
-                    let will_retry = attempt < max_retries && failure.is_retryable();
+                    let will_retry = failure.may_retry(attempt, max_retries, quota_limited);
                     span.record("outcome", "error");
                     if let Some(status) = failure.status {
                         span.record("status_code", status.as_u16());
@@ -602,6 +647,117 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
+        // The payload is sent as assembled. The egress gate that used to inspect this body
+        // here is removed: nothing about a request's content stops it reaching a provider.
+        // Paced before the daily budget, because the two refusals mean different things and
+        // only one of them is reversible. A minute window has room again shortly, so a
+        // request refused here should not spend a unit of the day's budget; the reservation
+        // is released again below if the daily allowance then refuses, since nothing reached
+        // the provider. Ordering it this way also means a route under minute pressure pays in
+        // the resource that refills rather than the one that does not.
+        let mut pacing = None;
+        if let Some(quota) = backend.pacing() {
+            match quota.reserve(crate::allowance::estimate_input_tokens(body)) {
+                Ok(ticket) => pacing = ticket,
+                Err(crate::allowance::PacingError::Throttled(throttled)) => {
+                    return Err(AttemptFailure {
+                        error: LlmClientError::MinuteAllowanceThrottled {
+                            model: model.clone(),
+                            scope: throttled.scope.as_str().to_string(),
+                            retry_after_secs: throttled.retry_after.as_secs().max(1),
+                        },
+                        // No request left this process, so there is no upstream status to
+                        // report and nothing was counted by the provider.
+                        status: None,
+                        retry_after: Some(throttled.retry_after),
+                    });
+                }
+                Err(crate::allowance::PacingError::ExceedsWindow {
+                    needed,
+                    limit,
+                    margin_permille,
+                }) => {
+                    // Its own classification, not a capability defect: this model could read
+                    // the input, the deployment's own minute budget cannot admit it at the
+                    // margin it insists on. A sibling with a wider window may serve the
+                    // request now, so the route advances instead of ending.
+                    return Err(AttemptFailure {
+                        error: LlmClientError::InputExceedsMinuteWindow {
+                            model: model.clone(),
+                            needed,
+                            limit,
+                            margin_permille,
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+            }
+        }
+        // Spent before the request leaves, at the one point every attempt passes
+        // through. A reservation is never refunded: an attempt that fails below may
+        // still have reached the provider, and refunding it would let a retrying
+        // client exceed the daily cap it is trying to respect.
+        if let Some(allowance) = backend.allowance() {
+            match allowance.try_reserve() {
+                Ok(()) => {}
+                Err(crate::allowance::ReserveError::Exhausted) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceExhausted {
+                            model: model.clone(),
+                            limit: allowance.limit(),
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+                Err(crate::allowance::ReserveError::ProviderExhausted { limit }) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
+                    return Err(AttemptFailure {
+                        error: LlmClientError::ProviderAllowanceExhausted {
+                            model: model.clone(),
+                            limit,
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+                Err(crate::allowance::ReserveError::Unusable(reason)) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceUnavailable {
+                            model: model.clone(),
+                            reason,
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+                // A reservation path never orders an observation, so this cannot be
+                // produced here. It is handled as a closed refusal rather than a panic: if
+                // the invariant ever breaks, the request must not be sent unaccounted.
+                Err(crate::allowance::ReserveError::ObservationRejected { reason }) => {
+                    if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref()) {
+                        quota.release(ticket);
+                    }
+                    return Err(AttemptFailure {
+                        error: LlmClientError::DailyRequestAllowanceUnavailable {
+                            model: model.clone(),
+                            reason: reason.to_string(),
+                        },
+                        status: None,
+                        retry_after: None,
+                    });
+                }
+            }
+        }
         let client = if backend.is_forwarding_auth() {
             &self.forward_auth_client
         } else {
@@ -658,6 +814,24 @@ impl TranslatingLlmClient {
                     });
                 }
             };
+            // The provider's own input count, fed straight back into the window that
+            // admitted this request. This is the only place the two are both in scope: the
+            // reservation lives here, and the response body is about to leave for the
+            // decoder. Doing it before returning matters — the very next request on this
+            // model reads this ledger, and an under-count left uncorrected is exactly how a
+            // minute window silently overruns its published budget.
+            //
+            // Parsed only for a paced target, so an unpaced one pays nothing. A body this
+            // cannot read leaves the conservative reservation in place: "no count" is not
+            // "no tokens".
+            if let (Some(quota), Some(ticket)) = (backend.pacing(), pacing.as_ref())
+                && let Some(reported) = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(crate::allowance::reported_input_tokens)
+            {
+                quota.reconcile(ticket, reported);
+            }
             metrics::record_upstream_attempt(Some(status.as_u16()));
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
@@ -733,6 +907,10 @@ impl TranslatingLlmClient {
             })?;
         llm_request.model = Some(model_id.to_string());
 
+        // A caller that asked for zero output gets an empty answer by request, not by
+        // failure. Captured here because the request is moved into the send below.
+        let wants_no_output = llm_request.output.max_output_tokens == Some(0);
+
         let orig_format = metadata.as_ref().and_then(|m| m.wire_format);
         let wire_format = orig_format.unwrap_or(
             self.model_to_config
@@ -766,7 +944,20 @@ impl TranslatingLlmClient {
                 chunks,
                 upstream_headers,
                 ..
-            } => (LlmResponse::Stream(chunks), upstream_headers),
+            } => (
+                LlmResponse::Stream(
+                    // Streamed state is recorded from the assembled response when the stream
+                    // ends: the same accumulator the consumer uses, so the recorded details are
+                    // the ones the caller will actually see.
+                    tap_streamed_provenance(
+                        chunks,
+                        Arc::clone(&self.provenance),
+                        reasoning_issuer(backend, &model_id),
+                        request_lineage(metadata.as_ref()),
+                    ),
+                ),
+                upstream_headers,
+            ),
             EncodedResponse::Buffered {
                 body,
                 upstream_headers,
@@ -777,26 +968,72 @@ impl TranslatingLlmClient {
                 })?;
                 // Map a provider's failed generation to 502, even under HTTP 200.
                 // Redact forwarded credentials before returning the provider error.
-                let agg =
-                    decode_aggregated_response(&body, wire_format).map_err(
-                        |error| match error {
-                            TranslationError::UpstreamFailure { error } => {
-                                LlmClientError::UpstreamHttp {
-                                    status: StatusCode::BAD_GATEWAY,
-                                    body: redact_forwarded_headers(
-                                        json!({ "error": error }).to_string(),
-                                        metadata.as_ref(),
-                                        backend.is_forwarding_auth(),
-                                    ),
-                                }
+                let policy = translation_policy(backend);
+                let agg = decode_aggregated_response_with_policy(&body, wire_format, &policy)
+                    .map_err(|error| match error {
+                        TranslationError::UpstreamFailure { error } => {
+                            LlmClientError::UpstreamHttp {
+                                status: StatusCode::BAD_GATEWAY,
+                                body: redact_forwarded_headers(
+                                    json!({ "error": error }).to_string(),
+                                    metadata.as_ref(),
+                                    backend.is_forwarding_auth(),
+                                ),
                             }
-                            error => LlmClientError::ResponseTranslation(error.to_string()),
-                        },
-                    )?;
+                        }
+                        error => LlmClientError::ResponseTranslation(error.to_string()),
+                    })?;
+                // Retain which target issued this response's opaque reasoning state, so a later
+                // request can be proven a continuation rather than assumed one.
+                record_reasoning_provenance(
+                    &agg,
+                    backend,
+                    &model_id,
+                    metadata.as_ref(),
+                    &self.provenance,
+                );
                 (LlmResponse::Agg(agg), upstream_headers)
             }
         };
 
+        // A delivered transport with an unusable result is not a successful call. Recorded
+        // here, where the decoded response exists and the wire status no longer does, so
+        // that"the model answered" and "the caller got something" stay separate facts.
+        //
+        // The route then advances rather than returning the non-answer. A candidate that
+        // answered with nothing has not served the request, and this layer knows it while
+        // the caller does not; handing back an empty 200 is how a leg that never works keeps
+        // being selected. Measured 2026-11-21: measured selection kept choosing a free Gemma
+        // leg that returned `completion_tokens: 0` because an empty reply was recorded as a
+        // success. The one caller that legitimately wants no output asks for zero tokens, and
+        // that request is left alone.
+        // The policy is read for one fact: whether this target declares that it writes
+        // reasoning inline. That is what makes a token total above input-plus-output mean
+        // thinking rather than a provider accounting quirk.
+        let hosted_thinking = translation_policy(backend).hosted_reasoning.is_some();
+        if let Some(reason) = llm_response
+            .as_agg()
+            .and_then(|agg| unusable_answer(agg, hosted_thinking))
+        {
+            metrics::record_incomplete_answer(reason);
+            // Two shapes are refused: a reported output count of zero, and a reply whose
+            // whole output was hidden reasoning on a target declared to charge it against
+            // the caller's reservation. A provider that reports no usage has told us
+            // nothing about its output, and a reply with output tokens but no visible text
+            // is a reasoning- or format-level question; convicting either would turn a
+            // diagnostic into a false accusation. The caller that legitimately wants no
+            // output asks for zero tokens, and that request is left alone.
+            let unanswered = matches!(
+                reason,
+                "empty_answer_zero_completion" | "empty_answer_thinking_only"
+            );
+            if unanswered && !wants_no_output {
+                return Err(LlmClientError::EmptyAnswer {
+                    model: model_id,
+                    reason,
+                });
+            }
+        }
         Ok(Response {
             llm_response,
             metadata,
@@ -980,6 +1217,50 @@ impl AttemptFailure {
     fn is_retryable(&self) -> bool {
         is_transient_failure(&self.error)
     }
+
+    /// Whether the retry loop may dispatch once more to this same target.
+    ///
+    /// One decision in one place, and it fails closed: the configured budget, whether the
+    /// failure class can clear at all, and - on a target that declares a daily request
+    /// allowance - the narrower budget that allowance implies. Keeping the conjunction
+    /// here means a caller cannot accidentally retry a 401 by checking only the budget.
+    fn may_retry(&self, attempt: u64, max_retries: u64, quota_limited: bool) -> bool {
+        if attempt >= max_retries || !self.is_retryable() {
+            return false;
+        }
+        self.retry_budget_allows(attempt, quota_limited)
+    }
+
+    /// Whether a quota-limited leaf may spend one more attempt on this same target.
+    ///
+    /// [`Self::is_retryable`] answers whether the condition is the kind that can clear;
+    /// this answers whether spending another request on the *same* target is worth it.
+    /// They are different questions on a target that declares a daily request
+    /// allowance, because every attempt reserves against that finite budget before the
+    /// provider is contacted and the reservation is never refunded on an HTTP failure.
+    /// A retry there spends the same scarce resource the retry is trying to obtain: one
+    /// 429 currently charges four reservations while the routing evidence records one
+    /// attempt.
+    ///
+    /// The budget for a quota-limited leaf is:
+    ///
+    /// * HTTP 429, any flavour: no further attempt on this target. A daily cap cannot
+    ///   clear on a backoff, and sleeping into a minute window spends the room the next
+    ///   request needs. The route decides whether an eligible sibling has headroom.
+    /// * any other retryable failure (transport, timeout, 5xx): at most ONE further
+    ///   attempt, so a bad second of upstream health costs two reservations, not four.
+    ///
+    /// A target with no allowance keeps the configured budget unchanged. Paid lanes are
+    /// not quota-limited per request and this rule must not move them.
+    fn retry_budget_allows(&self, attempt: u64, quota_limited: bool) -> bool {
+        if !quota_limited {
+            return true;
+        }
+        if self.status.is_some_and(|status| status.as_u16() == 429) {
+            return false;
+        }
+        attempt == 0
+    }
 }
 
 /// Whether a failure says the credential's account-wide allowance is exhausted.
@@ -1017,6 +1298,26 @@ const BILLING_LIMIT_CODES: &[&str] = &[
     "insufficient_quota",
 ];
 
+/// The free-model daily allowance, spelled out in a message instead of the marker.
+///
+/// OpenRouter normally names this allowance in `error.metadata.limit_source`, but not
+/// always: measured 2026-11-19 the refusal arrived as
+/// `{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit
+/// exceeded: free-models-per-day-high-balance."}}` — a bare 429 with no metadata, on a
+/// paid-tier key with credit remaining. The sentence can only name the per-credential
+/// free-model allowance, so it belongs with the marker rather than in the retry loop.
+///
+/// Matched on the whole phrase and not on "rate limit exceeded": the per-minute
+/// spelling of the same sentence is a genuine throttle that must keep its retries.
+const FREE_MODEL_DAILY_MESSAGE: &str = "free-models-per-day";
+
+fn names_free_model_daily_cap(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
+        .is_some_and(|message| message.contains(FREE_MODEL_DAILY_MESSAGE))
+}
+
 fn is_documented_billing_limit(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1044,6 +1345,16 @@ pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
         StatusCode::TOO_MANY_REQUESTS => {
             limit_source.is_some_and(|s| s == "openrouter_free_tier_daily")
                 || is_documented_billing_limit(body)
+                || names_free_model_daily_cap(body)
+                // Google returns two different 429s. `quota_exceeded` is the daily one;
+                // `rate_limit_exceeded` is a window that clears and is retried instead. The
+                // daily one is only ACCOUNT-wide when the body positively scoped it that way:
+                // this Free tier allocates RPD per model, so one Model's spent quota must not
+                // take the rest of the pool down with it.
+                || crate::google::parse(Some(status.as_u16()), body).is_some_and(|error| {
+                    error.condition == crate::google::GoogleCondition::DailyQuota
+                        && error.recovery().stop_candidate_list
+                })
         }
         // Insufficient credits: the account balance is the shared resource, so no
         // candidate on this credential can serve the request.
@@ -1075,6 +1386,110 @@ fn is_masked_permanent_failure(body: &str) -> bool {
     )
 }
 
+/// Whether a failure should rest the model it came from, independent of whether the same
+/// request may be sent to that model again.
+///
+/// These are two questions and Google separates them. A 503 `UNAVAILABLE` means the model is
+/// overloaded: replaying the same call would fail the same way, but the model genuinely needs
+/// to be left alone for a while. A 400 policy block means the request was refused without
+/// saying anything about the model's health, so it must not rest it. Arming the cooldown on
+/// `is_transient_failure` alone conflated the two, with the result that a target configured
+/// with a long capacity cooldown never armed it on the very condition it was configured for:
+/// the 31B's `failure_cooldown_ms = 300000` was unreachable because its own 503 correctly
+/// forbids a same-model replay, and forbidding the replay was read as "nothing to cool down".
+///
+/// The retry decision is not loosened here. `is_transient_failure` still decides what may be
+/// replayed; this only decides what rests.
+fn rests_the_model(error: &LlmClientError) -> bool {
+    if is_transient_failure(error) {
+        return true;
+    }
+    match error {
+        LlmClientError::UpstreamHttp { status, body } => {
+            crate::google::parse(Some(status.as_u16()), body)
+                .is_some_and(|error| error.recovery().cool_down_model)
+        }
+        _ => false,
+    }
+}
+
+/// Why an answered response carries nothing a caller can use, if that is the case.
+///
+/// `HTTP 200` says the provider accepted the request and answered it. It does not say the
+/// caller received an answer. The measured case is a Gemma reply whose entire output budget
+/// went to inline `<thought>` reasoning: `completion_tokens: 0`, empty content, no tool
+/// call, status 200. Treating that as a success is how a model looks healthy in transport
+/// telemetry while every caller gets nothing, and it is how a selector learns the wrong
+/// lesson about which leg serves a task.
+///
+/// Only the unambiguous shape is flagged: no text, no tool call, no refusal, and no output
+/// the caller can use. A response with output tokens but no visible text is left alone —
+/// that is a reasoning- or format-level question this function cannot settle, and guessing
+/// would turn a diagnostic into a false accusation.
+///
+/// The one provider-specific certainty is `hosted_thinking`: a target that declares it writes
+/// reasoning inline *and* charges that reasoning against the caller's output reservation. Its
+/// reply can therefore contain thinking only, and its own `completion_tokens` reads `0`
+/// because the provider does not count reasoning as output. Measured 2026-11-21 on Gemma 4
+/// 26B: `finish_reason: length`, `completion_tokens: 0`, `total_tokens` 499 against a
+/// 438-token prompt — 61 tokens of thinking and no answer. Classifying that as
+/// "the provider produced nothing" is wrong twice over: it blames the leg for a budget that
+/// the caller set, and it hides the only fact that would let an operator act on it. The
+/// hidden count is taken from the usage block rather than assumed, so a provider that reports
+/// no totals keeps the older, quieter classification.
+fn unusable_answer(
+    agg: &switchyard_protocol::llm::AggLlmResponse,
+    hosted_thinking: bool,
+) -> Option<&'static str> {
+    use switchyard_protocol::llm::ContentBlock;
+
+    let has_content = agg.outputs.iter().any(|output| {
+        output.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            // A tool call is a usable answer: the caller acts on it. A refusal is an answer
+            // too - the model declined, which is information, not silence.
+            ContentBlock::ToolCall(_) | ContentBlock::Refusal { .. } => true,
+            _ => false,
+        })
+    });
+    if has_content {
+        return None;
+    }
+    if hosted_thinking && hidden_output_tokens(&agg.usage) > 0 {
+        return Some("empty_answer_thinking_only");
+    }
+    match agg.usage.output_tokens {
+        Some(0) => Some("empty_answer_zero_completion"),
+        None => Some("empty_answer_no_usage"),
+        // Output was produced but none of it is visible: the model spent its budget on
+        // reasoning, which is a real and separate condition, not an empty answer.
+        Some(_) => Some("empty_answer_reasoning_only"),
+    }
+}
+
+/// Tokens the provider produced that it did not count as output and did not show.
+///
+/// For a target that hides its reasoning this is the thinking the reply contains. Taken from
+/// the provider's own totals, so an upstream that reports nothing reports zero here rather
+/// than a guess: `total - input - output`, saturating, with the cache details subtracted from
+/// the input side because the codec normalises input to its non-cached component.
+fn hidden_output_tokens(usage: &switchyard_protocol::llm::Usage) -> u64 {
+    let Some(total) = usage.total_tokens else {
+        return 0;
+    };
+    let cache = usage.cache.as_deref();
+    let input = usage.input_tokens.unwrap_or(0)
+        + cache
+            .and_then(|cache| cache.cached_input_tokens)
+            .unwrap_or(0)
+        + cache
+            .and_then(|cache| cache.cache_creation_input_tokens)
+            .unwrap_or(0);
+    total
+        .saturating_sub(input)
+        .saturating_sub(usage.output_tokens.unwrap_or(0))
+}
+
 fn is_transient_failure(error: &LlmClientError) -> bool {
     // Checked before the status table: 429 is retryable in general, but a daily
     // account cap is not a throttle that clears in a moment.
@@ -1085,8 +1500,33 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         LlmClientError::Transport { .. }
         | LlmClientError::Timeout { .. }
         | LlmClientError::AttemptTimeout { .. } => true,
+        // A daily allowance resets on the provider's clock, not on a backoff: retrying
+        // now would burn the next day's budget against an answer already known to be no.
+        LlmClientError::DailyRequestAllowanceExhausted { .. }
+        | LlmClientError::DailyRequestAllowanceUnavailable { .. } => false,
+        // A minute window refills shortly, but not within a backoff: the same legs' next
+        // attempt would spend the room the next request needs. The route decides whether a
+        // sibling has headroom; this call does not sleep into its own throttle.
+        LlmClientError::MinuteAllowanceThrottled { .. } => false,
+        // No wait on this leg makes the request smaller, and resending it would spend the
+        // window on a request this code already knows it must refuse.
+        LlmClientError::InputExceedsMinuteWindow { .. } => false,
+        // The model answered with nothing. The same budget on the same model produces the
+        // same non-answer, so this call does not retry in place; the route advances.
+        LlmClientError::EmptyAnswer { .. } => false,
+        // The feature is missing from the target, not from the attempt: sending it again,
+        // or to a sibling on the same wire format, cannot add it.
+        LlmClientError::UnsupportedFeature { .. } => false,
         LlmClientError::UpstreamHttp { status, body } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
+                return false;
+            }
+            // A provider that names its condition decides whether the same bytes go out
+            // again. Google distinguishes a window throttle from a spent daily quota on the
+            // same status, and a policy block from an outage on the same 400.
+            if crate::google::parse(Some(status.as_u16()), body)
+                .is_some_and(|error| !error.recovery().retry_same_model)
+            {
                 return false;
             }
             metrics::is_retryable_http_status(status.as_u16())
@@ -1148,7 +1588,8 @@ async fn prepare_response_stream(
             .map(|bytes| bytes.to_vec())
             .map_err(convert_reqwest_error)
     });
-    let mut chunks = decode_stream(bytes, backend.wire_format())?;
+    let mut chunks =
+        decode_stream_with_policy(bytes, backend.wire_format(), &translation_policy(backend))?;
     // Hold non-output events until something usable arrives. A provider announces
     // the response (`response.created`, a role-only delta) and may then stall; if
     // the attempt returned at that announcement, the attempt bound would stop
@@ -1311,6 +1752,285 @@ fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> Reques
         builder = builder.header(name, value);
     }
     builder
+}
+
+// The translation policy one backend declares.
+//
+// Both facts are per-target wire properties: whether the Responses `input` must be a list,
+// and which marker the upstream uses for reasoning it writes inline in the message. They are
+// assembled here rather than at each encode/decode site because a decode path that forgets
+// the marker silently returns the provider's monologue to the caller.
+//
+// The third fact is where opaque reasoning state may be replayed. `reasoning_details` and a
+// `signature` belong to the provider that issued them: OpenRouter hands them back and expects
+// them returned intact, while a native provider has no field for them and must not be given
+// another provider's private blob. Tying this to the dialect means one target cannot be told
+// to replay and another told to withhold by accident.
+fn translation_policy(backend: &Backend) -> TranslationPolicy {
+    // An OpenRouter-shaped target can *accept* opaque details, but acceptance is not proof: the
+    // same wire reached on another account is another issuer. Such a target is provenance-bound,
+    // and a target with no structured reasoning wire gets the plaintext form only.
+    let reasoning_details_replay = match backend.reasoning_dialect() {
+        switchyard_protocol::ReasoningDialect::OpenRouterEnabled => {
+            ReasoningDetailsReplay::ProvenanceBound
+        }
+        _ => ReasoningDetailsReplay::PlaintextOnly,
+    };
+    TranslationPolicy {
+        target_capabilities: TargetCapabilities {
+            requires_list_input: Some(backend.requires_list_input()),
+            ..TargetCapabilities::default()
+        },
+        hosted_reasoning: backend.hosted_reasoning(),
+        reasoning_details_replay,
+        ..TranslationPolicy::default()
+    }
+}
+
+// The `HttpBackendConfig` behind any backend variant.
+fn backend_config(backend: &Backend) -> &crate::backend::HttpBackendConfig {
+    match backend {
+        Backend::OpenAiChat(config)
+        | Backend::OpenAiResponses(config)
+        | Backend::Anthropic(config) => config,
+    }
+}
+
+// The host part of a base URL, used as the human-readable provider name.
+fn url_host(base_url: &str) -> String {
+    let without_scheme = base_url.split_once("://").map_or(base_url, |(_, rest)| rest);
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .to_string()
+}
+
+// A stable, non-secret identifier for one credential domain.
+//
+// This is what "the same account" means for provenance: two targets with the same base URL but
+// different keys are different domains, and a forwarding target is a different domain again
+// because the credential is the caller's, not ours. The key itself never leaves this function.
+fn credential_domain(config: &crate::backend::HttpBackendConfig) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"switchyard.credential-domain.v1\0");
+    hasher.update(config.base_url.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(config.api_key.as_deref().unwrap_or(""));
+    if config.forward_auth {
+        hasher.update(b"\0forwarded");
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+// The identity that would issue opaque reasoning state on this target.
+fn reasoning_issuer(backend: &Backend, model: &ModelId) -> ReasoningIssuer {
+    let config = backend_config(backend);
+    let provider = url_host(&config.base_url);
+    ReasoningIssuer {
+        client: format!("{provider}#{}", credential_domain(config)),
+        model: model.as_str().to_string(),
+        provider,
+        wire: backend.wire_format().to_string(),
+    }
+}
+
+// The lineage facts a request carries about itself.
+//
+// Switchyard has no inbound authentication: `agent_id` and `session_id` are caller-supplied
+// headers and can be forged, so they are recorded as advisory only and never authorise replay.
+// Until a verified caller boundary exists, every production request builds an untrusted lineage,
+// and admission rests on the issuer (credential domain, model, wire) alone.
+fn request_lineage(metadata: Option<&Metadata>) -> ReasoningLineage {
+    ReasoningLineage::untrusted(
+        metadata.and_then(|metadata| metadata.agent_id.clone()),
+        metadata.and_then(|metadata| metadata.session_id.clone()),
+    )
+}
+
+// Message indexes forming the active continuation edge.
+//
+// The most recent assistant turn is what the next call continues, provided nothing but tool
+// results follows it. Its opaque state cannot be dropped without changing the request the
+// provider is being asked to continue; older assistant turns are completed history.
+fn active_message_indexes(request: &LlmRequest) -> BTreeSet<usize> {
+    let mut active = BTreeSet::new();
+    let Some(last_assistant) = request
+        .messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant)
+    else {
+        return active;
+    };
+    if request.messages[last_assistant + 1..]
+        .iter()
+        .all(|message| message.role == Role::Tool)
+    {
+        active.insert(last_assistant);
+    }
+    active
+}
+
+// Resolves, before dispatch, which opaque state in this request this target may replay.
+//
+// This is the one place the registry and a request meet. The encoder is then a pure function of
+// the request and the policy, so the same decision is enforced on the normalised path and on the
+// preserved-body fast path alike.
+fn apply_reasoning_admission(
+    policy: &mut TranslationPolicy,
+    backend: &Backend,
+    model: &ModelId,
+    request: &LlmRequest,
+    metadata: Option<&Metadata>,
+    registry: &ProvenanceRegistry,
+) {
+    // `Verbatim` replays everything by construction, so there is nothing to resolve. Every
+    // other mode needs the active continuation edge identified, because that edge may not be
+    // quietly narrowed: `PlaintextOnly` never admits opaque state, but it still has to refuse
+    // active state rather than strip it.
+    let mode = policy.reasoning_details_replay;
+    if mode == ReasoningDetailsReplay::Verbatim {
+        return;
+    }
+    let issuer = reasoning_issuer(backend, model);
+    let lineage = request_lineage(metadata);
+    let active = active_message_indexes(request);
+    let mut admitted = Vec::new();
+    let mut active_unproven = Vec::new();
+    for (index, message) in request.messages.iter().enumerate() {
+        for block in &message.content {
+            let ContentBlock::Reasoning {
+                details, signature, ..
+            } = block
+            else {
+                continue;
+            };
+            if details.is_empty() && signature.is_none() {
+                continue;
+            }
+            let digest = opaque_digest(details, signature.as_deref());
+            // Only `ProvenanceBound` can admit; `PlaintextOnly` has no notion of proof and
+            // therefore leaves every digest unproven.
+            let proven = mode == ReasoningDetailsReplay::ProvenanceBound
+                && registry
+                    .resolve(&digest)
+                    .is_some_and(|(recorded, recorded_lineage)| {
+                        recorded.permits_replay_to(&issuer)
+                            && recorded_lineage.permits_replay_in(&lineage)
+                    });
+            if proven {
+                admitted.push(digest);
+            } else if active.contains(&index) {
+                active_unproven.push(digest);
+            }
+        }
+    }
+    policy.reasoning_admission = Some(ReasoningAdmission {
+        issuer,
+        admitted,
+        active_unproven,
+    });
+}
+
+// Records, for every opaque state block in a decoded response, which target issued it.
+fn record_reasoning_provenance(
+    response: &AggLlmResponse,
+    backend: &Backend,
+    model: &ModelId,
+    metadata: Option<&Metadata>,
+    registry: &ProvenanceRegistry,
+) {
+    let issuer = reasoning_issuer(backend, model);
+    let mut lineage = request_lineage(metadata);
+    lineage.response = response.id.clone();
+    for output in &response.outputs {
+        for block in &output.content {
+            let ContentBlock::Reasoning {
+                details, signature, ..
+            } = block
+            else {
+                continue;
+            };
+            if details.is_empty() && signature.is_none() {
+                continue;
+            }
+            let digest = opaque_digest(details, signature.as_deref());
+            registry.record(digest, issuer.clone(), lineage.clone());
+        }
+    }
+}
+
+// Records the provenance of a streamed response when the stream ends.
+//
+// The tap folds the same `ResponseAccumulator` the consumer uses, so the details it records are
+// the assembled ones and cannot diverge from what the caller receives.
+fn tap_streamed_provenance(
+    chunks: LlmResponseStream,
+    registry: Arc<ProvenanceRegistry>,
+    issuer: ReasoningIssuer,
+    lineage: ReasoningLineage,
+) -> LlmResponseStream {
+    use switchyard_protocol::stream::ResponseAccumulator;
+
+    let state = (chunks, ResponseAccumulator::new(), registry, issuer, lineage);
+    Box::pin(stream::unfold(state, |state| async move {
+        let (mut chunks, mut accumulator, registry, issuer, mut lineage) = state;
+        match chunks.next().await {
+            Some(Ok(event)) => {
+                for chunk in event.normalized() {
+                    accumulator.push(chunk.clone());
+                }
+                Some((Ok(event), (chunks, accumulator, registry, issuer, lineage)))
+            }
+            Some(Err(error)) => Some((Err(error), (chunks, accumulator, registry, issuer, lineage))),
+            None => {
+                let response = accumulator.finish();
+                lineage.response = response.id.clone();
+                for output in &response.outputs {
+                    for block in &output.content {
+                        let ContentBlock::Reasoning {
+                            details, signature, ..
+                        } = block
+                        else {
+                            continue;
+                        };
+                        if details.is_empty() && signature.is_none() {
+                            continue;
+                        }
+                        registry.record(
+                            opaque_digest(details, signature.as_deref()),
+                            issuer.clone(),
+                            lineage.clone(),
+                        );
+                    }
+                }
+                None
+            }
+        }
+    }))
+}
+
+// The caller's own Responses body, when this request arrived in that format.
+//
+// The decoder records the verbatim request for same-format replay, which is the only place
+// the fields a Chat target cannot carry survive. Without preservation there is nothing to
+// inspect and the guard cannot fire; that is the pre-existing behaviour, and it is why the
+// guard reads what was captured rather than reconstructing a body it never saw.
+fn caller_responses_feature(
+    request: &switchyard_protocol::LlmRequest,
+) -> Option<switchyard_translation::UnsupportedResponsesFeature> {
+    let format: switchyard_translation::FormatId =
+        switchyard_protocol::WireFormat::OpenAiResponses.into();
+    let body = request.preservation.requests.get(&format)?;
+    switchyard_translation::unsupported_feature(body)
 }
 
 // Overwrites the outbound body's `model` field with the resolved model id.
@@ -1581,6 +2301,39 @@ fn apply_reasoning_policy(body: &mut Value, backend: &Backend) {
     }
 }
 
+// Removes a reasoning-effort value the provider is known to refuse.
+//
+// The effort rides under two spellings depending on the wire, so both are inspected: a Chat
+// body carries a flat `reasoning_effort`, a Responses body nests it under `reasoning.effort`.
+// Only the effort key is touched, so an unrelated sibling (`reasoning.summary`, for example)
+// survives; an emptied `reasoning` object is removed rather than left as `{}`.
+fn drop_unsupported_reasoning_effort(body: &mut Value, unsupported: &BTreeSet<String>) {
+    if unsupported.is_empty() {
+        return;
+    }
+    let Value::Object(object) = body else {
+        return;
+    };
+    if let Some(Value::String(effort)) = object.get("reasoning_effort")
+        && unsupported.contains(effort)
+    {
+        object.remove("reasoning_effort");
+    }
+    let emptied = if let Some(Value::Object(reasoning)) = object.get_mut("reasoning") {
+        if let Some(Value::String(effort)) = reasoning.get("effort")
+            && unsupported.contains(effort)
+        {
+            reasoning.remove("effort");
+        }
+        reasoning.is_empty()
+    } else {
+        false
+    };
+    if emptied {
+        object.remove("reasoning");
+    }
+}
+
 // Applies target defaults without overriding fields supplied by the caller.
 fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     let Value::Object(object) = body else {
@@ -1797,18 +2550,78 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
     use std::io::{Read, Write};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
     use serde_json::json;
-    use switchyard_protocol::{completion_text, text_request};
+    use switchyard_protocol::{
+        ContentBlock, LlmResponseChunk, Message, PreservationMetadata, ProviderExtensions,
+        ResponseOutput, Usage, completion_text, text_request,
+    };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::backend::HttpBackendConfig;
     use switchyard_protocol::{ReasoningDialect, ReasoningPolicy};
+
+    /// Google's two 429s must not be collapsed: one clears, the other waits for the day.
+    #[test]
+    fn a_google_daily_quota_is_not_retried_but_its_window_throttle_is() {
+        let error = |status: u16, body: &str| LlmClientError::UpstreamHttp {
+            status: StatusCode::from_u16(status).expect("status"),
+            body: body.to_string(),
+        };
+
+        let throttle = error(
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow"}}"#,
+        );
+        assert!(is_transient_failure(&throttle));
+        assert!(!is_account_wide_quota(&throttle));
+
+        // An unscoped daily quota retires the model that reported it. It is NOT account
+        // wide: this project allocates RPD per model, so its siblings still have budget.
+        let quota = error(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily"}}"#,
+        );
+        assert!(!is_transient_failure(&quota));
+        assert!(!is_account_wide_quota(&quota));
+
+        // Only a scope the body positively identifies as project-wide stops the pool.
+        let project_wide = error(
+            429,
+            r#"{"error":{"code":"quota_exceeded","message":"daily","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+                  {"quotaId":"GenerateRequestsPerDayPerProject-FreeTier"}]}]}}"#,
+        );
+        assert!(!is_transient_failure(&project_wide));
+        assert!(is_account_wide_quota(&project_wide));
+
+        // A daily quota is still a daily quota when it arrives behind a 5xx: the code, not
+        // the status, says the allowance is spent, so no retry may follow it.
+        let quota_behind_5xx = error(
+            503,
+            r#"{"error":{"code":"quota_exceeded","message":"daily quota"}}"#,
+        );
+        assert!(!is_transient_failure(&quota_behind_5xx));
+        assert!(!is_account_wide_quota(&quota_behind_5xx));
+
+        // A content block is a 400 that must not be resent, and it is not a quota.
+        let blocked = error(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert!(!is_transient_failure(&blocked));
+        assert!(!is_account_wide_quota(&blocked));
+
+        // The other providers' contracts are untouched by the Google decoder.
+        let openrouter = error(
+            429,
+            r#"{"error":{"code":402,"message":"credits","metadata":{"limit_source":"openrouter_free_tier_daily"}}}"#,
+        );
+        assert!(!is_transient_failure(&openrouter));
+        assert!(is_account_wide_quota(&openrouter));
+    }
 
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
@@ -1818,6 +2631,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
             reasoning_effort: None,
             reasoning_policy: None,
             reasoning_dialect: ReasoningDialect::default(),
@@ -1828,6 +2642,9 @@ mod tests {
             attempt_timeout: None,
             stream_idle_timeout: None,
             requires_list_input: false,
+            allowance: None,
+            pacing: None,
+            hosted_reasoning: None,
         }
     }
 
@@ -1924,6 +2741,13 @@ mod tests {
         )]
     }
 
+    // A chat backend whose upstream writes its reasoning inline behind a marker.
+    fn chat_map_with_hosted_reasoning(base_url: &str) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.hosted_reasoning = Some(switchyard_translation::HostedReasoningMarker::ThoughtTag);
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
     fn chat_map_with_extra_body(
         base_url: &str,
         extra_body: BTreeMap<String, Value>,
@@ -1940,6 +2764,57 @@ mod tests {
         let mut backend = config(base_url);
         backend.omit_body_fields = omit_body_fields;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn chat_map_with_unsupported_effort(
+        base_url: &str,
+        unsupported: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.unsupported_reasoning_effort = unsupported;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn responses_map_with_unsupported_effort(
+        base_url: &str,
+        unsupported: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.unsupported_reasoning_effort = unsupported;
+        vec![ModelConfig::new(
+            "gpt",
+            Backend::OpenAiResponses(backend),
+            None,
+        )]
+    }
+
+    // Opaque reasoning state follows the dialect, not the format: only the OpenRouter wire may
+    // be given back `reasoning_details`, and even then only state this exact target was proven
+    // to have issued. A native target is narrowed so it can never receive another provider's
+    // signed blob, and the default (ProvenanceBound) is never what a real target resolves to by
+    // accident.
+    #[test]
+    fn replay_policy_follows_the_target_dialect() {
+        let mut base = config("http://stub");
+        base.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+        assert_eq!(
+            translation_policy(&Backend::OpenAiChat(base.clone())).reasoning_details_replay,
+            switchyard_translation::ReasoningDetailsReplay::ProvenanceBound,
+            "the issuing wire may replay only state it can prove it issued"
+        );
+        for dialect in [
+            ReasoningDialect::OpenAiEffort,
+            ReasoningDialect::LlamaCppEnableThinking,
+            ReasoningDialect::Unspecified,
+        ] {
+            let mut narrowed = base.clone();
+            narrowed.reasoning_dialect = dialect;
+            assert_eq!(
+                translation_policy(&Backend::OpenAiChat(narrowed)).reasoning_details_replay,
+                switchyard_translation::ReasoningDetailsReplay::PlaintextOnly,
+                "{dialect:?} must not replay opaque provider state"
+            );
+        }
     }
 
     fn chat_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {
@@ -2320,6 +3195,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_responses_only_feature_is_refused_before_egress()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // A caller posts /responses with a hosted search tool at a Chat target. The decoder
+        // drops the tool, so forwarding the rest would answer from memory and present that as
+        // the requested search. Nothing may reach the provider instead.
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "answer",
+                    "model": "gemini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "no search happened"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gemini",
+            Backend::OpenAiChat(config(&format!("{}/v1", server.uri()))),
+            None,
+        )])?;
+        let body = json!({
+            "model": "gemini",
+            "input": "what closed higher yesterday?",
+            "tools": [{"type": "web_search"}]
+        });
+
+        let refused = client
+            .call_rewrite_model_raw(
+                body,
+                None,
+                Some(&ModelId::from("gemini".to_string())),
+                WireFormat::OpenAiResponses,
+            )
+            .await;
+        let Err(error) = refused else {
+            panic!("a hosted tool at a Chat target must not be served");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("web_search"),
+            "the refusal must name the feature: {message}"
+        );
+        assert!(
+            message.contains("openai_responses"),
+            "and the way to serve it: {message}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the refusal must happen before any upstream request"
+        );
+
+        // Control: the same request without the hosted tool is served, so the guard refuses
+        // the feature rather than the endpoint.
+        let served = client
+            .call_rewrite_model_raw(
+                json!({"model": "gemini", "input": "hello"}),
+                None,
+                Some(&ModelId::from("gemini".to_string())),
+                WireFormat::OpenAiResponses,
+            )
+            .await?;
+        assert!(matches!(served, RawResponse::Buffered(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_overloaded_google_model_rests_without_being_replayed()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The measured shape Google sent for the 31B while it was starting: a list-wrapped
+        // 503 whose own status word is UNAVAILABLE. It must be neither replayed nor left
+        // available for the next caller, and its sibling must be untouched by either fact.
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&calls);
+        const UNAVAILABLE: &str = r#"[{"error":{"code":503,"message":"The model is overloaded.","status":"UNAVAILABLE"}}]"#;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                observed.lock().expect("call log").push(model.clone());
+                if model == "large" {
+                    ResponseTemplate::new(503).set_body_string(UNAVAILABLE)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "answer",
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        // The 31B's production configuration: a five-minute cooldown, no group, and a retry
+        // budget that would be spent if the condition did not forbid a replay.
+        let large = {
+            let mut backend = config(&format!("{}/v1", server.uri()));
+            backend.failure_cooldown = Duration::from_secs(300);
+            backend.max_retries = 2;
+            Backend::OpenAiChat(backend)
+        };
+        let small = {
+            let mut backend = config(&format!("{}/v1", server.uri()));
+            backend.failure_cooldown = Duration::from_secs(5);
+            backend.max_retries = 2;
+            Backend::OpenAiChat(backend)
+        };
+        let client = TranslatingLlmClient::new(&[
+            ModelConfig::new("large", large, None),
+            ModelConfig::new("small", small, None),
+        ])?;
+        let name = |model: &str| ModelId::from(model.to_string());
+
+        // First call: the overloaded model answers 503 once and is not replayed, even though
+        // three attempts were authorised.
+        let first = client
+            .call_rewrite_model(request_for(Some("large"), false), Some(&name("large")))
+            .await;
+        assert!(
+            matches!(
+                first,
+                Err(LlmClientError::UpstreamHttp {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ..
+                })
+            ),
+            "the caller sees the provider's own 503"
+        );
+        assert_eq!(
+            std::mem::take(&mut *calls.lock().expect("call log")),
+            ["large"],
+            "an UNAVAILABLE model must not be asked again inside the call"
+        );
+
+        // Second call: the cooldown is armed even though the failure was not retryable, so no
+        // request reaches the provider at all.
+        let second = client
+            .call_rewrite_model(request_for(Some("large"), false), Some(&name("large")))
+            .await;
+        assert!(
+            matches!(second, Err(LlmClientError::TemporarilyUnavailable)),
+            "a resting model answers without a provider call"
+        );
+        assert!(
+            calls.lock().expect("call log").is_empty(),
+            "the cooldown must arm on an unretryable capacity failure"
+        );
+
+        // The sibling is unaffected: the capacity fact was the large model's, and it was not
+        // declared as a shared pool.
+        let third = client
+            .call_rewrite_model(request_for(Some("small"), false), Some(&name("small")))
+            .await?;
+        assert_eq!(
+            third
+                .llm_response
+                .into_agg()
+                .await
+                .map(|agg| completion_text(&agg))?,
+            "ok"
+        );
+        assert_eq!(
+            std::mem::take(&mut *calls.lock().expect("call log")),
+            ["small"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_model_that_needs_resting_is_rested() {
+        let call = |status: u16, body: &str| LlmClientError::UpstreamHttp {
+            status: StatusCode::from_u16(status).expect("status"),
+            body: body.to_string(),
+        };
+        // Capacity: rest, do not replay.
+        let overloaded = call(
+            503,
+            r#"[{"error":{"code":503,"message":"overloaded","status":"UNAVAILABLE"}}]"#,
+        );
+        assert!(rests_the_model(&overloaded));
+        assert!(!is_transient_failure(&overloaded));
+        // A request fault says nothing about the model's health.
+        let blocked = call(400, r#"{"error":{"code":"safety","message":"blocked"}}"#);
+        assert!(!rests_the_model(&blocked));
+        // A credential fault is the operator's, and resting the model would hide it.
+        let denied = call(
+            403,
+            r#"{"error":{"code":"permission_denied","message":"no"}}"#,
+        );
+        assert!(!rests_the_model(&denied));
+        // An ordinary transport failure is retryable and therefore rests, as before.
+        let transport = LlmClientError::Transport {
+            source: Box::new(std::io::Error::other("reset")),
+        };
+        assert!(rests_the_model(&transport));
+    }
+
+    #[tokio::test]
+    async fn buffered_hosted_reasoning_never_reaches_the_caller()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // The upstream writes its chain of thought into `content`. A backend that declares
+        // the marker must hand the caller only the answer.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "model": "gemma",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "<thought>plan</thought>\n\nready"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 71}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+
+        assert_eq!(completion_text(&agg), "ready");
+        // Not merely out of the answer: the monologue must not survive in ANY block, because a
+        // reasoning block is re-encoded as `reasoning_content` and would reach the caller
+        // through that second field.
+        let output = agg.first_output().expect("one output item");
+        assert!(
+            !output
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Reasoning { .. })),
+            "a declared hosted marker must not leave a reasoning block: {:?}",
+            output.content
+        );
+        assert!(
+            !format!("{:?}", output.content).contains("plan"),
+            "the thought must not survive in any block: {:?}",
+            output.content
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_hosted_reasoning_never_reaches_the_caller()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<thou\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"ght>plan</thought>\\n\\nready\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+
+        assert_eq!(completion_text(&agg), "ready");
+        assert!(
+            !format!("{:?}", agg.first_output().map(|o| &o.content)).contains("plan"),
+            "the streamed thought must not survive in any block"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn invalid_json_is_a_response_translation_error()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
@@ -2490,6 +3669,265 @@ mod tests {
             )
             .await?;
         // The body_partial_json matcher asserts the upstream saw model "gpt".
+        Ok(())
+    }
+
+    /// Measured 2026-11-21 against hosted Gemma 4 26B through `smart-nt`: an output budget
+    /// went entirely to inline `<thought>` reasoning, so the reply was `completion_tokens: 0`
+    /// with no content and `finish_reason: length` while the wire said 200. The route returned
+    /// that empty body to the caller even though a sibling candidate could answer. An empty
+    /// answer is not a served request: it must advance.
+    ///
+    /// Replayed against a target that does *not* declare inline reasoning. That is the older
+    /// classification and it must not move: without a declaration, a token total above input
+    /// plus output is a provider accounting quirk, not evidence of hidden thinking. The
+    /// declared-reasoning case is the test that follows.
+    #[tokio::test]
+    async fn a_reply_that_spent_its_budget_on_reasoning_advances_rather_than_returning_empty()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 225, "completion_tokens": 0, "total_tokens": 1123}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(900);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("an empty answer must not be reported as a successful call");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        // The route may advance, but this call must not resend the same budget: the same
+        // model produces the same non-answer, so a retry only spends the window again.
+        assert!(
+            !is_transient_failure(&error),
+            "an empty answer must advance, not retry in place"
+        );
+        Ok(())
+    }
+
+    /// The measured Gemma shape, replayed against a target that *does* declare inline
+    /// reasoning: `completion_tokens: 0`, no content, and a total that exceeds prompt plus
+    /// completion. The difference is a fact the deployment did not have before — the model
+    /// produced tokens, they were thinking, and the caller's reservation was too small to
+    /// hold both. `empty_answer_zero_completion` would blame the leg; this says what happened.
+    #[tokio::test]
+    async fn a_thought_only_reply_on_a_hosted_reasoning_target_is_named_rather_than_blamed()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                // 438 prompt + 0 counted completion + 61 of thinking = 499, the measured
+                // 64-token-reservation row.
+                "usage": {"prompt_tokens": 438, "completion_tokens": 0, "total_tokens": 499}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_thinking_only");
+        // Same advance-not-retry rule as any empty answer: nothing about the next attempt on
+        // this budget changes the fact that the thinking alone filled it.
+        assert!(!is_transient_failure(&error));
+        Ok(())
+    }
+
+    /// A hosted-reasoning target that reports no totals has told us nothing about what it
+    /// produced. The invisible-token count must come from the provider's own numbers, so this
+    /// keeps the quieter classification rather than inventing thinking out of a missing field.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_without_totals_keeps_the_quieter_classification()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        Ok(())
+    }
+
+    /// The declaration alone must not be enough: a target that hides reasoning still has to
+    /// show spare tokens in its own totals. Here prompt plus completion accounts for the
+    /// whole total, so nothing was produced off the books and the reply is simply empty.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_whose_totals_account_for_every_token_is_not_thinking()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(64);
+
+        let error = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await
+            .err()
+            .expect("a reply with no visible answer must not be reported as a success");
+
+        let LlmClientError::EmptyAnswer { reason, .. } = &error else {
+            panic!("expected EmptyAnswer, got {error:?}");
+        };
+        assert_eq!(*reason, "empty_answer_zero_completion");
+        Ok(())
+    }
+
+    /// A hosted-reasoning target that does answer is a success, thinking or not. The new
+    /// classification must not start refusing replies that carry visible text.
+    #[tokio::test]
+    async fn a_hosted_reasoning_target_that_answers_is_still_a_success()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "<thought>two plus two</thought>four"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 438, "completion_tokens": 32, "total_tokens": 675}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_hosted_reasoning(&format!(
+            "{}/v1",
+            server.uri()
+        )))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(512);
+
+        let response = client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
+        assert!(
+            completion_text(&agg).contains("four"),
+            "the visible answer must survive: {:?}",
+            agg.outputs
+        );
+        Ok(())
+    }
+
+    /// The one caller that legitimately wants no output asks for zero tokens. Refusing that
+    /// as a failure would turn a deliberate probe into an error.
+    #[tokio::test]
+    async fn a_caller_that_asks_for_zero_output_is_not_an_empty_answer()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let mut request = request_for(Some("gpt"), false);
+        request.llm_request.output.max_output_tokens = Some(0);
+
+        client
+            .call_rewrite_model(request, Some(&ModelId::from("gpt")))
+            .await?;
         Ok(())
     }
 
@@ -2808,6 +4246,150 @@ mod tests {
                 None,
                 Some(&ModelId::from("gpt")),
                 WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // Google's OpenAI-compatibility surface answers HTTP 400 to `reasoning_effort: "none"`
+    // while accepting the graded values, and a no-thinking caller sends exactly `none`.
+    // The declared refusal is what keeps that caller's request from becoming a 400.
+    #[tokio::test]
+    async fn a_refused_effort_value_is_never_sent_on_the_chat_wire()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                body.get("reasoning_effort").is_none()
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none"
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // The refusal is a value list, not a switch: a graded effort the provider accepts still
+    // reaches the wire, so declaring `none` unsupported does not silently disable control.
+    #[tokio::test]
+    async fn an_accepted_effort_value_still_reaches_the_chat_wire()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "reasoning_effort": "high"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // A Responses body nests the effort under `reasoning`, beside fields the caller may have
+    // set. Only the refused `effort` key is removed; an unrelated sibling such as `summary`
+    // survives, and `reasoning` is not left behind as an empty object.
+    #[tokio::test]
+    async fn a_refused_effort_value_is_dropped_without_disturbing_its_siblings()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let reasoning = body.get("reasoning");
+                reasoning.and_then(|value| value.get("effort")).is_none()
+                    && reasoning.and_then(|value| value.get("summary")) == Some(&json!("auto"))
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map_with_unsupported_effort(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["none".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "input": "hi",
+            "reasoning": {"effort": "none", "summary": "auto"}
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiResponses,
             )
             .await?;
         Ok(())
@@ -3589,6 +5171,91 @@ mod tests {
         assert!(!context_window.is_retryable());
     }
 
+    /// A quota-limited leaf may not turn one bad response into four reservations.
+    ///
+    /// The two axes are deliberately separate. `is_retryable` still says a 429 or a 503
+    /// is the kind of failure that can clear, because the route uses that answer to
+    /// decide whether an eligible sibling is worth trying. `retry_budget_allows` says
+    /// whether *this* target may spend another reservation, because on a target with a
+    /// daily allowance each attempt charges the budget before the provider is called and
+    /// nothing refunds it.
+    ///
+    /// The first half of each case pins the class answer, so a change that quietly makes
+    /// 429s non-retryable everywhere fails here rather than passing as a tightened budget.
+    #[test]
+    fn a_quota_limited_leaf_retries_a_throttle_zero_times_and_a_5xx_once() {
+        let with_status = |status: StatusCode, body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status,
+                body: body.to_string(),
+            },
+            status: Some(status),
+            retry_after: None,
+        };
+        let transport = AttemptFailure {
+            error: LlmClientError::Transport {
+                source: std::io::Error::other("disconnected").into(),
+            },
+            status: None,
+            retry_after: None,
+        };
+
+        // Unmarked 429 and provider-pool 429 are both retryable classes, and neither may
+        // spend a second reservation on the same free target.
+        for body in [
+            "{}",
+            r#"{"error":{"code":429,"metadata":{"limit_source":"upstream_provider_shared_pool"}}}"#,
+        ] {
+            let throttle = with_status(StatusCode::TOO_MANY_REQUESTS, body);
+            assert!(throttle.is_retryable(), "{body} is still a throttle class");
+            for attempt in 0..4 {
+                assert!(
+                    !throttle.may_retry(attempt, 2, true),
+                    "429 at attempt {attempt} must not reserve again on a free leaf"
+                );
+            }
+        }
+
+        // Transient infrastructure: exactly one further attempt, whatever the configured
+        // budget says, so the worst case is two reservations rather than four.
+        for transient in [
+            with_status(StatusCode::INTERNAL_SERVER_ERROR, ""),
+            with_status(StatusCode::SERVICE_UNAVAILABLE, ""),
+            with_status(StatusCode::BAD_GATEWAY, ""),
+            transport,
+        ] {
+            assert!(transient.is_retryable());
+            assert!(
+                transient.may_retry(0, 2, true),
+                "the first attempt may still try once more"
+            );
+            for attempt in 1..4 {
+                assert!(
+                    !transient.may_retry(attempt, 2, true),
+                    "attempt {attempt} must be terminal on a free leaf"
+                );
+            }
+        }
+
+        // A non-retryable class stays non-retryable; the budget must not resurrect it.
+        let unauthorized = with_status(StatusCode::UNAUTHORIZED, "");
+        assert!(!unauthorized.may_retry(0, 2, true));
+        assert!(!unauthorized.may_retry(0, 2, false));
+
+        // Control: a lane with no daily allowance keeps today's configured behaviour
+        // exactly, so a paid request that 429s still gets both retries.
+        let throttle = with_status(StatusCode::TOO_MANY_REQUESTS, "{}");
+        assert!(throttle.may_retry(0, 2, false));
+        assert!(throttle.may_retry(1, 2, false));
+        assert!(
+            !throttle.may_retry(2, 2, false),
+            "the configured budget still bounds an unmetered lane"
+        );
+        // A lane configured with zero retries retries nothing, metered or not.
+        assert!(!throttle.may_retry(0, 0, false));
+        assert!(!throttle.may_retry(0, 0, true));
+    }
+
     /// A 5xx that masks a permanent auth or billing failure is not infrastructure.
     ///
     /// OpenRouter reports `authentication`, `permission_denied` and `payment_required`
@@ -4111,6 +5778,57 @@ mod tests {
                 "a genuine rate limit must keep its retries: {body}"
             );
         }
+    }
+
+    /// The free-model daily allowance, when OpenRouter omits its usual marker.
+    ///
+    /// Measured 2026-11-19 against this deployment's own credential: a request for
+    /// `openrouter/free` answered
+    /// `{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit
+    /// exceeded: free-models-per-day-high-balance. "}}` — a plain 429 carrying no
+    /// `metadata` at all. The key was paid tier with credit remaining, so the only
+    /// resource that sentence can name is the per-credential free-model allowance every
+    /// free model on it shares. Without recognizing it the request walks the rest of the
+    /// ladder, spending one refused call per rung against an allowance already at zero.
+    ///
+    /// The control is the per-minute spelling of the same sentence: that is a genuine
+    /// throttle and must keep its retries, so the match cannot be "rate limit exceeded".
+    #[test]
+    fn an_unmarked_free_model_daily_cap_is_account_wide_but_a_per_minute_throttle_retries() {
+        let failure = |body: &str| AttemptFailure {
+            error: LlmClientError::UpstreamHttp {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: body.to_string(),
+            },
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            retry_after: None,
+        };
+
+        // The recorded body, trimmed only of the provider's trailing space.
+        let measured = failure(
+            r#"{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit exceeded: free-models-per-day-high-balance."}}"#,
+        );
+        assert!(
+            is_account_wide_quota(&measured.error),
+            "the free-model daily allowance is shared by every candidate on the credential"
+        );
+        assert!(
+            !measured.is_retryable(),
+            "a daily allowance cannot clear on the next attempt"
+        );
+
+        // A throttle on the same status keeps recovering.
+        let per_minute = failure(
+            r#"{"error":{"code":"upstream_error","type":"upstream_error","message":"Rate limit exceeded: free-models-per-min."}}"#,
+        );
+        assert!(
+            !is_account_wide_quota(&per_minute.error),
+            "a per-minute throttle is not the daily allowance"
+        );
+        assert!(
+            per_minute.is_retryable(),
+            "a per-minute throttle must keep its retries"
+        );
     }
 
     #[test]
@@ -4744,4 +6462,441 @@ mod tests {
             .await?;
         Ok(())
     }
+
+    // -------------------------------------------------------------------------------------
+    // Provenance at the dispatch layer.
+    //
+    // The encoder tests prove what happens once a policy carries an admission. These prove the
+    // runner produces that admission from the registry, the request's own lineage and the
+    // target's canonical identity -- and that the active continuation edge is what decides
+    // between "strip" and "refuse".
+    // -------------------------------------------------------------------------------------
+
+    fn reasoning_details() -> Value {
+        json!([
+            {"type": "reasoning.text", "text": "consider wavelengths", "index": 0},
+            {"type": "reasoning.encrypted", "data": "opaque-blob-7f3a", "index": 0,
+             "signature": "sig-issuer-only"}
+        ])
+    }
+
+    fn reasoning_digest() -> String {
+        let details = reasoning_details();
+        opaque_digest(
+            details.as_array().expect("array"),
+            Some("sig-issuer-only"),
+        )
+    }
+
+    fn reasoning_message() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Reasoning {
+                text: "consider wavelengths".to_string(),
+                signature: Some("sig-issuer-only".to_string()),
+                details: reasoning_details().as_array().expect("array").clone(),
+            }],
+        }
+    }
+
+    fn metadatum(agent: Option<&str>, session: Option<&str>) -> Metadata {
+        Metadata {
+            agent_id: agent.map(ToOwned::to_owned),
+            session_id: session.map(ToOwned::to_owned),
+            ..Metadata::default()
+        }
+    }
+
+    fn backend_with_key(base_url: &str, api_key: &str) -> Backend {
+        let mut config = config(base_url);
+        config.api_key = Some(api_key.to_string());
+        Backend::OpenAiChat(config)
+    }
+
+    fn openrouter_backend() -> Backend {
+        let mut backend = backend_with_key("https://openrouter.ai/api/v1", "key-a");
+        if let Backend::OpenAiChat(config) = &mut backend {
+            config.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+        }
+        backend
+    }
+
+    fn model() -> ModelId {
+        ModelId::from("deepseek/deepseek-v4.1-flash-1017")
+    }
+
+    // Two accounts on one wire are two issuers: the credential is part of the identity even
+    // though the base URL is not. The key itself must never appear in the identifier.
+    #[test]
+    fn credential_domain_separates_accounts_on_the_same_wire() {
+        let first = backend_with_key("https://openrouter.ai/api/v1", "key-a");
+        let second = backend_with_key("https://openrouter.ai/api/v1", "key-b");
+        assert_ne!(
+            credential_domain(backend_config(&first)),
+            credential_domain(backend_config(&second)),
+            "two keys on one base URL are two credential domains"
+        );
+
+        let repeat = backend_with_key("https://openrouter.ai/api/v1", "key-a");
+        assert_eq!(
+            credential_domain(backend_config(&first)),
+            credential_domain(backend_config(&repeat)),
+            "the same key and URL are the same domain"
+        );
+
+        // A different endpoint on the same provider is also a different domain.
+        let other_host = backend_with_key("https://api.deepseek.com/v1", "key-a");
+        assert_ne!(
+            credential_domain(backend_config(&first)),
+            credential_domain(backend_config(&other_host))
+        );
+
+        let issuer = reasoning_issuer(&first, &model());
+        assert!(
+            !issuer.client.contains("key-a") && !issuer.client.contains("key-b"),
+            "the identifier must not carry the credential: {}",
+            issuer.client
+        );
+        assert!(
+            issuer.client.starts_with("openrouter.ai#"),
+            "the identifier names the endpoint then the domain: {}",
+            issuer.client
+        );
+    }
+
+    // A blob recorded from this exact target is admitted when the request is dispatched back to
+    // that same issuer. The issuer (credential domain, model, wire) is the whole of the proof;
+    // no caller-supplied header participates.
+    #[test]
+    fn admission_admits_state_this_issuer_recorded() {
+        let backend = openrouter_backend();
+        let registry = ProvenanceRegistry::default();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+
+        // Record by decoding a response that carries the state.
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "consider wavelengths".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &backend, &model(), Some(&metadata), &registry);
+
+        let request = LlmRequest {
+            messages: vec![Message::text(Role::User, "hi"), reasoning_message()],
+            ..LlmRequest::default()
+        };
+        let mut policy = translation_policy(&backend);
+        apply_reasoning_admission(
+            &mut policy,
+            &backend,
+            &model(),
+            &request,
+            Some(&metadata),
+            &registry,
+        );
+        let admission = policy.reasoning_admission.expect("provenance-bound sets one");
+        assert!(
+            admission.admits(&reasoning_digest()),
+            "state this target issued is replayable to the same issuer"
+        );
+        assert!(admission.active_unproven.is_empty());
+    }
+
+    // Ingress-to-egress trust boundary. Switchyard has no inbound authentication, so `agent_id`
+    // and `session_id` are advisory headers a caller can forge. A consumer or conversation that
+    // differs only in those headers must NOT change the admission decision: the state is still
+    // admitted to the same issuer, because the issuer check is the only trustworthy fact. This is
+    // the regression that fails if header matching is (re)introduced as if it were auth.
+    #[test]
+    fn advisory_headers_do_not_change_admission() {
+        let backend = openrouter_backend();
+        let registry = ProvenanceRegistry::default();
+        let recorded = metadatum(Some("agent-7"), Some("conv-1"));
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "consider wavelengths".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &backend, &model(), Some(&recorded), &registry);
+
+        let request = LlmRequest {
+            messages: vec![Message::text(Role::User, "hi"), reasoning_message()],
+            ..LlmRequest::default()
+        };
+
+        // Same bytes, same issuer, but every caller-supplied identity is different or absent.
+        for (label, metadata) in [
+            ("a spoofed consumer", metadatum(Some("attacker"), Some("conv-1"))),
+            ("another conversation", metadatum(Some("agent-7"), Some("conv-2"))),
+            ("absent ids", metadatum(None, None)),
+        ] {
+            let mut policy = translation_policy(&backend);
+            apply_reasoning_admission(
+                &mut policy,
+                &backend,
+                &model(),
+                &request,
+                Some(&metadata),
+                &registry,
+            );
+            let admission = policy.reasoning_admission.expect("admission");
+            assert!(
+                admission.admits(&reasoning_digest()),
+                "{label} must not change the decision: the issuer is the only trusted fact"
+            );
+        }
+    }
+
+    // The same opaque bytes on a different issuer (another account or another native model) are
+    // refused even though the caller-supplied conversation is identical. This is the
+    // "same digest, different scope" case: identity comes from the credential and the model, not
+    // from anything the caller sends.
+    #[test]
+    fn same_digest_on_another_issuer_is_refused() {
+        let registry = ProvenanceRegistry::default();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+        let issuer = openrouter_backend();
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "consider wavelengths".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &issuer, &model(), Some(&metadata), &registry);
+
+        let request = LlmRequest {
+            messages: vec![Message::text(Role::User, "hi"), reasoning_message()],
+            ..LlmRequest::default()
+        };
+
+        let other_account = {
+            let mut backend = backend_with_key("https://openrouter.ai/api/v1", "key-b");
+            if let Backend::OpenAiChat(config) = &mut backend {
+                config.reasoning_dialect = ReasoningDialect::OpenRouterEnabled;
+            }
+            backend
+        };
+        let other_model = ModelId::from("deepseek/deepseek-v4-pro");
+
+        for (label, backend, target) in [
+            ("another account", &other_account, model()),
+            ("another model", &issuer, other_model),
+        ] {
+            let mut policy = translation_policy(backend);
+            apply_reasoning_admission(
+                &mut policy,
+                backend,
+                &target,
+                &request,
+                Some(&metadata),
+                &registry,
+            );
+            let admission = policy.reasoning_admission.expect("admission");
+            assert!(
+                !admission.admits(&reasoning_digest()),
+                "{label} must not replay another issuer's state"
+            );
+            assert!(
+                admission.refuses(&reasoning_digest()),
+                "{label} lands on the active edge as required-and-unproven"
+            );
+        }
+    }
+
+    // Lineage for the response id is recorded too, so the fact is available rather than merely
+    // implied: the recorded entry carries the provider response id it arrived with.
+    #[test]
+    fn recorded_lineage_carries_the_provider_response_id() {
+        let backend = openrouter_backend();
+        let registry = ProvenanceRegistry::default();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+        let response = AggLlmResponse {
+            id: Some("resp-9".to_string()),
+            model: None,
+            outputs: vec![ResponseOutput {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Reasoning {
+                    text: "t".to_string(),
+                    signature: Some("sig-issuer-only".to_string()),
+                    details: reasoning_details().as_array().expect("array").clone(),
+                }],
+                url_citations: Vec::new(),
+                stop_reason: None,
+            }],
+            usage: Usage::default(),
+            extensions: ProviderExtensions::default(),
+            preservation: PreservationMetadata::default(),
+        };
+        record_reasoning_provenance(&response, &backend, &model(), Some(&metadata), &registry);
+
+        let (recorded, lineage) = registry
+            .resolve(&reasoning_digest())
+            .expect("the decoded state is recorded");
+        assert_eq!(lineage.advisory_consumer(), Some("agent-7"));
+        assert_eq!(lineage.advisory_conversation(), Some("conv-1"));
+        assert_eq!(lineage.response.as_deref(), Some("resp-9"));
+        assert_eq!(recorded, reasoning_issuer(&backend, &model()));
+    }
+
+    // Tool lineage decides the edge: the assistant turn that issued the state is active while
+    // only tool results follow it, and becomes completed history once a user turn follows.
+    #[test]
+    fn active_edge_follows_tool_lineage() {
+        let tool_result = Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::Text {
+                text: "port = 8080".to_string(),
+            }],
+        };
+        let user_turn = Message::text(Role::User, "and now?");
+
+        let in_flight = LlmRequest {
+            messages: vec![
+                Message::text(Role::User, "read the config"),
+                reasoning_message(),
+                tool_result.clone(),
+            ],
+            ..LlmRequest::default()
+        };
+        assert_eq!(
+            active_message_indexes(&in_flight),
+            BTreeSet::from([1]),
+            "an assistant turn followed only by tool results is the continuation"
+        );
+
+        let completed = LlmRequest {
+            messages: vec![
+                Message::text(Role::User, "read the config"),
+                reasoning_message(),
+                tool_result,
+                user_turn,
+            ],
+            ..LlmRequest::default()
+        };
+        assert!(
+            active_message_indexes(&completed).is_empty(),
+            "once a user turn follows, the assistant turn is completed history"
+        );
+    }
+
+    // The native path is marked too: `PlaintextOnly` may never replay, but required active state
+    // is pinned as unproven so the encoder refuses instead of stripping it.
+    #[test]
+    fn plaintext_only_runner_marks_active_state_as_required() {
+        let backend = backend_with_key("https://api.deepseek.com/v1", "key-a");
+        let registry = ProvenanceRegistry::default();
+        let request = LlmRequest {
+            messages: vec![
+                Message::text(Role::User, "read the config"),
+                reasoning_message(),
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentBlock::Text {
+                        text: "port = 8080".to_string(),
+                    }],
+                },
+            ],
+            ..LlmRequest::default()
+        };
+
+        let mut policy = translation_policy(&backend);
+        assert_eq!(
+            policy.reasoning_details_replay,
+            ReasoningDetailsReplay::PlaintextOnly,
+            "a native dialect has no structured reasoning wire"
+        );
+        apply_reasoning_admission(&mut policy, &backend, &model(), &request, None, &registry);
+        let admission = policy.reasoning_admission.expect("native paths are marked too");
+        assert!(
+            admission.refuses(&reasoning_digest()),
+            "required active state is refused rather than silently stripped"
+        );
+        assert!(
+            admission.admitted.is_empty(),
+            "a native wire can never admit opaque state"
+        );
+    }
+
+    // Streaming: the tap folds the same accumulator the consumer receives, so what is recorded
+    // is the assembled state, not a partial frame.
+    #[tokio::test]
+    async fn streamed_reasoning_is_recorded_from_the_assembled_response() {
+        let registry = Arc::new(ProvenanceRegistry::default());
+        let backend = openrouter_backend();
+        let metadata = metadatum(Some("agent-7"), Some("conv-1"));
+
+        // The details arrive as a stream delta, exactly as a provider sends them: the
+        // accumulator is what turns them into the assembled block the caller receives.
+        let details = reasoning_details().as_array().expect("array").clone();
+        let events: Vec<std::result::Result<LlmResponseStreamEvent, LlmClientError>> = vec![
+            Ok(LlmResponseStreamEvent::from(
+                LlmResponseChunk::MessageStart {
+                    id: Some("resp-9".to_string()),
+                    model: None,
+                },
+            )),
+            Ok(LlmResponseStreamEvent::from(
+                LlmResponseChunk::ReasoningDetailsDelta {
+                    index: 0,
+                    details,
+                    text: "consider wavelengths".to_string(),
+                },
+            )),
+        ];
+        let stream: LlmResponseStream = Box::pin(stream::iter(events));
+
+        let tapped = tap_streamed_provenance(
+            stream,
+            Arc::clone(&registry),
+            reasoning_issuer(&backend, &model()),
+            request_lineage(Some(&metadata)),
+        );
+        let drained: Vec<_> = tapped.collect().await;
+        assert!(
+            drained.iter().all(|event| event.is_ok()),
+            "the tap must not alter the stream"
+        );
+
+        let (recorded, lineage) = registry
+            .resolve(&reasoning_digest())
+            .expect("streamed state is recorded once the stream completes");
+        assert_eq!(recorded, reasoning_issuer(&backend, &model()));
+        assert_eq!(lineage.advisory_consumer(), Some("agent-7"));
+    }
+
 }

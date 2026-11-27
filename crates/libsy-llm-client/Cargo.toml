@@ -28,10 +28,15 @@ opentelemetry = { version = "0.32", default-features = false, features = ["metri
 parking_lot.workspace = true
 http.workspace = true
 httpdate.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+tokio-tungstenite = { version = "=0.20.1", default-features = false, features = ["connect", "stream", "handshake", "__rustls-tls"] }
+thiserror.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
+tungstenite = { version = "0.20", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

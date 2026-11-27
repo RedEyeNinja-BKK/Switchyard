@@ -169,3 +169,6 @@ openthoughts-tblite/
 
 # Build provenance written by the switchyard-server workflow.
 /build/
+
+# In-tree cargo target dir used by the topology workstream
+/targets/

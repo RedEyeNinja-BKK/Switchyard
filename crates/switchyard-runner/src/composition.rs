@@ -34,6 +34,8 @@ use crate::{Route, RunOutput, Runner, RunnerError, request_fit};
 pub struct CompositeSpec {
     /// Child routes in preference order.
     pub children: Vec<String>,
+    /// When the parent may move on to the next child.
+    pub cross_on: crate::config::CompositeCrossPolicy,
 }
 
 /// What a composite did for one request.
@@ -233,6 +235,42 @@ impl Runner {
                 return Err(RunnerError::UnknownRouteModel(child_name.clone()));
             };
 
+            // A child whose every candidate may only receive cleared payloads, for a
+            // request that is not cleared, is skipped before it is called. Its own refusal
+            // is correct and stays in place for a directly addressed leaf; inside a
+            // composite the refusal means "this leg may not carry these bytes", and the
+            // next leg is exactly what the composite exists to reach. Letting the refusal
+            // surface as the child's failure would end the whole composite with a 403 and
+            // leave the private branch unable to skip the provider it may not use.
+            if route.payload_refused(&request) {
+                children.push((
+                    child_name.clone(),
+                    ChildOutcome::Skipped {
+                        capability: "privacy_clearance",
+                    },
+                ));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
+                continue;
+            }
+
+            // A child no candidate of which can hold this request is skipped the same way.
+            // Its own refusal is right when it is addressed directly, but inside a composite
+            // it means "this leg cannot serve these bytes" and the wider sibling is exactly
+            // what the aggregate route exists to reach. Reported under the binding limit so
+            // the caller learns which axis excluded it.
+            if let Some(limit) = route.physical_ineligibility(&request) {
+                children.push((
+                    child_name.clone(),
+                    ChildOutcome::Skipped { capability: limit },
+                ));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
+                continue;
+            }
+
             // A child that cannot serve this request was never eligible. Skipping it is
             // routing, not recovery, and it receives no provider call at all.
             if let Some(capability) = request_fit::unsupported_capability(
@@ -244,6 +282,9 @@ impl Runner {
                     .unwrap_or(&serde_json::Value::Null),
             ) {
                 children.push((child_name.clone(), ChildOutcome::Skipped { capability }));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
                 continue;
             }
 
@@ -261,15 +302,25 @@ impl Runner {
                         capability: "context_window",
                     },
                 ));
+                if !self.eligibility_advances(spec) {
+                    break;
+                }
                 continue;
             }
 
-            // A child drawing on a credential a previous child already exhausted or had
-            // rejected is skipped before its first provider call. Every target in the
-            // child shares one `llm_client`, so a block that covers one covers all; a
-            // child that names no credential is left in place rather than guessed at.
-            if let Some(blocked) = self.blocked_by_credential(route, &credential_blocks) {
-                children.push((child_name.clone(), blocked));
+            // A child is skipped only when credential blocks leave NONE of its targets
+            // servable. Judged per target, because a child's candidates may span providers:
+            // a block on one provider's account must leave every peer on another provider
+            // servable, and a block on one model's own daily budget must leave its siblings
+            // servable. The survivors are handed to the child below, where they compete in
+            // the same order under the same gates.
+            if route.first_target_model().is_some()
+                && route.servable_after_blocks(&credential_blocks).is_empty()
+            {
+                children.push((
+                    child_name.clone(),
+                    self.credential_skip(route, &credential_blocks),
+                ));
                 continue;
             }
 
@@ -277,7 +328,10 @@ impl Runner {
             // prepared for its provider is deliberately dropped, so a child cannot inherit
             // another child's model, body or reasoning fields.
             let child_request = request.clone();
-            match route.execute(child_request, observer.clone()).await {
+            match route
+                .execute_with_blocks(child_request, observer.clone(), &credential_blocks)
+                .await
+            {
                 Ok(output) => {
                     // The response names the candidate that actually served it, which is not
                     // always the one the child selected: after the child's own fallback a later
@@ -321,11 +375,30 @@ impl Runner {
                     // names no credential this deployment resolves (a forwarded caller's
                     // 401, or a slug no route owns), and then plain class policy
                     // decides.
-                    let crossable = class.allows_cross_route()
-                        || matches!(
-                            block.as_ref().map(|block| &block.kind),
-                            Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
-                        );
+                    //
+                    // A composite that states `cross_on = "credential_block"` narrows
+                    // this to the block alone, because its children share one credential
+                    // and the question is which SCOPE that credential still serves. An
+                    // ordinary rate limit, a timeout or a provider fault carries no block
+                    // and then crosses nowhere.
+                    //
+                    // The scope, not the mere presence, decides: a per-model daily budget
+                    // is a block, but spending the paid leg to work around one model's own
+                    // allocation is a cost the owner did not authorize. `crosses_to_paid`
+                    // keeps that one fail-closed while the whole-credential scopes still
+                    // reach the paid leg.
+                    let crossable = match spec.cross_on {
+                        crate::config::CompositeCrossPolicy::FailureClass => {
+                            class.allows_cross_route()
+                                || matches!(
+                                    block.as_ref().map(|block| &block.kind),
+                                    Some(switchyard_llm_client::CredentialBlockKind::Unauthorized)
+                                )
+                        }
+                        crate::config::CompositeCrossPolicy::CredentialBlock => {
+                            block.as_ref().is_some_and(|block| block.crosses_to_paid())
+                        }
+                    };
                     if !crossable {
                         // Terminal for the parent. Surfacing the child's own error keeps a
                         // contract, policy or credential fault visible instead of letting a
@@ -352,13 +425,21 @@ impl Runner {
             }
         }
 
-        // Nothing answered. If no child was even eligible, the request itself asks for
-        // something no child can serve, which is the caller's problem rather than a
-        // deployment fault.
-        if let Some(capability) = children.iter().find_map(|(_, outcome)| match outcome {
-            ChildOutcome::Skipped { capability } => Some(*capability),
-            _ => None,
-        }) {
+        // Nothing answered, and the reason depends on whether anything was asked. A child
+        // is only contacted when it was eligible, so a recorded failure proves the request
+        // reached a provider: the answer is that failure, not the capability some other
+        // child happened to lack. Reporting the skip instead would name the wrong cause --
+        // a request an eligible child actually refused would read as unroutable, which is
+        // the opposite diagnosis for the caller.
+        let contacted = children
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, ChildOutcome::Failed { .. }));
+        if !contacted
+            && let Some(capability) = children.iter().find_map(|(_, outcome)| match outcome {
+                ChildOutcome::Skipped { capability } => Some(*capability),
+                _ => None,
+            })
+        {
             return Err(RunnerError::unsupported_capability(
                 parent_route,
                 capability,
@@ -458,50 +539,48 @@ impl Runner {
         })
     }
 
-    /// Whether this child would only spend a call on a credential already blocked.
+    /// Whether an eligibility skip may advance to the next child.
     ///
-    /// Every target in the child shares one `llm_client`, so the credential resolved
-    /// for its first target is the child's credential. A free-scope block (`:free`
-    /// slugs exhausted) skips the child only when every servable target is free: a
-    /// child with a paid candidate still has a servable leg on the same credential.
-    /// A whole-quota or unauthorized block skips the child outright.
-    fn blocked_by_credential(
+    /// Eligibility is a fact about the request — it needs vision, it does not fit this
+    /// window — and not a statement about any credential. Under the historical policy the
+    /// parent simply moves on to a child that can serve it, and that stays true.
+    ///
+    /// A composite that states `cross_on = "credential_block"` admits exactly ONE reason
+    /// to reach a later child: the provider said the earlier child's credential scope is
+    /// gone. Reaching a later child because the request was ineligible would spend that
+    /// child's account for a reason the policy does not name, so the skip is terminal for
+    /// the parent. The caller still gets the truthful diagnosis: the end-of-loop reporting
+    /// names the missing capability when nothing was called, and the child's own failure
+    /// when something was.
+    fn eligibility_advances(&self, spec: &CompositeSpec) -> bool {
+        !matches!(
+            spec.cross_on,
+            crate::config::CompositeCrossPolicy::CredentialBlock
+        )
+    }
+
+    /// The skip to report when blocks leave a child with no servable target.
+    ///
+    /// The reason names the block that covered the child's first target, which is the
+    /// candidate a call would have gone to. `servable_after_blocks` has already established
+    /// that every target is covered, so a child with targets always yields a reason; the
+    /// fallback exists only so the outcome is never silent.
+    fn credential_skip(
         &self,
         route: &Route,
         blocks: &[switchyard_llm_client::CredentialBlock],
-    ) -> Option<ChildOutcome> {
-        let credential = self.child_credential(route)?;
-        for block in blocks {
-            if matches!(
-                block.kind,
-                switchyard_llm_client::CredentialBlockKind::FreeQuota
-            ) && !route.all_targets_free()
-            {
-                continue;
-            }
-            if (*block).blocks(&credential, route.first_target_slug()) {
-                return Some(ChildOutcome::Skipped {
-                    capability: match block.kind {
-                        switchyard_llm_client::CredentialBlockKind::FreeQuota => "credential_quota",
-                        switchyard_llm_client::CredentialBlockKind::WholeQuota => {
-                            "credential_quota"
-                        }
-                        switchyard_llm_client::CredentialBlockKind::Unauthorized => {
-                            "credential_unauthorized"
-                        }
-                    },
-                });
-            }
-        }
-        None
-    }
-
-    /// The `llm_client` credential serving this child's targets, when known.
-    fn child_credential(&self, route: &Route) -> Option<String> {
-        route
+    ) -> ChildOutcome {
+        let capability = route
             .first_target_model()
-            .and_then(|model| route.target_credential(&model))
-            .map(str::to_string)
+            .and_then(|model| {
+                let credential = route.target_credential(&model)?;
+                blocks
+                    .iter()
+                    .find(|block| block.blocks(credential, model.as_str()))
+            })
+            .map(switchyard_llm_client::CredentialBlock::exclusion_code)
+            .unwrap_or("credential_quota");
+        ChildOutcome::Skipped { capability }
     }
 }
 

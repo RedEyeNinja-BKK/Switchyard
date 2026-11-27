@@ -4,6 +4,9 @@
 //! Rust HTTP server for libsy algorithms.
 
 mod capability_surfaces;
+mod live_surface;
+mod music_surface;
+mod robotics_surface;
 pub mod config;
 pub mod decision_surface;
 pub mod economics;
@@ -43,12 +46,12 @@ use libsy::{LibsyError, RoutingOutcome};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
+use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver, SelectionTrace};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::composition::Selection;
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
-    context_shadow, request_fit,
+    CallerAuthKind, DecisionTarget, Locality, ModelInfo, Route, RouteReasoningPolicy, RunOutput,
+    Runner, RunnerError, context_shadow, request_fit,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -248,6 +251,16 @@ impl SharedRoutingLog {
         }
     }
 
+    fn append_decision(&self, context: routing_log::RoutingLogContext, trace: &SelectionTrace) {
+        if let Err(error) = self.writer.lock().append_decision(context, trace) {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "routing decision append failed"
+            );
+        }
+    }
+
     fn snapshot_session(
         &self,
         session_id: &str,
@@ -391,6 +404,7 @@ fn start_economics(state: &ServerState) -> std::thread::JoinHandle<()> {
         state.runner.deployment_facts(),
         Arc::clone(&state.calendar),
         &env,
+        state.runner.daily_allowances(),
     )
 }
 
@@ -522,9 +536,18 @@ fn stats_observer(
     stats: StatsAccumulator,
     classifier_log: Option<(SharedRoutingLog, routing_log::RoutingLogContext)>,
     route_id: String,
+    selection: Option<Arc<Mutex<Option<SelectionTrace>>>>,
 ) -> RunObserver {
     Arc::new(move |observation| match observation {
         RunObservation::Outcome(_) => {}
+        // The record is emitted once per execution, on every exit path, and read after the
+        // run returns: keeping it here means the handler does not need a second observer
+        // layer competing with this one for the same terminology.
+        RunObservation::Selection(trace) => {
+            if let Some(selection) = selection.as_ref() {
+                *selection.lock() = Some(*trace);
+            }
+        }
         RunObservation::ContextPressurePromotion {
             promoted,
             estimated_input_tokens,
@@ -605,7 +628,24 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/decisions", post(decision_surface::decisions))
         .route("/v1/embeddings", post(capability_surfaces::embeddings))
         .route("/v1/rerank", post(capability_surfaces::rerank))
+        .route("/v1/audio/speech", post(capability_surfaces::speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(capability_surfaces::transcriptions),
+        )
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
+        .route(
+            "/v1/live/{capability}",
+            get(live_surface::live_websocket),
+        )
+        .route(
+            "/v1/music/{capability}",
+            get(music_surface::music_websocket),
+        )
+        .route(
+            "/v1/robotics/spatial",
+            post(robotics_surface::spatial),
+        )
         .route(
             "/v1/responses/input_tokens",
             post(openai_responses_input_tokens),
@@ -1274,6 +1314,14 @@ fn resolve_route(
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
         metadata.remove(switchyard_translation::util::SWITCHYARD_METADATA_KEY);
     }
+    // A caller and this deployment may spell the same video part differently: the provider
+    // accepts exactly one form, and the Chat spelling is what several clients (including
+    // Turnstone's own Responses client) send. Translate the spelling before decoding, so a
+    // same-format forward carries the accepted shape; anything that cannot be mapped is
+    // refused below with a reason instead of reaching the provider as an opaque error.
+    if wire_format == WireFormat::OpenAiResponses {
+        request_fit::normalize_responses_video_parts(&mut body);
+    }
     let llm_request = decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     let requested_model = llm_request
@@ -1321,19 +1369,47 @@ fn resolve_route(
     {
         // `vision` is a declaration about images. Video and audio have no declaration at
         // all, so saying they "declare ... = false" would name a field the config lacks.
-        let detail = if matches!(capability, "video" | "audio") {
-            format!(
+        // A carrier refusal is neither: the medium is supported, the form the request
+        // supplies it in is not, and the caller needs to hear that difference.
+        let detail = match capability {
+            "video" | "audio" => format!(
                 "route {requested_model} cannot accept {capability} input: this deployment \
                  declares no {capability}-capable target"
-            )
-        } else {
-            format!("route {requested_model} declares {capability} = false")
+            ),
+            "image_carrier" => format!(
+                "route {requested_model} cannot accept an image supplied on that carrier: \
+                 the targets behind it serve the other form (inline bytes vs a remote URL)"
+            ),
+            "video_carrier" => format!(
+                "route {requested_model} cannot accept video supplied on that carrier: \
+                 the targets behind it serve the other form (inline bytes vs a remote URL)"
+            ),
+            _ => format!("route {requested_model} declares {capability} = false"),
         };
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             format!("{detail}; remove the unsupported input or select another route"),
             "invalid_request_error",
             "unsupported_capability",
+        ));
+    }
+    // A same-format request is forwarded verbatim, so a video part this surface cannot
+    // express would reach the provider unchanged and come back as an opaque upstream error.
+    // Only the Responses surface is checked: the Chat spelling is the one measured to work,
+    // and refusing shapes there would risk breaking a path that is proven.
+    if wire_format == WireFormat::OpenAiResponses
+        && let Some(issue) = request_fit::unsupported_responses_video_part(&body)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "route {requested_model} cannot send this video part on the OpenAI Responses \
+                 surface: {} (`{}`). Supply video as {{\"type\":\"input_video\",\
+                 \"video_url\":\"<https URL or data: URI>\"}}",
+                issue.detail, issue.part_type
+            ),
+            "invalid_request_error",
+            "invalid_video_part",
         ));
     }
     let request = Request {
@@ -1376,30 +1452,72 @@ async fn handle_llm_request(
     });
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
+    let selection: Arc<Mutex<Option<SelectionTrace>>> = Arc::new(Mutex::new(None));
     let observer = stats_observer(
         state.stats.clone(),
         state.routing_log.clone().zip(routing_log_context.clone()),
         request.llm_request.model.clone().unwrap_or_default(),
+        Some(Arc::clone(&selection)),
     );
 
     // The routing log borrows the request, so the route id is taken before it is moved.
     let route_id = request.llm_request.model.clone().unwrap_or_default();
     // Execution goes through the runner seam, so a composite route is served the same way
     // as a leaf without tier behaviour reaching this crate.
-    let execution = match state
+    let execution = state
         .runner
         .execute_route(&route_id, request, Some(observer))
-        .await
+        .await;
+    // Written before the outcome is matched, so a refusal that never contacted a provider is
+    // recorded as well as a served request. `take` empties the slot: one decision, one line.
+    if let (Some(log), Some(context)) = (state.routing_log.as_ref(), routing_log_context.as_ref())
+        && let Some(trace) = selection.lock().take()
     {
+        log.append_decision(context.clone(), &trace);
+    }
+    let execution = match execution {
         Ok(execution) => execution,
         Err(RunnerError::UnsupportedCapability { model, capability }) => {
             // A valid request that no eligible route can serve is the caller's problem, not a
-            // deployment fault, so it must not be reported as a server failure.
+            // deployment fault, so it must not be reported as a server failure. A carrier
+            // refusal names a form, not a missing media type, so it reads as one.
+            let requirement = match capability {
+                "image_carrier" => {
+                    "an image supplied on that carrier (every candidate serves the other form)"
+                }
+                "video_carrier" => {
+                    "video supplied on that carrier (every candidate serves the other form)"
+                }
+                // A caller-supplied effort the provider refuses is not silently stripped:
+                // saying so is the difference between the caller changing the request and the
+                // caller believing an effort was applied that never left the router.
+                "unsupported_reasoning_effort" => {
+                    "a reasoning_effort the model accepts (every candidate refuses the one \
+                     requested, and dropping it would run a different reasoning mode)"
+                }
+                "output_budget_below_thinking_floor" => {
+                    "a larger max_output_tokens (this model cannot answer before its thinking \
+                     has used that budget)"
+                }
+                other => other,
+            };
             return error_response(
                 StatusCode::BAD_REQUEST,
-                format!("no eligible route for model {model:?}: requires {capability}"),
+                format!("no eligible route for model {model:?}: requires {requirement}"),
                 "invalid_request_error",
                 "unsupported_capability",
+            );
+        }
+        Err(RunnerError::Held { model, reason }) => {
+            // The alias is declared, so this is not an unknown model, and no change to the
+            // request would help, so it is not a capability refusal either. The provider
+            // withdrew the model; say that, in its own words, and always answer locally —
+            // a held target never reaches a provider and is never replaced by a live one.
+            return error_response(
+                StatusCode::GONE,
+                format!("model {model:?} is held and cannot serve: {reason}"),
+                "invalid_request_error",
+                "model_held",
             );
         }
         Err(RunnerError::StateConflict(message)) => {
@@ -1410,6 +1528,7 @@ async fn handle_llm_request(
                 "state_conflict",
             );
         }
+
         Err(error) => {
             if let RunnerError::Algorithm(LibsyError::ClientCall {
                 target,
@@ -2172,6 +2291,78 @@ fn client_error(error: &LlmClientError) -> Response {
             )
         }
         LlmClientError::RequestEncoding(message) => server_error(message),
+        // The payload is the caller's, not the deployment's: no amount of resending
+        // these bytes to another candidate makes an uncleared body admissible, so this
+        // is reported as a refusal the caller can act on rather than as an upstream
+        // fault that invites a retry.
+        // The requested feature is absent from the selected target's wire format, which the
+        // caller chose the route for. Reporting it as a bad request is the honest answer: an
+        // upstream fault would invite a retry that cannot change it, and an ordinary answer
+        // would hide that part of the request was never carried out.
+        LlmClientError::UnsupportedFeature { model, feature } => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("request refused before egress by {model}: {feature}"),
+            "invalid_request_error",
+            "unsupported_feature",
+        ),
+
+        // A spent daily budget is not an outage: this leg cannot serve until the
+        // provider day rolls over, and the reset is stated so a caller does not retry
+        // into the same refusal. Every other candidate keeps its own budget.
+        LlmClientError::DailyRequestAllowanceExhausted { model, limit } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "daily request allowance for {model} is spent ({limit} per provider day); \
+                 it resets at the next provider day (midnight America/Los_Angeles)"
+            ),
+            "invalid_request_error",
+            "daily_allowance_exhausted",
+        ),
+        // Accounting that cannot be read is a deployment fault, and a silent one would
+        // leave a cap unenforced. Refused fail-closed, reported as unavailable rather
+        // than as something the caller did wrong.
+        LlmClientError::DailyRequestAllowanceUnavailable { model, reason } => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("daily request allowance for {model} cannot be accounted: {reason}"),
+            "server_error",
+            "daily_allowance_unavailable",
+        ),
+        // A full minute window is a short wait, not an outage and not the caller's mistake.
+        // Reported as the throttle it is, with the interval, so the caller can pace itself
+        // instead of retrying into a window that has not refilled.
+        LlmClientError::MinuteAllowanceThrottled {
+            model,
+            scope,
+            retry_after_secs,
+        } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "per-minute {scope} budget for {model} is full; it clears in about \
+                 {retry_after_secs}s, and another candidate may serve this request now"
+            ),
+            "rate_limit_error",
+            "minute_allowance_throttled",
+        ),
+        // Distinguishable from the throttle above on purpose: no wait clears this, and the
+        // message says so rather than quoting an interval. 429 rather than 4xx-request
+        // because the caller's payload is not at fault and the same body may succeed on a
+        // route with a wider per-minute window.
+        LlmClientError::InputExceedsMinuteWindow {
+            model,
+            needed,
+            limit,
+            margin_permille,
+        } => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "this request reserves about {needed} tokens for {model} at a \
+                 {margin_permille}/1000 admission margin, which is more than its {limit}-token \
+                 per-minute input budget allows; waiting will not help, and another candidate \
+                 with a wider window may serve it now"
+            ),
+            "rate_limit_error",
+            "minute_allowance_input_exceeds_window",
+        ),
         _ => server_error(error.to_string()),
     }
 }
@@ -2324,8 +2515,8 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
     Json(model_list_payload(
         state
             .runner
-            .models()
-            .map(|model| (model.id.as_str(), model.capabilities)),
+            .advertised_models()
+            .map(|model| (model.id.as_str(), model)),
     ))
 }
 
@@ -2406,9 +2597,7 @@ async fn not_found() -> Response {
     )
 }
 
-fn model_list_payload<'a>(
-    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
-) -> Value {
+fn model_list_payload<'a>(entries: impl IntoIterator<Item = (&'a str, ModelInfo<'a>)>) -> Value {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|(model_id, _)| *model_id);
     let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
@@ -2416,7 +2605,7 @@ fn model_list_payload<'a>(
     let last_id = model_ids.last().copied();
     json!({
         "object": "list",
-        "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
+        "data": entries.iter().map(|(model, info)| model_entry_json(model, *info)).collect::<Vec<_>>(),
         // Codex requires this key; an empty list preserves its own catalog and instructions.
         "models": [],
         "first_id": first_id,
@@ -2427,7 +2616,31 @@ fn model_list_payload<'a>(
     })
 }
 
-fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
+/// Names a locality for the wire.
+///
+/// Spelled out rather than derived from the variant name so a reader of the JSON is not
+/// relying on a Rust identifier surviving the trip.
+fn locality_label(locality: Locality) -> &'static str {
+    match locality {
+        Locality::Local => "local",
+        Locality::Upstream => "upstream",
+        Locality::Mixed => "mixed",
+        Locality::Unknown => "unknown",
+    }
+}
+
+/// Names a route reasoning policy for the wire.
+fn reasoning_policy_label(policy: RouteReasoningPolicy) -> &'static str {
+    match policy {
+        RouteReasoningPolicy::Inherit => "inherit",
+        RouteReasoningPolicy::Medium => "medium",
+        RouteReasoningPolicy::High => "high",
+        RouteReasoningPolicy::None => "none",
+    }
+}
+
+fn model_entry_json(model: &str, info: ModelInfo<'_>) -> Value {
+    let capabilities = info.capabilities;
     json!({
         "id": model,
         "object": "model",
@@ -2437,11 +2650,38 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "display_name": model,
         // OpenAI-compatible clients read the context window from this field.
         "context_length": capabilities.context_window,
+        // Where the work happens, from each leg's declared billing. `unknown` is reported
+        // as itself: a route over an undeclared client has no locality fact to state.
+        "locality": locality_label(info.locality),
+        // The policy this route imposes on top of the target's own capability, which is
+        // what `capabilities.reasoning` reports separately. `inherit` means this route
+        // states none and the target decides.
+        "reasoning_policy": reasoning_policy_label(info.reasoning_policy),
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
             "vision": capabilities.vision,
             "video": capabilities.video,
+            // The carrier is the half of the fact a boolean cannot express: an endpoint can
+            // read inline media and still refuse a URL. Reported only when it is narrower
+            // than "either", so a caller reading a plain video target sees no new field and
+            // a caller reading a carrier-restricted one learns which form works.
+            "video_carriers": match capabilities.video_carrier {
+                Some(switchyard_runner::MediaCarrier::Both) | None => Value::Null,
+                Some(carrier) => json!(match carrier {
+                    switchyard_runner::MediaCarrier::Inline => ["inline"],
+                    switchyard_runner::MediaCarrier::Remote => ["remote"],
+                    switchyard_runner::MediaCarrier::Both => unreachable!(),
+                }),
+            },
+            "image_carriers": match capabilities.image_carrier {
+                Some(switchyard_runner::MediaCarrier::Both) | None => Value::Null,
+                Some(carrier) => json!(match carrier {
+                    switchyard_runner::MediaCarrier::Inline => ["inline"],
+                    switchyard_runner::MediaCarrier::Remote => ["remote"],
+                    switchyard_runner::MediaCarrier::Both => unreachable!(),
+                }),
+            },
             "supported_inbound_formats": [
                 "openai-chat-completions",
                 "openai-responses",
@@ -2491,10 +2731,16 @@ fn render_startup_banner_art(color: bool) -> String {
 }
 
 fn dry_run_summary(state: &ServerState) -> String {
-    format!(
-        "server OK: {}",
-        state.models().collect::<Vec<_>>().join(", ")
-    )
+    // The inventory keeps a held alias, and this banner reads the inventory, so the hold is
+    // named here. Otherwise a validation read would list an alias that can only answer with
+    // a refusal as one of the routes the process just accepted.
+    let models = state.models().map(|model| {
+        match state.runner.route(model).and_then(|route| route.held()) {
+            Some(_) => format!("{model} (held)"),
+            None => model.to_string(),
+        }
+    });
+    format!("server OK: {}", models.collect::<Vec<_>>().join(", "))
 }
 
 fn url_for_addr(scheme: &'static str, addr: SocketAddr) -> String {
@@ -2573,6 +2819,7 @@ mod tests {
             StatsAccumulator::default(),
             Some((log.clone(), context)),
             "route-under-test".to_string(),
+            None,
         );
 
         let call = |model: &str, answer: bool| {
@@ -2585,6 +2832,7 @@ mod tests {
                     output_tokens: Some(7),
                     ..Usage::default()
                 }),
+                outcome: None,
             };
             if answer {
                 RunObservation::AnswerCall(observation)
@@ -2911,6 +3159,12 @@ mod tests {
             assert_eq!(api_error.code, "upstream_timeout");
         }
     }
+
+    // The three allowance and privacy failures are caller-visible conditions with
+    // different meanings, so none of them may fall into the generic internal-error
+    // arm: an uncleared payload is the caller's to fix, a spent budget resets on the
+    // provider's day, and unreadable accounting is a deployment fault under which a
+    // cap is unenforced. Each is asserted by status and wire code.
 
     // The provider's message can quote request content, so the request log
     // records only the error class while the client still sees the message.

@@ -279,12 +279,15 @@ async fn an_out_of_bounds_request_reaches_no_backend() {
     .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // The body is the caller's remedy, not our enum name: it must say what about the
+    // request did not fit, because "Contract" tells a caller nothing to change.
     assert!(
         body["error"]
             .as_str()
-            .is_some_and(|error| error.contains("Contract")),
+            .is_some_and(|error| error.contains("decision wire contract")),
         "the failure must name the contract violation: {body}"
     );
+    assert_eq!(body["type"], "invalid_request_error", "{body}");
 }
 
 #[tokio::test]
@@ -436,9 +439,10 @@ async fn an_unknown_identity_is_not_found_and_dispatches_nothing() {
     assert!(
         body["error"]
             .as_str()
-            .is_some_and(|error| error.contains("TargetNotFound")),
-        "{body}"
+            .is_some_and(|error| error.contains("answers to that model name")),
+        "the body must tell the caller the name is unknown: {body}"
     );
+    assert_eq!(body["type"], "model_not_found", "{body}");
 }
 
 /// Naming a configured backend directly serves that backend alone.

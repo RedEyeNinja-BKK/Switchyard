@@ -203,6 +203,8 @@ fn a_declared_billing_kind_overrides_the_credential_name() {
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             api_key_env: Some("SY_OPENAI_OAUTH_TOKEN".to_string()),
             billing: Some(BillingKind::Metered),
+            quota_group: Some("openai".to_string()),
+            quota_provider: None,
         },
     );
     facts.targets.insert(

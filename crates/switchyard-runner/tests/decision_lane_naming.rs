@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use switchyard_protocol::{DecisionKind, DecisionQuestion, DecisionRequest};
+use switchyard_runner::decision_executor::{ComposedLane, LaneSelection};
 use switchyard_runner::{Runner, RunnerError};
 
 fn decision_config(lanes: &str, composition: &str) -> String {
@@ -421,6 +422,7 @@ async fn an_exhausted_child_lane_yields_to_the_next_child() {
             api_key_env: Some("DUMMY".to_string()),
             supported_types: SupportedTypes::ALL,
             state_forms: StateForms::ALL,
+            budget: None,
         }
     }
 
@@ -503,6 +505,7 @@ async fn an_ineligible_request_is_not_forwarded_to_a_sibling() {
         api_key_env: Some("DUMMY".to_string()),
         supported_types: SupportedTypes::NOUL_ONLY,
         state_forms: StateForms::SPAN_OBSERVED,
+        budget: None,
     };
     let children = vec![
         LaneChild::new(
@@ -523,6 +526,7 @@ async fn an_ineligible_request_is_not_forwarded_to_a_sibling() {
                     api_key_env: Some("DUMMY".to_string()),
                     supported_types: SupportedTypes::ALL,
                     state_forms: StateForms::ALL,
+                    budget: None,
                 }],
             }),
         ),
@@ -642,9 +646,12 @@ fn the_shared_classifier_resolves_an_explicitly_named_lane() {
     ]
     .into_iter()
     .collect();
-    let composition: Map<String, Vec<String>> = [(
+    let composition: Map<String, ComposedLane> = [(
         "tier".to_string(),
-        vec!["free-family".to_string(), "local-family".to_string()],
+        ComposedLane {
+            children: vec!["free-family".to_string(), "local-family".to_string()],
+            selection: LaneSelection::Ordered,
+        },
     )]
     .into_iter()
     .collect();
@@ -727,6 +734,7 @@ async fn serve_named_serves_the_named_lane_and_falls_through_only_when_unknown()
                     api_key_env: Some("DUMMY".to_string()),
                     supported_types: SupportedTypes::ALL,
                     state_forms: StateForms::ALL,
+                    budget: None,
                 }],
             }),
         }
@@ -738,9 +746,12 @@ async fn serve_named_serves_the_named_lane_and_falls_through_only_when_unknown()
     ]
     .into_iter()
     .collect();
-    let composition: Map<String, Vec<String>> = [(
+    let composition: Map<String, ComposedLane> = [(
         "tier".to_string(),
-        vec!["free-family".to_string(), "local-family".to_string()],
+        ComposedLane {
+            children: vec!["free-family".to_string(), "local-family".to_string()],
+            selection: LaneSelection::Ordered,
+        },
     )]
     .into_iter()
     .collect();

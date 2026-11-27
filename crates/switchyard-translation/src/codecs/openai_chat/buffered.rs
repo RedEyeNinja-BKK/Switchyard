@@ -24,7 +24,8 @@ use crate::llm::{
     MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
     SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
-use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
+use crate::policy::{DeterministicIdPolicy, ReasoningDetailsReplay, TranslationPolicy};
+use crate::provenance::opaque_digest;
 use crate::util::{
     capture_request_preservation, capture_response_preservation, embed_preservation,
     exact_preserved_request, exact_preserved_response, json_string, object, push_lossy,
@@ -190,6 +191,7 @@ impl FormatCodec for OpenAiChatCodec {
     ) -> Result<EncodedRequest> {
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiChat, policy)
+                .filter(|body| !withholds_replayed_details(body, policy))
         {
             return Ok(EncodedRequest {
                 body,
@@ -313,6 +315,20 @@ impl FormatCodec for OpenAiChatCodec {
                     "$.choices[0].message.content",
                 )?,
             };
+            if let Some(marker) = _policy.hosted_reasoning {
+                // The upstream put its reasoning in the visible message. Move it to a
+                // reasoning block before anything downstream can read it as the answer:
+                // `content` is what a caller displays, so the split has to happen here
+                // rather than in a presentation layer that may not exist.
+                content = split_hosted_reasoning_blocks(marker, content).map_err(|leak| {
+                    crate::TranslationError::InvalidValue {
+                        path: "$.choices[0].message.content".to_string(),
+                        message: format!(
+                            "response text carried a malformed inline reasoning block: {leak}"
+                        ),
+                    }
+                })?;
+            }
             prepend_openai_reasoning_blocks(&mut content, &message);
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -518,6 +534,41 @@ pub(crate) fn role_from_openai(role: Option<&str>, path: &str) -> Result<Role> {
 }
 
 /// Decodes OpenAI-style content into normalized content blocks.
+/// Moves an inline hosted reasoning block out of the visible text, and discards it.
+///
+/// Each text block is split with the shared factory, so the buffered path and the streaming
+/// path agree on what a block is. A message that fails the split is an error: emitting the
+/// text unchanged would leak the monologue, and emitting only the part before the failure
+/// would truncate an answer without saying so.
+///
+/// The reasoning is dropped rather than rebuilt as a `Reasoning` block. A reasoning block is
+/// not private: the chat encoder writes it back out as `reasoning_content`, so carrying the
+/// monologue there would hand it to the caller through a second field while the answer looked
+/// clean. Text the model marked as its own thinking is internal to the target that declared
+/// the marker, and the provider's own `reasoning_content` field is the only reasoning this
+/// translation passes through.
+fn split_hosted_reasoning_blocks(
+    marker: crate::codecs::openai_chat::HostedReasoningMarker,
+    content: Vec<ContentBlock>,
+) -> std::result::Result<Vec<ContentBlock>, crate::codecs::openai_chat::ThoughtLeak> {
+    let _ = marker;
+    let mut rebuilt = Vec::with_capacity(content.len());
+    for block in content {
+        match block {
+            ContentBlock::Text { text } => {
+                let split = crate::codecs::openai_chat::split_hosted_reasoning(&text)?;
+                if !split.answer.is_empty() {
+                    rebuilt.push(ContentBlock::Text {
+                        text: split.answer.to_string(),
+                    });
+                }
+            }
+            other => rebuilt.push(other),
+        }
+    }
+    Ok(rebuilt)
+}
+
 pub(crate) fn decode_openai_content(
     content: &Value,
     provider: WireFormat,
@@ -932,7 +983,20 @@ fn encode_message_without_tool_results_to_openai(
         "role": role,
         "content": encode_openai_content(&content_blocks, message.role, diagnostics, policy)?,
     });
-    encode_openai_message_reasoning(&mut message_json, &message.content);
+    let withheld = encode_openai_message_reasoning(&mut message_json, &message.content, policy)?;
+    if withheld > 0 {
+        // Reported rather than silent: a caller whose continuation lost provider state is
+        // entitled to know, and under a Reject lossy policy this becomes a typed refusal
+        // instead of a request that quietly sends less than it was given.
+        push_lossy(
+            diagnostics,
+            policy,
+            format!(
+                "withheld opaque reasoning state for {withheld} block(s): it was not issued by \
+                 this target, so replaying it would not be a provable continuation"
+            ),
+        )?;
+    }
     if !tool_calls.is_empty() {
         message_json["tool_calls"] = Value::Array(tool_calls);
         if message_json["content"] == Value::String(String::new()) {
@@ -942,14 +1006,170 @@ fn encode_message_without_tool_results_to_openai(
     Ok(message_json)
 }
 
-// Adds either plaintext reasoning or structured details to an OpenAI Chat message.
-fn encode_openai_message_reasoning(message: &mut Value, content: &[ContentBlock]) {
-    let details = reasoning_details_from_blocks(content);
-    if details.is_empty() {
-        encode_openai_message_plaintext_reasoning(message, content);
-    } else {
-        encode_openai_message_structured_reasoning(message, content, details);
+// Whether a preserved body must be re-encoded rather than replayed.
+//
+// The preserved-body path exists so fields the IR cannot represent survive a same-format trip,
+// so it is kept for every request that needs no narrowing. It is bypassed only when replaying
+// it would hand this target another provider's opaque reasoning state: the normalised path is
+// the only one that applies the replay policy, so it has to run in exactly that case.
+fn withholds_replayed_details(body: &Value, policy: &TranslationPolicy) -> bool {
+    let mode = policy.reasoning_details_replay;
+    if mode == ReasoningDetailsReplay::Verbatim {
+        return false;
     }
+    body
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                let Some(details) = message
+                    .get("reasoning_details")
+                    .and_then(Value::as_array)
+                    .filter(|details| !details.is_empty())
+                else {
+                    return false;
+                };
+                match mode {
+                    // Every target that did not issue this state must not receive it.
+                    ReasoningDetailsReplay::PlaintextOnly => true,
+                    // Only the state this request cannot prove is withheld; admitted state may
+                    // keep the caller's exact body, which is the whole point of this path.
+                    ReasoningDetailsReplay::ProvenanceBound => {
+                        // `opaque_digest` already resolves the inline signature, so the body
+                        // digests exactly as a decoded block would.
+                        let digest = opaque_digest(details, None);
+                        !policy
+                            .reasoning_admission
+                            .as_ref()
+                            .is_some_and(|admission| admission.admits(&digest))
+                    }
+                    ReasoningDetailsReplay::Verbatim => false,
+                }
+            })
+        })
+}
+
+// Adds reasoning to an OpenAI Chat message, honouring the target's replay policy.
+//
+// Returns whether any opaque state was withheld, so the caller can report it as a lossy
+// conversion. A block whose opaque state is required but unproven is a typed error instead:
+// silently dropping it would send a continuation the provider's contract cannot accept, and the
+// caller is entitled to see the refusal rather than a request that quietly says less.
+fn encode_openai_message_reasoning(
+    message: &mut Value,
+    content: &[ContentBlock],
+    policy: &TranslationPolicy,
+) -> crate::Result<usize> {
+    let (replayable, withheld) = partition_replayable_reasoning(content, policy)?;
+    encode_openai_message_reasoning_from_blocks(message, &replayable, content);
+    Ok(withheld)
+}
+
+// Encodes reasoning from the blocks permitted for this target, falling back to the portable
+// plaintext form when nothing structured survives.
+fn encode_openai_message_reasoning_from_blocks(
+    message: &mut Value,
+    replayable: &[ContentBlock],
+    original: &[ContentBlock],
+) {
+    let details = reasoning_details_from_blocks(replayable);
+    if details.is_empty() {
+        encode_openai_message_plaintext_reasoning(message, replayable);
+        // When the structured path is unavailable but the caller did supply reasoning, keep its
+        // prose visible rather than dropping the turn's thinking entirely.
+        if message.get("reasoning").is_none() && !original.is_empty() {
+            encode_openai_message_plaintext_reasoning(message, original);
+        }
+    } else {
+        encode_openai_message_structured_reasoning(message, replayable, details);
+    }
+}
+
+// The typed refusal for opaque state the active continuation cannot do without.
+//
+// One wording for both policies: the reason is not which replay mode the target uses, but that
+// the request is a continuation whose required state cannot be honoured. No digest is reported:
+// a refusal must not put any provider-derived value in a log line.
+fn active_state_refusal() -> crate::TranslationError {
+    crate::TranslationError::LossyConversion(
+        "opaque reasoning state this target did not provably issue is required by the active \
+         continuation; refusing rather than replaying unproven provider state"
+            .to_string(),
+    )
+}
+
+// Splits reasoning blocks into those whose opaque state may be sent to this target and a count
+// of the blocks that carried state and were denied it.
+//
+// The rule is provenance, not wire: `reasoning_details` and a signature are only meaningful to
+// the identity that issued them. A target that reached the same wire on a different account, or
+// with a different native model, is a different issuer. Unrecorded provenance is treated the
+// same as a mismatch — unproven is not compatible.
+fn partition_replayable_reasoning(
+    content: &[ContentBlock],
+    policy: &TranslationPolicy,
+) -> crate::Result<(Vec<ContentBlock>, usize)> {
+    let mut replayable = Vec::new();
+    let mut withheld = 0;
+    for block in content {
+        let ContentBlock::Reasoning {
+            text,
+            signature,
+            details,
+        } = block
+        else {
+            continue;
+        };
+        let carries_opaque = !details.is_empty() || signature.is_some();
+        let digest = carries_opaque.then(|| opaque_digest(details, signature.as_deref()));
+        let permitted = match policy.reasoning_details_replay {
+            ReasoningDetailsReplay::PlaintextOnly => {
+                // A target with no structured reasoning wire cannot be given opaque state, but
+                // that is only true of state it does not need. State on the active
+                // continuation edge is required by the request this target is being asked to
+                // continue, so stripping it would send a request that quietly says less than
+                // the caller meant. Refuse instead, exactly as `ProvenanceBound` does.
+                if let Some(digest) = digest.as_deref()
+                    && policy
+                        .reasoning_admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.refuses(digest))
+                {
+                    return Err(active_state_refusal());
+                }
+                false
+            }
+            ReasoningDetailsReplay::Verbatim => true,
+            ReasoningDetailsReplay::ProvenanceBound => {
+                let admission = policy.reasoning_admission.as_ref();
+                let admitted = digest
+                    .as_deref()
+                    .is_some_and(|digest| admission.is_some_and(|a| a.admits(digest)));
+                if !admitted
+                    && let Some(digest) = digest.as_deref()
+                    && admission.is_some_and(|a| a.refuses(digest))
+                {
+                    return Err(active_state_refusal());
+                }
+                admitted
+            }
+        };
+        if permitted {
+            replayable.push(block.clone());
+            continue;
+        }
+        if carries_opaque {
+            withheld += 1;
+        }
+        // The reasoning text itself is portable: it is prose, not a signature. Keep it so a
+        // narrowed target still sees the thinking, and leave only the opaque parts behind.
+        replayable.push(ContentBlock::Reasoning {
+            text: text.clone(),
+            signature: None,
+            details: Vec::new(),
+        });
+    }
+    Ok((replayable, withheld))
 }
 
 // Adds reasoning blocks that have no structured provider representation.

@@ -100,12 +100,17 @@ impl RunnerError {
                 None,
                 None,
             ),
-            // A capability no eligible route can satisfy, and a conflicting provider state
-            // claim, are both decided against the request rather than the deployment.
+            // A capability no eligible route can satisfy, a conflicting provider state
+            // claim, and a pre-egress refusal are all decided against the request rather
+            // than the deployment: the caller can change what it sends or how it clears it.
+            // A held model is the same class for a different reason — the alias exists, the
+            // provider withdrew it, and the caller's remedy is to choose another name — so it
+            // is classified here rather than as an algorithm fault to be retried.
             Self::UnknownRouteModel(_)
             | Self::IncompatibleCallerFormat(_)
             | Self::AuxiliaryUnsupported
             | Self::UnsupportedCapability { .. }
+            | Self::Held { .. }
             | Self::StateConflict(_) => summary(
                 RouteErrorKind::InvalidRequest,
                 RouteErrorPhase::BeforeResponse,

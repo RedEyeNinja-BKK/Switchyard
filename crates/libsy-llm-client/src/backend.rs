@@ -66,6 +66,16 @@ pub struct HttpBackendConfig {
     /// so a target can reinstate one deliberately. For providers that reject an otherwise
     /// standard field (e.g. an internal API that 400s on `max_output_tokens`).
     pub omit_body_fields: BTreeSet<String>,
+    /// Reasoning-effort values this provider rejects outright.
+    ///
+    /// A provider may accept part of the effort vocabulary and refuse the rest: Google's
+    /// OpenAI-compatibility surface answers `minimal`/`low`/`medium`/`high` and rejects
+    /// `none` with HTTP 400 `INVALID_ARGUMENT` (measured 2026-11-21 on
+    /// `gemini-3.5-flash-lite`). A no-thinking caller sends exactly `none`, so the value is
+    /// dropped at the target instead of being forwarded to a provider that refuses it.
+    /// Dropping leaves the provider's own default, which is the only other outcome available
+    /// on that wire. Empty means every value is forwarded, which is every other target.
+    pub unsupported_reasoning_effort: BTreeSet<String>,
     /// Reasoning effort forced on every request to this backend, replacing whatever the caller
     /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
     /// Anthropic has no equivalent and rejects the setting at configuration time.
@@ -111,6 +121,30 @@ pub struct HttpBackendConfig {
     /// `Input must be a list`. Only meaningful for a Responses backend; other formats ignore
     /// it. Defaults to false so every existing provider keeps the compact encoding.
     pub requires_list_input: bool,
+    /// The target's own daily request allowance, when the provider caps requests per day.
+    ///
+    /// Held here because one HTTP attempt is the granularity the provider counts in, and
+    /// [`TranslatingLlmClient`](crate::TranslatingLlmClient) reserves at exactly that point.
+    /// Shared across every backend of one target, so a model reachable over two wire
+    /// formats still draws on one budget.
+    pub allowance: Option<std::sync::Arc<crate::allowance::DailyRequestAllowance>>,
+    /// The provider's per-minute pacing budget for this target, when it publishes one.
+    ///
+    /// A different resource from the daily allowance above, and refused differently: a daily
+    /// budget resets on the provider's clock, while a minute window refills continuously, so a
+    /// full window means "route to a leg with headroom, or answer with the interval" rather
+    /// than "wait for tomorrow". Shared by every alias of one physical model, because the
+    /// provider counts per model within a project and not per alias.
+    pub pacing: Option<std::sync::Arc<crate::allowance::PacedQuota>>,
+    /// The upstream writes its reasoning inline in the visible message, behind this marker.
+    ///
+    /// A provider property, declared once per client: Google's hosted Gemma endpoints on the
+    /// OpenAI-compatible surface answer with `<thought>…</thought>` followed by the answer,
+    /// and count only the answer in `completion_tokens`. Declaring the marker moves the block
+    /// into a reasoning block, so the monologue is not returned to the caller as output.
+    /// `None` leaves response text untouched, which is what a model that legitimately writes
+    /// those tokens as text requires.
+    pub hosted_reasoning: Option<switchyard_translation::HostedReasoningMarker>,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -122,6 +156,10 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
             .field("omit_body_fields", &self.omit_body_fields)
+            .field(
+                "unsupported_reasoning_effort",
+                &self.unsupported_reasoning_effort,
+            )
             .field("reasoning_effort", &self.reasoning_effort)
             .field("reasoning_policy", &self.reasoning_policy)
             .field("reasoning_dialect", &self.reasoning_dialect)
@@ -130,6 +168,12 @@ impl fmt::Debug for HttpBackendConfig {
             .field("timeout", &self.timeout)
             .field("attempt_timeout", &self.attempt_timeout)
             .field("stream_idle_timeout", &self.stream_idle_timeout)
+            .field(
+                "daily_request_limit",
+                &self.allowance.as_ref().map(|a| a.limit()),
+            )
+            .field("minute_limits", &self.pacing.as_ref().map(|p| p.limits()))
+            .field("hosted_reasoning", &self.hosted_reasoning)
             .finish()
     }
 }
@@ -358,6 +402,11 @@ impl Backend {
         &self.config().omit_body_fields
     }
 
+    /// Reasoning-effort values this provider refuses, which are therefore never sent.
+    pub fn unsupported_reasoning_effort(&self) -> &BTreeSet<String> {
+        &self.config().unsupported_reasoning_effort
+    }
+
     /// Reasoning effort forced on outbound requests, if the target configures one.
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.config().reasoning_effort.as_deref()
@@ -381,6 +430,24 @@ impl Backend {
     /// Cooldown after an exhausted transient completion failure.
     pub fn failure_cooldown(&self) -> Duration {
         self.config().failure_cooldown
+    }
+
+    /// The target's daily request allowance, when it declares one.
+    pub fn allowance(&self) -> Option<&crate::allowance::DailyRequestAllowance> {
+        self.config().allowance.as_deref()
+    }
+
+    /// The target's per-minute pacing budget, when it declares one.
+    pub fn pacing(&self) -> Option<&crate::allowance::PacedQuota> {
+        self.config().pacing.as_deref()
+    }
+
+    /// Whether the provider may only receive a payload cleared as public.
+    /// The marker an upstream uses when it writes reasoning inline in the message.
+    ///
+    /// `None` means the upstream's text is already only the answer.
+    pub fn hosted_reasoning(&self) -> Option<switchyard_translation::HostedReasoningMarker> {
+        self.config().hosted_reasoning
     }
 
     /// The cooldown group this backend belongs to, when its targets share one.
@@ -508,6 +575,7 @@ mod tests {
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             omit_body_fields: BTreeSet::new(),
+            unsupported_reasoning_effort: BTreeSet::new(),
             reasoning_effort: None,
             reasoning_policy: None,
             reasoning_dialect: ReasoningDialect::default(),
@@ -518,6 +586,9 @@ mod tests {
             attempt_timeout: None,
             stream_idle_timeout: None,
             requires_list_input: false,
+            allowance: None,
+            pacing: None,
+            hosted_reasoning: None,
         }
     }
 

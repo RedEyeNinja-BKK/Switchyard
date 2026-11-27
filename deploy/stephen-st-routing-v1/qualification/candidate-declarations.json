@@ -1,0 +1,631 @@
+{
+  "direct_routes": {
+    "direct-comfyninja-qwen3_8-27b-q4-mtp": {
+      "target": "comfyninja-qwen3_8-27b-q4-mtp",
+      "tool_calling": true,
+      "vision": false
+    },
+    "direct-comfyninja-qwen3_8-27b-q4-mtp-vl": {
+      "target": "comfyninja-qwen3_8-27b-q4-mtp-vl",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-deepseek-deepseek-flash": {
+      "target": "deepseek-deepseek-flash",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-deepseek-deepseek-flash-nt": {
+      "target": "deepseek-deepseek-flash-nt",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-deepseek-deepseek-v4-pro": {
+      "target": "deepseek-deepseek-v4-pro",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3-flash": {
+      "target": "direct-google-gemini-3-flash",
+      "tool_calling": false,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.1-flash-lite": {
+      "target": "direct-google-gemini-3.1-flash-lite",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.5-flash-lite": {
+      "target": "direct-google-gemini-3.5-flash-lite",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.6-flash": {
+      "target": "direct-google-gemini-3.6-flash",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.8-flash": {
+      "target": "direct-google-gemini-3.8-flash",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-4-hydrogen": {
+      "target": "direct-google-gemini-4-hydrogen",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemma-4-26b-a4b-it": {
+      "target": "direct-google-gemma-4-26b-a4b-it",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemma-4-31b-it": {
+      "target": "direct-google-gemma-4-31b-it",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemini-3-flash-preview": {
+      "target": "stephen-google-gemini-3-flash-preview",
+      "tool_calling": false,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemini-3.1-flash-lite": {
+      "target": "stephen-google-gemini-3.1-flash-lite",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemini-3.5-flash-lite": {
+      "target": "stephen-google-gemini-3.5-flash-lite",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemini-3.6-flash": {
+      "target": "stephen-google-gemini-3.6-flash",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemini-3.8-flash": {
+      "target": "stephen-google-gemini-3.8-flash",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemini-4-hydrogen": {
+      "target": "stephen-google-gemini-4-hydrogen",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemma-4-26b-a4b-it": {
+      "target": "stephen-google-gemma-4-26b-a4b-it",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-google-stephen-gemma-4-31b-it": {
+      "target": "stephen-google-gemma-4-31b-it",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-htpc-qwen3_5-9b": {
+      "target": "htpc-qwen3_5-9b",
+      "tool_calling": true,
+      "vision": false
+    },
+    "direct-htpc-qwen3_5-9b-mtp": {
+      "target": "htpc-qwen3_5-9b-mtp",
+      "tool_calling": true,
+      "vision": false
+    },
+    "direct-htpc-qwen3_5-9b-mtp-nt": {
+      "target": "htpc-qwen3_5-9b-mtp-nt",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-openai-gpt-6-luna": {
+      "target": "openai-gpt-6-luna",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-openai-gpt-6-luna-nt": {
+      "target": "openai-gpt-6-luna-nt",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-openai-gpt-6-sol": {
+      "target": "openai-gpt-6-sol",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-openrouter-deepseek-v4.1-flash-1017": {
+      "target": "openrouter-deepseek-v4_1-flash-1017",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-dots-3-note-preview-free": {
+      "target": "openrouter-dots-3-note-preview-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-ernie-5_5-flash-preview-free": {
+      "target": "openrouter-ernie-5_5-flash-preview-free",
+      "tool_calling": true
+    },
+    "direct-openrouter-flint-v1-0-free": {
+      "target": "openrouter-flint-v1-0-free",
+      "tool_calling": true,
+      "vision": false
+    },
+    "direct-openrouter-gemma-4-26b-a4b-it-free": {
+      "target": "openrouter-google-gemma-4-26b-a4b-it-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-gemma-4-31b-it-free": {
+      "target": "openrouter-google-gemma-4-31b-it-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-glm-5_3-flash": {
+      "target": "openrouter-glm-5_3-flash",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-openrouter-ling-3_2-flash-free": {
+      "target": "openrouter-ling-3_2-flash-free",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-openrouter-liquid-lfm-2_5-2_6b-free": {
+      "target": "openrouter-liquid-lfm-2_5-2_6b-free",
+      "tool_calling": true,
+      "vision": false
+    },
+    "direct-openrouter-nemotron-3_5-super-vl-free": {
+      "target": "openrouter-nemotron-3_5-super-vl-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": true
+    },
+    "direct-openrouter-openrouter-free": {
+      "target": "openrouter-openrouter-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-qwen3_7-flash": {
+      "target": "openrouter-qwen3_7-flash",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-openrouter-qwen3_8-flash": {
+      "target": "openrouter-qwen3_8-flash",
+      "tool_calling": true,
+      "vision": true
+    },
+    "direct-openrouter-stephen-deepseek-v4-1-flash-1017": {
+      "target": "stephen-paid-deepseek-v4-1-flash-1017",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-stephen-dots-3-note-preview-free": {
+      "target": "stephen-dots-3-note-preview-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-stephen-ernie-5_5-flash-preview-free": {
+      "target": "stephen-ernie-5_5-flash-preview-free",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-openrouter-stephen-flint-v1-0-free": {
+      "target": "stephen-flint-v1-0-free",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "direct-openrouter-stephen-glm-5-3-flash": {
+      "target": "stephen-paid-glm-5-3-flash",
+      "tool_calling": true,
+      "vision": true,
+      "video": true
+    },
+    "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free": {
+      "target": "stephen-gemma-4-26b-a4b-it-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-stephen-google-gemma-4-31b-it-free": {
+      "target": "stephen-gemma-4-31b-it-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-stephen-ling-3_2-flash-free": {
+      "target": "stephen-ling-3_2-flash-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "direct-openrouter-stephen-nemotron-3-5-super-vl-free": {
+      "target": "stephen-nemotron-3-5-super-vl-free",
+      "tool_calling": true,
+      "vision": true,
+      "video": true
+    },
+    "direct-thaillm-openthaigpt": {
+      "target": "thaillm-openthaigpt",
+      "tool_calling": true,
+      "vision": false
+    },
+    "direct-thaillm-qwen3_5-9b": {
+      "target": "thaillm-qwen3_5-9b",
+      "tool_calling": false,
+      "vision": false
+    },
+    "direct-thaillm-qwen3_6-35b-a3b": {
+      "target": "thaillm-qwen3_6-35b-a3b",
+      "tool_calling": false,
+      "vision": false
+    },
+    "direct-thaillm-thalle": {
+      "target": "thaillm-thalle",
+      "tool_calling": true,
+      "vision": false
+    },
+    "direct-thaillm-typhoon": {
+      "target": "thaillm-typhoon",
+      "tool_calling": true,
+      "vision": false
+    }
+  },
+  "targets": {
+    "comfyninja-qwen3_8-27b-q4-mtp": {
+      "id": "comfyninja/qwen3.8-27b-q4-mtp",
+      "llm_client": "comfyninja",
+      "vision": false
+    },
+    "comfyninja-qwen3_8-27b-q4-mtp-vl": {
+      "id": "comfyninja/qwen3.8-27b-q4-mtp-vl",
+      "llm_client": "comfyninja",
+      "vision": true
+    },
+    "deepseek-deepseek-flash": {
+      "id": "deepseek-flash",
+      "llm_client": "deepseek",
+      "vision": true
+    },
+    "deepseek-deepseek-flash-nt": {
+      "id": "deepseek-flash",
+      "llm_client": "deepseek_nt",
+      "vision": true
+    },
+    "deepseek-deepseek-v4-pro": {
+      "id": "deepseek-v4-pro",
+      "llm_client": "deepseek",
+      "vision": false
+    },
+    "direct-google-gemini-3-flash": {
+      "id": "gemini-3-flash-preview",
+      "llm_client": "google_gemini",
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.1-flash-lite": {
+      "id": "gemini-3.1-flash-lite",
+      "llm_client": "google_gemini",
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.5-flash-lite": {
+      "id": "gemini-3.5-flash-lite",
+      "llm_client": "google_gemini",
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.6-flash": {
+      "id": "gemini-3.6-flash",
+      "llm_client": "google_gemini",
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-3.8-flash": {
+      "id": "gemini-3.8-flash",
+      "llm_client": "google_gemini",
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemini-4-hydrogen": {
+      "id": "gemini-4-hydrogen",
+      "llm_client": "google_gemini",
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemma-4-26b-a4b-it": {
+      "id": "gemma-4-26b-a4b-it",
+      "llm_client": "google_gemini",
+      "vision": false,
+      "video": false
+    },
+    "direct-google-gemma-4-31b-it": {
+      "id": "gemma-4-31b-it",
+      "llm_client": "google_gemma_31b",
+      "vision": false,
+      "video": false
+    },
+    "htpc-qwen3_5-9b": {
+      "id": "Qwen3.5-9B-Q4_0",
+      "llm_client": "htpc",
+      "vision": false
+    },
+    "htpc-qwen3_5-9b-mtp": {
+      "id": "Qwen3.5-9B-MTP",
+      "llm_client": "htpc",
+      "vision": false
+    },
+    "htpc-qwen3_5-9b-mtp-nt": {
+      "id": "Qwen3.5-9B-MTP",
+      "llm_client": "htpc-nt",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "openai-gpt-6-luna": {
+      "id": "gpt-6-luna",
+      "llm_client": "openai",
+      "vision": true
+    },
+    "openai-gpt-6-luna-nt": {
+      "id": "gpt-6-luna",
+      "llm_client": "openai_nt",
+      "vision": true
+    },
+    "openai-gpt-6-sol": {
+      "id": "gpt-6-sol",
+      "llm_client": "openai",
+      "vision": true
+    },
+    "openrouter-deepseek-v4_1-flash-1017": {
+      "id": "deepseek/deepseek-v4.1-flash-1017",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "openrouter-dots-3-note-preview-free": {
+      "id": "dots-studio/dots-3-note-preview:free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "openrouter-ernie-5_5-flash-preview-free": {
+      "id": "baidu/ernie-5.5-flash-preview:free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "openrouter-flint-v1-0-free": {
+      "id": "recursive/flint-v1.0:free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": false
+    },
+    "openrouter-glm-5_3-flash": {
+      "id": "z-ai/glm-5.3-flash",
+      "llm_client": "openrouter",
+      "vision": true
+    },
+    "openrouter-google-gemma-4-26b-a4b-it-free": {
+      "id": "google/gemma-4-26b-a4b-it:free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "openrouter-google-gemma-4-31b-it-free": {
+      "id": "google/gemma-4-31b-it:free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "openrouter-ling-3_2-flash-free": {
+      "id": "inclusionai/ling-3.2-flash:free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "openrouter-liquid-lfm-2_5-2_6b-free": {
+      "id": "liquid/lfm-2.5-2.6b:free",
+      "llm_client": "openrouter",
+      "vision": false
+    },
+    "openrouter-nemotron-3_5-super-vl-free": {
+      "id": "nvidia/nemotron-3.5-super-vl:free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": true,
+      "video": true
+    },
+    "openrouter-openrouter-free": {
+      "id": "openrouter/free",
+      "llm_client": "openrouter",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "openrouter-qwen3_7-flash": {
+      "id": "qwen/qwen3.7-flash",
+      "llm_client": "openrouter",
+      "vision": true
+    },
+    "openrouter-qwen3_8-flash": {
+      "id": "qwen/qwen3.8-flash",
+      "llm_client": "openrouter",
+      "vision": true
+    },
+    "stephen-dots-3-note-preview-free": {
+      "id": "dots-studio/dots-3-note-preview:free",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "stephen-ernie-5_5-flash-preview-free": {
+      "id": "baidu/ernie-5.5-flash-preview:free",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": false,
+      "video": false
+    },
+    "stephen-flint-v1-0-free": {
+      "id": "recursive/flint-v1.0:free",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": false
+    },
+    "stephen-gemma-4-26b-a4b-it-free": {
+      "id": "google/gemma-4-26b-a4b-it:free",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "stephen-gemma-4-31b-it-free": {
+      "id": "google/gemma-4-31b-it:free",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "stephen-google-gemini-3-flash-preview": {
+      "id": "gemini-3-flash-preview",
+      "llm_client": "google_gemini_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-google-gemini-3.1-flash-lite": {
+      "id": "gemini-3.1-flash-lite",
+      "llm_client": "google_gemini_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-google-gemini-3.5-flash-lite": {
+      "id": "gemini-3.5-flash-lite",
+      "llm_client": "google_gemini_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-google-gemini-3.6-flash": {
+      "id": "gemini-3.6-flash",
+      "llm_client": "google_gemini_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-google-gemini-3.8-flash": {
+      "id": "gemini-3.8-flash",
+      "llm_client": "google_gemini_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-google-gemini-4-hydrogen": {
+      "id": "gemini-4-hydrogen",
+      "llm_client": "google_gemini_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-google-gemma-4-26b-a4b-it": {
+      "id": "gemma-4-26b-a4b-it",
+      "llm_client": "google_gemini_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-google-gemma-4-31b-it": {
+      "id": "gemma-4-31b-it",
+      "llm_client": "google_gemma_31b_stephen",
+      "vision": false,
+      "video": false
+    },
+    "stephen-ling-3_2-flash-free": {
+      "id": "inclusionai/ling-3.2-flash:free",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "stephen-nemotron-3-5-super-vl-free": {
+      "id": "nvidia/nemotron-3.5-super-vl:free",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": true,
+      "video": true
+    },
+    "stephen-paid-deepseek-v4-1-flash-1017": {
+      "id": "deepseek/deepseek-v4.1-flash-1017",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": true,
+      "video": false
+    },
+    "stephen-paid-glm-5-3-flash": {
+      "id": "z-ai/glm-5.3-flash",
+      "llm_client": "openrouter_stephen",
+      "tool_calling": true,
+      "vision": true,
+      "video": true
+    },
+    "thaillm-openthaigpt": {
+      "id": "openthaigpt-thaillm-8b-instruct-v7.2",
+      "llm_client": "thaillm",
+      "vision": false
+    },
+    "thaillm-qwen3_5-9b": {
+      "id": "qwen3.5-9b",
+      "llm_client": "thaillm",
+      "vision": false
+    },
+    "thaillm-qwen3_6-35b-a3b": {
+      "id": "qwen3.6-35b-a3b",
+      "llm_client": "thaillm",
+      "vision": false
+    },
+    "thaillm-thalle": {
+      "id": "thalle-0.2-thaillm-8b-fa",
+      "llm_client": "thaillm",
+      "vision": false
+    },
+    "thaillm-typhoon": {
+      "id": "typhoon-s-thaillm-8b-instruct",
+      "llm_client": "thaillm",
+      "vision": false
+    }
+  },
+  "manifest_sha256": "fff8d8da5234c9ba6c47011ab371a24919d02d3e199dbb9200515db2684fbfaa"
+}

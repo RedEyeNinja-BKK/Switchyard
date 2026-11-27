@@ -16,19 +16,25 @@ mod provider_key_redactor;
 pub mod request_fit;
 mod route;
 mod runner;
+pub mod selection;
 
 pub use algorithm::{
     AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, CategoryModelConfig, ClassifierMode,
     ClassifierPolicyConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
-pub use config::BillingKind;
 pub use config::RouteReasoningPolicy;
+pub use config::{
+    BillingKind, ClientLocality, CompositeCrossPolicy, QuotaProvider, SelectionPolicy,
+    TerminalPolicy,
+};
 pub use facts::{ClientFacts, DeploymentFacts, RouteFacts, TargetFacts};
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 // Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.
 pub use libsy::RuntimeModels;
 pub use provider_key_redactor::ProviderKeyRedactor;
 pub use route::{
-    AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
+    AuxiliaryTarget, CallerAuthKind, HeldRoute, Locality, MediaCarrier, ModelCapabilities, Route,
+    RunOutput, RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};
+pub use selection::MeasuredSelector;

@@ -21,6 +21,14 @@ pub struct ClientFacts {
     pub api_key_env: Option<String>,
     /// How the client's usage is billed, when the deployment states it.
     pub billing: Option<crate::config::BillingKind>,
+    /// The quota group the client's daily counter belongs to.
+    ///
+    /// Already resolved to the client's own name when the deployment names no group, so a
+    /// consumer never has to repeat that default. Two clients stating the same group share
+    /// one counter, and this is how the economics layer finds it.
+    pub quota_group: Option<String>,
+    /// The provider-reported pool this client's counter reconciles against, when declared.
+    pub quota_provider: Option<crate::config::QuotaProvider>,
 }
 
 /// The configuration facts of one target.

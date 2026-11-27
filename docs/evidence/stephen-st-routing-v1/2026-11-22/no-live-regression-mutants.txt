@@ -1,0 +1,10 @@
+# Negative controls for the no-live-regression guard
+# run 2026-11-22T06:43:03Z
+OK    round-trip preserves the live manifest exactly
+CAUGHT  M1 deployed-only target dropped   expected_check='L1 no deployed target is dropped' exit=1
+CAUGHT  M2 unreviewed route key change (direct-comfyninja-qwen3_8-27b-q4-mtp)   expected_check='L4 deployed routes change only in reviewed keys' exit=1
+CAUGHT  M3 unreviewed target key change   expected_check='L3 deployed targets change only in reviewed keys' exit=1
+CAUGHT  M4 candidate drops a non-target key   expected_check='L5 deployed non-target sections survive unchanged' exit=1
+PASS  CONTROL unmutated live manifest passes
+
+4 mutants, 0 not caught

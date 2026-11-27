@@ -1,0 +1,4 @@
+{"probe": "turn1", "status": 200, "ms": 2930}
+{"probe": "turn1_tool_call_verbatim", "tool_call": {"extra_content": {"google": {"thought_signature": "EiYKJGUyNDgzMGE3LTVjZDYtNDJmZS05OThiLWVlNTM5ZTcyYjljMw=="}}, "function": {"arguments": "{\"location\":\"Bangkok\"}", "name": "get_weather"}, "id": "call_13380804948741808690", "type": "function"}}
+{"probe": "turn2_verbatim", "status": 503, "ms": 767, "error": "[{'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}]"}
+{"probe": "turn2_stripped", "status": 200, "ms": 2042, "finish_reason": "stop", "content_head": "<thought>The tool `get_weather` returned the temperature as 31\u00b0C and the conditions as \"hazy\" for Bangkok. I should now communicate this information to the user.</thought>The weather in Bangkok is currently 31\u00b0C and hazy."}

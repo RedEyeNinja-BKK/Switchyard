@@ -1,0 +1,371 @@
+{
+  "generated": "2026-11-22T12:45:00+07:00",
+  "issue": 58,
+  "batch": "A",
+  "baseline": {
+    "release": "20261122T050658Z-bf25c056b4598e65-1071be2f",
+    "source_commit": "07796640f7150e802bd5924c275680b0431fdea3",
+    "source_branch": "feat/gemini-r3-adaptive-bounded-live",
+    "binary_sha256": "bf25c056b4598e65efcd4d293139b9b1167a09c851c5d8a617afb8d61026637c",
+    "config_sha256": "1071be2fcbda2b146af6312071253bc3441c6ba5704ef02cc2ba21bd4efb6a02",
+    "config_bytes": 103416,
+    "provenance": "attested true (declared-at-deploy); no rebuild compared, recorded by the release itself",
+    "note": "The previous release in this session (20261122T042635Z, c9da3dc9) carried the same Stephen/ST slice; only five Google capability entries differed, so this delta is unchanged by the rebase."
+  },
+  "policy": {
+    "credential_client": "openrouter_stephen",
+    "credential_env_name": "SWITCHYARD_STEPHEN_OPENROUTER_API_KEY",
+    "st_route_context_cap": 262144,
+    "dynamic_selector_removed": "openrouter/free"
+  },
+  "groups": {
+    "ST_OR_Free": {
+      "kind": "catalogue label",
+      "callable": false,
+      "members": [
+        "stephen-ernie-5_5-flash-preview-free",
+        "stephen-flint-v1-0-free",
+        "stephen-dots-3-note-preview-free",
+        "stephen-gemma-4-26b-a4b-it-free",
+        "stephen-gemma-4-31b-it-free",
+        "stephen-ling-3_2-flash-free",
+        "stephen-nemotron-3-5-super-vl-free"
+      ]
+    },
+    "ST_OR_Paid": {
+      "kind": "catalogue label",
+      "callable": false,
+      "members": [
+        "stephen-paid-deepseek-v4-1-flash-1017",
+        "stephen-paid-glm-5-3-flash"
+      ]
+    },
+    "ST_Gemini_Free": {
+      "kind": "catalogue label",
+      "callable": false,
+      "status": "HELD_EXTERNAL",
+      "members": [],
+      "reason": "no Stephen Google client, target, route or quota group exists; the staged key is loaded but inert and unauthenticated"
+    }
+  },
+  "leaves": [
+    {
+      "route": "direct-openrouter-stephen-ernie-5_5-flash-preview-free",
+      "target": "stephen-ernie-5_5-flash-preview-free",
+      "upstream_id": "baidu/ernie-5.5-flash-preview:free",
+      "free": true,
+      "disposition": "INCLUDE",
+      "declared_route_context": 1024000,
+      "provider_context": 1024000,
+      "provider_max_completion_tokens": 921600,
+      "declared": {
+        "vision": false,
+        "video": false,
+        "tool_calling": true
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "free_entitlement": "VERIFIED_CATALOGUE (prompt 0, completion 0)",
+        "text_only": "VERIFIED_CATALOGUE (input modalities [text])",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "OBSERVED (443 ST_* completions served, 2026-10-22..2026-11-22 routing log)"
+      },
+      "references": [
+        "ST_Free (primary)"
+      ],
+      "changed_in_batch_a": "context_window 262144 -> 1024000; free_tier declared"
+    },
+    {
+      "route": "direct-openrouter-stephen-ling-3_2-flash-free",
+      "target": "stephen-ling-3_2-flash-free",
+      "upstream_id": "inclusionai/ling-3.2-flash:free",
+      "free": true,
+      "disposition": "INCLUDE",
+      "declared_route_context": 1048576,
+      "provider_context": 1048576,
+      "provider_max_completion_tokens": 262144,
+      "declared": {
+        "vision": true,
+        "video": false,
+        "tool_calling": true,
+        "image_carrier": "inline",
+        "reasoning_policy": "disabled"
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "free_entitlement": "VERIFIED_CATALOGUE (prompt 0, completion 0)",
+        "vision": "VERIFIED_CATALOGUE (input modalities include image)",
+        "reasoning_disabled": "MEASURED (thinking ~17.5 s vs ~1.4 s without; ~120 s at 430k tokens)",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "OBSERVED (4 ST_* completions served)"
+      },
+      "references": [
+        "ST_Free (candidate)"
+      ],
+      "changed_in_batch_a": "context_window 262144 -> 1048576; free_tier declared"
+    },
+    {
+      "route": "direct-openrouter-stephen-nemotron-3-5-super-vl-free",
+      "target": "stephen-nemotron-3-5-super-vl-free",
+      "upstream_id": "nvidia/nemotron-3.5-super-vl:free",
+      "free": true,
+      "disposition": "INCLUDE",
+      "declared_route_context": 1000000,
+      "provider_context": 1000000,
+      "provider_max_completion_tokens": 131072,
+      "declared": {
+        "vision": true,
+        "video": true,
+        "tool_calling": true,
+        "image_carrier": "inline",
+        "video_carrier": "inline"
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "free_entitlement": "VERIFIED_CATALOGUE (prompt 0, completion 0)",
+        "vision": "MEASURED (inline image 200, remote image 404 on this credential)",
+        "video": "VERIFIED_CATALOGUE (input modalities include video)",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "OBSERVED (13 ST_* completions served)"
+      },
+      "references": [
+        "ST_Free (candidate, escalation target)"
+      ],
+      "changed_in_batch_a": "context_window 262144 -> 1000000; free_tier declared"
+    },
+    {
+      "route": "direct-openrouter-stephen-flint-v1-0-free",
+      "target": "stephen-flint-v1-0-free",
+      "upstream_id": "recursive/flint-v1.0:free",
+      "free": true,
+      "disposition": "INCLUDE",
+      "declared_route_context": 262144,
+      "provider_context": 262144,
+      "provider_max_completion_tokens": 235929,
+      "declared": {
+        "vision": false,
+        "tool_calling": true
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "free_entitlement": "VERIFIED_CATALOGUE (prompt 0, completion 0)",
+        "text_only": "VERIFIED_CATALOGUE (input modalities [text])",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "NO_RECEIPT (0 ST_* completions; orphan leaf, reachable by name)"
+      },
+      "references": [
+        "ST_Free (candidate, added in batch A)"
+      ],
+      "changed_in_batch_a": "added as an explicit ST_Free candidate; free_tier declared"
+    },
+    {
+      "route": "direct-openrouter-stephen-dots-3-note-preview-free",
+      "target": "stephen-dots-3-note-preview-free",
+      "upstream_id": "dots-studio/dots-3-note-preview:free",
+      "free": true,
+      "disposition": "CONDITIONAL",
+      "declared_route_context": 262144,
+      "provider_context": null,
+      "provider_max_completion_tokens": null,
+      "declared": {
+        "vision": true,
+        "video": false,
+        "tool_calling": true
+      },
+      "grade": {
+        "context": "UNVERIFIED (model absent from the 2026-11-22 public catalogue; 262144 is the existing declaration)",
+        "free_entitlement": "DECLARED (`:free` slug, serving observed); no catalogue row to price",
+        "vision": "DECLARED_UNVERIFIED (no catalogue row)",
+        "serving": "OBSERVED (921 ST_* completions served, the largest single model share)"
+      },
+      "references": [
+        "ST_Free (candidate, added in batch A)"
+      ],
+      "changed_in_batch_a": "added as an explicit ST_Free candidate; free_tier declared",
+      "condition": "keep while it serves; hold if a request fails with a retired-model class, because the catalogue no longer lists it"
+    },
+    {
+      "route": "direct-openrouter-stephen-google-gemma-4-26b-a4b-it-free",
+      "target": "stephen-gemma-4-26b-a4b-it-free",
+      "upstream_id": "google/gemma-4-26b-a4b-it:free",
+      "free": true,
+      "disposition": "INCLUDE",
+      "declared_route_context": 262144,
+      "provider_context": 262144,
+      "provider_max_completion_tokens": 32768,
+      "declared": {
+        "vision": true,
+        "video": false,
+        "tool_calling": true,
+        "image_carrier": "inline"
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "free_entitlement": "VERIFIED_CATALOGUE (prompt 0, completion 0)",
+        "vision": "UNVERIFIED (every 2026-11-11 probe was refused upstream 429/503; inline admitted, remote refused)",
+        "video": "GAP: provider declares video input on this id, target refuses video and no wire test exists",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "NO_RECEIPT (0 ST_* completions; orphan leaf, reachable by name)"
+      },
+      "references": [
+        "ST_Free (candidate, added in batch A)"
+      ],
+      "changed_in_batch_a": "added as an explicit ST_Free candidate; free_tier declared",
+      "condition": "video stays refused until a wire test proves it; the provider modality row is not sufficient evidence"
+    },
+    {
+      "route": "direct-openrouter-stephen-google-gemma-4-31b-it-free",
+      "target": "stephen-gemma-4-31b-it-free",
+      "upstream_id": "google/gemma-4-31b-it:free",
+      "free": true,
+      "disposition": "INCLUDE",
+      "declared_route_context": 262144,
+      "provider_context": 262144,
+      "provider_max_completion_tokens": 32768,
+      "declared": {
+        "vision": true,
+        "video": false,
+        "tool_calling": true,
+        "image_carrier": "inline"
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "free_entitlement": "VERIFIED_CATALOGUE (prompt 0, completion 0)",
+        "vision": "UNVERIFIED (every 2026-11-11 probe was refused upstream 429/503; inline admitted, remote refused)",
+        "video": "GAP: provider declares video input on this id, target refuses video and no wire test exists",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "NO_RECEIPT (0 ST_* completions; orphan leaf, reachable by name)"
+      },
+      "references": [
+        "ST_Free (candidate, added in batch A)"
+      ],
+      "changed_in_batch_a": "added as an explicit ST_Free candidate; free_tier declared",
+      "condition": "video stays refused until a wire test proves it; the provider modality row is not sufficient evidence"
+    },
+    {
+      "route": "direct-openrouter-stephen-deepseek-v4-1-flash-1017",
+      "target": "stephen-paid-deepseek-v4-1-flash-1017",
+      "upstream_id": "deepseek/deepseek-v4.1-flash-1017",
+      "free": false,
+      "disposition": "INCLUDE",
+      "declared_route_context": 1048576,
+      "provider_context": 1048576,
+      "provider_max_completion_tokens": 393216,
+      "declared": {
+        "vision": true,
+        "video": false,
+        "tool_calling": true
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "metered": "VERIFIED_CATALOGUE (prompt 1.5e-7, completion 6.0e-7 per token)",
+        "vision": "VERIFIED_CATALOGUE (input modalities include image)",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "OBSERVED (149 ST_* completions served)"
+      },
+      "references": [
+        "ST_Paid (primary)"
+      ],
+      "changed_in_batch_a": "none"
+    },
+    {
+      "route": "direct-openrouter-stephen-glm-5-3-flash",
+      "target": "stephen-paid-glm-5-3-flash",
+      "upstream_id": "z-ai/glm-5.3-flash",
+      "free": false,
+      "disposition": "INCLUDE",
+      "declared_route_context": 1048576,
+      "provider_context": 1048576,
+      "provider_max_completion_tokens": 131072,
+      "declared": {
+        "vision": true,
+        "video": true,
+        "tool_calling": true,
+        "image_carrier": "both",
+        "video_carrier": "both"
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE",
+        "metered": "VERIFIED_CATALOGUE (prompt 3.99e-8, completion 7.84e-8 per token)",
+        "vision": "MEASURED (text, inline image, remote image, inline video, remote video each 200 through this deployment's wire, 2026-11-11)",
+        "video": "MEASURED (same receipt; the only Stephen target proven on both carriers for both media)",
+        "tool_calling": "DECLARED_UNVERIFIED (no tool-call receipt in this batch)",
+        "serving": "OBSERVED (989 ST_* completions served)"
+      },
+      "references": [
+        "ST_Paid (candidate)"
+      ],
+      "changed_in_batch_a": "none"
+    },
+    {
+      "route": "direct-openrouter-stephen-openrouter-free",
+      "target": "stephen-openrouter-free",
+      "upstream_id": "openrouter/free",
+      "free": true,
+      "disposition": "REMOVED",
+      "declared_route_context": null,
+      "provider_context": 200000,
+      "provider_max_completion_tokens": null,
+      "declared": {
+        "vision": true,
+        "video": false,
+        "tool_calling": true
+      },
+      "grade": {
+        "context": "VERIFIED_CATALOGUE before removal",
+        "identity": "NOT_A_MODEL: a provider-side router that chooses an eligible free model per request"
+      },
+      "references": [
+        "ST_Free (candidate 3, removed)",
+        "direct route removed"
+      ],
+      "changed_in_batch_a": "target and leaf deleted; the 0 requests naming either in the last 30 days of routing log is the compatibility evidence"
+    }
+  ],
+  "typed": {
+    "ST_Embed": {
+      "kind": "capability",
+      "target": "embedding-stephen",
+      "dimensions": 4096,
+      "normalization": "L2",
+      "model": "nvidia/nemotron-3.5-embed-8b:free",
+      "state": "SERVING",
+      "change": "none"
+    },
+    "ST_Rerank": {
+      "kind": "capability",
+      "target": "reranker-stephen",
+      "model": "nvidia/nemotron-3.5-rerank-8b:free",
+      "state": "SERVING",
+      "change": "none"
+    },
+    "ST_Decisions": {
+      "kind": "decision lane",
+      "plural": true,
+      "targets": [
+        "direct-openrouter-stephen-span-01-lite"
+      ],
+      "supported_types": {
+        "noul": true,
+        "choice": false,
+        "score": false
+      },
+      "state": "SERVING",
+      "change": "none"
+    },
+    "ST_Gemini_Free": {
+      "kind": "catalogue label",
+      "state": "HELD_EXTERNAL",
+      "reason": "no Stephen Google client/target/route; key staged and loaded, not authenticated, zero targets"
+    }
+  },
+  "not_changed": [
+    "ST_Route (children, cross_on=credential_block, context 262144)",
+    "ST_Paid (targets, context 1048576)",
+    "ST_Embed, ST_Rerank, ST_Decisions",
+    "owner smartfree, smart_gemini, smart-gemini-*, smart-nt, smart-nt-bounded-trial, VC_Paid",
+    "owner direct-* routes and all owner targets",
+    "all google_gemini clients, targets, capabilities and quota controls",
+    "[quota], [decision_lane_composition], [capability_clients], [llm_clients]"
+  ]
+}

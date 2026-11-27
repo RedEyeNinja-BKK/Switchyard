@@ -5,8 +5,13 @@
 
 mod buffered;
 mod stream;
+mod thought;
 
 pub use buffered::OpenAiChatCodec;
 pub use stream::OpenAiChatStreamCodec;
 
 pub(crate) use buffered::{decode_file_source, decode_image_source};
+pub use thought::{
+    Filtered, HostedReasoningMarker, Split, ThoughtLeak, ThoughtStreamFilter,
+    split_hosted_reasoning,
+};

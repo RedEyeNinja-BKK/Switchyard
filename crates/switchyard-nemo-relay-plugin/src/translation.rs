@@ -44,6 +44,13 @@ fn policy() -> TranslationPolicy {
         },
         preservation: PreservationPolicy::InMemory,
         target_capabilities: TargetCapabilities::default(),
+        // The relay carries no provider-specific response shaping: a marker belongs to the
+        // upstream that emits it, and this plugin is not that upstream.
+        hosted_reasoning: None,
+        // The relay encodes responses only and never decides a replay, so the safe default is
+        // the one that sends nothing it cannot prove.
+        reasoning_details_replay: switchyard_translation::ReasoningDetailsReplay::ProvenanceBound,
+        reasoning_admission: None,
     }
 }
 

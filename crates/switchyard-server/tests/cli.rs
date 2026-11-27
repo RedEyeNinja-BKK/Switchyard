@@ -100,6 +100,45 @@ policy = {{ type = "target_selector", selector = "/target" }}
     Ok(())
 }
 
+// A held alias is registered, so the inventory lists it; the banner must say so rather than
+// report the alias as one of the routes the configuration was just accepted with.
+#[test]
+fn dry_run_marks_a_held_route_instead_of_listing_it_as_served() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let config = directory.path().join("routes.toml");
+    fs::write(
+        &config,
+        r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "http://127.0.0.1:1/v1"
+[targets]
+live = { id = "live/model", llm_client = "upstream" }
+held = { id = "held/model", llm_client = "upstream", held = "Google answers HTTP 404." }
+[routes.live]
+id = "switchyard/live"
+type = "passthrough"
+target = "live"
+[routes.held]
+id = "switchyard/held"
+type = "passthrough"
+target = "held"
+"#,
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_switchyard-server"))
+        .args(["--config", config.to_string_lossy().as_ref(), "--dry-run"])
+        .env("RUST_LOG", "warn")
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("server OK: switchyard/held (held), switchyard/live"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
 // Dry-run rejects unsendable headers before startup without exposing credentials.
 #[test]
 fn dry_run_rejects_unsendable_configured_headers() -> TestResult {

@@ -1,0 +1,10 @@
+# No-live-regression guard - anchored on DEPLOYED bytes
+# run 2026-11-22T06:43:03Z
+PASS  L1 no deployed target is dropped   dropped=['stephen-openrouter-free'] sanctioned=['stephen-openrouter-free'] unexpected=[]
+PASS  L2 no deployed route is dropped   dropped=['direct-openrouter-stephen-openrouter-free'] sanctioned=['direct-openrouter-stephen-openrouter-free'] unexpected=[]
+PASS  L3 deployed targets change only in reviewed keys   drifted=[]
+PASS  L4 deployed routes change only in reviewed keys   drifted=[]
+PASS  L5 deployed non-target sections survive unchanged   lost=[]
+PASS  L6 every deployed target is present or explicitly sanctioned for removal   unaccounted=[]
+
+6 checks, 0 failed

@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 use humantime::format_rfc3339_millis;
 use serde::{Deserialize, Serialize};
+use switchyard_llm_client::SelectionTrace;
 use switchyard_protocol::{Metadata, ModelId, Usage};
 
 use crate::usage_metrics::token_usage;
@@ -22,8 +23,11 @@ const ORIGIN_HEADER: &str = "x-switchyard-origin";
 const TASK_HEADER: &str = "x-switchyard-intake-task";
 const TRIAL_ID_HEADER: &str = "x-switchyard-trial-id";
 
-/// Append-only writer for one routing JSONL file.
-pub(crate) struct RoutingLog(fs::File);
+/// Append-only writer for one routing JSONL file, plus the decision log beside it.
+pub(crate) struct RoutingLog {
+    attempts: fs::File,
+    decisions: fs::File,
+}
 
 impl RoutingLog {
     pub(crate) fn new(path: impl Into<PathBuf>) -> ServerResult<Self> {
@@ -39,7 +43,31 @@ impl RoutingLog {
             .append(true)
             .open(&path)
             .map_err(|error| routing_log_error(&path, error))?;
-        Ok(Self(file))
+        // The decision stream is a separate file on purpose: an attempt record carries
+        // usage, a decision record carries the candidates that were never attempted, and a
+        // session snapshot must not have to tell two shapes apart to sum tokens.
+        let decision_path = path.with_extension("decisions.jsonl");
+        let decisions = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&decision_path)
+            .map_err(|error| routing_log_error(&decision_path, error))?;
+        Ok(Self {
+            attempts: file,
+            decisions,
+        })
+    }
+
+    /// One request's selection decision, written to the decision log.
+    pub(crate) fn append_decision(
+        &mut self,
+        context: RoutingLogContext,
+        trace: &SelectionTrace,
+    ) -> std::io::Result<()> {
+        let record = RoutingDecisionRecord::from_trace(context, trace);
+        let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        self.decisions.write_all(&line)
     }
 
     /// Composition facts for one request, appended to the same record so the served
@@ -83,7 +111,7 @@ impl RoutingLog {
         let mut line = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
         line.push(b'\n');
 
-        self.0.write_all(&line)
+        self.attempts.write_all(&line)
     }
 }
 
@@ -188,6 +216,134 @@ struct RoutingRecord<'a> {
     total_tokens: u64,
 }
 
+/// One request's selection decision, written to the decision log beside the routing log.
+///
+/// The routing log records attempts that completed and produced usage. This record names the
+/// candidates that were *never* attempted and why, which is the half of the story the
+/// attempt log cannot carry: a request whose Google leg was skipped on privacy grounds has no
+/// usage line at all, so without this the exclusion is indistinguishable from a route that
+/// never declared Google.
+#[derive(Serialize)]
+struct RoutingDecisionRecord<'a> {
+    ts: Cow<'a, str>,
+    route_id: Cow<'a, str>,
+    algorithm: Cow<'a, str>,
+    /// `served`, `no_eligible_candidate` or `failed`.
+    outcome: &'static str,
+    served: Option<Cow<'a, str>>,
+    /// Bytes the conversation was costed at, including any output reservation.
+    demand_tokens: u64,
+    /// Input tokens the hard gates judged the payload by.
+    input_tokens: u64,
+    /// Declared order, so a reader can tell a demotion from a declaration.
+    considered: Vec<String>,
+    /// The order actually handed to dispatch.
+    dispatched: Vec<String>,
+    /// Candidate to the rule that excluded it before any call.
+    skipped: BTreeMap<String, &'static str>,
+    /// Candidate to the measurement that moved it down the order.
+    demoted: BTreeMap<String, &'static str>,
+    /// Leg the context-pressure rule offered first, when it did.
+    promotion: Option<String>,
+    /// Targets this route may reach only after every eligible primary is unavailable.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    terminal: Vec<String>,
+    /// Why this request stepped onto the terminal leg, when it did.
+    ///
+    /// Absent means the terminal leg was declared and not used, which is the common case.
+    /// A value names the claim that authorized the crossing, so a reader can tell a genuine
+    /// pool exhaustion from a leg that was simply reached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_crossed: Option<&'static str>,
+    /// The ordered tiers the terminal declaration was written as, when it had more than one.
+    ///
+    /// Omitted for the historical single-set shape, so existing records read exactly as they
+    /// did. Present only when the manifest declared an escalation order, because that is the
+    /// only case where the flat `terminal` union could be misread as one peer pool.
+    #[serde(skip_serializing_if = "terminal_tiers_are_not_a_sequence")]
+    terminal_tiers: Vec<Vec<String>>,
+    /// One-based index of the tier that answered, when the leg was crossed at a tier boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_tier: Option<usize>,
+    /// Terminal target to the rule that excluded it, recorded only for tiers the walk reached.
+    ///
+    /// Beside `terminal_crossed` on purpose. `terminal_crossed` absent means no tier was spent,
+    /// and that alone cannot distinguish "the tiers were never consulted" from "the tiers were
+    /// asked and could not hold this request". A non-empty map is a traversal fact -- the walk
+    /// reached that tier and it admitted nothing -- so it settles the distinction without a
+    /// second field. Absent means no tier was reached (never consulted) or every reached tier
+    /// had an eligible target.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    terminal_skipped: BTreeMap<String, &'static str>,
+    attempts: Vec<AttemptDecision>,
+}
+
+#[derive(Serialize)]
+struct AttemptDecision {
+    model: String,
+    /// `routing` or `answer`.
+    phase: &'static str,
+    /// Stable outcome code, `served` when the call completed.
+    outcome: &'static str,
+    duration_ms: u64,
+}
+
+impl<'a> RoutingDecisionRecord<'a> {
+    fn from_trace(context: RoutingLogContext, trace: &SelectionTrace) -> Self {
+        let mut skipped = BTreeMap::new();
+        let mut demoted = BTreeMap::new();
+        let terminal_skipped = trace.terminal_skipped.iter().cloned().collect();
+        for candidate in &trace.candidates {
+            if let Some(code) = candidate.exclusion {
+                skipped.insert(candidate.model.clone(), code);
+            }
+            if let Some(code) = candidate.demotion {
+                demoted.insert(candidate.model.clone(), code);
+            }
+        }
+        Self {
+            ts: format_rfc3339_millis(SystemTime::now()).to_string().into(),
+            route_id: context.route_id.into(),
+            algorithm: context.algorithm.into(),
+            outcome: trace.outcome,
+            served: trace.served.clone().map(Cow::Owned),
+            demand_tokens: trace.demand_tokens,
+            input_tokens: trace.estimated_input_tokens,
+            considered: trace.considered.clone(),
+            dispatched: trace.dispatched.clone(),
+            skipped,
+            demoted,
+            promotion: trace.promotion.clone(),
+            terminal: trace.terminal.clone(),
+            terminal_crossed: trace
+                .terminal_crossed
+                .then(|| trace.terminal_reason.unwrap_or("terminal")),
+            terminal_tiers: trace.terminal_tiers.clone(),
+            terminal_tier: trace.terminal_tier,
+            terminal_skipped,
+            attempts: trace
+                .attempts
+                .iter()
+                .map(|attempt| AttemptDecision {
+                    model: attempt.model.clone(),
+                    phase: attempt.phase,
+                    outcome: attempt.outcome,
+                    duration_ms: attempt.duration_ms,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Whether the tiered form would add nothing the flat `terminal` union does not already say.
+///
+/// A declaration written as one set — including every manifest that predates tiers — has no
+/// escalation order to record, and emitting `[[a, b]]` beside `[a, b]` would invite a reader to
+/// believe an order was declared. Only a genuine sequence is serialized.
+fn terminal_tiers_are_not_a_sequence(tiers: &[Vec<String>]) -> bool {
+    tiers.len() <= 1
+}
+
 /// Session totals returned by the routing stats endpoint.
 #[derive(Serialize)]
 pub(crate) struct SessionStatsSnapshot {
@@ -276,6 +432,7 @@ fn routing_log_error(path: &Path, error: std::io::Error) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use switchyard_llm_client::{AttemptTrace, CandidateTrace};
 
     /// Missing, empty, and non-text origin headers remain absent even with a User-Agent.
     #[test]
@@ -333,5 +490,92 @@ mod tests {
         assert_eq!(stats.models["m1"].calls, 1);
         assert_eq!(stats.models["unknown"].prompt_tokens, 5);
         assert!(snapshot(&path, "missing").expect("read log").is_none());
+    }
+
+    /// A decision record states the two things the attempt log cannot: which candidate was
+    /// never contacted and why, and which one was moved down after being measured.
+    #[test]
+    fn a_decision_record_names_skipped_and_demoted_candidates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("routing.jsonl");
+        let mut log = RoutingLog::new(&path).expect("routing log");
+        let trace = SelectionTrace {
+            algorithm: "passthrough".to_string(),
+            considered: vec!["gated".to_string(), "healthy".to_string()],
+            candidates: vec![
+                CandidateTrace {
+                    model: "gated".to_string(),
+                    eligible: false,
+                    exclusion: Some("privacy_refused"),
+                    tier: "free",
+                    rank: None,
+                    remaining_today: Some(14_400),
+                    pressure_permille: 120,
+                    demotion: None,
+                },
+                CandidateTrace {
+                    model: "healthy".to_string(),
+                    eligible: true,
+                    exclusion: None,
+                    tier: "free",
+                    rank: Some(0),
+                    remaining_today: Some(500),
+                    pressure_permille: 40,
+                    demotion: None,
+                },
+            ],
+            dispatched: vec!["healthy".to_string()],
+            attempts: vec![AttemptTrace {
+                model: "healthy".to_string(),
+                phase: "answer",
+                outcome: "served",
+                duration_ms: 412,
+                prompt_tokens: 900,
+                completion_tokens: 20,
+            }],
+            served: Some("healthy".to_string()),
+            outcome: "served",
+            demand_tokens: 1_234,
+            estimated_input_tokens: 1_000,
+            promotion: None,
+            pool: None,
+            terminal: Vec::new(),
+            terminal_tiers: Vec::new(),
+            terminal_crossed: false,
+            terminal_reason: None,
+            terminal_tier: None,
+            terminal_skipped: Vec::new(),
+        };
+        log.append_decision(
+            RoutingLogContext {
+                route_id: "gemini-lite".to_string(),
+                algorithm: "passthrough".to_string(),
+                origin: None,
+                task: None,
+                trial_id: None,
+                session_id: None,
+            },
+            &trace,
+        )
+        .expect("append decision");
+
+        let written = fs::read_to_string(path.with_extension("decisions.jsonl"))
+            .expect("decision log written beside the routing log");
+        let record: serde_json::Value =
+            serde_json::from_str(written.lines().next().expect("one line")).expect("valid json");
+        assert_eq!(record["route_id"], "gemini-lite");
+        assert_eq!(record["outcome"], "served");
+        assert_eq!(record["served"], "healthy");
+        assert_eq!(record["skipped"]["gated"], "privacy_refused");
+        assert_eq!(record["demoted"], serde_json::json!({}));
+        assert_eq!(record["dispatched"][0], "healthy");
+        assert_eq!(record["attempts"][0]["outcome"], "served");
+        assert_eq!(record["attempts"][0]["duration_ms"], 412);
+        // Control: the attempt stream is a different file, so a decision line can never be
+        // summed into token totals by a session snapshot.
+        assert!(
+            !path.exists() || fs::read_to_string(&path).expect("read").is_empty(),
+            "an attempt record must not be written by a decision append"
+        );
     }
 }

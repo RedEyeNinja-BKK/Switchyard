@@ -1637,3 +1637,519 @@ async fn transcription_passes_an_upstream_failure_back() {
         String::from_utf8_lossy(&body)
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Package D: typed rerank selection and pre-egress data admission.
+//
+// The selector walks interchangeable engines in declared order. Admission is evaluated before
+// anything is sent, from the caller's own declaration rather than from the payload's contents:
+// the broad content filter was removed on 2026-11-21 and must not return through this surface.
+// ---------------------------------------------------------------------------------------------
+
+/// A rerank selector over a local engine and a third-party free engine, exactly the deployed
+/// shape: `smartlocal-rerank` first, `smartfree-rerank` second.
+fn selector_config(local: &str, free: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.reranker-local]
+format = "cohere_jina_rerank"
+base_url = "{local}"
+model = "qwen3-reranker-0.6b-q8_0"
+
+[capability_clients.reranker-free]
+format = "cohere_jina_rerank"
+base_url = "{free}"
+model = "nvidia/nemotron-3.5-rerank-8b:free"
+privacy = "third_party_free"
+
+[capabilities.smart-rerank]
+id = "smart-rerank"
+target = "reranker-local"
+candidates = ["reranker-free"]
+max_candidates = 64
+top_n = 5
+max_doc_chars = 1024
+max_query_chars = 512
+"#
+    )
+}
+
+/// A rerank answer shaped the way these engines actually reply.
+fn rerank_answer() -> Value {
+    json!({
+        "id": "rerank-1",
+        "results": [{"index": 0, "relevance_score": 0.93, "document": "alpha"}],
+    })
+}
+
+/// Post with an explicit data-class declaration (or none, when `class` is `None`).
+async fn post_with_class(
+    router: axum::Router,
+    uri: &str,
+    body: Value,
+    class: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(class) = class {
+        builder = builder.header("x-switchyard-data-class", class);
+    }
+    let response = router
+        .oneshot(builder.body(Body::from(body.to_string())).expect("request builds"))
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    (status, bytes.to_vec())
+}
+
+fn rerank_body() -> Value {
+    json!({"model": "smart-rerank", "query": "find alpha", "documents": ["alpha", "beta"]})
+}
+
+// An unstated class is not evidence that the material is public, so it may only reach an
+// endpoint that declares no restriction. The retentive engine in the same selector must stay
+// untouched - but the request itself is served, because the internal engine may hold it.
+#[tokio::test]
+async fn an_unstated_data_class_never_reaches_a_third_party_free_engine() {
+    let local = MockServer::start().await;
+    let free = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rerank_answer()))
+        .expect(1)
+        .mount(&local)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rerank_answer()))
+        .expect(0)
+        .mount(&free)
+        .await;
+
+    let router = serve(&selector_config(&local.uri(), &free.uri())).await;
+    let (status, body) = post_with_class(router, "/v1/rerank", rerank_body(), None).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the internal engine serves an unclassified payload: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        free.received_requests().await.unwrap_or_default().len(),
+        0,
+        "no request may reach the third-party free engine"
+    );
+}
+
+// When the only engine is third-party free, an unstated class is refused rather than guessed,
+// and the refusal names the class and the engine instead of pretending the capability is absent.
+#[tokio::test]
+async fn an_unstated_data_class_is_refused_when_the_only_engine_is_third_party_free() {
+    let free = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rerank_answer()))
+        .expect(0)
+        .mount(&free)
+        .await;
+
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.reranker-free]
+format = "cohere_jina_rerank"
+base_url = "{}"
+model = "nvidia/nemotron-3.5-rerank-8b:free"
+privacy = "third_party_free"
+
+[capabilities.smart-rerank]
+id = "smart-rerank"
+target = "reranker-free"
+max_candidates = 64
+top_n = 5
+max_doc_chars = 1024
+max_query_chars = 512
+"#,
+        free.uri()
+    );
+
+    let router = serve(&config).await;
+    let (status, body) = post_with_class(router, "/v1/rerank", rerank_body(), None).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an unstated class must not reach a retentive endpoint: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("egress_not_admitted"), "{text}");
+    assert!(text.contains("unknown"), "the refusal names the class: {text}");
+    assert!(
+        text.contains("reranker-free"),
+        "the refusal names the engine that was skipped: {text}"
+    );
+    assert_eq!(
+        free.received_requests().await.unwrap_or_default().len(),
+        0,
+        "the payload never leaves the process"
+    );
+}
+
+// The local engine keeps working exactly as before for ordinary internal material, because its
+// endpoint declares no restriction. This is what stops the gate from becoming a broad filter.
+#[tokio::test]
+async fn internal_data_still_reaches_an_engine_that_declares_no_restriction() {
+    let local = MockServer::start().await;
+    let free = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"model": "qwen3-reranker-0.6b-q8_0"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rerank_answer()))
+        .expect(1)
+        .mount(&local)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rerank_answer()))
+        .expect(0)
+        .mount(&free)
+        .await;
+
+    let router = serve(&selector_config(&local.uri(), &free.uri())).await;
+    let (status, body) =
+        post_with_class(router, "/v1/rerank", rerank_body(), Some("internal")).await;
+
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        local.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the local engine answers, and only once"
+    );
+}
+
+// A public payload may use the free engine, which is the whole reason it is attached.
+#[tokio::test]
+async fn public_data_is_admitted_to_a_third_party_free_engine_when_the_local_one_fails() {
+    let local = MockServer::start().await;
+    let free = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&local)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"model": "nvidia/nemotron-3.5-rerank-8b:free"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rerank_answer()))
+        .expect(1)
+        .mount(&free)
+        .await;
+
+    let router = serve(&selector_config(&local.uri(), &free.uri())).await;
+    let (status, body) = post_with_class(router, "/v1/rerank", rerank_body(), Some("public")).await;
+
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        local.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the declared engine is tried first"
+    );
+    assert_eq!(
+        free.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the selector moves on only after the first engine fails"
+    );
+}
+
+// A caller error is the caller's answer: the walk stops rather than spending a second provider
+// call to receive the same complaint from a different engine.
+#[tokio::test]
+async fn a_caller_error_does_not_move_the_selector_to_the_next_engine() {
+    let local = MockServer::start().await;
+    let free = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({"error": "bad documents"})))
+        .expect(1)
+        .mount(&local)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rerank_answer()))
+        .expect(0)
+        .mount(&free)
+        .await;
+
+    let router = serve(&selector_config(&local.uri(), &free.uri())).await;
+    let (status, _) = post_with_class(router, "/v1/rerank", rerank_body(), Some("public")).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+// An embedding has no compatible fallback: a vector from another space is a different space.
+// Unstated data is therefore refused outright rather than re-homed to another engine.
+#[tokio::test]
+async fn an_embedding_refuses_a_third_party_free_endpoint_for_unstated_data() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"object": "embedding", "index": 0, "embedding": vec![0.1, 0.2]}],
+            "model": "nvidia/nemotron-3.5-embed-8b:free",
+            "usage": {"prompt_tokens": 2, "total_tokens": 2},
+        })))
+        .expect(0)
+        .mount(&engine)
+        .await;
+
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.embedding-free-nemotron]
+format = "openai_embeddings"
+base_url = "{}"
+model = "nvidia/nemotron-3.5-embed-8b:free"
+privacy = "third_party_free"
+
+[capabilities.smartfree-embedding]
+id = "smartfree-embedding"
+target = "embedding-free-nemotron"
+contract = "openrouter-embedding-space:nemotron3.5-embed8b-v1"
+dimensions = 4096
+normalization = "L2"
+max_batch = 64
+"#,
+        engine.uri()
+    );
+
+    let router = serve(&config).await;
+    let (status, body) = post_with_class(
+        router,
+        "/v1/embeddings",
+        json!({"model": "smartfree-embedding", "input": ["private note"]}),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("egress_not_admitted"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        engine.received_requests().await.unwrap_or_default().len(),
+        0,
+        "the payload never leaves the process"
+    );
+}
+
+// `smart-gemini-embedding` is an alias over the existing Gemini Embedding 2 client and its
+// existing space: one client, one contract, no new space and no cross-space fallback.
+#[tokio::test]
+async fn smart_gemini_embedding_is_an_alias_over_the_existing_space() {
+    let config = r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.embedding-google2]
+format = "google_embed_content_v2"
+base_url = "https://generativelanguage.test"
+model = "gemini-embedding-2"
+
+[capabilities.gemini-embedding-2]
+id = "gemini-embedding-2"
+target = "embedding-google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+
+[capabilities.smart-gemini-embedding]
+id = "smart-gemini-embedding"
+target = "embedding-google2"
+contract = "google-embedding-space:gemini-embedding-2-v1"
+dimensions = 3072
+normalization = "L2"
+max_batch = 8
+max_input_tokens = 8192
+"#;
+    let runner = Runner::from_toml(config).expect("the alias is expressible against the schema");
+
+    let canonical = runner
+        .capability("gemini-embedding-2")
+        .expect("the canonical capability still exists");
+    let alias = runner
+        .capability("smart-gemini-embedding")
+        .expect("the alias resolves");
+
+    assert_eq!(
+        alias.contract, canonical.contract,
+        "the alias must name the same value space, not a new one"
+    );
+    assert_eq!(alias.dimensions, canonical.dimensions);
+    assert_eq!(alias.normalization, canonical.normalization);
+    assert_eq!(
+        alias.format, canonical.format,
+        "the alias must speak the same wire"
+    );
+    assert_eq!(alias.model, canonical.model);
+    assert_eq!(
+        alias.targets[0].client, canonical.targets[0].client,
+        "one client: the alias is not a second endpoint"
+    );
+    assert_eq!(alias.url, canonical.url, "one endpoint, not two");
+    assert_eq!(
+        alias.targets.len(),
+        1,
+        "no candidates: an embedding selector would be a cross-space fallback"
+    );
+}
+
+// The selector is a rerank-only shape. Declaring candidates on an embedding space is refused at
+// load rather than silently resolving to whichever engine answered first.
+#[test]
+fn an_embedding_capability_may_not_declare_candidates() {
+    let config = r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.embedding-local]
+format = "openai_embeddings"
+base_url = "https://local.test"
+model = "Qwen3-Embedding-0.6B"
+
+[capability_clients.embedding-free]
+format = "openai_embeddings"
+base_url = "https://free.test"
+model = "nvidia/nemotron-3.5-embed-8b:free"
+
+[capabilities.smart-embedding]
+id = "smart-embedding"
+target = "embedding-local"
+candidates = ["embedding-free"]
+contract = "local-embedding-space:v1"
+dimensions = 1024
+normalization = "L2"
+"#;
+    let error = match Runner::from_toml(config) {
+        Ok(_) => panic!("an embedding may not select among engines"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("only a rerank capability may select among engines"),
+        "the refusal explains why: {error}"
+    );
+}
+
+// Two engines of different wire formats do not answer the same question, so the selector refuses
+// the pairing instead of discovering it on the first failover.
+#[test]
+fn a_selector_refuses_candidates_that_speak_a_different_wire() {
+    let config = r#"
+schema_version = 1
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://completion.test/v1"
+
+[targets.only]
+id = "vendor/only"
+llm_client = "responses"
+
+[routes.only]
+id = "probe/only"
+type = "passthrough"
+target = "only"
+
+[capability_clients.reranker-local]
+format = "cohere_jina_rerank"
+base_url = "https://local.test"
+model = "qwen3-reranker"
+
+[capability_clients.embedding-free]
+format = "openai_embeddings"
+base_url = "https://free.test"
+model = "nvidia/nemotron-3.5-embed-8b:free"
+
+[capabilities.mixed]
+id = "mixed"
+target = "reranker-local"
+candidates = ["embedding-free"]
+max_candidates = 64
+"#;
+    let error = match Runner::from_toml(config) {
+        Ok(_) => panic!("mismatched candidates must be refused"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("answer the same request shape"),
+        "the refusal names the mismatch: {error}"
+    );
+}

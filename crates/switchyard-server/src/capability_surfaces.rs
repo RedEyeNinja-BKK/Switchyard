@@ -14,18 +14,52 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use switchyard_llm_client::{PacingError, PacingTicket, ReserveError};
 use switchyard_runner::capability::{
-    CapabilityFormat, GEMINI_EMBEDDING_V2_MAX_DIMENSIONS, GEMINI_EMBEDDING_V2_MIN_DIMENSIONS,
-    ResolvedCapability,
+    CallerDataClass, CapabilityFormat, CapabilityTarget, GEMINI_EMBEDDING_V2_MAX_DIMENSIONS,
+    GEMINI_EMBEDDING_V2_MIN_DIMENSIONS, ResolvedCapability, admit_egress,
 };
 
 use crate::ServerState;
+
+/// Header a caller uses to state what the payload contains.
+///
+/// A declaration, not a classification: nothing here reads the payload. The broad content-based
+/// filter was removed on 2026-11-21 after it refused 27 of 29 otherwise eligible requests, and it
+/// is not coming back through this door.
+pub const DATA_CLASS_HEADER: &str = "x-switchyard-data-class";
+
+/// What the caller stated about its payload, or `Unknown` when it stated nothing.
+pub fn caller_data_class(headers: &HeaderMap) -> CallerDataClass {
+    headers
+        .get(DATA_CLASS_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(CallerDataClass::parse)
+        .unwrap_or_default()
+}
+
+/// The typed refusal for a payload an endpoint may not receive.
+fn egress_refusal(
+    capability: &ResolvedCapability,
+    client: &str,
+    class: CallerDataClass,
+    reason: &str,
+) -> Response {
+    error_body(
+        StatusCode::FORBIDDEN,
+        format!(
+            "capability {} cannot send data class {} to {client}: {reason}",
+            capability.id,
+            class.as_str()
+        ),
+        "egress_not_admitted",
+    )
+}
 
 /// `POST /v1/embeddings` — OpenAI-compatible embedding request.
 #[derive(Debug, Deserialize)]
@@ -53,8 +87,10 @@ pub struct RerankRequest {
 
 pub(crate) async fn embeddings(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     body: std::result::Result<Json<EmbeddingsRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let data_class = caller_data_class(&headers);
     let Json(request) = match body {
         Ok(parsed) => parsed,
         Err(error) => return contract_error(StatusCode::BAD_REQUEST, error.body_text()),
@@ -87,6 +123,15 @@ pub(crate) async fn embeddings(
         );
     }
 
+    // The endpoint's declared data handling is checked before any text leaves the process.
+    // An embedding has no compatible fallback: a vector from another space is a different
+    // space, not a degraded answer, so the request is refused rather than re-homed.
+    if let Some(target) = capability.targets.first()
+        && let Err(reason) = admit_egress(target.privacy, data_class)
+    {
+        return egress_refusal(capability, &target.client, data_class, &reason);
+    }
+
     // A Google embedding capability answers one content per call, so its batch is
     // assembled here. Everything else forwards the batch whole.
     if capability.format == CapabilityFormat::GoogleEmbedContent {
@@ -107,8 +152,10 @@ pub(crate) async fn embeddings(
 
 pub(crate) async fn rerank(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     body: std::result::Result<Json<RerankRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let data_class = caller_data_class(&headers);
     let Json(request) = match body {
         Ok(parsed) => parsed,
         Err(error) => return contract_error(StatusCode::BAD_REQUEST, error.body_text()),
@@ -203,7 +250,48 @@ pub(crate) async fn rerank(
     if let Some(top_n) = top_n {
         payload["top_n"] = json!(top_n);
     }
-    forward(&state, capability, payload, None).await
+
+    // Engines are walked in declared order. Two rules shape the walk:
+    //
+    // * admission first -- an engine that may not receive this data class is skipped before
+    //   anything is sent, and if every engine is skipped the request is refused. Unknown is
+    //   refused, never assumed harmless.
+    // * only a server-side failure moves the walk on. A 4xx is the caller's answer and is
+    //   returned as-is; retrying a malformed request against a second engine would spend a
+    //   second provider call to receive the same complaint.
+    let mut skipped: Vec<String> = Vec::new();
+    // The last upstream failure, returned when every admitted engine failed. Without this an
+    // ordinary single-engine outage would be reported as an admission refusal, which names the
+    // wrong cause and hides the provider's own status.
+    let mut last_failure: Option<Response> = None;
+    for target in &capability.targets {
+        if let Err(reason) = admit_egress(target.privacy, data_class) {
+            skipped.push(format!("{} ({reason})", target.client));
+            continue;
+        }
+        let mut target_payload = payload.clone();
+        target_payload["model"] = json!(target.model);
+        let response = forward_target(&state, capability, target, target_payload, None).await;
+        if response.status().is_server_error() {
+            skipped.push(format!("{} (upstream {})", target.client, response.status()));
+            last_failure = Some(response);
+            continue;
+        }
+        return response;
+    }
+    if let Some(response) = last_failure {
+        return response;
+    }
+    error_body(
+        StatusCode::FORBIDDEN,
+        format!(
+            "capability {} has no engine that may receive data class {}: {}",
+            capability.id,
+            data_class.as_str(),
+            skipped.join("; ")
+        ),
+        "egress_not_admitted",
+    )
 }
 
 /// Reserves one physical call against the capability's declared budgets.
@@ -1220,17 +1308,40 @@ async fn forward(
     payload: Value,
     embedding_count: Option<usize>,
 ) -> Response {
-    let client = match state.capability_http(capability.timeout_seconds) {
+    let Some(target) = capability.targets.first() else {
+        return upstream_contract_error(capability, "capability has no dispatchable engine");
+    };
+    forward_target(state, capability, target, payload, embedding_count).await
+}
+
+/// Forwards to one named engine behind a capability.
+///
+/// Split from [`forward`] so a selector can walk engines without re-deriving the request: the
+/// only thing that changes between attempts is which engine receives it.
+async fn forward_target(
+    state: &ServerState,
+    capability: &ResolvedCapability,
+    target: &CapabilityTarget,
+    payload: Value,
+    embedding_count: Option<usize>,
+) -> Response {
+    let client = match state.capability_http(target.timeout_seconds) {
         Ok(client) => client,
         Err(message) => return contract_error(StatusCode::BAD_GATEWAY, message),
     };
-    let mut builder = client.post(&capability.url).json(&payload);
-    if let Some(variable) = &capability.api_key_env {
+    let mut builder = client.post(&target.url).json(&payload);
+    if let Some(variable) = &target.api_key_env {
         let Ok(value) = std::env::var(variable) else {
-            return upstream_contract_error(capability, "credential unavailable");
+            return upstream_contract_error(
+                capability,
+                &format!("credential unavailable for engine {}", target.client),
+            );
         };
         if value.trim().is_empty() {
-            return upstream_contract_error(capability, "credential unavailable");
+            return upstream_contract_error(
+                capability,
+                &format!("credential unavailable for engine {}", target.client),
+            );
         }
         builder = builder.bearer_auth(value);
     }

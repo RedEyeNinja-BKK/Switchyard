@@ -214,3 +214,77 @@ protected; the skip from `fc05b640` to `8325fdca` to `f3b743f5` is not described
 Dashboards: V7 `turnstone-switchyard-v7` title **V7.101**, revision **106**;
 V9 `turnstone-switchyard-economics-v9` title **V9.19**, version **29**. The resume's "V9 version 26"
 is stale; V9 has advanced three revisions since. No dashboard write was made in this pass.
+
+---
+
+## Correction appended the same day (before review) — §4 membership was wrong
+
+The census in §4 used only `route.target` and `route.candidates` to decide binding. That misses
+`targets.*.groups`, which is what fills `routes.*.pool_groups`. Re-derived from the deployed manifest
+`f3b743f5`:
+
+| Pool group | Members |
+|---|---|
+| `ST_Gemini_Free` | 7: `stephen-google-gemini-4-hydrogen`, `-3.6-flash`, `-3.5-flash-lite`, `-3.1-flash-lite`, `-3-flash-preview`, `stephen-google-gemma-4-26b-a4b-it`, `stephen-google-gemma-4-31b-it` |
+| `ST_OR_Free` | 5: `stephen-nemotron-3-5-super-vl-free`, `stephen-flint-v1-0-free`, `stephen-ernie-5_5-flash-preview-free`, `stephen-dots-3-note-preview-free`, `stephen-particle-1-free` |
+| `ST_OR_Paid` | 3: `stephen-tencent-hy4-flash`, `stephen-paid-glm-5-3-flash`, `stephen-paid-deepseek-v4-1-flash-1017` |
+
+So the two OpenRouter Gemma twins **are** bound, through `ST_Gemini_Free`, and they also appear in
+`ST_Free`'s candidate list. The §4 statement that they were "provisioned but bound to no composite
+route" is **withdrawn**.
+
+**Exactly one Stephen target remains bound to no pool and no composite:**
+`stephen-google-gemini-3.8-flash` (`groups` absent). Given §2 — p50 189 s, p90 483 s, `vision = false` —
+leaving it direct-only is defensible and no binding change is proposed.
+
+### What the undocumented release actually did
+
+`20261128T070126Z-6a8209f97101563b-8325fdca` was not the trivial release the resume file implied. A
+parsed-document diff against `fc05b640` shows it was the **Stephen pool build-out**:
+
+- created `ST_Gemini_Free` (target moved from `stephen-google-gemini-3.5-flash-lite` to
+  `stephen-google-gemini-4-hydrogen`, 6 candidates) and `ST_OR_Paid`;
+- gave seven Stephen Google targets `groups = ["ST_Gemini_Free"]`;
+- moved the two OpenRouter Gemma twins out of `ST_OR_Free`;
+- added `stephen-tencent-hy4-flash` plus its direct route and `ST_OR_Paid` membership;
+- grew `ST_Free` from 6 to 10 candidates.
+
+That is the substance of "Stephen's remaining native Google free capabilities" for the chat lanes. It is
+already live.
+
+`20261128T080005Z-8325fdca → f3b743f5` was then checked independently and **is** strictly additive: four
+`capability_clients.speech-stephen-*` entries, four `capabilities.stephen-gemini-tts-*` entries, nothing
+removed, no routing key changed. The release provenance claim holds.
+
+### Still missing (unchanged conclusion, narrower list)
+
+Stephen-keyed twins that do not exist at all — the owner-key clients are present but there is no
+`*_stephen` counterpart:
+
+`live-3-5-translate`, `live-3-5-transcribe`, `live-3-8-flash`, `live-3-8-flash-extended-thinking`,
+`live-2-5-flash-native-audio`, `live-3-flash`, `music-lyria-realtime`, `robotics-er-2`, `transcribe-3-5`.
+
+Each is one additive `[capability_clients.*]` entry plus a `[capabilities.*]` entry. No binary change.
+None added in this pass.
+
+## Dashboard staleness — recorded, not written
+
+V7 `turnstone-switchyard-v7` is at title **V7.101**, revision **106**, and is **stale against live** in
+four panels:
+
+- **12001** — describes manifest `a7ef9174…` / 131,100 B and "53 of 53" direct aliases; live is
+  `f3b743f5…` / 137,957 B with 55 direct aliases.
+- **12002** — `smart-route` described as `8 leaves = 3/2/1/2`; live pools are
+  `ST_Gemini_Free` 3 (of 3 legs in `smart-gemini-chat`), `smart-openrouter-free` 2,
+  `smart-deepseek-flash` 1, `smart-openrouter-paid` 2, and the two Lite leaves are back in
+  `ST_Gemini_Free` after the 070126Z build-out.
+- **12004** — cites release `...040916Z-...fc05b640`.
+- **12007** — the whole CURRENT snapshot row set names `fc05b640` / PID 880721 / 72 advertised; live is
+  `f3b743f5` / PID 895156 / **74 advertised**.
+
+**No dashboard write was made.** Reaching V7.102 requires a new generator stage in
+`scripts/economics/v7/correct_dashboard.py` (title, revision 107, the `f3b743f5` token mappings, the new
+pool topology, the TTS capability rows) and a guarded write at `expected_version = 106`. I did not
+attempt a partial or hand-edited panel because an unverified live dashboard change is worse than a
+documented stale one. V9 (`V9.19`, version 29) has advanced three revisions past the resume record and
+was not touched.

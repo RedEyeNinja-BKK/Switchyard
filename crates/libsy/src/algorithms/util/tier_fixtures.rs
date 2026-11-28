@@ -99,6 +99,7 @@ pub(crate) fn turn_request(failed: bool) -> Request {
                 Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::ToolCall(ToolCall {
+                        provider_state: None,
                         id: "call_1".to_string(),
                         name: "Bash".to_string(),
                         arguments: json!({"command": "cargo test"}),

@@ -5,9 +5,11 @@
 
 mod buffered;
 mod stream;
+mod unsupported;
 
 pub use buffered::OpenAiResponsesCodec;
 pub use stream::OpenAiResponsesStreamCodec;
+pub use unsupported::{UnsupportedResponsesFeature, unsupported_feature};
 
 pub(crate) fn is_native_output(kind: &str) -> bool {
     matches!(

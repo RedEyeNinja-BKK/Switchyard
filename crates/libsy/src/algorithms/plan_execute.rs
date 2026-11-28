@@ -240,6 +240,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: "call-1".to_string(),
                 name: name.to_string(),
                 arguments,
@@ -307,6 +308,7 @@ mod tests {
                         details: vec![json!({"type": "reasoning.encrypted", "data": "opaque"})],
                     },
                     ContentBlock::ToolCall(ToolCall {
+                        provider_state: None,
                         id: "call-1".to_string(),
                         name: "apply_patch".to_string(),
                         arguments: json!({"patch": "*** Begin Patch"}),

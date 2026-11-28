@@ -733,6 +733,7 @@ mod tests {
                     text: "running it".to_string(),
                 },
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-1".to_string(),
                     name: "bash".to_string(),
                     arguments: json!({"cmd": "ls"}),
@@ -777,11 +778,13 @@ mod tests {
                     ),
                 },
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": first_command, "duration": 0.1}),
                 }),
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-2".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": second_command, "duration": 0.1}),
@@ -824,11 +827,13 @@ mod tests {
                     ),
                 },
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": first_command}),
                 }),
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-2".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": second_command}),
@@ -861,6 +866,7 @@ mod tests {
             content: vec![
                 ContentBlock::Text { text },
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": "sed -n '1,20p' app.py\n", "duration": 0.1}),
@@ -900,6 +906,7 @@ mod tests {
                     .to_string(),
                 },
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": first_command}),
@@ -931,6 +938,7 @@ mod tests {
                     .to_string(),
                 },
                 ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": command}),

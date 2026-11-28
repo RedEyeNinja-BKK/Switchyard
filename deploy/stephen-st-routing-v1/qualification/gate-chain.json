@@ -1,0 +1,41 @@
+{
+  "direct_count": 52,
+  "status": "REFUSED",
+  "failures": [
+    "TARGET_CAPABILITY_UNQUALIFIED direct-google-gemini-3.8-flash direct-google-gemini-3.8-flash.tool_calling",
+    "TARGET_CAPABILITY_UNQUALIFIED direct-google-stephen-gemini-3.8-flash stephen-google-gemini-3.8-flash.tool_calling",
+    "TARGET_CAPABILITY_UNQUALIFIED direct-openai-gpt-6-luna openai-gpt-6-luna.tool_calling",
+    "TARGET_CAPABILITY_UNQUALIFIED direct-openai-gpt-6-luna-nt openai-gpt-6-luna-nt.tool_calling",
+    "TARGET_CAPABILITY_UNQUALIFIED direct-openai-gpt-6-sol openai-gpt-6-sol.tool_calling"
+  ],
+  "upstream_vs_admission_gaps": [
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-gemini-3-flash model=gemini-3-flash-preview wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-gemini-3-flash model=gemini-3-flash-preview wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-gemini-3-flash: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-gemini-3.1-flash-lite model=gemini-3.1-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-gemini-3.1-flash-lite model=gemini-3.1-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-gemini-3.1-flash-lite: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-gemini-3.5-flash-lite model=gemini-3.5-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-gemini-3.5-flash-lite model=gemini-3.5-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-gemini-3.5-flash-lite: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-gemini-3.6-flash model=gemini-3.6-flash wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-gemini-3.6-flash model=gemini-3.6-flash wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-gemini-3.6-flash: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-gemma-4-26b-a4b-it model=gemma-4-26b-a4b-it wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-gemma-4-31b-it model=gemma-4-31b-it wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-stephen-gemini-3-flash-preview model=gemini-3-flash-preview wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-stephen-gemini-3-flash-preview model=gemini-3-flash-preview wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-stephen-gemini-3-flash-preview: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-stephen-gemini-3.1-flash-lite model=gemini-3.1-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-stephen-gemini-3.1-flash-lite model=gemini-3.1-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-stephen-gemini-3.1-flash-lite: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-stephen-gemini-3.5-flash-lite model=gemini-3.5-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-stephen-gemini-3.5-flash-lite model=gemini-3.5-flash-lite wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-stephen-gemini-3.5-flash-lite: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-stephen-gemini-3.6-flash model=gemini-3.6-flash wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_VIDEO_NOT_ADMITTED direct-google-stephen-gemini-3.6-flash model=gemini-3.6-flash wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_AUDIO_NOT_ADMITTED direct-google-stephen-gemini-3.6-flash: existing Switchyard audio ingress refuses audio regardless of Google upstream model support",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-stephen-gemma-4-26b-a4b-it model=gemma-4-26b-a4b-it wire=openai_chat; qualify the exact provider transport before changing admission",
+    "UPSTREAM_IMAGE_NOT_ADMITTED direct-google-stephen-gemma-4-31b-it model=gemma-4-31b-it wire=openai_chat; qualify the exact provider transport before changing admission"
+  ]
+}

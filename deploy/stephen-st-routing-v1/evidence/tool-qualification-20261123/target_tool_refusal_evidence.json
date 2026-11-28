@@ -1,0 +1,16 @@
+{
+  "thaillm-qwen3_5-9b": {
+    "basis": "PROVIDER_REFUSES_TOOLS",
+    "provider_status": 400,
+    "provider_message": "\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set",
+    "receipt": "PROVIDER_REFUSES_TOOLS 2026-11-23 switchyard-vm deploy/stephen-st-routing-v1/evidence/tool-qualification-20261123/upstream-tool-probe-20261123.jsonl",
+    "note": "thaillm /api/v1/chat/completions with a tools[] payload answers 400: the upstream server has no tool-call parser enabled. The sole referencing route already declares tool_calling=false, so no tool request reaches this target."
+  },
+  "thaillm-qwen3_6-35b-a3b": {
+    "basis": "PROVIDER_REFUSES_TOOLS",
+    "provider_status": 400,
+    "provider_message": "\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set",
+    "receipt": "PROVIDER_REFUSES_TOOLS 2026-11-23 switchyard-vm deploy/stephen-st-routing-v1/evidence/tool-qualification-20261123/upstream-tool-probe-20261123.jsonl",
+    "note": "thaillm /api/v1/chat/completions with a tools[] payload answers 400: the upstream server has no tool-call parser enabled. The sole referencing route already declares tool_calling=false, so no tool request reaches this target."
+  }
+}

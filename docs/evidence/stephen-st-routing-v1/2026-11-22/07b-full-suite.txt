@@ -1,0 +1,17 @@
+# Full suite - switchyard-llm-client, switchyard-runner, switchyard-server
+# command: CARGO_TARGET_DIR=/var/tmp/st1/target cargo test --release -p switchyard-llm-client -p switchyard-runner -p switchyard-server
+# tree: 5ed067d + the mixed-credential working changes (binary f2fd9866)
+totals: passed 932, failed 0, ignored 0
+test binaries: 31
+failed result lines: 0
+mixed_credential:
+     Running tests/mixed_credential.rs (/var/tmp/st1/target/release/deps/mixed_credential-b428987eddcc0d88)
+
+running 7 tests
+test a_policy_refusal_is_not_evaded_by_another_provider ... ok
+test a_model_scoped_quota_does_not_spend_the_paid_leg ... ok
+test a_spent_free_allowance_on_one_provider_leaves_the_other_servable ... ok
+test a_block_on_one_provider_does_not_skip_a_mixed_child ... ok
+test a_model_scoped_google_quota_retires_only_that_model ... ok
+test a_google_project_quota_leaves_the_openrouter_peer_servable ... ok
+test both_free_credentials_exhausted_crosses_to_the_paid_leg ... ok

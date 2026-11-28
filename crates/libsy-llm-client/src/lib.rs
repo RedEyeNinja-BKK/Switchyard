@@ -16,23 +16,41 @@
 //! answer call from the routing outcome when needed. A host that just wants the answer does not
 //! have to drive the step stream itself.
 
+pub mod allowance;
 pub mod backend;
 pub mod client;
 pub mod error;
+pub mod google;
+pub mod live;
 pub mod metrics;
 mod observability;
 mod observation;
 pub mod raw;
 pub mod run;
 
+pub use allowance::{
+    ACCOUNT_SCOPE_MODEL, AdmissionMargin, DailyRequestAllowance, DayBoundary, ExhaustionBasis,
+    GovernorKey, ObservationTicket, PacedQuota, PacingError, PacingScope, PacingTicket,
+    ProviderReading, ProviderState, QuotaGovernor, ReserveError, Throttled, WindowLimits,
+    account_allowance_path, allowance_path, estimate_input_tokens, reported_input_tokens,
+};
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
-pub use observation::{LlmCallObservation, RunObservation, RunObserver};
+pub mod provider_reason;
+pub use provider_reason::{
+    ProviderReason, ProviderScope, classify as classify_provider_error,
+    classify_with_scope as classify_provider_error_with_scope,
+};
+
+pub use observation::{
+    AttemptTrace, CandidateTrace, LlmCallObservation, RunObservation, RunObserver, SelectionTrace,
+    library_outcome_code, outcome_code,
+};
 pub use raw::RawResponse;
 pub use run::{
-    CapabilityFacts, ClientRouter, CredentialBlock, CredentialBlockKind, FailureClass,
-    credential_block, decide, failure_class, run,
+    CapabilityFacts, ClientRouter, CredentialBlock, CredentialBlockKind, FailureClass, Tariff,
+    credential_block, decide, failure_class, is_free_scope, run,
 };
 pub use switchyard_translation::RawEventStream;
 

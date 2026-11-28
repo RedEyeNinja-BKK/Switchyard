@@ -188,9 +188,19 @@ impl FormatCodec for OpenAiChatCodec {
         request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
-        if let Some(body) =
+        if let Some(mut body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiChat, policy)
         {
+            // The preserved body is the caller's own bytes replayed unchanged, except for the
+            // one thing the caller cannot know: whether this wire refuses a call it did not
+            // issue. See `apply_tool_signature_placeholder`.
+            if let Some(placeholder) = policy
+                .target_capabilities
+                .tool_signature_placeholder
+                .as_deref()
+            {
+                apply_tool_signature_placeholder(&mut body, placeholder);
+            }
             return Ok(EncodedRequest {
                 body,
                 diagnostics: Vec::new(),
@@ -261,7 +271,14 @@ impl FormatCodec for OpenAiChatCodec {
         }
         copy_openai_chat_request_extensions(&mut body, &request.extensions.fields);
 
-        let body = embed_preservation(Value::Object(body), &request.preservation, policy);
+        let mut body = embed_preservation(Value::Object(body), &request.preservation, policy);
+        if let Some(placeholder) = policy
+            .target_capabilities
+            .tool_signature_placeholder
+            .as_deref()
+        {
+            apply_tool_signature_placeholder(&mut body, placeholder);
+        }
         Ok(EncodedRequest { body, diagnostics })
     }
 
@@ -313,6 +330,20 @@ impl FormatCodec for OpenAiChatCodec {
                     "$.choices[0].message.content",
                 )?,
             };
+            if let Some(marker) = _policy.hosted_reasoning {
+                // The upstream put its reasoning in the visible message. Move it to a
+                // reasoning block before anything downstream can read it as the answer:
+                // `content` is what a caller displays, so the split has to happen here
+                // rather than in a presentation layer that may not exist.
+                content = split_hosted_reasoning_blocks(marker, content).map_err(|leak| {
+                    crate::TranslationError::InvalidValue {
+                        path: "$.choices[0].message.content".to_string(),
+                        message: format!(
+                            "response text carried a malformed inline reasoning block: {leak}"
+                        ),
+                    }
+                })?;
+            }
             prepend_openai_reasoning_blocks(&mut content, &message);
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -518,6 +549,41 @@ pub(crate) fn role_from_openai(role: Option<&str>, path: &str) -> Result<Role> {
 }
 
 /// Decodes OpenAI-style content into normalized content blocks.
+/// Moves an inline hosted reasoning block out of the visible text, and discards it.
+///
+/// Each text block is split with the shared factory, so the buffered path and the streaming
+/// path agree on what a block is. A message that fails the split is an error: emitting the
+/// text unchanged would leak the monologue, and emitting only the part before the failure
+/// would truncate an answer without saying so.
+///
+/// The reasoning is dropped rather than rebuilt as a `Reasoning` block. A reasoning block is
+/// not private: the chat encoder writes it back out as `reasoning_content`, so carrying the
+/// monologue there would hand it to the caller through a second field while the answer looked
+/// clean. Text the model marked as its own thinking is internal to the target that declared
+/// the marker, and the provider's own `reasoning_content` field is the only reasoning this
+/// translation passes through.
+fn split_hosted_reasoning_blocks(
+    marker: crate::codecs::openai_chat::HostedReasoningMarker,
+    content: Vec<ContentBlock>,
+) -> std::result::Result<Vec<ContentBlock>, crate::codecs::openai_chat::ThoughtLeak> {
+    let _ = marker;
+    let mut rebuilt = Vec::with_capacity(content.len());
+    for block in content {
+        match block {
+            ContentBlock::Text { text } => {
+                let split = crate::codecs::openai_chat::split_hosted_reasoning(&text)?;
+                if !split.answer.is_empty() {
+                    rebuilt.push(ContentBlock::Text {
+                        text: split.answer.to_string(),
+                    });
+                }
+            }
+            other => rebuilt.push(other),
+        }
+    }
+    Ok(rebuilt)
+}
+
 pub(crate) fn decode_openai_content(
     content: &Value,
     provider: WireFormat,
@@ -723,10 +789,19 @@ pub(crate) fn decode_openai_tool_call(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // Google's OpenAI-compatibility surface returns the provider's continuation state in
+    // `tool_calls[].extra_content` (its `thought_signature`). It is opaque and required on a
+    // replay, so it is carried verbatim rather than reconstructed. Absent or null means the
+    // issuer had none.
+    let provider_state = tool_call
+        .get("extra_content")
+        .filter(|state| !state.is_null())
+        .cloned();
     Ok(Some(ToolCall {
         id,
         name,
         arguments,
+        provider_state,
     }))
 }
 
@@ -891,6 +966,41 @@ fn push_pending_openai_message(
     Ok(())
 }
 
+/// Gives every assistant step a signature the wire will accept, without inventing one.
+///
+/// Google validates the FIRST `functionCall` part of each step of the current turn and refuses
+/// a part that carries no `thought_signature` with HTTP 400 `INVALID_ARGUMENT`. A call issued by
+/// another model has no signature to send, and Google documents that case — history transferred
+/// from a model that does not include thought signatures — with exactly one supported answer:
+/// the literal `skip_thought_signature_validator`, at a stated cost in fidelity.
+///
+/// A call that already carries state is left byte for byte, so the provider's own signature is
+/// never replaced by the placeholder; only a step whose first call has none is given the
+/// documented stand-in. Parallel non-first calls are left alone, which is the shape Google
+/// itself returns: only the first part of a parallel step is signed.
+fn apply_tool_signature_placeholder(body: &mut Value, placeholder: &str) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(first) = message
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .and_then(|calls| calls.first_mut())
+        else {
+            continue;
+        };
+        if first.get("extra_content").is_none_or(Value::is_null) {
+            first["extra_content"] = json!({
+                "google": { "thought_signature": placeholder },
+            });
+        }
+    }
+}
+
 // Encodes a normalized message that has no tool-result blocks.
 fn encode_message_without_tool_results_to_openai(
     message: &Message,
@@ -902,18 +1012,34 @@ fn encode_message_without_tool_results_to_openai(
         Role::Tool => "tool",
         _ => "user",
     };
+    // Continuation state goes back only to a wire that asks for it. A target declares
+    // `tool_signature_placeholder` when it validates a provider signature on a replayed
+    // function call; every other wire treats the field as unknown, so it is dropped rather
+    // than forwarded (replay provider-private state only to the wire that issued it).
+    let placeholder = policy
+        .target_capabilities
+        .tool_signature_placeholder
+        .as_deref();
     let tool_calls = message
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolCall(call) => Some(json!({
-                "id": call.id,
-                "type": "function",
-                "function": {
-                    "name": call.name,
-                    "arguments": json_string(&call.arguments),
-                },
-            })),
+            ContentBlock::ToolCall(call) => {
+                let mut encoded = json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": json_string(&call.arguments),
+                    },
+                });
+                if placeholder.is_some()
+                    && let Some(state) = &call.provider_state
+                {
+                    encoded["extra_content"] = state.clone();
+                }
+                Some(encoded)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();

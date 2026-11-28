@@ -1,0 +1,12 @@
+{
+  "direct-google-gemini-3-flash": {
+    "basis": "PRIOR_MEASUREMENT",
+    "receipt": "PRIOR_MEASUREMENT 2026-11-23 switchyard-vm deploy/stephen-st-routing-v1/evidence/tool-qualification-20261123/upstream-tool-probe-20261123.jsonl",
+    "note": "tool_calling=false was a conservative placeholder: 14 sibling Google direct leaves declare true, and the target answered a real tool call on 2026-11-23."
+  },
+  "direct-google-stephen-gemini-3-flash-preview": {
+    "basis": "PRIOR_MEASUREMENT",
+    "receipt": "PRIOR_MEASUREMENT 2026-11-23 switchyard-vm deploy/stephen-st-routing-v1/evidence/tool-qualification-20261123/upstream-tool-probe-20261123.jsonl",
+    "note": "same correction on Stephen's account; proven with his own credential."
+  }
+}

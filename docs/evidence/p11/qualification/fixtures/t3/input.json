@@ -1,0 +1,43 @@
+{
+  "uid": "qual-dashboard",
+  "title": "QUAL",
+  "version": 7,
+  "panels": [
+    {
+      "id": 1,
+      "title": "alpha",
+      "options": {
+        "content": "keep alpha"
+      }
+    },
+    {
+      "id": 2,
+      "title": "retire-me",
+      "options": {
+        "content": "drop me"
+      }
+    },
+    {
+      "id": 3,
+      "title": "omega",
+      "options": {
+        "content": "keep omega",
+        "extra": [
+          1,
+          2,
+          3
+        ]
+      }
+    }
+  ],
+  "meta": {
+    "keep": true,
+    "nested": {
+      "a": 1,
+      "b": [
+        2,
+        3
+      ]
+    }
+  }
+}

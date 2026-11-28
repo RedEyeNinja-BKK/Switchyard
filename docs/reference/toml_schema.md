@@ -124,6 +124,10 @@ endpoint, before it calls an upstream.
 | `system_prompt` | No | unset | System prompt prepended when this target serves a completion. |
 | `extra_body` | No | `{}` | Values merged into the upstream request when the request does not already set that key. |
 | `reasoning_effort` | No | unset | Reasoning effort forced on every request to this target, replacing the value the caller sent (`reasoning.effort` on `openai_responses`, `reasoning_effort` on `openai_chat`). Rejected on `anthropic_messages` clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at `max` behind a client that sends `high`. Targets with different effort settings need distinct model IDs when used within one route. Separate routes may use the same model ID with separate `llm_clients` entries (same endpoint, different name). |
+| `vision` | No | unset | Whether this target accepts image input. Unset and `true` both accept images; `false` refuses them. |
+| `video` | No | unset | Whether this target accepts video. Never inferred from `vision`, and unset is treated as "cannot". A target declaring `true` must sit on an `openai_responses` client and must state `video_carrier`. |
+| `video_carrier` | No | required when `video = true` | Which forms of video this endpoint serves: `inline` (bytes or a `data:` URL in the request), `remote` (a URL the provider fetches itself), or `both`. Required because the two are different capabilities: an endpoint can read inline video and answer a remote URL with `404`. |
+| `image_carrier` | No | `both` when `vision = true` | The image counterpart of `video_carrier`. Optional for the historical reason `vision` is: a deployment written before carriers existed declares images and means both. A target that serves inline images only must state `inline`, or a remote image is forwarded into a provider `404`. |
 
 Within one route, callable targets with the same model ID must use the same `llm_client`.
 This includes completion targets and targets used for judging or classification. Switchyard rejects
@@ -153,6 +157,9 @@ Every route takes the common keys below, plus the keys for its type.
 | `tool_calling` | No | unset | Tool-calling support advertised by `GET /v1/models`. When `false`, the server rejects tool definitions, tool controls, and tool history with HTTP 400 before dispatch. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. |
 | `reasoning` | No | unset | When `false`, the server rejects reasoning controls with HTTP 400 before dispatch. Explicit `true` and unset values do not restrict requests. The server does not include this declaration in `GET /v1/models`. |
 | `vision` | No | unset | Image-input support advertised in `GET /v1/models` under `data[].capabilities.vision`. When `false`, the server rejects images with HTTP 400 before dispatch, including images in tool results. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. Declare `true` only when every target the route can select accepts images. |
+| `video` | No | unset | Video-input support advertised in `GET /v1/models` under `data[].capabilities.video`. Never inferred from `vision`: a target that does not declare it is treated as unable to receive video. A route declaring `true` needs a target that declares it, on an `openai_responses` client. |
+| `video_carrier` | No | `both` when `video = true` | Which forms of video the route accepts: `inline`, `remote`, or `both`. Reported in `GET /v1/models` as `data[].capabilities.video_carriers` when narrower than `both`. Every carrier the route claims must be served by at least one of its targets, or the configuration is rejected at load; a `video_carrier` without `video = true` is likewise rejected. |
+| `image_carrier` | No | `both` when `vision = true` | The image counterpart of `video_carrier`, reported as `data[].capabilities.image_carriers`. Checked against the same per-target facts, so a route over inline-only targets must narrow to `inline`. |
 
 ### `noop`
 

@@ -64,6 +64,18 @@ pub struct TargetCapabilities {
     /// Absent or false the compact string form is kept, which is what every other Responses
     /// upstream expects.
     pub requires_list_input: Option<bool>,
+    /// The signature value this wire accepts for a replayed call it did not issue.
+    ///
+    /// Presence is the declaration that the wire validates a provider-issued signature on
+    /// the first `functionCall` part of every step and cannot be sent a foreign call bare.
+    /// Google documents the case — history transferred from a model that carries no
+    /// signatures — and accepts the literal `skip_thought_signature_validator` in place of
+    /// the real value, warning that it costs context fidelity. When this is set, a call that
+    /// arrives with [`switchyard_protocol::ToolCall::provider_state`] echoes it verbatim and
+    /// a call that arrives without one is replayed with this placeholder; when it is absent,
+    /// no continuation state is emitted at all and the wire must not be sent replayed lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_signature_placeholder: Option<String>,
 }
 
 /// Provider-level profile that can be used to configure target capabilities.
@@ -82,6 +94,13 @@ pub struct TranslationPolicy {
     pub deterministic_ids: DeterministicIdPolicy,
     pub preservation: PreservationPolicy,
     pub target_capabilities: TargetCapabilities,
+    /// The upstream embeds its reasoning in the message text behind this marker.
+    ///
+    /// Set per target, because it is a wire property of one provider family rather than a
+    /// global preference: applying it everywhere would mangle a model that legitimately
+    /// writes those tokens as text. `None` leaves response text untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_reasoning: Option<crate::codecs::openai_chat::HostedReasoningMarker>,
 }
 
 impl Default for TranslationPolicy {
@@ -94,6 +113,7 @@ impl Default for TranslationPolicy {
             },
             preservation: PreservationPolicy::InMemory,
             target_capabilities: TargetCapabilities::default(),
+            hosted_reasoning: None,
         }
     }
 }

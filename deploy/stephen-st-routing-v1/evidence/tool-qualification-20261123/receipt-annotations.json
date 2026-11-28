@@ -1,0 +1,14 @@
+{
+  "note": "Receipt files whose records do not name their own subject. An entry here is an annotation, not a measurement: the probe content is evidence, the subject attribution is not carried by any field in the file. Every annotated row is reported as ANNOTATED so a reader can weight it separately.",
+  "files": {
+    "gemma31-20261121.jsonl": {
+      "subject": "gemma-4-31b-it",
+      "reason": "no record carries a model field. The file is the 31B continuation of gemma-tools-20261121.jsonl: that file's rows name gemma-4-31b-it and end with the literal outcome 'still 503' at 02:49Z, and this file resumes the same probe 3 minutes later with two more 503s and then a 200 carrying finish_reason=tool_calls.",
+      "subject_corroboration": [
+        "gemma-tools-20261121.jsonl rows 1-3 name gemma-4-31b-it and return 503",
+        "gemma-tools-20261121.jsonl row 4 records outcome 'still 503'",
+        "gemma31-20261121.jsonl rows 1-2 return the same 503 shape at 38.3s and 14.2s"
+      ]
+    }
+  }
+}

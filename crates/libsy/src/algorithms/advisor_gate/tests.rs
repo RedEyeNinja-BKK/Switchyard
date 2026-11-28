@@ -88,6 +88,7 @@ fn tool_call_turn() -> Response {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolCall(ToolCall {
+                    provider_state: None,
                     id: "t1".to_string(),
                     name: "bash".to_string(),
                     arguments: serde_json::json!({}),
@@ -921,6 +922,7 @@ async fn pattern_trigger_matches_on_tool_call_turns() {
                         text: "task_complete: true".to_string(),
                     },
                     ContentBlock::ToolCall(ToolCall {
+                        provider_state: None,
                         id: "t1".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({}),

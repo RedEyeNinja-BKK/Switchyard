@@ -10,6 +10,7 @@
 //! reached — because a collection that reports a failure as a success would show a
 //! healthy balance that does not exist.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
@@ -41,6 +42,8 @@ fn facts(clients: &[(&str, &str, &str)]) -> DeploymentFacts {
                 base_url: (*base_url).to_string(),
                 api_key_env: Some((*key_env).to_string()),
                 billing: None,
+                quota_group: Some((*name).to_string()),
+                quota_provider: None,
             },
         );
     }
@@ -808,5 +811,287 @@ async fn the_deepseek_reader_reports_the_balance_and_its_parts() {
             ReportingPeriod::Total,
             "a remaining balance is not a purchase total and carries no window"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider allowance reconciliation, end to end.
+//
+// These cases drive the whole path a real deployment uses: a configuration that
+// declares a provider pool, the readers built from its credentials, the counters bound
+// to those readers, and finally admission. A unit test on any one link would not catch
+// the failure that actually matters -- a deployment that reads the provider correctly
+// and never consults it.
+// ---------------------------------------------------------------------------
+
+use switchyard_llm_client::{DayBoundary, ReserveError};
+use switchyard_server::economics::reconcile::Reconcilers;
+use switchyard_server::economics::runtime::{build_account_readers, build_reconcilers};
+
+/// A deployment with one OpenRouter client declaring a provider pool and an account counter.
+fn pool_deployment(
+    client: &str,
+    key_env: &str,
+    group: &str,
+    pool: Option<switchyard_runner::QuotaProvider>,
+) -> (DeploymentFacts, std::path::PathBuf) {
+    let mut deployment = DeploymentFacts::default();
+    deployment.clients.insert(
+        client.to_string(),
+        ClientFacts {
+            name: client.to_string(),
+            base_url: OPENROUTER_URL.to_string(),
+            api_key_env: Some(key_env.to_string()),
+            billing: None,
+            quota_group: Some(group.to_string()),
+            quota_provider: pool,
+        },
+    );
+    let directory = std::env::temp_dir()
+        .join("switchyard-pool-deployment")
+        .join(format!("{client}-{}", std::process::id()));
+    (deployment, directory)
+}
+
+/// Builds the account-scoped counter the loader builds, for the test's state directory.
+fn account_counter(
+    directory: &std::path::Path,
+    group: &str,
+    limit: u64,
+) -> std::sync::Arc<switchyard_llm_client::DailyRequestAllowance> {
+    std::sync::Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
+        group,
+        switchyard_llm_client::ACCOUNT_SCOPE_MODEL.into(),
+        limit,
+        switchyard_llm_client::account_allowance_path(directory, group),
+        DayBoundary::Utc,
+    ))
+}
+
+fn at(seconds: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+/// 2026-01-15T23:00:00Z
+const LATE_UTC_DAY: u64 = 1_768_518_000;
+
+/// The configuration binds a counter to the account it was read from, and a reading then
+/// refuses admission under that account.
+#[test]
+fn a_declared_pool_is_bound_and_refuses_admission() {
+    let (deployment, directory) = pool_deployment(
+        "openrouter-free",
+        "SY_OPENROUTER_STEPHEN_KEY",
+        "openrouter-free-stephen",
+        Some(switchyard_runner::QuotaProvider::OpenRouterFreeModels),
+    );
+    let env = env_holding(&["SY_OPENROUTER_STEPHEN_KEY"]);
+    let readers = build_account_readers(&deployment, &env);
+    assert_eq!(readers.len(), 1, "one credential, one reader");
+
+    let counter = account_counter(&directory, "openrouter-free-stephen", 1000);
+    let mut allowances = std::collections::HashMap::new();
+    allowances.insert(
+        (
+            "openrouter-free-stephen".to_string(),
+            switchyard_llm_client::ACCOUNT_SCOPE_MODEL.into(),
+        ),
+        std::sync::Arc::clone(&counter),
+    );
+
+    let reconcilers = build_reconcilers(&readers, &deployment, &allowances);
+    assert_eq!(
+        reconcilers.bindings(),
+        vec![(
+            "openrouter-free".to_string(),
+            "free_model_daily_requests".to_string()
+        )],
+        "the binding names the account label and the provider's own pool"
+    );
+
+    // The provider says the account has spent its free-model allowance.
+    let mut observation = AccountObservation::default();
+    observation.request_allowances.push(
+        switchyard_server::economics::providers::RequestAllowanceReading::new(
+            "free_model_daily_requests",
+            1000,
+            1000,
+            0,
+            at(LATE_UTC_DAY),
+            None,
+        ),
+    );
+    let applied = reconcilers.apply("openrouter-free", &observation, at(LATE_UTC_DAY));
+    assert_eq!(applied.written, 1);
+
+    assert!(matches!(
+        counter.try_reserve_at(at(LATE_UTC_DAY)),
+        Err(ReserveError::ProviderExhausted { limit: 1000 })
+    ));
+}
+
+/// A client that declares no pool produces no binding, and its counter keeps admitting on
+/// its own budget. Without this, every deployment would be reconciled against whatever
+/// account happened to be configured.
+#[test]
+fn a_client_without_a_pool_binds_nothing() {
+    let (deployment, directory) =
+        pool_deployment("openrouter-free", "SY_OPENROUTER_STEPHEN_KEY", "g", None);
+    let env = env_holding(&["SY_OPENROUTER_STEPHEN_KEY"]);
+    let readers = build_account_readers(&deployment, &env);
+    let counter = account_counter(&directory, "g", 3);
+    let mut allowances = std::collections::HashMap::new();
+    allowances.insert(
+        (
+            "g".to_string(),
+            switchyard_llm_client::ACCOUNT_SCOPE_MODEL.into(),
+        ),
+        std::sync::Arc::clone(&counter),
+    );
+
+    let reconcilers = build_reconcilers(&readers, &deployment, &allowances);
+    assert!(reconcilers.is_empty());
+    counter
+        .try_reserve_at(at(LATE_UTC_DAY))
+        .expect("an unreconciled counter admits on its own budget");
+}
+
+/// Two accounts on one provider are two bindings with two labels. A reading that arrives
+/// from one of them cannot touch the other's counter -- this is the isolation boundary
+/// that stops one account's exhaustion from refusing another account's traffic.
+#[test]
+fn two_accounts_on_one_provider_are_bound_apart() {
+    let (mut owner, owner_dir) = pool_deployment(
+        "openrouter-free-owner",
+        "SY_OPENROUTER_KEY",
+        "openrouter-free-owner",
+        Some(switchyard_runner::QuotaProvider::OpenRouterFreeModels),
+    );
+    let (stephen, _stephen_dir) = pool_deployment(
+        "openrouter-free-stephen",
+        "SY_OPENROUTER_STEPHEN_KEY",
+        "openrouter-free-stephen",
+        Some(switchyard_runner::QuotaProvider::OpenRouterFreeModels),
+    );
+    for (name, client) in stephen.clients {
+        owner.clients.insert(name, client);
+    }
+    let env = env_holding(&["SY_OPENROUTER_KEY", "SY_OPENROUTER_STEPHEN_KEY"]);
+    let readers = build_account_readers(&owner, &env);
+    assert_eq!(readers.len(), 2, "two credentials, two accounts");
+
+    let owner_counter = account_counter(&owner_dir, "openrouter-free-owner", 1000);
+    let stephen_counter = account_counter(&owner_dir, "openrouter-free-stephen", 1000);
+    let mut allowances = std::collections::HashMap::new();
+    for (group, counter) in [
+        ("openrouter-free-owner", &owner_counter),
+        ("openrouter-free-stephen", &stephen_counter),
+    ] {
+        allowances.insert(
+            (
+                group.to_string(),
+                switchyard_llm_client::ACCOUNT_SCOPE_MODEL.into(),
+            ),
+            std::sync::Arc::clone(counter),
+        );
+    }
+
+    let reconcilers = build_reconcilers(&readers, &owner, &allowances);
+    assert_eq!(reconcilers.len(), 2);
+
+    // Exhaustion arrives under one account's label only.
+    let mut observation = AccountObservation::default();
+    observation.request_allowances.push(
+        switchyard_server::economics::providers::RequestAllowanceReading::new(
+            "free_model_daily_requests",
+            1000,
+            1000,
+            0,
+            at(LATE_UTC_DAY),
+            None,
+        ),
+    );
+    for (account, _) in reconcilers.bindings() {
+        if account.contains("owner") {
+            reconcilers.apply(&account, &observation, at(LATE_UTC_DAY));
+        }
+    }
+
+    owner_counter
+        .try_reserve_at(at(LATE_UTC_DAY))
+        .expect_err("the account that reported exhaustion must refuse");
+    stephen_counter
+        .try_reserve_at(at(LATE_UTC_DAY))
+        .expect("the other account must keep serving");
+}
+
+/// The collector applies a reading during its round, so no separate call is needed for a
+/// running deployment. This is the link a unit test on the reconciler alone would miss.
+#[test]
+fn the_collector_applies_the_reading_during_its_round() {
+    let directory = std::env::temp_dir()
+        .join("switchyard-collector-reconcile")
+        .join(format!("{}", std::process::id()));
+    let counter = account_counter(&directory, "openrouter-free", 1000);
+    let reconcilers = Reconcilers::new(vec![
+        switchyard_server::economics::reconcile::AllowanceReconciler::new(
+            "openrouter-free",
+            "free_model_daily_requests",
+            std::sync::Arc::clone(&counter),
+        ),
+    ]);
+
+    let mut observation = AccountObservation::default();
+    observation.request_allowances.push(
+        switchyard_server::economics::providers::RequestAllowanceReading::new(
+            "free_model_daily_requests",
+            1000,
+            1000,
+            0,
+            std::time::SystemTime::now(),
+            None,
+        ),
+    );
+    let api = Arc::new(StaticAccount::new("openrouter-free", observation));
+    let mut collector = AccountCollector::new(vec![api]).with_reconcilers(reconcilers);
+    assert_eq!(collector.reconciled_counters(), 1);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let successful = runtime.block_on(collector.collect_once());
+    assert_eq!(successful, 1);
+
+    assert!(matches!(
+        counter.try_reserve_at(std::time::SystemTime::now()),
+        Err(ReserveError::ProviderExhausted { limit: 1000 })
+    ));
+}
+
+/// An account reader that answers with a fixed observation, so a collection round can be
+/// driven without a provider.
+struct StaticAccount {
+    label: String,
+    observation: AccountObservation,
+}
+
+impl StaticAccount {
+    fn new(label: &str, observation: AccountObservation) -> Self {
+        Self {
+            label: label.to_string(),
+            observation,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AccountApi for StaticAccount {
+    fn provider(&self) -> &str {
+        &self.label
+    }
+
+    async fn fetch(&self) -> FetchOutcome {
+        FetchOutcome::Ok(Box::new(self.observation.clone()))
     }
 }

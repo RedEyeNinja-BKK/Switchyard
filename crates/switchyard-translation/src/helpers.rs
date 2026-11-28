@@ -58,8 +58,21 @@ pub fn encode_request_with_policy(
 
 /// Decodes a buffered `wire_format` response body into the neutral aggregate.
 pub fn decode_aggregated_response(body: &Value, wire_format: WireFormat) -> Result<AggLlmResponse> {
+    decode_aggregated_response_with_policy(body, wire_format, &DEFAULT_TRANSLATION_POLICY)
+}
+
+/// Like [`decode_aggregated_response`], with an explicit policy.
+///
+/// The policy is what carries a target's inline hosted reasoning marker, so this is the
+/// entry point a per-target decode uses. A target that states no marker gets exactly the
+/// behaviour of the policy-free form.
+pub fn decode_aggregated_response_with_policy(
+    body: &Value,
+    wire_format: WireFormat,
+    policy: &TranslationPolicy,
+) -> Result<AggLlmResponse> {
     Ok(DEFAULT_TRANSLATION_ENGINE
-        .decode_response(wire_format, body, &DEFAULT_TRANSLATION_POLICY)?
+        .decode_response(wire_format, body, policy)?
         .response)
 }
 
@@ -262,6 +275,43 @@ pub fn decode_stream<S>(
 where
     S: Stream<Item = std::result::Result<Vec<u8>, LlmClientError>> + Send + 'static,
 {
+    decode_stream_with_policy(bytes, source, &DEFAULT_TRANSLATION_POLICY)
+}
+
+/// Like [`decode_stream`], with an explicit policy.
+///
+/// The policy supplies the target's inline hosted reasoning marker, which the stream codec
+/// applies to text deltas before they reach a caller.
+/// The raw source frame to attach to a decoded stream event, or `Value::Null` when the
+/// target's policy forbids replaying it.
+///
+/// The encoder prefers a preserved frame over the normalized chunks when it can, so a
+/// policy that removes text from the answer must also stop the frame that still contains it
+/// from travelling with the event.
+fn replayed_stream_event(
+    preserve: bool,
+    source: FormatId,
+    frame: Value,
+    normalized: Vec<LlmResponseChunk>,
+) -> LlmResponseStreamEvent {
+    if preserve {
+        LlmResponseStreamEvent::preserved(source, frame, normalized)
+    } else {
+        // No retained frame at all: `preserved(.., Value::Null, ..)` would still be a
+        // retained frame, and the encoder replays what it is given. An event with no
+        // preservation is the only shape that cannot replay the monologue.
+        LlmResponseStreamEvent::new(normalized)
+    }
+}
+
+pub fn decode_stream_with_policy<S>(
+    bytes: S,
+    source: WireFormat,
+    policy: &TranslationPolicy,
+) -> std::result::Result<LlmResponseStream, LlmClientError>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, LlmClientError>> + Send + 'static,
+{
     let marker = sse::done_marker(source);
     let source_format: FormatId = source.into();
     // The source is always a built-in wire format, so this lookup cannot fail; a
@@ -279,8 +329,12 @@ where
         Box::pin(bytes.map(|item| item.map_err(std::io::Error::other)));
     let lines = futures::io::BufReader::new(io_bytes.into_async_read()).lines();
 
+    // The frame rule is a plain bool so the generator below captures nothing borrowed
+    // from the policy: a stream that outlives this call must not hold a reference to it.
+    let preserve_frames = policy.hosted_reasoning.is_none();
     let mut state = StreamTranslationState {
         source: Some(source_format.clone()),
+        hosted_reasoning: policy.hosted_reasoning,
         ..StreamTranslationState::default()
     };
     let mut frame = String::new();
@@ -309,7 +363,11 @@ where
                             LlmResponseChunk::DecodeError { .. }
                                 | LlmResponseChunk::StreamError { .. }
                         ));
-                        yield LlmResponseStreamEvent::preserved(
+                        // A target that declares a hosted reasoning marker must not carry
+                        // the raw upstream frame: the frame is what the encoder replays when
+                        // it can, and it still contains the monologue this policy removes.
+                        yield replayed_stream_event(
+                            preserve_frames,
                             source_format.clone(),
                             value,
                             normalized,
@@ -346,9 +404,45 @@ where
                         LlmResponseChunk::DecodeError { .. }
                             | LlmResponseChunk::StreamError { .. }
                     ));
-                    yield LlmResponseStreamEvent::preserved(source_format, value, normalized);
+                    yield replayed_stream_event(
+                        preserve_frames,
+                        source_format.clone(),
+                        value,
+                        normalized,
+                    );
                 }
                 sse::SseFrame::Empty => {}
+            }
+        }
+
+        // A marker-enabled stream that ended mid-block is refused: the answer was never
+        // released, and synthesising one from a truncated block is the leak this filter
+        // exists to prevent. When the filter does have text left over it is answer text,
+        // so it is emitted rather than dropped.
+        if state.hosted_reasoning.is_some() {
+            match state.thought_filter.finish() {
+                Ok(events) => {
+                    // Reasoning is dropped here for the same reason as in the delta path:
+                    // a reasoning chunk is re-encoded as `reasoning_content`, which would
+                    // hand the caller the monologue through a second field.
+                    let chunks: Vec<LlmResponseChunk> = events
+                        .into_iter()
+                        .filter_map(|event| match event {
+                            crate::codecs::openai_chat::Filtered::Reasoning(_) => None,
+                            crate::codecs::openai_chat::Filtered::Answer(text) => {
+                                Some(LlmResponseChunk::TextDelta { index: 0, text })
+                            }
+                        })
+                        .collect();
+                    if !chunks.is_empty() {
+                        yield LlmResponseStreamEvent::preserved(
+                            source_format,
+                            Value::Null,
+                            chunks,
+                        );
+                    }
+                }
+                Err(leak) => Err(LlmClientError::ResponseTranslation(leak.to_string()))?,
             }
         }
 
@@ -387,10 +481,11 @@ mod tests {
     };
 
     use super::{
-        decode_aggregated_response, decode_request, decode_stream, encode_aggregated_response,
-        encode_request, encode_stream, stamp_streamed_response_model,
+        decode_aggregated_response, decode_aggregated_response_with_policy, decode_request,
+        decode_stream, decode_stream_with_policy, encode_aggregated_response, encode_request,
+        encode_stream, stamp_streamed_response_model,
     };
-    use crate::{LlmResponseStream, LlmStreamError, WireFormat};
+    use crate::{LlmResponseStream, LlmStreamError, TranslationPolicy, WireFormat};
 
     // A boxed stream item error, matching the streamed IR contract.
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -994,6 +1089,131 @@ mod tests {
             panic!("expected invalid SSE JSON to fail");
         };
         assert!(matches!(error, LlmClientError::ResponseTranslation(_)));
+        Ok(())
+    }
+
+    // The policy a hosted-Gemma target states: the upstream writes its reasoning
+    // inline, behind a marker, and the codec is asked to move it out of the answer.
+    fn thought_marker_policy() -> TranslationPolicy {
+        TranslationPolicy {
+            hosted_reasoning: Some(crate::codecs::openai_chat::HostedReasoningMarker::ThoughtTag),
+            ..TranslationPolicy::default()
+        }
+    }
+
+    #[test]
+    fn decode_stream_moves_hosted_reasoning_out_of_the_answer() -> Result<(), BoxError> {
+        // The marker is split across deltas on purpose: a filter that only recognised a
+        // whole block inside one chunk would leak the monologue here.
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"<thou\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"ght>plan</thought>\\n\\nready\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n"
+            .to_vec();
+        let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
+        let decoded =
+            decode_stream_with_policy(bytes, WireFormat::OpenAiChat, &thought_marker_policy())?;
+
+        // Judged on the wire the caller receives, not on the IR: a thought can leave through
+        // `content` or through `reasoning_content`, and only the encoding says which.
+        let encoded = encode_stream(decoded, WireFormat::OpenAiChat, None)?;
+        let wire = block_on(encoded.collect::<Vec<_>>())
+            .into_iter()
+            .collect::<std::result::Result<Vec<Value>, _>>()?
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+
+        assert!(
+            wire.contains("ready"),
+            "the answer still reaches the caller: {wire}"
+        );
+        assert!(
+            !wire.contains("plan"),
+            "the thought must not reach the caller through content: {wire}"
+        );
+        assert!(
+            !wire.contains("reasoning_content"),
+            "a declared hosted marker must not emit a reasoning field at all: {wire}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_stream_refuses_a_stream_that_ends_inside_the_block() -> Result<(), BoxError> {
+        // Nothing was ever released as an answer, so there is no partial reply to hand
+        // over; synthesising one from the buffered thought is the leak this refuses.
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"<thought>plan\"}}]}\n\n\
+             data: [DONE]\n\n"
+            .to_vec();
+        let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
+        let results = block_on(
+            decode_stream_with_policy(bytes, WireFormat::OpenAiChat, &thought_marker_policy())?
+                .collect::<Vec<_>>(),
+        );
+        let Some(Err(error)) = results.last() else {
+            panic!("expected an unterminated reasoning block to fail the stream");
+        };
+        assert!(matches!(error, LlmClientError::ResponseTranslation(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_aggregated_response_moves_hosted_reasoning_out_of_the_message() -> Result<(), BoxError>
+    {
+        let body = json!({
+            "id": "1",
+            "model": "gemma",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<thought>plan</thought>\n\nready"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let agg = decode_aggregated_response_with_policy(
+            &body,
+            WireFormat::OpenAiChat,
+            &thought_marker_policy(),
+        )?;
+
+        // A reasoning block would be free to become `reasoning_content`, so the check is
+        // made on the encoded chat body the caller actually reads.
+        let encoded = encode_aggregated_response(&agg, WireFormat::OpenAiChat, None)?;
+        let message = &encoded["choices"][0]["message"];
+        assert_eq!(message["content"], "ready");
+        assert!(
+            message.get("reasoning_content").is_none(),
+            "a declared hosted marker must not emit reasoning_content: {encoded}"
+        );
+        assert!(
+            !encoded.to_string().contains("plan"),
+            "the thought must appear in no field of the encoded body: {encoded}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_target_without_the_marker_leaves_the_text_alone() -> Result<(), BoxError> {
+        // Negative control for the three tests above: the marker is what moves the block.
+        // A model that legitimately writes these tokens as text must be untouched by a
+        // target that does not declare the marker.
+        let body = json!({
+            "id": "1",
+            "model": "plain",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<thought>plan</thought>\n\nready"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let agg = decode_aggregated_response(&body, WireFormat::OpenAiChat)?;
+        assert_eq!(completion_text(&agg), "<thought>plan</thought>\n\nready");
         Ok(())
     }
 }

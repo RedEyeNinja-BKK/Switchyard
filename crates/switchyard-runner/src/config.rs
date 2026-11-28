@@ -21,10 +21,12 @@ use switchyard_llm_client::{
 use switchyard_protocol::{
     Category, ModelId, ReasoningDialect, ReasoningPolicy, RoutedLlmClient, WireFormat,
 };
+use switchyard_translation::HostedReasoningMarker;
 
 use crate::{
-    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError, capability, decision_executor, decision_transport,
+    AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, HeldRoute, MediaCarrier,
+    ModelCapabilities, Route, Runner, RunnerError, capability, decision_executor,
+    decision_transport,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -105,6 +107,24 @@ pub(crate) struct DeploymentConfig {
     /// Ordered composites over complete child routes, by route name.
     #[serde(default)]
     pub(crate) composites: BTreeMap<String, CompositeRouteConfig>,
+    /// Where per-target daily request allowances keep their counters.
+    ///
+    /// Optional as a whole: a deployment with no `daily_request_limit` has no budget to
+    /// account for. Required as soon as one target declares a limit, because an allowance
+    /// whose counter cannot be written is a cap nobody is enforcing.
+    #[serde(default)]
+    quota: Option<QuotaConfig>,
+}
+
+/// Accounting for per-target daily request allowances.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QuotaConfig {
+    /// Directory holding one counter file per (llm client, model).
+    ///
+    /// Created if it does not exist. Verified writable at load, so a budget that cannot be
+    /// counted is a startup error rather than a silently unenforced cap.
+    pub(crate) state_dir: std::path::PathBuf,
 }
 
 /// A route composed of ordered whole child routes.
@@ -117,6 +137,16 @@ pub(crate) struct DeploymentConfig {
 pub(crate) struct CompositeRouteConfig {
     /// Child route names in preference order.
     pub(crate) children: Vec<String>,
+    /// When this composite may try its next child.
+    ///
+    /// Defaults to the historical failure-class rule, which is right for a composite whose
+    /// children sit on different credentials. A composite whose children share one
+    /// credential has a different question to answer: whether the *scope* the failed child
+    /// used is exhausted while the next child's scope is not. `credential_block` says that
+    /// and nothing more, so an ordinary rate limit, a timeout or a provider fault cannot
+    /// spend a paid call.
+    #[serde(default)]
+    pub(crate) cross_on: CompositeCrossPolicy,
     /// Certified context this composite guarantees, as an explicit policy promise.
     ///
     /// Stated rather than derived: a composite whose first child accepts a million tokens
@@ -132,6 +162,43 @@ pub(crate) struct CompositeRouteConfig {
     /// Whether any child can accept video input. Stated, never inferred from `vision`.
     #[serde(default)]
     pub(crate) video: Option<bool>,
+    /// Which video carriers any child can accept, when the composite claims video.
+    ///
+    /// Same reasoning as the route field: a composite resolves before its children, so a
+    /// carrier it cannot back would advertise a medium and then skip every child.
+    #[serde(default)]
+    pub(crate) video_carrier: Option<MediaCarrier>,
+    /// Which image carriers any child can accept, when the composite claims vision.
+    #[serde(default)]
+    pub(crate) image_carrier: Option<MediaCarrier>,
+}
+
+/// When a whole-route composite may try its next child.
+///
+/// The two answers differ in what they treat as evidence. `failure_class` asks whether the
+/// failure looks recoverable somewhere else, which is the right question when children sit
+/// on different credentials. `credential_block` asks whether the failure named a
+/// credential-scoped resource as out, which is the right question when children share one
+/// credential and the later child's *scope* is what differs.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositeCrossPolicy {
+    /// Cross on any failure class that says another complete route might answer.
+    ///
+    /// This is the historical rule and stays the default, so an existing composite's
+    /// behaviour does not change because a new policy became available.
+    #[default]
+    FailureClass,
+    /// Cross only when the failed child reported a credential-level block AND a later
+    /// child on that credential still has a servable scope.
+    ///
+    /// A block is what the provider said about the credential, not what the request
+    /// looked like: the free-model daily allowance reported exhausted is a block, while a
+    /// 20-per-minute throttle, a timeout, a transport fault or a per-model refusal is not.
+    /// A later child on a different credential is unaffected by any block and is judged on
+    /// its own failure. A whole-credential exhaustion or a rejected key blocks every child
+    /// on that credential, so no later child is called and the child's own error surfaces.
+    CredentialBlock,
 }
 
 /// One explicitly ordered decision lane.
@@ -152,17 +219,25 @@ pub(crate) struct DecisionLaneConfig {
     pub(crate) types: Vec<decision_transport::QuestionKind>,
 }
 
-/// A decision lane composed of ordered child POLICY lanes.
+/// A decision lane composed of child POLICY lanes.
 ///
-/// Children are lane names, not targets. Each child runs its own candidate order,
-/// question-kind eligibility and failure policy in process, and the parent adds only
-/// ordered selection between them. Keeping the reference rather than flattening it is
-/// what lets a family stay independently addressable and its policy stay single-sourced.
+/// Children are lane names, not targets. Each child keeps its own question-kind
+/// eligibility and failure policy in process, and the parent adds selection between them.
+/// Keeping the reference rather than flattening it is what lets a family stay
+/// independently addressable and its policy stay single-sourced.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DecisionLaneCompositionConfig {
     /// Child decision lane names in preference order.
     pub(crate) children: Vec<String>,
+    /// How this lane selects between its children.
+    ///
+    /// Absent means [`decision_executor::LaneSelection::Ordered`], the historic
+    /// behaviour, so a manifest that does not name a policy keeps its meaning. The policy
+    /// is stated here rather than inferred from the lane's name: renaming a lane must not
+    /// change how it routes.
+    #[serde(default)]
+    pub(crate) selection: decision_executor::LaneSelection,
 }
 
 #[derive(Debug)]
@@ -173,6 +248,15 @@ struct RouteConfig {
     reasoning: Option<bool>,
     vision: Option<bool>,
     video: Option<bool>,
+    /// Which video carriers this route admits, when it claims video.
+    ///
+    /// A route promise, not a target fact: the target says what one endpoint can serve and
+    /// this says what the route lets through. They are intersected at load, so a route that
+    /// promises both carriers over an inline-only target is a configuration error rather
+    /// than a request that fails at the provider.
+    video_carrier: Option<MediaCarrier>,
+    /// Which image carriers this route admits, when it claims vision.
+    image_carrier: Option<MediaCarrier>,
     /// Reasoning policy for this route. Applies on top of the target's factual policy.
     route_reasoning_policy: Option<RouteReasoningPolicy>,
     /// Whether this route's reasoning policy is applied on a best-effort basis.
@@ -190,13 +274,285 @@ struct RouteConfig {
     route_reasoning_policy_best_effort: bool,
     /// Estimated input tokens above which this route escalates to a wider-context leg.
     escalation_max_input_tokens: Option<u64>,
+    /// Groups whose members form this route's candidate pool, when it declares one.
+    pool_groups: Option<Vec<String>>,
+    /// How a grouped pool orders its groups against each other.
+    ///
+    /// `adaptive` (the default) treats them as equal peers whose order follows readiness,
+    /// completion rate and latency; `ordered` treats the declared sequence as the priority
+    /// order and exhausts each group before offering the next. `flat` is refused here: a
+    /// grouped pool always groups, and the word exists only so the shared vocabulary can say
+    /// what the other policies are.
+    group_ordering: Option<String>,
+    /// Targets this route may reach only after its entire eligible primary pool is
+    /// verifiably unavailable, in declared order.
+    ///
+    /// Kept separate from the candidate list on purpose. A terminal leg that was merely a
+    /// candidate would be ranked with its peers and would serve whenever the pool was busy,
+    /// which is the paid escalation this field exists to prevent; naming it here means the
+    /// exhaustion rule is the only way to reach it. A terminal target therefore must not also
+    /// appear among the candidates.
+    ///
+    /// A flat list of names is ONE leg, which is the historical shape and still means exactly
+    /// what it meant: its members are peers of each other and the route crosses onto them as a
+    /// single set. A list of lists declares ordered TIERS instead, and only the nested form
+    /// orders them. The distinction is not cosmetic. Peerage inside one set is decided by the
+    /// route's selection policy, so two providers' last resorts written as `[a, b]` would
+    /// compete and the cheaper or faster one would win regardless of the order they were
+    /// typed in. Tier `n + 1` is reachable only once tier `n` has itself been proved out, and
+    /// each boundary is authorized separately.
+    terminal_fallback: Option<TerminalFallback>,
+    /// Which evidence may spend `terminal_fallback`.
+    ///
+    /// Absent keeps the historical rule, so no route changes behaviour because this option
+    /// exists. Declared, it is a statement about money: a lane whose terminal leg exists for
+    /// one kind of failure must not be able to spend it on another. Declaring a policy with
+    /// no terminal leg is refused rather than ignored, because a policy that governs nothing
+    /// reads as a guarantee it cannot provide.
+    terminal_policy: Option<TerminalPolicy>,
+    /// Which evidence may carry the walk past each declared tier, when a tier's boundary
+    /// differs from the route's own.
+    ///
+    /// `terminal_policy` governs the claim that opens the terminal walk: what may spend the
+    /// FIRST tier. That is the right statement for a local tier behind a free pool — the
+    /// local capacity exists for allowance exhaustion and for nothing else. It is the wrong
+    /// statement for a metered tier behind that local tier: once the allowance is exhausted
+    /// and the local model cannot answer, "the local capacity is gone" is a capacity fact,
+    /// and a route that only accepts quota evidence at that boundary can never reach a tier
+    /// that exists precisely for the local outage.
+    ///
+    /// So each boundary may state its own policy, aligned with the declared tiers and
+    /// defaulting to `terminal_policy`. It cannot widen what any tier accepts: the request
+    /// still has to pass every gate of the tier it is leaving.
+    terminal_policies: Option<Vec<TerminalPolicy>>,
+    /// Whether a request no primary candidate can hold may be escalated to the declared
+    /// tiers.
+    ///
+    /// Absent is the historical behaviour and stays the default: the pool admitted nothing,
+    /// the caller is told what did not fit, and no further leg is contacted. Declared, it is
+    /// a second and narrower claim beside `terminal_policy` -- not a wider reading of it.
+    ///
+    /// The two are deliberately separate axes. `terminal_policy` decides what may spend the
+    /// leg when the pool *failed*: an allowance gone, a throttle, an outage. This decides
+    /// whether a pool that never dispatched anything may hand the request to the next tier
+    /// because the request is larger than the pool can hold. Reading a size refusal as
+    /// capacity exhaustion would let a metered tier absorb a request the deployment never
+    /// promised to serve and would hide from the caller that their prompt was the problem;
+    /// refusing to escalate at all strands a request an authorized wider tier can serve.
+    ///
+    /// It cannot widen what any tier accepts: each tier is judged on its own gates, and a
+    /// request that fails them ends the walk with the refusal the primary pool gave.
+    fit_escalation: Option<bool>,
+    /// Whether a request no primary candidate's *wire* can carry may be escalated to the
+    /// declared tiers.
+    ///
+    /// Absent is the historical behaviour and stays the default: a pool whose targets cannot
+    /// carry the request refuses, and the caller is told what the deployment lacks rather than
+    /// having a later group asked the same question. Declared, it is a third and narrower claim
+    /// beside `terminal_policy` and `fit_escalation`, and the three are deliberately separate
+    /// axes: capacity, size, and the wire.
+    ///
+    /// It authorizes consideration of the next declared group, not expenditure. Every group is
+    /// judged on its own credential, allowance, fit, privacy and continuation gates, so a
+    /// metered group reached this way still has to admit the request on its own terms, or it is
+    /// skipped exactly as before.
+    ///
+    /// Only a closed vocabulary of measured per-target wire facts may open this boundary
+    /// (`tool_call_replay` today). A malformed or unsafe continuation, an authentication,
+    /// billing or policy refusal, and a request the route never promised to serve all fail
+    /// outside it and end the walk with the pool's own refusal.
+    capability_escalation: Option<bool>,
     /// Target this route prefers once it is under context pressure.
     ///
     /// Named rather than inferred: a target's context window is not a fact this config
     /// carries. `context_window` is a route-level promise, and upstream rejects it as an
     /// unknown field on a target, so which leg is wider has to be stated.
     escalation_target: Option<String>,
+    /// How this route orders the candidates that survived eligibility filtering.
+    ///
+    /// Declared order is the historical behaviour and stays the default, so no existing
+    /// route reorders because a new option became available. `measured` lets a route whose
+    /// candidates are interchangeable free models pick by what this deployment has actually
+    /// observed — completion, then latency — instead of by configuration order, which for
+    /// interchangeable models is an accident of spelling rather than a decision.
+    ///
+    /// Read by the manual `Deserialize` below, which is why it carries no attribute: this
+    /// struct removes its own fields from the table before the algorithm spec sees them.
+    selection: SelectionPolicy,
     algorithm: AlgorithmSpec,
+}
+
+/// How a route orders its eligible candidates.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionPolicy {
+    /// Walk candidates in the order configuration states. Unchanged behaviour.
+    #[default]
+    Declared,
+    /// Order by measured completion and latency, falling back to declared order.
+    ///
+    /// Only reorders among candidates that already survived every hard gate — privacy,
+    /// capability, physical fit, quota — so it can never spend a leg the deployment would
+    /// have refused. A target with too few observations keeps its declared position, so a
+    /// cold deployment behaves exactly like a declared-order one.
+    Measured,
+    /// Treat every candidate as a peer, regardless of which provider or credential serves it.
+    ///
+    /// `Measured` still breaks ties with the manifest's own order, which is the right answer
+    /// for a lineup an operator wrote down deliberately. It is the wrong answer for a pool
+    /// assembled from several providers' free tiers, because the manifest order is then an
+    /// accident of how the file was written and would silently become a provider priority:
+    /// the leg typed first would win every tie, every time.
+    ///
+    /// `Peer` removes that priority in two places. Ties are broken by canonical route id, so
+    /// reordering the manifest cannot change the chosen model; and a candidate whose own
+    /// remaining allowance is unknown ranks behind one whose headroom is verifiable, instead
+    /// of ahead of every declared budget as an absent number used to. Free eligibility is
+    /// still decided by declared tariff, never by position: a `Peer` pool excludes every
+    /// candidate that is not stated free before it ranks anything.
+    Peer,
+    /// Treat the declared `pool_groups` as groups, not as one peer set.
+    ///
+    /// `Peer` still compares candidates leaf by leaf, which is honest while every leaf is
+    /// measured on the same yardstick. Across two providers it is not: one provider states a
+    /// daily request budget and the other states none, so "more requests left" would make the
+    /// budget-declaring provider win every comparison and the pool would silently become a
+    /// priority list. A group whose membership is four leaves against another's one also wins
+    /// a per-leaf count for a reason nobody chose.
+    ///
+    /// `Grouped` chooses the group first, on evidence that is comparable between providers —
+    /// whether the group has anything left to spend, whether it has been measured failing, and
+    /// how fast it has answered — with a rotation floor so two equally-evidenced groups are
+    /// both used. Inside the chosen group the `Peer` leaf keys still decide, including the
+    /// daily budget, because there the budget is the same provider's yardstick.
+    ///
+    /// Requires at least two `pool_groups`; a single group is a `Peer` pool written the long
+    /// way, and accepting it here would make the policy look like it does something.
+    Grouped,
+}
+
+/// One declared terminal leg: either a single target or one tier of peers.
+///
+/// Untagged so the manifest stays readable. This is the INNER shape — what one tier is —
+/// and it is only ever reached through [`TerminalFallback::Tiered`], so seeing `One` here
+/// never means "a separate tier", only "a tier written without brackets".
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TerminalTierSpec {
+    /// A tier of one target.
+    One(String),
+    /// One tier whose members are peers of each other.
+    Many(Vec<String>),
+}
+
+impl TerminalTierSpec {
+    /// The target names in this tier, in declared order.
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            Self::One(name) => vec![name.as_str()],
+            Self::Many(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// A route's declared terminal legs, and whether their order means anything.
+///
+/// Untagged so that every manifest written before tiers existed keeps its meaning exactly.
+/// The distinction is not cosmetic and it is not inferable from the inner type: if this
+/// enum did not exist, `["a", "b"]` would deserialise as *two* tiers of one target each, and
+/// a route that declares two peers would silently become an escalation from `a` to `b`.
+/// Peerage inside one set is decided by the route's own selection policy; only the nested
+/// form orders legs, and only the nested form makes a leg wait for its predecessor.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TerminalFallback {
+    /// The historical shape: one leg, whose members are peers of one another.
+    Flat(Vec<String>),
+    /// Declared escalation order: a tier is reachable only once its predecessor is proved out.
+    Tiered(Vec<TerminalTierSpec>),
+}
+
+impl TerminalFallback {
+    /// The declaration as ordered tiers, flattening the historical one-leg shape into a
+    /// single tier so every reader sees one representation.
+    fn tiers(&self) -> Vec<TerminalTierSpec> {
+        match self {
+            Self::Flat(names) => vec![TerminalTierSpec::Many(names.clone())],
+            Self::Tiered(tiers) => tiers.clone(),
+        }
+    }
+
+    /// Every declared target name, in declaration order, borrowed from the declaration.
+    ///
+    /// Separate from [`Self::tiers`] because the target lists here are handed to builders
+    /// that store `&str`: those borrows have to point into the configuration, not into a
+    /// temporary that `tiers` allocated.
+    fn name_refs(&self) -> Vec<&str> {
+        match self {
+            Self::Flat(names) => names.iter().map(String::as_str).collect(),
+            Self::Tiered(tiers) => tiers.iter().flat_map(TerminalTierSpec::names).collect(),
+        }
+    }
+}
+
+/// Which evidence may spend a route's declared terminal fallback.
+///
+/// A terminal leg exists so that one specific kind of failure does not become the caller's
+/// problem. Which kind is a policy decision, and it is not the same decision for every lane:
+/// a provider-neutral pool escalates on "nothing in this pool can answer right now", while a
+/// lane built to work inside a free allowance escalates only when that allowance is spent.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPolicy {
+    /// Any capacity or availability failure of the whole pool, or a pool wholly covered by a
+    /// credential block. The historical rule; every route that declares no policy keeps it.
+    #[default]
+    Capacity,
+    /// Quota evidence only: the terminal leg is spent when the primary pool is demonstrably
+    /// out of allowance or throttled, and never on an outage, a timeout, a transport fault or
+    /// a credential/permission failure. Those say the deployment cannot reach the pool, not
+    /// that the pool's free allowance ran out, and the terminal leg is reserved for the
+    /// second case.
+    QuotaOnly,
+    /// Capacity or availability failure of the whole pool, but never a credential refusal and
+    /// never a fault that is about this deployment's accounting or this request's size.
+    ///
+    /// The difference from `Capacity` is the two authentication outcomes, plus
+    /// `daily_allowance_unavailable` and `minute_window_too_small`. A rejected key or a
+    /// refused balance says the deployment is misconfigured or unpaid, and spending a
+    /// further leg on it converts a configuration fault into cost without making the request
+    /// any more likely to be answered. An unreadable allowance ledger is an accounting fault
+    /// rather than a measured exhaustion -- the allowance may be untouched -- and a request
+    /// larger than a model's whole minute window can never be served by that model. Every
+    /// other capacity class is accepted -- allowance exhaustion, a minute window, a retryable
+    /// 5xx or 429, a transport fault, a leg that went unavailable, or an attempt that timed
+    /// out -- because those are the ways a healthy deployment legitimately cannot serve right
+    /// now.
+    Availability,
+    /// Allowance evidence only, in the strictest sense: the terminal leg is spent when every
+    /// primary leg reports that an allowance domain is *exhausted*, and on nothing else.
+    ///
+    /// This is the rule the owner stated for the NT and judge lanes: the local tier sits behind
+    /// "both primary allowances are exhausted", not behind "the pool is temporarily unable".
+    /// The distinction matters because the two answers look alike in a decision record and cost
+    /// very different things:
+    ///
+    /// * A minute window regains room by itself within the same minute. Crossing on it spends a
+    ///   local or metered request to solve a problem that would have solved itself.
+    /// * A bare `429` is unclassified. It may be a per-minute throttle, an account cap, a
+    ///   concurrency limit, or a provider policy that says nothing about allowance. Reading it
+    ///   as exhaustion is an inference the evidence does not support.
+    /// * `daily_allowance_unavailable` is an unreadable ledger, i.e. *unknown*, and an unknown
+    ///   allowance is not an exhausted one.
+    /// * An outage, a transport fault, a timeout, a rejected key, a refused balance, a malformed
+    ///   request or a policy answer are all facts about the deployment or the request. None of
+    ///   them is evidence that an allowance ran out.
+    ///
+    /// Only `daily_allowance_exhausted` and `provider_allowance_exhausted` survive: both are
+    /// affirmative statements, from the provider's own accounting, that a domain is at zero for
+    /// the current window. A stale retained reading is reported as unavailable by the same code
+    /// path, so it cannot reach here as exhaustion.
+    AllowanceOnly,
 }
 
 /// Route reasoning policy: what this ROUTE asks of the provider, independent of what the
@@ -254,11 +610,21 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
         let video = take_optional(&mut table, "video")?;
+        let video_carrier = take_optional::<MediaCarrier, _>(&mut table, "video_carrier")?;
+        let image_carrier = take_optional::<MediaCarrier, _>(&mut table, "image_carrier")?;
         let route_reasoning_policy = take_optional(&mut table, "route_reasoning_policy")?;
         let route_reasoning_policy_best_effort: Option<bool> =
             take_optional(&mut table, "route_reasoning_policy_best_effort")?;
         let escalation_max_input_tokens = take_optional(&mut table, "escalation_max_input_tokens")?;
+        let pool_groups = take_optional(&mut table, "pool_groups")?;
+        let group_ordering = take_optional::<String, _>(&mut table, "group_ordering")?;
+        let terminal_fallback = take_optional(&mut table, "terminal_fallback")?;
+        let terminal_policy = take_optional(&mut table, "terminal_policy")?;
+        let terminal_policies = take_optional(&mut table, "terminal_policies")?;
+        let fit_escalation = take_optional(&mut table, "fit_escalation")?;
+        let capability_escalation = take_optional(&mut table, "capability_escalation")?;
         let escalation_target = take_optional(&mut table, "escalation_target")?;
+        let selection: Option<SelectionPolicy> = take_optional(&mut table, "selection")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -268,10 +634,20 @@ impl<'de> Deserialize<'de> for RouteConfig {
             reasoning,
             vision,
             video,
+            video_carrier,
+            image_carrier,
             route_reasoning_policy,
             route_reasoning_policy_best_effort: route_reasoning_policy_best_effort.unwrap_or(false),
             escalation_max_input_tokens,
+            pool_groups,
+            group_ordering,
+            terminal_fallback,
+            terminal_policy,
+            terminal_policies,
+            fit_escalation,
+            capability_escalation,
             escalation_target,
+            selection: selection.unwrap_or_default(),
             algorithm,
         })
     }
@@ -305,6 +681,17 @@ impl RouteConfig {
             reasoning: self.reasoning,
             vision: self.vision,
             video: self.video,
+            // A route that claims a medium without naming carriers means every carrier, so
+            // a caller reading `/v1/models` and a request carrying either form agree.
+            video_carrier: (self.video == Some(true))
+                .then(|| self.video_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+            image_carrier: (self.vision == Some(true))
+                .then(|| self.image_carrier.unwrap_or(MediaCarrier::DEFAULT)),
+            // Deliberately undeclared at route level: whether a replayed tool call can be
+            // accepted is a property of one provider's wire, not a promise a route can make
+            // across children with different wires. Candidate filtering reads each target's
+            // fact instead, so this stays `None` rather than becoming a knob that does nothing.
+            tool_call_replay: None,
         }
     }
 
@@ -315,9 +702,102 @@ impl RouteConfig {
     fn callable_target_names(&self) -> Vec<&str> {
         self.algorithm.callable_target_names()
     }
+
+    /// Every target this route may contact: the ranked candidates plus the terminal last
+    /// resort. Facts, credentials, daily ledgers and prompt policy have to describe a
+    /// target the route can actually call, or the terminal leg is reached without the
+    /// admission and block machinery that protects every ranked leg.
+    fn served_target_names(&self) -> Vec<&str> {
+        let mut names = self.routing_target_names();
+        if let Some(terminal) = &self.terminal_fallback {
+            for name in terminal.name_refs() {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+}
+
+/// The two ledgers a resolved deployment shares, owned together.
+///
+/// Kept as one value because the pair is not optional in either direction: a resolver
+/// built with a governor but no counters would pace its calls without counting them,
+/// which is the defect this whole path exists to prevent. Passing them as one value
+/// makes that omission unrepresentable rather than merely discouraged.
+struct Accounting<'a> {
+    governor: &'a Arc<switchyard_llm_client::QuotaGovernor>,
+    allowances: &'a HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
 }
 
 impl DeploymentConfig {
+    /// The media capabilities a composite actually guarantees.
+    ///
+    /// A composite can serve a request only through one of its children, so what it can
+    /// promise is what the children between them accept. When the parent states a medium or
+    /// a carrier it keeps its word (an explicit `false` is a policy cap, not an omission),
+    /// and when it states nothing the answer is derived from the children:
+    ///
+    /// * a medium is claimed only when some child declares it -- an undeclared child is not
+    ///   evidence that it reads images, so derivation never invents a claim;
+    /// * a carrier is the union over the children that admit the medium, so a composite over
+    ///   inline-only children advertises inline and a mixed set advertises both.
+    ///
+    /// Deriving rather than hand-editing every parent is what keeps the declaration honest
+    /// when a child's carrier narrows: the parent follows, and
+    /// `validate_composite_media_claims` still refuses an explicit claim no child keeps.
+    fn composite_capabilities(&self, composite: &CompositeRouteConfig) -> crate::ModelCapabilities {
+        let children: Vec<crate::ModelCapabilities> = composite
+            .children
+            .iter()
+            .filter_map(|child| self.routes.get(child))
+            .map(RouteConfig::capabilities)
+            .collect();
+        let serves = |medium: fn(&crate::ModelCapabilities) -> Option<bool>| {
+            children.iter().any(|caps| medium(caps) == Some(true))
+        };
+        let carrier_union =
+            |medium: fn(&crate::ModelCapabilities) -> Option<bool>,
+             carrier: fn(&crate::ModelCapabilities) -> Option<MediaCarrier>| {
+                children
+                    .iter()
+                    .filter(|caps| medium(caps) == Some(true))
+                    .map(|caps| carrier(caps).unwrap_or(MediaCarrier::DEFAULT))
+                    .reduce(MediaCarrier::union)
+            };
+        let video = composite.video.unwrap_or_else(|| serves(|caps| caps.video));
+        let vision = composite
+            .vision
+            .unwrap_or_else(|| serves(|caps| caps.vision));
+        crate::ModelCapabilities {
+            context_window: composite.context_window,
+            tool_calling: composite.tool_calling,
+            reasoning: composite.reasoning,
+            vision: Some(vision),
+            video: Some(video),
+            // A stated carrier is a policy narrowing; otherwise the union of the children's
+            // carriers, never the permissive default, so the parent cannot advertise a
+            // carrier nothing below it serves.
+            video_carrier: video.then(|| {
+                composite
+                    .video_carrier
+                    .or_else(|| carrier_union(|caps| caps.video, |caps| caps.video_carrier))
+                    .unwrap_or(MediaCarrier::DEFAULT)
+            }),
+            image_carrier: vision.then(|| {
+                composite
+                    .image_carrier
+                    .or_else(|| carrier_union(|caps| caps.vision, |caps| caps.image_carrier))
+                    .unwrap_or(MediaCarrier::DEFAULT)
+            }),
+            // A composite resolves before its children and each child filters its own
+            // candidates on this axis, so the parent states nothing and cannot exclude a
+            // child that could still serve the continuation.
+            tool_call_replay: None,
+        }
+    }
+
     fn decision_target(&self, name: &str) -> Option<DecisionTarget> {
         let target = self.targets.get(name)?;
         let client = self.llm_clients.get(&target.llm_client)?;
@@ -357,6 +837,8 @@ impl DeploymentConfig {
                     base_url: client.base_url.as_str().to_string(),
                     api_key_env: client.api_key_env.clone(),
                     billing: client.billing,
+                    quota_group: Some(client.quota_group.clone().unwrap_or_else(|| name.clone())),
+                    quota_provider: client.quota_provider,
                 },
             );
         }
@@ -403,6 +885,7 @@ impl DeploymentConfig {
         }
 
         let facts = self.deployment_facts();
+        // Resolved once, before any route is built, so a gated deployment that cannot
 
         let mut route_names_by_id = HashMap::new();
         for (route_name, config) in &self.routes {
@@ -436,11 +919,12 @@ impl DeploymentConfig {
                     if first.reasoning_effort != target.reasoning_effort
                         || first.extra_body != target.extra_body
                         || first.omit_body_fields != target.omit_body_fields
+                        || first.unsupported_reasoning_effort != target.unsupported_reasoning_effort
                         || first.reasoning_policy != target.reasoning_policy
                         || first.reasoning_dialect != target.reasoning_dialect
                     {
                         return Err(RunnerError::configuration(format!(
-                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields; one target per model id is kept, so give each its own model id or llm client",
+                            "targets {first_name} and {target_name} both name model {} on llm client {} but with different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, omit_body_fields, or unsupported_reasoning_effort; one target per model id is kept, so give each its own model id or llm client",
                             target.id, target.llm_client
                         )));
                     }
@@ -454,7 +938,21 @@ impl DeploymentConfig {
         }
 
         let mut provider_api_keys = Vec::new();
-        let clients = self.build_clients(&mut provider_api_keys)?;
+        // Built once and shared: the dispatch gate reserves against these counters and
+        // selection reads the same remainder, so one budget has one source of truth.
+        let allowances = self.build_allowances()?;
+        self.validate_minute_windows()?;
+        self.validate_quota_providers()?;
+        // One governor for the whole deployment. Its key is (quota group, physical model),
+        // so every alias of one model draws on one window — which is what the provider
+        // counts, and the only way `smart-nt`, `smart_gemini` and a direct leaf cannot each
+        // spend the same minute's allowance.
+        let governor = Arc::new(switchyard_llm_client::QuotaGovernor::new());
+        let accounting = Accounting {
+            governor: &governor,
+            allowances: &allowances,
+        };
+        let clients = self.build_clients(&mut provider_api_keys, &allowances, &governor)?;
         capability::CapabilityDeployment {
             clients: self.capability_clients.clone(),
             capabilities: self.capabilities.clone(),
@@ -465,8 +963,10 @@ impl DeploymentConfig {
         let fallback_base_url = self.fallback_base_url()?;
         self.validate_composites()?;
         self.validate_route_capability_claims()?;
-        self.validate_composite_video_claims()?;
+        self.validate_composite_media_claims()?;
+        self.validate_physical_context_claims()?;
         self.validate_video_transport()?;
+        self.validate_responses_wire_targets()?;
         self.validate_decision_lanes()?;
         self.validate_default_decision_lane()?;
         self.validate_decision_lane_composition()?;
@@ -481,7 +981,7 @@ impl DeploymentConfig {
             BTreeMap::new();
         for (name, lane_config) in &self.decision_lanes {
             let names: Vec<&str> = lane_config.targets.iter().map(String::as_str).collect();
-            let Some(resolver) = self.build_decision_resolver(&names) else {
+            let Some(resolver) = self.build_decision_resolver(&names, &accounting) else {
                 continue;
             };
             let handle = decision_executor::LaneResolverHandle {
@@ -492,6 +992,11 @@ impl DeploymentConfig {
         }
         let lane_composition = self.resolve_decision_lane_composition(&lane_handles)?;
         let lane_identity = self.default_decision_lane.clone();
+        // One evidence set for the whole deployment, shared by every measured route. A
+        // physical model behaves the same whichever alias named it, so a request served by
+        // one route is evidence for the others — and a subsidiary route cannot accumulate
+        // observations nobody reads.
+        let measured_selector = crate::selection::MeasuredSelector::new();
         let mut routes = Vec::with_capacity(self.routes.len());
         for (route_name, config) in &self.routes {
             // Before the unknown-target sweep below, so a malformed candidate list is
@@ -611,14 +1116,125 @@ impl DeploymentConfig {
                 .algorithm
                 .validate_candidates(route_name)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+            // A pool route states its membership by group label, so the two records of the
+            // pool - the labels on the targets and the candidate list on the route - have to
+            // agree. Disagreeing would either silently narrow the pool (a member forgotten in
+            // the list) or advertise a member the route cannot call (a stale entry). Both are
+            // startup errors, because a pool whose membership is unclear is not a policy.
+            // The group shape is a deployment decision, not a synonym for `Grouped`: the same
+            // membership can be deployed as equal peers or as a declared cost sequence. An
+            // unknown word is a refusal rather than a default, and `flat` is refused because a
+            // route that declares groups cannot then rank leaf by leaf.
+            //
+            // Read before the pool is validated, because the shape decides one membership
+            // rule: an equal-peer pool is a free pool, while an ordered pool is a cost ladder
+            // whose later groups are deliberately metered.
+            let group_ordering = match config.group_ordering.as_deref() {
+                None => crate::selection::Grouping::Adaptive,
+                Some(name) => {
+                    if config.selection != SelectionPolicy::Grouped {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares group_ordering = \"{name}\" without selection = \"grouped\"; group ordering only describes a grouped pool"
+                        )));
+                    }
+                    match crate::selection::Grouping::from_name(name) {
+                        Some(crate::selection::Grouping::Flat) => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares group_ordering = \"flat\"; a grouped pool always orders by group"
+                            )));
+                        }
+                        Some(ordering) => ordering,
+                        None => {
+                            return Err(RunnerError::configuration(format!(
+                                "route {route_name} declares unknown group_ordering = \"{name}\"; expected \"adaptive\" or \"ordered\""
+                            )));
+                        }
+                    }
+                }
+            };
+            if let Some(groups) = &config.pool_groups {
+                self.validate_route_pool(
+                    route_name,
+                    config,
+                    groups,
+                    group_ordering != crate::selection::Grouping::Ordered,
+                )?;
+            }
+            // A grouped pool exists to compare groups, so a route that declares the policy
+            // without two groups would be a `Peer` pool in disguise. Refusing it is the only
+            // honest answer: silently treating it as `Peer` would let an operator believe a
+            // boundary exists that the deployment never draws.
+            if config.selection == SelectionPolicy::Grouped {
+                match config.pool_groups.as_ref() {
+                    Some(groups) if groups.len() >= 2 => {}
+                    Some(_) => {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares selection = \"grouped\" with fewer than two pool_groups; a grouped pool compares groups, and one group is a peer pool"
+                        )))
+                    }
+                    None => {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares selection = \"grouped\" but no pool_groups; a grouped pool compares groups, and one group is a peer pool"
+                        )))
+                    }
+                }
+            }
+            // The group shape was read above; membership keeps the label/candidate agreement
+            // check and only the tariff rule depends on the shape.
+            // The groups as model sets, resolved once here so the dispatch path never has to
+            // re-derive membership from labels. Members are ordered by target name, the same
+            // order the load-time membership check reads, so the plan and the check cannot
+            // disagree about who is in a group.
+            let group_plan = config.pool_groups.as_ref().map(|groups| {
+                let callable = config.callable_target_names();
+                crate::selection::GroupPlan {
+                    groups: groups
+                        .iter()
+                        .map(|group| {
+                            let mut names: Vec<&str> = self
+                                .targets
+                                .iter()
+                                .filter(|(name, target)| {
+                                    callable.iter().any(|candidate| candidate == name)
+                                        && target.groups.iter().any(|label| label == group)
+                                })
+                                .map(|(name, _target)| name.as_str())
+                                .collect();
+                            names.sort_unstable();
+                            crate::selection::GroupMembers {
+                                name: group.clone(),
+                                members: names
+                                    .into_iter()
+                                    .filter_map(|name| self.targets.get(name))
+                                    .map(|target| target.id.clone())
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                }
+            });
+            // A terminal leg is a last resort, so its declaration has to be unambiguous: it
+            // must name real targets, none of them a candidate of this route, and none of
+            // them held. A terminal target that was also a candidate would be ranked as a
+            // peer and could serve without exhaustion; one that does not exist would make
+            // the route silently unwilling to use its last resort at startup.
+            let terminal_ids = self.validate_terminal_fallback(route_name, config)?;
             let algorithm = config
                 .algorithm
                 .build(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
-            let lane_composition: BTreeMap<String, Vec<String>> = self
+            let lane_composition: BTreeMap<String, decision_executor::ComposedLane> = self
                 .decision_lane_composition
                 .iter()
-                .map(|(name, composition)| (name.clone(), composition.children.clone()))
+                .map(|(name, composition)| {
+                    (
+                        name.clone(),
+                        decision_executor::ComposedLane {
+                            children: composition.children.clone(),
+                            selection: composition.selection,
+                        },
+                    )
+                })
                 .collect();
             let (route_clients, caller_auth) = self.build_route_clients(
                 route_name,
@@ -627,13 +1243,14 @@ impl DeploymentConfig {
                 lane_identity.clone(),
                 &lane_index,
                 &lane_composition,
+                &accounting,
             )?;
             let anthropic_auxiliary_target =
                 self.build_anthropic_auxiliary_target(config, &clients);
             let responses_auxiliary_target =
                 self.build_responses_auxiliary_target(config, &clients);
             let decision_targets = config
-                .routing_target_names()
+                .served_target_names()
                 .into_iter()
                 .filter_map(|name| self.decision_target(name))
                 .collect();
@@ -645,6 +1262,37 @@ impl DeploymentConfig {
             if let Some(subagent) = names.subagent {
                 models = models.with_subagent(resolve_category_models(subagent, &targets)?);
             }
+            // Held targets keep their declaration, credential and facts, but they leave the
+            // candidate set here — before any algorithm is handed it — so no selection rule
+            // and no fallback walk can reach one, and no request spends a provider call on a
+            // model the provider has withdrawn. Filtering the model set rather than each
+            // algorithm's configuration is what makes this true for every algorithm: the
+            // dispatch path reads candidates from here and nowhere else.
+            let held_models: BTreeSet<ModelId> = config
+                .callable_target_names()
+                .into_iter()
+                .filter_map(|name| self.targets.get(name))
+                .filter(|target| target.held.is_some())
+                .map(|target| target.id.clone())
+                .collect();
+            if !held_models.is_empty() {
+                models = models.filtered(&|model| !held_models.contains(model));
+            }
+            let held = self.route_held(config, &held_models);
+            // The terminal leg is handed to the route as its own model sets, one per declared
+            // tier, never merged with the candidates, so the ranking machinery cannot see it at
+            // all and tier order cannot be re-decided by a cost or latency score.
+            let terminal = (!terminal_ids.is_empty()).then(|| {
+                terminal_ids
+                    .iter()
+                    .map(|tier| {
+                        RuntimeModels::new(HashMap::from([(
+                            switchyard_protocol::Category::Any,
+                            tier.clone(),
+                        )]))
+                    })
+                    .collect::<Vec<_>>()
+            });
             let route = Route::new(
                 algorithm,
                 route_clients,
@@ -660,7 +1308,63 @@ impl DeploymentConfig {
                 config.escalation_max_input_tokens,
                 escalation_model,
             )
-            .with_target_credentials(target_credentials(config, &self.targets));
+            .with_target_credentials(target_credentials(config, &self.targets))
+            .with_locality(route_locality(config, &self.targets, &self.llm_clients))
+            .with_daily_allowances(Arc::new(
+                config
+                    .served_target_names()
+                    .into_iter()
+                    .filter_map(|name| self.targets.get(name))
+                    .filter_map(|target| {
+                        // The same derivation the counters were built with. Account scope has
+                        // one counter for the whole group, so every model in the group resolves
+                        // to that one allowance instead of a per-model counter that was never
+                        // created; model scope resolves to its own.
+                        let group = self.allowance_group(target);
+                        allowances
+                            .get(&self.allowance_key(target, &group))
+                            .map(|allowance| (target.id.clone(), Arc::clone(allowance)))
+                    })
+                    .collect::<HashMap<ModelId, Arc<switchyard_llm_client::DailyRequestAllowance>>>(
+                    ),
+            ));
+            let route = match held {
+                Some(held) => route.with_held(held),
+                None => route,
+            };
+            let route = match terminal {
+                Some(terminal) => route
+                    .with_terminal_fallback(terminal)
+                    .with_terminal_policy(config.terminal_policy.unwrap_or_default())
+                    .with_terminal_policies(config.terminal_policies.clone().unwrap_or_default())
+                    .with_fit_escalation(config.fit_escalation.unwrap_or(false))
+                    .with_capability_escalation(config.capability_escalation.unwrap_or(false)),
+                None => route,
+            };
+            // A measured route ranks candidates only after it has evidence, and shares that
+            // evidence with every other measured route so real work is not isolated to one
+            // alias.
+            let route = match config.selection {
+                crate::config::SelectionPolicy::Measured => {
+                    route.with_measured_selection(Arc::clone(&measured_selector))
+                }
+                // A peer pool needs the evidence of a measured route: the ranking is
+                // computed from facts and observation, so without the selector it would
+                // fall back to declared order and quietly become the waterfall this policy
+                // exists to remove.
+                crate::config::SelectionPolicy::Peer => route
+                    .with_measured_selection(Arc::clone(&measured_selector))
+                    .with_pool_groups(config.pool_groups.clone().unwrap_or_default()),
+                // A grouped pool needs both the selector that supplies the evidence and the
+                // resolved groups themselves; without either it would degrade to the flat
+                // peer ranking this policy exists to replace.
+                crate::config::SelectionPolicy::Grouped => route
+                    .with_measured_selection(Arc::clone(&measured_selector))
+                    .with_pool_groups(config.pool_groups.clone().unwrap_or_default())
+                    .with_group_plan(group_plan.clone().unwrap_or_default())
+                    .with_group_ordering(group_ordering),
+                crate::config::SelectionPolicy::Declared => route,
+            };
             routes.push((config.id.clone(), route));
         }
         // The default logical decision lane. Every configured decision target in
@@ -670,28 +1374,29 @@ impl DeploymentConfig {
         // compatibility surface, so Decision has one implementation.
 
         let mut runner = Runner::new(routes)
+            .with_daily_allowance_registry(allowances.clone())
             .with_fallback_url(fallback_base_url)
             .with_provider_api_keys(provider_api_keys)
             .with_deployment_facts(facts)
-            .with_capabilities(capability::resolve(&capability::CapabilityDeployment {
-                clients: self.capability_clients.clone(),
-                capabilities: self.capabilities.clone(),
-            }));
+            .with_capabilities(
+                capability::resolve_with_budget(
+                    &capability::CapabilityDeployment {
+                        clients: self.capability_clients.clone(),
+                        capabilities: self.capabilities.clone(),
+                    },
+                    Some(&governor),
+                    self.quota.as_ref().map(|quota| quota.state_dir.as_path()),
+                )
+                .map_err(RunnerError::configuration)?,
+            );
         self.validate_decision_lanes()?;
         // Composites are registered as named routes, so lookup is uniform: a caller
         // resolving a route cannot tell whether it is a leaf or a composite.
         for (name, composite) in &self.composites {
             runner = runner.with_composite(name.clone(), composite.children.clone());
-            runner = runner.with_composite_capabilities(
-                name.clone(),
-                crate::ModelCapabilities {
-                    context_window: composite.context_window,
-                    tool_calling: composite.tool_calling,
-                    reasoning: composite.reasoning,
-                    vision: composite.vision,
-                    video: composite.video,
-                },
-            );
+            runner = runner.with_composite_cross_policy(name.clone(), composite.cross_on);
+            runner = runner
+                .with_composite_capabilities(name.clone(), self.composite_capabilities(composite));
         }
 
         // The same lanes are registered on the runner, so the public surface and the
@@ -702,16 +1407,545 @@ impl DeploymentConfig {
         if let Some(name) = &self.default_decision_lane {
             runner = runner.with_default_decision_lane(name.clone());
         }
-        for (name, children) in lane_composition {
-            runner = runner.with_decision_lane_composition(name, children);
+        for (name, composition) in lane_composition {
+            runner = runner.with_composed_decision_lane(name, composition);
         }
         Ok(runner)
+    }
+
+    /// Builds one daily request allowance per (quota group, model) that declares a limit.
+    ///
+    /// Keyed by the client's declared quota group rather than by the client's name, because
+    /// the provider caps requests per project: two clients that name the same project are
+    /// one budget, and keying them apart would hand the deployment twice the allowance it
+    /// actually has. A client that declares no group is its own group, which leaves a
+    /// single-client deployment unchanged.
+    /// The counter a target's declared daily limit is counted on, and the clock it resets on.
+    ///
+    /// Model scope — the default — keys the counter by the target's model id, which is
+    /// correct for a provider that budgets each model separately. Account scope collapses
+    /// every model in the group onto one counter and one sentinel, because the provider
+    /// states one allowance for the whole account; under model scope each free model would
+    /// be granted the full budget and the fleet could spend several times the real cap
+    /// before any counter reported exhaustion.
+    fn quota_counter(
+        &self,
+        target: &TargetConfig,
+        group: &str,
+        state_dir: &std::path::Path,
+    ) -> (
+        ModelId,
+        std::path::PathBuf,
+        switchyard_llm_client::DayBoundary,
+    ) {
+        let client = self.llm_clients.get(&target.llm_client);
+        let boundary = match client
+            .and_then(|client| client.quota_reset)
+            .unwrap_or_default()
+        {
+            QuotaReset::Pacific => switchyard_llm_client::DayBoundary::Pacific,
+            QuotaReset::Utc => switchyard_llm_client::DayBoundary::Utc,
+        };
+        match client
+            .and_then(|client| client.quota_scope)
+            .unwrap_or_default()
+        {
+            QuotaScope::Account => (
+                ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL),
+                switchyard_llm_client::account_allowance_path(state_dir, group),
+                boundary,
+            ),
+            QuotaScope::Model => (
+                target.id.clone(),
+                switchyard_llm_client::allowance_path(state_dir, group, target.id.as_str()),
+                boundary,
+            ),
+        }
+    }
+
+    /// The quota group a target's requests are charged to.
+    ///
+    /// A client that declares no group is its own group, so two clients never share a
+    /// counter by accident just because neither named one.
+    fn allowance_group(&self, target: &TargetConfig) -> String {
+        self.llm_clients
+            .get(&target.llm_client)
+            .and_then(|client| client.quota_group.clone())
+            .unwrap_or_else(|| target.llm_client.clone())
+    }
+
+    /// Targets whose daily counter is account-scoped, mapped to their quota group.
+    ///
+    /// Only an account-scoped counter speaks for its whole group, so only those targets
+    /// are declared. A model-scoped budget is left out on purpose: its refusal belongs to
+    /// one slug, and declaring it here would let one model's spent budget skip a sibling
+    /// that still has its own.
+    fn target_allowance_groups(
+        &self,
+        route: &RouteConfig,
+    ) -> std::collections::HashMap<ModelId, String> {
+        route
+            .served_target_names()
+            .into_iter()
+            .filter_map(|name| self.targets.get(name))
+            .filter(|target| {
+                self.llm_clients
+                    .get(&target.llm_client)
+                    .and_then(|client| client.quota_scope)
+                    .unwrap_or_default()
+                    == QuotaScope::Account
+            })
+            .map(|target| (target.id.clone(), self.allowance_group(target)))
+            .collect()
+    }
+
+    /// The key a target's daily allowance is stored under.
+    ///
+    /// Producer and every consumer derive this the same way. A consumer that derives a
+    /// different key gets `None`, which is indistinguishable from "this target declares no
+    /// budget": the manifest advertises a limit, the counter is built and reconciled, and the
+    /// target dispatches unmetered. Deriving it once, here, is what keeps an account's single
+    /// counter reachable from every target that shares it -- not merely from whichever target
+    /// happened to create the entry first.
+    fn allowance_key(&self, target: &TargetConfig, group: &str) -> (String, ModelId) {
+        let scope = self
+            .llm_clients
+            .get(&target.llm_client)
+            .and_then(|client| client.quota_scope)
+            .unwrap_or_default();
+        let counter_model = match scope {
+            QuotaScope::Account => ModelId::from(switchyard_llm_client::ACCOUNT_SCOPE_MODEL),
+            QuotaScope::Model => target.id.clone(),
+        };
+        (group.to_owned(), counter_model)
+    }
+
+    fn build_allowances(
+        &self,
+    ) -> RunnerResult<HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>>
+    {
+        let mut allowances = HashMap::new();
+        let mut limits: HashMap<(String, ModelId), (u64, &str)> = HashMap::new();
+        for (target_name, target) in &self.targets {
+            let Some(limit) = target.daily_request_limit else {
+                continue;
+            };
+            if limit == 0 {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} daily_request_limit must be at least 1"
+                )));
+            }
+            let group = self.allowance_group(target);
+            let quota = self.quota.as_ref().ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {target_name} declares daily_request_limit but the deployment configures no [quota] state_dir; a daily budget has to be counted to be enforced"
+                ))
+            })?;
+            let (counter_model, path, boundary) =
+                self.quota_counter(target, &group, &quota.state_dir);
+            let key = (group.clone(), counter_model.clone());
+            match limits.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let (first_limit, first_name) = existing.get();
+                    if *first_limit != limit {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} draw on the same daily counter ({}) in quota group {group} but declare different daily_request_limit values ({first_limit} and {limit}); one counter serves one budget, so state it once",
+                            counter_model.as_str()
+                        )));
+                    }
+                    // One counter, already built, and every target in the group resolves to it
+                    // through `allowance_key`. A per-target alias added only on this branch's
+                    // sibling is exactly what left the second and later targets unmetered, so
+                    // there is deliberately nothing to bind here: the canonical entry is the
+                    // binding.
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((limit, target_name.as_str()));
+                    allowances.insert(
+                        key,
+                        Arc::new(switchyard_llm_client::DailyRequestAllowance::new_on(
+                            group.clone(),
+                            counter_model.clone(),
+                            limit,
+                            path,
+                            boundary,
+                        )),
+                    );
+                }
+            }
+        }
+        // Fail closed on a declared budget that cannot be attached. Without this, a target
+        // whose key is missing dispatches unmetered while the manifest still advertises a
+        // limit, and nothing downstream can tell that apart from a target that declares no
+        // budget. Checked per target once the map is complete, so no entry ordering can make
+        // it pass by luck.
+        for (target_name, target) in &self.targets {
+            let Some(limit) = target.daily_request_limit else {
+                continue;
+            };
+            let group = self.allowance_group(target);
+            if !allowances.contains_key(&self.allowance_key(target, &group)) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares daily_request_limit = {limit} but no daily counter can be attached to its lookup key in quota group {group}; a declared budget that could not be attached would dispatch unmetered, so this deployment is refused"
+                )));
+            }
+        }
+        if !allowances.is_empty() {
+            self.validate_quota_state_dir()?;
+            // The directory probe above is not enough. A counter file can be left behind by
+            // a different account - the deployment path runs as root while the unit runs as
+            // its own user - and then the DIRECTORY is writable while that model's counter
+            // and lock are not. The first caller would see a bare `Permission denied`
+            // reported as an unavailable allowance.
+            //
+            // Checked per counter, at load, and refused with the file and its owner named.
+            // Absent counters are not created here on purpose: the first reservation creates
+            // them as the account that spends, so a root-run preflight cannot leave files
+            // the service user cannot write.
+            for allowance in allowances.values() {
+                allowance.check_usable().map_err(|reason| {
+                    RunnerError::configuration(format!(
+                        "the daily request counter for model {} in quota group {} cannot be used \
+                         by this process: {reason}",
+                        allowance.model(),
+                        allowance.group()
+                    ))
+                })?;
+            }
+        }
+        Ok(allowances)
+    }
+
+    /// Proves the allowance counter directory is usable now, not at the first request.
+    ///
+    /// Without this, a wrong path or ownership would leave the budget unenforced until a
+    /// request arrived - and then surface as a refused leg rather than as the configuration
+    /// error it is.
+    /// Checks that a pool route's group labels and candidate list describe the same leaves.
+    ///
+    /// Every member must exist, be callable by this route, and positively declare itself
+    /// free. A group with no members is refused too: a pool that names an empty group has
+    /// silently become a different pool, and that is exactly the drift the label exists to
+    /// prevent.
+    fn validate_terminal_fallback(
+        &self,
+        route_name: &str,
+        config: &RouteConfig,
+    ) -> RunnerResult<Vec<Vec<ModelId>>> {
+        let Some(declaration) = &config.terminal_fallback else {
+            if config.terminal_policy.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares terminal_policy but no terminal_fallback; a \
+                     policy that governs no leg would read as a guarantee it cannot provide"
+                )));
+            }
+            if config.terminal_policies.is_some() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares terminal_policies but no terminal_fallback; a \
+                     policy that governs no leg would read as a guarantee it cannot provide"
+                )));
+            }
+            if config.fit_escalation == Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares fit_escalation but no terminal_fallback; a \
+                     size refusal would have no wider tier to escalate to, so the option would \
+                     read as a guarantee it cannot provide"
+                )));
+            }
+            if config.capability_escalation == Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares capability_escalation but no terminal_fallback; a \
+                     wire refusal would have no later group to consider, so the option would \
+                     read as a guarantee it cannot provide"
+                )));
+            }
+            return Ok(Vec::new());
+        };
+        let tiers = declaration.tiers();
+        if tiers.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} declares terminal_fallback but names no target"
+            )));
+        }
+        // A boundary policy is aligned with the tiers it governs. Declaring fewer policies
+        // than tiers would silently leave the rest on the route policy, and declaring more
+        // would name a boundary that does not exist; both are states an operator cannot read
+        // back, so both are refused.
+        if let Some(policies) = &config.terminal_policies {
+            if policies.len() != tiers.len() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares {} terminal_policies for {} terminal tiers; a \
+                     boundary policy must state one value per tier",
+                    policies.len(),
+                    tiers.len()
+                )));
+            }
+        }
+        let candidates = config.callable_target_names();
+        let mut resolved: Vec<Vec<ModelId>> = Vec::new();
+        // Duplicates are refused across the whole declaration, not just inside one tier: a
+        // target named twice would be tried twice under two different exhaustion claims, and
+        // the second attempt would repeat a call the first one already made.
+        let mut seen: Vec<ModelId> = Vec::new();
+        for (index, tier) in tiers.iter().enumerate() {
+            let names = tier.names();
+            if names.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} terminal_fallback tier {} names no target; an empty \
+                     tier would escalate past a leg that was never consulted",
+                    index + 1
+                )));
+            }
+            let mut tier_ids: Vec<ModelId> = Vec::new();
+            for name in names {
+                let Some(target) = self.targets.get(name) else {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names unknown target {name}"
+                    )));
+                };
+                if candidates.contains(&name) {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names {name}, which is also a \
+                         candidate; a terminal leg must not be ranked with the primary pool, or \
+                         it would serve whenever that pool was merely busy"
+                    )));
+                }
+                if target.held.is_some() {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names {name}, which is held; a \
+                         withdrawn target cannot be a last resort"
+                    )));
+                }
+                if seen.contains(&target.id) {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} terminal_fallback names {name} more than once"
+                    )));
+                }
+                seen.push(target.id.clone());
+                tier_ids.push(target.id.clone());
+            }
+            resolved.push(tier_ids);
+        }
+        Ok(resolved)
+    }
+
+    fn validate_route_pool(
+        &self,
+        route_name: &str,
+        config: &RouteConfig,
+        groups: &[String],
+        requires_free_members: bool,
+    ) -> RunnerResult<()> {
+        if groups.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} declares pool_groups but names no group"
+            )));
+        }
+        let callable = config.callable_target_names();
+        let mut members: Vec<&str> = Vec::new();
+        for group in groups {
+            let mut names: Vec<&str> = self
+                .targets
+                .iter()
+                .filter(|(_name, target)| target.groups.iter().any(|label| label == group))
+                .map(|(name, _target)| name.as_str())
+                .collect();
+            names.sort_unstable();
+            if names.is_empty() {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} pool_groups names group {group}, which no target belongs to"
+                )));
+            }
+            for name in names {
+                let target = self
+                    .targets
+                    .get(name)
+                    .expect("group membership was read from this map");
+                // An equal-peer pool is a free pool by definition, so membership implies a
+                // positive free declaration. `Unknown` is refused for the same reason it is
+                // excluded at request time, and one authority answers the question so the load
+                // gate and the request-time gate cannot disagree about whether a tariff is
+                // free.
+                //
+                // An ORDERED pool is a different shape: its groups are a declared cost
+                // sequence, and the later ones exist precisely to be metered. Demanding a free
+                // declaration there would refuse the ladder it describes. The spending
+                // boundary for a metered group is the group ahead of it plus the existing
+                // metered admission gates, not a tariff check that would delete the group.
+                if requires_free_members
+                    && !switchyard_llm_client::Tariff::from_declaration(target.free_tier).is_free()
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} pool_groups names group {group}, whose member                          {name} does not declare free_tier = true; a free peer pool cannot                          contain a target whose tariff is not positively free"
+                    )));
+                }
+                if !callable.contains(&name) {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name} pool_groups names group {group}, whose member                          {name} is not a candidate of this route; the pool and the candidate                          list must state the same membership"
+                    )));
+                }
+                if !members.contains(&name) {
+                    members.push(name);
+                }
+            }
+        }
+        // The union of the groups must be exactly the route's candidates: a member missing
+        // from the list would never be called, and a listed candidate outside every group
+        // would be a leg with no stated membership.
+        let listed: Vec<&str> = callable.clone();
+        let mut extra: Vec<&str> = listed
+            .iter()
+            .copied()
+            .filter(|name| !members.contains(name))
+            .collect();
+        extra.sort_unstable();
+        if !extra.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} lists candidates {extra:?} that belong to none of its                  pool_groups {groups:?}"
+            )));
+        }
+        let mut missing: Vec<&str> = members
+            .iter()
+            .copied()
+            .filter(|name| !listed.contains(name))
+            .collect();
+        missing.sort_unstable();
+        if !missing.is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "route {route_name} pool_groups include {missing:?}, which are not in its                  candidate list"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_quota_state_dir(&self) -> RunnerResult<()> {
+        let Some(quota) = self.quota.as_ref() else {
+            return Ok(());
+        };
+        // Only an EXISTING directory is probed. Creating it here would be a load-time side
+        // effect performed by whoever validated - including a root-run preflight - and a
+        // root-owned state directory under a unit that runs as its own user is exactly the
+        // failure this check exists to prevent. A missing directory is created by the first
+        // reservation, as the account that will own it.
+        if !quota.state_dir.exists() {
+            return Ok(());
+        }
+        let probe = quota.state_dir.join(".write-probe");
+        std::fs::write(&probe, b"switchyard quota state\n").map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} is not writable: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        std::fs::remove_file(&probe).map_err(|error| {
+            RunnerError::configuration(format!(
+                "[quota] state_dir {} probe could not be removed: {error}",
+                quota.state_dir.display()
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Rejects a provider-pool mapping that could not be applied honestly.
+    ///
+    /// Three rules, each of which prevents a specific wrong admission rather than a
+    /// stylistic preference:
+    ///
+    /// * The pool is account-wide, so the counter it reconciles must be account-scoped. A
+    ///   per-model counter fed an account total would refuse model B on the account's
+    ///   spend and then refuse model A again on the same number -- one account's figure
+    ///   spent as though it were several budgets.
+    /// * The boundary must be the pool's own. A reading is placed in a day on the
+    ///   counter's clock; an OpenRouter reading counted on the Pacific clock lands in the
+    ///   wrong day for eight hours a night, so exhaustion from yesterday could refuse the
+    ///   new UTC day or, worse, a fresh reading could be ignored as belonging to another
+    ///   day.
+    /// * The client must actually have a counter. Naming a pool for a client whose targets
+    ///   declare no `daily_request_limit` would authorize a reconciliation with nowhere to
+    ///   write, so the mapping would read as configured while doing nothing.
+    /// * One pool names one counter. Two clients on one pool with different groups produce
+    ///   two counters fed the same account figure, each admitting the full reported
+    ///   remainder; there is no way to merge those reservations after the fact, so the
+    ///   mapping is refused rather than reconciled.
+    fn validate_quota_providers(&self) -> RunnerResult<()> {
+        // One provider account is one budget, so it may name exactly one counter.
+        let mut accounts: BTreeMap<&'static str, (&str, String)> = BTreeMap::new();
+        for (name, client) in &self.llm_clients {
+            let Some(provider) = client.quota_provider else {
+                continue;
+            };
+            let scope = client.quota_scope.unwrap_or_default();
+            if scope != QuotaScope::Account {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but quota_scope is \
+                     {:?}; {} reports one allowance for the whole account, so the counter it \
+                     reconciles must be account-scoped (quota_scope = \"account\") or several \
+                     model counters would each spend the one account figure",
+                    provider.as_str(),
+                    scope,
+                    provider.as_str()
+                )));
+            }
+            let reset = client.quota_reset.unwrap_or_default();
+            if reset != provider.reset() {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but quota_reset is {:?}; \
+                     {} turns over at midnight {} ({}), so the counter must use the same \
+                     clock or a reading lands in a day the provider does not recognise",
+                    provider.as_str(),
+                    reset,
+                    provider.as_str(),
+                    provider.reset().as_str(),
+                    provider.pool()
+                )));
+            }
+            let holds_counter = self.targets.values().any(|target| {
+                target.llm_client == *name
+                    && target.daily_request_limit.is_some_and(|limit| limit > 0)
+            });
+            if !holds_counter {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} names quota_provider = \"{}\" but none of its targets \
+                     declares daily_request_limit, so there is no counter to reconcile and \
+                     the mapping would read as configured while admitting on nothing",
+                    provider.as_str()
+                )));
+            }
+            // Two clients naming one pool resolve to two counters whenever they name
+            // different groups, and both counters are then fed the same account figure. Each
+            // admits the full reported remainder, so the account is spent twice over -- and
+            // no runtime bookkeeping can merge reservations that live in two files. One
+            // account is one counter, therefore one group.
+            let group = client.quota_group.clone().unwrap_or_else(|| name.clone());
+            match accounts.entry(provider.as_str()) {
+                std::collections::btree_map::Entry::Occupied(existing) => {
+                    let (first_client, first_group) = existing.get();
+                    if *first_group != group {
+                        return Err(RunnerError::configuration(format!(
+                            "llm clients {first_client} and {name} both name quota_provider = \
+                             \"{}\" but resolve to different quota groups ({first_group} and \
+                             {group}); one provider account is one budget, so both counters \
+                             would spend the same reported remainder -- give them one \
+                             quota_group, or name the pool on only one of them",
+                            provider.as_str()
+                        )));
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((name.as_str(), group));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn build_clients(
         &self,
         provider_api_keys: &mut Vec<String>,
+        allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+        governor: &Arc<switchyard_llm_client::QuotaGovernor>,
     ) -> RunnerResult<BTreeMap<String, Arc<TranslatingLlmClient>>> {
+        // Built before the per-target backends so each one can carry its own budget.
         let mut models_by_client = self
             .llm_clients
             .keys()
@@ -725,9 +1959,13 @@ impl DeploymentConfig {
                 client_config,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
+                None,
+                None,
                 None,
             )?;
             let (Backend::OpenAiChat(config)
@@ -768,6 +2006,14 @@ impl DeploymentConfig {
                     )));
                 }
             }
+            let hosted_reasoning = match target.hosted_reasoning.as_deref() {
+                None => None,
+                Some(value) => Some(HostedReasoningMarker::parse(value).ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "target {target_name} hosted_reasoning {value:?} is not a known marker; expected thought_tag"
+                    ))
+                })?),
+            };
             model_configs.push(ModelConfig::new(
                 target.id.clone(),
                 build_backend(
@@ -775,10 +2021,20 @@ impl DeploymentConfig {
                     client_config,
                     &target.extra_body,
                     &target.omit_body_fields,
+                    &target.unsupported_reasoning_effort,
                     target.reasoning_effort.clone(),
                     target.reasoning_policy,
                     target.reasoning_dialect,
                     target.cooldown_group.clone(),
+                    {
+                        // Resolved through the same derivation the map was built with, so a
+                        // shared account counter is reachable from every target in the group
+                        // and not only from the one that created the entry.
+                        let group = self.allowance_group(target);
+                        allowances.get(&self.allowance_key(target, &group)).cloned()
+                    },
+                    pacing_for(target, client_config, governor),
+                    hosted_reasoning,
                 )?,
                 None,
             ));
@@ -800,6 +2056,42 @@ impl DeploymentConfig {
             .iter()
             .map(|(name, config)| (name.clone(), config.id.clone()))
             .collect()
+    }
+
+    /// The holding record for a route whose every completion target is held.
+    ///
+    /// A route with at least one live candidate is not held: the live ones serve, and the
+    /// held ones were already removed from its candidate set. Only a route with nothing left
+    /// to call is registered as held, which is what keeps the refusal specific instead of
+    /// letting the caller's alias fall through to the unknown-model path.
+    fn route_held(
+        &self,
+        config: &RouteConfig,
+        held_models: &BTreeSet<ModelId>,
+    ) -> Option<HeldRoute> {
+        if held_models.is_empty() {
+            return None;
+        }
+        let names = config.routing_target_names();
+        if names.is_empty() {
+            return None;
+        }
+        let all_held = names.iter().all(|name| {
+            self.targets
+                .get(*name)
+                .is_some_and(|target| target.held.is_some())
+        });
+        if !all_held {
+            return None;
+        }
+        let first = self.targets.get(names[0])?;
+        Some(HeldRoute {
+            // Named by configuration, not by the model id: it is the alias the manifest
+            // declares and the caller reads, and it survives in the message even though the
+            // dispatch set no longer contains it.
+            model: names[0].to_string(),
+            reason: first.held.clone()?,
+        })
     }
 
     /// Builds the decision resolver for a route, from its configured targets in order.
@@ -862,6 +2154,22 @@ impl DeploymentConfig {
     /// targets: a route may deliberately be narrower than its widest target.
     fn validate_route_capability_claims(&self) -> RunnerResult<()> {
         for (route_name, route) in &self.routes {
+            // A carrier without its medium would be a silently inert field: `capabilities()`
+            // only reports a carrier for a medium the route actually claims, so a route
+            // writing `video_carrier` without `video = true` would read as configured and do
+            // nothing. Refuse it rather than accept a no-op.
+            if route.video_carrier.is_some() && route.video != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares video_carrier without video = true; a carrier \
+                     is a narrowing of a medium the route must first claim"
+                )));
+            }
+            if route.image_carrier.is_some() && route.vision != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} declares image_carrier without vision = true; a carrier \
+                     is a narrowing of a medium the route must first claim"
+                )));
+            }
             let capabilities = route.capabilities();
             let mut names: Vec<&str> = route.routing_target_names().into_iter().collect();
             names.sort_unstable();
@@ -890,30 +2198,397 @@ impl DeploymentConfig {
                          supports it; declare a target that does, or stop claiming it"
                     )));
                 }
+                // A carrier claim is a promise about a specific transport, and every carrier
+                // the route advertises must be backed by some target below it. "Both" is two
+                // promises: a target that only fetches URLs does not keep the inline half,
+                // so a route advertising both over inline-only targets would send a caller
+                // into a refusal the advertisement said could not happen.
+                let claimed_carrier = match label {
+                    "vision" => capabilities.image_carrier,
+                    "video" => capabilities.video_carrier,
+                    _ => None,
+                };
+                if let Some(claimed) = claimed_carrier {
+                    let missing: Vec<MediaCarrier> = claimed
+                        .carriers()
+                        .iter()
+                        .copied()
+                        .filter(|need| {
+                            !names.iter().any(|name| {
+                                let Some(target) = self.targets.get(*name) else {
+                                    return false;
+                                };
+                                // A target that refuses the medium serves none of its
+                                // carriers, whatever its carrier field says.
+                                let admits_medium = match label {
+                                    "vision" => target.vision != Some(false),
+                                    _ => target.video == Some(true),
+                                };
+                                // An undeclared carrier on an admitted medium means both,
+                                // exactly as it does on a route.
+                                let served = match label {
+                                    "vision" => target.image_carrier,
+                                    _ => target.video_carrier,
+                                }
+                                .unwrap_or(MediaCarrier::Both);
+                                admits_medium && served.includes(*need)
+                            })
+                        })
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(RunnerError::configuration(format!(
+                            "route {route_name} declares {label} carrier {claimed:?} but no \
+                             target serves {missing:?}; declare a target that does, or narrow \
+                             the route's carrier"
+                        )));
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// Checks that a composite claiming video has a child that can serve it.
+    /// Checks the per-minute window declarations before any backend carries one.
     ///
-    /// A composite is registered with its own declared capabilities and is resolved
-    /// before its children, so a claim nothing below it can keep would advertise video to
-    /// callers and then skip every child at request time.
-    fn validate_composite_video_claims(&self) -> RunnerResult<()> {
-        for (name, composite) in &self.composites {
-            if composite.video != Some(true) {
+    /// Two rules, both of which fail closed at load rather than as a 429 under traffic: a
+    /// window whose per-request ceiling exceeds it can never admit that request however long
+    /// it waits, and two targets naming one physical model in one quota group share one
+    /// window, so stating different values would make whichever loaded first the real limit.
+    fn validate_minute_windows(&self) -> RunnerResult<()> {
+        // Request rate, token rate, admission pad in per mille, and the target that stated
+        // them: one declared window, as compared across aliases of one physical model.
+        type DeclaredMinuteWindow<'a> = (Option<u64>, Option<u64>, u32, &'a str);
+        let mut declared: HashMap<(String, ModelId), DeclaredMinuteWindow<'_>> = HashMap::new();
+        for (target_name, target) in &self.targets {
+            // Validate the pad for every target, not only paced ones: a margin naming no
+            // token window still means the author expected padding to happen, and skipping
+            // the check would let that mistake load and surface only as absent protection.
+            let margin = admission_margin(target, target_name)?;
+            if target.requests_per_minute.is_none() && target.input_tokens_per_minute.is_none() {
                 continue;
             }
-            let supported = composite.children.iter().any(|child| {
-                self.routes
-                    .get(child)
-                    .is_some_and(|route| route.capabilities().video == Some(true))
-            });
-            if !supported {
+            if target.requests_per_minute == Some(0) || target.input_tokens_per_minute == Some(0) {
                 return Err(RunnerError::configuration(format!(
-                    "composite route {name} declares video = true but none of its children \
-                     does; declare a child that does, or stop claiming it"
+                    "target {target_name} declares a per-minute limit of zero; a window that \
+                     admits nothing would refuse every request, so omit the field instead"
+                )));
+            }
+            if let Some(limit) = target.input_tokens_per_minute {
+                // The ceiling is judged at the margin, because that is the reservation the
+                // send path will compute. Checking the raw ceiling instead would admit a
+                // manifest whose stated ceiling the governor then refuses on every request —
+                // a window that looks configured and serves nothing.
+                let safe = switchyard_llm_client::WindowLimits {
+                    requests_per_minute: target.requests_per_minute,
+                    input_tokens_per_minute: target.input_tokens_per_minute,
+                }
+                .safe_input_ceiling(margin)
+                .unwrap_or(limit);
+                let margin_per_mille = margin.permille();
+                match target.max_input_tokens {
+                    None => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares input_tokens_per_minute {limit} \
+                             without max_input_tokens; a per-request ceiling at or below the \
+                             minute budget is what keeps a request from being unservable no \
+                             matter how long it waits"
+                        )));
+                    }
+                    Some(max_input) if max_input > limit => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares max_input_tokens {max_input} above \
+                             its input_tokens_per_minute {limit}; a single request larger than \
+                             a whole window can never be admitted"
+                        )));
+                    }
+                    // Above the margin-adjusted ceiling but not above the raw window: this
+                    // would admit nothing the governor allows, so it is a configuration that
+                    // only pretends to be open past `safe`.
+                    Some(max_input) if max_input > safe => {
+                        return Err(RunnerError::configuration(format!(
+                            "target {target_name} declares max_input_tokens {max_input}, but \
+                             at an admission_margin_permille of {margin_per_mille} per mille against \
+                             input_tokens_per_minute {limit} the largest estimate it can admit \
+                             is {safe}; lower max_input_tokens to {safe} or below, or lower the \
+                             margin"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            let group = self
+                .llm_clients
+                .get(&target.llm_client)
+                .and_then(|client| client.quota_group.clone())
+                .unwrap_or_else(|| target.llm_client.clone());
+            match declared.entry((group.clone(), target.id.clone())) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let (first_rpm, first_tpm, first_margin, first_name) = *existing.get();
+                    if first_rpm != target.requests_per_minute
+                        || first_tpm != target.input_tokens_per_minute
+                        || first_margin != margin.permille()
+                    {
+                        return Err(RunnerError::configuration(format!(
+                            "targets {first_name} and {target_name} share model {} in quota \
+                             group {group} but declare different per-minute limits or \
+                             admission margins; one window serves them both, so state it once",
+                            target.id
+                        )));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((
+                        target.requests_per_minute,
+                        target.input_tokens_per_minute,
+                        margin.permille(),
+                        target_name.as_str(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that a route's advertised context is capacity some target can actually serve.
+    ///
+    /// `context_window` on a route is what a caller reads before choosing it, and it is
+    /// plain metadata — nothing at request time compares it to a model's real window. A
+    /// route aggregating several physical models may therefore advertise the widest of
+    /// them, which is truthful: some eligible target can hold such a request. Advertising
+    /// more than the widest target is not, so a route that states a window while its
+    /// targets state physical windows must fit inside the largest of them. A target that
+    /// states no physical window is treated as undeclared rather than as zero, so a
+    /// manifest written before this field existed keeps loading unchanged.
+    fn validate_physical_context_claims(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if let Some(max_input) = target.max_input_tokens {
+                if max_input == 0 {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} max_input_tokens must be at least 1"
+                    )));
+                }
+                if let Some(window) = target.context_window
+                    && max_input > window
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "target {target_name} declares max_input_tokens {max_input} above its \
+                         context_window {window}; a per-request ceiling larger than the window \
+                         is never the binding limit, so one of the two is wrong"
+                    )));
+                }
+            }
+            if target.context_window == Some(0) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} context_window must be at least 1"
+                )));
+            }
+        }
+
+        for (route_name, route) in &self.routes {
+            let Some(claimed) = route.context_window else {
+                continue;
+            };
+            let declared: Vec<u64> = route
+                .routing_target_names()
+                .into_iter()
+                .filter_map(|name| self.targets.get(name))
+                .filter_map(|target| target.context_window)
+                .collect();
+            let Some(widest) = declared.iter().copied().max() else {
+                // No target states a physical window, so there is nothing to check against
+                // and the historical manifest keeps its behaviour.
+                continue;
+            };
+            if u64::from(claimed) > widest {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} advertises context_window {claimed} but its widest \
+                     declared target window is {widest}; the route would promise capacity no \
+                     candidate can serve"
+                )));
+            }
+        }
+
+        // A composite is resolved before its children, so the number a caller reads comes
+        // from the composite itself. Leaving it unchecked would let the one surface a
+        // bounded lane publishes be the only unverified promise in the file. A child
+        // route's own stated window is the tighter and therefore the authoritative value;
+        // only a child that states nothing falls back to its targets.
+        for (name, composite) in &self.composites {
+            let Some(claimed) = composite.context_window else {
+                continue;
+            };
+            let widest = composite
+                .children
+                .iter()
+                .filter_map(|child| self.routes.get(child))
+                .filter_map(|route| {
+                    route
+                        .context_window
+                        .map(u64::from)
+                        .or_else(|| self.widest_target_window(route))
+                })
+                .max();
+            let Some(widest) = widest else {
+                // Nothing below states a window, so there is no claim to contradict.
+                continue;
+            };
+            if u64::from(claimed) > widest {
+                return Err(RunnerError::configuration(format!(
+                    "composite {name} advertises context_window {claimed} but its widest \
+                     declared child window is {widest}; the composite would promise capacity \
+                     no child route can serve"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The widest physical window any target behind `route` declares, if any does.
+    fn widest_target_window(&self, route: &RouteConfig) -> Option<u64> {
+        route
+            .routing_target_names()
+            .into_iter()
+            .filter_map(|name| self.targets.get(name))
+            .filter_map(|target| target.context_window)
+            .max()
+    }
+
+    /// Checks a composite's effective media claim against the children that must keep it.
+    ///
+    /// A composite is resolved before its children and reports its own guarantee, so a claim
+    /// nothing below it can keep would advertise a medium and then skip every child at
+    /// request time. The claim checked here is the *effective* one -- a stated value, or the
+    /// value derived from the children when the parent states nothing -- so a derived claim
+    /// is held to the same standard as a hand-written one.
+    ///
+    /// Two failures are refused and one is only reported:
+    ///
+    /// * a carrier stated without the medium it narrows, which would otherwise be silently
+    ///   inert;
+    /// * an effective claim no child can keep (an explicit over-claim);
+    /// * a parent that states *less* than its children serve (an explicit under-claim). That
+    ///   is safe -- nothing false is advertised -- so it is warned about rather than refused,
+    ///   and naming it at load is what stops a narrowed child from leaving a stale parent
+    ///   promise behind unnoticed.
+    fn validate_composite_media_claims(&self) -> RunnerResult<()> {
+        for (name, composite) in &self.composites {
+            let children: Vec<crate::ModelCapabilities> = composite
+                .children
+                .iter()
+                .filter_map(|child| self.routes.get(child))
+                .map(RouteConfig::capabilities)
+                .collect();
+            let effective = self.composite_capabilities(composite);
+            let claims = [
+                (
+                    "vision",
+                    composite.vision,
+                    composite.image_carrier,
+                    effective.vision,
+                    effective.image_carrier,
+                ),
+                (
+                    "video",
+                    composite.video,
+                    composite.video_carrier,
+                    effective.video,
+                    effective.video_carrier,
+                ),
+            ];
+            for (label, stated_medium, stated_carrier, effective_medium, effective_carrier) in
+                claims
+            {
+                // A stated carrier narrows a medium that is *served*, whether it was stated
+                // or derived. Reading the raw statement here would refuse a narrowing over a
+                // derived medium, which is a normal thing to write once children are the
+                // source of the capability.
+                if stated_carrier.is_some() && effective_medium != Some(true) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} states a {label} carrier but does not serve \
+                         {label}; a carrier narrows a medium, so state {label} = true beside a \
+                         child that serves it, or drop the carrier"
+                    )));
+                }
+                let serving = |caps: &crate::ModelCapabilities| match label {
+                    "vision" => caps.vision == Some(true),
+                    _ => caps.video == Some(true),
+                };
+                let child_carrier = |caps: &crate::ModelCapabilities| match label {
+                    "vision" => caps.image_carrier.unwrap_or(MediaCarrier::DEFAULT),
+                    _ => caps.video_carrier.unwrap_or(MediaCarrier::DEFAULT),
+                };
+                let Some(claimed) = effective_medium
+                    .filter(|medium| *medium)
+                    .and(effective_carrier)
+                else {
+                    continue;
+                };
+                if !children.iter().any(serving) {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} declares {label} = true but none of its \
+                         children does; declare a child that does, or stop claiming it"
+                    )));
+                }
+                let missing: Vec<MediaCarrier> = claimed
+                    .carriers()
+                    .iter()
+                    .copied()
+                    .filter(|need| {
+                        !children
+                            .iter()
+                            .any(|caps| serving(caps) && child_carrier(caps).includes(*need))
+                    })
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(RunnerError::configuration(format!(
+                        "composite route {name} declares {label} carrier {claimed:?} but no \
+                         child serves {missing:?}; declare a child that does, or narrow the \
+                         composite's carrier"
+                    )));
+                }
+                // Report, do not refuse: an explicit promise narrower than what the children
+                // serve is safe, but it is the shape that goes stale when a child changes.
+                if stated_medium == Some(false)
+                    || stated_carrier.is_some_and(|stated| stated != claimed)
+                {
+                    let available = children
+                        .iter()
+                        .filter(|caps| serving(caps))
+                        .map(child_carrier)
+                        .reduce(MediaCarrier::union);
+                    if let Some(available) = available.filter(|available| *available != claimed) {
+                        tracing::warn!(
+                            "composite route {name} states {label} = {stated_medium:?} carrier \
+                             {stated_carrier:?} but its children serve {available:?}; the parent \
+                             refuses media a child could serve. Omit the statement to derive it \
+                             from the children."
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that every declared carrier is backed by the medium it narrows.
+    ///
+    /// A video declaration without a carrier is the ambiguity this change removes: the
+    /// provider may answer an inline video and 404 a URL, and nothing in the manifest would
+    /// say which. Requiring the carrier turns that into a load error instead of a
+    /// caller-visible 404 at request time. An image carrier is the mirror case and needs the
+    /// vision claim it narrows.
+    fn validate_target_carriers(&self) -> RunnerResult<()> {
+        for (target_name, target) in &self.targets {
+            if target.video == Some(true) && target.video_carrier.is_none() {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares video = true but no video_carrier; state \
+                     which of \"inline\" / \"remote\" / \"both\" it serves"
+                )));
+            }
+            if target.image_carrier.is_some() && target.vision != Some(true) {
+                return Err(RunnerError::configuration(format!(
+                    "target {target_name} declares image_carrier without vision = true; \
+                     a carrier is a narrowing of a medium it must first claim"
                 )));
             }
         }
@@ -928,6 +2603,9 @@ impl DeploymentConfig {
     /// of the video. Refusing at load makes that a configuration error rather than a
     /// silent conversion at request time.
     fn validate_video_transport(&self) -> RunnerResult<()> {
+        // Carrier declarations are checked for EVERY target, not only the video ones: an
+        // image carrier is a real narrowing on a target that may declare no video at all.
+        self.validate_target_carriers()?;
         for (target_name, target) in &self.targets {
             if target.video != Some(true) {
                 continue;
@@ -947,6 +2625,36 @@ impl DeploymentConfig {
                 return Err(RunnerError::configuration(format!(
                     "target {target_name} declares video = true but its client uses {format}; \
                      video requires an openai_responses client"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a Responses backend pointed at a provider that serves no such path.
+    ///
+    /// Google documents `/v1beta/openai/chat/completions` and no `/openai/responses`
+    /// equivalent. A target configured as `openai_responses` against that base URL would build
+    /// a path the provider has never offered, and the resulting 404 is a missing endpoint
+    /// rather than a missing model - which is exactly the confusion that gets a healthy model
+    /// recorded as retired. Checked at load so the misconfiguration cannot reach a request,
+    /// and the message names the fix.
+    fn validate_responses_wire_targets(&self) -> RunnerResult<()> {
+        for (name, client) in &self.llm_clients {
+            if !matches!(client.format, ClientFormat::OpenAiResponses) {
+                continue;
+            }
+            if client
+                .base_url
+                .as_str()
+                .to_ascii_lowercase()
+                .contains("generativelanguage.googleapis.com")
+            {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} uses openai_responses against {}; Google's \
+                     OpenAI-compatible surface documents /v1beta/openai/chat/completions only \
+                     and serves no Responses path. Use format = \"openai_chat\" for this client",
+                    client.base_url.as_str()
                 )));
             }
         }
@@ -1109,7 +2817,7 @@ impl DeploymentConfig {
     fn resolve_decision_lane_composition(
         &self,
         lanes: &BTreeMap<String, decision_executor::LaneResolverHandle>,
-    ) -> RunnerResult<Vec<(String, Vec<String>)>> {
+    ) -> RunnerResult<Vec<(String, decision_executor::ComposedLane)>> {
         let mut resolved = Vec::with_capacity(self.decision_lane_composition.len());
         for (name, composition) in &self.decision_lane_composition {
             let children = &composition.children;
@@ -1129,7 +2837,13 @@ impl DeploymentConfig {
                 }
                 ordered.push(child.clone());
             }
-            resolved.push((name.clone(), ordered));
+            resolved.push((
+                name.clone(),
+                decision_executor::ComposedLane {
+                    children: ordered,
+                    selection: composition.selection,
+                },
+            ));
         }
         Ok(resolved)
     }
@@ -1137,6 +2851,7 @@ impl DeploymentConfig {
     fn build_decision_resolver(
         &self,
         target_names: &[&str],
+        accounting: &Accounting<'_>,
     ) -> Option<decision_executor::DecisionResolver> {
         let mut candidates = Vec::new();
         for name in target_names {
@@ -1171,11 +2886,53 @@ impl DeploymentConfig {
                     .supported_types
                     .unwrap_or(decision_transport::SupportedTypes::ALL),
                 state_forms: target.state_forms,
+                budget: self.decision_budget(target, accounting.governor, accounting.allowances),
             });
         }
         (!candidates.is_empty()).then_some(decision_executor::DecisionResolver { candidates })
     }
 
+    /// The provider budgets one decision backend's calls are charged to.
+    ///
+    /// A decision call is one request to one physical model, so it draws on exactly the
+    /// budgets the same model draws on when it is used for generation: the same quota
+    /// group, the same daily counter, the same minute window. Two counters for one model
+    /// would let a deployment hold two allowances the provider never granted.
+    fn decision_budget(
+        &self,
+        target: &TargetConfig,
+        governor: &Arc<switchyard_llm_client::QuotaGovernor>,
+        allowances: &HashMap<(String, ModelId), Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    ) -> Option<Arc<decision_executor::DecisionBudget>> {
+        let group = self.allowance_group(target);
+        let allowance = allowances.get(&self.allowance_key(target, &group)).cloned();
+        let limits = switchyard_llm_client::WindowLimits {
+            requests_per_minute: target.requests_per_minute,
+            input_tokens_per_minute: target.input_tokens_per_minute,
+        };
+        let pacing = if limits.is_unlimited() {
+            None
+        } else {
+            Some(Arc::new(switchyard_llm_client::PacedQuota::new(
+                Arc::clone(governor),
+                switchyard_llm_client::GovernorKey::new(group, target.id.clone(), "decide"),
+                limits,
+                admission_margin_opt(target),
+            )))
+        };
+        if allowance.is_none() && pacing.is_none() {
+            return None;
+        }
+        Some(Arc::new(decision_executor::DecisionBudget {
+            allowance,
+            pacing,
+        }))
+    }
+
+    // One internal builder with one caller. Grouping these further would introduce a
+    // carrier struct purely to satisfy the lint, and would separate the decision wiring
+    // from the route it wires.
+    #[allow(clippy::too_many_arguments)]
     fn build_route_clients(
         &self,
         route_name: &str,
@@ -1191,7 +2948,12 @@ impl DeploymentConfig {
         // `Call::Decision` resolves a named lane by the SAME mechanism as the public
         // surface. Without it, the same request could be served at `/v1/decisions`
         // and fail internally, which is a split contract rather than one mechanism.
-        composition: &BTreeMap<String, Vec<String>>,
+        composition: &BTreeMap<String, decision_executor::ComposedLane>,
+        // The deployment's one governor and its per-model daily counters, threaded here so
+        // a route-local decision resolver is paced by the same ledgers as a named lane:
+        // the public surface and an internal Call::Decision must not hold two different
+        // views of one model's remaining budget.
+        accounting: &Accounting<'_>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let TargetPromptPolicy {
             prompts,
@@ -1200,7 +2962,19 @@ impl DeploymentConfig {
         let mut by_model = HashMap::new();
         let mut targets_by_model: HashMap<&str, (&str, &TargetConfig)> = HashMap::new();
         let mut caller_auth = None;
-        for name in route.callable_target_names() {
+        // The terminal leg is dispatched through the same router, so its client has to be
+        // constructed here even though it is never a ranked candidate.
+        let mut contact_names = route.callable_target_names();
+        for name in route
+            .terminal_fallback
+            .iter()
+            .flat_map(TerminalFallback::name_refs)
+        {
+            if !contact_names.contains(&name) {
+                contact_names.push(name);
+            }
+        }
+        for name in contact_names {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
             })?;
@@ -1247,7 +3021,7 @@ impl DeploymentConfig {
         // Decision calls need a host. One resolver is built from this route's configured
         // decision targets, in configured order, and serves both the internal call path
         // and any public typed surface, so Decision has one implementation.
-        let route_targets = route.routing_target_names();
+        let route_targets = route.served_target_names();
         // Target capability facts reach the client router so ordered candidates can be
         // filtered before dispatch. A target with no declaration is left in place.
         let mut facts: HashMap<ModelId, switchyard_llm_client::CapabilityFacts> = HashMap::new();
@@ -1260,16 +3034,77 @@ impl DeploymentConfig {
                         // Video is never inferred: a target that does not state support is
                         // treated as unable to receive it.
                         no_video: target.video != Some(true),
+                        // A target that declares video without carriers means both, so an
+                        // older manifest keeps the behaviour it had before carriers existed.
+                        no_remote_video: !matches!(
+                            target.video_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Remote | MediaCarrier::Both
+                        ),
+                        no_inline_video: !matches!(
+                            target.video_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Inline | MediaCarrier::Both
+                        ),
+                        // Images carry the same distinction and the same default: a target
+                        // that declares vision without carriers means both.
+                        no_remote_image: !matches!(
+                            target.image_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Remote | MediaCarrier::Both
+                        ),
+                        no_inline_image: !matches!(
+                            target.image_carrier.unwrap_or(MediaCarrier::Both),
+                            MediaCarrier::Inline | MediaCarrier::Both
+                        ),
                         no_tool_calling: target.tool_calling == Some(false),
+                        // A target that states its wire cannot accept a replayed tool call
+                        // is skipped for a request carrying one, and stays eligible for the
+                        // request that merely offers tools. Undeclared keeps permitting,
+                        // so a manifest written before the field behaves as it did.
+                        no_tool_call_replay: target.tool_call_replay == Some(false),
+                        // A target states when it cannot carry a caller's reasoning control;
+                        // an undeclared target keeps permitting it.
+                        no_reasoning_control: target.accepts_reasoning_control == Some(false),
+                        // Declared per target so selection can order a free candidate ahead
+                        // of a metered one without inferring cost from a provider name or a
+                        // model slug. Absent stays `Unknown`, which is not free.
+                        tariff: switchyard_llm_client::Tariff::from_declaration(target.free_tier),
+                        // The physical window and the per-request input ceiling travel as
+                        // facts so the pre-dispatch filter can drop a target that cannot
+                        // hold this request, before any provider is contacted.
+                        context_window: target.context_window,
+                        max_input_tokens: target.max_input_tokens,
+                        // The bound the deployment will actually admit: the declared ceiling
+                        // capped by what a margin-padded estimate can fit in the minute
+                        // window. Computed from the same arithmetic the send path uses, so
+                        // the filter and the governor cannot disagree about where a request
+                        // stops fitting.
+                        safe_input_tokens: safe_input_tokens(target),
+                        // A target that charges its own reasoning against the caller's
+                        // output reservation states the smallest reservation it can answer
+                        // within, so a smaller one is skipped instead of attempted.
+                        min_output_tokens: target.min_output_tokens,
+                        // The same declaration the send boundary uses to strip a value the
+                        // provider refuses. Carried here so a candidate can be judged
+                        // ineligible BEFORE the call when the caller is the one who asked
+                        // for that value, instead of being sent and silently altered.
+                        unsupported_reasoning_effort: target.unsupported_reasoning_effort.clone(),
                     },
                 );
             }
         }
         let router = router.with_target_capabilities(facts);
+        // The credential each target draws on travels with the router as well, so a
+        // failure is attributed to the target that actually failed rather than to the
+        // route's first target. A mixed-provider free pool is exactly the case where
+        // those two differ.
+        let router = router.with_target_credentials(target_credentials(route, &self.targets));
+        // The account-scoped allowance group each target draws on travels with the
+        // router too, so a refusal from one group's counter skips that group's other
+        // candidates instead of reading the same zero once per leg.
+        let router = router.with_target_allowance_groups(self.target_allowance_groups(route));
 
         // A route-level resolver serves a concrete target; the configured lanes serve a
         // logical identity and may order candidates differently per question type.
-        if let Some(resolver) = self.build_decision_resolver(&route_targets) {
+        if let Some(resolver) = self.build_decision_resolver(&route_targets, accounting) {
             let resolver = Arc::new(resolver);
             let handler_resolver = Arc::clone(&resolver);
             let handler_lane: Arc<Option<String>> = Arc::new(lane_identity.clone());
@@ -1400,7 +3235,7 @@ impl DeploymentConfig {
     ) -> RunnerResult<TargetPromptPolicy> {
         let mut prompts = HashMap::new();
         let mut aliases = HashMap::<&ModelId, Option<&str>>::new();
-        for name in route.algorithm.routing_target_names() {
+        for name in route.served_target_names() {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
             })?;
@@ -1515,6 +3350,55 @@ fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
         .unwrap_or(3)
 }
 
+/// Resolves a route's locality from the billing its targets' clients declare.
+///
+/// The answer is the fact the configuration states, not an inference from a name, a slug
+/// or a base URL. A single leg whose client states no billing makes the whole answer
+/// `Unknown`: one unstated leg is enough that "this never leaves the building" could be
+/// false, and calling it external instead would be a guess presented as a fact.
+fn route_locality(
+    route: &RouteConfig,
+    targets: &BTreeMap<String, TargetConfig>,
+    clients: &BTreeMap<String, LlmClientConfig>,
+) -> crate::route::Locality {
+    use crate::route::Locality;
+
+    let mut legs = 0usize;
+    let mut saw_local = false;
+    let mut saw_external = false;
+    for name in route.served_target_names() {
+        let Some(target) = targets.get(name) else {
+            continue;
+        };
+        let Some(client) = clients.get(&target.llm_client) else {
+            return Locality::Unknown;
+        };
+        legs += 1;
+        // A declared locality is authoritative. Undeclared falls back to a `local`
+        // billing, which states the same fact for an operator-hosted client; any other
+        // undeclared combination stays unknown rather than being given a cost class it
+        // did not claim, because a subscription credential is still an external provider.
+        match client.locality {
+            Some(crate::config::ClientLocality::Local) => saw_local = true,
+            Some(crate::config::ClientLocality::External) => saw_external = true,
+            None => match client.billing {
+                Some(BillingKind::Local) => saw_local = true,
+                Some(BillingKind::Metered | BillingKind::Subscription) | None => {
+                    return Locality::Unknown;
+                }
+            },
+        }
+    }
+
+    match (legs, saw_local, saw_external) {
+        (0, _, _) => Locality::Unknown,
+        (_, true, false) => Locality::Local,
+        (_, false, true) => Locality::Upstream,
+        (_, true, true) => Locality::Mixed,
+        (_, false, false) => Locality::Unknown,
+    }
+}
+
 /// Resolves each target model id to the `llm_client` credential that serves it.
 ///
 /// Whole-route composition uses this identity to decide whether a credential-level
@@ -1526,7 +3410,7 @@ fn target_credentials(
     targets: &BTreeMap<String, TargetConfig>,
 ) -> std::collections::HashMap<ModelId, String> {
     route
-        .routing_target_names()
+        .served_target_names()
         .into_iter()
         .filter_map(|name| {
             targets
@@ -1605,6 +3489,19 @@ struct LlmClientConfig {
     /// advertised inbound formats. Ignored by the Chat and Anthropic formats.
     #[serde(default)]
     requires_list_input: bool,
+    /// The signature this wire accepts for a replayed tool call it did not issue.
+    ///
+    /// Declaring it states two things at once: the wire validates a provider signature on
+    /// the first replayed `functionCall` part of each step, and this is the placeholder it
+    /// accepts for a call another model issued. Google documents the literal
+    /// `skip_thought_signature_validator` for exactly that case ("history transferred from a
+    /// model that does not include thought signatures"), at a stated cost in fidelity. A
+    /// client that declares it echoes [`switchyard_protocol::ToolCall::provider_state`] when
+    /// the call has it and substitutes this value when it does not, which is what makes a
+    /// request carrying another provider's tool lineage servable here. A client that omits
+    /// it sends no continuation state, and targets on it must keep `tool_call_replay` off.
+    #[serde(default)]
+    tool_signature_placeholder: Option<String>,
     /// How this client's usage is billed.
     ///
     /// Stated rather than inferred, because the difference decides whether a per-token
@@ -1613,6 +3510,146 @@ struct LlmClientConfig {
     /// provider never made.
     #[serde(default)]
     billing: Option<BillingKind>,
+    /// Where requests sent to this client are transported, as the deployment declares it.
+    ///
+    /// Deliberately separate from `billing`. That field classifies cost for the economics
+    /// surface, and a subscription credential is still an external provider; deriving an
+    /// egress claim from it would let an economics label decide whether a payload leaves
+    /// the operator's infrastructure. Locality answers that second question on its own and
+    /// stays undeclared when the deployment does not state it.
+    #[serde(default)]
+    locality: Option<ClientLocality>,
+    /// The provider-side quota group every model served here draws on.
+    ///
+    /// A provider caps requests per *project*, and several clients can name the same
+    /// project - a second base URL, a different wire format, a second model list. Naming
+    /// the group here makes the counters meet: two clients declaring the same group share
+    /// one counter per model instead of each believing it owns the whole daily budget.
+    /// Defaults to the client's own name, which keeps a single-client deployment exactly
+    /// as it was.
+    #[serde(default)]
+    quota_group: Option<String>,
+    /// Whether this client's daily cap is stated per model or for the whole account.
+    ///
+    /// Model scope is the historical behaviour and stays the default, because it is
+    /// correct for a provider that budgets each model separately (Google's free tier).
+    /// Account scope exists for providers that publish one free-request allowance for the
+    /// whole account (OpenRouter): under model scope every free model would be given the
+    /// full daily budget as its own, and the fleet would collectively spend several times
+    /// the real cap before any counter reported exhaustion.
+    #[serde(default)]
+    quota_scope: Option<QuotaScope>,
+    /// Which midnight this client's daily counter turns over on.
+    ///
+    /// Pacific by default, which is the historical behaviour and is correct for Google's
+    /// AI Studio free tier. OpenRouter's free-model counter turns over at midnight UTC;
+    /// counting it on the Pacific clock would either spend the new day's budget hours
+    /// early or refuse traffic the provider has already restored.
+    #[serde(default)]
+    quota_reset: Option<QuotaReset>,
+    /// The provider-reported request pool this client's counter reconciles against.
+    ///
+    /// A local counter sees only this deployment's traffic. On a shared free tier another
+    /// client -- or the same person in a browser -- can spend the account's allowance while
+    /// our counter still shows room. Naming a pool here authorizes the economics collector
+    /// to write the provider's own figure into this client's counter, so admission is
+    /// decided on the account rather than on our own slice of it.
+    ///
+    /// Omitted means the local budget is the only authority, which is the historical
+    /// behaviour and is correct for a provider that exposes no such reading.
+    #[serde(default)]
+    quota_provider: Option<QuotaProvider>,
+}
+
+/// A provider-reported request pool a counter may reconcile against.
+///
+/// A closed set rather than a free string: each variant names a pool whose wire shape and
+/// reset semantics this code knows, so a configuration cannot ask for a mapping the
+/// parser does not implement and then silently admit on a reading that never arrives.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaProvider {
+    /// OpenRouter's account-wide free-model daily request counter, reported by
+    /// `GET /api/v1/key` as `data.free_model_daily_requests`. It resets at midnight UTC.
+    ///
+    /// The spelling is pinned rather than derived from the variant name: serde's snake_case
+    /// rule would render `OpenRouterFreeModels` as `open_router_free_models`, which is not
+    /// how the provider's name is written anywhere else in this codebase and would become a
+    /// second spelling for one thing.
+    #[serde(rename = "openrouter_free_models")]
+    OpenRouterFreeModels,
+}
+
+impl QuotaProvider {
+    /// The pool name the provider itself uses.
+    ///
+    /// This must match the `pool` an account reader publishes, because reconciliation
+    /// selects the reading by that string. The two are joined here rather than written
+    /// out twice, so a rename cannot leave the reader and the config disagreeing.
+    pub fn pool(self) -> &'static str {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => "free_model_daily_requests",
+        }
+    }
+
+    /// The stable spelling used in configuration and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => "openrouter_free_models",
+        }
+    }
+
+    /// The day boundary the pool turns over on.
+    ///
+    /// Not configurable: the provider states when its own window resets, and counting it
+    /// on a different clock would place a reading in a day the provider does not recognise.
+    pub fn reset(self) -> QuotaReset {
+        match self {
+            QuotaProvider::OpenRouterFreeModels => QuotaReset::Utc,
+        }
+    }
+}
+
+/// How a client's daily request cap is scoped.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaScope {
+    /// One counter per model within the quota group.
+    #[default]
+    Model,
+    /// One counter for the whole quota group: every model draws on one account budget.
+    Account,
+}
+
+/// Which midnight a client's daily counter turns over on.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaReset {
+    /// Midnight Pacific — Google's AI Studio free tier.
+    #[default]
+    Pacific,
+    /// Midnight UTC — OpenRouter's free-model daily counter.
+    Utc,
+}
+
+impl QuotaReset {
+    /// The stable spelling used in configuration and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaReset::Pacific => "pacific",
+            QuotaReset::Utc => "utc",
+        }
+    }
+}
+
+/// Where a client's traffic terminates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientLocality {
+    /// The operator's own deployment: requests never leave operator infrastructure.
+    Local,
+    /// A third-party provider reached over the public network.
+    External,
 }
 
 /// How a client's usage is billed.
@@ -1639,6 +3676,15 @@ struct TargetConfig {
     /// For providers that reject an otherwise standard field.
     #[serde(default)]
     omit_body_fields: BTreeSet<String>,
+    /// Reasoning-effort values this target's provider refuses outright.
+    ///
+    /// The effort vocabulary is not portable: Google's OpenAI-compatibility surface accepts
+    /// `minimal`/`low`/`medium`/`high` and answers HTTP 400 `INVALID_ARGUMENT` to `none`
+    /// (measured 2026-11-21 on `gemini-3.5-flash-lite`), and a no-thinking consumer sends
+    /// exactly `none`. A value named here is removed at the target instead of being forwarded,
+    /// which leaves the provider's own default. Unset forwards every value.
+    #[serde(default)]
+    unsupported_reasoning_effort: BTreeSet<String>,
     system_prompt: Option<String>,
     /// Reasoning effort forced on every request to this target, replacing the caller's value.
     /// Only meaningful on `openai_chat` and `openai_responses` clients.
@@ -1650,6 +3696,16 @@ struct TargetConfig {
     /// one transport routinely differ here, which is why it is not an `llm_client` setting.
     #[serde(default)]
     reasoning_dialect: ReasoningDialect,
+    /// The marker this target's upstream uses when it writes reasoning inline in the message.
+    ///
+    /// A per-target wire fact, like `reasoning_dialect`: Google's hosted Gemma endpoints
+    /// answer `<thought>…</thought>` followed by the answer and count only the answer in
+    /// `completion_tokens`, while the Gemini chat models on the same credential do not.
+    /// Declaring `thought_tag` moves the block into a reasoning block so the monologue is
+    /// never returned as output. An unrecognised value is a load error rather than a
+    /// silently disabled filter.
+    #[serde(default)]
+    hosted_reasoning: Option<String>,
     /// Wire family this target speaks when serving a typed decision call.
     #[serde(default)]
     decision_transport: Option<decision_transport::DecisionTransport>,
@@ -1691,8 +3747,156 @@ struct TargetConfig {
     /// video, and on this deployment it does not. Omitted means "cannot".
     #[serde(default)]
     video: Option<bool>,
+    /// Which video carriers this deployment accepts, when it accepts video at all.
+    ///
+    /// Required whenever `video` is `true`. A provider can list video among a model's input
+    /// modalities and still refuse to fetch a URL for it: the free Nemotron endpoint answers
+    /// an inline `data:` video and 404s `video_url` with "No endpoints found that support
+    /// video URLs". Declaring `video = true` without this field leaves the same ambiguity
+    /// the boolean has, so the load refuses it rather than guessing a carrier.
+    #[serde(default)]
+    video_carrier: Option<MediaCarrier>,
+    /// Which image carriers this deployment accepts, when it accepts images at all.
+    ///
+    /// The image counterpart of `video_carrier`, and optional for the same historical reason
+    /// `vision` is: a deployment that predates carriers declares images and means both.
+    #[serde(default)]
+    image_carrier: Option<MediaCarrier>,
     #[serde(default)]
     tool_calling: Option<bool>,
+    /// Whether this deployment accepts a request that replays an earlier tool call.
+    ///
+    /// `false` is a measured wire fact, not a policy: Google's OpenAI-compatibility surface
+    /// issues a `thought_signature` with each function call and refuses a replayed
+    /// `functionCall` part without it (HTTP 400 `INVALID_ARGUMENT`, measured 2026-11-26 for
+    /// both a call that surface had just issued with the signature stripped and a call issued
+    /// elsewhere). A caller that only offers tools is still served there, so this is narrower
+    /// than `tool_calling` and does not replace it. Omitted permits replayed calls, which is
+    /// what every manifest written before the field did.
+    #[serde(default)]
+    tool_call_replay: Option<bool>,
+    /// Requests this target may make per provider day, when the provider caps them.
+    ///
+    /// Stated on the target rather than the client because the cap is per model within one
+    /// project: two targets on one credential routinely have different daily budgets. A
+    /// declared limit must be accompanied by a `[quota]` state directory; a spent
+    /// allowance removes the target from consideration and the route advances.
+    #[serde(default)]
+    daily_request_limit: Option<u64>,
+    /// Requests permitted in any rolling minute, when the provider publishes a window.
+    ///
+    /// A different resource from `daily_request_limit` and enforced separately: the provider
+    /// counts requests per model per minute, and a daily budget reached by bursting through
+    /// the minute is refused long before the day is spent. Declared per target for the same
+    /// reason the daily budget is — the cap belongs to the model, not the client — and targets
+    /// that name one physical model in one quota group must state the same value, because one
+    /// window serves them all.
+    #[serde(default)]
+    requests_per_minute: Option<u64>,
+    /// Input tokens permitted in any rolling minute, when the provider publishes a window.
+    ///
+    /// Tokens are estimated from the outbound body before the call, so this is pacing rather
+    /// than billing: being slightly early is the safe direction, and the request is routed to
+    /// a leg with headroom rather than retried. Requires `max_input_tokens` at or below this
+    /// value — a request larger than a whole window's budget can never be admitted, and
+    /// discovering that at the send path would spend eligibility on a 429.
+    #[serde(default)]
+    input_tokens_per_minute: Option<u64>,
+    /// How much larger than its pre-dispatch estimate a request is assumed to be, in
+    /// thousandths, when it is reserved against `input_tokens_per_minute`.
+    ///
+    /// The estimate is characters over the outbound body divided by four, which measured
+    /// against the provider's own count has erred in both directions on real prompts. This
+    /// is the protective pad that keeps a near-limit request from being dispatched on a
+    /// number the provider will exceed: at 1300, a gemma request estimating 15,202 tokens
+    /// reserves 19,763 and is refused against a 16,000 window instead of being sent and
+    /// charged 18,054.
+    ///
+    /// Not a claim of accuracy. A value below 1000 is rejected at load, because a pad that
+    /// makes the reservation smaller than the estimate is an under-count by construction.
+    /// Omitted means 1000 — the estimate as stated — so a manifest that does not declare it
+    /// keeps the behaviour it had.
+    #[serde(default)]
+    admission_margin_permille: Option<u32>,
+    /// The physical model's own request window, when the deployment knows it.
+    ///
+    /// A route's `context_window` is what callers are promised; this is what one backing
+    /// model can actually hold, input plus output. A route whose aggregate claim exceeds
+    /// every candidate's physical window would promise capacity no target can serve, so
+    /// load refuses the pair rather than discovering it as an upstream 400. Unset leaves
+    /// the target unconstrained on this axis, which keeps every manifest written before the
+    /// field existed behaving exactly as it did.
+    #[serde(default)]
+    context_window: Option<u64>,
+    /// The most input a single request may carry here, when the provider caps it below the
+    /// context window.
+    ///
+    /// This is the per-minute input budget expressed as a per-request ceiling: a request
+    /// that needs more than a whole minute's allowance can never be served, so admitting it
+    /// would spend the target's eligibility and return a 429. The free hosted Gemma models
+    /// are the case that forced the field — 262,144-token window, 16,000 input tokens per
+    /// minute — and a 256K prompt is not a 16K request with a long wait.
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    /// Whether the provider charges nothing for a request here inside a declared allowance.
+    ///
+    /// Whether a request here draws on a free allowance, when the deployment states it.
+    ///
+    /// Tri-state, because two answers are not enough to make an economic claim. `true` says
+    /// the request is free, `false` says it is billed, and absent says nothing at all - which
+    /// is [`switchyard_llm_client::Tariff::Unknown`] and never counts as free entitlement.
+    /// A boolean could not tell "this is metered" apart from "nobody declared this", and the
+    /// second is exactly the case a free-only selection pool must exclude.
+    ///
+    /// It is also a selection fact: no measured latency moves a paid leg in front of an
+    /// eligible free leg, and no free leg is entered ahead of a cheaper tier by accident.
+    #[serde(default)]
+    free_tier: Option<bool>,
+    /// Economic/selection groups this target belongs to, as labels only.
+    ///
+    /// A group is a membership tag, never an execution stage: nothing dispatches *to* a
+    /// group, and no group is preferred over another. It exists so one route can declare a
+    /// pool by membership (`pool_groups`) and so a catalogue can describe which leaves belong
+    /// to `ST_OR_Free`, `ST_Gemini_Free` or `ST_OR_Paid` without the route's candidate list
+    /// being the only record of it.
+    #[serde(default)]
+    groups: Vec<String>,
+    /// Whether the backing model accepts a caller's explicit reasoning control.
+    ///
+    /// `false` is a measured wire fact, not a policy: Google's hosted Gemma answers HTTP
+    /// 400 to `reasoning_effort`, while the Gemini chat models on the same credential accept
+    /// it. A target that states `false` is skipped for a request carrying any reasoning
+    /// control and stays eligible for one carrying none, so its native reasoning default is
+    /// never overridden. Unset keeps the previous behaviour, where control is permitted.
+    #[serde(default)]
+    accepts_reasoning_control: Option<bool>,
+    /// The smallest output reservation this target can produce an answer within.
+    ///
+    /// Set only for a target whose reasoning is charged against the caller's
+    /// `max_output_tokens` — Google's hosted Gemma writes `<thought>` inline and stops when
+    /// the budget runs out mid-thought, so at a small reservation it answers with thinking
+    /// only (measured 2026-11-21: 61–328 thinking tokens for prompts of 49–438 tokens, and
+    /// zero visible text once the budget fell below the thought). A request whose output
+    /// reservation is below this floor is not dispatched here: the route keeps the candidate
+    /// list honest and spends the provider request on a leg that can answer. Unset means no
+    /// floor, which is every target outside this shape.
+    #[serde(default)]
+    min_output_tokens: Option<u64>,
+    /// Why this target is held out of service, stated as the provider's own evidence.
+    ///
+    /// A held target keeps its place in the inventory — the declaration, its credential and
+    /// its facts stay readable — but it is removed from every route's candidate set at load,
+    /// so no request is ever dispatched to it and no `/v1/models` entry advertises it. It is
+    /// not retired: retiring would delete the record of what was measured and would make the
+    /// alias indistinguishable from a typo.
+    ///
+    /// The value is the reason the caller is shown, so it must be a fact rather than a
+    /// judgement: for a model the provider has withdrawn, the provider's own sentence. Held
+    /// is deliberately not a fallback: a held target must never be replaced by a live model,
+    /// because the caller asked for this one and a silent substitution would answer a
+    /// different question.
+    #[serde(default)]
+    held: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1747,17 +3951,117 @@ fn resolve_category_models(
 
 // The per-target overrides are all forwarded verbatim from the target being built;
 // bundling them into a struct would only move the same fields one level down.
+/// The shared minute-window budget one target draws on, when it declares limits.
+///
+/// The key is the provider's own identity — quota group plus physical model — not the
+/// target name or the route alias, because that is what the provider counts. Every alias
+/// therefore draws on one ledger, which is the whole point: three names for one model must
+/// not each be handed the same minute.
+fn pacing_for(
+    target: &TargetConfig,
+    client_config: &LlmClientConfig,
+    governor: &Arc<switchyard_llm_client::QuotaGovernor>,
+) -> Option<Arc<switchyard_llm_client::PacedQuota>> {
+    let limits = switchyard_llm_client::WindowLimits {
+        requests_per_minute: target.requests_per_minute,
+        input_tokens_per_minute: target.input_tokens_per_minute,
+    };
+    if limits.is_unlimited() {
+        return None;
+    }
+    let group = client_config
+        .quota_group
+        .clone()
+        .unwrap_or_else(|| target.llm_client.clone());
+    Some(Arc::new(switchyard_llm_client::PacedQuota::new(
+        Arc::clone(governor),
+        switchyard_llm_client::GovernorKey::new(group, target.id.clone(), "generate"),
+        limits,
+        // Validation already rejected a pad below 1.0, so the fallback here is the
+        // no-pad default rather than an error: this function builds, it does not judge.
+        admission_margin_opt(target),
+    )))
+}
+
+/// The configured admission pad, or no pad when the target declares none.
+fn admission_margin_opt(target: &TargetConfig) -> switchyard_llm_client::AdmissionMargin {
+    target
+        .admission_margin_permille
+        .and_then(switchyard_llm_client::AdmissionMargin::from_permille)
+        .unwrap_or(switchyard_llm_client::AdmissionMargin::NONE)
+}
+
+/// The most estimated input a target will admit, mirroring the send path's arithmetic.
+///
+/// `None` when the target declares no minute token window. Otherwise the smaller of the
+/// declared per-request ceiling and the largest estimate a margin-padded reservation can
+/// fit. A target that declares a window but no ceiling is already a load error, so the
+/// `max_input_tokens` arm is only for completeness.
+fn safe_input_tokens(target: &TargetConfig) -> Option<u64> {
+    let limits = switchyard_llm_client::WindowLimits {
+        requests_per_minute: target.requests_per_minute,
+        input_tokens_per_minute: target.input_tokens_per_minute,
+    };
+    let window = limits.safe_input_ceiling(admission_margin_opt(target))?;
+    Some(match target.max_input_tokens {
+        Some(ceiling) => ceiling.min(window),
+        None => window,
+    })
+}
+
+/// The admission pad, with load-time validation of the declared value.
+fn admission_margin(
+    target: &TargetConfig,
+    target_name: &str,
+) -> RunnerResult<switchyard_llm_client::AdmissionMargin> {
+    let Some(declared) = target.admission_margin_permille else {
+        return Ok(switchyard_llm_client::AdmissionMargin::NONE);
+    };
+    if target.input_tokens_per_minute.is_none() {
+        return Err(RunnerError::configuration(format!(
+            "target {target_name} declares admission_margin_permille {declared} without \
+             input_tokens_per_minute; the margin pads a token reservation, and there is no \
+             token window here to pad, so it would protect nothing"
+        )));
+    }
+    switchyard_llm_client::AdmissionMargin::from_permille(declared).ok_or_else(|| {
+        RunnerError::configuration(format!(
+            "target {target_name} declares admission_margin_permille {declared}; a margin below \
+             1000 would reserve less than the estimate, which is an under-count by construction"
+        ))
+    })
+}
 #[allow(clippy::too_many_arguments)]
 fn build_backend(
     client_name: &str,
     config: &LlmClientConfig,
     extra_body: &BTreeMap<String, Value>,
     omit_body_fields: &BTreeSet<String>,
+    unsupported_reasoning_effort: &BTreeSet<String>,
     reasoning_effort: Option<String>,
     reasoning_policy: Option<ReasoningPolicy>,
     reasoning_dialect: ReasoningDialect,
     cooldown_group: Option<String>,
+    allowance: Option<Arc<switchyard_llm_client::DailyRequestAllowance>>,
+    pacing: Option<Arc<switchyard_llm_client::PacedQuota>>,
+    hosted_reasoning: Option<HostedReasoningMarker>,
 ) -> RunnerResult<Backend> {
+    // A declared placeholder is a promise that this wire can absorb foreign tool lineage.
+    // An empty value would encode `extra_content.google.thought_signature: ""`, which is
+    // neither a signature nor the documented placeholder, and the wire would refuse it with
+    // the very 400 the declaration exists to prevent.
+    if let Some(placeholder) = config.tool_signature_placeholder.as_deref() {
+        if placeholder.trim().is_empty() {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} tool_signature_placeholder must not be empty"
+            )));
+        }
+        if !matches!(config.format, ClientFormat::OpenAiChat) {
+            return Err(RunnerError::configuration(format!(
+                "llm client {client_name} tool_signature_placeholder is only meaningful for the openai_chat format"
+            )));
+        }
+    }
     if config.max_retries > MAX_CONFIGURED_RETRIES {
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} max_retries must be at most {MAX_CONFIGURED_RETRIES}"
@@ -1824,6 +4128,7 @@ fn build_backend(
         extra_headers: config.extra_headers.clone(),
         extra_body: extra_body.clone(),
         omit_body_fields: omit_body_fields.clone(),
+        unsupported_reasoning_effort: unsupported_reasoning_effort.clone(),
         reasoning_effort,
         reasoning_policy,
         reasoning_dialect,
@@ -1834,6 +4139,10 @@ fn build_backend(
         attempt_timeout: config.attempt_timeout_ms.map(Duration::from_millis),
         stream_idle_timeout: config.stream_idle_timeout_ms.map(Duration::from_millis),
         requires_list_input: config.requires_list_input,
+        allowance,
+        pacing,
+        hosted_reasoning,
+        tool_signature_placeholder: config.tool_signature_placeholder.clone(),
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -1864,6 +4173,344 @@ fn validate_value(label: &str, value: &str) -> RunnerResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Loads a deployment that must be refused, returning the refusal text.
+    ///
+    /// `Runner` has no `Debug` impl, so `expect_err` cannot be used; matching keeps the
+    /// failure honest - a successful load panics rather than being reported as a refusal.
+    fn refuse(source: &str) -> String {
+        match runner_from_toml(source) {
+            Ok(_) => panic!("deployment loaded but should have been refused"),
+            Err(error) => format!("{error}"),
+        }
+    }
+
+    /// A target may state that its wire cannot accept a replayed tool call.
+    ///
+    /// The declaration has to be a consumed field on the target: an unconsumed key would be
+    /// rejected by the strict schema, and a key that parses into nothing would be a knob with
+    /// no effect. This asserts the load accepts it and that a misspelling does not.
+    #[test]
+    fn a_target_may_declare_that_it_cannot_replay_a_tool_call() {
+        let accepted = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+[targets.gemini]
+id = "gemini-lite"
+llm_client = "google"
+tool_calling = true
+tool_call_replay = false
+
+[routes.ladder]
+id = "ladder"
+type = "passthrough"
+target = "gemini"
+candidates = []
+"#;
+        runner_from_toml(accepted).expect("a declared replay refusal loads");
+
+        // The same manifest with the key misspelt must fail, not silently ignore it.
+        let misspelt = accepted.replace("tool_call_replay = false", "tool_call_replays = false");
+        let message = refuse(&misspelt);
+        assert!(
+            message.contains("tool_call_replays") || message.to_lowercase().contains("unknown"),
+            "a misspelt capability key must be refused by name, got: {message}"
+        );
+    }
+
+    /// A deployment whose paced lane declares a margin but no token window refuses to load.
+    ///
+    /// The margin pads a token reservation. A target with no `input_tokens_per_minute` has
+    /// nothing to pad, so the declaration states an intent the runtime cannot honour. This
+    /// was reachable only through the helper: the paced-target check ran first and skipped
+    /// unpaced targets before the margin was ever validated.
+    #[test]
+    fn a_margin_without_a_token_window_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("without input_tokens_per_minute"),
+            "refusal must name the missing window, got: {message}"
+        );
+        assert!(
+            message.contains("protect nothing"),
+            "refusal must say the margin protects nothing, got: {message}"
+        );
+    }
+
+    /// A margin below parity reserves less than the estimate, which is an under-count by
+    /// construction. It must be refused rather than silently clamped.
+    #[test]
+    fn a_margin_below_parity_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 900
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("below") && message.contains("1000"),
+            "refusal must name the parity floor, got: {message}"
+        );
+    }
+
+    /// The measured overrun, expressed as a manifest: a 16,000-token window padded by 1,300
+    /// per mille can admit at most 12,307 estimated tokens, so a 16,000-token ceiling is a
+    /// promise the governor would refuse on every large request.
+    #[test]
+    fn a_ceiling_above_the_padded_window_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 16000
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("12307"),
+            "refusal must state the derived ceiling 12307, got: {message}"
+        );
+    }
+
+    /// The honest form of the same lane loads: the ceiling is lowered to what the padded
+    /// window can actually admit.
+    #[test]
+    fn a_padded_lane_loads_at_its_derived_ceiling() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.padded]
+id = "gemma/padded"
+llm_client = "google"
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+max_input_tokens = 12307
+admission_margin_permille = 1300
+
+[routes.padded]
+id = "padded"
+type = "passthrough"
+target = "padded"
+candidates = []
+"#;
+        runner_from_toml(config).expect("the derived ceiling is admittable");
+    }
+
+    /// Locality is the client's own declaration, not a cost class read from billing.
+    ///
+    /// A subscription credential is still an external provider, so `billing` cannot answer
+    /// this question. An undeclared client stays unknown rather than being given the
+    /// answer its billing field implies.
+    #[test]
+    fn route_locality_comes_from_the_declared_transport() {
+        let base = r#"
+schema_version = 1
+
+[llm_clients.ext]
+format = "openai_responses"
+base_url = "https://provider.test/v1"
+locality = "external"
+
+[targets.ext-a]
+id = "vendor/ext-a"
+llm_client = "ext"
+
+[routes.remote]
+id = "remote"
+type = "passthrough"
+target = "ext-a"
+candidates = []
+
+[llm_clients.mine]
+format = "openai_responses"
+base_url = "http://host.test:8446/v1"
+billing = "local"
+
+[targets.mine-a]
+id = "vendor/mine-a"
+llm_client = "mine"
+
+[routes.here]
+id = "here"
+type = "passthrough"
+target = "mine-a"
+candidates = []
+
+[llm_clients.undeclared]
+format = "openai_responses"
+base_url = "https://other.test/v1"
+billing = "subscription"
+
+[targets.undeclared-a]
+id = "vendor/undeclared-a"
+llm_client = "undeclared"
+
+[routes.unknown]
+id = "unknown"
+type = "passthrough"
+target = "undeclared-a"
+candidates = []
+"#;
+        let runner = crate::Runner::from_toml(base).expect("deployment builds");
+        let by_id = runner
+            .models()
+            .map(|model| (model.id.as_str().to_string(), model.locality))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_id["remote"], crate::route::Locality::Upstream);
+        assert_eq!(by_id["here"], crate::route::Locality::Local);
+        assert_eq!(
+            by_id["unknown"],
+            crate::route::Locality::Unknown,
+            "a subscription credential alone states no locality"
+        );
+    }
+
+    /// A target declares the marker its upstream uses, or the deployment does not load.
+    ///
+    /// Accepting an unknown value would disable the filter silently, which is the defect
+    /// the filter exists to prevent, so the refusal must name the field and the accepted
+    /// value.
+    #[test]
+    fn a_target_names_its_hosted_reasoning_marker() {
+        let deployment = |marker: &str| {
+            format!(
+                r#"
+schema_version = 1
+
+[llm_clients.gemma]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma-a]
+id = "google/gemma"
+llm_client = "gemma"
+hosted_reasoning = "{marker}"
+
+[routes.chat]
+id = "chat"
+type = "passthrough"
+target = "gemma-a"
+candidates = []
+"#
+            )
+        };
+
+        crate::Runner::from_toml(&deployment("thought_tag")).expect("a known marker loads");
+
+        let Err(error) = crate::Runner::from_toml(&deployment("thought")) else {
+            panic!("an unknown marker must not load");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("hosted_reasoning") && message.contains("thought_tag"),
+            "the refusal must name the field and the accepted value: {message}"
+        );
+    }
+
+    #[test]
+    fn a_responses_client_cannot_be_pointed_at_google() {
+        // Google serves /v1beta/openai/chat/completions and no Responses path. A target built
+        // against that base with the Responses format would request an endpoint that does not
+        // exist, and a 404 from a missing path is not a retired model. Refused at load.
+        let deployment = |format: &str, base_url: &str| {
+            format!(
+                r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "{format}"
+base_url = "{base_url}"
+
+[targets.gemini]
+id = "gemini-3.5-flash-lite"
+llm_client = "google"
+
+[routes.chat]
+id = "chat"
+type = "passthrough"
+target = "gemini"
+candidates = []
+"#
+            )
+        };
+
+        crate::Runner::from_toml(&deployment(
+            "openai_chat",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ))
+        .expect("the documented Chat Completions path loads");
+
+        let Err(error) = crate::Runner::from_toml(&deployment(
+            "openai_responses",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        )) else {
+            panic!("a Responses client against Google must not load");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("openai_chat") && message.contains("generativelanguage"),
+            "the refusal must name the fix: {message}"
+        );
+
+        // Control: the format itself is still supported for providers that serve it.
+        crate::Runner::from_toml(&deployment("openai_responses", "https://api.openai.com/v1"))
+            .expect("a Responses client against a Responses provider loads");
+    }
 
     #[test]
     fn route_presentation_fields_are_split_from_the_algorithm() {
@@ -1976,6 +4623,154 @@ type = "plan_execute"
 capable_target = "strong"
 efficient_target = "weak"
 "#;
+
+    /// The provider's own sentence, repeated verbatim in the refusal.
+    const HELD_REASON: &str = "This model is no longer available to new users.";
+
+    /// A deployment with one held target reached three ways: as a route's whole candidate
+    /// set, as an extra candidate, and as the head target with a live fallback behind it.
+    ///
+    /// The live target is declared once so the three routes differ only in where the held
+    /// one sits — that is the variable these tests are about.
+    const HELD_CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.live]
+id = "live/model"
+llm_client = "primary"
+
+[targets.retired]
+id = "retired/model"
+llm_client = "primary"
+held = "This model is no longer available to new users."
+
+[routes.held_only]
+id = "switchyard/held-only"
+type = "passthrough"
+target = "retired"
+
+[routes.held_as_candidate]
+id = "switchyard/held-as-candidate"
+type = "passthrough"
+target = "live"
+candidates = ["retired"]
+
+[routes.held_as_head]
+id = "switchyard/held-as-head"
+type = "passthrough"
+target = "retired"
+candidates = ["live"]
+
+[routes.live_only]
+id = "switchyard/live-only"
+type = "passthrough"
+target = "live"
+"#;
+
+    /// A held target must not fail the load.
+    ///
+    /// Holding is a service decision about a model that exists in the manifest, so the
+    /// declaration, its credential and its facts all still have to parse. Refusing the
+    /// deployment here would turn a deliberate hold into an outage.
+    #[test]
+    fn a_held_target_still_loads_and_keeps_its_record() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        let route = runner
+            .route("switchyard/held-only")
+            .expect("a held route keeps its registration");
+        assert_eq!(route.held_reason(), Some(HELD_REASON));
+        assert!(
+            route.models().models_for(&Category::Any).is_empty(),
+            "no candidate may remain when every target is held"
+        );
+        Ok(())
+    }
+
+    /// A held target leaves the candidate list without condemning the route that named it.
+    ///
+    /// Both positions are covered because they are filtered by the same set but reached by
+    /// different code: a candidate is one entry in an ordered list, while the head target is
+    /// the entry the algorithm would otherwise always offer first.
+    #[test]
+    fn a_held_candidate_leaves_the_list_without_holding_the_route() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        for name in ["switchyard/held-as-candidate", "switchyard/held-as-head"] {
+            let route = runner.route(name).expect("route is registered");
+            assert_eq!(
+                route.held_reason(),
+                None,
+                "{name} still has a live target and must keep serving"
+            );
+            assert_eq!(
+                route.models().models_for(&Category::Any),
+                vec![ModelId::from("live/model")],
+                "{name} must offer only the live target"
+            );
+        }
+        Ok(())
+    }
+
+    /// The catalogue promises answers; the inventory records what is declared.
+    ///
+    /// Both are asserted together because either one alone would pass under the wrong
+    /// behaviour: dropping the route from both lists would look like a correct retirement,
+    /// and leaving it in both would look like an untouched inventory.
+    #[test]
+    fn the_catalogue_drops_a_held_route_while_the_inventory_keeps_it() -> RunnerResult<()> {
+        let runner = runner_from_toml(HELD_CONFIG)?;
+        let advertised: Vec<&str> = runner
+            .advertised_models()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(
+            !advertised.contains(&"switchyard/held-only"),
+            "a route that can only refuse must not be advertised: {advertised:?}"
+        );
+        for name in [
+            "switchyard/held-as-candidate",
+            "switchyard/held-as-head",
+            "switchyard/live-only",
+        ] {
+            assert!(
+                advertised.contains(&name),
+                "{name} serves and must stay advertised: {advertised:?}"
+            );
+        }
+        let inventory: Vec<&str> = runner.models().map(|model| model.id.as_str()).collect();
+        assert!(
+            inventory.contains(&"switchyard/held-only"),
+            "the declaration stays readable for diagnostics: {inventory:?}"
+        );
+        Ok(())
+    }
+
+    /// The refusal names the held alias and quotes the provider, before any request work.
+    ///
+    /// Executed with a default request on purpose: a held route has nothing to dispatch, so
+    /// the decision must not depend on the request being well formed. A refusal that had to
+    /// read the payload could not be trusted to stay free of provider calls.
+    #[tokio::test]
+    async fn a_held_route_refuses_locally_with_the_providers_evidence() {
+        let runner = runner_from_toml(HELD_CONFIG).expect("fixture loads");
+        let route = runner
+            .route("switchyard/held-only")
+            .expect("route is registered");
+        match route
+            .execute(switchyard_protocol::Request::default(), None)
+            .await
+        {
+            Err(RunnerError::Held { model, reason }) => {
+                assert_eq!(model, "retired", "the refusal names the alias asked for");
+                assert_eq!(reason, HELD_REASON, "the provider's evidence is forwarded");
+            }
+            Err(other) => panic!("expected Held, got {other:?}"),
+            Ok(_) => panic!("a held route must never produce a response"),
+        }
+    }
 
     #[test]
     fn public_runner_from_toml_builds_a_deployment() -> RunnerResult<()> {
@@ -2166,6 +4961,212 @@ new = ["send_message"]
                 .any(|model| model.id.as_str() == "switchyard/hier")
         );
         Ok(())
+    }
+
+    /// Two leaves whose carriers differ, a text-only leaf, and composites over each.
+    /// The composites state nothing about media: what they advertise must come from the
+    /// children, except where a test deliberately states a policy cap.
+    fn composite_media_config(extra: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[llm_clients.responses]
+format = "openai_responses"
+base_url = "https://example.test/v1"
+
+[targets.inline]
+id = "inline/model"
+llm_client = "responses"
+vision = true
+image_carrier = "inline"
+video = true
+video_carrier = "inline"
+
+[targets.both]
+id = "both/model"
+llm_client = "responses"
+vision = true
+video = true
+video_carrier = "both"
+
+[targets.text]
+id = "text/model"
+llm_client = "primary"
+
+[routes.child_inline]
+id = "child-inline"
+type = "passthrough"
+target = "inline"
+vision = true
+image_carrier = "inline"
+video = true
+video_carrier = "inline"
+
+[routes.child_both]
+id = "child-both"
+type = "passthrough"
+target = "both"
+vision = true
+video = true
+video_carrier = "both"
+
+[routes.child_text]
+id = "child-text"
+type = "passthrough"
+target = "text"
+
+[composites.tier_inline]
+children = ["child_inline"]
+
+[composites.tier_mixed]
+children = ["child_inline", "child_both"]
+
+[composites.tier_text]
+children = ["child_text"]
+
+[composites.tier_bounded]
+children = ["child_inline"]
+
+{extra}
+"#
+        )
+    }
+
+    fn composite_media(runner: &Runner, name: &str) -> crate::ModelCapabilities {
+        runner
+            .route_capabilities(name)
+            .unwrap_or_else(|| panic!("composite {name} is not registered"))
+    }
+
+    #[test]
+    fn a_composite_derives_video_and_carrier_from_its_only_child() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_inline");
+        assert_eq!(media.video, Some(true));
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        assert_eq!(media.vision, Some(true));
+        assert_eq!(media.image_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn a_mixed_composite_derives_the_union_of_child_carriers() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_mixed");
+        // Inline + Both is Both: a request on either carrier has a child that serves it.
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Both));
+        assert_eq!(media.image_carrier, Some(MediaCarrier::Both));
+        Ok(())
+    }
+
+    #[test]
+    fn a_composite_over_text_only_children_claims_no_video() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        let media = composite_media(&runner, "tier_text");
+        // Derived, never invented: no child declares video, so the composite refuses it
+        // locally instead of offering a medium every child would skip.
+        assert_eq!(media.video, Some(false));
+        assert_eq!(media.video_carrier, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_bounded_lane_derives_independently_from_its_own_child() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(""))?;
+        // A bounded composite's children are different routes; its declaration must be read
+        // from those children, not inherited from the unbounded twin.
+        let media = composite_media(&runner, "tier_bounded");
+        assert_eq!(media.video, Some(true));
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_video_false_stays_a_policy_cap() -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(
+            "[composites.capped]\nchildren = [\"child_both\"]\nvideo = false\n",
+        ))?;
+        let media = composite_media(&runner, "capped");
+        assert_eq!(media.video, Some(false));
+        assert_eq!(media.video_carrier, None);
+        Ok(())
+    }
+
+    #[test]
+    fn video_true_without_a_carrier_derives_the_union_not_the_permissive_default()
+    -> RunnerResult<()> {
+        let runner = runner_from_toml(&composite_media_config(
+            "[composites.stated]\nchildren = [\"child_inline\"]\nvideo = true\n",
+        ))?;
+        let media = composite_media(&runner, "stated");
+        // The old default would have been Both, advertising a remote carrier that no child
+        // below the composite serves.
+        assert_eq!(media.video_carrier, Some(MediaCarrier::Inline));
+        Ok(())
+    }
+
+    #[test]
+    fn a_composite_cannot_advertise_a_carrier_no_child_serves() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.overclaim]\nchildren = [\"child_inline\"]\nvideo = true\n\
+             video_carrier = \"both\"\n",
+        ))
+        .err()
+        .expect("an explicit both claim over inline-only children must be refused");
+        let text = error.to_string();
+        assert!(text.contains("overclaim"), "{text}");
+        assert!(text.contains("Remote"), "{text}");
+    }
+
+    #[test]
+    fn a_composite_cannot_state_a_carrier_without_the_medium_it_narrows() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.inert]\nchildren = [\"child_inline\"]\nvideo = false\n\
+             video_carrier = \"inline\"\n",
+        ))
+        .err()
+        .expect("a carrier on a composite that refuses the medium must be refused");
+        let text = error.to_string();
+        assert!(text.contains("inert"), "{text}");
+    }
+
+    #[test]
+    fn a_stated_carrier_narrows_a_derived_medium() {
+        // The medium is not stated; it is derived from the one inline-only child. Narrowing
+        // it to what that child serves is not inert, so it must load.
+        runner_from_toml(&composite_media_config(
+            "[composites.narrowed]\nchildren = [\"child_inline\"]\n\
+             video_carrier = \"inline\"\n",
+        ))
+        .expect("a carrier matching the derived capability must load");
+
+        // The same shape with a carrier no child serves must still be refused, naming the
+        // carrier that is missing rather than the (unstated) medium.
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.widened]\nchildren = [\"child_inline\"]\n\
+             video_carrier = \"both\"\n",
+        ))
+        .err()
+        .expect("a derived medium cannot be widened past its children");
+        let text = error.to_string();
+        assert!(text.contains("widened"), "{text}");
+        assert!(text.contains("Remote"), "{text}");
+    }
+
+    #[test]
+    fn a_composite_claiming_video_over_text_only_children_is_refused() {
+        let error = runner_from_toml(&composite_media_config(
+            "[composites.hollow]\nchildren = [\"child_text\"]\nvideo = true\n",
+        ))
+        .err()
+        .expect("a video claim no child can keep must be refused");
+        let text = error.to_string();
+        assert!(text.contains("hollow"), "{text}");
     }
 
     #[test]
@@ -2883,7 +5884,7 @@ max_query_chars = 512
         assert!(
             error_message(&conflicting)
                 .contains(
-                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, or omit_body_fields",
+                "different reasoning_effort, reasoning_policy, reasoning_dialect, extra_body, omit_body_fields, or unsupported_reasoning_effort",
             ),
             "{}",
             error_message(&conflicting)
@@ -3009,11 +6010,14 @@ efficient_target = "weak"
         );
         assert!(error_message(&unknown_classifier_field).contains("unknown field"));
 
+        // `context_window`, `max_input_tokens` and `daily_request_limit` are supported
+        // target fields, so the control names one that is not: a typo must still be
+        // refused rather than silently ignored.
         let target_capability = VALID_CONFIG.replace(
             "llm_client = \"responses\"",
-            "llm_client = \"responses\"\ncontext_window = 1000000",
+            "llm_client = \"responses\"\nwindow_magic = 1000000",
         );
-        assert!(error_message(&target_capability).contains("unknown field `context_window`"));
+        assert!(error_message(&target_capability).contains("unknown field `window_magic`"));
 
         let unknown_algorithm = VALID_CONFIG.replace("type = \"noop\"", "type = \"imaginary\"");
         assert!(error_message(&unknown_algorithm).contains("unknown variant"));
@@ -3303,7 +6307,7 @@ confidence_threshold = 0.5
     fn video_declaration_requires_a_responses_client() -> RunnerResult<()> {
         let configured = VALID_CONFIG.replacen(
             "id = \"classifier/model\"",
-            "id = \"classifier/model\"\nvideo = true",
+            "id = \"classifier/model\"\nvideo = true\nvideo_carrier = \"both\"",
             1,
         );
         let message = match runner_from_toml(&configured) {
@@ -3342,7 +6346,7 @@ confidence_threshold = 0.5
         let configured = VALID_CONFIG
             .replacen(
                 "id = \"strong/model\"",
-                "id = \"strong/model\"\nvideo = true",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"both\"",
                 1,
             )
             .replacen(
@@ -3356,6 +6360,201 @@ confidence_threshold = 0.5
             .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
         let capabilities = route.capabilities();
         assert_eq!(capabilities.video, Some(true));
+        Ok(())
+    }
+
+    /// A video declaration must say which carrier it serves.
+    ///
+    /// Without it the manifest cannot express the one distinction that matters: the free
+    /// Nemotron endpoint answers an inline video and 404s a URL, and `video = true` alone
+    /// would admit the request that then fails at the provider.
+    #[test]
+    fn a_video_target_must_state_its_carrier() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"strong/model\"",
+            "id = \"strong/model\"\nvideo = true",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "video without a carrier was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("no video_carrier"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// An image carrier is a narrowing of a medium the target must first claim.
+    #[test]
+    fn an_image_carrier_needs_a_vision_claim() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "id = \"strong/model\"",
+            "id = \"strong/model\"\nimage_carrier = \"inline\"",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "carrier without vision was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("image_carrier without vision"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A carrier on a route that claims no medium is an inert field, so the load refuses it.
+    #[test]
+    fn a_carrier_without_its_medium_is_refused() -> RunnerResult<()> {
+        let configured = VALID_CONFIG.replacen(
+            "targets = [\"strong\", \"weak\"]",
+            "targets = [\"strong\", \"weak\"]\nvideo_carrier = \"inline\"",
+            1,
+        );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("inert carrier was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("video_carrier without video = true"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// "Both" is two promises, and a route that advertises it needs targets for each half.
+    ///
+    /// The previous shape of this check accepted any claim while one target served *a*
+    /// carrier, so a route advertising both over an inline-only target still told callers a
+    /// remote URL would work. Every half of the claim is now required separately.
+    #[test]
+    fn a_route_advertising_both_carriers_needs_both_served() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("unserved carrier was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Both") && message.contains("Remote"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A target that refuses the medium does not serve any of its carriers.
+    ///
+    /// The carrier field defaults to "both" when absent, so reading it without first asking
+    /// whether the target admits the medium at all would let a vision-refusing target keep a
+    /// route's vision promise alive.
+    #[test]
+    fn a_target_refusing_the_medium_serves_no_carrier() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvision = true\nimage_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "id = \"weak/model\"",
+                "id = \"weak/model\"\nvision = false",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvision = true",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => return Err(RunnerError::configuration("refusing target was accepted")),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Both"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// A route may not promise a carrier no target of that route serves.
+    ///
+    /// This is the carrier counterpart of "video = true with no video target": the promise
+    /// would be advertised and then refused at request time. Both targets here are narrowed,
+    /// so a route asking for the other carrier has nothing behind it.
+    #[test]
+    fn a_route_may_not_promise_a_carrier_no_target_serves() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "id = \"weak/model\"",
+                "id = \"weak/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true\nvideo_carrier = \"remote\"",
+                1,
+            );
+        let message = match runner_from_toml(&configured) {
+            Ok(_) => {
+                return Err(RunnerError::configuration(
+                    "unsupported carrier was accepted",
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("carrier Remote") && message.contains("no target serves"),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    /// The same manifest is accepted once the route asks only for the carrier its targets
+    /// serve, which is the case this change exists to make expressible.
+    #[test]
+    fn an_inline_carrier_is_accepted_when_a_target_serves_it() -> RunnerResult<()> {
+        let configured = VALID_CONFIG
+            .replacen(
+                "id = \"strong/model\"",
+                "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            )
+            .replacen(
+                "targets = [\"strong\", \"weak\"]",
+                "targets = [\"strong\", \"weak\"]\nvideo = true\nvideo_carrier = \"inline\"",
+                1,
+            );
+        let runner = runner_from_toml(&configured)?;
+        let route = runner
+            .route("switchyard/random")
+            .ok_or_else(|| RunnerError::configuration("random route is missing"))?;
+        let capabilities = route.capabilities();
+        assert_eq!(capabilities.video, Some(true));
+        assert_eq!(capabilities.video_carrier, Some(MediaCarrier::Inline));
         Ok(())
     }
 
@@ -3384,7 +6583,7 @@ confidence_threshold = 0.5
             VALID_CONFIG
                 .replacen(
                     "id = \"strong/model\"",
-                    "id = \"strong/model\"\nvideo = true",
+                    "id = \"strong/model\"\nvideo = true\nvideo_carrier = \"both\"",
                     1
                 )
                 .replacen(
@@ -3420,10 +6619,14 @@ confidence_threshold = 0.5
             client,
             &target.extra_body,
             &target.omit_body_fields,
+            &target.unsupported_reasoning_effort,
             None,
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
+            None,
+            None,
         )?;
 
         assert_eq!(
@@ -3462,10 +6665,14 @@ confidence_threshold = 0.5
             client,
             &target.extra_body,
             &target.omit_body_fields,
+            &target.unsupported_reasoning_effort,
             None,
             None,
             ReasoningDialect::default(),
             target.cooldown_group.clone(),
+            None,
+            None,
+            None,
         )?;
 
         assert!(backend.omit_body_fields().contains("max_output_tokens"));
@@ -3488,9 +6695,13 @@ confidence_threshold = 0.5
                 &config,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 None,
                 None,
                 ReasoningDialect::default(),
+                None,
+                None,
+                None,
                 None,
             );
             if expected == Some(0) {
@@ -3821,6 +7032,69 @@ advisor_target = "advisor"
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
     }
+
+    /// A route may narrow what may spend its terminal leg without changing anything else.
+    ///
+    /// The policy is a statement about money, so it has to be loadable on exactly the route
+    /// that needs it and nowhere else: the default stays the historical capacity rule.
+    const JUDGE_CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[llm_clients.neutral]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.gemma]
+id = "google/gemma-4-26b"
+llm_client = "google"
+free_tier = true
+
+[targets.luna]
+id = "openai/luna-nt"
+llm_client = "neutral"
+
+[routes.judge]
+id = "smart-judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+terminal_fallback = ["luna"]
+terminal_policy = "quota_only"
+"#;
+
+    #[test]
+    fn a_quota_only_terminal_policy_loads_on_its_own_route() -> RunnerResult<()> {
+        let runner = runner_from_toml(JUDGE_CONFIG)?;
+        assert!(runner.route("smart-judge").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_policy_without_a_terminal_leg_is_refused() {
+        let invalid = JUDGE_CONFIG.replace(
+            "terminal_fallback = [\"luna\"]\nterminal_policy = \"quota_only\"",
+            "terminal_policy = \"quota_only\"",
+        );
+        let message = error_message(&invalid);
+        assert!(
+            message.contains("terminal_policy but no terminal_fallback"),
+            "the refusal names the two declarations: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_terminal_policy_is_refused() {
+        let invalid = JUDGE_CONFIG.replace("quota_only", "cheapest");
+        let message = error_message(&invalid);
+        assert!(
+            message.contains("unknown variant `cheapest`"),
+            "a policy must be one of the declared ones: {message}"
+        );
+    }
 }
 
 /// Closure controls for the production-path fixes in whole-route composition.
@@ -3908,5 +7182,1500 @@ mod composition_closure_tests {
                 "{class:?} must not cross routes"
             );
         }
+    }
+
+    // ---- Per-minute windows -------------------------------------------------
+
+    fn paced_config(extra: &str) -> DeploymentConfig {
+        // Self-contained: this module only needs one client for the window checks, and a
+        // shared fixture would make these assertions depend on unrelated route wiring.
+        toml::from_str(&format!(
+            "schema_version = 1\n\
+             [llm_clients.primary]\nformat = \"openai_chat\"\n\
+             base_url = \"https://example.test/v1\"\n\
+             [routes.noop]\nid = \"switchyard/noop\"\ntype = \"noop\"\n\
+             {extra}"
+        ))
+        .expect("the paced fixture parses")
+    }
+
+    /// A minute budget with no per-request ceiling, or a ceiling above the whole minute,
+    /// can never serve its largest admissible request, so both are refused at load rather
+    /// than discovered as a 429 under traffic.
+    #[test]
+    fn a_minute_window_must_contain_the_per_request_ceiling() {
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a token window without a ceiling is unfalsifiable");
+        assert!(
+            error.to_string().contains("without max_input_tokens"),
+            "{error}"
+        );
+
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n\
+             max_input_tokens = 20000\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a ceiling above the window can never be served");
+        assert!(error.to_string().contains("above"), "{error}");
+
+        paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\ninput_tokens_per_minute = 16000\n\
+             max_input_tokens = 16000\n",
+        )
+        .validate_minute_windows()
+        .expect("a ceiling at or below the window is accepted");
+    }
+
+    /// A zero window admits nothing, and one window serves every target that names the same
+    /// physical model in one quota group, so both mistakes are caught at load.
+    #[test]
+    fn minute_windows_reject_zero_and_disagreeing_declarations() {
+        let error = paced_config(
+            "[targets.paced]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 0\n",
+        )
+        .validate_minute_windows()
+        .expect_err("a zero window admits nothing");
+        assert!(error.to_string().contains("zero"), "{error}");
+
+        let error = paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 30\n",
+        )
+        .validate_minute_windows()
+        .expect_err("one window cannot have two limits");
+        assert!(
+            error.to_string().contains("one window serves them both"),
+            "{error}"
+        );
+
+        paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n",
+        )
+        .validate_minute_windows()
+        .expect("the same value stated twice is one declaration");
+    }
+
+    /// A different physical model keeps a separate window even on one credential.
+    #[test]
+    fn a_different_model_is_a_separate_window() {
+        paced_config(
+            "[targets.first]\nid = \"google/gemma-4-26b-a4b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 15\n\
+             [targets.second]\nid = \"google/gemma-4-31b-it\"\nllm_client = \"primary\"\n\
+             requests_per_minute = 30\n",
+        )
+        .validate_minute_windows()
+        .expect("per-model windows are independent");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch A: the remaining Google chat models, and the order of a free lane
+// ---------------------------------------------------------------------------
+
+/// A Gemini free-tier deployment carrying every Google chat target, plus the two paid NT
+/// legs the live `smart-nt` route actually falls back to.
+///
+/// The paid targets are present on purpose. A fixture with free legs only cannot say anything
+/// about whether a free leg precedes a paid one, which is the property that had to change.
+/// No credential is declared: these tests exercise ordering, capability declaration and
+/// tariff facts, and a client that reads no environment keeps the suite hermetic.
+#[cfg(test)]
+mod batch_a_tests {
+    use super::*;
+
+    const MANIFEST: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "__STATE_DIR__"
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+locality = "external"
+quota_group = "google-ai-studio-free"
+max_retries = 0
+
+[llm_clients.openai_nt]
+format = "openai_responses"
+base_url = "https://api.openai.test/v1"
+
+[llm_clients.deepseek_nt]
+format = "openai_responses"
+base_url = "https://api.deepseek.test/v1"
+
+[targets."direct-google-gemini-3.5-flash-lite"]
+id = "gemini-3.5-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 500
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.1-flash-lite"]
+id = "gemini-3.1-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 500
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 15
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.6-flash"]
+id = "gemini-3.6-flash"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-3.8-flash"]
+id = "gemini-3.8-flash"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-4-hydrogen"]
+id = "gemini-4-hydrogen"
+llm_client = "google"
+vision = false
+video = false
+daily_request_limit = 20
+context_window = 1048576
+max_input_tokens = 250000
+free_tier = true
+requests_per_minute = 5
+input_tokens_per_minute = 250000
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemini-2.5-flash-lite"]
+id = "gemini-2.5-flash-lite"
+llm_client = "google"
+vision = false
+video = false
+free_tier = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+held = "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21)."
+
+[targets."direct-google-gemini-3-flash"]
+id = "gemini-3-flash-preview"
+llm_client = "google"
+vision = false
+video = false
+free_tier = true
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+min_output_tokens = 600
+
+[targets."direct-google-gemma-4-26b-a4b-it"]
+id = "gemma-4-26b-a4b-it"
+llm_client = "google"
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 1300
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets."direct-google-gemma-4-31b-it"]
+id = "gemma-4-31b-it"
+llm_client = "google"
+vision = false
+video = false
+context_window = 262144
+max_input_tokens = 12307
+daily_request_limit = 14400
+free_tier = true
+accepts_reasoning_control = false
+hosted_reasoning = "thought_tag"
+min_output_tokens = 512
+requests_per_minute = 30
+input_tokens_per_minute = 16000
+admission_margin_permille = 1300
+omit_body_fields = ["store", "metadata", "prompt_cache_key"]
+unsupported_reasoning_effort = ["none"]
+
+[targets.openai-gpt-6-luna-nt]
+id = "gpt-6-luna"
+llm_client = "openai_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[targets.deepseek-deepseek-flash-nt]
+id = "deepseek-flash"
+llm_client = "deepseek_nt"
+vision = true
+reasoning_policy = "disabled"
+reasoning_dialect = "openai_effort"
+
+[routes."direct-google-gemini-3.5-flash-lite"]
+id = "direct-google-gemini-3.5-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.1-flash-lite"]
+id = "direct-google-gemini-3.1-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-3.1-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.6-flash"]
+id = "direct-google-gemini-3.6-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.6-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-3.8-flash"]
+id = "direct-google-gemini-3.8-flash"
+type = "passthrough"
+target = "direct-google-gemini-3.8-flash"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-4-hydrogen"]
+id = "direct-google-gemini-4-hydrogen"
+type = "passthrough"
+target = "direct-google-gemini-4-hydrogen"
+candidates = []
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes."direct-google-gemini-2.5-flash-lite"]
+id = "direct-google-gemini-2.5-flash-lite"
+type = "passthrough"
+target = "direct-google-gemini-2.5-flash-lite"
+candidates = []
+context_window = 1048576
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemini-3-flash"]
+id = "direct-google-gemini-3-flash"
+type = "passthrough"
+target = "direct-google-gemini-3-flash"
+candidates = []
+context_window = 1048576
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemma-4-26b-a4b-it"]
+id = "direct-google-gemma-4-26b-a4b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-26b-a4b-it"
+candidates = []
+context_window = 262144
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes."direct-google-gemma-4-31b-it"]
+id = "direct-google-gemma-4-31b-it"
+type = "passthrough"
+target = "direct-google-gemma-4-31b-it"
+candidates = []
+context_window = 262144
+tool_calling = false
+reasoning = false
+vision = false
+video = false
+
+[routes.smart_gemini]
+id = "smart_gemini"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-4-hydrogen",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+]
+selection = "measured"
+context_window = 1048576
+tool_calling = true
+reasoning = true
+vision = false
+video = false
+
+[routes.smart-nt]
+id = "smart-nt"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-3.1-flash-lite",
+    "direct-google-gemini-3.6-flash",
+    "direct-google-gemini-3.8-flash",
+    "direct-google-gemini-4-hydrogen",
+    "direct-google-gemma-4-26b-a4b-it",
+    "direct-google-gemma-4-31b-it",
+    "openai-gpt-6-luna-nt",
+    "deepseek-deepseek-flash-nt",
+]
+selection = "measured"
+context_window = 262144
+tool_calling = true
+reasoning = true
+vision = true
+video = false
+
+# Mirrors the live pool shape: a held target named as an inner candidate. Nothing about
+# this route should change except that the dead leg is never offered.
+[routes.pool_with_held]
+id = "switchyard/pool-with-held"
+type = "passthrough"
+target = "direct-google-gemini-3.5-flash-lite"
+candidates = [
+    "direct-google-gemini-2.5-flash-lite",
+    "direct-google-gemini-3.1-flash-lite",
+]
+selection = "measured"
+"#;
+
+    /// The provider's sentence, repeated from the manifest so the assertions compare the
+    /// refusal a caller would actually see rather than a second hand-written copy.
+    const HELD_2_5_REASON: &str = "Google answers HTTP 404: this model is no longer available to new users, and directs callers to models/gemini-3.5-flash-lite (measured 2026-11-21).";
+
+    /// The fixture with `dir` as its allowance state directory.
+    ///
+    /// A load probes an EXISTING state directory by writing and removing a file in it, so
+    /// parallel tests must not share a directory that exists: two probes racing is reported
+    /// as an unusable quota directory. An absent directory is not created by a load at all.
+    fn fixture(dir: &str) -> String {
+        MANIFEST.replace("__STATE_DIR__", dir)
+    }
+
+    /// Loading a deployment must not create its accounting state.
+    ///
+    /// A deployment preflight runs this same loader, usually as root. Creating the quota
+    /// directory at load left a root-owned directory under a unit that runs as its own
+    /// account, and that lane's first call then failed with a permission error reported as an
+    /// unavailable budget. Creation belongs to the process that spends.
+    #[test]
+    fn loading_a_deployment_creates_no_quota_state() {
+        let dir = format!(
+            "/tmp/switchyard-quota-load-side-effect-{}",
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let _runner = Runner::from_toml(&fixture(&dir)).expect("a fresh state directory loads");
+
+        assert!(
+            !std::path::Path::new(&dir).exists(),
+            "a load must leave no accounting state: a root-run validation would own it"
+        );
+    }
+
+    /// An EXISTING state directory this process cannot write is a configuration error at
+    /// load, naming the path, rather than a refused leg at the first request.
+    #[test]
+    fn loading_refuses_a_state_directory_this_process_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = format!("/tmp/switchyard-quota-readonly-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the state directory");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make it read-only");
+
+        let root = std::fs::write(std::path::Path::new(&dir).join(".root-probe"), b"x").is_ok();
+        let loaded = Runner::from_toml(&fixture(&dir));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore so the directory can be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+        if root {
+            assert!(
+                loaded.is_ok(),
+                "root can write it, so there is nothing to refuse"
+            );
+            return;
+        }
+        let error = match loaded {
+            Ok(_) => panic!("an unwritable state directory is refused at load"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(&dir),
+            "the refusal must name the directory: {error}"
+        );
+    }
+
+    fn runner() -> Runner {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = format!("/tmp/switchyard-quota-batch-a-{n}");
+        Runner::from_toml(&fixture(&dir)).expect("the fixture deployment loads")
+    }
+
+    fn parsed() -> DeploymentConfig {
+        toml::from_str(&fixture("/tmp/switchyard-quota-batch-a-parse"))
+            .expect("the fixture parses as a deployment config")
+    }
+
+    fn ordered_ids(route: &Route) -> Vec<String> {
+        route
+            .models()
+            .all_models()
+            .iter()
+            .map(|model| model.as_str().to_owned())
+            .collect()
+    }
+
+    /// Every Google chat target the owner's dossier names is loadable in one deployment, and
+    /// the two held records are catalogued without claiming a capability they cannot serve.
+    #[test]
+    fn every_google_chat_target_loads_in_one_deployment() {
+        let runner = runner();
+
+        for (name, model) in [
+            (
+                "direct-google-gemini-3.5-flash-lite",
+                "gemini-3.5-flash-lite",
+            ),
+            (
+                "direct-google-gemini-3.1-flash-lite",
+                "gemini-3.1-flash-lite",
+            ),
+            ("direct-google-gemini-3.6-flash", "gemini-3.6-flash"),
+            ("direct-google-gemini-3.8-flash", "gemini-3.8-flash"),
+            ("direct-google-gemini-4-hydrogen", "gemini-4-hydrogen"),
+            // The catalogued id is the preview name; the route name is the stable one.
+            ("direct-google-gemini-3-flash", "gemini-3-flash-preview"),
+            ("direct-google-gemma-4-26b-a4b-it", "gemma-4-26b-a4b-it"),
+            ("direct-google-gemma-4-31b-it", "gemma-4-31b-it"),
+        ] {
+            let Some(route) = runner.route(name) else {
+                panic!("{name} route is missing from the deployment")
+            };
+            assert_eq!(
+                route.first_target_slug(),
+                model,
+                "{name} must resolve to its model id"
+            );
+        }
+
+        for serving in [
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+        ] {
+            let capabilities = runner.route_capabilities(serving).expect("capabilities");
+            assert_eq!(
+                capabilities.tool_calling,
+                Some(true),
+                "{serving} must advertise tool_calling"
+            );
+            assert_eq!(
+                capabilities.reasoning,
+                Some(true),
+                "{serving} must advertise reasoning"
+            );
+        }
+
+        for held in [
+            "direct-google-gemini-2.5-flash-lite",
+            "direct-google-gemini-3-flash",
+        ] {
+            let capabilities = runner.route_capabilities(held).expect("capabilities");
+            assert_ne!(
+                capabilities.tool_calling,
+                Some(true),
+                "{held} is a catalogue record and must not claim tool_calling"
+            );
+            assert_ne!(
+                capabilities.reasoning,
+                Some(true),
+                "{held} is a catalogue record and must not claim reasoning"
+            );
+        }
+
+        // Only the withdrawn 2.5 record is held out of service. The 3-flash record is a
+        // catalogue entry for a model that does answer, so it must stay advertised: holding
+        // it would take a working alias out of the catalogue for the wrong reason.
+        let withheld = runner
+            .route("direct-google-gemini-2.5-flash-lite")
+            .expect("the held route keeps its registration");
+        assert_eq!(
+            withheld.held_reason(),
+            Some(HELD_2_5_REASON),
+            "the hold must carry the provider's evidence, not a placeholder"
+        );
+        assert!(
+            withheld.models().all_models().is_empty(),
+            "a held route must offer no candidate"
+        );
+        assert_eq!(
+            runner
+                .route("direct-google-gemini-3-flash")
+                .expect("3-flash route exists")
+                .held_reason(),
+            None,
+            "3-flash serves and must not be held"
+        );
+        let advertised: Vec<&str> = runner
+            .advertised_models()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(
+            !advertised.contains(&"direct-google-gemini-2.5-flash-lite"),
+            "a held route must not be advertised: {advertised:?}"
+        );
+        assert!(
+            advertised.contains(&"direct-google-gemini-3-flash"),
+            "a serving route must stay advertised: {advertised:?}"
+        );
+    }
+
+    /// The declared order is the whole point: eight free Gemini legs, then the two paid NT
+    /// legs. Selection may demote a free leg on measurement, but the tariff is part of the
+    /// sort key, so no paid leg can be ordered ahead of an eligible free one.
+    #[test]
+    fn smart_nt_declares_eight_free_legs_before_the_paid_fallbacks() {
+        let runner = runner();
+        let route = runner.route("smart-nt").expect("smart-nt exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-4-hydrogen",
+                "gemma-4-26b-a4b-it",
+                "gemma-4-31b-it",
+                "gpt-6-luna",
+                "deepseek-flash",
+            ],
+            "smart-nt must declare every free Gemini leg before the paid NT legs"
+        );
+
+        // The tariff is a per-target fact (`free_tier`), not the `:free` slug convention that
+        // `all_targets_free` reads, so the structural claim is asserted on the declarations.
+        let config = parsed();
+        for free in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert!(
+                config.targets[free].free_tier == Some(true),
+                "{free} must be declared free, or selection may order a paid leg ahead of it"
+            );
+        }
+        for paid in ["openai-gpt-6-luna-nt", "deepseek-deepseek-flash-nt"] {
+            assert!(
+                config.targets[paid].free_tier != Some(true),
+                "{paid} is metered and must stay behind the free tier"
+            );
+        }
+    }
+
+    /// `smart_gemini` is the same pool without the paid fallbacks, so it is genuinely free
+    /// end to end and can be offered where spending a paid call is not acceptable.
+    #[test]
+    fn smart_gemini_carries_every_gemini_leg_and_no_paid_leg() {
+        let runner = runner();
+        let route = runner.route("smart_gemini").expect("smart_gemini exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-4-hydrogen",
+                "gemma-4-26b-a4b-it",
+                "gemma-4-31b-it",
+            ]
+        );
+        // Every leg is in the free allowance, so this alias never spends a paid call.
+        let config = parsed();
+        for free in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert!(
+                config.targets[free].free_tier == Some(true),
+                "{free} must be declared free"
+            );
+        }
+    }
+
+    /// A held leg inside a measured pool is never offered, and the pool keeps serving.
+    ///
+    /// This is the live shape: `smart_gemini` and `smart-nt` name a target in their candidate
+    /// list that the provider has since withdrawn. Removing it from the declared list would
+    /// hide the measurement; leaving it in without a hold would spend one dispatch per request
+    /// on a 404. Filtering at load is the third option, and the one asserted here.
+    #[test]
+    fn a_held_leg_leaves_a_measured_pool_without_emptying_it() {
+        let runner = runner();
+        let route = runner
+            .route("switchyard/pool-with-held")
+            .expect("the pool exists");
+
+        assert_eq!(
+            ordered_ids(route),
+            vec![
+                "gemini-3.5-flash-lite".to_string(),
+                "gemini-3.1-flash-lite".to_string()
+            ],
+            "the held leg must be absent and the declared order otherwise preserved"
+        );
+        assert_eq!(
+            route.held_reason(),
+            None,
+            "a pool with live legs is not itself held"
+        );
+    }
+
+    /// The output floor is declared where it was measured, and nowhere else.
+    ///
+    /// `gemini-3-flash-preview` answered HTTP 500 with an empty completion at an 8-token
+    /// reservation and normally at 600, so 600 is the smallest reservation observed to work
+    /// and is the one declared. The Gemma pair keeps its own measured 512. Every other free
+    /// leg declares no floor: adding one there would refuse requests that currently succeed,
+    /// which no measurement supports.
+    #[test]
+    fn the_output_floor_is_declared_where_it_was_measured() {
+        let config = parsed();
+        assert_eq!(
+            config.targets["direct-google-gemini-3-flash"].min_output_tokens,
+            Some(600),
+            "3-flash needs the measured reservation, or an 8-token call becomes a 500"
+        );
+        for gemma in [
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            assert_eq!(
+                config.targets[gemma].min_output_tokens,
+                Some(512),
+                "{gemma}'s measured floor must survive untouched"
+            );
+        }
+        for unmeasured in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+        ] {
+            assert_eq!(
+                config.targets[unmeasured].min_output_tokens, None,
+                "{unmeasured} has no measured floor; inventing one would refuse working requests"
+            );
+        }
+    }
+
+    /// A held model serves nothing, so it declares no budget at all: zero is refused at load
+    /// ("must be at least 1"), and a fabricated limit would claim an allowance nobody metered.
+    #[test]
+    fn held_models_declare_no_daily_budget_and_serve_nothing() {
+        let config = parsed();
+
+        for held in [
+            "direct-google-gemini-2.5-flash-lite",
+            "direct-google-gemini-3-flash",
+        ] {
+            let target = config
+                .targets
+                .get(held)
+                .expect("the held record is catalogued");
+            assert_eq!(
+                target.daily_request_limit, None,
+                "{held} must not declare a daily budget"
+            );
+        }
+
+        for serving in [
+            "direct-google-gemini-3.5-flash-lite",
+            "direct-google-gemini-3.1-flash-lite",
+            "direct-google-gemini-3.6-flash",
+            "direct-google-gemini-3.8-flash",
+            "direct-google-gemini-4-hydrogen",
+            "direct-google-gemma-4-26b-a4b-it",
+            "direct-google-gemma-4-31b-it",
+        ] {
+            let target = config
+                .targets
+                .get(serving)
+                .expect("the serving target is declared");
+            assert!(
+                target.daily_request_limit.is_some_and(|limit| limit >= 1),
+                "{serving} must declare a real daily budget"
+            );
+            assert!(
+                target.free_tier == Some(true),
+                "{serving} is served inside a free allowance"
+            );
+        }
+    }
+
+    /// The measured provider refusal is a declaration, not a code branch, so it has to be on
+    /// every Google target: a no-thinking consumer sends `none` and the provider answers 400.
+    #[test]
+    fn the_refused_effort_value_is_declared_on_every_google_target() {
+        let config = parsed();
+        let none = BTreeSet::from(["none".to_string()]);
+
+        for name in config
+            .targets
+            .keys()
+            .filter(|name| name.starts_with("direct-google-"))
+        {
+            assert_eq!(
+                config.targets[name].unsupported_reasoning_effort, none,
+                "{name} must declare that its provider refuses effort `none`"
+            );
+            assert_eq!(
+                config.targets[name].omit_body_fields,
+                BTreeSet::from([
+                    "metadata".to_string(),
+                    "prompt_cache_key".to_string(),
+                    "store".to_string(),
+                ]),
+                "{name} must drop the Responses-only fields Google rejects"
+            );
+        }
+
+        // A target on a wire that accepts `none` keeps every value, so the declaration is
+        // scoped to the provider that needs it rather than applied fleet-wide.
+        assert!(
+            config.targets["openai-gpt-6-luna-nt"]
+                .unsupported_reasoning_effort
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod fit_escalation_config_tests {
+    use super::*;
+
+    /// Loads a deployment that must be refused, returning the refusal text.
+    ///
+    /// Matched rather than unwrapped because `Runner` has no `Debug`; a successful load panics
+    /// instead of being reported as a refusal.
+    fn refuse(source: &str) -> String {
+        match runner_from_toml(source) {
+            Ok(_) => panic!("deployment loaded but should have been refused"),
+            Err(error) => format!("{error}"),
+        }
+    }
+
+    /// A deployment whose route opts into fit escalation but declares no wider tier refuses to
+    /// load. The option promises a request its pool cannot hold will still be answered, and
+    /// without a terminal leg there is nothing that could answer it.
+    #[test]
+    fn fit_escalation_without_a_terminal_leg_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.judge]
+id = "judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+fit_escalation = true
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("fit_escalation"),
+            "refusal must name the option, got: {message}"
+        );
+        assert!(
+            message.contains("terminal_fallback"),
+            "refusal must name the missing declaration, got: {message}"
+        );
+    }
+
+    /// The same route with one declared tier loads. This is the control for the refusal above:
+    /// the guard must bite on the missing declaration, not on the option itself.
+    #[test]
+    fn fit_escalation_with_a_terminal_leg_loads() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[targets.wider]
+id = "wider/model"
+llm_client = "google"
+
+[routes.judge]
+id = "judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+terminal_fallback = [["wider"]]
+fit_escalation = true
+"#;
+        runner_from_toml(config).expect("a route with a wider tier may declare fit_escalation");
+    }
+
+    /// Declaring the option off is the pre-change behaviour and must not require a tier.
+    #[test]
+    fn fit_escalation_off_does_not_require_a_tier() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.judge]
+id = "judge"
+type = "passthrough"
+target = "gemma"
+candidates = []
+fit_escalation = false
+"#;
+        runner_from_toml(config).expect("fit_escalation = false is the default behaviour");
+    }
+
+    /// The capability axis refuses the same unfillable promise: a route that says a wire
+    /// refusal will still be answered must name the group that would answer it.
+    #[test]
+    fn capability_escalation_without_a_terminal_leg_refuses_the_deployment() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+capability_escalation = true
+"#;
+        let message = refuse(config);
+        assert!(
+            message.contains("capability_escalation"),
+            "refusal must name the option, got: {message}"
+        );
+        assert!(
+            message.contains("terminal_fallback"),
+            "refusal must name the missing declaration, got: {message}"
+        );
+    }
+
+    /// Control for the refusal above: the guard bites on the missing declaration, not on the
+    /// option.
+    #[test]
+    fn capability_escalation_with_a_terminal_leg_loads() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[targets.portable]
+id = "portable/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+terminal_fallback = [["portable"]]
+capability_escalation = true
+"#;
+        runner_from_toml(config).expect("a route with a later group may declare the option");
+    }
+
+    /// Off is the default and needs no tier, exactly as the fit axis does. This is the
+    /// invariant that keeps the option from widening any existing route at load.
+    #[test]
+    fn capability_escalation_off_does_not_require_a_tier() {
+        let config = r#"
+schema_version = 1
+
+[llm_clients.google]
+format = "openai_chat"
+base_url = "https://provider.test/v1"
+
+[targets.gemma]
+id = "gemma/model"
+llm_client = "google"
+
+[routes.smart-route]
+id = "smart-route"
+type = "passthrough"
+target = "gemma"
+candidates = []
+capability_escalation = false
+"#;
+        runner_from_toml(config).expect("capability_escalation = false is the default behaviour");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daily quota scope: one counter per account, or one per model
+// ---------------------------------------------------------------------------
+
+/// Two free models drawing on one provider account.
+///
+/// The account scope exists because the OpenRouter free-model allowance is stated once per
+/// account (`free_model_daily_requests: 1000`), so a per-model counter would hand the fleet
+/// one 1000-request budget per model and the fleet could spend several times the real cap
+/// before any counter refused it.
+#[cfg(test)]
+mod daily_quota_scope_tests {
+    use super::*;
+
+    const SHARED_ACCOUNT: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "/var/tmp/switchyard-quota-scope-fixture"
+
+[llm_clients.openrouter_free]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+
+[targets."free-a"]
+id = "vendor/free-a"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[routes."free"]
+id = "free"
+type = "passthrough"
+target = "free-a"
+candidates = ["free-b"]
+"#;
+
+    fn shared_account_config() -> DeploymentConfig {
+        toml::from_str(SHARED_ACCOUNT).expect("the fixture must parse")
+    }
+
+    /// Every model in an account-scoped group resolves to the one sentinel counter, at one
+    /// path, on the client's declared clock. A regression that keyed by target id would
+    /// give each model its own budget while the manifest still read `quota_scope = "account"`.
+    #[test]
+    fn account_scope_collapses_every_model_onto_one_counter() {
+        let config = shared_account_config();
+        let state_dir = std::path::Path::new("/var/tmp/switchyard-quota-scope-fixture");
+        let group = "openrouter-free-owner";
+
+        let (model_a, path_a, boundary_a) =
+            config.quota_counter(&config.targets["free-a"], group, state_dir);
+        let (model_b, path_b, boundary_b) =
+            config.quota_counter(&config.targets["free-b"], group, state_dir);
+
+        assert_eq!(
+            model_a.as_str(),
+            switchyard_llm_client::ACCOUNT_SCOPE_MODEL,
+            "an account-scoped target must count against the account sentinel"
+        );
+        assert_eq!(model_a, model_b, "two models, one account counter");
+        assert_eq!(path_a, path_b, "one counter means one file");
+        assert_eq!(
+            boundary_a,
+            switchyard_llm_client::DayBoundary::Utc,
+            "the OpenRouter free-model counter turns over at midnight UTC"
+        );
+        assert_eq!(boundary_a, boundary_b);
+    }
+
+    /// One counter cannot serve two budgets: two targets on the same account counter that
+    /// declare different limits are refused, and the refusal names both targets and both
+    /// numbers so the operator can decide which one is meant.
+    #[test]
+    fn differing_limits_on_one_account_counter_refuse_the_deployment() {
+        let source = SHARED_ACCOUNT.replace(
+            "id = \"vendor/free-b\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000",
+            "id = \"vendor/free-b\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 250",
+        );
+        assert!(
+            source.contains("daily_request_limit = 250"),
+            "the fixture edit must apply, or this test proves nothing"
+        );
+
+        let message = match runner_from_toml(&source) {
+            Ok(_) => panic!("a shared counter with two different limits must be refused"),
+            Err(error) => format!("{error}"),
+        };
+
+        assert!(
+            message.contains("free-a") && message.contains("free-b"),
+            "the refusal must name both targets, got: {message}"
+        );
+        assert!(
+            message.contains("1000") && message.contains("250"),
+            "the refusal must name both limits, got: {message}"
+        );
+        assert!(
+            message.contains("one counter serves one budget"),
+            "the refusal must say why it is refused, got: {message}"
+        );
+    }
+
+    /// The default is per model: a client that names no scope keeps a counter per target,
+    /// so declaring a daily limit today cannot silently change meaning.
+    #[test]
+    fn a_client_naming_no_scope_keeps_one_counter_per_model() {
+        let source = SHARED_ACCOUNT
+            .replace("quota_scope = \"account\"\n", "")
+            .replace("quota_reset = \"utc\"\n", "");
+        let config: DeploymentConfig = toml::from_str(&source).expect("the fixture must parse");
+        let state_dir = std::path::Path::new("/var/tmp/switchyard-quota-scope-fixture");
+        let group = "openrouter-free-owner";
+
+        let (model_a, path_a, boundary_a) =
+            config.quota_counter(&config.targets["free-a"], group, state_dir);
+        let (model_b, path_b, _) =
+            config.quota_counter(&config.targets["free-b"], group, state_dir);
+
+        assert_eq!(model_a.as_str(), "vendor/free-a");
+        assert_eq!(model_b.as_str(), "vendor/free-b");
+        assert_ne!(path_a, path_b, "per-model counters are separate files");
+        assert_eq!(
+            boundary_a,
+            switchyard_llm_client::DayBoundary::Pacific,
+            "Pacific stays the default boundary"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quota_provider_tests {
+    use super::*;
+
+    const BASE: &str = r#"
+schema_version = 1
+
+[quota]
+state_dir = "/var/tmp/switchyard-quota-provider-fixture"
+
+[llm_clients.openrouter_free]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-a"]
+id = "vendor/free-a"
+llm_client = "openrouter_free"
+daily_request_limit = 1000
+
+[routes."free"]
+id = "free"
+type = "passthrough"
+target = "free-a"
+"#;
+
+    fn config() -> DeploymentConfig {
+        toml::from_str(BASE).expect("the fixture must parse")
+    }
+
+    /// A state directory no other test can touch. The shared fixture path is used by the
+    /// other tests in this module, and a counter directory is mutable state: two tests
+    /// pointing at one path race over the same files regardless of what they assert.
+    fn unique_state_dir(name: &str) -> String {
+        let dir = std::path::PathBuf::from("/var/tmp").join(format!(
+            "switchyard-quota-binding-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("the fixture state dir must exist");
+        dir.display().to_string()
+    }
+
+    /// Every target that shares an account counter resolves to that one counter, and the
+    /// deployment refuses to build when a declared budget cannot be attached.
+    ///
+    /// The failure this guards is silent by construction: a consumer that derives a different
+    /// key gets `None`, which is indistinguishable from "declares no budget". Measured live on
+    /// 2026-11-26 -- two served free requests left `spent` at 0 and the counter untouched --
+    /// because only the target that created the counter entry could reach it.
+    #[test]
+    fn every_target_sharing_an_account_counter_resolves_to_it() {
+        let state_dir = unique_state_dir("shared-counter");
+        let mut shared = BASE.replace("/var/tmp/switchyard-quota-provider-fixture", &state_dir);
+        for (name, slug) in [
+            ("free-b", "vendor/free-b"),
+            ("free-c", "vendor/free-c"),
+            ("free-d", "vendor/free-d"),
+        ] {
+            shared.push_str(&format!(
+                "\n[targets.\"{name}\"]\nid = \"{slug}\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000\n"
+            ));
+        }
+        let config: DeploymentConfig = toml::from_str(&shared).expect("the fixture must parse");
+        let allowances = config.build_allowances().expect("the fixture must build");
+        let group = "openrouter-free-owner";
+        // Exactly one counter for the account, whatever the number of targets on it.
+        assert_eq!(
+            allowances.keys().filter(|(g, _)| g == group).count(),
+            1,
+            "one account budget is one counter, keys were {:?}",
+            allowances
+                .keys()
+                .map(|(g, m)| (g.as_str(), m.as_str()))
+                .collect::<Vec<_>>()
+        );
+        // Every target, first and subsequent, resolves to that same object.
+        let canonical = allowances
+            .iter()
+            .find(|((g, _), _)| g == group)
+            .map(|(_, allowance)| Arc::clone(allowance))
+            .expect("the account counter exists");
+        for name in ["free-a", "free-b", "free-c", "free-d"] {
+            let target = &config.targets[name];
+            let key = config.allowance_key(target, group);
+            let found = allowances.get(&key).unwrap_or_else(|| {
+                panic!("{name} must resolve its declared allowance, looked up as {key:?}")
+            });
+            assert!(
+                Arc::ptr_eq(found, &canonical),
+                "{name} must share the account's one counter, not a copy of it"
+            );
+            assert_eq!(found.path(), canonical.path(), "{name} counter path");
+        }
+    }
+
+    /// A target that declares a budget but cannot reach a counter is a load error, not a
+    /// silent unmetered target.
+    #[test]
+    fn a_declared_budget_that_cannot_be_attached_refuses_the_deployment() {
+        let state_dir = unique_state_dir("unattachable");
+        let mut source = BASE.replace("/var/tmp/switchyard-quota-provider-fixture", &state_dir);
+        // A second group on the same provider account is refused for its own reason; this
+        // fixture instead makes the allowance key unreachable by declaring the target's
+        // counter under a scope whose key the census cannot find.
+        source.push_str(
+            "\n[targets.\"stray\"]\nid = \"vendor/stray\"\nllm_client = \"openrouter_free\"\ndaily_request_limit = 1000\n",
+        );
+        let mut config: DeploymentConfig = toml::from_str(&source).expect("the fixture must parse");
+        let allowances = config
+            .build_allowances()
+            .expect("the honest fixture builds");
+        assert!(allowances.contains_key(
+            &config.allowance_key(&config.targets["stray"], "openrouter-free-owner")
+        ));
+        // Drop the counter the census needs and prove the gate names the target.
+        config.quota = None;
+        let error = config
+            .build_allowances()
+            .expect_err("a budget with no [quota] state_dir cannot be counted");
+        assert!(
+            error.to_string().contains("no [quota] state_dir"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The declared pool is read into the typed form, so the loader never carries a free
+    /// string that a reader might not implement.
+    #[test]
+    fn a_declared_pool_parses_and_names_the_providers_own_bucket() {
+        let config = config();
+        let client = &config.llm_clients["openrouter_free"];
+        let provider = client.quota_provider.expect("the pool must parse");
+        assert_eq!(provider, QuotaProvider::OpenRouterFreeModels);
+        assert_eq!(provider.pool(), "free_model_daily_requests");
+        assert_eq!(provider.reset(), QuotaReset::Utc);
+    }
+
+    /// A pool name the code does not implement is refused at load. Accepting it would
+    /// authorize a mapping that never produces a reading, which reads as configured and
+    /// admits on the local budget forever.
+    #[test]
+    fn an_unknown_pool_name_refuses_the_deployment() {
+        let source = BASE.replace(
+            "quota_provider = \"openrouter_free_models\"",
+            "quota_provider = \"some_other_pool\"",
+        );
+        assert!(source.contains("some_other_pool"), "the edit must apply");
+        assert!(
+            toml::from_str::<DeploymentConfig>(&source).is_err(),
+            "an unimplemented pool must not deserialize"
+        );
+    }
+
+    /// An account-wide pool cannot feed a per-model counter: one account figure spent as
+    /// though it were several budgets would refuse each model on the same number.
+    #[test]
+    fn a_pool_on_a_model_scoped_counter_refuses_the_deployment() {
+        let source = BASE.replace("quota_scope = \"account\"", "quota_scope = \"model\"");
+        assert!(
+            source.contains("quota_scope = \"model\""),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a model-scoped counter must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("quota_scope") && message.contains("openrouter_free_models"),
+            "the refusal must name the pool and the rule: {message}"
+        );
+    }
+
+    /// The counter must turn over on the pool's own clock. An OpenRouter reading counted on
+    /// the Pacific boundary lands in the wrong day for eight hours a night.
+    #[test]
+    fn a_pool_on_the_wrong_reset_clock_refuses_the_deployment() {
+        let source = BASE.replace("quota_reset = \"utc\"", "quota_reset = \"pacific\"");
+        assert!(
+            source.contains("quota_reset = \"pacific\""),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a counter on the wrong clock must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("quota_reset") && message.contains("utc"),
+            "the refusal must name the clock the pool requires: {message}"
+        );
+    }
+
+    /// A pool named for a client whose targets declare no daily limit has nowhere to write,
+    /// so the mapping would read as configured while doing nothing.
+    #[test]
+    fn a_pool_without_a_counter_refuses_the_deployment() {
+        let source = BASE.replace("daily_request_limit = 1000\n", "");
+        assert!(
+            !source.contains("daily_request_limit"),
+            "the edit must apply"
+        );
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("a pool with no counter must be refused");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("daily_request_limit"),
+            "the refusal must say what is missing: {message}"
+        );
+    }
+
+    /// Two clients naming one pool must resolve to one counter. With different groups they
+    /// get two, both fed the same account figure, and each admits the full reported
+    /// remainder -- the account is spent twice over with nothing to detect it.
+    #[test]
+    fn two_groups_on_one_provider_account_are_refused() {
+        let second = r#"
+[llm_clients.openrouter_free_second]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-second"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free_second"
+daily_request_limit = 1000
+"#;
+        let source = format!("{BASE}\n{second}");
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let refusal = config
+            .validate_quota_providers()
+            .expect_err("two counters on one account must not be reconciled");
+        let message = refusal.to_string();
+        assert!(
+            message.contains("openrouter_free_models")
+                && message.contains("openrouter-free-owner")
+                && message.contains("openrouter-free-second"),
+            "the refusal must name the pool and both groups: {message}"
+        );
+    }
+
+    /// A second client on the same group is the same counter, which is the shape a second
+    /// credential for one account must use.
+    #[test]
+    fn a_second_client_on_the_same_group_shares_one_counter() {
+        let second = r#"
+[llm_clients.openrouter_free_second]
+format = "openai_chat"
+base_url = "https://openrouter.test/api/v1"
+quota_group = "openrouter-free-owner"
+quota_scope = "account"
+quota_reset = "utc"
+quota_provider = "openrouter_free_models"
+
+[targets."free-b"]
+id = "vendor/free-b"
+llm_client = "openrouter_free_second"
+daily_request_limit = 1000
+"#;
+        let source = format!("{BASE}\n{second}");
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        config
+            .validate_quota_providers()
+            .expect("one account may be read by more than one credential label");
+    }
+
+    /// The valid shape passes, so the three refusals above are about the rule and not about
+    /// the fixture being invalid in every direction.
+    #[test]
+    fn a_valid_pool_mapping_is_accepted() {
+        config()
+            .validate_quota_providers()
+            .expect("the documented shape must be accepted");
+    }
+
+    /// The facts carry the resolved group and the pool, so a consumer outside the route path
+    /// can find the counter without repeating the loader's defaults.
+    #[test]
+    fn the_facts_carry_the_group_and_the_pool() {
+        let config = config();
+        let facts = config.deployment_facts();
+        let client = &facts.clients["openrouter_free"];
+        assert_eq!(client.quota_group.as_deref(), Some("openrouter-free-owner"));
+        assert_eq!(
+            client.quota_provider,
+            Some(QuotaProvider::OpenRouterFreeModels)
+        );
+
+        // A client that names no group is its own group, so a consumer never has to
+        // reproduce that default.
+        let source = BASE.replace("quota_group = \"openrouter-free-owner\"\n", "")
+            + "\n[llm_clients.other]\nformat = \"openai_chat\"\nbase_url = \"https://x.test/v1\"\n";
+        let config: DeploymentConfig = toml::from_str(&source).expect("it parses");
+        let facts = config.deployment_facts();
+        assert_eq!(facts.clients["other"].quota_group.as_deref(), Some("other"));
+        assert_eq!(facts.clients["other"].quota_provider, None);
     }
 }

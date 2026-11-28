@@ -368,6 +368,29 @@ impl SwitchyardRuntime {
                     }));
                     events.extend(token_usage_metrics("answer", &call, metadata));
                 }
+                // Why a candidate was never called is invisible in per-call marks: those
+                // exist only for calls that happened. The selection record is emitted on
+                // every exit path, including a refusal that contacted no provider.
+                RunObservation::Selection(trace) => {
+                    let mut skipped = Map::new();
+                    for candidate in &trace.candidates {
+                        if let Some(code) = candidate.exclusion {
+                            skipped.insert(candidate.model.clone(), Json::String(code.into()));
+                        }
+                    }
+                    events.push(RoutingEvent::Mark(RoutingMark {
+                        name: "switchyard.routing.selection".into(),
+                        data: json!({
+                            "outcome": trace.outcome,
+                            "served": trace.served,
+                            "dispatched": trace.dispatched,
+                            "considered": trace.considered,
+                            "skipped": Json::Object(skipped),
+                        }),
+                        metadata: metadata.clone(),
+                        severity: Some(LogSeverity::Debug),
+                    }));
+                }
                 RunObservation::ContextPressurePromotion {
                     promoted,
                     estimated_input_tokens,
@@ -1326,6 +1349,9 @@ mod tests {
                         input_tokens: Some(4),
                         ..Usage::default()
                     }),
+                    outcome: None,
+                    reason: None,
+                    scope: None,
                 }),
                 RunObservation::RoutingOverhead(std::time::Duration::from_millis(3)),
             ],
@@ -1422,6 +1448,9 @@ mod tests {
                 cost: None,
                 cost_currency: None,
             }),
+            outcome: None,
+            reason: None,
+            scope: None,
         };
 
         let routing = token_usage_metrics("routing", &call, &json!({"session_id": "session"}));
@@ -1478,6 +1507,9 @@ mod tests {
                     is_success: false,
                     duration: std::time::Duration::from_millis(2),
                     usage: None,
+                    outcome: None,
+                    reason: None,
+                    scope: None,
                 }),
                 RunObservation::AnswerCall(LlmCallObservation {
                     selected_model: ModelId::from("strong-target"),
@@ -1487,6 +1519,9 @@ mod tests {
                         output_tokens: Some(9),
                         ..Usage::default()
                     }),
+                    outcome: None,
+                    reason: None,
+                    scope: None,
                 }),
             ],
             &json!({}),

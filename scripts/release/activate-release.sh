@@ -37,6 +37,9 @@
 #       Re-check a stored release's bytes, and the live files when it is CURRENT.
 #   list
 #       Show stored releases, their ages and which is CURRENT / LAST-KNOWN-GOOD.
+#   env-files
+#       Show the environment files the unit declares, in read order, with a hash of
+#       each. Refuses rather than guessing when the unit cannot be resolved.
 #
 # EXIT CODES
 #   0  ok
@@ -63,11 +66,25 @@ METRICS_URL=${METRICS_URL:-http://127.0.0.1:4000/metrics}
 HEALTH_CMD=${HEALTH_CMD:-}
 RESTART_CMD=${RESTART_CMD:-systemctl restart "$UNIT"}
 HEALTH_ATTEMPTS=${HEALTH_ATTEMPTS:-80}
-# The two environment files the unit reads. Their CONTENTS are never copied: the
+# The environment files the unit reads. Their CONTENTS are never copied: the
 # release records a hash so the configuration is identifiable without the secret
 # leaving its file.
-ENV_FILE_1=${ENV_FILE_1:-/etc/switchyard/secrets/providers.env}
-ENV_FILE_2=${ENV_FILE_2:-/var/lib/switchyard/oauth/switchyard-openai.env}
+#
+# The UNIT is the authority for which files those are, not this script. A release
+# is validated under the environment the service will get, so a credential added
+# as a drop-in -- a third EnvironmentFile, a fourth -- needs no change here. A
+# hand-maintained list drifts the moment that happens, and it drifts silently: the
+# missing file is only noticed when a variable from it is required, at which point
+# the candidate is refused for a reason that names the variable and not the cause.
+#
+# There is deliberately no built-in fallback list. A host whose unit cannot be
+# queried is a host where this script cannot say what environment the service gets,
+# and validating under a guess is worse than refusing: two files that happen to be
+# named here would pass a candidate that the service then fails to start. ENV_FILES
+# names the set explicitly for such a host and for the tests, and is the only way to
+# override discovery.
+ENV_FILES=${ENV_FILES:-}
+SYSTEMCTL=${SYSTEMCTL:-systemctl}
 MANIFEST_GROUP=${MANIFEST_GROUP:-switchyard}
 RELEASE_ROOT=${RELEASE_ROOT:-/var/lib/switchyard/releases}
 RETAIN=${RETAIN:-5}
@@ -77,6 +94,85 @@ CAPABILITY_TOOL=${CAPABILITY_TOOL:-$SELF_DIR/capability_contract.py}
 
 say() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
+
+# --------------------------------------------------------------------- serialisation
+#
+# Every verb that reads the release store and then moves CURRENT or LAST-KNOWN-GOOD
+# takes this lock FIRST, and the state it reasons about -- which release is CURRENT,
+# which rollback target exists, whether the release id is already stored, what the
+# unit's environment files currently are -- is read AFTER the lock is held.
+#
+# That read-under-lock is the compare-and-swap. Without it two writers each take a
+# snapshot of the same pre-state, each believe they own the rollback target, and the
+# later failure path restores over the release the other just activated. The window
+# is not theoretical: a deploy validates, installs, restarts, waits for health and
+# then verifies, so it holds the store open for seconds to minutes.
+#
+# A plain flock on a file inside the release store, deliberately. No daemon and no
+# unit, because a lock that needs its own service is a new critical path; and the
+# kernel drops it when the process dies, so a killed deployment cannot wedge the
+# store. The refusal names the holder, so a stuck lock is diagnosable rather than
+# indistinguishable from a slow validation.
+#
+# Two properties the lock is only worth anything without, and how they are kept:
+#
+#   * The inode must be stable and belong to the writer's own trust domain. A lock
+#     file that anyone may delete can be removed and recreated, and the contender
+#     then locks a DIFFERENT inode while the holder sleeps on the old one -- both
+#     proceed, which is worse than no lock because it looks protected. So the file
+#     is created once, never removed, and its owner and mode are checked: the store
+#     is root-owned in production, so a non-root owner here means the store itself
+#     has been compromised and the refusal says so instead of locking it anyway.
+#
+#   * The descriptor must not leak into children. `flock` is held per open file
+#     description, and a fork/exec shares it, so a child that outlives this script
+#     would hold the lock after the deploy returned. Children get it closed.
+RELEASE_LOCK_TIMEOUT=${RELEASE_LOCK_TIMEOUT:-900}
+RELEASE_LOCK_FD=9
+hold_release_lock() {
+  local lock=$RELEASE_ROOT/.release.lock owner mode
+  mkdir -p "$RELEASE_ROOT" || die "cannot create the release store at $RELEASE_ROOT"
+  command -v flock >/dev/null 2>&1 \
+    || die "flock is not installed, so concurrent release operations cannot be serialised; install util-linux"
+  # Created if absent and never unlinked by this script: O_APPEND to an existing
+  # inode is what makes the lock addressable by more than one writer.
+  exec 9>>"$lock" || die "cannot open the release lock at $lock"
+  # Read back what we actually locked, rather than trusting the path. Ownership is
+  # only asserted when this process is root: an unprivileged run against a sandbox
+  # store legitimately owns its own lock, and inventing a refusal there would make
+  # the acceptance suite test the wrong thing.
+  owner=$(stat -c '%u' "$lock" 2>/dev/null || echo "?")
+  mode=$(stat -c '%a' "$lock" 2>/dev/null || echo "?")
+  if [ "$(id -u)" = "0" ] && [ "$owner" != "0" ]; then
+    die "the release lock $lock is owned by uid $owner, not root; a lock file that another account can delete or replace cannot serialise writers, so the release store is not safe to use (expected root-owned, found mode $mode)"
+  fi
+  # A group- or world-writable lock file can be replaced between writers, so it
+  # cannot serialise them. Only asserted as root: an unprivileged run against a
+  # sandbox store legitimately owns its own lock, and inventing a refusal there
+  # would make the acceptance suite test the wrong thing.
+  if [ "$(id -u)" = "0" ] && [ "$mode" != "?" ]; then
+    local group_bits other_bits
+    group_bits=$(( (8#$mode / 8) % 8 ))
+    other_bits=$(( 8#$mode % 8 ))
+    if [ $(( group_bits & 2 )) -ne 0 ] || [ $(( other_bits & 2 )) -ne 0 ]; then
+      die "the release lock $lock is mode $mode; a group- or world-writable lock file can be replaced between writers, so it cannot serialise them (expected root-owned 0644 or 0600)"
+    fi
+  fi
+  if ! flock -w "$RELEASE_LOCK_TIMEOUT" 9; then
+    local holder
+    holder=$(cat "$lock" 2>/dev/null || true)
+    die "another release operation (pid ${holder:-unknown}) has held $lock for more than ${RELEASE_LOCK_TIMEOUT}s; refusing to act on the release store concurrently (raise RELEASE_LOCK_TIMEOUT if that operation is expected to be slow)"
+  fi
+  # The inode must still be the one we locked. If it was unlinked and recreated
+  # between open and flock, the lock we hold is on a file no later contender will
+  # ever open, and continuing would run unprotected while appearing serialised.
+  if [ "$(stat -c '%i' "$lock" 2>/dev/null || echo ?)" != "$(stat -Lc '%i' /proc/$$/fd/9 2>/dev/null || echo !)" ]; then
+    die "the release lock $lock was replaced while it was being acquired (its inode no longer matches the descriptor this process holds); refusing to act on a store whose lock can be swapped under a holder"
+  fi
+  # Written under the lock, so the next contender's refusal names the real holder
+  # rather than whoever released it last.
+  printf '%s\n' "$$" > "$lock" 2>/dev/null || true
+}
 
 healthy() {
   if [ -n "$HEALTH_CMD" ]; then
@@ -155,7 +251,7 @@ activate_release() {
   install_pair "$dir/switchyard-server" "$want_bin" "$dir/routes.toml" "$want_man" \
     || return 1
   say "restarting $UNIT onto $id"
-  eval "$RESTART_CMD" >/dev/null 2>&1 || say "restart command reported failure"
+  ( eval "$RESTART_CMD" ) 9>&- >/dev/null 2>&1 || say "restart command reported failure"
   wait_healthy || return 1
   [ "$(sha "$LIVE_BIN")" = "$want_bin" ] || { say "live binary is not $id"; return 1; }
   [ "$(sha "$LIVE_MANIFEST")" = "$want_man" ] || { say "live manifest is not $id"; return 1; }
@@ -210,17 +306,128 @@ release_id() {
     "$(printf '%s' "$1" | cut -c1-16)" "$(printf '%s' "$2" | cut -c1-8)"
 }
 
+# One resolved file per line, as "<required|optional>\t<path>": exactly the
+# EnvironmentFiles systemd hands the process, in the order it reads them.
+#
+# Order is load-bearing, not cosmetic. When two files declare the same variable the
+# later one wins, both for systemd and for the validator (which merges them in the
+# same order), so the list is preserved rather than sorted or deduplicated.
+#
+# The marker is kept because it is a fact about the unit, not decoration:
+# ignore_errors=no means systemd refuses to start when the file is absent, so a
+# deployment that cannot read that file would be validating an environment the
+# service will never have.
+#
+# Two output shapes have to be read. systemd >= 247 prints one
+# "PATH (ignore_errors=no)" per file; older releases print every path on a single
+# line. A path containing a space is quoted and is taken whole: word splitting
+# there would hand the validator half a path, which it would then find missing.
+#
+# Returns non-zero when the unit cannot be asked, answers with nothing, or emits
+# something this parser cannot read. It never substitutes a default; see the note
+# above ENV_FILES.
+environment_files() {
+  local raw line path rest flag emitted=0
+  if [ -n "$ENV_FILES" ]; then
+    for path in $ENV_FILES; do
+      printf 'required\t%s\n' "$path"
+      emitted=$((emitted + 1))
+    done
+    [ "$emitted" -gt 0 ] || return 1
+    return 0
+  fi
+  if ! raw=$("$SYSTEMCTL" show -p EnvironmentFiles --value "$UNIT" 2>/dev/null); then
+    return 1
+  fi
+  [ -n "$raw" ] || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    flag=required
+    case $line in
+      *"(ignore_errors=yes)"*) flag=optional ;;
+    esac
+    line=${line%% (ignore_errors=*}
+    while [ -n "$line" ]; do
+      line=${line#"${line%%[![:space:]]*}"}
+      [ -n "$line" ] || break
+      case $line in
+        \"*)
+          path=${line#\"}
+          case $path in
+            *\"*) ;;
+            *) return 1 ;;
+          esac
+          rest=${path#*\"}
+          path=${path%%\"*}
+          line=$rest
+          ;;
+        *)
+          path=${line%%[[:space:]]*}
+          line=${line#"$path"}
+          ;;
+      esac
+      case $path in
+        "") ;;
+        /*)
+          printf '%s\t%s\n' "$flag" "$path"
+          emitted=$((emitted + 1))
+          ;;
+      esac
+    done
+  done <<< "$raw"
+  [ "$emitted" -gt 0 ]
+}
+
+# The resolved set, in read order, as two parallel arrays. Every caller is about to
+# make a claim -- "this candidate loads under the service's environment", "this
+# record names the configuration" -- that a partial or guessed set would make false,
+# so anything short of the unit's own answer is fatal here rather than later.
+ENV_FLAGS=()
+ENV_PATHS=()
+resolve_environment_files() {
+  local listing flag path i
+  if ! listing=$(environment_files); then
+    die "cannot resolve the EnvironmentFiles of $UNIT: systemd was not asked, or the unit declares none. Refusing to validate a candidate under an environment the service will not get. Set ENV_FILES only if you know the set the unit runs with."
+  fi
+  ENV_FLAGS=()
+  ENV_PATHS=()
+  while IFS=$'\t' read -r flag path; do
+    [ -n "$path" ] || continue
+    ENV_FLAGS+=("$flag")
+    ENV_PATHS+=("$path")
+  done <<< "$listing"
+  if [ "${#ENV_PATHS[@]}" -eq 0 ]; then
+    die "resolved no environment files for $UNIT; refusing to validate under an empty environment"
+  fi
+  for i in "${!ENV_PATHS[@]}"; do
+    if [ -f "${ENV_PATHS[$i]}" ]; then
+      continue
+    fi
+    if [ "${ENV_FLAGS[$i]}" = optional ]; then
+      say "note: ${ENV_PATHS[$i]} is declared optional and absent; systemd skips it"
+      continue
+    fi
+    die "the unit declares ${ENV_PATHS[$i]} but it is missing: systemd would refuse to start $UNIT, so no candidate can be validated under the service's real environment"
+  done
+}
+
 # Records the release being replaced and installation, without the secret. A hash
 # identifies a configuration; the file keeps the secret.
 env_identity_json() {
-  local path out="" entry
-  for path in "$ENV_FILE_1" "$ENV_FILE_2"; do
+  local path out="" entry i required
+  [ "${#ENV_PATHS[@]}" -gt 0 ] \
+    || die "no environment files resolved; refusing to write a release record that names none"
+  for i in "${!ENV_PATHS[@]}"; do
+    path=${ENV_PATHS[$i]}
+    required=true
+    [ "${ENV_FLAGS[$i]}" = optional ] && required=false
     if [ -f "$path" ]; then
-      entry=$(printf '{"path":"%s","sha256":"%s","bytes":%s,"mode":"%s","owner":"%s","group":"%s"}' \
-        "$path" "$(sha "$path")" "$(stat -c %s "$path")" "$(stat -c %a "$path")" \
+      entry=$(printf '{"path":"%s","required":%s,"sha256":"%s","bytes":%s,"mode":"%s","owner":"%s","group":"%s"}' \
+        "$path" "$required" \
+        "$(sha "$path")" "$(stat -c %s "$path")" "$(stat -c %a "$path")" \
         "$(stat -c %U "$path")" "$(stat -c %G "$path")")
     else
-      entry=$(printf '{"path":"%s","present":false}' "$path")
+      entry=$(printf '{"path":"%s","required":false,"present":false}' "$path")
     fi
     out=${out:+$out,}$entry
   done
@@ -335,6 +542,9 @@ adopt_release() {
   local label=$1 commit=$2 branch=$3 dirty=$4 basis=$5 caps=$6
   [ -f "$LIVE_BIN" ] || die "no live binary at $LIVE_BIN"
   [ -f "$LIVE_MANIFEST" ] || die "no live manifest at $LIVE_MANIFEST"
+  # Adopt writes the only two pointers this host has, so it is a writer like any other.
+  hold_release_lock
+  resolve_environment_files
   local b_sha m_sha id dir
   b_sha=$(sha "$LIVE_BIN")
   m_sha=$(sha "$LIVE_MANIFEST")
@@ -431,22 +641,39 @@ list_release_ids() {
 #      before they reach a log, and its full output goes to a 0600 file under the
 #      release root for the operator, not to the terminal.
 validate_candidate() {
-  local binary=$1 manifest=$2 log=$3
+  local binary=$1 manifest=$2 log=$3 path i
+  local -a env_args=()
+  for i in "${!ENV_PATHS[@]}"; do
+    path=${ENV_PATHS[$i]}
+    # A declared-optional file that is absent was already skipped during
+    # resolution; anything still listed here is a file systemd will read.
+    [ -f "$path" ] || continue
+    env_args+=(--env-file "$path")
+  done
+  # Never validate under a guessed environment. Resolution has already refused the
+  # cases it could not read; an empty list here means every declared file is
+  # optional and absent, which is a real (if unusual) unit environment, so it is
+  # reported rather than turned into a refusal for the candidate's innocence.
+  [ "${#env_args[@]}" -gt 0 ] \
+    || say "note: no environment file is readable for $UNIT; validating with an empty environment"
   if [ -n "$VALIDATE_CMD" ]; then
     # Testing seam: the real check would need a working binary and real keys. The
     # override runs with the same parsed environment so an injected failure still
     # exercises the same path.
+    # The validator executes the candidate binary. It is trusted, but it is not the
+    # lock holder, so fd 9 is closed for it: a child that inherited the descriptor
+    # would keep the release lock held past the deploy's own exit.
     "$VALIDATOR" --binary "$binary" --manifest "$manifest" \
-      --env-file "$ENV_FILE_1" --env-file "$ENV_FILE_2" \
-      --command "$VALIDATE_CMD" --log "$log"
+      ${env_args[@]+"${env_args[@]}"} \
+      --command "$VALIDATE_CMD" --log "$log" 9>&-
     return
   fi
   "$VALIDATOR" --binary "$binary" --manifest "$manifest" \
-    --env-file "$ENV_FILE_1" --env-file "$ENV_FILE_2" --log "$log"
+    ${env_args[@]+"${env_args[@]}"} --log "$log" 9>&-
 }
 
 capability_gate() {
-  local binary=$1 caps=$2 baseline=$3
+  local binary=$1 caps=$2 baseline=$3 approvals=${4:-}
 
   # Once a release line has a baseline, the gate is part of deploying to it: a
   # candidate that arrives without its own manifest cannot be compared, and
@@ -473,8 +700,18 @@ capability_gate() {
     return 1
   fi
   [ -f "$caps" ] || { say "capability manifest $caps not found"; return 1; }
-  python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
-    --baseline "$baseline"
+  # An approval is not a bypass: it names the family and the reason, and the tool
+  # still refuses any removal that is not in the file. Without a file every
+  # removal is unapproved, which is the default.
+  if [ -n "$approvals" ]; then
+    [ -f "$approvals" ] || { say "capability approvals $approvals not found"; return 1; }
+    say "approvals: $approvals"
+    python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
+      --baseline "$baseline" --approvals "$approvals"
+  else
+    python3 "$CAPABILITY_TOOL" preflight --binary "$binary" --manifest "$caps" \
+      --baseline "$baseline"
+  fi
 }
 
 post_verify() {
@@ -493,11 +730,12 @@ post_verify() {
 # ---------------------------------------------------------------------- deploy
 cmd_deploy() {
   local m_src="" m_want="" b_src="" b_want="" label="" caps="" commit="" branch="" dirty=false
-  local basis="build-session" promote=0
+  local cap_approvals="" basis="build-session" promote=0
   while [ $# -gt 0 ]; do
     case $1 in
       --label) label=$2; shift 2 ;;
       --capabilities) caps=$2; shift 2 ;;
+      --capability-approvals) cap_approvals=$2; shift 2 ;;
       --source-commit) commit=$2; shift 2 ;;
       --source-branch) branch=$2; shift 2 ;;
       --source-dirty) dirty=true; shift ;;
@@ -514,12 +752,46 @@ cmd_deploy() {
         shift ;;
     esac
   done
+  # --command is a unit-test seam in release_validate.py. It skips the
+  # production P9 preflight, so never allow an inherited VALIDATE_CMD to make
+  # a real deployment appear qualified. Sandbox release roots remain usable.
+  if [ -n "$VALIDATE_CMD" ]; then
+    case "$RELEASE_ROOT" in
+      /var/lib/switchyard/releases|/var/lib/switchyard/releases/*)
+        die "VALIDATE_CMD test seam is forbidden for the production release store" ;;
+    esac
+  fi
   [ -n "$b_want" ] || die "usage: $0 deploy <manifest> <manifest-sha> <binary> <binary-sha>"
   [ -f "$m_src" ] || die "missing manifest $m_src"
   [ -f "$b_src" ] || die "missing binary $b_src"
   [ "$(sha "$m_src")" = "$m_want" ] || die "manifest hash mismatch"
   [ "$(sha "$b_src")" = "$b_want" ] || die "binary hash mismatch"
   say "artefacts match the approved hashes"
+
+  # Everything below reads or writes the release store, the live pair or the unit's
+  # environment, so it runs inside the lock. Taken before the reads, not before the
+  # argument checks: a malformed invocation should fail instantly rather than wait
+  # out the timeout to be told its hashes are wrong.
+  hold_release_lock
+
+  # The hashes checked above were checked OUTSIDE the lock, so they say what the
+  # candidate files held while this process was still waiting for the store. The
+  # candidate path is normally a staging directory under /var/tmp, which anyone can
+  # write, so that earlier comparison is a fast rejection, not a proof. Re-derive
+  # both digests now that the lock is held and the files are about to be installed:
+  # the bytes the deployment records must be the bytes it read while it was the only
+  # writer. This is the pinned-hash revalidation the store's integrity rests on.
+  [ "$(sha "$m_src")" = "$m_want" ] \
+    || die "the manifest at $m_src changed while this deployment waited for the release lock (expected $m_want); refusing to install bytes that were not the ones approved"
+  [ "$(sha "$b_src")" = "$b_want" ] \
+    || die "the binary at $b_src changed while this deployment waited for the release lock (expected $b_want); refusing to install bytes that were not the ones approved"
+  say "pinned artefact hashes re-verified under the release lock"
+
+  # What the service actually runs with. Resolved once, here, so the validation
+  # below and the release record further on cannot disagree about the set, and so a
+  # host whose unit cannot be read is refused before anything is touched.
+  resolve_environment_files
+  say "the unit reads ${#ENV_PATHS[@]} environment file(s)"
 
   # The rollback target must exist BEFORE anything is replaced. A deployment with
   # nowhere to go back to is the situation this whole change exists to remove.
@@ -548,7 +820,7 @@ cmd_deploy() {
   say "candidate validates"
 
   say "capability gate"
-  if ! capability_gate "$b_src" "$caps" "$prev_dir/capabilities.json"; then
+  if ! capability_gate "$b_src" "$caps" "$prev_dir/capabilities.json" "$cap_approvals"; then
     die "capability gate refused this candidate; production untouched"
   fi
 
@@ -588,7 +860,9 @@ cmd_deploy() {
   say "installing"
   install_pair "$b_src" "$b_want" "$m_src" "$m_want" || fail_and_rollback "could not install the candidate"
   say "restarting $UNIT"
-  eval "$RESTART_CMD" >/dev/null 2>&1 || fail_and_rollback "restart failed"
+  # fd 9 closed for the child: this is where a deployment could hand the release
+  # lock to a long-lived process by accident, and the one place it must not.
+  ( eval "$RESTART_CMD" ) 9>&- >/dev/null 2>&1 || fail_and_rollback "restart failed"
   wait_healthy || fail_and_rollback "health check failed after restart"
   say "health ok after restart"
   [ "$(sha "$LIVE_BIN")" = "$b_want" ] || fail_and_rollback "installed binary is not the candidate"
@@ -661,6 +935,7 @@ cmd_deploy() {
 # exited, possibly days later, with nothing in /var/tmp to rely on.
 cmd_rollback() {
   local target=${1:-} from_id from_dir
+  hold_release_lock
   from_id=$(link_target "$CURRENT_LINK")
   case $from_id in
     DANGLING:*) die "CURRENT points at ${from_id#DANGLING:} which is not a release" ;;
@@ -711,6 +986,7 @@ cmd_rollback() {
 
 cmd_promote() {
   local id=${1:-}
+  hold_release_lock
   if [ -z "$id" ]; then
     id=$(link_target "$CURRENT_LINK")
     [ -n "$id" ] || die "no CURRENT release to promote"
@@ -774,6 +1050,25 @@ a release, so there is nothing to verify against a record it never had"
   return $rc
 }
 
+# What the unit reads, as this installer resolves it. No contents: the hash
+# identifies a file, and the whole point of the verb is to answer "will a
+# deployment validate under the same environment the service gets?" without
+# deploying anything.
+cmd_env_files() {
+  resolve_environment_files
+  local i path digest
+  printf '%s reads %d environment file(s), in read order:\n' "$UNIT" "${#ENV_PATHS[@]}"
+  for i in "${!ENV_PATHS[@]}"; do
+    path=${ENV_PATHS[$i]}
+    if [ -f "$path" ]; then
+      digest=$(sha "$path")
+    else
+      digest="(absent)"
+    fi
+    printf '  %-8s %s  %s\n' "${ENV_FLAGS[$i]}" "$digest" "$path"
+  done
+}
+
 cmd_list() {
   local cur lkg id created bin mark
   cur=$(link_target "$CURRENT_LINK")
@@ -801,7 +1096,9 @@ cmd_list() {
 RELEASE_VERIFIED=0
 
 usage() {
-  sed -n '1,40p' "${BASH_SOURCE[0]}" | sed -n '/^# VERBS/,/^# EXIT/p' | sed 's/^# \{0,1\}//'
+  # Bounded by the markers rather than by a line count: the verb list grows, and a
+  # fixed window silently truncates the last verb when it does.
+  sed -n '/^# VERBS/,/^# EXIT/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 verb=${1:-}
@@ -816,6 +1113,7 @@ case $verb in
   promote) shift; cmd_promote "$@" ;;
   verify) shift; cmd_verify "$@" ;;
   list) shift; cmd_list "$@" ;;
+  env-files) shift; cmd_env_files "$@" ;;
   adopt)
     shift
     label="" ; commit="" ; branch="" ; dirty=false ; basis="adopted-unattested" ; caps=""

@@ -1,0 +1,97 @@
+{
+  "subject": "local no-thinking leaf behind smart-judge's third tier",
+  "date": "2026-11-23",
+  "method": "bounded read-only inference calls against an already-running endpoint; no model loaded, unloaded or restarted, no configuration written, every call under a small token ceiling",
+  "surface": {
+    "label": "local Studio front",
+    "port": 8889,
+    "path": "/v1/chat/completions",
+    "build_info": "unsloth-studio/v0.1.917-beta",
+    "total_slots": 1,
+    "advertised_models": [
+      {
+        "id": "htpc/qwen3.5-9b",
+        "context_length": 114688
+      },
+      {
+        "id": "htpc/qwen3.5-9b-mtp",
+        "context_length": 81920
+      }
+    ],
+    "loaded_model_path": "Qwen3.5-9B-Q4_0",
+    "loaded_model_alias": "Qwen3.5-9B-Q4_0"
+  },
+  "model_identity": {
+    "requested_ids_observed": [
+      "Qwen3.5-9B-MTP",
+      "Qwen3.5-9B-Q4_0",
+      "htpc/qwen3.5-9b-mtp"
+    ],
+    "served_model_for_every_request": [
+      "Qwen3.5-9B-Q4_0"
+    ],
+    "finding": "the front accepts any of the requested ids and does not enforce identity; the response body names the loaded weights, so the manifest's id is a REQUESTED name and not proof that a separate variant is resident"
+  },
+  "reasoning_control": {
+    "dialect": "llama_cpp_enable_thinking",
+    "declared_policy": "disabled",
+    "wire_fragment": {
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "template_supports_enable_thinking": true,
+    "observations": {
+      "absent_arm": {
+        "finish_reason": "stop",
+        "content": "1,2,3,4,5",
+        "completion_tokens": 10
+      },
+      "false_arm_first": {
+        "finish_reason": "stop",
+        "content": "1,2,3,4,5",
+        "completion_tokens": 10
+      },
+      "false_arm_repeat": {
+        "finish_reason": "stop",
+        "content": "1,2,3,4,5",
+        "completion_tokens": 10
+      },
+      "true_arm": {
+        "finish_reason": "length",
+        "content": "The model used its whole output allowance of 64 tokens on reasoning and had none left for an answer.\n\nTo get past this:\n- Raise Max Tokens, so a thought and an answer both fit\n- Or lower the reasoning effort, or turn thinking off\n- Or ask for a smaller piece of the task at a time",
+        "completion_tokens": 64
+      }
+    },
+    "determinism": {
+      "false_arm_repeat_identical": true,
+      "absent_vs_false_differ": false,
+      "true_vs_false_differ": true
+    },
+    "finding": "at temperature 0 with a fixed seed, false twice is byte-identical, and false is identical to absent: the server's default is already no-thinking, so the declaration makes an implicit default explicit rather than overriding a thinking default. true differs from both and, under a 64-token ceiling, spends the whole allowance on reasoning and answers nothing",
+    "why_it_matters": "a verdict lane that inherited a thinking default would return an empty answer at the budget the judge can afford; this is the property the leaf exists for"
+  },
+  "tool_calling": {
+    "declared": true,
+    "probe": {
+      "finish_reason": "tool_calls",
+      "returned_tool_calls": true,
+      "content": null,
+      "completion_tokens": 26
+    },
+    "finding": "a function definition plus an invoking request produced a populated tool_calls array with finish_reason tool_calls and null content, so tool_calling = true is a measured fact on this surface rather than a model-card claim"
+  },
+  "media_admission": {
+    "vision": {
+      "declared": false,
+      "http": 400,
+      "provider_message": "Image provided but current GGUF model does not support vision."
+    },
+    "video": {
+      "declared": false,
+      "http": 400,
+      "provider_message": "Video provided but the current GGUF model cannot take video input. It needs an mmproj with video support, and ffmpeg/ffprobe installed."
+    },
+    "finding": "the provider refuses both media in its own words, naming the missing capability rather than failing obliquely, so vision = false and video = false are provider-confirmed and not inferred from the model metadata"
+  }
+}

@@ -750,12 +750,14 @@ fn random_state_with_retries(
     max_retries: u32,
 ) -> TestResult<ServerState> {
     let backend = Backend::OpenAiChat(HttpBackendConfig {
+        tool_signature_placeholder: None,
         base_url: base_url.to_string(),
         api_key: Some("test-key".to_string()),
         forward_auth: false,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         omit_body_fields: BTreeSet::new(),
+        unsupported_reasoning_effort: BTreeSet::new(),
         reasoning_effort: None,
         reasoning_policy: None,
         reasoning_dialect: ReasoningDialect::default(),
@@ -766,6 +768,9 @@ fn random_state_with_retries(
         attempt_timeout: None,
         stream_idle_timeout: None,
         requires_list_input: false,
+        allowance: None,
+        pacing: None,
+        hosted_reasoning: None,
     });
     let target_models = routes
         .iter()
@@ -3299,6 +3304,187 @@ target = "openai"
     Ok(())
 }
 
+/// A held model is refused locally, is not advertised, and never reaches an upstream.
+///
+/// The manifest points every target at an unusable address on purpose: if the refusal were
+/// reached after dispatch, the response would be a transport failure rather than the held
+/// status, so the asserted status is itself the evidence that nothing was called.
+#[tokio::test]
+async fn a_held_model_is_refused_before_any_upstream_call() -> TestResult {
+    const REASON: &str = "Google answers HTTP 404: this model is no longer available to new users.";
+    let toml = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "http://127.0.0.1:1/v1"
+
+[targets.live]
+id = "live/model"
+llm_client = "primary"
+
+[targets.retired]
+id = "retired/model"
+llm_client = "primary"
+held = "Google answers HTTP 404: this model is no longer available to new users."
+
+[routes.live]
+id = "switchyard/live"
+type = "passthrough"
+target = "live"
+
+[routes.held]
+id = "switchyard/held"
+type = "passthrough"
+target = "retired"
+"#;
+    let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(toml)?)?);
+
+    let catalogue = send(&app, "GET", "/v1/models", None).await?;
+    assert_eq!(catalogue.status, StatusCode::OK);
+    let pool = catalogue.json()?["model_pool"].clone();
+    assert_eq!(
+        pool,
+        json!(["switchyard/live"]),
+        "only the serving alias may be advertised"
+    );
+
+    let refused = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/held",
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+    )
+    .await?;
+    assert_eq!(
+        refused.status,
+        StatusCode::GONE,
+        "a held alias must be refused without a dispatch"
+    );
+    let body = refused.json()?;
+    assert_eq!(body["error"]["code"], "model_held");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("the error carries a message");
+    assert!(
+        message.contains(REASON),
+        "the refusal must quote the recorded evidence: {message}"
+    );
+    Ok(())
+}
+
+/// Fails if any key on a surface names a reasoning effort, which would be a claim that one
+/// was applied.
+fn assert_no_effort_claim(value: &Value, surface: &str) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                assert!(
+                    !key.contains("effort"),
+                    "{surface} claims a reasoning effort under {key}"
+                );
+                assert_no_effort_claim(child, surface);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_effort_claim(item, surface);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A deployment-injected effort the provider refuses must leave the wire, and nothing may
+/// report it as applied: not the upstream body, not the routing record, not the decision
+/// record, not the response. The caller did not ask for it, so the honest reading is "not
+/// sent", which is exactly what these surfaces are checked for.
+#[tokio::test]
+async fn a_stripped_injected_effort_is_not_reported_as_honoured_anywhere() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let directory = tempfile::tempdir()?;
+    let log_path = directory.path().join("routing.jsonl");
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{}"
+
+[targets.model]
+id = "model/a"
+llm_client = "upstream"
+reasoning_effort = "none"
+unsupported_reasoning_effort = ["none"]
+
+[routes.model]
+id = "switchyard/model"
+type = "passthrough"
+target = "model"
+"#,
+        upstream.base_url
+    ))?
+    .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let calls = upstream.calls.lock().await;
+    let body = calls
+        .first()
+        .ok_or("the upstream was never called")?
+        .clone();
+    drop(calls);
+    assert_eq!(
+        body.get("reasoning_effort"),
+        None,
+        "a refused effort must not reach the wire: {body}"
+    );
+    assert_eq!(
+        body.get("reasoning"),
+        None,
+        "a refused effort must not reach the wire nested either: {body}"
+    );
+    assert_no_effort_claim(&body, "the upstream request body");
+
+    let response_body = response.json()?;
+    assert_no_effort_claim(&response_body, "the response body");
+
+    let attempts = std::fs::read_to_string(&log_path)?;
+    for line in attempts.lines() {
+        assert_no_effort_claim(&serde_json::from_str(line)?, "the routing record");
+    }
+    let decisions = std::fs::read_to_string(log_path.with_extension("decisions.jsonl"))?;
+    let decision: Value = serde_json::from_str(
+        decisions
+            .lines()
+            .next()
+            .ok_or("the decision record was not written")?,
+    )?;
+    assert_eq!(decision["outcome"], "served");
+    assert_eq!(
+        decision["skipped"],
+        json!({}),
+        "an injected effort the provider refuses must not be reported as an exclusion: {decision}"
+    );
+    assert_no_effort_claim(&decision, "the decision record");
+    Ok(())
+}
+
 #[tokio::test]
 async fn routes_dispatch_and_discovery_endpoints_are_stable() -> TestResult {
     let (upstream, app) = test_app(&[
@@ -3690,6 +3876,70 @@ async fn video_and_audio_never_reach_the_upstream() -> TestResult {
     assert!(
         upstream.calls.lock().await.is_empty(),
         "no video or audio request may reach an incompatible upstream"
+    );
+    Ok(())
+}
+
+// A caller may spell video the Chat way on the Responses surface -- Turnstone's own
+// Responses client does. The provider accepts only `input_video` with a string
+// `video_url`, so ingress translates the spelling instead of refusing a request it can
+// carry. What must reach the upstream is the accepted shape, with the bytes intact.
+#[tokio::test]
+async fn the_chat_video_spelling_is_translated_before_the_responses_surface() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let base = format!("{}/buffered", upstream.base_url.trim_end_matches("/v1"));
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_responses"
+base_url = "{base}"
+[targets]
+shared = {{ id = "model/efficient", llm_client = "upstream", video = true, video_carrier = "inline" }}
+[routes]
+watcher = {{ id = "watcher", type = "passthrough", target = "shared", vision = true, video = true, video_carrier = "inline" }}
+"#,
+    ))?);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(json!({
+            "model": "watcher",
+            "input": [{"role": "user", "content": [
+                {"type": "text", "text": "watch"},
+                {"type": "video_url", "video_url": {
+                    "url": "data:video/mp4;base64,AAAA", "media_type": "video/mp4"
+                }}
+            ]}]
+        })),
+    )
+    .await?;
+    assert_ne!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "a translatable video part must not be refused: {:?}",
+        response.json().ok()
+    );
+
+    let calls = upstream.calls.lock().await;
+    assert_eq!(
+        calls.len(),
+        1,
+        "the request must reach the upstream exactly once"
+    );
+    let parts = calls[0]["input"][0]["content"]
+        .as_array()
+        .expect("upstream body should carry input content");
+    let video = parts
+        .iter()
+        .find(|part| part["type"] == "input_video")
+        .unwrap_or_else(|| panic!("no input_video part in {parts:?}"));
+    assert_eq!(video["video_url"], "data:video/mp4;base64,AAAA");
+    assert!(
+        video.get("video").is_none(),
+        "the object spelling is what the provider rejects: {video}"
     );
     Ok(())
 }

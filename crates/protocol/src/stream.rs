@@ -471,6 +471,7 @@ impl ResponseAccumulator {
         }
         for call in self.tool_calls.into_values() {
             content.push(ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: call.id.unwrap_or_default(),
                 name: call.name.unwrap_or_default(),
                 arguments: parse_tool_arguments(&call.arguments),
@@ -659,6 +660,7 @@ mod tests {
         assert_eq!(
             agg.outputs[0].content,
             vec![ContentBlock::ToolCall(ToolCall {
+                provider_state: None,
                 id: "call_1".to_string(),
                 name: "lookup".to_string(),
                 arguments: json!({"q": "rust"}),

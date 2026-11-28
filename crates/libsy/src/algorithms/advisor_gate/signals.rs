@@ -98,6 +98,7 @@ mod tests {
                         text: "running a tool".to_string(),
                     },
                     ContentBlock::ToolCall(ToolCall {
+                        provider_state: None,
                         id: "t1".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({}),

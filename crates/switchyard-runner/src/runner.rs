@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use libsy::RoutingOutcome;
 use serde_json::Value;
@@ -28,7 +29,7 @@ pub struct Runner {
     /// Decision lanes that compose child POLICY lanes rather than physical targets.
     /// A tier over families is preserved as a reference, so the child policies stay
     /// independently addressable and a child change is inherited rather than copied.
-    decision_lane_composition: BTreeMap<String, Vec<String>>,
+    decision_lane_composition: BTreeMap<String, crate::decision_executor::ComposedLane>,
     /// Ordered composites over complete child routes.
     composites: BTreeMap<String, crate::composition::CompositeSpec>,
     /// Declared capabilities of composite routes, which are policy promises rather than
@@ -36,6 +37,16 @@ pub struct Runner {
     composite_capabilities: BTreeMap<String, ModelCapabilities>,
     /// The configuration facts an economics surface needs, extracted at load.
     deployment_facts: crate::facts::DeploymentFacts,
+    /// Every daily request counter the deployment built, keyed by (quota group, counter).
+    ///
+    /// The routes each hold their own view of this map, filtered to the targets they serve.
+    /// The economics collector needs the unfiltered one: it writes provider readings into
+    /// counters by quota group, and a counter reached only through a route would be
+    /// invisible whenever that route was not the one being reconciled.
+    daily_allowances: std::collections::HashMap<
+        (String, ModelId),
+        Arc<switchyard_llm_client::DailyRequestAllowance>,
+    >,
 }
 
 /// One configured lane: its resolver and the kinds it serves.
@@ -48,10 +59,15 @@ pub struct Lane {
 }
 
 /// Borrowed model metadata returned while listing routes.
+#[derive(Clone, Copy)]
 pub struct ModelInfo<'a> {
     pub id: &'a ModelId,
     pub algorithm: &'a str,
     pub capabilities: ModelCapabilities,
+    /// The reasoning policy this route imposes, independent of what its target accepts.
+    pub reasoning_policy: crate::config::RouteReasoningPolicy,
+    /// Where this route's work is performed, as declared by its clients' billing.
+    pub locality: crate::route::Locality,
 }
 
 /// Fully resolved routing decision.
@@ -111,6 +127,7 @@ impl Runner {
             composites: BTreeMap::new(),
             composite_capabilities: BTreeMap::new(),
             deployment_facts: crate::facts::DeploymentFacts::default(),
+            daily_allowances: std::collections::HashMap::new(),
         }
     }
 
@@ -175,7 +192,29 @@ impl Runner {
             id,
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
+            reasoning_policy: route.route_reasoning_policy(),
+            locality: route.locality(),
         })
+    }
+
+    /// The routes a catalogue may advertise: every registered leaf except a held one.
+    ///
+    /// `models()` stays the full inventory, because diagnostics and economics want to see a
+    /// held target and the alias that still resolves to it. Advertising is the narrower
+    /// question: an entry here is a promise that a caller can get an answer from that name,
+    /// and a held route can only answer with a refusal. So the catalogue lists what serves,
+    /// while the declaration and its evidence stay readable everywhere else.
+    pub fn advertised_models(&self) -> impl Iterator<Item = ModelInfo<'_>> {
+        self.routes
+            .iter()
+            .filter(|(_, route)| route.held().is_none())
+            .map(|(id, route)| ModelInfo {
+                id,
+                algorithm: route.algorithm_name(),
+                capabilities: route.capabilities(),
+                reasoning_policy: route.route_reasoning_policy(),
+                locality: route.locality(),
+            })
     }
 
     /// Registers the configuration facts an economics surface needs.
@@ -187,6 +226,28 @@ impl Runner {
     /// Returns the configuration facts an economics surface needs.
     pub fn deployment_facts(&self) -> &crate::facts::DeploymentFacts {
         &self.deployment_facts
+    }
+
+    /// Every daily request counter this deployment built, keyed by quota group and counter.
+    pub fn daily_allowances(
+        &self,
+    ) -> &std::collections::HashMap<
+        (String, ModelId),
+        Arc<switchyard_llm_client::DailyRequestAllowance>,
+    > {
+        &self.daily_allowances
+    }
+
+    /// Registers the counters so a component outside the route path can reconcile them.
+    pub(crate) fn with_daily_allowance_registry(
+        mut self,
+        allowances: std::collections::HashMap<
+            (String, ModelId),
+            Arc<switchyard_llm_client::DailyRequestAllowance>,
+        >,
+    ) -> Self {
+        self.daily_allowances = allowances;
+        self
     }
 
     /// The URL unmatched requests may fall through to, when configured.
@@ -259,17 +320,37 @@ impl Runner {
         self
     }
 
-    /// Registers a decision lane that composes child POLICY lanes in order.
+    /// Registers a decision lane that composes child POLICY lanes in declared order.
     ///
     /// The child lanes are resolved in process through the same named-lane mechanism,
     /// so a tier inherits each child's candidate order, question-kind eligibility,
     /// failure policy and telemetry instead of a copied list of physical targets.
+    ///
+    /// This is the ordered form, kept as its own method because ordered selection is a
+    /// policy rather than an implementation detail: a lane that wants another one states
+    /// it through [`Runner::with_composed_decision_lane`].
     pub fn with_decision_lane_composition(
         mut self,
         name: impl Into<String>,
         children: Vec<String>,
     ) -> Self {
-        self.decision_lane_composition.insert(name.into(), children);
+        self.decision_lane_composition.insert(
+            name.into(),
+            crate::decision_executor::ComposedLane {
+                children,
+                selection: crate::decision_executor::LaneSelection::Ordered,
+            },
+        );
+        self
+    }
+
+    /// Registers a composed decision lane with an explicit selection policy.
+    pub fn with_composed_decision_lane(
+        mut self,
+        name: impl Into<String>,
+        lane: crate::decision_executor::ComposedLane,
+    ) -> Self {
+        self.decision_lane_composition.insert(name.into(), lane);
         self
     }
 
@@ -277,8 +358,35 @@ impl Runner {
     pub fn with_composite(mut self, route_id: impl Into<String>, children: Vec<String>) -> Self {
         self.composites.insert(
             route_id.into(),
-            crate::composition::CompositeSpec { children },
+            crate::composition::CompositeSpec {
+                children,
+                cross_on: crate::config::CompositeCrossPolicy::default(),
+            },
         );
+        self
+    }
+
+    /// Declares when a composite may move on to its next child.
+    ///
+    /// Applied separately from registration so the historical default needs no argument
+    /// and a deployment that wants the narrower rule states it explicitly.
+    ///
+    /// Panics when no composite with that id is registered. A silent no-op would leave the
+    /// historical `failure_class` rule in place, which for a composite whose children share
+    /// one credential is exactly the defect this policy exists to remove: a plain throttle
+    /// would spend a paid call. A misordered registration is a programming error, so it
+    /// fails at startup rather than routing wrongly at runtime.
+    pub fn with_composite_cross_policy(
+        mut self,
+        route_id: impl Into<String>,
+        cross_on: crate::config::CompositeCrossPolicy,
+    ) -> Self {
+        let route_id = route_id.into();
+        let spec = self
+            .composites
+            .get_mut(&route_id)
+            .unwrap_or_else(|| panic!("cross policy set for unregistered composite {route_id:?}"));
+        spec.cross_on = cross_on;
         self
     }
 
@@ -352,7 +460,17 @@ impl Runner {
     pub fn decision_lane_children(&self, lane: &str) -> Option<&[String]> {
         self.decision_lane_composition
             .get(lane)
-            .map(|children| children.as_slice())
+            .map(|composed| composed.children.as_slice())
+    }
+
+    /// A composed lane's selection policy, when it composes other lanes.
+    pub fn decision_lane_selection(
+        &self,
+        lane: &str,
+    ) -> Option<crate::decision_executor::LaneSelection> {
+        self.decision_lane_composition
+            .get(lane)
+            .map(|composed| composed.selection)
     }
 
     /// Every lane's resolver, for a caller resolving a named identity.
@@ -373,7 +491,9 @@ impl Runner {
     }
 
     /// The named composition, so a caller can serve a composed lane by its own name.
-    pub fn decision_lane_composition_map(&self) -> BTreeMap<String, Vec<String>> {
+    pub fn decision_lane_composition_map(
+        &self,
+    ) -> BTreeMap<String, crate::decision_executor::ComposedLane> {
         self.decision_lane_composition.clone()
     }
 
@@ -383,7 +503,9 @@ impl Runner {
     }
 
     /// Every decision lane that composes child lanes, for diagnostics and validation.
-    pub fn decision_lane_compositions(&self) -> &BTreeMap<String, Vec<String>> {
+    pub fn decision_lane_compositions(
+        &self,
+    ) -> &BTreeMap<String, crate::decision_executor::ComposedLane> {
         &self.decision_lane_composition
     }
 
@@ -422,5 +544,28 @@ impl Runner {
         self.decision_lanes
             .values()
             .find(|lane| crate::decision_transport::lane_serves(&lane.types, request))
+    }
+}
+
+#[cfg(test)]
+mod cross_policy_tests {
+    use super::*;
+    use crate::config::CompositeCrossPolicy;
+
+    /// A policy set on a composite that was never registered must fail loudly.
+    ///
+    /// The registration loop pairs `with_composite` with this call, so reaching this arm
+    /// means the two drifted apart. Accepting it silently would leave the historical
+    /// `failure_class` rule in place, and for a composite whose children share one
+    /// credential that rule spends a paid call on an ordinary throttle.
+    #[test]
+    #[should_panic(expected = "cross policy set for unregistered composite")]
+    fn cross_policy_for_an_unregistered_composite_panics() {
+        if let Err(err) = std::panic::catch_unwind(|| {
+            Runner::new(Vec::new())
+                .with_composite_cross_policy("absent", CompositeCrossPolicy::CredentialBlock)
+        }) {
+            std::panic::resume_unwind(err);
+        }
     }
 }

@@ -1,0 +1,8 @@
+{
+  "route": "direct-openrouter-liquid-lfm-2_5-2_6b-free",
+  "target": "openrouter-liquid-lfm-2_5-2_6b-free",
+  "provider_status": 404,
+  "provider_message": "liquid/lfm-2.5-2.6b:free is no longer available on OpenRouter: no provider serves this model anymore.",
+  "receipt": "UPSTREAM_RETIRED_404 2026-11-23 switchyard-vm deploy/stephen-st-routing-v1/evidence/tool-qualification-20261123/route-tool-probe-20261123b.jsonl",
+  "note": "Audited: one route references the target, no route references either name, and the sibling liquid/lfm-2.5-embedding-350m:free embedding model is a different target that is left untouched."
+}

@@ -25,7 +25,28 @@ Write for a high-school level in short, simple sentences. Avoid jargon, analogie
 - Avoid abstractions, configurability, and defensive code for hypothetical needs.
 - If the implementation grows unexpectedly large, reconsider and simplify it.
 - For bugs, reproduce the failure before fixing it; for refactors, establish a behavioral baseline first.
-- Make reasonable, reversible assumptions when consequences are small. Ask only when ambiguity would materially change the result, expand scope, or risk an irreversible acti
+- Make reasonable, reversible assumptions when consequences are small. Ask only when ambiguity would materially change the result, expand scope, or risk an irreversible action.
+
+## Release and deployment safety
+
+These rules apply to every Switchyard release, without exception.
+
+1. **Never write inside the managed release store.** Do not overwrite, move or
+   edit any file under `CURRENT`, a retained release directory, or
+   `LAST-KNOWN-GOOD`. Those bytes are the rollback evidence and are hash-checked
+   against `release.json`; a direct write breaks the store's integrity even when
+   the running service is unaffected.
+2. **Prepare candidates outside the store.** Build the candidate manifest in a
+   scratch directory such as `/var/tmp`, hash it, and activate it only through the
+   documented release mechanism (`activate-release.sh deploy`), which validates the
+   candidate under the unit environment, records a durable release, and keeps the
+   predecessor as the rollback target.
+3. **Never invent command flags.** Read the tool's usage before invoking it. A
+   rejected flag is a failed command, not a partial success.
+4. **Never report an activation without proof.** A release is deployed only when the
+   command exited 0 *and* an authoritative readback agrees: `sha256sum` of the live
+   manifest and binary, the unit's `MainPID`/`NRestarts`, and `/v1/models`. Anything
+   short of that is a claim, not a result.
 
 ## Git guidance
 

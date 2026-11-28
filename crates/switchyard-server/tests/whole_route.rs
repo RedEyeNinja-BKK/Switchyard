@@ -516,6 +516,75 @@ async fn an_exhausted_child_lets_the_parent_cross_and_says_why() {
     assert!(healthy.calls() >= 1, "the healthy child served");
 }
 
+/// A provider that refuses a REPLAYED tool call for want of its own continuation text is
+/// naming a fact about itself, so the next leg in the same child must be tried.
+///
+/// Measured live 2026-11-27: with every free leg spent and Google unable to replay a
+/// foreign call, `smart-route` ended on DeepSeek's 400 instead of reaching a leg that
+/// answers the same request. The paired case is the control: a generic 400 stays terminal,
+/// because handing a genuinely malformed request to another provider is evasion, not
+/// recovery.
+#[tokio::test]
+async fn a_replay_requirement_refusal_moves_on_but_a_malformed_request_does_not() {
+    let upstream = Upstream::new();
+    let url = upstream.clone().server();
+
+    // Two leaves on one upstream so the scripted refusal is attributable by model name.
+    let config = format!(
+        "schema_version = 1\n{}{}",
+        leaf_scoped(
+            "replay",
+            &url,
+            &["always-400-prose-id", "healthy"],
+            "",
+            "replay"
+        ),
+        leaf_scoped(
+            "malformed",
+            &url,
+            &["always-400", "healthy"],
+            "",
+            "malformed"
+        ),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "replay",
+        json!({"model": "replay", "input": "ping"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the leg with a different continuation contract must answer: {body}"
+    );
+    assert_eq!(body["model"], "healthy", "{body}");
+    assert_eq!(
+        seen_models(&upstream).await,
+        vec!["always-400-prose-id".to_string(), "healthy".to_string()],
+        "the refused leg was tried once and the sibling answered"
+    );
+
+    let before = seen_models(&upstream).await.len();
+    let (status, body) = call(
+        runner(&config),
+        "malformed",
+        json!({"model": "malformed", "input": "ping"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an ordinary bad request is the caller's to fix: {body}"
+    );
+    assert_eq!(
+        seen_models(&upstream).await.len(),
+        before + 1,
+        "the sibling of a malformed request must not be contacted"
+    );
+}
+
 /// A terminal failure is a defect in the child, not an opportunity for another route.
 /// Retrying elsewhere would hide a contract or credential fault behind another answer.
 #[tokio::test]
@@ -652,6 +721,146 @@ children = ["smartfree", "smartlocal"]
         "the skip is recorded as request-fit, not failure"
     );
     assert_eq!(vision.calls(), 1);
+}
+
+/// A carrier the route cannot serve is refused at the surface, before any provider call.
+///
+/// This is the measured shape of the free Nemotron endpoint: it answers an inline `data:`
+/// image and 404s a remote URL. Without the carrier fact the request would be forwarded and
+/// the caller would receive an upstream 404 instead of a routing answer.
+#[tokio::test]
+async fn a_remote_image_is_refused_by_an_inline_only_route_without_a_call() {
+    let upstream = Upstream::new();
+    let base = upstream.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.client]
+format = "openai_responses"
+base_url = "{base}"
+
+[targets.inline-vl]
+id = "vendor/inline-vl"
+llm_client = "client"
+vision = true
+image_carrier = "inline"
+
+[routes.vl]
+id = "test/vl"
+type = "passthrough"
+target = "inline-vl"
+candidates = []
+vision = true
+image_carrier = "inline"
+"#
+    );
+    let remote = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": "https://example.test/cat.jpg"}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", remote).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "unsupported_capability", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("other form"),
+        "the refusal names the carrier, not a missing medium: {body}"
+    );
+    assert_eq!(
+        upstream.calls(),
+        0,
+        "a carrier the target cannot serve is never forwarded"
+    );
+
+    let inline = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", inline).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream.calls(), 1, "the inline form is admitted");
+}
+
+/// Within one route that advertises both carriers, each request reaches the candidate that
+/// serves its form, and the other candidate receives nothing.
+///
+/// This is the dispatch half of the change: the route claim is truthful, and the per-target
+/// facts decide which candidate runs. A single boolean could not express it.
+#[tokio::test]
+async fn each_carrier_reaches_the_candidate_that_serves_it() {
+    let inline_only = Upstream::new();
+    let remote_only = Upstream::new();
+    let inline_url = inline_only.clone().server();
+    let remote_url = remote_only.clone().server();
+    let config = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.inline]
+format = "openai_responses"
+base_url = "{inline_url}"
+
+[llm_clients.remote]
+format = "openai_responses"
+base_url = "{remote_url}"
+
+[targets.inline-vl]
+id = "vendor/inline-vl"
+llm_client = "inline"
+vision = true
+image_carrier = "inline"
+
+[targets.remote-vl]
+id = "vendor/remote-vl"
+llm_client = "remote"
+vision = true
+image_carrier = "remote"
+
+[routes.vl]
+id = "test/vl"
+type = "passthrough"
+target = "inline-vl"
+candidates = ["remote-vl"]
+vision = true
+image_carrier = "both"
+"#
+    );
+    let remote = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.test/cat.jpg"}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", remote).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (inline_only.calls(), remote_only.calls()),
+        (0, 1),
+        "a remote image must skip the inline-only candidate"
+    );
+
+    let inline = json!({
+        "model": "test/vl",
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+        ]}]
+    });
+    let (status, body) = call(runner(&config), "test/vl", inline).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (inline_only.calls(), remote_only.calls()),
+        (1, 1),
+        "an inline image goes to the declared head candidate and not the fallback"
+    );
 }
 
 /// Every child receives the pristine request. A child that prepared provider-specific
@@ -2394,4 +2603,296 @@ async fn the_shadow_reports_a_composite_verdict_from_its_children() {
     assert_eq!(small.calls(), 0, "the too-small child is skipped");
     assert_eq!(large.calls(), 1, "the composable child serves");
     assert_eq!(response.0, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// `cross_on = "credential_block"`: a composite whose children share one credential
+// may only spend a later child when the failure said the earlier child's SCOPE is
+// gone. Everything else - a throttle, a timeout, a provider fault - is not evidence.
+// The fixture's `script` answers by the model name in the body, so one backend can
+// serve both children and still prove which child reached it.
+// ---------------------------------------------------------------------------
+
+/// Builds a Stephen-shaped deployment: a free child and a paid child on ONE credential,
+/// joined by a composite that only crosses on a credential block.
+fn stephen_shared_credential(free_slug: &str, paid_slug: &str, base: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.stephen]
+format = "openai_responses"
+base_url = "{base}"
+
+[targets.free-leg]
+id = "{free_slug}"
+llm_client = "stephen"
+
+[routes.ST_Free]
+id = "ST_Free"
+type = "passthrough"
+target = "free-leg"
+candidates = []
+vision = false
+
+[targets.paid-leg]
+id = "{paid_slug}"
+llm_client = "stephen"
+
+[routes.ST_Paid]
+id = "ST_Paid"
+type = "passthrough"
+target = "paid-leg"
+candidates = []
+vision = false
+
+[composites.ST_Route]
+children = ["ST_Free", "ST_Paid"]
+cross_on = "credential_block"
+"#
+    )
+}
+
+/// An ordinary rate limit on the free child must not spend a paid call.
+#[tokio::test]
+async fn a_throttled_free_child_does_not_cross_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/pool-429-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_ne!(status, StatusCode::OK, "the throttle is surfaced: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().all(|model| model.contains("pool-429-leg")),
+        "only the free leg may be called, but the backend saw {models:?}"
+    );
+}
+
+/// A confirmed account-wide daily free-allowance exhaustion DOES cross, because the
+/// paid scope on the same credential is still servable.
+#[tokio::test]
+async fn an_exhausted_free_allowance_crosses_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/account-quota-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "the paid leg serves: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the paid child must be reached after a free-allowance exhaustion: {models:?}"
+    );
+}
+
+/// A whole-credential exhaustion crosses the CLASS but must still spend no call: the
+/// block condemns every later child on that credential.
+#[tokio::test]
+async fn a_whole_credential_exhaustion_spends_no_later_call() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/payment-required-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    );
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_ne!(status, StatusCode::OK, "the 402 is surfaced: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().all(|model| !model.contains("paid-leg-1017")),
+        "a whole-credential block must stop the paid child: {models:?}"
+    );
+}
+
+/// The same failures under the historical policy DO cross, which is what makes the
+/// narrower policy a real difference rather than a description of what already happens.
+#[tokio::test]
+async fn the_historical_policy_still_crosses_on_a_throttle() {
+    let backend = Upstream::new();
+    let config = stephen_shared_credential(
+        "vendor/pool-429-leg:free",
+        "vendor/paid-leg-1017",
+        &backend.clone().server(),
+    )
+    .replace("cross_on = \"credential_block\"\n", "");
+
+    let (status, _body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the default policy crosses on a 429"
+    );
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().any(|model| model.contains("paid-leg-1017")),
+        "control: the default crosses where the narrower policy does not: {models:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The remaining `credential_block` question, measured 2026-11-19: an eligibility
+// skip is not a credential block, so it must not spend a paid call.
+//
+// The four production crossings after release 20261119T001835Z were all logged
+// `ST_Free:ineligible`, i.e. the free child was never called because the request
+// did not fit its declared window - not because Stephen's daily free allowance was
+// reported exhausted. The owner's policy admits ONE paid-crossing reason: confirmed
+// account-wide daily free-allowance exhaustion. These tests pin that the other
+// skip reasons do not spend the paid leg.
+// ---------------------------------------------------------------------------
+
+/// A Stephen-shaped deployment whose free child declares a small window and no vision,
+/// so a request can be turned away from it without any provider call.
+fn stephen_with_declared_limits(free_ctx: u32, paid_ctx: u32, base: &str) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.stephen]
+format = "openai_responses"
+base_url = "{base}"
+
+[targets.free-leg]
+id = "vendor/account-quota-leg:free"
+llm_client = "stephen"
+
+[routes.ST_Free]
+id = "ST_Free"
+type = "passthrough"
+target = "free-leg"
+candidates = []
+context_window = {free_ctx}
+vision = false
+
+[targets.paid-leg]
+id = "vendor/paid-leg-1017"
+llm_client = "stephen"
+
+[routes.ST_Paid]
+id = "ST_Paid"
+type = "passthrough"
+target = "paid-leg"
+candidates = []
+context_window = {paid_ctx}
+vision = true
+
+[composites.ST_Route]
+children = ["ST_Free", "ST_Paid"]
+cross_on = "credential_block"
+"#
+    )
+}
+
+/// A request the free child cannot hold must not become a paid call.
+///
+/// The free child is skipped for its window, which is a routing fact about the
+/// request, not a statement about the credential. Crossing to the paid leg here
+/// spends money for a reason the owner did not authorize.
+#[tokio::test]
+async fn a_context_ineligible_free_child_does_not_cross_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_with_declared_limits(2_000, 1_000_000, &backend.clone().server());
+
+    let oversized = "q".repeat(200_000); // about 50,000 estimated tokens
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": oversized}]}),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an over-window request must fail closed rather than spend the paid leg: {body}"
+    );
+    let models = seen_models(&backend).await;
+    assert!(
+        !models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the paid child must not be called for a context skip: {models:?}"
+    );
+}
+
+/// A request the free child cannot read (no vision) must not become a paid call.
+#[tokio::test]
+async fn a_vision_ineligible_free_child_does_not_cross_to_the_paid_child() {
+    let backend = Upstream::new();
+    let config = stephen_with_declared_limits(1_000_000, 1_000_000, &backend.clone().server());
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "describe"},
+            {"type": "input_image", "image_url": "https://example.test/a.png"}
+        ]}]}),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a capability skip must fail closed rather than spend the paid leg: {body}"
+    );
+    let models = seen_models(&backend).await;
+    assert!(
+        !models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the paid child must not be called for a capability skip: {models:?}"
+    );
+}
+
+/// The approved reason still crosses: a confirmed daily free-allowance exhaustion
+/// reaches the paid leg even though the free child was never eligible for a skip
+/// reason. This is the positive control for the guard above, so the guard cannot be
+/// satisfied by refusing every request.
+#[tokio::test]
+async fn the_approved_daily_free_exhaustion_still_crosses_after_the_guard() {
+    let backend = Upstream::new();
+    let config = stephen_with_declared_limits(1_000_000, 1_000_000, &backend.clone().server());
+
+    let (status, body) = call(
+        runner(&config),
+        "ST_Route",
+        json!({"model": "ST_Route", "input": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "the paid leg serves: {body}");
+    let models = seen_models(&backend).await;
+    assert!(
+        models.iter().any(|model| model.contains("paid-leg-1017")),
+        "the approved quota crossing must survive: {models:?}"
+    );
 }

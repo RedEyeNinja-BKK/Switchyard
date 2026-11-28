@@ -171,7 +171,7 @@ pub(crate) async fn decisions(
     {
         Ok(Some(outcome)) => return finish(Ok(outcome), &requested),
         Ok(None) => {}
-        Err(failure) => return error_body(status_for(&failure), format!("{failure:?}")),
+        Err(failure) => return refusal(&failure),
     }
 
     // The lane serving this request's question kinds. Candidate order may differ per
@@ -215,7 +215,7 @@ pub(crate) async fn decisions(
         &identity_to_resolve,
     );
     let outcome = match resolved {
-        Err(failure) => return error_body(status_for(&failure), format!("{failure:?}")),
+        Err(failure) => return refusal(&failure),
         Ok(switchyard_runner::decision_executor::DecisionIdentity::Target(name)) => {
             let Some(candidate) = lane
                 .candidates
@@ -257,12 +257,7 @@ fn finish(
             }
             (StatusCode::OK, Json(payload)).into_response()
         }
-        Err(failure) => error_body(
-            // A caller mistake and an exhausted backend are different situations, and a
-            // provider outage must never be reported as a malformed request.
-            status_for(&failure),
-            format!("decision request failed: {failure:?}"),
-        ),
+        Err(failure) => refusal(&failure),
     }
 }
 
@@ -284,29 +279,185 @@ fn lane_name_for(
 
 /// Maps a classified decision failure to the status a caller should see.
 ///
-/// A contract or eligibility refusal is the caller's problem and is never retried; an
-/// unknown identity is a missing model; a missing credential is a deployment fault, not
-/// the caller's; and eligible backends exhausted by transient failures are genuinely
-/// unavailable right now.
+/// The three classes are kept apart deliberately:
+///
+/// * a refusal of the REQUEST (state shape, question kind, wire bounds, unknown identity)
+///   is the caller's to fix and is never retried;
+/// * a refusal of our own BUDGET is a rate limit: the lane is working as configured and the
+///   same request may succeed after the window refills or the day resets;
+/// * anything else that was actually sent and failed is an availability answer.
+///
+/// A deployment fault - no credential, an unusable counter - is ours, and is reported as a
+/// server error so it cannot be mistaken for caller misuse.
 fn status_for(failure: &switchyard_runner::decision_executor::DecisionFailure) -> StatusCode {
     use switchyard_runner::decision_executor::{DecisionFailure, DecisionSkip};
     match failure {
-        DecisionFailure::NotEligible(DecisionSkip::TargetNotFound) => StatusCode::NOT_FOUND,
-        DecisionFailure::NotEligible(DecisionSkip::Unauthenticated) => {
+        // `Refused` is the lane-scoped form of a candidate eligibility refusal: nothing was
+        // dispatched, so it is never an availability answer.
+        DecisionFailure::NotEligible(DecisionSkip::TargetNotFound)
+        | DecisionFailure::Refused(DecisionSkip::TargetNotFound) => StatusCode::NOT_FOUND,
+        DecisionFailure::NotEligible(DecisionSkip::Unauthenticated)
+        | DecisionFailure::Refused(DecisionSkip::Unauthenticated) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
-        DecisionFailure::NotEligible(_) => StatusCode::BAD_REQUEST,
-        DecisionFailure::Serving { reason, .. } if *reason == "no_eligible_backend" => {
-            StatusCode::SERVICE_UNAVAILABLE
+        DecisionFailure::NotEligible(_) | DecisionFailure::Refused(_) => StatusCode::BAD_REQUEST,
+        // Budget refusals. `daily_allowance_unavailable` is excluded on purpose: a counter
+        // that cannot be read is a deployment fault, not a quota the caller spent.
+        DecisionFailure::Serving { reason, .. }
+            if matches!(
+                *reason,
+                "minute_allowance_throttled"
+                    | "input_exceeds_minute_window"
+                    | "daily_allowance_exhausted"
+            ) =>
+        {
+            StatusCode::TOO_MANY_REQUESTS
         }
         DecisionFailure::Serving { .. } => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// Renders a decision failure as the response a caller should act on.
+///
+/// One place decides both the status and the words, so a caller mistake can never be
+/// reported as an outage (or the reverse) by one call site drifting from another.
+fn refusal(failure: &switchyard_runner::decision_executor::DecisionFailure) -> Response {
+    error_body(status_for(failure), failure.message())
+}
+
+/// The error class a caller reads in the body's `type`.
+fn error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::NOT_FOUND => "model_not_found",
+        status if status.is_server_error() => "api_error",
+        _ => "invalid_request_error",
     }
 }
 
 fn error_body(status: StatusCode, message: String) -> Response {
     (
         status,
-        Json(json!({"error": message, "type": "invalid_request_error"})),
+        Json(json!({"error": message, "type": error_type(status)})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use switchyard_runner::decision_executor::{DecisionFailure, DecisionSkip};
+
+    /// The status a caller sees is decided by the CLASS of the failure, never by which call
+    /// site reported it.
+    ///
+    /// These are the four answers a decision caller can act on differently: fix the request
+    /// (400), fix the name (404), wait (429), or treat it as ours (500/503). A regression
+    /// here is a caller retrying a request that can never succeed, or a monitoring system
+    /// treating a spent quota as an outage.
+    #[test]
+    fn every_failure_class_maps_to_the_answer_the_caller_can_act_on() {
+        use DecisionFailure as F;
+        use DecisionSkip as S;
+
+        for (failure, status, class) in [
+            (
+                F::Refused(S::UnsupportedState),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                F::Refused(S::UnsupportedType),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                F::NotEligible(S::Contract),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                F::Refused(S::TargetNotFound),
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+            ),
+            (
+                F::NotEligible(S::Unauthenticated),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+            ),
+            (
+                F::Serving {
+                    reason: "minute_allowance_throttled",
+                    retryable: true,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+            (
+                F::Serving {
+                    reason: "input_exceeds_minute_window",
+                    retryable: true,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+            (
+                F::Serving {
+                    reason: "daily_allowance_exhausted",
+                    retryable: true,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+            // Ours, not the caller's: a counter that cannot be read is not a quota spent.
+            (
+                F::Serving {
+                    reason: "daily_allowance_unavailable",
+                    retryable: false,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+            ),
+            (
+                F::Serving {
+                    reason: "connect",
+                    retryable: true,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+            ),
+            (
+                F::Serving {
+                    reason: "decodable_response",
+                    retryable: false,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+            ),
+        ] {
+            assert_eq!(status_for(&failure), status, "{failure:?}");
+            assert_eq!(error_type(status), class, "{failure:?}");
+        }
+    }
+
+    /// A quota refusal must not read like a caller error, and a caller error must not read
+    /// like a quota refusal: the two bodies are the two remedies.
+    #[test]
+    fn the_body_carries_the_remedy_not_our_vocabulary() {
+        let refused = refusal(
+            &switchyard_runner::decision_executor::DecisionFailure::Refused(
+                DecisionSkip::UnsupportedState,
+            ),
+        );
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let throttled = refusal(
+            &switchyard_runner::decision_executor::DecisionFailure::Serving {
+                reason: "daily_allowance_exhausted",
+                retryable: true,
+            },
+        );
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }

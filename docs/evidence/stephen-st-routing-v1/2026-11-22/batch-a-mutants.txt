@@ -1,0 +1,19 @@
+# Mutation control for the Batch A verifier
+# run 2026-11-22T06:43:11Z
+PASS  CONTROL unmutated candidate passes (rc=0)
+PASS  M1 ST_Free keeps the dynamic router: rc=1 caught_by=A8 ok
+PASS  M2 ST_Free gains a metered leg: rc=1 caught_by=A8 ok
+PASS  M3 direct leaf inherits the parent cap: rc=1 caught_by=A15 ok
+PASS  M4 ST_Paid gains a free leg: rc=1 caught_by=A10 ok
+PASS  M5 ST_Route crosses on every failure class: rc=1 caught_by=A21 ok
+PASS  M6 ST_Embed dims drift to 3072: rc=1 caught_by=A22 ok
+PASS  M7 a composite names a composite: rc=1 caught_by=A20 ok
+PASS  M8 a metered target declares free_tier: rc=1 caught_by=A17 ok
+PASS  M9 an owner route is edited: rc=1 caught_by=A7 ok
+PASS  M10 a new target appears: rc=1 caught_by=A2 ok
+PASS  M11 a Stephen target uses another client: rc=1 caught_by=A11 ok
+PASS  M12 a candidate names a missing target: rc=1 caught_by=A18 ok
+PASS  M13 truth table drifts from config: rc=1 caught_by=A24
+PASS  CONTROL empty verdict refuses (rc=3)
+
+15 mutants/controls, 0 failed

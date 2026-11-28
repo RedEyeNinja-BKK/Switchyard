@@ -680,6 +680,7 @@ fn decode_anthropic_content_block(
             details: Vec::new(),
         }],
         Some("tool_use") => vec![ContentBlock::ToolCall(ToolCall {
+            provider_state: None,
             id: block
                 .get("id")
                 .and_then(Value::as_str)

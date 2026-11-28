@@ -73,15 +73,32 @@ release adopted from what is already running can never be attested.
 
 All paths and commands can be overridden by environment variable
 (`LIVE_BIN`, `LIVE_MANIFEST`, `RELEASE_ROOT`, `RESTART_CMD`, `HEALTH_CMD`,
-`VALIDATE_CMD`, `CAPABILITY_TOOL`, `ENV_FILE_1`, `ENV_FILE_2`, `MANIFEST_GROUP`).
+`VALIDATE_CMD`, `CAPABILITY_TOOL`, `ENV_FILES`, `SYSTEMCTL`, `MANIFEST_GROUP`).
 Those seams exist so the failure paths can be tested without touching production.
+
+The candidate is validated under the environment the **unit** declares, read from
+`systemctl show -p EnvironmentFiles`, in the order the unit reads it. A credential
+added as a drop-in is therefore picked up without changing this script, and a
+variable declared twice resolves the way systemd resolves it: the later file wins.
+
+There is no built-in fallback list. If the unit cannot be queried, or declares no
+file, the deploy **refuses** rather than validating under a guess: an environment
+that is not the service's own would pass a candidate the service then fails to
+start, and the failure would present as a missing variable rather than as this.
+`ENV_FILES` names the set explicitly for such a host (and for the tests). A
+declared file that is missing is fatal too, unless the unit marks it
+`ignore_errors=yes`. `activate-release.sh env-files` prints the resolved set, in
+read order, with a hash of each, without deploying anything.
 
 `test_release_recovery.py` was removed with the installer it exercised. Its cases
 are covered, and in more detail, by `scripts/release/test_activate_release.py`
-(26 acceptance tests: deploy, rollback, promote, verify, adopt, retention, the
-capability gate, the validation gate, attestation, pointer independence). That
-harness also defaulted to a `/var/tmp` scratch path and contained no
-pytest-collectable tests, so it never ran in CI.
+(43 acceptance tests: deploy, rollback, promote, verify, adopt, retention, the
+capability gate, the validation gate, the environment the candidate is validated
+under, attestation, pointer independence). `scripts/release/mutants_env_files.py`
+is the negative control for the environment-file cases: it breaks each property in
+turn and requires the suite to fail, so a case that asserts nothing shows up as a
+survivor. That harness also defaulted to a `/var/tmp` scratch path and contained
+no pytest-collectable tests, so it never ran in CI.
 
 ## `disk-retention.sh`
 

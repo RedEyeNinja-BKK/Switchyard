@@ -102,16 +102,21 @@ def correct(doc):
 
     flat[12002]['options']['content'] = (
         "**ROUTING TOPOLOGY \u2014 19 advertised non-direct routes, 1 composite and the 4 typed-decision lanes.** "
-        "Regenerated from the deployed manifest (`routes.toml` sha256 `18b377cd465862f3\u2026`, 133,736 B, "
-        "release `20261128T002506Z-6a8209f97101563b-18b377cd`) and cross-checked against `/v1/models` on the "
-        "service listener (127.0.0.1:4000, **74 of 74 advertised**, 2026-11-28). The single composite is "
+        "Regenerated from the deployed manifest (`routes.toml` sha256 `79286007eb597dcc\u2026`, 133,673 B, "
+        "release `20261128T020526Z-6a8209f97101563b-79286007`) and cross-checked against `/v1/models` on the "
+        "service listener (127.0.0.1:4000, **74 of 74 advertised**, 2026-11-28). `smart-route` is "
+        "`selection = grouped` over four ordered pool groups totalling **11 leaves = 5/3/1/2**: "
+        "`smart-gemini-chat` (5), `smart-openrouter-free` (3: `openrouter-ernie-5_5-flash-preview-free` \u2192 "
+        "`openrouter-ling-3_2-flash-free` \u2192 `openrouter-nemotron-3_5-super-vl-free`), "
+        "`smart-deepseek-flash` (1: `deepseek-deepseek-flash`), and `smart-openrouter-paid` (2: "
+        "`openrouter-tencent-hy4-flash` \u2192 `openrouter-glm-5_3-flash`). "
+        "`openrouter-nemotron-3-ultra-free` was removed from automatic dispatch on 2026-11-28 (its group "
+        "membership was cleared and it was removed from `smart-route` candidates); its direct alias "
+        "`direct-openrouter-nemotron-3-ultra-free` is preserved for manual use. The single composite is "
         "`smart-decision` (selection `capability_first`) with children `smart-gemini-decision`, "
-        "`smartlocal-decision`, `smartfree-decision`. The four OpenRouter free candidates in the "
-        "`smart-openrouter-free` pool are all present: `google/gemma-4-26b-a4b-it:free`, "
-        "`google/gemma-4-31b-it:free`, `inclusionai/ling-3.2-flash:free`, `nvidia/nemotron-3.5-super-vl:free`. "
-        "Retired decision definitions (`tier1-decision`, the standalone `google-decision` lane) are gone; "
-        "`smart-gemini-decision` is the surviving Google decision lane. A declared route context is an "
-        "advertisement, not an admission check."
+        "`smartlocal-decision`, `smartfree-decision`. Retired decision definitions (`tier1-decision`, the "
+        "standalone `google-decision` lane) are gone; `smart-gemini-decision` is the surviving Google decision "
+        "lane. A declared route context is an advertisement, not an admission check."
     )
 
     flat[12003]['options']['content'] = (
@@ -158,17 +163,55 @@ def correct(doc):
     flat[12007]['options']['content'] = (
         "**DEPLOYMENT SNAPSHOT - live P11 record (read 2026-11-28, sha256sum-verified).**\n\n"
         "| Item | Recorded evidence |\n|---|---|\n"
-        "| CURRENT (deployed) | `20261128T002506Z-6a8209f97101563b-18b377cd` |\n"
-        "| Release action / label | `deploy` / `p11-functional-cleanup` |\n"
-        "| Binary sha256 | `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B) |\n"
-        "| Manifest sha256 | `18b377cd465862f3183fcb10cf01300659ec57ee2925735d7408d5ffd7e8c15e` (133,736 B installed routes.toml) |\n"
-        "| Capabilities sha256 | `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B) |\n"
-        "| Rollback target | `20261127T223854Z-6a8209f97101563b-ead40bb6` (P10, protected) |\n"
+        "| CURRENT (deployed) | `20261128T020526Z-6a8209f97101563b-79286007` |\n"
+        "| Release action / label | `deploy` / `p11-ultra-out` (created 2026-11-28T02:05:26Z) |\n"
+        "| Binary sha256 | `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B) - unchanged from the qualified binary |\n"
+        "| Manifest sha256 | `79286007eb597dcc53bc66977a088b3ecb0d1a9b8c09b8d8085adcc1ecdeef0e` (133,673 B installed routes.toml) |\n"
+        "| Capabilities sha256 | `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B) - reused verified capsule (byte-identical binary) |\n"
+        "| Rollback target | `20261128T002506Z-6a8209f97101563b-18b377cd` (predecessor, protected in store) |\n"
         "| LAST-KNOWN-GOOD | `20261126T061331Z-65757ec7aaa51166-737a6887` (not promoted) |\n"
-        "| Running service | PID 873638, NRestarts=0, /v1/models 74 of 74 |\n"
-        "| Basis | config-only on qualified binary 6a8209f9; removed vc-paid-core, VC_Paid, smart-nt-bounded-trial; google-decision reconciled into smart-gemini-decision |\n\n"
-        "P11 is a functional-cleanup release: binary unchanged from P10; only manifest bytes differ. No rebuild, no LKG promotion, no provider traffic."
+        "| Running service | PID 876990, NRestarts=0, /v1/models 74 of 74 |\n"
+        "| Basis | config-only on qualified binary 6a8209f9: removed `openrouter-nemotron-3-ultra-free` from the `smart-openrouter-free` group and from `smart-route` candidates; direct alias preserved; `smart-route` topology now 5/3/1/2 = 11 |\n\n"
+        "P11 config-only release: binary unchanged; only manifest bytes differ. No rebuild, no LKG promotion, no provider traffic."
     )
+
+    # Normalise any residual release/topology tokens left in reference panels (e.g. 12001).
+    _NORM = [
+        ("20261128T002506Z-6a8209f97101563b-18b377cd", "20261128T020526Z-6a8209f97101563b-79286007"),
+        ("20261128T002506Z", "20261128T020526Z"),
+        ("18b377cd465862f3183fcb10cf01300659ec57ee2925735d7408d5ffd7e8c15e", "79286007eb597dcc53bc66977a088b3ecb0d1a9b8c09b8d8085adcc1ecdeef0e"),
+        ("18b377cd465862f3\u2026", "79286007eb597dcc\u2026"),
+        ("18b377cdc05aed26\u2026", "79286007eb597dcc\u2026"),
+        ("18b377cd\u2026", "79286007\u2026"),
+        ("133,736 B", "133,673 B"),
+        ("12 = 5/4/1/2", "11 = 5/3/1/2"),
+        ("12 = 5/3/1/2", "11 = 5/3/1/2"),
+        ("5/4/1/2", "5/3/1/2"),
+        ("12 leaves", "11 leaves"),
+        ("**12** candidates", "**11** candidates"),
+        ("12-candidate", "11-candidate"),
+        ("12 candidates", "11 candidates"),
+        ("`smart-openrouter-free` (4:", "`smart-openrouter-free` (3:"),
+        ("the route is also a member of pool group `smart-openrouter-free`, which makes the desired and admitted `smart-route` topology the same 11 = 5/3/1/2.",
+         "on 2026-11-28 the route was removed from automatic dispatch (group membership cleared, deleted from `smart-route` candidates), so `smart-route` is now 11 = 5/3/1/2."),
+        ("it is also a member of pool group `smart-openrouter-free`",
+         "it was removed from automatic dispatch on 2026-11-28"),
+        ("member of pool group `smart-openrouter-free`",
+         "removed from smart-route auto-dispatch 2026-11-28"),
+        ("member of `smart-openrouter-free`", "removed from smart-route auto-dispatch 2026-11-28; direct alias preserved"),
+        ("The 54 rows are still 54, because the held Nemotron Ultra leaf's direct alias is **not** installed.",
+         "The direct alias `direct-openrouter-nemotron-3-ultra-free` is installed and advertised; on 2026-11-28 it was removed from `smart-route` automatic dispatch and kept as a manual direct route."),
+        ("held Nemotron Ultra leaf's direct alias is **not** installed.",
+         "The direct alias `direct-openrouter-nemotron-3-ultra-free` is installed and advertised; on 2026-11-28 it was removed from `smart-route` automatic dispatch and kept as a manual direct route."),
+        ("\u2192 `openrouter-nemotron-3-ultra-free`", ""),
+    ]
+    for _p in flat.values():
+        _o = _p.get('options')
+        if isinstance(_o, dict) and isinstance(_o.get('content'), str):
+            _c = _o['content']
+            for _a, _b in _NORM:
+                _c = _c.replace(_a, _b)
+            _o['content'] = _c
     return doc
 
 def main(argv=None):

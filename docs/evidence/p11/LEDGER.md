@@ -121,3 +121,57 @@ protected. Dashboard state at the time of this record: V7 title **V7.101** revis
 Vision estimator correction (`ab101c0a`, binary `60c3556f…`) was built, gated and staged but **not
 activated** — it awaits an owner GO naming that hash. Measurement and localisation work for Gemini 3.8
 and Particle are in `qualification/FINDINGS-20261128-vision-gemini-particle.md`.
+
+## Correction release and dashboard republication - 2026-11-28 evening
+
+Release `20261128T182648Z-6a8209f97101563b-02587e3e` is **CURRENT**. It is a config-only correction
+release: binary `6a8209f9…` was not rebuilt, capabilities `987dd039…` reused, LAST-KNOWN-GOOD unmoved at
+`20261126T061331Z-65757ec7aaa51166-737a6887`. The manifest at `02587e3e…` is 145,413 B with 74 routes /
+60 targets, and it carries the 15 `stephen-*` capability twins plus the four recovered Stephen TTS lanes.
+
+| Item | Value |
+|---|---|
+| CURRENT | `20261128T182648Z-6a8209f97101563b-02587e3e` |
+| Manifest | `02587e3ef974b2c1a62593b5256039eb62b9cdcfc26b7fbfba314a6cba485145` (145,413 B) |
+| Rollback / predecessor | `20261128T080005Z-…-f3b743f5` (protected); LKG unchanged |
+| Service | MainPID 912928, NRestarts 0, `/v1/models` 74 |
+| Direct routes | **55** (was 53 when V7.101 was published) |
+
+### Dashboards (revision-controlled publication)
+
+Both were produced from the **byte-exact server read** of the published document, not from the repo
+builders - `build_v9_dashboard.py` emits 86 top-level panels where the live document has 77, and the V7
+builder still self-describes as V7.98. The correctors apply only the release delta and refuse the build if
+any anchor does not match exactly once.
+
+| Dashboard | Title | Grafana `version` | Corrected by | Server read |
+|---|---|---|---|---|
+| `turnstone-switchyard-v7` | **V7.102** | **107** | `scripts/economics/v7/reconcile_v102.py` | `v7-rev107-server-export.json` |
+| `turnstone-switchyard-economics-v9` | **V9.20** | **30** | `scripts/economics/v9/reconcile_v920.py` | `v9-rev30-server-export.json` |
+
+V7.102 replaces the stale "53 of 53" master-route header with "55 of 55" and adds the two rows that were
+missing (`direct-openrouter-particle-1-free`, `direct-openrouter-stephen-tencent-hy4-flash`), and drops the
+retired `fc05b640`/`a7ef9174` references. V9.20 is metadata plus one dated anchor on panel 1047; the release
+in question changed no expression, because free-tier capability lanes carry no provider spend.
+
+The title suffix is a **content** version and the Grafana `version` is the CAS revision; they advance
+together but are not the same number. Rollback backups are
+`turnstone-switchyard-v7-v106-20261128T194108Z.json` and
+`turnstone-switchyard-economics-v9-v29-20261128T194210Z.json` under
+`/var/log/turnstone-grafana/backups/`. The previous revisions (V7.101/r106, V9.19/r29) are preserved
+byte-exactly in this directory and were not edited.
+
+### Vision packet (rebuilt, not activated)
+
+`/var/tmp/vision-release-0222872a/` was reconstructed from the `cand/` inputs so that it pins the
+**deployed** manifest rather than a candidate one:
+
+| File | sha256 | Bytes |
+|---|---|---|
+| `switchyard-server` | `0222872abcaecff13c50ad3cc5346ea4896269d559cb1cea88f32f6b44013bf0` | 31,276,304 |
+| `routes.toml` | `02587e3ef974b2c1a62593b5256039eb62b9cdcfc26b7fbfba314a6cba485145` | 145,413 |
+| `capabilities.json` | `5c86a61cf94ac5b42c36ef2b2f6a88a6b47383d58fca7bec7d2f90f9d9b97317` | - |
+
+Nothing was promoted and nothing was activated; binary activation still requires an owner GO naming the
+hash. The earlier packet over `f3b743f5` (binary `3f72ab74…`, manifest `f3b743f5…`, 137,957 B) is obsolete
+and must not be deployed.

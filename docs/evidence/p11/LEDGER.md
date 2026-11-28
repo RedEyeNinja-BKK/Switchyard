@@ -93,3 +93,9 @@ Six deterministic fixtures plus an independent on-disk verifier live in `/var/tm
 - `particle-ai/particle-1:free`: HTTP 429 rate-limited upstream; no binding created, no agentic run.
 
 Attribution: provider throughput (harness turn context vs per-minute input budget), not model quality; control failure prevents matched comparison. No admission change made; re-run when a pinnable per-candidate harness or quota headroom exists.
+
+**Correction, 2026-11-28 (supersedes the attribution above).** The throughput attribution was withdrawn. Tracing the pinned workstream's own request through Switchyard shows the first attempt did reach the provider and returned HTTP 503 after 1.63 s (`provider_unavailable`, `upstream_error (HTTP 503)`); the two retries 0.4 s and 1.4 s later never left the host — they were refused by the lane's 5 s failure cooldown (`local_unavailable`, "backend temporarily unavailable", 4.6 ms and 2.6 ms, `selected_model=""`). Turnstone surfaced only the last of those, which is why the message looked local. The 69–70k-token rows cited above belong to the parent workstream, not to a pinned candidate. Full trace, run record and both Lite T1 results: `docs/evidence/p11/qualification/EVIDENCE-20261128.md`. Fixtures and the independent verifier are now versioned in `docs/evidence/p11/qualification/`.
+
+Both Lite candidates subsequently completed fixture t1 in a pinned workstream under the same harness; each needed one resume after Switchyard's per-minute input-token budget refused further calls, and both artifacts were verified independently on disk.
+
+V9 export committed alongside: `docs/evidence/p11/v9-gen26-server-export.json` (raw server read, revision 26, title V9.19, sha256 `b6226ade…`).

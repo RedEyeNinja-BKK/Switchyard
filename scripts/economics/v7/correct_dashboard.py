@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Offline V7.100 corrector/generator (P11 gemini-lite-out).
+"""Offline V7.101 corrector/generator (P11 ling-out).
 
-Pure offline transform: reviewed V7.98 blob in, V7.100 candidate out.
+Pure offline transform: reviewed V7.98 blob in, V7.101 candidate out.
 """
 import argparse
 import json
@@ -32,7 +32,7 @@ def _flatten(panels):
 def _strip_retired_lines(content):
     out = []
     for line in content.splitlines():
-        if re.match(r'^\| `?(vc-paid-core|VC_Paid|smart-nt-bounded-trial)`? \|', line):
+        if re.match(r'^\| \d+ \| `?(vc-paid-core|VC_Paid|smart-nt-bounded-trial|direct-openrouter-ling-3_2-flash-free|direct-openrouter-stephen-ling-3_2-flash-free)`? \|', line):
             continue
         out.append(line)
     return '\n'.join(out)
@@ -50,10 +50,10 @@ def _renumber(content):
     return '\n'.join(out)
 
 def correct(doc):
-    doc['title'] = 'SWITCHYARD DASHBOARD V7.100'
-    doc['version'] = 105
-    doc['description'] = ('P11 closeout: functional route cleanup with the 57-panel specification '
-                          'reconciled against live telemetry (V7.99).')
+    doc['title'] = 'SWITCHYARD DASHBOARD V7.101'
+    doc['version'] = 106
+    doc['description'] = ('P11: Ling 3.2 Flash Free retired from both accounts; smart-route 3/2/1/2 = 8; '
+                          '53 direct / 72 advertised (V7.101).')
     flat = _flatten(doc['panels'])
 
     # 1. 9006
@@ -100,7 +100,7 @@ def correct(doc):
     c = _renumber(c)
     flat[12001]['options']['content'] = c
 
-    flat[12002]['options']['content'] = "**ROUTING TOPOLOGY — 19 advertised non-direct routes, 1 non-advertised chat composite (`ST_Route`), 4 typed-decision lanes and 1 decision composition (`smart-decision`).** Regenerated from the deployed manifest (`routes.toml` sha256 `a7ef91747befd072…`, 133,545 B, release `20261128T034335Z-6a8209f97101563b-a7ef9174`) and cross-checked against `/v1/models` on the service listener (127.0.0.1:4000, **74 of 74 advertised**, 2026-11-28). `smart-route` is `selection = grouped` over four ordered pool groups totalling **9 leaves = 3/3/1/2**: `smart-gemini-chat` (3), `smart-openrouter-free` (3: `openrouter-ernie-5_5-flash-preview-free` → `openrouter-ling-3_2-flash-free` → `openrouter-nemotron-3_5-super-vl-free`), `smart-deepseek-flash` (1: `deepseek-deepseek-flash`), and `smart-openrouter-paid` (2: `openrouter-tencent-hy4-flash` → `openrouter-glm-5_3-flash`). `openrouter-nemotron-3-ultra-free` was removed from automatic dispatch on 2026-11-28 (its group membership was cleared and it was removed from `smart-route` candidates); its direct alias `direct-openrouter-nemotron-3-ultra-free` is preserved for manual use. On 2026-11-28 the two Google Gemini Lite leaves (`direct-google-gemini-3.5-flash-lite` and `direct-google-gemini-3.1-flash-lite`) were withdrawn from the same ladder: their `groups` lost `smart-gemini-chat` and each was removed from the route's `candidates`, while their `smart-gemini-bounded` membership and both direct aliases were preserved. The Gemini chat pool is therefore `direct-google-gemini-4-hydrogen` → `direct-google-gemini-3.8-flash` → `direct-google-gemini-3.6-flash`. `deepseek-deepseek-v4-pro` is excluded from `smart-route` on every path; its direct alias is retained. The single chat composite is `ST_Route` (children `ST_Free`, `ST_Paid`; not advertised). The decision composition is `smart-decision` (`capability_first`) over the four typed lanes `smart-gemini-decision` (reconciled from the retired `google-decision`), `smartlocal-decision`, `smartfree-decision`, `ST_Decisions`, served at `/v1/decisions` rather than `/v1/chat/completions`. A declared route context is an advertisement, not an admission check."
+    flat[12002]['options']['content'] = "**ROUTING TOPOLOGY — 19 advertised non-direct routes, 1 non-advertised chat composite (`ST_Route`), 4 typed-decision lanes and 1 decision composition (`smart-decision`).** Regenerated from the deployed manifest (`routes.toml` sha256 `fc05b640b49edfd2…`, 131,100 B, release `20261128T040916Z-6a8209f97101563b-fc05b640`) and cross-checked against `/v1/models` on the service listener (127.0.0.1:4000, **72 of 72 advertised**, 2026-11-28). `smart-route` is `selection = grouped` over four ordered pool groups totalling **8 leaves = 3/2/1/2**: `smart-gemini-chat` (3: `direct-google-gemini-4-hydrogen` → `direct-google-gemini-3.8-flash` → `direct-google-gemini-3.6-flash`), `smart-openrouter-free` (2: `openrouter-ernie-5_5-flash-preview-free` → `openrouter-nemotron-3_5-super-vl-free`), `smart-deepseek-flash` (1: `deepseek-deepseek-flash`), and `smart-openrouter-paid` (2: `openrouter-tencent-hy4-flash` → `openrouter-glm-5_3-flash`). `inclusionai/ling-3.2-flash:free` was retired on 2026-11-28 and removed from both accounts - its two targets, both direct aliases, and its memberships in `smart-route`, `smart-openrouter-free`, `smartfree` and `ST_Free` - after the live OpenRouter catalogue stopped listing the `:free` slug. `openrouter-nemotron-3-ultra-free` was removed from automatic dispatch earlier the same day (its group membership was cleared and it was removed from `smart-route` candidates); its direct alias `direct-openrouter-nemotron-3-ultra-free` is preserved for manual use. The two Google Gemini Lite leaves (`direct-google-gemini-3.5-flash-lite` and `direct-google-gemini-3.1-flash-lite`) were also withdrawn from the ladder: their `groups` lost `smart-gemini-chat` and each was removed from the route's `candidates`, while their `smart-gemini-bounded` membership and both direct aliases were preserved. `deepseek-deepseek-v4-pro` is excluded from `smart-route` on every path; its direct alias is retained. The single chat composite is `ST_Route` (children `ST_Free`, `ST_Paid`; not advertised). The decision composition is `smart-decision` (`capability_first`) over the four typed lanes `smart-gemini-decision` (reconciled from the retired `google-decision`), `smartlocal-decision`, `smartfree-decision`, `ST_Decisions`, served at `/v1/decisions` rather than `/v1/chat/completions`. A declared route context is an advertisement, not an admission check."
 
     flat[12003]['options']['content'] = (
         "**TYPED OPERATIONS \u2014 decisions / embed / rerank (separate from the 74 chat routes).**\n\n"
@@ -122,13 +122,13 @@ def correct(doc):
         "Owner and Stephen credentials are never pooled."
     )
 
-    flat[12004]['options']['content'] = '**CREDENTIAL AND REGISTRY BOUNDARIES — refreshed against release `20261128T034335Z-6a8209f97101563b-a7ef9174` (`routes.toml` sha256 `a7ef91747befd072…`, 133,545 B; 2026-11-28).** Keys are referenced by scope, never shown. Separate owner and Stephen credentials cannot be pooled.\n\n| Identity / credential scope | Distinction |\n|---|---|\n| Owner OpenRouter vs Stephen OpenRouter | Different credentials and billing histories, even for identical native model strings |\n| Owner Google vs Stephen Google | separate keys, separate free-tier quota, same model facts |\n| DeepSeek vs DeepSeek-NT | Same provider account, different reasoning policy |\n| OpenAI vs OpenAI-NT | Codex OAuth, not a raw API key |\n| HTPC / ComfyNinja | Owner-operated hardware; compute not free in absolute terms |\n| ThaiLLM | Independent upstream credential |\n\n**Registry census (2026-11-28):** 74 advertised chat routes on `/v1/models` — 55 direct aliases (5 owner-operated local: 2 ComfyNinja, 3 HTPC) and 19 non-direct (1 non-advertised chat composite `ST_Route`, 1 decision composition `smart-decision`, 4 typed-decision lanes, embedding and reranking lanes). The Turnstone model registry is a separate surface and is not identical to the Switchyard route count by definition.'
+    flat[12004]['options']['content'] = '**CREDENTIAL AND REGISTRY BOUNDARIES — refreshed against release `20261128T040916Z-6a8209f97101563b-fc05b640` (`routes.toml` sha256 `fc05b640b49edfd2…`, 131,100 B; 2026-11-28).** Keys are referenced by scope, never shown. Separate owner and Stephen credentials cannot be pooled.\n\n| Identity / credential scope | Distinction |\n|---|---|\n| Owner OpenRouter vs Stephen OpenRouter | Different credentials and billing histories, even for identical native model strings |\n| Owner Google vs Stephen Google | separate keys, separate free-tier quota, same model facts |\n| DeepSeek vs DeepSeek-NT | Same provider account, different reasoning policy |\n| OpenAI vs OpenAI-NT | Codex OAuth, not a raw API key |\n| HTPC / ComfyNinja | Owner-operated hardware; compute not free in absolute terms |\n| ThaiLLM | Independent upstream credential |\n\n**Registry census (2026-11-28):** 72 advertised chat routes on `/v1/models` — 53 direct aliases (5 owner-operated local: 2 ComfyNinja, 3 HTPC) and 19 non-direct (1 non-advertised chat composite `ST_Route`, 1 decision composition `smart-decision`, 4 typed-decision lanes, embedding and reranking lanes). The Turnstone model registry is a separate surface and is not identical to the Switchyard route count by definition.'
 
     c = flat[12006]['options']['content']
     c = c.replace('`VC_Paid` is not a cost/quality judge.', 'No composite is a cost/quality judge.')
     flat[12006]['options']['content'] = c
 
-    flat[12007]['options']['content'] = '**DEPLOYMENT SNAPSHOT - live P11 record (read 2026-11-28, sha256sum-verified).**\n\n| Item | Recorded evidence |\n|---|---|\n| CURRENT (deployed) | `20261128T034335Z-6a8209f97101563b-a7ef9174` |\n| Release action / label | `deploy` / `gemini-lite-out` (activated 2026-11-28T03:43:35Z) |\n| Binary sha256 | `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B) - unchanged from the qualified binary |\n| Manifest sha256 | `a7ef91747befd072624ec589caafef0b0edce0de879b15c5b514994c8f49bf06` (133,545 B installed routes.toml) |\n| Capabilities sha256 | `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B) - reused verified capsule (byte-identical binary) |\n| Rollback target | `20261128T020526Z-6a8209f97101563b-79286007` (predecessor, protected in store) |\n| LAST-KNOWN-GOOD | `20261126T061331Z-65757ec7aaa51166-737a6887` (not promoted) |\n| Running service | PID 879484, NRestarts=0, /v1/models 74 of 74 |\n| Basis | config-only on qualified binary 6a8209f9: withdrew the `smart-gemini-chat` membership of `direct-google-gemini-3.5-flash-lite` and `direct-google-gemini-3.1-flash-lite` and removed both from `smart-route` candidates; `smart-gemini-bounded` membership and both direct aliases preserved; `smart-route` topology now 3/3/1/2 = 9 |\n\nP11 config-only release: binary unchanged; only manifest bytes differ. No rebuild, no LKG promotion, no provider traffic.'
+    flat[12007]['options']['content'] = '**DEPLOYMENT SNAPSHOT - live P11 record (read 2026-11-28, sha256sum-verified).**\n\n| Item | Recorded evidence |\n|---|---|\n| CURRENT (deployed) | `20261128T040916Z-6a8209f97101563b-fc05b640` |\n| Release action / label | `deploy` / `ling-out` (activated 2026-11-28T04:09:16Z) |\n| Binary sha256 | `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B) - unchanged from the qualified binary |\n| Manifest sha256 | `fc05b640b49edfd2956f93d6cedea8dab66157a4871c2b08d26b3111f5352817` (131,100 B installed routes.toml) |\n| Capabilities sha256 | `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B) - reused verified capsule (byte-identical binary) |\n| Rollback target | `20261128T034335Z-6a8209f97101563b-a7ef9174` (predecessor, protected in store) |\n| LAST-KNOWN-GOOD | `20261126T061331Z-65757ec7aaa51166-737a6887` (not promoted) |\n| Running service | PID 880721, NRestarts=0, /v1/models 72 of 72 |\n| Basis | config-only on qualified binary 6a8209f9: retired `inclusionai/ling-3.2-flash:free` from both accounts (2 targets, 2 direct aliases, 4 memberships); `smart-route` topology now 3/2/1/2 = 8; census 72 routes / 58 targets / 53 direct aliases |\n\nP11 config-only release: binary unchanged; only manifest bytes differ. No rebuild, no LKG promotion, no provider traffic.'
 
     # Normalise any residual release/topology tokens left in reference panels (e.g. 12001).
     _NORM = [
@@ -160,13 +160,13 @@ def correct(doc):
          "The direct alias `direct-openrouter-nemotron-3-ultra-free` is installed and advertised; on 2026-11-28 it was removed from `smart-route` automatic dispatch and kept as a manual direct route."),
         ("\u2192 `openrouter-nemotron-3-ultra-free`", ""),
         # gemini-lite-out (release a7ef9174) - the current production baseline.
-        ("20261128T020526Z-6a8209f97101563b-79286007", "20261128T034335Z-6a8209f97101563b-a7ef9174"),
-        ("20261128T020526Z", "20261128T034335Z"),
+        ("20261128T020526Z-6a8209f97101563b-79286007", "20261128T040916Z-6a8209f97101563b-fc05b640"),
+        ("20261128T020526Z", "20261128T040916Z"),
         ("79286007eb597dcc53bc66977a088b3ecb0d1a9b8c09b8d8085adcc1ecdeef0e",
-         "a7ef91747befd072624ec589caafef0b0edce0de879b15c5b514994c8f49bf06"),
+         "fc05b640b49edfd2956f93d6cedea8dab66157a4871c2b08d26b3111f5352817"),
         ("79286007eb597dcc\u2026", "a7ef91747befd072\u2026"),
         ("79286007\u2026", "a7ef9174\u2026"),
-        ("133,673 B", "133,545 B"),
+        ("133,673 B", "131,100 B"),
         ("11 = 5/3/1/2", "9 = 3/3/1/2"),
         ("5/3/1/2", "3/3/1/2"),
         ("11 leaves", "9 leaves"),
@@ -175,6 +175,19 @@ def correct(doc):
         ("11 candidates", "9 candidates"),
         ("`smart-gemini-chat` (5", "`smart-gemini-chat` (3"),
         ("2026-11-28T05:41Z", "2026-11-28T03:44Z"),
+        # ling-out (release fc05b640) - Ling 3.2 Flash Free retired from both accounts.
+        ("9 = 3/3/1/2", "8 = 3/2/1/2"),
+        ("3/3/1/2", "3/2/1/2"),
+        ("9 leaves", "8 leaves"),
+        ("**9** candidates", "**8** candidates"),
+        ("9-candidate", "8-candidate"),
+        ("9 candidates", "8 candidates"),
+        ("`smart-openrouter-free` (3:", "`smart-openrouter-free` (2:"),
+        ("`openrouter-ernie-5_5-flash-preview-free` → `openrouter-ling-3_2-flash-free` → ", "`openrouter-ernie-5_5-flash-preview-free` → "),
+        ("74 of 74", "72 of 72"),
+        ("74 advertised", "72 advertised"),
+        ("55 direct", "53 direct"),
+        ("55 of 55", "53 of 53"),
     ]
     for _pid, _p in flat.items():
         if _pid == 12007:
@@ -240,7 +253,7 @@ def correct_v799(doc):
     # 12004: actual current registry evidence
     flat[12004]['options']['content'] = (
         "**CREDENTIAL AND REGISTRY BOUNDARIES - manifest-side facts refreshed for release `20261128T002506Z` (133,736 B).**\n\n"
-        "- **Direct Routes:** 55 direct aliases defined and advertised (5 local: 2 ComfyNinja, 3 HTPC). All 74 chat routes verified active on `/v1/models`.\n"
+        "- **Direct Routes:** 53 direct aliases defined and advertised (5 local: 2 ComfyNinja, 3 HTPC). All 74 chat routes verified active on `/v1/models`.\n"
         "- **Credentials:** Owner OpenRouter vs Stephen OpenRouter (separate accounts); Owner Google vs Stephen Google (separate keys/quotas); DeepSeek vs DeepSeek-NT; OpenAI Codex OAuth; ThaiLLM.\n"
         "- **Typed / Registered-only rows:** `smart-decision`, `smart-gemini-decision`, `smartlocal-decision`, `smartfree-decision`, `ST_Decisions`, `smartlocal-embedding`, `smartfree-embedding`, `ST_Embed`, `smartlocal-rerank`, `smartfree-rerank`, `ST_Rerank`."
     )

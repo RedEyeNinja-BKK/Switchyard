@@ -68,3 +68,28 @@ The defect was corrected before deployment: the shipped candidate keeps `groups 
 Reproduction check: 64 of 65 panels are byte-identical to `v7-rev105-server-export.json`. The one intentional divergence is panel 12001's Ultra paragraph, which still reads `11 = 5/3/1/2` and `11-candidate` in the published document; the generator renders `9 = 3/3/1/2` and `9-candidate`. The live panel was not corrected because no live dashboard change was authorised in this pass.
 
 The export file is named for the server revision (`v7-rev105-server-export.json`), not for a generation counter, because the revision is the number Grafana assigns and the number the write path checks.
+## Ling retirement (2026-11-28, release `ling-out`)
+
+Owner directive: remove `inclusionai/ling-3.2-flash:free` from active Switchyard configuration and dashboards after the live catalogue stopped listing the `:free` slug.
+
+| Release | Manifest | Note |
+|---|---|---|
+| `20261128T040916Z-6a8209f97101563b-fc05b640` | `fc05b640…` (131,100 B) | **CURRENT — ling-out**: two targets, two direct aliases and memberships in `smart-route`, `smart-openrouter-free`, `smartfree`, `ST_Free` removed; `smart-route` now 8 = 3/2/1/2 |
+
+Dated evidence: OpenRouter `/api/v1/models` fetched 2026-11-28 lists `inclusionai/ling-3.2-flash` (paid) and no `:free` slug — retirement, not allowance exhaustion. The candidate was produced by a line-aware mutator that asserts the parsed-document diff equals exactly the removal set; snapshot committed as `docs/evidence/p11/routes-ling-out.toml`.
+
+Deployment: binary `6a8209f9…` unchanged (no rebuild), capabilities `987dd039…` reused, predecessor `a7ef9174` protected, `LAST-KNOWN-GOOD` `20261126T061331Z-…-737a6887` untouched, P9 `direct=53 qualified=53 failures=0`, `/v1/models` 72 with no `ling`, PID 880721, NRestarts=0.
+
+Dashboards: V7 published as **V7.101** revision **106** (export `v7-rev106-server-export.json`); V9 published as **V9.19** version **26**. Generator `scripts/economics/v7/correct_dashboard.py` reproduces the published V7.101 document (12001 carries no Ling rows and reads "53 of 53"; 12002 reads 8 = 3/2/1/2).
+
+Registry: three retired Ling definitions deleted via the documented admin API — `direct-openrouter-ling-3_2-flash-free` (`e1998a35…`), `direct-openrouter-stephen-ling-3_2-flash-free` (`3abd88dc…`) and the external `openrouter-ling-3.2-flash-free` (`09fb1ef2…`, upstream slug delisted). `POST /v1/api/admin/model-definitions/reload` returned `status: ok` for all five nodes with zero `ling` aliases; 92 → 89 definitions, all unrelated rows preserved. Pre-state (non-secret fields) captured at `/var/tmp/ling-registry-prestate.json`.
+
+## Qualification attempt (2026-11-28) — INCONCLUSIVE
+
+Six deterministic fixtures plus an independent on-disk verifier live in `/var/tmp/qual-ling-out` (t1 repair-and-retest, t2 boundary patch, t3 manifest reconciliation, t4 staged-release refusals, t5 long-context needle, t6 multi-step continuation).
+
+- Control `direct-google-gemini-3.8-flash` / `3.6-flash`: HTTP 429, daily allowance spent (20 per provider day).
+- `direct-google-gemini-3.1-flash-lite`: direct calls succeed at 4.4k and 13.3k input tokens, 429 at ~26k; `task_agent` first turn recorded at 69.4k–69.9k prompt tokens, then `503 backend temporarily unavailable` on every tool-using task (5/5 attempts, both Lite models).
+- `particle-ai/particle-1:free`: HTTP 429 rate-limited upstream; no binding created, no agentic run.
+
+Attribution: provider throughput (harness turn context vs per-minute input budget), not model quality; control failure prevents matched comparison. No admission change made; re-run when a pinnable per-candidate harness or quota headroom exists.

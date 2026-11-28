@@ -99,3 +99,25 @@ Attribution: provider throughput (harness turn context vs per-minute input budge
 Both Lite candidates subsequently completed fixture t1 in a pinned workstream under the same harness; each needed one resume after Switchyard's per-minute input-token budget refused further calls, and both artifacts were verified independently on disk.
 
 V9 export committed alongside: `docs/evidence/p11/v9-gen26-server-export.json` (raw server read, revision 26, title V9.19, sha256 `b6226ade…`).
+## Release lineage additions — 2026-11-28 (recorded later the same day)
+
+Two releases occurred after the `ling-out` record above and were not in this ledger:
+
+| Release | Manifest | Change | Note |
+|---|---|---|---|
+| `20261128T070126Z-6a8209f97101563b-8325fdca` | `8325fdca…` | not described in the resume file | protected; binary unchanged |
+| `20261128T080005Z-6a8209f97101563b-f3b743f5` | `f3b743f5…` (137,957 B) | label `stephen-google-tts-lanes-recovered-20261128`: adds four authorized Stephen-keyed Google TTS lanes | **CURRENT**. Config-only; binary `6a8209f9…` (31,281,480 B) not rebuilt. Capabilities `987dd039…` reused |
+
+The Stephen TTS lanes added by `f3b743f5` are `speech-stephen-2-5-flash`, `speech-stephen-3-1-flash`,
+`speech-stephen-3-8-flash-lite` and `speech-stephen-3-8-flash`, all on
+`SWITCHYARD_GEMINI_STEPHEN_API_KEY` with quota group `google-ai-studio-free-stephen`. They are working
+and must be preserved by any later candidate — the vision candidate reuses `f3b743f5` byte-for-byte, so
+it preserves them by construction.
+
+LAST-KNOWN-GOOD remains `20261126T061331Z-65757ec7aaa51166-737a6887`, not promoted. 18 releases are
+protected. Dashboard state at the time of this record: V7 title **V7.101** revision **106**; V9 title
+**V9.19** version **29**.
+
+Vision estimator correction (`ab101c0a`, binary `60c3556f…`) was built, gated and staged but **not
+activated** — it awaits an owner GO naming that hash. Measurement and localisation work for Gemini 3.8
+and Particle are in `qualification/FINDINGS-20261128-vision-gemini-particle.md`.

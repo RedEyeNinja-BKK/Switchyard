@@ -101,7 +101,7 @@ def correct(doc):
     flat[12001]['options']['content'] = c
 
     flat[12002]['options']['content'] = (
-        "**ROUTING TOPOLOGY \u2014 19 advertised non-direct routes, 1 composite and the 4 typed-decision lanes.** "
+        "**ROUTING TOPOLOGY \u2014 19 advertised non-direct routes, 1 non-advertised chat composite (`ST_Route`), 4 typed-decision lanes and 1 decision composition (`smart-decision`).** "
         "Regenerated from the deployed manifest (`routes.toml` sha256 `79286007eb597dcc\u2026`, 133,673 B, "
         "release `20261128T020526Z-6a8209f97101563b-79286007`) and cross-checked against `/v1/models` on the "
         "service listener (127.0.0.1:4000, **74 of 74 advertised**, 2026-11-28). `smart-route` is "
@@ -112,11 +112,12 @@ def correct(doc):
         "`openrouter-tencent-hy4-flash` \u2192 `openrouter-glm-5_3-flash`). "
         "`openrouter-nemotron-3-ultra-free` was removed from automatic dispatch on 2026-11-28 (its group "
         "membership was cleared and it was removed from `smart-route` candidates); its direct alias "
-        "`direct-openrouter-nemotron-3-ultra-free` is preserved for manual use. The single composite is "
-        "`smart-decision` (selection `capability_first`) with children `smart-gemini-decision`, "
-        "`smartlocal-decision`, `smartfree-decision`. Retired decision definitions (`tier1-decision`, the "
-        "standalone `google-decision` lane) are gone; `smart-gemini-decision` is the surviving Google decision "
-        "lane. A declared route context is an advertisement, not an admission check."
+        "`direct-openrouter-nemotron-3-ultra-free` is preserved for manual use. `deepseek-deepseek-v4-pro` is "
+        "excluded from `smart-route` on every path; its direct alias is retained. The single chat composite is "
+        "`ST_Route` (children `ST_Free`, `ST_Paid`; not advertised). The decision composition is `smart-decision` "
+        "(`capability_first`) over the four typed lanes `smart-gemini-decision` (reconciled from the retired "
+        "`google-decision`), `smartlocal-decision`, `smartfree-decision`, `ST_Decisions`, served at `/v1/decisions` "
+        "rather than `/v1/chat/completions`. A declared route context is an advertisement, not an admission check."
     )
 
     flat[12003]['options']['content'] = (
@@ -151,7 +152,7 @@ def correct(doc):
         "| HTPC / ComfyNinja | Owner-operated hardware; compute not free in absolute terms |\n"
         "| ThaiLLM | Independent upstream credential |\n\n"
         "**Registry census (2026-11-28):** 74 advertised chat routes on `/v1/models` \u2014 55 direct aliases "
-        "(5 owner-operated local: 2 ComfyNinja, 3 HTPC) and 19 non-direct (1 composite `smart-decision`, "
+        "(5 owner-operated local: 2 ComfyNinja, 3 HTPC) and 19 non-direct (1 non-advertised chat composite `ST_Route`, 1 decision composition `smart-decision`, "
         "4 typed-decision lanes, embedding and reranking lanes). The Turnstone model registry is a separate "
         "surface and is not identical to the Switchyard route count by definition."
     )
@@ -205,7 +206,10 @@ def correct(doc):
          "The direct alias `direct-openrouter-nemotron-3-ultra-free` is installed and advertised; on 2026-11-28 it was removed from `smart-route` automatic dispatch and kept as a manual direct route."),
         ("\u2192 `openrouter-nemotron-3-ultra-free`", ""),
     ]
-    for _p in flat.values():
+    for _pid, _p in flat.items():
+        if _pid == 12007:
+            # 12007 is authored with the correct predecessor; do not rewrite its rollback reference.
+            continue
         _o = _p.get('options')
         if isinstance(_o, dict) and isinstance(_o.get('content'), str):
             _c = _o['content']

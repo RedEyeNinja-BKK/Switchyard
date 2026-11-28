@@ -3912,7 +3912,7 @@
             },
             "id": 12002,
             "options": {
-              "content": "**ROUTING TOPOLOGY \u2014 19 advertised non-direct routes, 1 composite and the 4 typed-decision lanes.** Regenerated from the deployed manifest (`routes.toml` sha256 `79286007eb597dcc\u2026`, 133,673 B, release `20261128T020526Z-6a8209f97101563b-79286007`) and cross-checked against `/v1/models` on the service listener (127.0.0.1:4000, **74 of 74 advertised**, 2026-11-28). `smart-route` is `selection = grouped` over four ordered pool groups totalling **11 leaves = 5/3/1/2**: `smart-gemini-chat` (5), `smart-openrouter-free` (3: `openrouter-ernie-5_5-flash-preview-free` \u2192 `openrouter-ling-3_2-flash-free` \u2192 `openrouter-nemotron-3_5-super-vl-free`), `smart-deepseek-flash` (1: `deepseek-deepseek-flash`), and `smart-openrouter-paid` (2: `openrouter-tencent-hy4-flash` \u2192 `openrouter-glm-5_3-flash`). `openrouter-nemotron-3-ultra-free` was removed from automatic dispatch on 2026-11-28 (its group membership was cleared and it was removed from `smart-route` candidates); its direct alias `direct-openrouter-nemotron-3-ultra-free` is preserved for manual use. The single composite is `smart-decision` (selection `capability_first`) with children `smart-gemini-decision`, `smartlocal-decision`, `smartfree-decision`. Retired decision definitions (`tier1-decision`, the standalone `google-decision` lane) are gone; `smart-gemini-decision` is the surviving Google decision lane. A declared route context is an advertisement, not an admission check.",
+              "content": "**ROUTING TOPOLOGY \u2014 19 advertised non-direct routes, 1 non-advertised chat composite (`ST_Route`), 4 typed-decision lanes and 1 decision composition (`smart-decision`).** Regenerated from the deployed manifest (`routes.toml` sha256 `79286007eb597dcc\u2026`, 133,673 B, release `20261128T020526Z-6a8209f97101563b-79286007`) and cross-checked against `/v1/models` on the service listener (127.0.0.1:4000, **74 of 74 advertised**, 2026-11-28). `smart-route` is `selection = grouped` over four ordered pool groups totalling **11 leaves = 5/3/1/2**: `smart-gemini-chat` (5), `smart-openrouter-free` (3: `openrouter-ernie-5_5-flash-preview-free` \u2192 `openrouter-ling-3_2-flash-free` \u2192 `openrouter-nemotron-3_5-super-vl-free`), `smart-deepseek-flash` (1: `deepseek-deepseek-flash`), and `smart-openrouter-paid` (2: `openrouter-tencent-hy4-flash` \u2192 `openrouter-glm-5_3-flash`). `openrouter-nemotron-3-ultra-free` was removed from automatic dispatch on 2026-11-28 (its group membership was cleared and it was removed from `smart-route` candidates); its direct alias `direct-openrouter-nemotron-3-ultra-free` is preserved for manual use. `deepseek-deepseek-v4-pro` is excluded from `smart-route` on every path; its direct alias is retained. The single chat composite is `ST_Route` (children `ST_Free`, `ST_Paid`; not advertised). The decision composition is `smart-decision` (`capability_first`) over the four typed lanes `smart-gemini-decision` (reconciled from the retired `google-decision`), `smartlocal-decision`, `smartfree-decision`, `ST_Decisions`, served at `/v1/decisions` rather than `/v1/chat/completions`. A declared route context is an advertisement, not an admission check.",
               "mode": "markdown"
             },
             "title": "ROUTING \u00b7 PRIMITIVES + COMPOSITES",
@@ -3944,7 +3944,7 @@
             },
             "id": 12004,
             "options": {
-              "content": "**CREDENTIAL AND REGISTRY BOUNDARIES \u2014 refreshed against release `20261128T020526Z` (`routes.toml` sha256 `79286007\u2026`, 133,673 B; 2026-11-28).** Keys are referenced by scope, never shown. Separate owner and Stephen credentials cannot be pooled.\n\n| Identity / credential scope | Distinction |\n|---|---|\n| Owner OpenRouter vs Stephen OpenRouter | Different credentials and billing histories, even for identical native model strings |\n| Owner Google vs Stephen Google | separate keys, separate free-tier quota, same model facts |\n| DeepSeek vs DeepSeek-NT | Same provider account, different reasoning policy |\n| OpenAI vs OpenAI-NT | Codex OAuth, not a raw API key |\n| HTPC / ComfyNinja | Owner-operated hardware; compute not free in absolute terms |\n| ThaiLLM | Independent upstream credential |\n\n**Registry census (2026-11-28):** 74 advertised chat routes on `/v1/models` \u2014 55 direct aliases (5 owner-operated local: 2 ComfyNinja, 3 HTPC) and 19 non-direct (1 composite `smart-decision`, 4 typed-decision lanes, embedding and reranking lanes). The Turnstone model registry is a separate surface and is not identical to the Switchyard route count by definition.",
+              "content": "**CREDENTIAL AND REGISTRY BOUNDARIES \u2014 refreshed against release `20261128T020526Z` (`routes.toml` sha256 `79286007\u2026`, 133,673 B; 2026-11-28).** Keys are referenced by scope, never shown. Separate owner and Stephen credentials cannot be pooled.\n\n| Identity / credential scope | Distinction |\n|---|---|\n| Owner OpenRouter vs Stephen OpenRouter | Different credentials and billing histories, even for identical native model strings |\n| Owner Google vs Stephen Google | separate keys, separate free-tier quota, same model facts |\n| DeepSeek vs DeepSeek-NT | Same provider account, different reasoning policy |\n| OpenAI vs OpenAI-NT | Codex OAuth, not a raw API key |\n| HTPC / ComfyNinja | Owner-operated hardware; compute not free in absolute terms |\n| ThaiLLM | Independent upstream credential |\n\n**Registry census (2026-11-28):** 74 advertised chat routes on `/v1/models` \u2014 55 direct aliases (5 owner-operated local: 2 ComfyNinja, 3 HTPC) and 19 non-direct (1 non-advertised chat composite `ST_Route`, 1 decision composition `smart-decision`, 4 typed-decision lanes, embedding and reranking lanes). The Turnstone model registry is a separate surface and is not identical to the Switchyard route count by definition.",
               "mode": "markdown"
             },
             "title": "PROVIDERS \u00b7 CREDENTIALS / REGISTRY",
@@ -3992,7 +3992,7 @@
             },
             "id": 12007,
             "options": {
-              "content": "**DEPLOYMENT SNAPSHOT - live P11 record (read 2026-11-28, sha256sum-verified).**\n\n| Item | Recorded evidence |\n|---|---|\n| CURRENT (deployed) | `20261128T020526Z-6a8209f97101563b-79286007` |\n| Release action / label | `deploy` / `p11-ultra-out` (created 2026-11-28T02:05:26Z) |\n| Binary sha256 | `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B) - unchanged from the qualified binary |\n| Manifest sha256 | `79286007eb597dcc53bc66977a088b3ecb0d1a9b8c09b8d8085adcc1ecdeef0e` (133,673 B installed routes.toml) |\n| Capabilities sha256 | `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B) - reused verified capsule (byte-identical binary) |\n| Rollback target | `20261128T020526Z-6a8209f97101563b-79286007` (predecessor, protected in store) |\n| LAST-KNOWN-GOOD | `20261126T061331Z-65757ec7aaa51166-737a6887` (not promoted) |\n| Running service | PID 876990, NRestarts=0, /v1/models 74 of 74 |\n| Basis | config-only on qualified binary 6a8209f9: removed `openrouter-nemotron-3-ultra-free` from the `smart-openrouter-free` group and from `smart-route` candidates; direct alias preserved; `smart-route` topology now 5/3/1/2 = 11 |\n\nP11 config-only release: binary unchanged; only manifest bytes differ. No rebuild, no LKG promotion, no provider traffic.",
+              "content": "**DEPLOYMENT SNAPSHOT - live P11 record (read 2026-11-28, sha256sum-verified).**\n\n| Item | Recorded evidence |\n|---|---|\n| CURRENT (deployed) | `20261128T020526Z-6a8209f97101563b-79286007` |\n| Release action / label | `deploy` / `p11-ultra-out` (created 2026-11-28T02:05:26Z) |\n| Binary sha256 | `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B) - unchanged from the qualified binary |\n| Manifest sha256 | `79286007eb597dcc53bc66977a088b3ecb0d1a9b8c09b8d8085adcc1ecdeef0e` (133,673 B installed routes.toml) |\n| Capabilities sha256 | `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B) - reused verified capsule (byte-identical binary) |\n| Rollback target | `20261128T002506Z-6a8209f97101563b-18b377cd` (predecessor, protected in store) |\n| LAST-KNOWN-GOOD | `20261126T061331Z-65757ec7aaa51166-737a6887` (not promoted) |\n| Running service | PID 876990, NRestarts=0, /v1/models 74 of 74 |\n| Basis | config-only on qualified binary 6a8209f9: removed `openrouter-nemotron-3-ultra-free` from the `smart-openrouter-free` group and from `smart-route` candidates; direct alias preserved; `smart-route` topology now 5/3/1/2 = 11 |\n\nP11 config-only release: binary unchanged; only manifest bytes differ. No rebuild, no LKG promotion, no provider traffic.",
               "mode": "markdown"
             },
             "title": "RELEASE / PROVENANCE \u00b7 DATED MEDIA RECORD",
@@ -4100,7 +4100,7 @@
     "timezone": "browser",
     "title": "SWITCHYARD DASHBOARD V7.99",
     "uid": "turnstone-switchyard-v7",
-    "version": 99
+    "version": 101
   },
   "meta": {
     "annotationsPermissions": {
@@ -4129,10 +4129,10 @@
     "provisionedExternalId": "",
     "slug": "switchyard-dashboard-v7-99",
     "type": "db",
-    "updated": "2026-11-28T02:08:50Z",
+    "updated": "2026-11-28T02:28:11Z",
     "updatedBy": "turnstone-mgmt",
     "url": "/d/turnstone-switchyard-v7/switchyard-dashboard-v7-99",
-    "version": 99
+    "version": 101
   },
   "status": 200
 }

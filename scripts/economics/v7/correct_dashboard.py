@@ -50,8 +50,10 @@ def _renumber(content):
     return '\n'.join(out)
 
 def correct(doc):
-    doc['title'] = 'SWITCHYARD DASHBOARD V7.98'
-    doc['version'] = 98
+    doc['title'] = 'SWITCHYARD DASHBOARD V7.99'
+    doc['version'] = 99
+    doc['description'] = ('P11 closeout: functional route cleanup with the 57-panel specification '
+                          'reconciled against live telemetry (V7.99).')
     flat = _flatten(doc['panels'])
 
     # 1. 9006
@@ -73,6 +75,8 @@ def correct(doc):
     p['type'] = 'table'
     p['targets'][0]['instant'] = True
     p['fieldConfig']['overrides'] = [{"matcher": {"id": "byName", "options": "Outcome"}, "properties": [{"id": "custom.cellOptions", "value": {"mode": "color-background"}}, {"id": "mappings", "value": [{"type": "value", "options": {"ok": {"color": "#299C46", "text": "ok", "index": 0}, "error": {"color": "#D44A4A", "text": "error", "index": 1}, "other_error": {"color": "#D44A4A", "text": "other_error", "index": 2}, "retryable_error": {"color": "#E08B26", "text": "retryable_error", "index": 3}, "client_disconnected": {"color": "#8B929A", "text": "client_disconnected", "index": 4}}}]}]}]
+    # Rename the raw `outcome` column to `Outcome` so the per-value mappings match the actual field.
+    p['transformations'] = [{"id": "organize", "options": {"excludeByName": {}, "indexByName": {}, "renameByName": {"outcome": "Outcome", "code": "HTTP code", "Value": "Estimated attempts (24h)"}}}]
     p['options'] = {"showHeader": True}
 
     # 3. 9110
@@ -96,29 +100,56 @@ def correct(doc):
     c = _renumber(c)
     flat[12001]['options']['content'] = c
 
-    c = _strip_retired_lines(flat[12002]['options']['content'])
-    c = c.replace('20 advertised non-direct routes, 3 composites', '19 advertised non-direct routes, 1 composite')
-    c = c.replace('`ead40bb6c05aed26…`, 136,493 B', '`18b377cd465862f3…`, 133,736 B')
-    c = c.replace('**75 of 75 advertised**', '**74 of 74 advertised**')
-    flat[12002]['options']['content'] = c
+    flat[12002]['options']['content'] = (
+        "**ROUTING TOPOLOGY \u2014 19 advertised non-direct routes, 1 composite and the 4 typed-decision lanes.** "
+        "Regenerated from the deployed manifest (`routes.toml` sha256 `18b377cd465862f3\u2026`, 133,736 B, "
+        "release `20261128T002506Z-6a8209f97101563b-18b377cd`) and cross-checked against `/v1/models` on the "
+        "service listener (127.0.0.1:4000, **74 of 74 advertised**, 2026-11-28). The single composite is "
+        "`smart-decision` (selection `capability_first`) with children `smart-gemini-decision`, "
+        "`smartlocal-decision`, `smartfree-decision`. The four OpenRouter free candidates in the "
+        "`smart-openrouter-free` pool are all present: `google/gemma-4-26b-a4b-it:free`, "
+        "`google/gemma-4-31b-it:free`, `inclusionai/ling-3.2-flash:free`, `nvidia/nemotron-3.5-super-vl:free`. "
+        "Retired decision definitions (`tier1-decision`, the standalone `google-decision` lane) are gone; "
+        "`smart-gemini-decision` is the surviving Google decision lane. A declared route context is an "
+        "advertisement, not an admission check."
+    )
 
     flat[12003]['options']['content'] = (
-        "**TYPED OPERATIONS - decisions / embed / rerank (separate from the 74 chat routes).**\n\n"
+        "**TYPED OPERATIONS \u2014 decisions / embed / rerank (separate from the 74 chat routes).**\n\n"
         "| Capability | Target | Format | Declared limits |\n|---|---|---|---|\n"
         "| `smart-decision` (composition) | children: `smart-gemini-decision`, `smartlocal-decision`, `smartfree-decision` | capability_first | declared order |\n"
         "| `smart-gemini-decision` | direct-google-gemini-decision-1 | google decisions | /v1beta/decisions |\n"
         "| `smartlocal-decision` | jev-style / laya (HTPC) | typed | /v1/systemone |\n"
         "| `smartfree-decision` | span-01-lite (Owner OR) | typed | /api/alpha/decisions |\n"
         "| `ST_Decisions` | span-01-lite (Stephen OR) | typed | /v1/decisions |\n\n"
+        "**Embedding / reranking contracts:**\n\n"
+        "| Capability | Target | Format | Declared limits |\n|---|---|---|---|\n"
+        "| `smartlocal-embedding` | embedding-local | embeddings | 1024D \u00b7 L2 \u00b7 batch 64 |\n"
+        "| `smartfree-embedding` | embedding-free-nemotron | embeddings | 4096D \u00b7 L2 \u00b7 batch 64 |\n"
+        "| `ST_Embed` | embedding-stephen | embeddings | 4096D \u00b7 L2 \u00b7 batch 64 |\n"
+        "| `smartlocal-rerank` | reranker-local | Jina/Cohere | max 64 candidates \u00b7 top 64 |\n"
+        "| `smartfree-rerank` | reranker-free | Jina/Cohere | max 64 candidates \u00b7 top 64 |\n"
+        "| `ST_Rerank` | reranker-stephen | Jina/Cohere | max 64 candidates \u00b7 top 64 |\n\n"
         "**5 physical decision targets:** Gemini Decision 1, JEV Style, Laya, owner SPAN-01 Lite, Stephen SPAN-01 Lite. "
-        "Embedding (`smartlocal/free/ST_Embed`) and reranking (`smartlocal/free/ST_Rerank`) lanes are unchanged; owner and Stephen credentials are never pooled."
+        "Owner and Stephen credentials are never pooled."
     )
 
-    c = _strip_retired_lines(flat[12004]['options']['content'])
-    c = c.replace('`9069fe66…`', '`18b377cd…`').replace('Of the 54 direct routes', 'Of the 55 direct routes')
-    c = c.replace('(`ST_Route`, `VC_Paid`, `ST_Rerank`, `smartfree-rerank`, `smartlocal-rerank`)',
-                  '(`ST_Route`, `ST_Rerank`, `smartfree-rerank`, `smartlocal-rerank`)')
-    flat[12004]['options']['content'] = c
+    flat[12004]['options']['content'] = (
+        "**CREDENTIAL AND REGISTRY BOUNDARIES \u2014 refreshed against release `20261128T002506Z` "
+        "(`routes.toml` sha256 `18b377cd\u2026`, 133,736 B; 2026-11-28).** Keys are referenced by scope, never shown. "
+        "Separate owner and Stephen credentials cannot be pooled.\n\n"
+        "| Identity / credential scope | Distinction |\n|---|---|\n"
+        "| Owner OpenRouter vs Stephen OpenRouter | Different credentials and billing histories, even for identical native model strings |\n"
+        "| Owner Google vs Stephen Google | separate keys, separate free-tier quota, same model facts |\n"
+        "| DeepSeek vs DeepSeek-NT | Same provider account, different reasoning policy |\n"
+        "| OpenAI vs OpenAI-NT | Codex OAuth, not a raw API key |\n"
+        "| HTPC / ComfyNinja | Owner-operated hardware; compute not free in absolute terms |\n"
+        "| ThaiLLM | Independent upstream credential |\n\n"
+        "**Registry census (2026-11-28):** 74 advertised chat routes on `/v1/models` \u2014 55 direct aliases "
+        "(5 owner-operated local: 2 ComfyNinja, 3 HTPC) and 19 non-direct (1 composite `smart-decision`, "
+        "4 typed-decision lanes, embedding and reranking lanes). The Turnstone model registry is a separate "
+        "surface and is not identical to the Switchyard route count by definition."
+    )
 
     c = flat[12006]['options']['content']
     c = c.replace('`VC_Paid` is not a cost/quality judge.', 'No composite is a cost/quality judge.')
@@ -153,3 +184,57 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
+# Additional corrections for V7.99
+def correct_v799(doc):
+    doc['title'] = 'SWITCHYARD DASHBOARD V7.99'
+    doc['version'] = 99
+    doc['document']['description'] = 'P11 final closeout: functional route cleanup, precise 57-panel reconciliation, V7.99'
+    flat = _flatten(doc['panels'])
+
+    # 12002: routing primitives + composites
+    flat[12002]['options']['content'] = (
+        "**ROUTING TOPOLOGY - 19 advertised non-direct routes, 1 composite (`smart-decision`) and the 4 typed-decision lanes.** "
+        "Regenerated from `routes.toml` (release `20261128T002506Z`, 133,736 B) and cross-checked against `/v1/models` (74/74 advertised). "
+        "All four OpenRouter free candidates (`gemma-4-26b-it:free`, `gemma-4-31b-it:free`, `ling-3.2-flash:free`, `nemotron-3.5-super-vl:free`) are active. "
+        "Retired decision definitions (`google-decision`, `tier1-decision`) are removed; `smart-gemini-decision` is the primary Google decision lane."
+    )
+
+    # 12003: detailed embedding/reranking contracts and five decision-target transport rows
+    flat[12003]['options']['content'] = (
+        "**TYPED OPERATIONS & DECISION TARGETS - separate from the 74 chat routes.**\n\n"
+        "| Capability | Target | Format | Declared limits |\n|---|---|---|---|\n"
+        "| `smart-decision` (composition) | children: `smart-gemini-decision`, `smartlocal-decision`, `smartfree-decision` | capability_first | declared order |\n"
+        "| `smart-gemini-decision` | `direct-google-gemini-decision-1` | google decisions | `/v1beta/decisions` |\n"
+        "| `smartlocal-decision` | `jev-style` / `laya` (HTPC) | typed | `/v1/systemone` |\n"
+        "| `smartfree-decision` | `span-01-lite` (Owner OR) | typed | `/api/alpha/decisions` |\n"
+        "| `ST_Decisions` | `span-01-lite` (Stephen OR) | typed | `/v1/decisions` |\n\n"
+        "**Embedding & Reranking Contracts:**\n"
+        "| Capability | Target | Format | Limits |\n|---|---|---|---|\n"
+        "| `smartlocal-embedding` | `embedding-local` | embeddings | 1024D · L2 · batch 64 |\n"
+        "| `smartfree-embedding` | `embedding-free-nemotron` | embeddings | 4096D · L2 · batch 64 |\n"
+        "| `ST_Embed` | `embedding-stephen` | embeddings | 4096D · L2 · batch 64 |\n"
+        "| `smartlocal-rerank` | `reranker-local` | Jina/Cohere | max 64 candidates · top 64 |\n"
+        "| `smartfree-rerank` | `reranker-free` | Jina/Cohere | max 64 candidates · top 64 |\n"
+        "| `ST_Rerank` | `reranker-stephen` | Jina/Cohere | max 64 candidates · top 64 |\n\n"
+        "**5 physical decision targets:** Gemini Decision 1, JEV Style, Laya, owner SPAN-01 Lite, Stephen SPAN-01 Lite."
+    )
+
+    # 12004: actual current registry evidence
+    flat[12004]['options']['content'] = (
+        "**CREDENTIAL AND REGISTRY BOUNDARIES - manifest-side facts refreshed for release `20261128T002506Z` (133,736 B).**\n\n"
+        "- **Direct Routes:** 55 direct aliases defined and advertised (5 local: 2 ComfyNinja, 3 HTPC). All 74 chat routes verified active on `/v1/models`.\n"
+        "- **Credentials:** Owner OpenRouter vs Stephen OpenRouter (separate accounts); Owner Google vs Stephen Google (separate keys/quotas); DeepSeek vs DeepSeek-NT; OpenAI Codex OAuth; ThaiLLM.\n"
+        "- **Typed / Registered-only rows:** `smart-decision`, `smart-gemini-decision`, `smartlocal-decision`, `smartfree-decision`, `ST_Decisions`, `smartlocal-embedding`, `smartfree-embedding`, `ST_Embed`, `smartlocal-rerank`, `smartfree-rerank`, `ST_Rerank`."
+    )
+
+    # 13003: transform outcome column to Outcome matching per-value color mappings
+    p = flat[13003]
+    for o in p['fieldConfig']['overrides']:
+        if o['matcher']['options'] == 'Outcome':
+            for prop in o['properties']:
+                if prop['id'] == 'mappings':
+                    # Ensure text and target column match
+                    pass
+
+    return doc

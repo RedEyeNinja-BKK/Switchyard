@@ -30,7 +30,27 @@ WHAT IS PRINTED
 EXIT CODES
     0  the candidate validated
     1  the candidate refused to load
-    2  usage or environment-file problem
+    2  usage, environment-file or isolation problem
+
+QUOTA STATE ISOLATION
+    The candidate's dry-run really loads the configuration, so it reaches the
+    same lazy creation of daily-request counters a real start does. Run against
+    the live state directory as root, anything it creates there is root:root,
+    and the service - which runs unprivileged - then cannot write it: on
+    2026-11-28 a start failed with "cannot be opened read-write by this process:
+    Permission denied (os error 13)" because two Stephen counters were root:root.
+    Whether that particular pair was created by a validation run was never
+    established; that validation can reach the write is not in doubt, and
+    pre-existing counter ownership was never checked either.
+
+    So the child runs inside a private mount namespace with a tmpfs over the
+    state directory named by the candidate's own [quota].state_dir, and the
+    counters that already exist are opened read-write as the account that owns
+    that directory - the account the service runs as - before anything is
+    installed. A counter the service cannot use is a refusal here instead of an
+    outage after the swap. Neither defence can be turned off, and an isolation
+    that cannot be established is a refusal (exit 2) rather than a fallback to
+    running unsandboxed.
 
 P9 RELEASE CONTRACT
     All normal candidate validations refuse unless a pinned, unprivileged-write
@@ -276,6 +296,187 @@ def manifest_direct_routes(manifest: str) -> dict[str, tuple[str, str, str]]:
     return derived
 
 
+# --------------------------------------------------------------------------
+# Production quota state
+#
+# The candidate's dry-run is a real load of the real configuration, so it
+# performs the same lazy accounting-file creation a real start does. Run as an
+# ordinary process against the live state directory, that means validation can
+# write to production, and anything it creates there is root:root 0644 - which
+# the unprivileged service then cannot use:
+#
+#     the daily request counter ... cannot be opened read-write by this
+#     process: Permission denied (os error 13)
+#
+# That failure took a 2026-11-28 start down until the ownership was repaired by
+# hand. Whether that day's two root:root Stephen counters came from a validation
+# run was not established, and this change does not claim it: what it removes is
+# the capability. Validation that can take the service down is not validation.
+#
+# Two independent defences, because one is a mechanism and the other is a
+# measurement:
+#
+#   isolation   the child runs inside a private mount namespace with a tmpfs
+#               over the state directory, so anything it creates is discarded.
+#               The underlying filesystem is never written.
+#   identity    the counters that DO exist are opened read-write as the account
+#               that owns the state directory - the account the service runs as
+#               - before any byte is installed. A counter the service cannot
+#               use becomes a refusal here instead of an outage after the swap.
+#
+# Both fail closed. An isolation that cannot be established is a refusal, not a
+# fallback to running unsandboxed, because the unsandboxed path is the defect.
+# --------------------------------------------------------------------------
+
+QUOTA_STATE_FALLBACK = "/var/lib/switchyard/quota"
+QUOTA_ISOLATION_MARKER = "QUOTA_ISOLATION_FAILED"
+QUOTA_ISOLATION_SIZE = "33554432"  # 32 MiB: counters are a few hundred bytes each.
+
+
+def resolve_quota_state_dir(manifest: str) -> str:
+    """The manifest's own [quota].state_dir, else the deployed default.
+
+    Read from the candidate so validation protects the directory this release
+    will actually use, not whichever one the validator happens to know about.
+    """
+    declared = None
+    if tomllib is not None:
+        try:
+            with open(manifest, "rb") as handle:
+                document = tomllib.load(handle)
+            quota = document.get("quota")
+            if isinstance(quota, dict):
+                candidate = quota.get("state_dir")
+                if isinstance(candidate, str) and candidate.startswith("/"):
+                    declared = candidate
+        except (OSError, ValueError):
+            declared = None
+    return declared or QUOTA_STATE_FALLBACK
+
+
+def service_account(state_dir: str) -> tuple[int, str, int, str]:
+    """The account that owns the state directory: the account the service runs as.
+
+    Derived rather than configured. The directory is created for the service and
+    must be writable by it, so its owner is the runtime identity by construction.
+    A root-owned state directory is not a guessable identity - it is the fault
+    this check exists to catch - so it is a refusal rather than an assumption.
+    """
+    info = os.stat(state_dir)
+    if info.st_uid == 0:
+        raise ValueError(
+            f"{state_dir} is owned by root; the accounting files must belong to the "
+            "account the service runs as, so the runtime identity cannot be derived "
+            "from it. Repair the ownership before validating."
+        )
+    try:
+        import pwd
+
+        user = pwd.getpwuid(info.st_uid).pw_name
+    except (KeyError, ImportError):
+        user = str(info.st_uid)
+    try:
+        import grp
+
+        group = grp.getgrgid(info.st_gid).gr_name
+    except (KeyError, ImportError):
+        group = str(info.st_gid)
+    return info.st_uid, user, info.st_gid, group
+
+
+def isolated_command(command: list[str], state_dir: str) -> list[str]:
+    """Run `command` with a private tmpfs mounted over the production state dir.
+
+    The mount lives only in the child's namespace, so the directory and the
+    files in it are untouched on the host. The marker distinguishes "isolation
+    could not be established" from "the candidate refused to load": they are
+    different faults and only one of them is about the candidate.
+    """
+    script = (
+        "set -eu\n"
+        'dir=$1; shift\n'
+        f'mount -t tmpfs -o mode=0750,size={QUOTA_ISOLATION_SIZE} tmpfs "$dir" '
+        f'|| {{ echo "{QUOTA_ISOLATION_MARKER}" >&2; exit 97; }}\n'
+        'exec "$@"\n'
+    )
+    return [
+        "/usr/bin/unshare", "--mount", "--propagation", "private", "--",
+        "/bin/bash", "-c", script, "switchyard-quota-isolation", state_dir,
+    ] + list(command)
+
+
+# Runs as the service identity. Reads only: it opens each accounting file
+# read-write to prove the open succeeds, and writes nothing.
+_IDENTITY_PROBE = r"""
+import json, os, sys
+state, want_uid, want_gid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+report = {"state": state, "uid": os.getuid(), "gid": os.getgid(),
+          "expected_uid": want_uid, "expected_gid": want_gid,
+          "dir_ok": False, "dir_error": None, "checked": [], "denied": [],
+          "root_owned": []}
+try:
+    info = os.stat(state)
+    if not os.path.isdir(state):
+        report["dir_error"] = "not a directory"
+    elif not os.access(state, os.R_OK | os.W_OK | os.X_OK):
+        report["dir_error"] = "directory is not readable, writable and searchable"
+    else:
+        report["dir_ok"] = True
+except OSError as exc:
+    report["dir_error"] = str(exc)
+try:
+    names = sorted(os.listdir(state))
+except OSError:
+    names = []
+for name in names:
+    if not (name.endswith(".json") or name.endswith(".lock")):
+        continue
+    path = os.path.join(state, name)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        continue
+    if st.st_uid == 0:
+        report["root_owned"].append(name)
+    if not os.path.isfile(path):
+        continue
+    report["checked"].append(name)
+    try:
+        fd = os.open(path, os.O_RDWR)
+        os.close(fd)
+    except OSError as exc:
+        report["denied"].append({"file": name, "error": exc.strerror or str(exc)})
+json.dump(report, sys.stdout)
+"""
+
+
+def check_service_identity_access(state_dir: str,
+                                  identity: tuple[int, str, int, str]) -> tuple[bool, dict]:
+    """Open every production counter read-write as the service account.
+
+    The failure this detects is exactly the outage: a counter that exists but
+    that the service cannot open. Root here would pass regardless of the file's
+    owner, which is why the probe runs under the owning identity instead.
+    """
+    uid, _user, gid, _group = identity
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups",
+             "--", sys.executable, "-c", _IDENTITY_PROBE, state_dir, str(uid), str(gid)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, {"error": f"identity probe could not run: {exc}"}
+    if completed.returncode != 0:
+        return False, {"error": (completed.stderr or completed.stdout or "").strip()[:400]}
+    try:
+        report = json.loads(completed.stdout)
+    except ValueError:
+        return False, {"error": f"identity probe produced no report: {completed.stdout[:200]}"}
+    ok = bool(report.get("dir_ok")) and not report.get("denied") and not report.get("root_owned")
+    return ok, report
+
+
 def judge_p9_report(stdout: str, manifest: str, checker: str,
                     checker_sha: str) -> tuple[bool, str]:
     """Accept the gate's verdict only when it describes this exact candidate.
@@ -413,6 +614,54 @@ def main(argv: list[str]) -> int:
     else:
         command = [args.binary, "--config", args.manifest, "--dry-run"]
 
+    # Production quota state: protect it, then prove the service can still use
+    # what is already there. Both happen before the candidate is executed and
+    # before any pointer or byte is installed.
+    quota_state = resolve_quota_state_dir(args.manifest)
+    quota_receipt = ""
+    if not os.path.isdir(quota_state):
+        if not args.command:
+            print(
+                f"FAILED: quota state directory {quota_state} does not exist; a dry-run "
+                "would create it, and creating production state as a side effect of "
+                "validation is what this check exists to prevent",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"note: {quota_state} does not exist; quota isolation skipped for the test seam")
+    else:
+        try:
+            identity = service_account(quota_state)
+        except (OSError, ValueError) as exc:
+            print(f"FAILED: quota state ownership: {exc}", file=sys.stderr)
+            return 1
+        access_ok, access_report = check_service_identity_access(quota_state, identity)
+        if not access_ok:
+            uid, user, gid, group = identity
+            print("FAILED: the service account cannot use the production quota state",
+                  file=sys.stderr)
+            print(f"  account {user}({uid}):{group}({gid}) on {quota_state}",
+                  file=sys.stderr)
+            if access_report.get("error"):
+                print(f"  {access_report['error']}", file=sys.stderr)
+            if access_report.get("dir_error"):
+                print(f"  directory: {access_report['dir_error']}", file=sys.stderr)
+            for entry in (access_report.get("denied") or [])[:DETAIL_LINES]:
+                print(f"  cannot open {entry['file']}: {entry['error']}", file=sys.stderr)
+            for name in (access_report.get("root_owned") or [])[:DETAIL_LINES]:
+                print(f"  owned by root, so no service account can write it: {name}",
+                      file=sys.stderr)
+            print("  repair with: chown -R <service-user>:<service-group> " + quota_state,
+                  file=sys.stderr)
+            return 1
+        uid, user, gid, group = identity
+        quota_receipt = (
+            f"quota: isolated tmpfs over {quota_state}; "
+            f"{len(access_report.get('checked') or [])} existing counter(s) opened "
+            f"read-write as {user}({uid}):{group}({gid})"
+        )
+        command = isolated_command(command, quota_state)
+
     try:
         completed = subprocess.run(command, env=child_env, capture_output=True,
                                    text=True, timeout=180)
@@ -438,6 +687,10 @@ def main(argv: list[str]) -> int:
             print(f"note: could not write {args.log}: {exc}", file=sys.stderr)
 
     if completed.returncode != 0:
+        if QUOTA_ISOLATION_MARKER in output:
+            print("FAILED: quota state isolation could not be established; refusing to "
+                  "run the candidate against production state unsandboxed", file=sys.stderr)
+            return 2
         print(f"FAILED: the candidate refused to load (exit {completed.returncode})",
               file=sys.stderr)
         detail = scrub(output, secrets).strip().splitlines()
@@ -448,11 +701,33 @@ def main(argv: list[str]) -> int:
                   file=sys.stderr)
         return 1
 
+    # Independent measurement of the isolation: whatever the child did, no file in
+    # the live state directory may be root-owned. A breach is a refusal, because a
+    # validation that wrote to production is not a validation.
+    if quota_receipt:
+        try:
+            stray = [
+                name for name in sorted(os.listdir(quota_state))
+                if os.lstat(os.path.join(quota_state, name)).st_uid == 0
+            ]
+        except OSError as exc:
+            print(f"FAILED: cannot re-read {quota_state} after validation: {exc}",
+                  file=sys.stderr)
+            return 1
+        if stray:
+            print("FAILED: validation left root-owned files in production quota state; "
+                  "isolation did not hold", file=sys.stderr)
+            for name in stray[:DETAIL_LINES]:
+                print(f"  {name}", file=sys.stderr)
+            return 1
+
     summary = scrub(output, secrets).strip().splitlines()
     first = summary[0] if summary else "loaded"
     print(f"candidate validates: {first[:120]}")
     if p9_receipt:
         print(p9_receipt)
+    if quota_receipt:
+        print(quota_receipt)
     return 0
 
 

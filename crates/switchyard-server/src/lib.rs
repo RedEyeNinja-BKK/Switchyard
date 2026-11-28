@@ -2423,9 +2423,7 @@ fn upstream_error(status: StatusCode, body: &str, retry_after_secs: Option<u64>)
     // which made a spent allowance, a minute throttle and a request the provider could not
     // parse indistinguishable in the log. An unrecognised refusal keeps the generic label
     // rather than being guessed into a quota or entitlement failure.
-    let error_class = match switchyard_llm_client::provider_reason::classify(
-        status.as_u16(), body,
-    ) {
+    let error_class = match switchyard_llm_client::provider_reason::classify(status.as_u16(), body) {
         switchyard_llm_client::ProviderReason::Unknown => "upstream_rejected",
         reason => reason.as_str(),
     };

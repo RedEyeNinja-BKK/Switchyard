@@ -29,3 +29,34 @@ The PNGs under `docs/evidence/p11/` are **synthetic telemetry illustrations** pr
 
 - V7 `turnstone-switchyard-v7`: generation **101** (V7.99) — current.
 - V9 `turnstone-switchyard-economics-v9`: version **24** (V9.17) — description updated; dated P11 correction appended to the historical PICTURE-3 record (panel 11007), history preserved.
+## Gemini Lite withdrawal (2026-11-28)
+
+Owner directive: remove `direct-google-gemini-3.5-flash-lite` and `direct-google-gemini-3.1-flash-lite` from automatic `smart-route` dispatch.
+
+| Release | Manifest | Note |
+|---|---|---|
+| `20261128T034335Z-6a8209f97101563b-a7ef9174` | `a7ef9174…` (133,545 B) | **CURRENT - gemini-lite-out**: both Lite leaves out of the ladder; `smart-route` now 9 = 3/3/1/2; both direct aliases and `smart-gemini-bounded` membership preserved |
+
+Exactly four semantic lines differ from `79286007`: the `groups` line of each Lite target (`["smart-gemini-bounded", "smart-gemini-chat"]` → `["smart-gemini-bounded"]`) and the two candidate entries removed from `[routes.smart-route]`. The delta was proved by a full parsed-document diff whose differing paths were asserted to be exactly those three keys; any additional path refuses the build.
+
+`smart-gemini-bounded` still has all four members (`direct-google-gemini-3.5-flash-lite`, `direct-google-gemini-3.1-flash-lite`, `direct-google-gemma-4-31b-it`, `direct-google-gemma-4-26b-a4b-it`); the `smart-gemini-chat` pool is `direct-google-gemini-4-hydrogen`, `direct-google-gemini-3.8-flash`, `direct-google-gemini-3.6-flash`. The bounded lane therefore keeps serving the two Lite models; only the automatic chat ladder changed.
+
+Deployment: binary `6a8209f9…` unchanged (no rebuild), capabilities capsule `987dd039…` reused, predecessor `79286007` protected in the store, `LAST-KNOWN-GOOD` `20261126T061331Z-…-737a6887` untouched. P9 gate: `direct=55 qualified=55 failures=0`. `/v1/models` 74 of 74 advertised after restart (PID 879484).
+
+## Incident record - in-place store mutation and repair (2026-11-28)
+
+An earlier attempt copied a candidate manifest directly over `CURRENT/routes.toml` at 03:20:26Z without creating a release. That candidate also carried a defect: both Lite targets were set to `groups = []`, which would have removed them from `smart-gemini-bounded` as well - collateral to the owner's instruction.
+
+What was and was not affected:
+
+- `/etc/switchyard/routes.toml`, the live manifest, was never touched and remained `79286007…` throughout (mtime 02:05:25Z).
+- The running process never read the mutated copy: the unit declares no `ExecReload=`, and PID 876990 had started at 02:05:25Z. No reload occurred.
+- The store copy was restored byte-exactly from the live manifest at 03:41Z; `activate-release.sh verify` then reported `manifest 79286007… ok`, `service healthy`.
+- No release was created by that attempt, and no release id beyond the ones listed above exists.
+
+The defect was corrected before deployment: the shipped candidate keeps `groups = ["smart-gemini-bounded"]`. `activate-release.sh` would in fact have refused the mutated baseline anyway, because its rollback-target integrity check compares the stored manifest against `release.json`.
+
+## Dashboard generations
+
+- V7 `turnstone-switchyard-v7`: generation **102** (title V7.100, revision 105). Panels 12001 (both Lite rows retained), 12002 (topology 9 = 3/3/1/2 and the Lite withdrawal note), 12004 (release reference) and 12007 (present-tense release snapshot, rollback target `020526Z`) updated; all earlier P11 corrections preserved.
+- V9 `turnstone-switchyard-economics-v9`: version **25** (title V9.18). A dated `CORRECTION 2026-11-28` block was appended to the historical PICTURE-3 record (panel 11007); the prior text is unedited.

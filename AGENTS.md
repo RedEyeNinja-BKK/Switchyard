@@ -25,7 +25,7 @@ Write for a high-school level in short, simple sentences. Avoid jargon, analogie
 - Avoid abstractions, configurability, and defensive code for hypothetical needs.
 - If the implementation grows unexpectedly large, reconsider and simplify it.
 - For bugs, reproduce the failure before fixing it; for refactors, establish a behavioral baseline first.
-- Make reasonable, reversible assumptions when consequences are small. Ask only when ambiguity would materially change the result, expand scope, or risk an irreversible acti
+- Make reasonable, reversible assumptions when consequences are small. Ask only when ambiguity would materially change the result, expand scope, or risk an irreversible action.
 
 ## Release and deployment safety
 

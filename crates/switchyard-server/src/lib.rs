@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, Request as HttpRequest, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -634,18 +634,12 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
             post(capability_surfaces::transcriptions),
         )
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
-        .route(
-            "/v1/live/{capability}",
-            get(live_surface::live_websocket),
-        )
+        .route("/v1/live/{capability}", get(live_surface::live_websocket))
         .route(
             "/v1/music/{capability}",
             get(music_surface::music_websocket),
         )
-        .route(
-            "/v1/robotics/spatial",
-            post(robotics_surface::spatial),
-        )
+        .route("/v1/robotics/spatial", post(robotics_surface::spatial))
         .route(
             "/v1/responses/input_tokens",
             post(openai_responses_input_tokens),
@@ -2273,7 +2267,11 @@ fn client_error(error: &LlmClientError) -> Response {
             "temporarily_unavailable",
             *retry_after_secs,
         ),
-        LlmClientError::UpstreamHttp { status, body } => upstream_error(*status, body),
+        LlmClientError::UpstreamHttp {
+            status,
+            body,
+            retry_after_secs,
+        } => upstream_error(*status, body, *retry_after_secs),
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -2395,7 +2393,7 @@ fn client_error(error: &LlmClientError) -> Response {
 }
 
 // Keep the provider's message and nonempty string code in our error JSON.
-fn upstream_error(status: StatusCode, body: &str) -> Response {
+fn upstream_error(status: StatusCode, body: &str, retry_after_secs: Option<u64>) -> Response {
     let parsed = serde_json::from_str::<Value>(body).unwrap_or_default();
     let error = &parsed["error"];
     let message = error["message"].as_str().unwrap_or(body);
@@ -2404,6 +2402,11 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
         .filter(|code| !code.is_empty())
         .unwrap_or("upstream_error");
     let mut response = error_response(status, message, "upstream_error", code);
+    if let Some(seconds) = retry_after_secs
+        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+    {
+        response.headers_mut().insert(RETRY_AFTER, value);
+    }
     // Provider messages and codes can quote request content; log only fixed metadata.
     response
         .extensions_mut()
@@ -2421,8 +2424,7 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
     // parse indistinguishable in the log. An unrecognised refusal keeps the generic label
     // rather than being guessed into a quota or entitlement failure.
     let error_class = match switchyard_llm_client::provider_reason::classify(
-        status.as_u16(),
-        body,
+        status.as_u16(), body,
     ) {
         switchyard_llm_client::ProviderReason::Unknown => "upstream_rejected",
         reason => reason.as_str(),
@@ -3410,6 +3412,7 @@ mod tests {
             body: format!(
                 r#"{{"error":{{"message":"validation failed: {LEAKED}","code":"invalid_request_{LEAKED}"}}}}"#
             ),
+            retry_after_secs: None,
         };
         for wire_format in [
             WireFormat::OpenAiChat,
@@ -3434,6 +3437,21 @@ mod tests {
     /// now read where the body still exists, and an unexplained refusal is not guessed into a
     /// quota or entitlement class.
     #[test]
+    fn upstream_retry_after_is_forwarded_but_local_refusals_are_unchanged() {
+        let body = r#"{"error":{"message":"slow down","code":"rate_limit"}}"#;
+        let forwarded = upstream_error(StatusCode::TOO_MANY_REQUESTS, body, Some(7));
+        assert_eq!(forwarded.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(forwarded.headers().get(RETRY_AFTER).unwrap(), "7");
+
+        let absent = upstream_error(StatusCode::TOO_MANY_REQUESTS, body, None);
+        assert!(absent.headers().get(RETRY_AFTER).is_none());
+
+        let local = client_error(&LlmClientError::TemporarilyUnavailable);
+        assert_eq!(local.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(local.headers().get(RETRY_AFTER).is_none());
+    }
+
+    #[test]
     fn an_upstream_refusal_is_logged_with_the_providers_reason() {
         let cases = [
             (
@@ -3446,14 +3464,26 @@ mod tests {
                 r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}"#,
                 "provider_model_quota_exhausted",
             ),
-            (429, r#"{"error":{"code":"rate_limit_exceeded"}}"#, "provider_throttled"),
+            (
+                429,
+                r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+                "provider_throttled",
+            ),
             (
                 400,
                 r#"{"error":{"code":"unsupported_parameter","message":"unknown field"}}"#,
                 "provider_incompatible",
             ),
-            (401, r#"{"error":{"code":"invalid_api_key"}}"#, "provider_auth_failed"),
-            (503, r#"{"error":{"message":"overloaded"}}"#, "provider_unavailable"),
+            (
+                401,
+                r#"{"error":{"code":"invalid_api_key"}}"#,
+                "provider_auth_failed",
+            ),
+            (
+                503,
+                r#"{"error":{"message":"overloaded"}}"#,
+                "provider_unavailable",
+            ),
             (
                 400,
                 r#"{"error":{"message":"Bad Request"}}"#,
@@ -3461,7 +3491,11 @@ mod tests {
             ),
         ];
         for (status, body, expected) in cases {
-            let response = upstream_error(StatusCode::from_u16(status).expect("a valid status"), body);
+            let response = upstream_error(
+                StatusCode::from_u16(status).expect("a valid status"),
+                body,
+                None,
+            );
             let failure = response
                 .extensions()
                 .get::<RequestLogFailure>()
@@ -3558,7 +3592,7 @@ mod tests {
             r#"{{"error":{{"message":"{MISSING}","type":"upstream_error","code":"upstream_error","request_id":"req_test_123"}}}}"#
         );
         let response = render_error_response(
-            upstream_error(StatusCode::BAD_REQUEST, &body),
+            upstream_error(StatusCode::BAD_REQUEST, &body, None),
             WireFormat::OpenAiChat,
         );
         let events = captured_events(|| request_log_context().emit(&response));
@@ -3618,7 +3652,8 @@ mod tests {
                 events[0].1
             );
             assert!(
-                !events[0].1.contains("local_invalid_request") || expected == "local_invalid_request",
+                !events[0].1.contains("local_invalid_request")
+                    || expected == "local_invalid_request",
                 "{status} must not be folded into local_invalid_request: {}",
                 events[0].1
             );
@@ -3763,7 +3798,7 @@ mod tests {
         );
 
         let response = render_error_response(
-            upstream_error(StatusCode::BAD_REQUEST, &body),
+            upstream_error(StatusCode::BAD_REQUEST, &body, None),
             WireFormat::OpenAiChat,
         );
         let events = captured_events(|| request_log_context().emit(&response));
@@ -3811,7 +3846,7 @@ mod tests {
         let body = r#"{"error":{"message":"Provider returned error","type":"upstream_error","code":"upstream_error"}}"#;
         assert!(RequestLogFailure::from_error_body(body).is_none());
         let response = render_error_response(
-            upstream_error(StatusCode::BAD_REQUEST, body),
+            upstream_error(StatusCode::BAD_REQUEST, body, None),
             WireFormat::OpenAiChat,
         );
         let events = captured_events(|| request_log_context().emit(&response));

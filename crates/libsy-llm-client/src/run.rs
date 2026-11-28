@@ -505,6 +505,7 @@ async fn buffer_routing_stream(
                     return Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::BAD_GATEWAY,
                         body: message.clone(),
+                        retry_after_secs: None,
                     });
                 }
                 _ => {}
@@ -622,7 +623,7 @@ impl FailureClass {
 fn is_retired_minimax_free(error: &LibsyError) -> bool {
     let LibsyError::ClientCall {
         target,
-        source: LlmClientError::UpstreamHttp { status, body },
+        source: LlmClientError::UpstreamHttp { status, body, .. },
     } = error
     else {
         return false;
@@ -656,7 +657,7 @@ fn is_retired_minimax_free(error: &LibsyError) -> bool {
 /// predicate lives in `client.rs`: two decision layers (candidate fallback and
 /// whole-route composition) must reach the same verdict.
 pub(crate) fn is_retired_model(error: &LlmClientError) -> bool {
-    let LlmClientError::UpstreamHttp { status, body } = error else {
+    let LlmClientError::UpstreamHttp { status, body, .. } = error else {
         return false;
     };
     if *status != StatusCode::NOT_FOUND {
@@ -728,7 +729,7 @@ fn credential_scoped_stop(error: &LibsyError) -> bool {
     }
     // Google names the scope of its own stops, so its verdict decides: a stop that keeps
     // the outcome is about the request and stays terminal.
-    if let LlmClientError::UpstreamHttp { status, body } = source
+    if let LlmClientError::UpstreamHttp { status, body, .. } = source
         && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
     {
         let recovery = google.recovery();
@@ -966,7 +967,7 @@ fn provider_reason_of(
         return (None, None);
     };
     match source {
-        LlmClientError::UpstreamHttp { status, body } => {
+        LlmClientError::UpstreamHttp { status, body, .. } => {
             let (reason, scope) =
                 crate::provider_reason::classify_with_scope(status.as_u16(), body);
             (Some(reason), Some(scope))
@@ -1005,7 +1006,7 @@ pub fn credential_block(error: &LibsyError) -> Option<(CredentialBlockKind, Stri
     // which would leave a per-model exhaustion both unrecorded and fatal to a mixed pool:
     // unrecorded because no block is produced, fatal because a composite with
     // `cross_on = "credential_block"` treats "no block" as terminal and returns.
-    let LlmClientError::UpstreamHttp { status, body } = source else {
+    let LlmClientError::UpstreamHttp { status, body, .. } = source else {
         return None;
     };
     // The block kind is the provider's typed reason and scope rather than a second reading of
@@ -1134,7 +1135,7 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         // the target is resting, so a composite may still advance to a sibling. The interval
         // is published to the caller; it is not a reason to sleep inside the router.
         LlmClientError::CoolingDown { .. } => FailureClass::TemporarilyUnavailable,
-        LlmClientError::UpstreamHttp { status, body } => match *status {
+        LlmClientError::UpstreamHttp { status, body, .. } => match *status {
             // Google names its condition in the body, and the name decides more than the
             // status: a 429 is a throttle or a spent daily quota, a 400 is an adapter defect
             // or a content block. Diagnosis stays a pure mapping; what may be retried or
@@ -1266,7 +1267,7 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     // policy block, a malformed tool call - is an answer, so handing it to another provider
     // would be evading it rather than serving the caller. A quota scoped to one model is
     // neither: its siblings on the same credential still have their own budget.
-    if let LlmClientError::UpstreamHttp { status, body } = source
+    if let LlmClientError::UpstreamHttp { status, body, .. } = source
         && let Some(google) = crate::google::parse(Some(status.as_u16()), body)
     {
         let recovery = google.recovery();
@@ -1294,7 +1295,7 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         }
         // A policy denial can be specific to one provider. Preserve its HTTP
         // error, but allow another candidate to serve the request.
-        LlmClientError::UpstreamHttp { status, body }
+        LlmClientError::UpstreamHttp { status, body, .. }
             if *status == StatusCode::BAD_REQUEST
                 && serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
                     value["error"]["code"].as_str() == Some("content_policy_violation")
@@ -1311,7 +1312,7 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         // by policy, so that leg can never accept the replay; declaring
         // `tool_call_replay = false` keeps it out of the dispatch, and this arm keeps an
         // undeclared target from ending the route with a 400.
-        LlmClientError::UpstreamHttp { status, body }
+        LlmClientError::UpstreamHttp { status, body, .. }
             if *status == StatusCode::BAD_REQUEST && missing_reasoning_replay(body) =>
         {
             Some(RoutingFallbackReason::Unavailable)
@@ -1761,10 +1762,7 @@ impl ClientRouter {
     /// `None` makes a block unattributable rather than guessed at: a failure whose target
     /// resolves to no configured credential must not condemn one.
     pub fn credential_for(&self, model: &ModelId) -> Option<&str> {
-        self.inner
-            .target_credentials
-            .get(model)
-            .map(String::as_str)
+        self.inner.target_credentials.get(model).map(String::as_str)
     }
 
     /// Declares which account-scoped allowance group serves each target model.
@@ -3055,7 +3053,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reference_without_resolved_state_is_refused_before_any_upstream_call() -> Result<()> {
+    async fn a_reference_without_resolved_state_is_refused_before_any_upstream_call() -> Result<()>
+    {
         // A `previous_response_id` is caller-supplied. When this router holds no
         // state for it, the tool result it was supposed to answer stays
         // unresolved: the request is refused before dispatch, so no leg of the
@@ -3071,7 +3070,10 @@ mod tests {
             first: FirstOutcome::StreamSuccess,
         });
         let clients = ClientRouter::new(HashMap::from([
-            (ModelId::from("weak"), primary.clone() as Arc<dyn RoutedLlmClient>),
+            (
+                ModelId::from("weak"),
+                primary.clone() as Arc<dyn RoutedLlmClient>,
+            ),
             (
                 ModelId::from("strong"),
                 fallback.clone() as Arc<dyn RoutedLlmClient>,

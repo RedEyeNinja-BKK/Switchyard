@@ -290,6 +290,7 @@ mod tests {
                 LlmClientError::UpstreamHttp {
                     status: axum::http::StatusCode::BAD_GATEWAY,
                     body: format!("upstream failed: {LEAKED}"),
+                    retry_after_secs: None,
                 },
             ))]))
         })?;

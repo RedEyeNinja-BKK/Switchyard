@@ -276,6 +276,8 @@ pub enum LlmClientError {
         status: http::StatusCode,
         /// Raw upstream error body.
         body: String,
+        /// The upstream's Retry-After delta, when supplied and parseable.
+        retry_after_secs: Option<u64>,
     },
 
     /// The upstream returned a response the client could not decode.

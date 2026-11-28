@@ -844,6 +844,7 @@ mod tests {
         let source = stream::iter([Err(LlmClientError::UpstreamHttp {
             status: http::StatusCode::BAD_GATEWAY,
             body: LEAKED.to_string(),
+            retry_after_secs: None,
         })]);
 
         let warnings = warnings_of(observed(source), None).await;

@@ -749,7 +749,6 @@ pub(crate) async fn spatial(
         .into_response()
 }
 
-
 fn error_body(status: StatusCode, message: String, kind: &str) -> Response {
     (
         status,

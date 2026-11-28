@@ -236,7 +236,11 @@ pub fn classify(status: u16, body: &str) -> ProviderReason {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let limit_source = error
-        .and_then(|error| error.get("metadata").and_then(|metadata| metadata.get("limit_source")))
+        .and_then(|error| {
+            error
+                .get("metadata")
+                .and_then(|metadata| metadata.get("limit_source"))
+        })
         .and_then(serde_json::Value::as_str)
         .map(str::to_ascii_lowercase);
 
@@ -287,7 +291,9 @@ pub fn classify(status: u16, body: &str) -> ProviderReason {
                 .map(str::to_ascii_lowercase)
                 .or(code);
             match cause.as_deref() {
-                Some("authentication" | "permission_denied") => ProviderReason::AuthenticationFailed,
+                Some("authentication" | "permission_denied") => {
+                    ProviderReason::AuthenticationFailed
+                }
                 Some("payment_required" | "insufficient_quota") => {
                     ProviderReason::AccountAllowanceExhausted
                 }
@@ -305,7 +311,7 @@ pub fn classify(status: u16, body: &str) -> ProviderReason {
 /// own and must not be dressed up as provider statements.
 pub fn reason_code(error: &LlmClientError) -> Option<&'static str> {
     match error {
-        LlmClientError::UpstreamHttp { status, body } => {
+        LlmClientError::UpstreamHttp { status, body, .. } => {
             Some(classify(status.as_u16(), body).as_str())
         }
         _ => None,
@@ -316,7 +322,11 @@ pub fn reason_code(error: &LlmClientError) -> Option<&'static str> {
 ///
 /// The OpenRouter marker is the measured one; the billing codes and the free-model sentence are
 /// the published spellings of the same fact without it.
-fn names_exhausted_allowance(limit_source: Option<&str>, code: &Option<String>, message: &str) -> bool {
+fn names_exhausted_allowance(
+    limit_source: Option<&str>,
+    code: &Option<String>,
+    message: &str,
+) -> bool {
     if limit_source.is_some_and(|source| source.starts_with("openrouter_free_tier")) {
         return true;
     }
@@ -445,7 +455,10 @@ mod tests {
     #[test]
     fn a_documented_malformed_code_is_an_invalid_request() {
         assert_eq!(
-            classify_body(400, r#"{"error":{"code":"invalid_request_error","message":"bad"}}"#),
+            classify_body(
+                400,
+                r#"{"error":{"code":"invalid_request_error","message":"bad"}}"#
+            ),
             ProviderReason::InvalidRequest
         );
     }
@@ -481,7 +494,10 @@ mod tests {
             classify_body(400, r#"{"error":{"message":"Bad Request"}}"#),
             ProviderReason::Unknown
         );
-        assert_eq!(classify_body(400, "not json at all"), ProviderReason::Unknown);
+        assert_eq!(
+            classify_body(400, "not json at all"),
+            ProviderReason::Unknown
+        );
     }
 
     #[test]

@@ -1586,7 +1586,7 @@ async fn upstream_body_is_redacted_from_the_client_call_span() -> switchyard_lib
     assert!(matches!(
         result,
         Err(LibsyError::ClientCall {
-            source: LlmClientError::UpstreamHttp { status, body },
+            source: LlmClientError::UpstreamHttp { status, body, .. },
             ..
         }) if status == http::StatusCode::INTERNAL_SERVER_ERROR && body.contains(LEAKED_CONTENT)
     ));

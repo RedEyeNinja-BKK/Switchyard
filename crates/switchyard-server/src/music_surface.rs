@@ -780,7 +780,6 @@ async fn account_and_forward_text(
     None
 }
 
-
 fn unknown_capability(model: &str, available: &[String]) -> Response {
     (
         StatusCode::NOT_FOUND,

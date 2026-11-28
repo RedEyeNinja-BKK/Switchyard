@@ -339,6 +339,7 @@ impl TranslatingLlmClient {
                     return Err(LlmClientError::UpstreamHttp {
                         status,
                         body: "upstream still cooling down after a recent failure".to_string(),
+                        retry_after_secs: None,
                     });
                 }
             }
@@ -865,7 +866,11 @@ impl TranslatingLlmClient {
                     message: body,
                 }
             } else {
-                LlmClientError::UpstreamHttp { status, body }
+                LlmClientError::UpstreamHttp {
+                    status,
+                    body,
+                    retry_after_secs: retry_after.map(|d| d.as_secs().max(1)),
+                }
             };
         Err(AttemptFailure {
             error,
@@ -962,6 +967,7 @@ impl TranslatingLlmClient {
                                     metadata.as_ref(),
                                     backend.is_forwarding_auth(),
                                 ),
+                                retry_after_secs: None,
                             }
                         }
                         error => LlmClientError::ResponseTranslation(error.to_string()),
@@ -1305,7 +1311,7 @@ fn is_documented_billing_limit(body: &str) -> bool {
 }
 
 pub(crate) fn is_account_wide_quota(source: &LlmClientError) -> bool {
-    let LlmClientError::UpstreamHttp { status, body } = source else {
+    let LlmClientError::UpstreamHttp { status, body, .. } = source else {
         return false;
     };
     let limit_source = serde_json::from_str::<serde_json::Value>(body)
@@ -1379,7 +1385,7 @@ fn rests_the_model(error: &LlmClientError) -> bool {
         return true;
     }
     match error {
-        LlmClientError::UpstreamHttp { status, body } => {
+        LlmClientError::UpstreamHttp { status, body, .. } => {
             crate::google::parse(Some(status.as_u16()), body)
                 .is_some_and(|error| error.recovery().cool_down_model)
         }
@@ -1491,7 +1497,7 @@ fn is_transient_failure(error: &LlmClientError) -> bool {
         // The feature is missing from the target, not from the attempt: sending it again,
         // or to a sibling on the same wire format, cannot add it.
         LlmClientError::UnsupportedFeature { .. } => false,
-        LlmClientError::UpstreamHttp { status, body } => {
+        LlmClientError::UpstreamHttp { status, body, .. } => {
             if status.is_server_error() && is_masked_permanent_failure(body) {
                 return false;
             }
@@ -5038,7 +5044,7 @@ mod tests {
             Err(error) => error,
         };
 
-        let LlmClientError::UpstreamHttp { status, body } = &error else {
+        let LlmClientError::UpstreamHttp { status, body, .. } = &error else {
             panic!("expected an upstream HTTP error, got {error:?}");
         };
         assert_eq!(*status, StatusCode::BAD_REQUEST);

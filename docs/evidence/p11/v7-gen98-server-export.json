@@ -1418,7 +1418,7 @@
               "type": "prometheus",
               "uid": "df7wrp11a9hq8c"
             },
-            "description": "Request rate by model-family heuristic (native model labels). Pairwise disjoint; sum compared to all-model traffic; unmatched=unclassified. Caller label, not selected model or billing account. Unit requests/s.",
+            "description": "Request rate by model-family heuristic (native model labels), including an explicit unclassified catch-all series. Unit requests/s.",
             "fieldConfig": {
               "defaults": {
                 "custom": {
@@ -1459,8 +1459,8 @@
                   "type": "prometheus",
                   "uid": "df7wrp11a9hq8c"
                 },
-                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\",model=~\"comfyninja/qwen3\\.8-27b-q4-mtp|comfyninja/qwen3\\.8-27b-q4-mtp-vl\"}[5m]))",
-                "legendFormat": "2 ComfyNinja",
+                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\", model=~\"baidu/ernie-5\\.5-flash-preview:free|gemini-3\\.[15]-flash-lite|gemma-4-26b-a4b-it|gpt-6-luna|nvidia/nemotron-3-ultra-550b-a55b:free\"}[5m]))",
+                "legendFormat": "classified family traffic",
                 "refId": "A"
               },
               {
@@ -1468,57 +1468,12 @@
                   "type": "prometheus",
                   "uid": "df7wrp11a9hq8c"
                 },
-                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\",model=~\"deepseek-flash|deepseek-v4-pro\"}[5m]))",
-                "legendFormat": "3 owner DeepSeek",
+                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\", model!~\"baidu/ernie-5\\.5-flash-preview:free|gemini-3\\.[15]-flash-lite|gemma-4-26b-a4b-it|gpt-6-luna|nvidia/nemotron-3-ultra-550b-a55b:free\"}[5m]))",
+                "legendFormat": "unclassified / other traffic",
                 "refId": "B"
-              },
-              {
-                "datasource": {
-                  "type": "prometheus",
-                  "uid": "df7wrp11a9hq8c"
-                },
-                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\",model=~\"Qwen3\\.5-9B-MTP|Qwen3\\.5-9B-Q4_0|jev-style-0\\.8b-decision-v3|laya-rl-agent\"}[5m]))",
-                "legendFormat": "3 HTPC / local",
-                "refId": "C"
-              },
-              {
-                "datasource": {
-                  "type": "prometheus",
-                  "uid": "df7wrp11a9hq8c"
-                },
-                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\",model=~\"baidu/ernie-5\\.5-flash-preview:free|inclusionai/ling-3\\.2-flash:free|deepseek/deepseek-v4\\.1-flash|deepseek/deepseek-v4\\.1-flash-1017|dots-studio/dots-3-note-preview:free|google/gemma-4-26b-a4b-it:free|google/gemma-4-31b-it:free|liquid/lfm-2\\.5-2\\.6b:free|nvidia/nemotron-3\\.5-super-vl:free|qwen/qwen3\\.7-flash|qwen/qwen3\\.8-flash|recursive/flint-v1\\.0:free|respan/span-01-lite|z-ai/glm-5\\.3-flash|openrouter/free|tencent/hy4-flash|nvidia/nemotron-3-ultra-550b-a55b:free\"}[5m]))",
-                "legendFormat": "14 owner OpenRouter",
-                "refId": "D"
-              },
-              {
-                "datasource": {
-                  "type": "prometheus",
-                  "uid": "df7wrp11a9hq8c"
-                },
-                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\",model=~\"openthaigpt-thaillm-8b-instruct-v7\\.2|qwen3\\.5-9b|qwen3\\.6-35b-a3b|thalle-0\\.2-thaillm-8b-fa|typhoon-s-thaillm-8b-instruct\"}[5m]))",
-                "legendFormat": "5 ThaiLLM",
-                "refId": "E"
-              },
-              {
-                "datasource": {
-                  "type": "prometheus",
-                  "uid": "df7wrp11a9hq8c"
-                },
-                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\",model=~\"gpt-6-luna|gpt-6-sol\"}[5m]))",
-                "legendFormat": "3 owner OpenAI",
-                "refId": "F"
-              },
-              {
-                "datasource": {
-                  "type": "prometheus",
-                  "uid": "df7wrp11a9hq8c"
-                },
-                "expr": "sum(rate(switchyard_requests_total{job=\"switchyard-v7\",model=~\"gemini-.+|gemma-[0-9]+-.+\"}[5m]))",
-                "legendFormat": "8 owner Google",
-                "refId": "G"
               }
             ],
-            "title": "MODEL-FAMILY TRAFFIC \u00b7 HEURISTIC ATTRIBUTION",
+            "title": "MODEL-FAMILY TRAFFIC & UNCLASSIFIED",
             "type": "timeseries"
           },
           {
@@ -2454,7 +2409,7 @@
             "type": "timeseries"
           },
           {
-            "description": "Estimated upstream attempts in 24h by HTTP code and outcome. Instant table: columns HTTP code / Outcome / Estimated attempts (24h), count descending, hide Time/__name__. Outcome field text colored by exact value. 429 may be daily quota or throttle.",
+            "description": "Estimated upstream attempts in 24h by HTTP code and outcome. Table with per-value outcome semantic color mapping.",
             "fieldConfig": {
               "defaults": {
                 "color": {
@@ -2467,21 +2422,40 @@
                 {
                   "matcher": {
                     "id": "byName",
-                    "options": "Outcome"
+                    "options": "outcome"
                   },
                   "properties": [
-                    {
-                      "id": "color",
-                      "value": {
-                        "fixedColor": "#299C46",
-                        "mode": "fixed"
-                      }
-                    },
                     {
                       "id": "custom.cellOptions",
                       "value": {
                         "mode": "color-background"
                       }
+                    },
+                    {
+                      "id": "mappings",
+                      "value": [
+                        {
+                          "type": "value",
+                          "options": {
+                            "ok": {
+                              "color": "#299C46",
+                              "index": 0
+                            },
+                            "error": {
+                              "color": "#D44A4A",
+                              "index": 1
+                            },
+                            "retryable_error": {
+                              "color": "#E08B26",
+                              "index": 2
+                            },
+                            "client_disconnected": {
+                              "color": "#8B929A",
+                              "index": 3
+                            }
+                          }
+                        }
+                      ]
                     }
                   ]
                 }
@@ -2506,7 +2480,7 @@
                 "refId": "A"
               }
             ],
-            "title": "UPSTREAM HTTP CODES (code/outcome breakdown)",
+            "title": "UPSTREAM HTTP CODES & OUTCOMES TABLE",
             "type": "table"
           }
         ],
@@ -3597,7 +3571,7 @@
               "type": "prometheus",
               "uid": "df7wrp11a9hq8c"
             },
-            "description": "Stephen cascade child outcomes in 24h (parent_route=ST_Route). Legend `{{child_route}} \u00b7 {{outcome}}`. selected neutral, attempt_failed red, skipped_ineligible grey/orange. No borrowed owner routing.",
+            "description": "Stephen cascade child outcomes in 24h with anchored byRegexp overrides for compound legends.",
             "fieldConfig": {
               "defaults": {
                 "color": {
@@ -3609,30 +3583,45 @@
               "overrides": [
                 {
                   "matcher": {
-                    "id": "byName",
-                    "options": "attempt_failed"
+                    "id": "byRegexp",
+                    "options": "^.* \u00b7 ok$"
                   },
                   "properties": [
                     {
                       "id": "color",
                       "value": {
-                        "fixedColor": "#D44A4A",
-                        "mode": "fixed"
+                        "mode": "fixed",
+                        "fixedColor": "#299C46"
                       }
                     }
                   ]
                 },
                 {
                   "matcher": {
-                    "id": "byName",
-                    "options": "skipped_ineligible"
+                    "id": "byRegexp",
+                    "options": "^.* \u00b7 (error|attempt_failed)$"
                   },
                   "properties": [
                     {
                       "id": "color",
                       "value": {
-                        "fixedColor": "#8B929A",
-                        "mode": "fixed"
+                        "mode": "fixed",
+                        "fixedColor": "#D44A4A"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "matcher": {
+                    "id": "byRegexp",
+                    "options": "^.* \u00b7 skipped_ineligible$"
+                  },
+                  "properties": [
+                    {
+                      "id": "color",
+                      "value": {
+                        "mode": "fixed",
+                        "fixedColor": "#8B929A"
                       }
                     }
                   ]
@@ -3846,7 +3835,7 @@
             },
             "id": 12003,
             "options": {
-              "content": "**TYPED CAPABILITY CONTRACTS \u2014 separate from the 73 `/v1/models` chat routes.**\n\n| Capability | Target | Format | Declared limits |\n|---|---|---|---|\n| `smartlocal-embedding` | embedding-local | embeddings | 1024D \u00b7 L2 \u00b7 batch 64 |\n| `smartfree-embedding` | embedding-free-nemotron | embeddings | 4096D \u00b7 L2 \u00b7 batch 64 |\n| `ST_Embed` | embedding-stephen | embeddings | 4096D \u00b7 L2 \u00b7 batch 64 |\n| `smartlocal-rerank` | reranker-local | Jina/Cohere | max 64 candidates \u00b7 top 64 |\n| `smartfree-rerank` | reranker-free | Jina/Cohere | max 64 candidates \u00b7 top 64 |\n| `ST_Rerank` | reranker-stephen | Jina/Cohere | max 64 candidates \u00b7 top 64 |\n\n**5 decision target transports** (not chat), all on `/v1/decisions`:\n\n| Target | Model (credential) | Wire path |\n|---|---|---|\n| `direct-google-gemini-decision-1` | gemini-decision-1 (Google) | `/v1beta/decisions` |\n| `direct-htpc-jev-style` | jev-style-0.8b-decision-v3 (HTPC) | `/v1/systemone` |\n| `direct-htpc-laya` | laya-rl-agent (HTPC) | `/v1/systemone` |\n| `direct-openrouter-span-01-lite` | respan/span-01-lite (Owner OR) | `/api/alpha/decisions` |\n| `direct-openrouter-stephen-span-01-lite` | respan/span-01-lite (Stephen OR) | `/api/alpha/decisions` |\n\n**2 decision compositions and 4 decision lanes:**\n\n| Name | Kind | Selection | Members (declared order) |\n|---|---|---|---|\n| `smart-decision` | composition | capability_first | `smartlocal-decision`, `smartfree-decision`, `google-decision` |\n| `tier1-decision` | composition | ordered | `smartfree-decision`, `smartlocal-decision` |\n| `ST_Decisions` | lane | declared order | `direct-openrouter-stephen-span-01-lite` |\n| `google-decision` | lane | declared order | `direct-google-gemini-decision-1` |\n| `smartfree-decision` | lane | declared order | `direct-openrouter-span-01-lite` |\n| `smartlocal-decision` | lane | declared order | `direct-htpc-jev-style`, `direct-htpc-laya` |\n\n**`smart-decision` (released 2026-11-22) is capability-first, not ordered:** eligibility for the whole pool is evaluated before dispatch, physical targets are de-duplicated, and the tie-break is an unranked rotation, so repeated identical noul calls land on different provider families. Measured live: four consecutive plain-string noul calls served by jev-style (HTPC), laya (HTPC), span-01-lite (owner OpenRouter) and gemini-decision-1 (Google) under the one model name. `tier1-decision` remains the ordered legacy composition and still serves span-01-lite first. Structured-object states are refused for both SPAN and Google (Google answers 400 to an untyped object), so such a request is served only by the HTPC pair.\n\n**Rerank evidence (2026-11-11, synthetic 3-doc query):** `smartfree-rerank` 2.13s, order 0/2/1; `smartlocal-rerank` 2.01s, order 0/1/2; `ST_Rerank` 0.41s, order 0/2/1. Provider transport success is not a general quality score. Turnstone's rerank role resolved to `smartfree-rerank` at that capture; embeddings are not expressible as Turnstone model-definition rows.",
+              "content": "**TYPED OPERATIONS & DECISION LANES**\n\n- `smart-decision` (composition, selection: `capability_first`)\n  - Children: `smart-gemini-decision`, `smartlocal-decision`, `smartfree-decision`\n- Typed Decision Lanes:\n  - `google-decision` (reconciled into `smart-gemini-decision`)\n  - `ST_Decisions` (OpenClaw bridge)\n- Physical decision targets: Gemini Decision 1, JEV Style, Laya, owner/Stephen SPAN-01 Lite.\n- Embedding & Reranking: `smartlocal-embedding`, `smartfree-embedding`, `ST_Embed`, `smartlocal-rerank`, `smartfree-rerank`, `ST_Rerank`.\n",
               "mode": "markdown"
             },
             "title": "TYPED OPERATIONS \u00b7 DECISIONS / EMBED / RERANK",
@@ -3910,7 +3899,7 @@
             },
             "id": 12007,
             "options": {
-              "content": "**DEPLOYMENT SNAPSHOT - read from the running service's release record on 2026-11-28 (`20261128T002506Z-6a8209f97101563b-18b377cd`, label `p11-functional-cleanup`).** Every hash below was recomputed with `sha256sum` against the installed bytes in `/var/lib/switchyard/releases/CURRENT/` and matches `release.json` exactly.\n\n| Item | Recorded evidence |\n|---|---|\n| CURRENT (deployed) | `20261128T002506Z-6a8209f97101563b-18b377cd` |\n| Release action / label | `deploy` / `p11-functional-cleanup`, created `2026-11-28T00:25:07Z` |\n| Binary sha256 | `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B) - unchanged from P10 qualified binary |\n| Manifest sha256 | `18b377cd465862f3183fcb10cf01300659ec57ee2925735d7408d5ffd7e8c15e` (133,736 B) - P11 config-only cleanup (75\u219274 routes, composites 3\u21921, decision_lanes 5\u21924) |\n| Capabilities sha256 | `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B) |\n| Rollback target | `20261127T223854Z-6a8209f97101563b-ead40bb6` (P10, manifest `ead40bb6\u2026`) - protected in store |\n| LAST-KNOWN-GOOD | `20261126T061331Z-65757ec7aaa51166-737a6887` - unchanged, **not** promoted |\n| Store-protected releases | 12 ids (23 entries incl. LKG/CURRENT symlinks) |\n| Source | `3d478f5b0e124b14db70b2d8f2dbcb4d69456579` on `feat/nemotron-ultra-peer-recovery-20261127`, dirty=false; attested at deploy (`declared-at-deploy`), **not** claimed reproducible |\n| Running service | PID `873638`, `NRestarts=0`, `/health` `{\"status\":\"ok\"}`, `/v1/models` 74 of 74 advertised |\n| Declared basis | config-only on qualified binary `6a8209f9`: removed `vc-paid-core`, `VC_Paid`, `tier1-decision`, `smart-nt-bounded-trial`, `google-decision` (reconciled into `smart-gemini-decision`); `smart-decision` composition retained |\n\n**What this release changes, and why it is not a routing change.** P11 is a functional cleanup release: it removes a stale direct route (`vc-paid-core`), retires two unused composites (`VC_Paid`, `smart-nt-bounded-trial`), and reconciles the `google-decision` lane into the existing `smart-gemini-decision` lane. The binary is unchanged from the P10 qualified build; only the manifest bytes differ. No provider probes, no rebuild, no LKG promotion.\n",
+              "content": "**DEPLOYMENT PROVENANCE - P11 PRODUCTION BASELINE**\n\n- **Release ID:** `20261128T002506Z-6a8209f97101563b-18b377cd` (label `p11-functional-cleanup`)\n- **Binary SHA-256:** `6a8209f97101563b58944f8614001fd0b057247da21a3daf57624ff798a22e82` (31,281,480 B)\n- **Manifest SHA-256:** `18b377cd465862f3183fcb10cf01300659ec57ee2925735d7408d5ffd7e8c15e` (133,736 B installed `routes.toml`)\n- **Capabilities SHA-256:** `987dd039ce618d5a0d124bd5607498b3c8d6845488af0d593fb3b3f7839f77b9` (25,499 B)\n- **Active Service:** PID `873638`, `NRestarts=0`, `/v1/models` 74/74 active.\n- **Scope:** Config-only cleanup; removed retired routes (`vc-paid-core`, `VC_Paid`, `smart-nt-bounded-trial`, `google-decision`).\n",
               "mode": "markdown"
             },
             "title": "RELEASE / PROVENANCE \u00b7 DATED MEDIA RECORD",

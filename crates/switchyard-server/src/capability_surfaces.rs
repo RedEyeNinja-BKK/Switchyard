@@ -327,7 +327,7 @@ fn reserve_physical_call(
         Some(pacing) => match pacing.reserve(input_bytes) {
             Ok(ticket) => ticket,
             Err(PacingError::Throttled(throttled)) => {
-                return Err(Box::new(error_body(
+                return Err(Box::new(error_body_with_retry_after(
                     StatusCode::TOO_MANY_REQUESTS,
                     format!(
                         "per-minute {} budget for capability {} is full; it clears in about {}s",
@@ -336,6 +336,7 @@ fn reserve_physical_call(
                         throttled.retry_after.as_secs()
                     ),
                     "minute_allowance_throttled",
+                    throttled.retry_after.as_secs(),
                 )));
             }
             Err(PacingError::ExceedsWindow {
@@ -1530,6 +1531,26 @@ fn error_body(status: StatusCode, message: String, kind: &str) -> Response {
         Json(json!({"error": {"message": message, "type": kind}})),
     )
         .into_response()
+}
+
+/// The same body, plus the measured interval published as `Retry-After`.
+///
+/// Only a temporary minute allowance reaches this helper. A refusal whose recovery
+/// interval is unknown keeps [`error_body`], so no short wait is advertised where waiting
+/// cannot help.
+fn error_body_with_retry_after(
+    status: StatusCode,
+    message: String,
+    kind: &str,
+    retry_after_secs: u64,
+) -> Response {
+    let mut response = error_body(status, message, kind);
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_secs.max(1).to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
 }
 
 #[cfg(test)]

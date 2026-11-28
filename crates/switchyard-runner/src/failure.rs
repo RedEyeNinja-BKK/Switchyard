@@ -156,6 +156,9 @@ fn client_error_summary(
             (RouteErrorKind::ContextWindowExceeded, None)
         }
         LlmClientError::TemporarilyUnavailable => (RouteErrorKind::TemporarilyUnavailable, None),
+        // Same route-level kind, so escalation and sibling selection are untouched; the
+        // difference is carried on the error itself, not in the recovery decision.
+        LlmClientError::CoolingDown { .. } => (RouteErrorKind::TemporarilyUnavailable, None),
         LlmClientError::Timeout { .. } | LlmClientError::AttemptTimeout { .. } => {
             (RouteErrorKind::Timeout, None)
         }

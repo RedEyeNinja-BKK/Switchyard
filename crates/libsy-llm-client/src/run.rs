@@ -1130,6 +1130,10 @@ pub fn failure_class(error: &LibsyError) -> FailureClass {
         // composite treats it exactly like an upstream 408.
         LlmClientError::AttemptTimeout { .. } => FailureClass::Timeout,
         LlmClientError::TemporarilyUnavailable => FailureClass::TemporarilyUnavailable,
+        // An armed cooldown is the same failure as an unarmed one, seen at a known distance:
+        // the target is resting, so a composite may still advance to a sibling. The interval
+        // is published to the caller; it is not a reason to sleep inside the router.
+        LlmClientError::CoolingDown { .. } => FailureClass::TemporarilyUnavailable,
         LlmClientError::UpstreamHttp { status, body } => match *status {
             // Google names its condition in the body, and the name decides more than the
             // status: a 429 is a throttle or a spent daily quota, a 400 is an adapter defect
@@ -1246,6 +1250,10 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
             // A minute window regains room on its own, so this leg is worth returning to
             // later in the same call; the route may also reach a sibling with headroom now.
             | LlmClientError::MinuteAllowanceThrottled { .. }
+            // An armed cooldown is a fact about this target's recent failure, not about the
+            // request or its siblings. Its interval is published to the caller and is never
+            // slept on inside the router: an eligible alternative is tried immediately.
+            | LlmClientError::CoolingDown { .. }
             // A request this leg's minute budget cannot hold at the deployment's margin is
             // not a failure of the request or of the model: a sibling with a wider window
             // is exactly what the Free pool provides, so the route crosses to it.

@@ -202,6 +202,9 @@ fn llm_client_error_type(error: &LlmClientError) -> Cow<'static, str> {
         LlmClientError::Configuration { .. } => Cow::Borrowed("configuration"),
         LlmClientError::Transport { .. } => Cow::Borrowed("transport"),
         LlmClientError::TemporarilyUnavailable => Cow::Borrowed("temporarily_unavailable"),
+        // Deliberately the same label: an operator aggregating refusals should not have one
+        // causal event split across two series because one of them knows how long it lasts.
+        LlmClientError::CoolingDown { .. } => Cow::Borrowed("temporarily_unavailable"),
         LlmClientError::Timeout { .. } => Cow::Borrowed("timeout"),
         LlmClientError::AttemptTimeout { .. } => Cow::Borrowed("attempt_timeout"),
         LlmClientError::ContextWindowExceeded { .. } => Cow::Borrowed("context_window_exceeded"),

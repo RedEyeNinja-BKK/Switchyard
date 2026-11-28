@@ -67,6 +67,23 @@ pub enum LlmClientError {
     #[error("backend temporarily unavailable")]
     TemporarilyUnavailable,
 
+    /// The selected backend is cooling down after a transient failure, and the remaining
+    /// interval is known.
+    ///
+    /// Rendered exactly as [`Self::TemporarilyUnavailable`] — same status, class and body —
+    /// because the established answer is right: the model is resting and another candidate
+    /// may serve. The difference is that the wait is a measurement rather than a guess, so
+    /// it is published as `Retry-After`. Nothing in the router sleeps on it: an eligible
+    /// sibling is still tried immediately.
+    #[error("backend temporarily unavailable")]
+    CoolingDown {
+        /// Whole seconds left before this target may be attempted again.
+        ///
+        /// Rounded up, and never zero: a cooldown that is still armed always has something
+        /// left to wait for, and `Retry-After: 0` would invite an immediate retry.
+        retry_after_secs: u64,
+    },
+
     /// The target's own daily request allowance is spent for the current provider day.
     ///
     /// Distinct from an account-wide cap: a per-project, per-model request budget (the

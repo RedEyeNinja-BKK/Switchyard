@@ -2262,6 +2262,17 @@ fn client_error(error: &LlmClientError) -> Response {
             "upstream_error",
             "temporarily_unavailable",
         ),
+        // The same answer as above, because the target is resting for the same reason, and
+        // the body keeps its established shape. The difference is that this cooldown is armed
+        // to a known instant, so the wait is stated instead of inferred: a caller that paces
+        // itself stops spending its bounded reissues inside a window that cannot have refilled.
+        LlmClientError::CoolingDown { retry_after_secs } => error_response_with_retry_after(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+            "upstream_error",
+            "temporarily_unavailable",
+            *retry_after_secs,
+        ),
         LlmClientError::UpstreamHttp { status, body } => upstream_error(*status, body),
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
@@ -2349,7 +2360,7 @@ fn client_error(error: &LlmClientError) -> Response {
             model,
             scope,
             retry_after_secs,
-        } => error_response(
+        } => error_response_with_retry_after(
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "per-minute {scope} budget for {model} is full; it clears in about \
@@ -2357,6 +2368,7 @@ fn client_error(error: &LlmClientError) -> Response {
             ),
             "rate_limit_error",
             "minute_allowance_throttled",
+            *retry_after_secs,
         ),
         // Distinguishable from the throttle above on purpose: no wait clears this, and the
         // message says so rather than quoting an interval. 429 rather than 4xx-request
@@ -2429,6 +2441,12 @@ struct ApiError {
     message: String,
     error_type: &'static str,
     code: String,
+    /// Published as `Retry-After` when the wait is a measurement rather than a guess.
+    ///
+    /// `None` is the default and the honest answer for every refusal whose recovery
+    /// interval is unknown: a spent provider day, an oversized request and a fault with no
+    /// known end must not hand a caller a short interval to retry into.
+    retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
@@ -2443,7 +2461,14 @@ impl ApiError {
             message: message.into(),
             error_type,
             code: code.into(),
+            retry_after_secs: None,
         }
+    }
+
+    /// States how long the caller should wait. Used only where that interval is known.
+    fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after_secs = Some(secs.max(1));
+        self
     }
 
     fn into_response(self, wire_format: WireFormat) -> Response {
@@ -2467,6 +2492,16 @@ impl ApiError {
             }),
         };
         let mut response = (self.status, Json(body)).into_response();
+        // The interval travels beside the body, not instead of it: the prose above already
+        // names it for a human, and this is the same figure for a client that paces itself.
+        // A header the caller never asked for cannot change routing or sibling selection.
+        if let Some(secs) = self.retry_after_secs {
+            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
         response
             .extensions_mut()
             .insert(RequestLogError(self.message.clone()));
@@ -2572,6 +2607,22 @@ fn error_response(
     code: impl Into<String>,
 ) -> Response {
     ApiError::new(status, message, error_type, code).into_response(WireFormat::OpenAiChat)
+}
+
+/// The same refusal as [`error_response`], with a measured wait attached.
+///
+/// Only a temporary minute allowance and an armed cooldown know their interval. Every other
+/// refusal keeps the plain form, so no caller is handed an interval it could act on wrongly.
+fn error_response_with_retry_after(
+    status: StatusCode,
+    message: impl Into<String>,
+    error_type: &'static str,
+    code: impl Into<String>,
+    retry_after_secs: u64,
+) -> Response {
+    ApiError::new(status, message, error_type, code)
+        .with_retry_after(retry_after_secs)
+        .into_response(WireFormat::OpenAiChat)
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
@@ -3192,6 +3243,98 @@ mod tests {
                 .get::<RequestLogError>()
                 .map(|error| error.0.as_str()),
             Some("invalid request")
+        );
+    }
+
+    // A temporary minute allowance is the one refusal whose interval is a measurement, so it
+    // travels as a header as well as prose. The value is the error's own figure, not a
+    // re-derivation: a caller pacing itself must wait exactly as long as the router said.
+    #[test]
+    fn a_minute_allowance_refusal_publishes_its_interval_as_retry_after() {
+        let error = LlmClientError::MinuteAllowanceThrottled {
+            model: ModelId::from("gemini-3.1-flash-lite"),
+            scope: "input_tokens_per_minute".to_string(),
+            retry_after_secs: 21,
+        };
+        let response = client_error(&error);
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap()),
+            Some("21")
+        );
+    }
+
+    // An armed cooldown answers exactly as an unarmed unavailability did -- same status, same
+    // body, same class -- and adds only the remainder. The body contract is unchanged on
+    // purpose: callers that already handle "backend temporarily unavailable" keep working.
+    #[test]
+    fn an_armed_cooldown_publishes_its_remaining_interval_and_keeps_the_body() {
+        let error = LlmClientError::CoolingDown {
+            retry_after_secs: 4,
+        };
+        let response = client_error(&error);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap()),
+            Some("4")
+        );
+        assert_eq!(
+            response
+                .extensions()
+                .get::<RequestLogError>()
+                .map(|error| error.0.as_str()),
+            Some("backend temporarily unavailable")
+        );
+    }
+
+    // The same target in the same state without a known remainder must not advertise one.
+    #[test]
+    fn an_unarmed_unavailability_states_no_interval() {
+        let response = client_error(&LlmClientError::TemporarilyUnavailable);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    // A spent provider day is hours away, not seconds, and an oversized request is never
+    // servable at this target: an actionable short interval on either would manufacture the
+    // burst the refusal exists to prevent.
+    #[test]
+    fn daily_and_oversized_refusals_state_no_interval() {
+        let daily = LlmClientError::DailyRequestAllowanceExhausted {
+            model: ModelId::from("gemini-3.1-flash-lite"),
+            limit: 500,
+            group: None,
+        };
+        assert!(
+            client_error(&daily)
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+
+        let oversized = LlmClientError::InputExceedsMinuteWindow {
+            model: ModelId::from("gemini-3.1-flash-lite"),
+            needed: 325_000,
+            limit: 250_000,
+            margin_permille: 1300,
+        };
+        assert!(
+            client_error(&oversized)
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
         );
     }
 

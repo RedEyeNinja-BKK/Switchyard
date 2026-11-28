@@ -312,7 +312,13 @@ impl TranslatingLlmClient {
                 None
             };
         if let Some(until) = unavailable_until
-            && until.load(Ordering::Relaxed) > duration_millis(self.cooldown_epoch.elapsed())
+            // A cooldown that is still armed always has something left to wait for, and the
+            // caller is told what it is. Measured against the same clock that armed it, so the
+            // interval is the remainder rather than the configured duration.
+            && let remaining_ms = until
+                .load(Ordering::Relaxed)
+                .saturating_sub(duration_millis(self.cooldown_epoch.elapsed()))
+            && remaining_ms > 0
         {
             tracing::debug!(model = %model, wire_format = %wire_format, "skipping backend during failure cooldown");
             // A cooldown the target itself armed keeps its established answer:
@@ -336,7 +342,11 @@ impl TranslatingLlmClient {
                     });
                 }
             }
-            return Err(LlmClientError::TemporarilyUnavailable);
+            // Rounded up: half a second left is still a wait, and `Retry-After: 0` would ask
+            // the caller to come back immediately, which is the behaviour this replaces.
+            return Err(LlmClientError::CoolingDown {
+                retry_after_secs: remaining_ms.div_ceil(1000),
+            });
         }
 
         // A Responses upstream may declare that it requires a list-shaped `input`, and a
@@ -3038,13 +3048,20 @@ mod tests {
         );
 
         // Second call: the cooldown is armed even though the failure was not retryable, so no
-        // request reaches the provider at all.
+        // request reaches the provider at all -- and the answer now states the remainder,
+        // which is what a pacing caller needs. The configured cooldown is 300 s and no time
+        // has been spent, so the rounded remainder is 300 (never the failure's own status).
         let second = client
             .call_rewrite_model(request_for(Some("large"), false), Some(&name("large")))
             .await;
         assert!(
-            matches!(second, Err(LlmClientError::TemporarilyUnavailable)),
-            "a resting model answers without a provider call"
+            matches!(
+                second,
+                Err(LlmClientError::CoolingDown { retry_after_secs })
+                    if (250..=300).contains(&retry_after_secs)
+            ),
+            "a resting model answers with its remaining cooldown: {:?}",
+            second.err()
         );
         assert!(
             calls.lock().expect("call log").is_empty(),
@@ -4394,10 +4411,18 @@ mod tests {
                     .call_rewrite_model(request_with_headers("gpt", headers), None)
                     .await;
                 if !forward_auth && credential == "Bearer second-user" {
-                    assert!(matches!(
-                        result,
-                        Err(LlmClientError::TemporarilyUnavailable)
-                    ));
+                    // The cooldown is 60 s and this request follows immediately, so the
+                    // remainder is the configured interval rounded up -- not a guess, and not
+                    // a value copied from the upstream header on the previous attempt.
+                    assert!(
+                        matches!(
+                            result,
+                            Err(LlmClientError::CoolingDown { retry_after_secs })
+                                if (55..=60).contains(&retry_after_secs)
+                        ),
+                        "a shared-credential cooldown states its remainder: {:?}",
+                        result.err()
+                    );
                 } else {
                     assert!(matches!(
                         result,

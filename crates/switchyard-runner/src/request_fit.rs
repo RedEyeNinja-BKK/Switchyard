@@ -729,6 +729,68 @@ fn has_media_key(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool
         .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
 }
 
+/// The part types that carry a picture, matching the vocabulary
+/// `unsupported_preserved_content` already uses to refuse images for a target without
+/// vision. One list, so the size gate and the capability gate cannot disagree about what an
+/// image is.
+const IMAGE_PART_TYPES: &[&str] = &["image", "image_url", "input_image", "computer_screenshot"];
+
+/// Tokens charged for one image part.
+///
+/// An image is a picture, not prose. Charging its base64 payload at the text rate priced a
+/// 361 KB PNG at 120,425 tokens, which pushed a request that actually cost tens of thousands
+/// of tokens past a 262,144-token window and refused it as `requires context_window`.
+///
+/// One figure for every vision leaf, not a per-model table: the provider is not known when
+/// this gate runs, because a candidate is chosen after admission. It is set above every
+/// documented per-image cost of the families these routes can select, so the estimate never
+/// under-admits an image on a rule that only holds for one of them:
+///
+/// | family | documented rule | tokens |
+/// |---|---|---|
+/// | Google Gemini | 258 per 768x768 tile, four tiles after the 1,536x1,536 downscale | 1,032 |
+/// | OpenAI | `detail: high`, 85 + 170 per 512x512 tile, six tiles at an extreme aspect | 1,105 |
+/// | OpenAI | `detail: low` | 85 |
+/// | Anthropic | (width * height) / 750 at the 1,568-long-side cap | 3,279 |
+///
+/// Leaves with no published per-image rule -- the free vision lanes, local engines -- are
+/// charged the same figure. That is an assumption rather than a theorem, and its residual
+/// risk is bounded in one direction only: a few thousand tokens per image, against windows of
+/// 262,144 and above. Charging too much can refuse a request that would have fitted; charging
+/// too little admits one the provider then rejects. Only the second is silent.
+const IMAGE_TOKENS: u64 = 4_096;
+
+/// Whether this object is a media part carrying a picture.
+///
+/// Only a part that names itself as media is media. A base64 blob or a `data:image` URI that
+/// appears inside ordinary text, a tool argument or a tool result is left to the text rate:
+/// treating it as a picture would replace its real character cost with 4,096 and under-admit
+/// a request that is mostly prose.
+fn is_image_part(map: &serde_json::Map<String, Value>) -> bool {
+    match map.get("type").and_then(Value::as_str) {
+        Some(kind) => IMAGE_PART_TYPES.contains(&kind),
+        // An untyped part is still an image when it only names an image.
+        None => map.contains_key("image_url") || map.contains_key("source"),
+    }
+}
+
+/// Fields of an image part that carry the picture or its location, never prose.
+fn is_image_field(key: &str) -> bool {
+    matches!(
+        key,
+        "image_url"
+            | "url"
+            | "data"
+            | "b64_json"
+            | "base64"
+            | "source"
+            | "detail"
+            | "mime_type"
+            | "media_type"
+            | "format"
+    )
+}
+
 /// Estimated input tokens for a request body.
 ///
 /// Ported from the retired FleetRouter rather than re-derived, so an escalation decision
@@ -747,6 +809,14 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
                     .saturating_add(1);
             }
             Value::Array(items) => items.iter().for_each(|item| walk(item, acc)),
+            Value::Object(map) if is_image_part(map) => {
+                *acc = acc.saturating_add(IMAGE_TOKENS);
+                for (key, child) in map {
+                    if !is_image_field(key) {
+                        walk(child, acc);
+                    }
+                }
+            }
             Value::Object(map) => map.values().for_each(|value| walk(value, acc)),
             _ => {}
         }
@@ -1539,6 +1609,267 @@ mod tests {
         assert_eq!(parts[0]["type"], "input_video");
         assert_eq!(parts[0]["video_url"], "https://example.test/clip.mp4");
         Ok(())
+    }
+
+    /// Regression: an inline image is charged as a picture, not as its base64 characters.
+    ///
+    /// Measured on a real Discord turn: a 361,273-byte PNG became 481,700 base64 characters
+    /// and the text rate priced it at 120,425 tokens, so a request that fitted a 262,144
+    /// window was refused with `requires context_window` and no provider was ever called.
+    #[test]
+    fn an_inline_image_is_not_charged_as_text() {
+        let payload = "A".repeat(481_700);
+        let with_image = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{payload}")}}
+        ]}]});
+        let without_image = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"}
+        ]}]});
+        let estimate = estimate_input_tokens(&with_image);
+        assert!(
+            estimate < 6_000,
+            "an inline image must not cost its base64 length in tokens: {estimate}"
+        );
+        // The picture contributes a fixed charge: ten times the payload costs the same. A
+        // residual character count would move with it, which is exactly the defect.
+        let ten_times = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{}", payload.repeat(10))
+            }}
+        ]}]});
+        assert_eq!(
+            estimate_input_tokens(&ten_times),
+            estimate,
+            "an image charge must not follow the payload size"
+        );
+        // And the picture, not its bytes, is what the estimate gained.
+        assert!(
+            estimate - estimate_input_tokens(&without_image) >= IMAGE_TOKENS,
+            "an image must cost at least one image charge"
+        );
+    }
+
+    /// The control that isolates the defect: the same byte count as text is still charged in
+    /// full, so the fix narrows one claim rather than lowering the estimator everywhere.
+    #[test]
+    fn the_same_bytes_as_text_are_still_charged_in_full() {
+        let payload = "A".repeat(481_700);
+        let body = json!({"messages": [{"role": "user", "content": format!("what is this {payload}")}]});
+        assert!(
+            estimate_input_tokens(&body) > 120_000,
+            "text must keep costing its characters: {}",
+            estimate_input_tokens(&body)
+        );
+    }
+
+    /// Every wire shape the deployment forwards carries the picture, not prose: chat and
+    /// Responses parts, Anthropic's `source.data`, and a remote URL that cannot be weighed.
+    #[test]
+    fn each_image_wire_shape_is_charged_once() {
+        let payload = "A".repeat(481_700);
+        for body in [
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{payload}")}}
+            ]}]}),
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{payload}")}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": payload.clone()
+                }}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.test/photo.jpg"}}
+            ]}]}),
+            // A part that names no type but carries only an image reference.
+            json!({"messages": [{"role": "user", "content": [
+                {"image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                (IMAGE_TOKENS..6_000).contains(&estimate),
+                "{estimate} for {body}"
+            );
+        }
+    }
+
+    /// Review correction: a base64 blob or a `data:image` URI in ordinary text, a tool
+    /// argument or a tool result is text. It must keep its character cost, because replacing
+    /// it with one image charge would under-admit a prose request by ~120k tokens.
+    #[test]
+    fn text_carrying_an_image_payload_keeps_text_accounting() {
+        let payload = "A".repeat(481_700);
+        for body in [
+            // A user turn that merely quotes one.
+            json!({"messages": [{"role": "user", "content":
+                format!("here is the header: data:image/png;base64,{payload}")}]}),
+            // A tool result carrying one as its whole content.
+            json!({"messages": [{"role": "tool", "content":
+                format!("data:image/png;base64,{payload}")}]}),
+            // A tool argument naming one.
+            json!({"messages": [{"role": "assistant", "tool_calls": [{"id": "c1",
+                "type": "function", "function": {"name": "inspect", "arguments":
+                format!("{{\"image\":\"data:image/png;base64,{payload}\"}}")}}]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                estimate > 120_000,
+                "text must keep costing its characters: {estimate}"
+            );
+        }
+    }
+
+    /// Images accumulate: each picture is its own charge, so a turn with several images is
+    /// not priced as one.
+    #[test]
+    fn images_accumulate_per_part() {
+        let body_of = |count: usize| {
+            let parts: Vec<serde_json::Value> = (0..count)
+                .map(|n| json!({"type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{}", "A".repeat(1_000 + n))
+                }}))
+                .collect();
+            json!({"messages": [{"role": "user", "content": parts}]})
+        };
+        let one = estimate_input_tokens(&body_of(1));
+        for count in 2..=4usize {
+            let estimate = estimate_input_tokens(&body_of(count));
+            let extra = u64::try_from(count - 1).expect("small count");
+            let gained = estimate - one;
+            // Each added picture must cost at least one image charge. The small excess is the
+            // part's own structural keys ("image_url", the message wrapper), which are real
+            // text; the upper bound is what proves the payload is not being counted, since
+            // 1,000 base64 characters would cost 250 tokens each if it were.
+            let per_image = gained / extra;
+            assert!(
+                (IMAGE_TOKENS..IMAGE_TOKENS + 64).contains(&per_image),
+                "{count} images gained {gained} for {extra} extra pictures ({per_image} each)"
+            );
+        }
+    }
+
+    /// Resolution and detail do not change the charge: the gate cannot weigh pixels, so it
+    /// charges the ceiling whether the image declares itself small, large or `detail: low`.
+    #[test]
+    fn resolution_and_detail_do_not_change_the_charge() {
+        let small = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"},
+             "width": 64, "height": 64}
+        ]}]});
+        let huge = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"},
+             "width": 8192, "height": 8192}
+        ]}]});
+        let low_detail = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"},
+             "detail": "low"}
+        ]}]});
+        assert_eq!(estimate_input_tokens(&small), estimate_input_tokens(&huge));
+        assert_eq!(estimate_input_tokens(&small), estimate_input_tokens(&low_detail));
+    }
+
+    /// Malformed and empty image parts are still charged, and never panic: a part the
+    /// provider would refuse must not slip through the window gate because it has no payload.
+    #[test]
+    fn malformed_image_parts_are_charged_and_do_not_panic() {
+        for body in [
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": null}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url"}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,"}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": null}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "data": null}}
+            ]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                estimate >= IMAGE_TOKENS,
+                "a declared image part is charged even without a payload: {estimate}"
+            );
+        }
+    }
+
+    /// The charge must stay above every documented per-image cost of a family these routes
+    /// can select. Lowering the constant below one of them fails here, so the number cannot
+    /// drift back to a Google-only figure.
+    #[test]
+    fn the_charge_covers_every_documented_family() {
+        let documented = [
+            ("google_gemini (4 tiles at 258)", 1_032u64),
+            ("openai detail=high (85 + 6 tiles at 170)", 1_105),
+            ("anthropic (1568x1568 / 750)", 3_279),
+        ];
+        for (family, tokens) in documented {
+            assert!(
+                IMAGE_TOKENS >= tokens,
+                "{family} documents {tokens} tokens per image, above IMAGE_TOKENS {IMAGE_TOKENS}"
+            );
+        }
+        // And it is not wild: a handful of images must still fit an ordinary window.
+        assert!(10 * IMAGE_TOKENS < 262_144 / 4, "ten images must not dominate a window");
+    }
+
+    /// Mixed request: tool definitions, text and an image are each accounted for, and the
+    /// tool schema is not disturbed by the image rule.
+    #[test]
+    fn an_image_mixed_with_tools_and_text_is_accounted_for() {
+        let payload = "A".repeat(481_700);
+        let body = json!({
+            "model": "ST_Route",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is in this picture?"},
+                    {"type": "image_url", "image_url": {
+                        "url": format!("data:image/png;base64,{payload}")
+                    }}
+                ]},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                 "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "lookup",
+                       "description": "look something up",
+                       "parameters": {"type": "object", "properties": {
+                           "q": {"type": "string"}}}}}]
+        });
+        let estimate = estimate_input_tokens(&body);
+        assert!(
+            (IMAGE_TOKENS..6_000).contains(&estimate),
+            "one image plus a small conversation: {estimate}"
+        );
+        // The same request without the image is smaller by exactly one image charge.
+        let text_only = json!({"model": "ST_Route", "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "what is in this picture?"}
+        ], "tools": [{"type": "function", "function": {"name": "lookup",
+            "description": "look something up", "parameters": {"type": "object"}}}]});
+        assert!(estimate > estimate_input_tokens(&text_only) + IMAGE_TOKENS - 200);
+    }
+
+    /// Scope check: a non-image `data:` URI keeps the old treatment, so audio and video
+    /// pricing is not silently changed by this fix.
+    #[test]
+    fn a_non_image_data_uri_is_unchanged() {
+        let payload = "A".repeat(4_000);
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {
+                "data": format!("data:audio/wav;base64,{payload}"), "format": "wav"
+            }}
+        ]}]});
+        assert!(estimate_input_tokens(&body) > 900, "{}", estimate_input_tokens(&body));
     }
 }
 

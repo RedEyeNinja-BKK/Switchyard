@@ -2046,3 +2046,53 @@ async fn a_route_with_no_servable_allowance_is_not_reported_as_a_request_fault()
         "nothing about this request is invalid; every pool is simply out until it resets"
     );
 }
+
+/// The live Discord vision failure, specified at the gate's own boundary.
+///
+/// `required_tokens` is input + reservation, and the free tier declares a 262,144-token
+/// window. On 2026-11-28 a 361,273-byte PNG travelled inline as 481,700 base64 characters;
+/// priced as text it became 120,425 tokens, on top of ~191k of conversation, so the free
+/// child was skipped for size, the composite could not cross without a credential block, and
+/// the caller got `no eligible route ... requires context_window` with no provider call.
+///
+/// Expressed through the public estimator because that is what the gate reads: a request
+/// carrying a real inline image must fit the declared window, and the same bytes as text
+/// must still overrun it.
+#[test]
+fn an_inline_image_fits_the_free_window_it_was_refused_for() {
+    const WINDOW: u64 = 262_144;
+    const RESERVE: u64 = 12_000;
+    let image = "A".repeat(481_700);
+    let conversation = "q".repeat(764_000);
+    let with_image = serde_json::json!({
+        "model": "ST_Route",
+        "messages": [
+            {"role": "user", "content": conversation},
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{image}")
+                }}
+            ]}
+        ],
+        "max_output_tokens": RESERVE,
+    });
+    let required = estimate_input_tokens(&with_image) + RESERVE;
+    assert!(
+        required <= WINDOW,
+        "an inline image must fit the window it was refused for: {required} > {WINDOW}"
+    );
+
+    let as_text = serde_json::json!({
+        "model": "ST_Route",
+        "messages": [
+            {"role": "user", "content": conversation},
+            {"role": "user", "content": format!("what is in this picture? {image}")}
+        ],
+        "max_output_tokens": RESERVE,
+    });
+    assert!(
+        estimate_input_tokens(&as_text) + RESERVE > WINDOW,
+        "the control must still overrun the window"
+    );
+}

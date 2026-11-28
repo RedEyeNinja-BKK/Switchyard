@@ -1,0 +1,134 @@
+{
+ "checks": [
+  {
+   "name": "A1 upstream 429 status preserved",
+   "ok": true,
+   "detail": "status=429"
+  },
+  {
+   "name": "A2 provider message and code preserved",
+   "ok": true,
+   "detail": "code='rate_limit_exceeded'"
+  },
+  {
+   "name": "A3 one outbound attempt, no hidden retry",
+   "ok": true,
+   "detail": "stub hits=1"
+  },
+  {
+   "name": "A4 upstream interval NOT forwarded",
+   "ok": true,
+   "detail": "NOTE retry-after=None; recorded as an open gap"
+  },
+  {
+   "name": "A5 internal parse: retry gap equals 3 s +-0.6",
+   "ok": true,
+   "detail": "gap=3.0"
+  },
+  {
+   "name": "A6 max_retries=1 spends exactly two attempts",
+   "ok": true,
+   "detail": "stub hits=2"
+  },
+  {
+   "name": "B1 first 503 reaches the caller",
+   "ok": true,
+   "detail": "status=503"
+  },
+  {
+   "name": "B2 cooldown refuses locally with 503",
+   "ok": true,
+   "detail": "status=503"
+  },
+  {
+   "name": "B3 retry-after within 1..=6",
+   "ok": true,
+   "detail": "retry-after='5'"
+  },
+  {
+   "name": "B4 no second outbound while cooling",
+   "ok": true,
+   "detail": "stub hits=1"
+  },
+  {
+   "name": "B5 refusal is immediate",
+   "ok": true,
+   "detail": "elapsed=0.00s"
+  },
+  {
+   "name": "B6 refusal keeps the established code",
+   "ok": true,
+   "detail": "code='temporarily_unavailable'"
+  },
+  {
+   "name": "C1 first call served",
+   "ok": true,
+   "detail": "status=200"
+  },
+  {
+   "name": "C2 second call refused 429",
+   "ok": true,
+   "detail": "status=429"
+  },
+  {
+   "name": "C3 minute-window code",
+   "ok": true,
+   "detail": "code='minute_allowance_throttled'"
+  },
+  {
+   "name": "C4 retry-after within 1..=60",
+   "ok": true,
+   "detail": "retry-after='59'"
+  },
+  {
+   "name": "C5 only one outbound issued",
+   "ok": true,
+   "detail": "stub hits=1"
+  },
+  {
+   "name": "D1 SDK serves the first call",
+   "ok": true,
+   "detail": "content='stub ok'"
+  },
+  {
+   "name": "D2 SDK raises RateLimitError",
+   "ok": true,
+   "detail": "exc=RateLimitError"
+  },
+  {
+   "name": "D3 Turnstone reads the advertised interval",
+   "ok": true,
+   "detail": "delay=59.0"
+  },
+  {
+   "name": "D4 no hidden SDK retry",
+   "ok": true,
+   "detail": "stub hits=1"
+  },
+  {
+   "name": "D5 the SDK itself does not sleep",
+   "ok": true,
+   "detail": "elapsed=0.00s"
+  },
+  {
+   "name": "F1 three advertised waits, each 2 s",
+   "ok": true,
+   "detail": "waits=[2.0, 2.0, 2.0]"
+  },
+  {
+   "name": "F2 closing answer served",
+   "ok": true,
+   "detail": "answer='stub ok'"
+  },
+  {
+   "name": "F3 four attempts, one per window",
+   "ok": true,
+   "detail": "stub hits=4"
+  },
+  {
+   "name": "F4 observed gaps are 2 s +-0.8",
+   "ok": true,
+   "detail": "gaps=[2.06, 2.06, 2.06]"
+  }
+ ]
+}

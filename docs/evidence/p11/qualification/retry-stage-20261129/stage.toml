@@ -1,0 +1,133 @@
+schema_version = 1
+
+[llm_clients.ca]
+format = "openai_chat"
+base_url = "http://127.0.0.1:18991/v1"
+max_retries = 0
+failure_cooldown_ms = 5000
+
+[llm_clients.cb]
+format = "openai_chat"
+base_url = "http://127.0.0.1:18991/v1"
+max_retries = 0
+failure_cooldown_ms = 5000
+
+[llm_clients.cc]
+format = "openai_chat"
+base_url = "http://127.0.0.1:18991/v1"
+max_retries = 0
+failure_cooldown_ms = 5000
+
+[llm_clients.cd]
+format = "openai_chat"
+base_url = "http://127.0.0.1:18991/v1"
+max_retries = 0
+failure_cooldown_ms = 0
+
+[llm_clients.ce]
+format = "openai_chat"
+base_url = "http://127.0.0.1:18991/v1"
+max_retries = 1
+failure_cooldown_ms = 0
+
+[llm_clients.cf]
+format = "openai_chat"
+base_url = "http://127.0.0.1:18991/v1"
+max_retries = 0
+failure_cooldown_ms = 2000
+
+[targets.ta]
+id = "ta"
+llm_client = "ca"
+requests_per_minute = 600
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[targets.tb]
+id = "tb"
+llm_client = "cb"
+requests_per_minute = 600
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[targets.tc]
+id = "tc"
+llm_client = "cc"
+requests_per_minute = 600
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[targets.td]
+id = "td"
+llm_client = "cd"
+requests_per_minute = 600
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[targets.te]
+id = "te"
+llm_client = "ce"
+requests_per_minute = 600
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[targets.tf]
+id = "tf"
+llm_client = "cf"
+requests_per_minute = 600
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[targets.tg]
+id = "tg"
+llm_client = "cd"
+requests_per_minute = 1
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[targets.th]
+id = "th"
+llm_client = "cd"
+requests_per_minute = 1
+max_input_tokens = 4000
+input_tokens_per_minute = 400000
+
+[routes.ra-route]
+id = "ra-route"
+type = "passthrough"
+target = "ta"
+
+[routes.rb-route]
+id = "rb-route"
+type = "passthrough"
+target = "tb"
+
+[routes.rc-route]
+id = "rc-route"
+type = "passthrough"
+target = "tc"
+
+[routes.rd-route]
+id = "rd-route"
+type = "passthrough"
+target = "td"
+
+[routes.re-route]
+id = "re-route"
+type = "passthrough"
+target = "te"
+
+[routes.rf-route]
+id = "rf-route"
+type = "passthrough"
+target = "tf"
+
+[routes.rg-route]
+id = "rg-route"
+type = "passthrough"
+target = "tg"
+
+[routes.rh-route]
+id = "rh-route"
+type = "passthrough"
+target = "th"

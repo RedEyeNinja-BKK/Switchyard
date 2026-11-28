@@ -60,3 +60,11 @@ The defect was corrected before deployment: the shipped candidate keeps `groups 
 
 - V7 `turnstone-switchyard-v7`: generation **102** (title V7.100, revision 105). Panels 12001 (both Lite rows retained), 12002 (topology 9 = 3/3/1/2 and the Lite withdrawal note), 12004 (release reference) and 12007 (present-tense release snapshot, rollback target `020526Z`) updated; all earlier P11 corrections preserved.
 - V9 `turnstone-switchyard-economics-v9`: version **25** (title V9.18). A dated `CORRECTION 2026-11-28` block was appended to the historical PICTURE-3 record (panel 11007); the prior text is unedited.
+
+## Generator synchronisation (2026-11-28)
+
+`scripts/economics/v7/correct_dashboard.py` now emits the published V7.100 configuration: title `SWITCHYARD DASHBOARD V7.100`, revision 105, the published description, and the published 12002/12004/12007 texts. The normalisation chain gained the `a7ef9174` token mappings so 12001 lands on the current release, size and read time.
+
+Reproduction check: 64 of 65 panels are byte-identical to `v7-rev105-server-export.json`. The one intentional divergence is panel 12001's Ultra paragraph, which still reads `11 = 5/3/1/2` and `11-candidate` in the published document; the generator renders `9 = 3/3/1/2` and `9-candidate`. The live panel was not corrected because no live dashboard change was authorised in this pass.
+
+The export file is named for the server revision (`v7-rev105-server-export.json`), not for a generation counter, because the revision is the number Grafana assigns and the number the write path checks.

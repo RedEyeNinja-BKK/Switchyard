@@ -729,10 +729,9 @@ fn has_media_key(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool
         .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
 }
 
-/// The part types that carry a picture, matching the vocabulary
-/// `unsupported_preserved_content` already uses to refuse images for a target without
-/// vision. One list, so the size gate and the capability gate cannot disagree about what an
-/// image is.
+/// The part types that carry a picture. This is the one vocabulary: the capability gate
+/// (`unsupported_preserved_content`) refuses exactly these types for a target without
+/// vision, so the size gate and the capability gate cannot disagree about what an image is.
 const IMAGE_PART_TYPES: &[&str] = &["image", "image_url", "input_image", "computer_screenshot"];
 
 /// Tokens charged for one image part.
@@ -754,41 +753,104 @@ const IMAGE_PART_TYPES: &[&str] = &["image", "image_url", "input_image", "comput
 /// | Anthropic | (width * height) / 750 at the 1,568-long-side cap | 3,279 |
 ///
 /// Leaves with no published per-image rule -- the free vision lanes, local engines -- are
-/// charged the same figure. That is an assumption rather than a theorem, and its residual
-/// risk is bounded in one direction only: a few thousand tokens per image, against windows of
-/// 262,144 and above. Charging too much can refuse a request that would have fitted; charging
-/// too little admits one the provider then rejects. Only the second is silent.
+/// charged the same figure.
+///
+/// That last sentence is an operational heuristic, not a proof: for an undocumented family
+/// there is no published maximum and therefore no bounded error. The figure is chosen to be
+/// conservative -- above every documented ceiling, and small against the windows these routes
+/// declare (four images are 1/16 of a 262,144 window) -- so that being wrong refuses a
+/// request that would have fitted rather than admitting one the provider then rejects. Only
+/// the second failure is silent, and only it is treated as acceptable.
 const IMAGE_TOKENS: u64 = 4_096;
 
-/// Whether this object is a media part carrying a picture.
+/// Where a value sits in the request. Only a protocol content part can be a picture; the
+/// rest of the body is data, however much it looks like a part.
 ///
-/// Only a part that names itself as media is media. A base64 blob or a `data:image` URI that
-/// appears inside ordinary text, a tool argument or a tool result is left to the text rate:
-/// treating it as a picture would replace its real character cost with 4,096 and under-admit
-/// a request that is mostly prose.
-fn is_image_part(map: &serde_json::Map<String, Value>) -> bool {
-    match map.get("type").and_then(Value::as_str) {
-        Some(kind) => IMAGE_PART_TYPES.contains(&kind),
-        // An untyped part is still an image when it only names an image.
-        None => map.contains_key("image_url") || map.contains_key("source"),
+/// The raw body is forwarded verbatim, so it is full of near-misses: a tool schema property
+/// named `source`, a JSON-schema `"type": "image"`, a metadata object with an `image_url`
+/// key. Pricing any of those as a picture charges 4,096 tokens and then *skips* a subtree
+/// that may hold kilobytes of prose -- the same under-accounting class as reading a payload
+/// as text, in the opposite direction.
+///
+/// The three slots below mirror the traversal `preserved_media` already uses for the same
+/// reason: an explicit discriminator is only meaningful where the protocol puts parts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// The request body itself. Only `messages`, `input` and `system` open a message slot.
+    Root,
+    /// A message or input item: its `content` holds parts, and a tool-output item's `output`
+    /// does too.
+    Message,
+    /// An element of a protocol content array: the only place a media part may appear.
+    Part,
+    /// Everything else -- tool definitions, tool arguments, metadata, arbitrary data.
+    Data,
+}
+
+/// Whether `key` opens a content-part slot in an object at `slot`.
+///
+/// `content` is a message's own content and also a tool-result block's nested content, so it
+/// opens parts from both. `output` is only a part slot on an item whose own type says it is a
+/// call output or tool result; the same key on an unrelated object is ordinary data.
+fn opens_parts(key: &str, map: &serde_json::Map<String, Value>, slot: Slot) -> bool {
+    if !matches!(slot, Slot::Message | Slot::Part) {
+        return false;
+    }
+    match key {
+        "content" => true,
+        "output" => map
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.ends_with("_output") || kind.ends_with("_result")),
+        _ => false,
     }
 }
 
-/// Fields of an image part that carry the picture or its location, never prose.
-fn is_image_field(key: &str) -> bool {
-    matches!(
-        key,
-        "image_url"
-            | "url"
-            | "data"
-            | "b64_json"
-            | "base64"
-            | "source"
-            | "detail"
-            | "mime_type"
-            | "media_type"
-            | "format"
-    )
+/// Whether this object names itself as a media part carrying a picture.
+///
+/// A declared type is the discriminator, and only the vocabulary the capability gate refuses
+/// for a vision-less target counts. An untyped object must carry an unambiguous image
+/// reference: a bare `source` does not qualify, because audio, documents and provider
+/// metadata all use that key, so an untyped `source` keeps text accounting.
+fn is_image_part(map: &serde_json::Map<String, Value>) -> bool {
+    match map.get("type").and_then(Value::as_str) {
+        Some(kind) => IMAGE_PART_TYPES.contains(&kind),
+        None => has_image_url(map.get("image_url")),
+    }
+}
+
+/// Whether an `image_url` value carries a usable location: a string (Responses) or an object
+/// with a non-empty `url` (chat). An empty or absent one is not a picture.
+fn has_image_url(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(url)) => !url.is_empty(),
+        Some(Value::Object(object)) => object
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.is_empty()),
+        _ => false,
+    }
+}
+
+/// Whether this field of a confirmed image part is the picture itself rather than prose.
+///
+/// Only the payload is skipped, and only when its shape says bytes or a location. A `source`
+/// object holding a description is walked, because skipping it would hide real text. Metadata
+/// fields (`detail`, `mime_type`, `media_type`, `format`) are small and are simply counted.
+fn is_image_payload(key: &str, value: &Value) -> bool {
+    match key {
+        "image_url" => has_image_url(Some(value)),
+        "source" => value.as_object().is_some_and(|source| {
+            source.get("data").is_some_and(Value::is_string)
+                || source.get("url").is_some_and(Value::is_string)
+                || source.contains_key("file_id")
+        }),
+        "data" | "b64_json" | "base64" => value.is_string(),
+        // A bare `url` is payload only when it carries the bytes itself; a location is
+        // short and is counted as text like any other short string.
+        "url" => value.as_str().is_some_and(|url| url.starts_with("data:")),
+        _ => false,
+    }
 }
 
 /// Estimated input tokens for a request body.
@@ -797,7 +859,7 @@ fn is_image_field(key: &str) -> bool {
 /// this deployment makes is comparable with the decisions the deployment it replaces made.
 /// One estimator: a second, differently-tuned copy would silently move the boundary.
 pub fn estimate_input_tokens(body: &Value) -> u64 {
-    fn walk(value: &Value, acc: &mut u64) {
+    fn walk(value: &Value, acc: &mut u64, slot: Slot) {
         match value {
             Value::String(text) => {
                 let chars = text.chars().count() as u64;
@@ -808,21 +870,43 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
                     .saturating_add(non_ascii)
                     .saturating_add(1);
             }
-            Value::Array(items) => items.iter().for_each(|item| walk(item, acc)),
-            Value::Object(map) if is_image_part(map) => {
+            // An array keeps its slot: the elements of `messages` are messages, and the
+            // elements of a `content` array are parts. A string in a part slot is a
+            // text-only content and is counted by the arm above.
+            Value::Array(items) => items
+                .iter()
+                .for_each(|item| walk(item, acc, slot)),
+            Value::Object(map) if slot == Slot::Part && is_image_part(map) => {
                 *acc = acc.saturating_add(IMAGE_TOKENS);
                 for (key, child) in map {
-                    if !is_image_field(key) {
-                        walk(child, acc);
+                    if !is_image_payload(key, child) {
+                        walk(child, acc, Slot::Data);
                     }
                 }
             }
-            Value::Object(map) => map.values().for_each(|value| walk(value, acc)),
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let next = if slot == Slot::Root {
+                        match key.as_str() {
+                            "messages" | "input" => Slot::Message,
+                            // `system` is an array of content blocks (Anthropic), not of
+                            // messages, so its elements are parts.
+                            "system" => Slot::Part,
+                            _ => Slot::Data,
+                        }
+                    } else if opens_parts(key, map, slot) {
+                        Slot::Part
+                    } else {
+                        Slot::Data
+                    };
+                    walk(child, acc, next);
+                }
+            }
             _ => {}
         }
     }
     let mut total = 0u64;
-    walk(body, &mut total);
+    walk(body, &mut total, Slot::Root);
     // Fixed structural overhead (model field, message roles, wrapper keys).
     total.saturating_add(8)
 }
@@ -846,12 +930,8 @@ fn unsupported_preserved_content(
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if capabilities.vision == Some(false)
-            && matches!(
-                kind,
-                "image" | "image_url" | "input_image" | "computer_screenshot"
-            )
-        {
+        // The same vocabulary the estimator prices, so the two gates cannot disagree.
+        if capabilities.vision == Some(false) && IMAGE_PART_TYPES.contains(&kind) {
             return Some("vision");
         }
         if capabilities.tool_calling == Some(false)
@@ -1752,8 +1832,12 @@ mod tests {
         }
     }
 
-    /// Resolution and detail do not change the charge: the gate cannot weigh pixels, so it
-    /// charges the ceiling whether the image declares itself small, large or `detail: low`.
+    /// Resolution and detail do not change the image charge: the gate cannot weigh pixels, so
+    /// it charges the ceiling whether the image declares itself small, large or `detail: low`.
+    ///
+    /// Pixel counts are numbers and are ignored. `detail` is a metadata string and is counted
+    /// as the two tokens it is, rather than having its subtree skipped: counting it is the
+    /// safer rule, and what must not happen is the charge moving with resolution or detail.
     #[test]
     fn resolution_and_detail_do_not_change_the_charge() {
         let small = json!({"messages": [{"role": "user", "content": [
@@ -1769,7 +1853,17 @@ mod tests {
              "detail": "low"}
         ]}]});
         assert_eq!(estimate_input_tokens(&small), estimate_input_tokens(&huge));
-        assert_eq!(estimate_input_tokens(&small), estimate_input_tokens(&low_detail));
+        let small_tokens = estimate_input_tokens(&small);
+        let low_tokens = estimate_input_tokens(&low_detail);
+        let delta = small_tokens.abs_diff(low_tokens);
+        assert!(
+            delta < 16,
+            "`detail` is metadata, not a second picture: {small_tokens} vs {low_tokens}"
+        );
+        assert!(
+            (IMAGE_TOKENS..6_000).contains(&low_tokens),
+            "one image stays one image charge: {low_tokens}"
+        );
     }
 
     /// Malformed and empty image parts are still charged, and never panic: a part the
@@ -1870,6 +1964,195 @@ mod tests {
             }}
         ]}]});
         assert!(estimate_input_tokens(&body) > 900, "{}", estimate_input_tokens(&body));
+    }
+
+    // ---- Position: only a protocol content slot can hold a media part --------------------
+    //
+    // The raw body is forwarded verbatim and is full of objects that merely *look* like
+    // parts. A tool schema property named `source`, a JSON-schema `"type": "image"`, or any
+    // metadata object carrying an `image_url` key is data, and charging it 4,096 tokens
+    // while skipping its subtree under-counts prose by the same class of error as the
+    // original defect. These controls hold that boundary.
+
+    /// A JSON-schema property named `source` is a schema, not a picture. Its description is
+    /// prose and must be priced as prose.
+    #[test]
+    fn a_tool_schema_property_named_source_keeps_text_accounting() {
+        let prose = "d".repeat(40_000);
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+                "type": "object",
+                "properties": {"source": {"type": "object", "description": prose}}
+            }}}]
+        });
+        let estimate = estimate_input_tokens(&body);
+        assert!(
+            estimate > 9_000,
+            "a property named `source` is data, not a picture: {estimate}"
+        );
+    }
+
+    /// Likewise a property named `image_url`: the name alone does not make a schema an image.
+    #[test]
+    fn a_tool_schema_property_named_image_url_keeps_text_accounting() {
+        let prose = "d".repeat(40_000);
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+                "type": "object",
+                "properties": {"image_url": {"type": "string", "description": prose}}
+            }}}]
+        });
+        let estimate = estimate_input_tokens(&body);
+        assert!(estimate > 9_000, "a schema property is data: {estimate}");
+    }
+
+    /// `"type": "image"` is also a JSON-schema type name. Outside a content slot it is data.
+    #[test]
+    fn a_json_schema_type_image_outside_content_is_data() {
+        let prose = "d".repeat(40_000);
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+                "type": "object",
+                "properties": {"kind": {"type": "image", "description": prose}}
+            }}}]
+        });
+        let estimate = estimate_input_tokens(&body);
+        assert!(estimate > 9_000, "a schema type is data, not a part: {estimate}");
+    }
+
+    /// A schema property *named* `content` does not open a content slot: the slot is a
+    /// position in the protocol, not a key that happens to be spelled the same way.
+    #[test]
+    fn a_schema_property_named_content_does_not_open_a_part_slot() {
+        let prose = "d".repeat(40_000);
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+                "type": "object",
+                "properties": {"content": {"image_url": {
+                    "url": "data:image/png;base64,AAAA", "description": prose
+                }}}
+            }}}]
+        });
+        let estimate = estimate_input_tokens(&body);
+        assert!(
+            estimate > 9_000,
+            "an image-shaped schema is still a schema: {estimate}"
+        );
+    }
+
+    /// An untyped object carrying `source` inside a content slot is ambiguous -- audio,
+    /// documents and provider metadata all use that key -- so it is priced as text.
+    #[test]
+    fn an_untyped_source_in_content_is_not_a_picture() {
+        let payload = "A".repeat(481_700);
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"source": {"data": payload}}
+        ]}]});
+        let estimate = estimate_input_tokens(&body);
+        assert!(
+            estimate > 120_000,
+            "an untyped `source` must keep text accounting: {estimate}"
+        );
+    }
+
+    /// Within a *confirmed* image part, only the payload fields are skipped. A `source`
+    /// object that carries prose rather than bytes is prose.
+    #[test]
+    fn a_typed_image_part_with_prose_in_source_charges_the_prose() {
+        let prose = "d".repeat(40_000);
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"description": prose}}
+        ]}]});
+        let estimate = estimate_input_tokens(&body);
+        assert!(
+            estimate >= IMAGE_TOKENS + 9_000,
+            "an image part's prose sibling is still prose: {estimate}"
+        );
+    }
+
+    /// Non-image media keeps text accounting: a document's base64 and an audio payload are
+    /// not pictures, and this fix does not start pricing them as ones.
+    #[test]
+    fn non_image_media_keep_text_accounting() {
+        let payload = "A".repeat(481_700);
+        for body in [
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": payload.clone()
+                }}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": payload.clone(), "format": "wav"}}
+            ]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                estimate > 120_000,
+                "non-image media is charged by its bytes: {estimate}"
+            );
+        }
+    }
+
+    /// The shapes that must keep working: a genuine part in a user message, in a chat tool
+    /// result, and in a Responses tool output. Each costs one charge and not its payload.
+    #[test]
+    fn genuine_image_positions_are_charged_once() {
+        let payload = "A".repeat(481_700);
+        for body in [
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{payload}")
+                }}
+            ]}]}),
+            // A chat tool result that carries a picture.
+            json!({"messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                 "type": "function", "function": {"name": "shot", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": [
+                    {"type": "image_url", "image_url": {
+                        "url": format!("data:image/png;base64,{payload}")
+                    }}
+                ]}
+            ]}),
+            // A Responses tool output that carries a picture.
+            json!({"input": [
+                {"type": "function_call_output", "call_id": "c1", "output": [
+                    {"type": "input_image", "image_url": format!("data:image/png;base64,{payload}")}
+                ]}
+            ]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                (IMAGE_TOKENS..6_000).contains(&estimate),
+                "a genuine part costs one image charge and not its payload: {estimate}"
+            );
+        }
+    }
+
+    /// Malformed nested metadata must not panic, and must not buy a 4,096-token discount on
+    /// a subtree that actually holds text.
+    #[test]
+    fn malformed_nested_metadata_is_charged_and_does_not_panic() {
+        let prose = "d".repeat(40_000);
+        for body in [
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"nested": {"deeper": [prose.clone()]}}}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": null},
+                 "annotations": [{"note": prose.clone()}]}
+            ]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                estimate >= IMAGE_TOKENS + 9_000,
+                "nested prose inside a part is charged: {estimate}"
+            );
+        }
     }
 }
 

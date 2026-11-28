@@ -759,8 +759,12 @@ const IMAGE_PART_TYPES: &[&str] = &["image", "image_url", "input_image", "comput
 /// there is no published maximum and therefore no bounded error. The figure is chosen to be
 /// conservative -- above every documented ceiling, and small against the windows these routes
 /// declare (four images are 1/16 of a 262,144 window) -- so that being wrong refuses a
-/// request that would have fitted rather than admitting one the provider then rejects. Only
-/// the second failure is silent, and only it is treated as acceptable.
+/// request that would have fitted rather than admitting one the provider then rejects.
+///
+/// Only the second of those two failures is silent: an over-estimate costs a refusal the
+/// caller can see and retry around, while an under-estimate is discovered by the provider,
+/// after dispatch, as a rejected request. That asymmetry is the reason the estimate leans
+/// high; it is not a licence to under-count.
 const IMAGE_TOKENS: u64 = 4_096;
 
 /// Where a value sits in the request. Only a protocol content part can be a picture; the
@@ -819,35 +823,49 @@ fn is_image_part(map: &serde_json::Map<String, Value>) -> bool {
     }
 }
 
-/// Whether an `image_url` value carries a usable location: a string (Responses) or an object
-/// with a non-empty `url` (chat). An empty or absent one is not a picture.
+/// Whether a location string names a picture.
+///
+/// A plain URL is a location. A data URI is only a picture when its media type is an image:
+/// `data:audio/wav` and `data:application/pdf` are payloads this rule must not price as
+/// pictures, or an untyped object carrying one would be charged a single image and have its
+/// bytes skipped instead of counted.
+fn is_image_location(url: &str) -> bool {
+    match url.strip_prefix("data:") {
+        Some(rest) => rest
+            .split([';', ','])
+            .next()
+            .is_some_and(|media| media.starts_with("image/")),
+        None => !url.is_empty(),
+    }
+}
+
+/// Whether an `image_url` value carries a usable picture location: a string (Responses) or an
+/// object with a non-empty `url` (chat). An empty, absent or non-image one is not a picture.
 fn has_image_url(value: Option<&Value>) -> bool {
     match value {
-        Some(Value::String(url)) => !url.is_empty(),
+        Some(Value::String(url)) => is_image_location(url),
         Some(Value::Object(object)) => object
             .get("url")
             .and_then(Value::as_str)
-            .is_some_and(|url| !url.is_empty()),
+            .is_some_and(is_image_location),
         _ => false,
     }
 }
 
-/// Whether this field of a confirmed image part is the picture itself rather than prose.
+/// Whether this leaf *is* the picture rather than a field beside it.
 ///
-/// Only the payload is skipped, and only when its shape says bytes or a location. A `source`
-/// object holding a description is walked, because skipping it would hide real text. Metadata
-/// fields (`detail`, `mime_type`, `media_type`, `format`) are small and are simply counted.
-fn is_image_payload(key: &str, value: &Value) -> bool {
+/// The payload is skipped at the leaf and never by discarding the object that contains it: a
+/// `source` or `image_url` object can carry a description, caption or other metadata next to
+/// the bytes, and that metadata is prose the body still forwards. Skipping the object because
+/// it happens to contain a recognised payload would drop exactly the text this change exists
+/// to keep.
+fn is_payload_leaf(key: &str, value: &Value) -> bool {
     match key {
-        "image_url" => has_image_url(Some(value)),
-        "source" => value.as_object().is_some_and(|source| {
-            source.get("data").is_some_and(Value::is_string)
-                || source.get("url").is_some_and(Value::is_string)
-                || source.contains_key("file_id")
-        }),
+        // A string `image_url` is the bytes only when it carries them itself; a plain
+        // location is short and is counted as text like any other short string.
+        "image_url" => value.as_str().is_some_and(|url| url.starts_with("data:")),
         "data" | "b64_json" | "base64" => value.is_string(),
-        // A bare `url` is payload only when it carries the bytes itself; a location is
-        // short and is counted as text like any other short string.
+        // A bare `url` is payload only when it carries the bytes itself.
         "url" => value.as_str().is_some_and(|url| url.starts_with("data:")),
         _ => false,
     }
@@ -879,9 +897,7 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
             Value::Object(map) if slot == Slot::Part && is_image_part(map) => {
                 *acc = acc.saturating_add(IMAGE_TOKENS);
                 for (key, child) in map {
-                    if !is_image_payload(key, child) {
-                        walk(child, acc, Slot::Data);
-                    }
+                    walk_media_field(key, child, acc);
                 }
             }
             Value::Object(map) => {
@@ -905,6 +921,35 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
             _ => {}
         }
     }
+    /// Walk one field of a confirmed image part, skipping only the leaf that holds the picture.
+    ///
+    /// `image_url` and `source` are containers: the payload sits one level in (`url`, `data`), and
+    /// their other fields are metadata. Both are walked field by field so those siblings are
+    /// counted. A non-object `source` is not a shape the protocol defines, so it keeps text
+    /// accounting rather than being guessed at.
+    ///
+    /// Measured against a stub upstream: a `source` sibling reaches the wire on both the
+    /// `openai_chat` and `openai_responses` paths, while an `image_url` caption reaches it on
+    /// the chat path and is normalised away on the Responses path. The estimator runs at
+    /// admission, before a candidate -- and therefore a client format -- is chosen, so it
+    /// cannot be format-dependent. Counting a sibling that one path drops over-estimates,
+    /// which refuses a request that would have fitted; not counting one that another path
+    /// keeps under-estimates, which the provider discovers after dispatch. The first is the
+    /// failure this gate is allowed to make, so siblings are counted.
+    fn walk_media_field(key: &str, value: &Value, acc: &mut u64) {
+        match value {
+            Value::Object(object) if matches!(key, "image_url" | "source") => {
+                for (inner, child) in object {
+                    if !is_payload_leaf(inner, child) {
+                        walk(child, acc, Slot::Data);
+                    }
+                }
+            }
+            _ if is_payload_leaf(key, value) => {}
+            _ => walk(value, acc, Slot::Data),
+        }
+    }
+
     let mut total = 0u64;
     walk(body, &mut total, Slot::Root);
     // Fixed structural overhead (model field, message roles, wrapper keys).
@@ -1988,7 +2033,7 @@ mod tests {
         });
         let estimate = estimate_input_tokens(&body);
         assert!(
-            estimate > 9_000,
+            (9_000..12_000).contains(&estimate),
             "a property named `source` is data, not a picture: {estimate}"
         );
     }
@@ -2005,7 +2050,10 @@ mod tests {
             }}}]
         });
         let estimate = estimate_input_tokens(&body);
-        assert!(estimate > 9_000, "a schema property is data: {estimate}");
+        assert!(
+            (9_000..12_000).contains(&estimate),
+            "a schema property is data: {estimate}"
+        );
     }
 
     /// `"type": "image"` is also a JSON-schema type name. Outside a content slot it is data.
@@ -2020,7 +2068,10 @@ mod tests {
             }}}]
         });
         let estimate = estimate_input_tokens(&body);
-        assert!(estimate > 9_000, "a schema type is data, not a part: {estimate}");
+        assert!(
+            (9_000..12_000).contains(&estimate),
+            "a schema type is data, not a part: {estimate}"
+        );
     }
 
     /// A schema property *named* `content` does not open a content slot: the slot is a
@@ -2039,7 +2090,7 @@ mod tests {
         });
         let estimate = estimate_input_tokens(&body);
         assert!(
-            estimate > 9_000,
+            (9_000..12_000).contains(&estimate),
             "an image-shaped schema is still a schema: {estimate}"
         );
     }
@@ -2095,6 +2146,101 @@ mod tests {
                 "non-image media is charged by its bytes: {estimate}"
             );
         }
+    }
+
+    /// A payload does not make its container disappear.
+    ///
+    /// The picture is one leaf, but the object around it may carry a description, caption or
+    /// other metadata that the body forwards verbatim. Skipping the whole `source` or
+    /// `image_url` object because it happens to contain recognised bytes dropped that prose
+    /// from the estimate -- the same silent under-accounting this change exists to remove,
+    /// one level down.
+    #[test]
+    fn a_payload_does_not_hide_its_sibling_prose() {
+        let payload = "A".repeat(481_700);
+        let prose = "d".repeat(40_000);
+        for body in [
+            // Anthropic-shaped `source`: bytes plus a description beside them.
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": payload.clone(),
+                    "description": prose.clone()
+                }}
+            ]}]}),
+            // Chat-shaped `image_url` object: location plus a caption beside it.
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{payload}"), "caption": prose.clone()
+                }}
+            ]}]}),
+            // A `source` object holding a location plus metadata.
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "url", "url": "https://example.test/a.png", "notes": prose.clone()
+                }}
+            ]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                estimate >= IMAGE_TOKENS + 9_000,
+                "prose beside a payload is still prose: {estimate}"
+            );
+        }
+    }
+
+    /// A payload leaf is still skipped at the leaf, so the fix does not resurrect the
+    /// base64-as-text over-count it replaced.
+    #[test]
+    fn a_payload_leaf_is_still_skipped() {
+        let payload = "A".repeat(481_700);
+        for body in [
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": payload.clone()
+                }}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{payload}")}}
+            ]}]}),
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{payload}")}
+            ]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                (IMAGE_TOKENS..6_000).contains(&estimate),
+                "a recognised payload leaf is not charged as text: {estimate}"
+            );
+        }
+    }
+
+    /// A data URI that is not an image is not a picture, so an untyped object carrying one
+    /// keeps text accounting instead of being charged one image and having its bytes skipped.
+    #[test]
+    fn a_non_image_data_uri_is_not_a_picture() {
+        let payload = "A".repeat(481_700);
+        for body in [
+            json!({"messages": [{"role": "user", "content": [
+                {"image_url": {"url": format!("data:audio/wav;base64,{payload}")}}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"image_url": {"url": format!("data:application/pdf;base64,{payload}")}}
+            ]}]}),
+        ] {
+            let estimate = estimate_input_tokens(&body);
+            assert!(
+                estimate > 120_000,
+                "a non-image data URI keeps text accounting: {estimate}"
+            );
+        }
+        // The same shape with an image media type is a picture and is charged once.
+        let estimate = estimate_input_tokens(&json!({"messages": [{"role": "user", "content": [
+            {"image_url": {"url": format!("data:image/jpeg;base64,{payload}")}}
+        ]}]}));
+        assert!(
+            (IMAGE_TOKENS..6_000).contains(&estimate),
+            "an image data URI is still a picture: {estimate}"
+        );
     }
 
     /// The shapes that must keep working: a genuine part in a user message, in a chat tool
